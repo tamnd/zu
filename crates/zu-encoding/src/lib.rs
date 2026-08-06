@@ -7,7 +7,11 @@
 
 pub mod bitpack;
 pub mod delta;
+pub mod dict;
 pub mod for_bitpack;
+pub mod rle;
+pub mod segment;
+pub mod validity;
 
 use zu_common::ZuError;
 

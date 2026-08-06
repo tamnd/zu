@@ -6,7 +6,9 @@
 //! groups, segments, and CSR build on top of these within M1.
 
 pub mod file;
+pub mod graph;
 pub mod meta;
+pub mod segment;
 
 use std::path::Path;
 
@@ -27,8 +29,9 @@ pub const FORMAT_VERSION: u16 = 1;
 pub const MIN_READER_VERSION: u16 = 1;
 
 /// Walks the whole file checking every crc: file header, database
-/// headers, and each meta-block chain reachable from the committed roots.
-/// Returns the number of chain payload bytes verified.
+/// headers, each meta-block chain reachable from the committed roots, and
+/// every column segment listed in the group directory. Returns the number
+/// of payload bytes verified.
 pub fn verify(path: &Path) -> Result<u64> {
     let mut db = Zu1File::open(path)?;
     let roots = [
@@ -40,6 +43,18 @@ pub fn verify(path: &Path) -> Result<u64> {
     let mut bytes = 0u64;
     for root in roots {
         bytes += meta::read_chain(&mut db, root)?.len() as u64;
+    }
+    if db.db_header().table_index_root != file::NULL_BLOCK {
+        let reader = graph::GraphReader::load(&mut db)?;
+        let groups = reader.directory().groups.clone();
+        let mut values = Vec::new();
+        for group in &groups {
+            for seg in [&group.offsets, &group.neighbors] {
+                values.clear();
+                segment::read_segment(&mut db, seg, &mut values)?;
+                bytes += seg.payload_len;
+            }
+        }
     }
     Ok(bytes)
 }

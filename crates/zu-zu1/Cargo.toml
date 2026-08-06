@@ -19,3 +19,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "ingest"
+harness = false

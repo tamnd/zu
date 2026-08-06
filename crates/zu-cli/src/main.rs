@@ -28,6 +28,12 @@ fn main() -> ExitCode {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
         },
+        Some("copy") => match (args.get(1), args.get(2)) {
+            (Some(edges), Some(out)) => {
+                copy(std::path::Path::new(edges), std::path::Path::new(out))
+            }
+            _ => usage_error("zu copy <edges.txt> <out.zu1>"),
+        },
         Some(cmd) => {
             eprintln!("zu: unknown command '{cmd}' (commands arrive with their milestones)");
             ExitCode::FAILURE
@@ -76,6 +82,56 @@ fn stat(path: &std::path::Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => command_error("stat", &e),
+    }
+}
+
+/// Bulk-loads a whitespace separated `src dst` edge list (SNAP layout,
+/// `#` comments) into a fresh zu1 file and prints the ingest numbers.
+fn copy(edges_path: &std::path::Path, out_path: &std::path::Path) -> ExitCode {
+    let started = std::time::Instant::now();
+    let edges = match zu::zu1::graph::read_edge_list(edges_path) {
+        Ok(e) => e,
+        Err(e) => return command_error("copy", &e),
+    };
+    let parsed = started.elapsed();
+    let node_count = edges
+        .iter()
+        .map(|&(s, d)| u64::from(s.max(d)) + 1)
+        .max()
+        .unwrap_or(0);
+    let mut sorted = edges;
+    sorted.sort_unstable();
+    sorted.dedup();
+    let load_started = std::time::Instant::now();
+    let result = (|| {
+        let mut db = zu::zu1::file::Zu1File::create(out_path)?;
+        zu::zu1::graph::bulk_load(&mut db, node_count, &sorted)
+    })();
+    match result {
+        Ok(d) => {
+            let load = load_started.elapsed();
+            let total = started.elapsed();
+            let file_bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+            let bits_per_edge = file_bytes as f64 * 8.0 / d.edge_count as f64;
+            println!(
+                "copied {} edges, {} nodes, {} groups",
+                d.edge_count,
+                d.node_count,
+                d.groups.len()
+            );
+            println!(
+                "parse {:.2}s, encode+write {:.2}s, total {:.2}s",
+                parsed.as_secs_f64(),
+                load.as_secs_f64(),
+                total.as_secs_f64()
+            );
+            println!(
+                "{:.2} M edges/s end to end, {file_bytes} bytes on disk, {bits_per_edge:.2} bits/edge",
+                d.edge_count as f64 / total.as_secs_f64() / 1e6
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => command_error("copy", &e),
     }
 }
 

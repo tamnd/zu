@@ -6,9 +6,11 @@
 //! M edges/s (parse excluded, sort included: that is the COPY hot path),
 //! the on-disk adjacency density in bits/edge, and random 1-hop point
 //! reads in K lookups/s. With ZU_GATE=1 the process exits nonzero when a
-//! floor or ceiling in bench/budgets.toml is missed.
+//! floor or ceiling in bench/budgets.toml is missed. ZU_B6=1 adds the
+//! B6 scale check: the same COPY path over the 117 M edge com-Orkut
+//! graph, since B6 is defined at 100 M edges and LiveJournal is 69 M.
 //!
-//! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu-zu1
+//! Run: ZU_GATE=1 ZU_DATA=~/data/zu ZU_B6=1 cargo bench -p zu-zu1
 
 use std::time::Instant;
 
@@ -244,6 +246,42 @@ fn main() {
         println!("GATE FAIL point-in: {in_klookups_s:.0} K lookups/s < floor {floor}");
         failed = true;
     }
+    // B6 is defined at 100 M edges (docs/12) and LiveJournal tops out at
+    // 69 M, so the scale check loads com-Orkut (117 M edges) when opted
+    // in with ZU_B6=1. The ungraph lists each undirected edge once and is
+    // ingested as the directed list it is on disk. Only the throughput
+    // floor gates here: the density ceilings and point floors are defined
+    // against LiveJournal's degree structure, so Orkut's numbers print as
+    // information. The servers leave ZU_B6 unset to keep fleet runs
+    // short; the box only needs one honest machine.
+    if std::env::var("ZU_B6").is_ok_and(|v| v == "1") {
+        let path = std::env::var("ZU_DATA")
+            .map(|d| format!("{d}/com-orkut.ungraph.txt"))
+            .unwrap_or_default();
+        match read_edge_list(std::path::Path::new(&path)) {
+            Ok(edges) => {
+                println!("data: com-orkut.ungraph.txt, {} edges", edges.len());
+                let node_count = edges
+                    .iter()
+                    .map(|&(s, d)| u64::from(s.max(d)) + 1)
+                    .max()
+                    .unwrap_or(0);
+                let (medges_s, _, _, _, _) = run_load("b6-orkut", edges, node_count);
+                if let Some(floor) = budget("copy_medges_s")
+                    && medges_s < floor
+                {
+                    println!("GATE FAIL b6: {medges_s:.2} M edges/s < floor {floor}");
+                    failed = true;
+                }
+            }
+            Err(_) => {
+                println!("b6: com-orkut.ungraph.txt not found, run scripts/fetch-datasets.sh")
+            }
+        }
+    } else {
+        println!("b6: skipped (set ZU_B6=1, loads the 117 M edge com-Orkut graph)");
+    }
+
     if gate && failed {
         std::process::exit(1);
     }

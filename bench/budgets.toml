@@ -5,20 +5,19 @@
 
 for_bitpack = 1.0
 delta_bitpack = 1.0
+delta_patch = 1.0
 rle = 1.0
 dict = 1.0
 
 # COPY ingest floors, single core, sort included, parse excluded (B6/B8).
-# bits_per_edge is a ceiling, not a floor. Raw-order LiveJournal measures
-# 24.29 bits/edge today: delta packs 1024-value chunks, each chunk spans
-# about 70 adjacency lists at average degree 14, and one 23-bit restart
-# delta per chunk sets the whole chunk width. The docs/12 budget of 8
-# bits/edge needs patched bitpacking (outlier exceptions); the ceiling
-# drops when that encoding lands. Lower ceilings, never raise them.
+# The density keys are ceilings, not floors, set just above the measured
+# LiveJournal numbers with Delta+Patch: raw order 22.77, BFS 22.01.
+# Lower ceilings, never raise them. The 8.0 exit budget from docs/12
+# remains open: patched exceptions removed the outlier tax, but in-list
+# gaps on LiveJournal run 16-18 bits even BFS-reordered, because BFS
+# frontiers on a social graph are millions wide. Getting under 8 needs
+# an LLP-class ordering or copy-list compression, both deferred by
+# docs/04 section 5.
 copy_medges_s = 1.0
-bits_per_edge = 25.0
-# BFS reorder measures 23.28 bits/edge: ordering is not the bottleneck,
-# the per-chunk max width is, because nearly every list holds one low-id
-# hub neighbor and one 23-bit delta per 1024-value chunk prices the whole
-# chunk. Patched bitpacking is the path to the 8.0 exit gate.
-bits_per_edge_bfs = 23.5
+bits_per_edge = 23.0
+bits_per_edge_bfs = 22.5

@@ -79,6 +79,13 @@ fn main() {
         ("constant", vec![42; 2000]),
         ("runs", (0..2000u64).map(|i| i / 250).collect()),
         ("dictish", (0..2000u64).map(|i| (i * 7) % 16).collect()),
+        ("binary", (0..2000u64).map(|i| (i * i / 7) & 1).collect()),
+        (
+            "dominant",
+            (0..2000u64)
+                .map(|i| if i % 9 == 4 { i * 40_009 } else { 777 })
+                .collect(),
+        ),
         ("adjacency", {
             let mut v = Vec::new();
             for list in 0..150u64 {
@@ -106,5 +113,16 @@ fn main() {
         zu_encoding::delta_patch::encode(values, &mut dp);
         write_seed(&corpus.join("decode_delta_patch"), name, &dp);
     }
+
+    // The typed encoders only accept their own shapes, so they seed from
+    // the matching entry instead of every shape in the loop.
+    let binary = &shapes.iter().find(|(n, _)| *n == "binary").unwrap().1;
+    let mut bb = Vec::new();
+    zu_encoding::bool_bitpack::encode(binary, &mut bb);
+    write_seed(&corpus.join("decode_bool_bitpack"), "binary", &bb);
+    let dominant = &shapes.iter().find(|(n, _)| *n == "dominant").unwrap().1;
+    let mut fq = Vec::new();
+    zu_encoding::frequency::encode(dominant, &mut fq);
+    write_seed(&corpus.join("decode_frequency"), "dominant", &fq);
     println!("seeds written under {}", corpus.display());
 }

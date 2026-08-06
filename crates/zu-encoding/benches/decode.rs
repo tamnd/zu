@@ -139,6 +139,39 @@ fn main() {
         }
     }
 
+    // Derived streams for the typed encodings. The parity bit of each
+    // neighbor id models a boolean property column at the real length,
+    // and the gap stream of the sorted ids has a genuinely dominant
+    // value, gap zero from duplicate destinations, which is the shape
+    // Frequency exists for.
+    let parity: Vec<u64> = data.iter().map(|&v| v & 1).collect();
+    let gaps: Vec<u64> = data.windows(2).map(|w| w[1] - w[0]).collect();
+    let typed: [(&str, &[u64], EncodeFn, DecodeFn); 2] = [
+        (
+            "bool_bitpack",
+            &parity,
+            zu_encoding::bool_bitpack::encode,
+            zu_encoding::bool_bitpack::decode,
+        ),
+        (
+            "frequency",
+            &gaps,
+            zu_encoding::frequency::encode,
+            zu_encoding::frequency::decode,
+        ),
+    ];
+    for (name, values, encode, decode) in typed {
+        let mut encoded = Vec::new();
+        encode(values, &mut encoded);
+        let gbps = measure(name, &encoded, values.len(), decode);
+        if let Some(floor) = budgets.floor(name)
+            && gbps < floor
+        {
+            println!("GATE FAIL {name}: {gbps:.2} GB/s < floor {floor} GB/s");
+            failed = true;
+        }
+    }
+
     if gate && failed {
         std::process::exit(1);
     }

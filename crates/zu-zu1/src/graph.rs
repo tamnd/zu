@@ -15,17 +15,23 @@
 //! `group_count: u32`, then per group `row_count: u32` followed by the
 //! fwd offsets, fwd neighbors, bwd offsets, and bwd neighbors
 //! `SegmentMeta`.
+//!
+//! Each rel table's directory is its own meta chain, reached through the
+//! catalog and the table index of `crate::catalog`, so one file holds any
+//! number of named graphs and a bulk load replaces only the table it
+//! names.
 
 use std::io::BufRead;
 use std::path::Path;
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 
-use crate::file::{NULL_BLOCK, Zu1File};
+use crate::catalog::{Catalog, TableIndex};
+use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::meta;
 use crate::segment::{SegmentMeta, read_range, read_segment, write_segment};
 
-const DIRECTORY_VERSION: u16 = 2;
+const DIRECTORY_VERSION: u16 = 3;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -85,7 +91,7 @@ impl Directory {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let corrupt = |detail: &str| ZuError::Corrupt {
             what: "group directory",
             detail: detail.to_string(),
@@ -217,14 +223,10 @@ fn build_direction(
     Ok(dirs)
 }
 
-/// Frees every block of the graph published at `table_index_root`: all
-/// four segments per group plus the directory chain itself. The blocks
-/// recycle at the next checkpoint per the shadow-publishing rules.
-fn free_previous_graph(db: &mut Zu1File) -> Result<()> {
-    let root = db.db_header().table_index_root;
-    if root == NULL_BLOCK {
-        return Ok(());
-    }
+/// Frees every block of the directory chain at `root` plus all four
+/// segments per group it lists. The blocks recycle at the next
+/// checkpoint per the shadow-publishing rules.
+fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
     let directory = Directory::decode(&meta::read_chain(db, root)?)?;
     for group in &directory.groups {
         for seg in [
@@ -241,19 +243,51 @@ fn free_previous_graph(db: &mut Zu1File) -> Result<()> {
     for ptr in meta::chain_blocks(db, root)? {
         db.free_block(ptr)?;
     }
-    db.db_header_mut().table_index_root = NULL_BLOCK;
     Ok(())
 }
 
-/// Bulk-loads both CSR directions from an edge list into `db` and
-/// publishes them with a checkpoint. `edges` must be sorted by
-/// `(src, dst)` and node ids must be dense row ids below `node_count`.
-/// The reverse direction is built from an internally sorted `(dst, src)`
-/// copy, so peak memory holds the edge list twice. A graph already
-/// published in `db` is freed first; its blocks recycle one checkpoint
-/// later. Returns the directory.
+/// Frees a committed meta chain so a rewritten copy replaces it.
+fn free_chain(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+    if root == NULL_BLOCK {
+        return Ok(());
+    }
+    for ptr in meta::chain_blocks(db, root)? {
+        db.free_block(ptr)?;
+    }
+    Ok(())
+}
+
+/// Bulk-loads both CSR directions from an edge list into `db` as the
+/// default tables `node` and `edge`, publishing them with a checkpoint.
 pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Result<Directory> {
-    free_previous_graph(db)?;
+    bulk_load_as(db, "node", "edge", node_count, edges)
+}
+
+/// Bulk-loads both CSR directions from an edge list into `db` as the rel
+/// table `rel_table` over the node table `node_table`, then publishes
+/// the catalog, table index, and directory with a checkpoint. `edges`
+/// must be sorted by `(src, dst)` and node ids must be dense row ids
+/// below `node_count`. The reverse direction is built from an internally
+/// sorted `(dst, src)` copy, so peak memory holds the edge list twice.
+/// A rel table with the same name is replaced and its blocks recycle one
+/// checkpoint later; other tables in the file are untouched. The node
+/// table's row domain only grows across loads. Returns the directory.
+pub fn bulk_load_as(
+    db: &mut Zu1File,
+    node_table: &str,
+    rel_table: &str,
+    node_count: u64,
+    edges: &[(u32, u32)],
+) -> Result<Directory> {
+    let mut catalog = Catalog::load(db)?;
+    let mut index = TableIndex::load(db)?;
+    if let Some(rel) = catalog.rel_by_name(rel_table) {
+        let id = rel.id;
+        if let Some(root) = index.get(id) {
+            free_directory(db, root)?;
+            index.remove(id);
+        }
+    }
     let fwd = build_direction(db, node_count, edges)?;
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
     rev.sort_unstable();
@@ -279,7 +313,17 @@ pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Res
         groups,
     };
     let root = meta::write_chain(db, &directory.encode())?;
-    db.db_header_mut().table_index_root = root;
+    let from = catalog.upsert_node(node_table, node_count)?;
+    let rel_id = catalog.upsert_rel(rel_table, from, from, edges.len() as u64)?;
+    index.set(rel_id, root);
+    // The catalog and index chains are rewritten whole, freeing the
+    // committed copies first.
+    free_chain(db, db.db_header().catalog_root)?;
+    free_chain(db, db.db_header().table_index_root)?;
+    let catalog_root = meta::write_chain(db, &catalog.encode())?;
+    let index_root = meta::write_chain(db, &index.encode())?;
+    db.db_header_mut().catalog_root = catalog_root;
+    db.db_header_mut().table_index_root = index_root;
     db.checkpoint()?;
     Ok(directory)
 }
@@ -293,9 +337,39 @@ pub struct GraphReader {
 }
 
 impl GraphReader {
-    /// Loads the directory from the committed table index root.
+    /// Opens the only rel table in the file, the common single-graph
+    /// case. A file holding several rel tables needs [`Self::load_table`]
+    /// with a name.
     pub fn load(db: &mut Zu1File) -> Result<Self> {
-        let root = db.db_header().table_index_root;
+        let catalog = Catalog::load(db)?;
+        match catalog.rel_tables() {
+            [rel] => {
+                let name = rel.name.clone();
+                Self::load_table(db, &name)
+            }
+            [] => Err(ZuError::InvalidArgument(
+                "file holds no rel tables".to_string(),
+            )),
+            many => Err(ZuError::InvalidArgument(format!(
+                "file holds {} rel tables, name one",
+                many.len()
+            ))),
+        }
+    }
+
+    /// Opens the rel table called `name` through the catalog and the
+    /// table index.
+    pub fn load_table(db: &mut Zu1File, name: &str) -> Result<Self> {
+        let catalog = Catalog::load(db)?;
+        let rel = catalog
+            .rel_by_name(name)
+            .ok_or_else(|| ZuError::InvalidArgument(format!("no rel table '{name}'")))?;
+        let root = TableIndex::load(db)?
+            .get(rel.id)
+            .ok_or_else(|| ZuError::Corrupt {
+                what: "table index",
+                detail: format!("rel table '{name}' has no directory entry"),
+            })?;
         let bytes = meta::read_chain(db, root)?;
         Ok(Self {
             directory: Directory::decode(&bytes)?,
@@ -539,6 +613,46 @@ mod tests {
                 .neighbors_into(&mut db, u64::from(n), &mut point)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn named_tables_share_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let mut follows = vec![(0u32, 1u32), (1, 2), (2, 0)];
+        let mut likes = vec![(0u32, 2u32), (3, 1)];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load_as(&mut db, "person", "follows", 3, sorted_edges(&mut follows)).unwrap();
+            bulk_load_as(&mut db, "person", "likes", 4, sorted_edges(&mut likes)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        // Two rel tables: loading without a name must fail, naming works.
+        assert!(GraphReader::load(&mut db).is_err());
+        assert!(GraphReader::load_table(&mut db, "nope").is_err());
+        let mut r = GraphReader::load_table(&mut db, "follows").unwrap();
+        assert_eq!(r.neighbors(&mut db, 0).unwrap(), &[1]);
+        assert_eq!(r.neighbors_dir(&mut db, 0, Direction::Bwd).unwrap(), &[2]);
+        let mut r = GraphReader::load_table(&mut db, "likes").unwrap();
+        assert_eq!(r.neighbors(&mut db, 3).unwrap(), &[1]);
+        assert_eq!(r.neighbors_dir(&mut db, 2, Direction::Bwd).unwrap(), &[0]);
+        // The shared node table grew to the larger row domain.
+        let catalog = crate::catalog::Catalog::load(&mut db).unwrap();
+        assert_eq!(catalog.node_by_name("person").unwrap().node_count, 4);
+        assert_eq!(catalog.rel_tables().len(), 2);
+        // Replacing one rel table leaves the other untouched.
+        let mut third = vec![(1u32, 0u32)];
+        bulk_load_as(&mut db, "person", "likes", 4, sorted_edges(&mut third)).unwrap();
+        let mut r = GraphReader::load_table(&mut db, "likes").unwrap();
+        assert_eq!(r.directory().edge_count, 1);
+        assert_eq!(r.neighbors(&mut db, 1).unwrap(), &[0]);
+        let mut r = GraphReader::load_table(&mut db, "follows").unwrap();
+        assert_eq!(r.neighbors(&mut db, 2).unwrap(), &[0]);
+        drop(db);
+        crate::verify(&path).unwrap();
+        // A fresh file holds no rel tables at all.
+        let mut empty = Zu1File::create(&dir.path().join("e.zu1")).unwrap();
+        assert!(GraphReader::load(&mut empty).is_err());
     }
 
     #[test]

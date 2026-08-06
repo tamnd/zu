@@ -5,6 +5,7 @@
 //! flip; `meta` the meta-block chains behind every root pointer. Node
 //! groups, segments, and CSR build on top of these within M1.
 
+pub mod catalog;
 pub mod file;
 pub mod graph;
 pub mod meta;
@@ -30,36 +31,65 @@ pub const FORMAT_VERSION: u16 = 1;
 pub const MIN_READER_VERSION: u16 = 1;
 
 /// Walks the whole file checking every crc: file header, database
-/// headers, each meta-block chain reachable from the committed roots, and
-/// every column segment listed in the group directory. Also decodes the
-/// free list and rejects a file whose free list claims a block the graph
-/// still uses, since allocating such a block would overwrite live data.
+/// headers, the catalog, the table index, and each rel table's group
+/// directory with every column segment it lists. Cross-checks the three
+/// against each other (every rel table has a directory, every directory
+/// belongs to a rel table, counts agree), then decodes the free list and
+/// rejects a file whose free list claims a block a live chain or segment
+/// uses, since allocating such a block would overwrite live data.
 /// Returns the number of payload bytes verified.
 pub fn verify(path: &Path) -> Result<u64> {
+    let corrupt = |what, detail| zu_common::ZuError::Corrupt { what, detail };
     let mut db = Zu1File::open(path)?;
-    let roots = [
+    let mut bytes = 0u64;
+    let mut live: std::collections::HashSet<file::BlockPtr> = std::collections::HashSet::new();
+    for root in [
         db.db_header().catalog_root,
         db.db_header().table_index_root,
-        db.db_header().free_list_root,
         db.db_header().stats_root,
-    ];
-    let mut bytes = 0u64;
-    for root in roots {
+    ] {
         bytes += meta::read_chain(&mut db, root)?.len() as u64;
+        live.extend(meta::chain_blocks(&mut db, root)?);
     }
-    let free_root = db.db_header().free_list_root;
-    let free_bytes = meta::read_chain(&mut db, free_root)?;
-    let free = file::decode_free_list(&free_bytes, db.db_header().block_count)?;
-    let table_root = db.db_header().table_index_root;
-    if table_root != file::NULL_BLOCK {
-        let mut live: std::collections::HashSet<file::BlockPtr> =
-            meta::chain_blocks(&mut db, table_root)?
-                .into_iter()
-                .collect();
-        let reader = graph::GraphReader::load(&mut db)?;
-        let groups = reader.directory().groups.clone();
-        let mut values = Vec::new();
-        for group in &groups {
+    let catalog = catalog::Catalog::load(&mut db)?;
+    let index = catalog::TableIndex::load(&mut db)?;
+    for rel in catalog.rel_tables() {
+        if index.get(rel.id).is_none() {
+            return Err(corrupt(
+                "table index",
+                format!("rel table '{}' has no directory entry", rel.name),
+            ));
+        }
+    }
+    let mut values = Vec::new();
+    for &(id, root) in index.entries() {
+        let rel = catalog
+            .rel_by_id(id)
+            .ok_or_else(|| corrupt("table index", format!("entry {id} names no catalog table")))?;
+        let chain = meta::read_chain(&mut db, root)?;
+        bytes += chain.len() as u64;
+        live.extend(meta::chain_blocks(&mut db, root)?);
+        let directory = graph::Directory::decode(&chain)?;
+        if directory.edge_count != rel.edge_count {
+            return Err(corrupt(
+                "catalog",
+                format!(
+                    "rel table '{}' claims {} edges, directory holds {}",
+                    rel.name, rel.edge_count, directory.edge_count
+                ),
+            ));
+        }
+        let from = catalog.node_by_id(rel.from).expect("validated on decode");
+        if directory.node_count > from.node_count {
+            return Err(corrupt(
+                "catalog",
+                format!(
+                    "rel table '{}' spans {} nodes, node table '{}' holds {}",
+                    rel.name, directory.node_count, from.name, from.node_count
+                ),
+            ));
+        }
+        for group in &directory.groups {
             for seg in [
                 &group.fwd.offsets,
                 &group.fwd.neighbors,
@@ -72,12 +102,16 @@ pub fn verify(path: &Path) -> Result<u64> {
                 live.extend(seg.blocks.iter().copied());
             }
         }
-        if let Some(ptr) = free.iter().find(|ptr| live.contains(ptr)) {
-            return Err(zu_common::ZuError::Corrupt {
-                what: "free list",
-                detail: format!("block {ptr} is listed free but the graph uses it"),
-            });
-        }
+    }
+    let free_root = db.db_header().free_list_root;
+    let free_bytes = meta::read_chain(&mut db, free_root)?;
+    bytes += free_bytes.len() as u64;
+    let free = file::decode_free_list(&free_bytes, db.db_header().block_count)?;
+    if let Some(ptr) = free.iter().find(|ptr| live.contains(ptr)) {
+        return Err(corrupt(
+            "free list",
+            format!("block {ptr} is listed free but the graph uses it"),
+        ));
     }
     Ok(bytes)
 }

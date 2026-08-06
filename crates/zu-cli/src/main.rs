@@ -28,12 +28,32 @@ fn main() -> ExitCode {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
         },
-        Some("copy") => match (args.get(1), args.get(2)) {
-            (Some(edges), Some(out)) => {
-                copy(std::path::Path::new(edges), std::path::Path::new(out))
+        Some("copy") => {
+            let mut reorder = zu::zu1::reorder::Reorder::None;
+            let mut rest = &args[1..];
+            if rest.first().map(String::as_str) == Some("--reorder") {
+                match rest
+                    .get(1)
+                    .and_then(|s| zu::zu1::reorder::Reorder::parse(s))
+                {
+                    Some(r) => reorder = r,
+                    None => {
+                        return usage_error(
+                            "zu copy [--reorder degree|bfs|none] <edges.txt> <out.zu1>",
+                        );
+                    }
+                }
+                rest = &rest[2..];
             }
-            _ => usage_error("zu copy <edges.txt> <out.zu1>"),
-        },
+            match (rest.first(), rest.get(1)) {
+                (Some(edges), Some(out)) => copy(
+                    std::path::Path::new(edges),
+                    std::path::Path::new(out),
+                    reorder,
+                ),
+                _ => usage_error("zu copy [--reorder degree|bfs|none] <edges.txt> <out.zu1>"),
+            }
+        }
         Some(cmd) => {
             eprintln!("zu: unknown command '{cmd}' (commands arrive with their milestones)");
             ExitCode::FAILURE
@@ -87,9 +107,13 @@ fn stat(path: &std::path::Path) -> ExitCode {
 
 /// Bulk-loads a whitespace separated `src dst` edge list (SNAP layout,
 /// `#` comments) into a fresh zu1 file and prints the ingest numbers.
-fn copy(edges_path: &std::path::Path, out_path: &std::path::Path) -> ExitCode {
+fn copy(
+    edges_path: &std::path::Path,
+    out_path: &std::path::Path,
+    reorder: zu::zu1::reorder::Reorder,
+) -> ExitCode {
     let started = std::time::Instant::now();
-    let edges = match zu::zu1::graph::read_edge_list(edges_path) {
+    let mut edges = match zu::zu1::graph::read_edge_list(edges_path) {
         Ok(e) => e,
         Err(e) => return command_error("copy", &e),
     };
@@ -99,6 +123,17 @@ fn copy(edges_path: &std::path::Path, out_path: &std::path::Path) -> ExitCode {
         .map(|&(s, d)| u64::from(s.max(d)) + 1)
         .max()
         .unwrap_or(0);
+    match reorder {
+        zu::zu1::reorder::Reorder::None => {}
+        zu::zu1::reorder::Reorder::Degree => {
+            let map = zu::zu1::reorder::degree_order(node_count, &edges);
+            zu::zu1::reorder::relabel(&mut edges, &map);
+        }
+        zu::zu1::reorder::Reorder::Bfs => {
+            let map = zu::zu1::reorder::bfs_order(node_count, &edges);
+            zu::zu1::reorder::relabel(&mut edges, &map);
+        }
+    }
     let mut sorted = edges;
     sorted.sort_unstable();
     sorted.dedup();

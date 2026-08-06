@@ -17,3 +17,8 @@ dict = 1.0
 # drops when that encoding lands. Lower ceilings, never raise them.
 copy_medges_s = 1.0
 bits_per_edge = 25.0
+# BFS reorder measures 23.28 bits/edge: ordering is not the bottleneck,
+# the per-chunk max width is, because nearly every list holds one low-id
+# hub neighbor and one 23-bit delta per 1024-value chunk prices the whole
+# chunk. Patched bitpacking is the path to the 8.0 exit gate.
+bits_per_edge_bfs = 23.5

@@ -23,6 +23,7 @@ zu = { path = "crates/zu" }
 
 thiserror = "2"
 crc32c = "0.6"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
 
 [workspace.lints.clippy]

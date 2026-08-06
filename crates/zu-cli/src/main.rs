@@ -20,11 +20,83 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::SUCCESS
         }
+        Some("stat") => match args.get(1) {
+            Some(path) => stat(std::path::Path::new(path)),
+            None => usage_error("zu stat <file.zu1>"),
+        },
+        Some("verify") => match args.get(1) {
+            Some(path) => verify(std::path::Path::new(path)),
+            None => usage_error("zu verify <file.zu1>"),
+        },
         Some(cmd) => {
             eprintln!("zu: unknown command '{cmd}' (commands arrive with their milestones)");
             ExitCode::FAILURE
         }
     }
+}
+
+fn stat(path: &std::path::Path) -> ExitCode {
+    match zu::zu1::file::Zu1File::open(path) {
+        Ok(db) => {
+            let fh = db.file_header();
+            let dh = db.db_header();
+            let u = fh.uuid;
+            println!("file:            {}", path.display());
+            println!(
+                "uuid:            {:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                u[0],
+                u[1],
+                u[2],
+                u[3],
+                u[4],
+                u[5],
+                u[6],
+                u[7],
+                u[8],
+                u[9],
+                u[10],
+                u[11],
+                u[12],
+                u[13],
+                u[14],
+                u[15]
+            );
+            println!(
+                "format:          zu1 v{}, min reader v{}",
+                fh.format_version, fh.min_reader_version
+            );
+            println!("block size:      {} KiB", fh.block_size / 1024);
+            println!("epoch:           {}", dh.epoch);
+            println!("blocks:          {}", dh.block_count);
+            println!("wal seq:         {}", dh.wal_seq);
+            println!(
+                "roots:           catalog={} tables={} free={} stats={}",
+                dh.catalog_root, dh.table_index_root, dh.free_list_root, dh.stats_root
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => command_error("stat", &e),
+    }
+}
+
+fn verify(path: &std::path::Path) -> ExitCode {
+    match zu::zu1::verify(path) {
+        Ok(bytes) => {
+            println!("{}: ok, {bytes} meta bytes verified", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => command_error("verify", &e),
+    }
+}
+
+fn usage_error(usage: &str) -> ExitCode {
+    eprintln!("usage: {usage}");
+    ExitCode::FAILURE
+}
+
+fn command_error(cmd: &str, err: &zu::ZuError) -> ExitCode {
+    eprintln!("zu {cmd}: {err}");
+    ExitCode::FAILURE
 }
 
 fn print_usage() {

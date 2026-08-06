@@ -29,9 +29,12 @@ use zu_common::{GROUP_ROWS, Result, ZuError};
 use crate::catalog::{Catalog, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::meta;
-use crate::segment::{SegmentMeta, read_range, read_segment, write_segment};
+use crate::segment::{SegmentMeta, probe, read_range, read_segment, write_segment};
 
-const DIRECTORY_VERSION: u16 = 3;
+// Version 4 added the per-chunk fence array to segment payloads, which
+// shifts the body offset, so version 3 files must fail as unsupported
+// here rather than misread downstream.
+const DIRECTORY_VERSION: u16 = 4;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -450,6 +453,30 @@ impl GraphReader {
         self.neighbors_dir_into(db, node, Direction::Fwd, out)
     }
 
+    /// Edge probe: does `node` list `other` in `dir`? Two offset values
+    /// locate the list, then the fence array names the one chunk that
+    /// could hold `other`, so a probe decodes at most one neighbor chunk
+    /// however large the degree. This is the primitive behind
+    /// `MATCH (a)-[]->(b)` on bound endpoints.
+    pub fn has_edge_dir(
+        &self,
+        db: &mut Zu1File,
+        node: u64,
+        other: u64,
+        dir: Direction,
+    ) -> Result<bool> {
+        let (g, row) = self.locate(node)?;
+        let meta = self.directory.groups[g].dir(dir);
+        let mut offs = Vec::with_capacity(2);
+        read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
+        probe(db, &meta.neighbors, offs[0], offs[1], other)
+    }
+
+    /// Edge probe on the forward direction: does `src` point at `dst`?
+    pub fn has_edge(&self, db: &mut Zu1File, src: u64, dst: u64) -> Result<bool> {
+        self.has_edge_dir(db, src, dst, Direction::Fwd)
+    }
+
     /// Point access to the in-neighbor list.
     pub fn in_neighbors_into(&self, db: &mut Zu1File, node: u64, out: &mut Vec<u64>) -> Result<()> {
         self.neighbors_dir_into(db, node, Direction::Bwd, out)
@@ -748,6 +775,41 @@ mod tests {
                 assert_eq!(got, want, "node {node} {dir:?}");
             }
         }
+    }
+
+    #[test]
+    fn edge_probe_matches_the_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        // A hub with a multi-chunk list, ordinary nodes, and a node in
+        // the tail group, so probes cross chunk and group boundaries.
+        let mut edges: Vec<(u32, u32)> = (0..3000).map(|d| (7u32, d * 2)).collect();
+        edges.extend([(9, 4), (9, 7000), (1023, 1), (1024, 2), (GROUP_ROWS, 3)]);
+        let node_count = u64::from(GROUP_ROWS) + 5;
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let reader = GraphReader::load(&mut db).unwrap();
+        for &(s, d) in edges.iter() {
+            assert!(
+                reader
+                    .has_edge(&mut db, u64::from(s), u64::from(d))
+                    .unwrap(),
+                "present edge {s}->{d}"
+            );
+            assert!(
+                reader
+                    .has_edge_dir(&mut db, u64::from(d), u64::from(s), Direction::Bwd)
+                    .unwrap(),
+                "present edge {s}->{d} backward"
+            );
+        }
+        for (s, d) in [(7u64, 1u64), (7, 5999), (7, 6000), (9, 5), (0, 0), (500, 7)] {
+            assert!(!reader.has_edge(&mut db, s, d).unwrap(), "absent {s}->{d}");
+        }
+        assert!(reader.has_edge(&mut db, node_count, 0).is_err());
     }
 
     #[test]

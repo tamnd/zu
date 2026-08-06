@@ -43,6 +43,24 @@ fn main() -> ExitCode {
                 _ => usage_error("zu neighbors [--in] <file.zu1> <node>"),
             }
         }
+        Some("edge") => {
+            let mut rest = &args[1..];
+            let mut dir = zu::zu1::graph::Direction::Fwd;
+            if rest.first().map(String::as_str) == Some("--in") {
+                dir = zu::zu1::graph::Direction::Bwd;
+                rest = &rest[1..];
+            }
+            match (
+                rest.first(),
+                rest.get(1).and_then(|s| s.parse::<u64>().ok()),
+                rest.get(2).and_then(|s| s.parse::<u64>().ok()),
+            ) {
+                (Some(path), Some(src), Some(dst)) => {
+                    edge(std::path::Path::new(path), src, dst, dir)
+                }
+                _ => usage_error("zu edge [--in] <file.zu1> <src> <dst>"),
+            }
+        }
         Some("copy") => {
             let mut reorder = zu::zu1::reorder::Reorder::None;
             let mut rest = &args[1..];
@@ -250,6 +268,32 @@ fn neighbors(path: &std::path::Path, node: u64, dir: zu::zu1::graph::Direction) 
     }
 }
 
+/// Edge probe via the fence path: decodes at most one neighbor chunk
+/// however large the endpoint's degree. Exits 0 when the edge exists and
+/// 1 when it does not, so scripts can branch on it.
+fn edge(path: &std::path::Path, src: u64, dst: u64, dir: zu::zu1::graph::Direction) -> ExitCode {
+    let result = (|| {
+        let mut db = zu::zu1::file::Zu1File::open(path)?;
+        let reader = zu::zu1::graph::GraphReader::load(&mut db)?;
+        reader.has_edge_dir(&mut db, src, dst, dir)
+    })();
+    let arrow = match dir {
+        zu::zu1::graph::Direction::Fwd => "->",
+        zu::zu1::graph::Direction::Bwd => "<-",
+    };
+    match result {
+        Ok(true) => {
+            println!("{src} {arrow} {dst}: exists");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("{src} {arrow} {dst}: absent");
+            ExitCode::FAILURE
+        }
+        Err(e) => command_error("edge", &e),
+    }
+}
+
 fn verify(path: &std::path::Path) -> ExitCode {
     match zu::zu1::verify(path) {
         Ok(bytes) => {
@@ -275,6 +319,8 @@ fn print_usage() {
     println!();
     println!("usage: zu <command> [args]");
     println!();
-    println!("commands: shell, query, copy, convert, verify, stat, neighbors [--in], bench");
+    println!(
+        "commands: shell, query, copy, convert, verify, stat, neighbors [--in], edge [--in], bench"
+    );
     println!("(implemented milestone by milestone, see the repo issues)");
 }

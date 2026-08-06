@@ -14,12 +14,12 @@ use zu_common::{Result, ZuError};
 use crate::for_bitpack;
 
 #[inline]
-fn zigzag(v: i64) -> u64 {
+pub(crate) fn zigzag(v: i64) -> u64 {
     ((v << 1) ^ (v >> 63)) as u64
 }
 
 #[inline]
-fn unzigzag(v: u64) -> i64 {
+pub(crate) fn unzigzag(v: u64) -> i64 {
     ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
 

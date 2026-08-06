@@ -17,7 +17,11 @@
 //! about 0.06 bits per value.
 //! Metas serialize into meta-block chains with a fixed layout:
 //! `value_count: u64`, `payload_len: u64`, `uncompressed_bytes: u64`,
-//! `crc32c: u32`, `block_count: u32`, then one `u64` per block pointer.
+//! `min: u64`, `max: u64`, `crc32c: u32`, `block_count: u32`, then one
+//! `u64` per block pointer. The min and max are the segment's zone map
+//! (`docs/04` §6): [`probe`] answers absent for any value outside them
+//! without touching the payload, and the full scan cross-checks them
+//! against the decoded values.
 //!
 //! The segment crc covers the whole payload and is verified by the full
 //! scan path and `zu verify`. The point path skips it by design (checking
@@ -40,6 +44,10 @@ pub struct SegmentMeta {
     pub value_count: u64,
     pub payload_len: u64,
     pub uncompressed_bytes: u64,
+    /// Zone map: the smallest value in the segment, 0 when empty.
+    pub min: u64,
+    /// Zone map: the largest value in the segment, 0 when empty.
+    pub max: u64,
     pub crc: u32,
     pub blocks: Vec<BlockPtr>,
 }
@@ -47,7 +55,7 @@ pub struct SegmentMeta {
 impl SegmentMeta {
     /// Serialized size in bytes.
     pub fn encoded_len(&self) -> usize {
-        32 + self.blocks.len() * 8
+        48 + self.blocks.len() * 8
     }
 
     /// Appends the meta to `out`.
@@ -55,6 +63,8 @@ impl SegmentMeta {
         out.extend_from_slice(&self.value_count.to_le_bytes());
         out.extend_from_slice(&self.payload_len.to_le_bytes());
         out.extend_from_slice(&self.uncompressed_bytes.to_le_bytes());
+        out.extend_from_slice(&self.min.to_le_bytes());
+        out.extend_from_slice(&self.max.to_le_bytes());
         out.extend_from_slice(&self.crc.to_le_bytes());
         out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
         for b in &self.blocks {
@@ -70,24 +80,29 @@ impl SegmentMeta {
             detail: detail.to_string(),
         };
         let head = bytes
-            .get(pos..pos + 32)
+            .get(pos..pos + 48)
             .ok_or_else(|| corrupt("truncated header"))?;
         let word = |i: usize| u64::from_le_bytes(head[i..i + 8].try_into().unwrap());
         let value_count = word(0);
         let payload_len = word(8);
         let uncompressed_bytes = word(16);
-        let crc = u32::from_le_bytes(head[24..28].try_into().unwrap());
-        let block_count = u32::from_le_bytes(head[28..32].try_into().unwrap()) as usize;
+        let min = word(24);
+        let max = word(32);
+        let crc = u32::from_le_bytes(head[40..44].try_into().unwrap());
+        let block_count = u32::from_le_bytes(head[44..48].try_into().unwrap()) as usize;
+        if min > max {
+            return Err(corrupt("zone min above max"));
+        }
         if payload_len.div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
             return Err(corrupt("payload length disagrees with block count"));
         }
         // The claimed count must fit in the bytes actually present before
         // it sizes an allocation.
-        if block_count > bytes.len().saturating_sub(pos + 32) / 8 {
+        if block_count > bytes.len().saturating_sub(pos + 48) / 8 {
             return Err(corrupt("truncated block list"));
         }
         let mut blocks = Vec::with_capacity(block_count);
-        let mut p = pos + 32;
+        let mut p = pos + 48;
         for _ in 0..block_count {
             let ptr = bytes
                 .get(p..p + 8)
@@ -100,6 +115,8 @@ impl SegmentMeta {
                 value_count,
                 payload_len,
                 uncompressed_bytes,
+                min,
+                max,
                 crc,
                 blocks,
             },
@@ -157,6 +174,8 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
         value_count: values.len() as u64,
         payload_len: payload.len() as u64,
         uncompressed_bytes: (values.len() * 8) as u64,
+        min: values.iter().copied().min().unwrap_or(0),
+        max: values.iter().copied().max().unwrap_or(0),
         crc,
         blocks,
     })
@@ -196,6 +215,7 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
         .get(idx_len..idx_len + chunks * 8)
         .ok_or_else(|| corrupt("truncated fences"))?;
     let body = &payload[idx_len + chunks * 8..];
+    let first_out = out.len();
     let mut prev = 0usize;
     for i in 0..chunks {
         let end = u32::from_le_bytes(index[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
@@ -215,6 +235,16 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
     }
     if prev != body.len() {
         return Err(corrupt("trailing bytes after last chunk"));
+    }
+    // The zone map is what lets probes skip segments unread, so the full
+    // scan holds it to the values the same way it holds every fence.
+    if meta.value_count > 0 {
+        let decoded = &out[first_out..];
+        let lo = decoded.iter().copied().min().unwrap();
+        let hi = decoded.iter().copied().max().unwrap();
+        if lo != meta.min || hi != meta.max {
+            return Err(corrupt("zone disagrees with values"));
+        }
     }
     Ok(())
 }
@@ -290,6 +320,8 @@ pub fn read_range(
 /// of it, so a binary search over them names the single chunk that could
 /// hold `value`, and only that chunk is read and decoded: a probe
 /// touches bytes on the order of one chunk regardless of the degree.
+/// A value outside the segment's zone map answers absent from the meta
+/// alone, without reading the payload at all.
 pub fn probe(
     db: &mut Zu1File,
     meta: &SegmentMeta,
@@ -308,6 +340,11 @@ pub fn probe(
         )));
     }
     if start == end {
+        return Ok(false);
+    }
+    // The zone covers the whole segment, so a value outside it is absent
+    // from every row range.
+    if value < meta.min || value > meta.max {
         return Ok(false);
     }
     let chunks = meta.chunk_count();
@@ -551,7 +588,7 @@ mod tests {
 
     #[test]
     fn hostile_meta_block_count_rejected() {
-        // A 32 byte header whose payload length and block count agree
+        // A 48 byte header whose payload length and block count agree
         // with each other but not with the bytes present: the claimed
         // list must fail the size check before it sizes an allocation.
         let block_count = 0x1000_0000u32;
@@ -559,10 +596,66 @@ mod tests {
         bytes.extend_from_slice(&100u64.to_le_bytes());
         bytes.extend_from_slice(&(u64::from(block_count) * u64::from(BLOCK_SIZE)).to_le_bytes());
         bytes.extend_from_slice(&800u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&99u64.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&block_count.to_le_bytes());
         let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
         assert!(format!("{err}").contains("truncated block list"));
+    }
+
+    #[test]
+    fn hostile_zone_min_above_max_rejected() {
+        let meta = SegmentMeta {
+            value_count: 10,
+            payload_len: 80,
+            uncompressed_bytes: 80,
+            min: 5,
+            max: 4,
+            crc: 0,
+            blocks: vec![3],
+        };
+        let mut bytes = Vec::new();
+        meta.encode(&mut bytes);
+        let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
+        assert!(format!("{err}").contains("zone min above max"));
+    }
+
+    #[test]
+    fn corrupt_zone_is_rejected_by_full_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let values: Vec<u64> = (0..5000u64).map(|i| i * 3).collect();
+        let meta = write_segment(&mut db, &values).unwrap();
+        assert_eq!((meta.min, meta.max), (0, 4999 * 3));
+        // The crc covers the payload, not the meta, so a zone that
+        // drifted from the values must fall to the cross check alone.
+        let mut patched = meta.clone();
+        patched.max -= 1;
+        let mut out = Vec::new();
+        let err = read_segment(&mut db, &patched, &mut out).unwrap_err();
+        assert!(format!("{err}").contains("zone"));
+    }
+
+    #[test]
+    fn zone_prunes_probes_without_reading_the_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let values: Vec<u64> = (0..5000u64).map(|i| 100 + i * 2).collect();
+        let meta = write_segment(&mut db, &values).unwrap();
+        // Destroy the payload wholesale. A probe outside the zone must
+        // still answer absent because it never reads a byte of it, and
+        // one inside the zone must fail on the wreckage, proving the
+        // difference is the early out and not luck.
+        for &ptr in &meta.blocks {
+            db.write_block(ptr, &vec![0u8; BLOCK_SIZE as usize])
+                .unwrap();
+        }
+        let end = values.len() as u64;
+        assert!(!probe(&mut db, &meta, 0, end, 99).unwrap());
+        assert!(!probe(&mut db, &meta, 0, end, 100 + 4999 * 2 + 1).unwrap());
+        assert!(!probe(&mut db, &meta, 0, end, u64::MAX).unwrap());
+        assert!(probe(&mut db, &meta, 0, end, 5000).is_err());
     }
 
     #[test]

@@ -31,10 +31,11 @@ use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::meta;
 use crate::segment::{SegmentMeta, probe, read_range, read_segment, write_segment};
 
-// Version 4 added the per-chunk fence array to segment payloads, which
-// shifts the body offset, so version 3 files must fail as unsupported
-// here rather than misread downstream.
-const DIRECTORY_VERSION: u16 = 4;
+// Version 5 widened SegmentMeta with the zone map min and max, which
+// shifts every field behind them, so version 4 files must fail as
+// unsupported here rather than misread downstream. Version 4 had added
+// the per-chunk fence array to segment payloads.
+const DIRECTORY_VERSION: u16 = 5;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -113,10 +114,10 @@ impl Directory {
         let node_count = u64::from_le_bytes(head[2..10].try_into().unwrap());
         let edge_count = u64::from_le_bytes(head[10..18].try_into().unwrap());
         let group_count = u32::from_le_bytes(head[18..22].try_into().unwrap()) as usize;
-        // A group entry is at least 132 bytes (row count plus four empty
+        // A group entry is at least 196 bytes (row count plus four empty
         // segment metas), so a count the payload cannot hold is rejected
         // before it sizes an allocation.
-        if group_count > bytes.len().saturating_sub(22) / 132 {
+        if group_count > bytes.len().saturating_sub(22) / 196 {
             return Err(corrupt("truncated group entry"));
         }
         let mut pos = 22;

@@ -13,5 +13,9 @@ authors.workspace = true
 zu-common.workspace = true
 zu-storage.workspace = true
 
+[[bench]]
+name = "kernels"
+harness = false
+
 [lints]
 workspace = true

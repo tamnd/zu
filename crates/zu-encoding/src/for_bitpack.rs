@@ -1,9 +1,10 @@
 //! Frame-of-reference plus bit packing (encoding id 4).
 //!
 //! Layout: `count: u32 LE`, then per 1024-value chunk a header of
-//! `min: u64 LE, width: u8` followed by `bitpack::packed_bytes(width)` bytes.
-//! Chunks are independently decodable, which is what makes chunk-granular
-//! point reads cheap.
+//! `min: u64 LE, width: u8` followed by the packed body, which is
+//! `bitpack::packed_bytes(width, chunk_len)` bytes. Full chunks are
+//! independently decodable at fixed offsets, which is what makes
+//! chunk-granular point reads cheap; only the final chunk can be short.
 
 use zu_common::{Result, ZuError};
 
@@ -24,7 +25,6 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
         for (slot, &v) in scratch.iter_mut().zip(chunk) {
             *slot = v - min;
         }
-        scratch[chunk.len()..].fill(0);
         bitpack::pack(&scratch[..chunk.len()], width, out);
     }
     out.len() - start
@@ -61,13 +61,13 @@ pub(crate) fn decode_chunks(
             return Err(corrupt("width > 64"));
         }
         pos += 9;
-        let plen = bitpack::packed_bytes(width);
+        let take = remaining.min(CHUNK);
+        let plen = bitpack::packed_bytes(width, take);
         let packed = bytes
             .get(pos..pos + plen)
             .ok_or_else(|| corrupt("truncated chunk body"))?;
         bitpack::unpack(packed, width, &mut scratch);
         pos += plen;
-        let take = remaining.min(CHUNK);
         sink(min, &scratch, take);
         remaining -= take;
     }

@@ -29,21 +29,27 @@ pub fn encode_auto(values: &[u64], out: &mut Vec<u8>) -> EncodingId {
     id
 }
 
-/// Decodes a segment produced by `encode_auto`, appending to `out`.
-pub fn decode_any(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
+/// Decodes a segment produced by `encode_auto`, appending at most
+/// `max_values` values to `out`. Every encoding here amplifies, that
+/// is the point of compression, so decoded counts are claims until the
+/// caller vouches for them: a container claiming more than the ceiling
+/// is rejected before anything is allocated for it. Callers always
+/// know the bound, the row count their segment meta or chunk index
+/// promised.
+pub fn decode_any(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "segment",
         detail: detail.to_string(),
     };
     let (&id, payload) = bytes.split_first().ok_or_else(|| corrupt("empty"))?;
     match EncodingId::try_from(id)? {
-        EncodingId::Plain => decode_plain(payload, out),
-        EncodingId::Constant => decode_constant(payload, out),
-        EncodingId::Rle => rle::decode(payload, out),
-        EncodingId::Dict => dict::decode(payload, out),
-        EncodingId::ForBitPack => for_bitpack::decode(payload, out),
-        EncodingId::DeltaBitPack => delta::decode(payload, out),
-        EncodingId::DeltaPatch => delta_patch::decode(payload, out),
+        EncodingId::Plain => decode_plain(payload, max_values, out),
+        EncodingId::Constant => decode_constant(payload, max_values, out),
+        EncodingId::Rle => rle::decode(payload, max_values, out),
+        EncodingId::Dict => dict::decode(payload, max_values, out),
+        EncodingId::ForBitPack => for_bitpack::decode(payload, max_values, out),
+        EncodingId::DeltaBitPack => delta::decode(payload, max_values, out),
+        EncodingId::DeltaPatch => delta_patch::decode(payload, max_values, out),
         other => Err(ZuError::Unsupported {
             what: "segment encoding",
             id: other as u8 as u32,
@@ -142,7 +148,7 @@ fn encode_plain(values: &[u64], out: &mut Vec<u8>) {
     }
 }
 
-fn decode_plain(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
+fn decode_plain(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "plain",
         detail: detail.to_string(),
@@ -154,6 +160,9 @@ fn decode_plain(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
             .try_into()
             .unwrap(),
     ) as usize;
+    if count > max_values {
+        return Err(corrupt("count above the caller ceiling"));
+    }
     let body = bytes
         .get(4..4 + count * 8)
         .ok_or_else(|| corrupt("truncated body"))?;
@@ -170,13 +179,18 @@ fn encode_constant(values: &[u64], out: &mut Vec<u8>) {
     out.extend_from_slice(&values[0].to_le_bytes());
 }
 
-fn decode_constant(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
+fn decode_constant(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "constant",
         detail: detail.to_string(),
     };
     let body = bytes.get(..12).ok_or_else(|| corrupt("truncated"))?;
     let count = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+    // Twelve bytes claim any count at all; this wall is the whole
+    // defense, and the first thing the fuzzer found without it.
+    if count > max_values {
+        return Err(corrupt("count above the caller ceiling"));
+    }
     let value = u64::from_le_bytes(body[4..12].try_into().unwrap());
     out.extend(std::iter::repeat_n(value, count));
     Ok(())
@@ -190,7 +204,7 @@ mod tests {
         let mut buf = Vec::new();
         let id = encode_auto(values, &mut buf);
         let mut out = Vec::new();
-        decode_any(&buf, &mut out).unwrap();
+        decode_any(&buf, values.len(), &mut out).unwrap();
         assert_eq!(values, out.as_slice());
         id
     }
@@ -283,10 +297,22 @@ mod tests {
     #[test]
     fn unknown_id_rejected() {
         let mut out = Vec::new();
-        assert!(decode_any(&[200, 0, 0], &mut out).is_err());
-        assert!(decode_any(&[], &mut out).is_err());
+        assert!(decode_any(&[200, 0, 0], 16, &mut out).is_err());
+        assert!(decode_any(&[], 16, &mut out).is_err());
         // FSST is a known id without a shipped decoder yet; it must error
         // by name, not panic.
-        assert!(decode_any(&[8, 1, 2], &mut out).is_err());
+        assert!(decode_any(&[8, 1, 2], 16, &mut out).is_err());
+    }
+
+    #[test]
+    fn fuzzer_found_constant_flood_rejected() {
+        // The exact payload libFuzzer produced in 21 execs against the
+        // unguarded decoder: Constant claiming 0xFFF607D0 values, which
+        // was a 34 GB allocation from a 14 byte input. The ceiling turns
+        // it into a Corrupt error.
+        let bytes = [1, 208, 7, 246, 255, 88, 42, 0, 0, 0, 0, 16, 0, 0];
+        let mut out = Vec::new();
+        assert!(decode_any(&bytes, 2048, &mut out).is_err());
+        assert!(out.is_empty());
     }
 }

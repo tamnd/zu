@@ -48,3 +48,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Seed corpora
+        run: cargo run --manifest-path fuzz/Cargo.toml --bin seeds
+      - name: Fuzz decoders
+        run: |
+          for target in zu1_decode decode_segment decode_for_bitpack decode_delta decode_delta_patch; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=3072
+          done
+      - name: Fuzz file verify
+        run: cargo +nightly fuzz run zu1_file -- -max_total_time=60 -rss_limit_mb=3072 -max_len=2200000
+      - name: Keep artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

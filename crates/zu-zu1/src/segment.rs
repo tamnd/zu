@@ -75,6 +75,11 @@ impl SegmentMeta {
         if payload_len.div_ceil(u64::from(BLOCK_SIZE)) != block_count as u64 {
             return Err(corrupt("payload length disagrees with block count"));
         }
+        // The claimed count must fit in the bytes actually present before
+        // it sizes an allocation.
+        if block_count > bytes.len().saturating_sub(pos + 32) / 8 {
+            return Err(corrupt("truncated block list"));
+        }
         let mut blocks = Vec::with_capacity(block_count);
         let mut p = pos + 32;
         for _ in 0..block_count {
@@ -152,7 +157,9 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
         what: "segment",
         detail: detail.to_string(),
     };
-    let mut payload = Vec::with_capacity(meta.payload_len as usize);
+    // The claimed length only seeds the reservation; growth past the cap
+    // is bounded by the block reads, which fail on the first bad pointer.
+    let mut payload = Vec::with_capacity((meta.payload_len as usize).min(1 << 22));
     for &ptr in &meta.blocks {
         let block = db.read_block(ptr)?;
         let want = (meta.payload_len as usize - payload.len()).min(block.len());
@@ -181,7 +188,7 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
             return Err(corrupt("chunk index not monotone"));
         }
         let before = out.len();
-        enc::decode_any(&body[prev..end], out)?;
+        enc::decode_any(&body[prev..end], meta.chunk_rows(i), out)?;
         if out.len() - before != meta.chunk_rows(i) {
             return Err(corrupt("chunk count disagrees with meta"));
         }
@@ -244,6 +251,7 @@ pub fn read_range(
         scratch.clear();
         enc::decode_any(
             &bytes[prev - body_start..chunk_end - body_start],
+            meta.chunk_rows(i),
             &mut scratch,
         )?;
         if scratch.len() != meta.chunk_rows(i) {
@@ -402,6 +410,22 @@ mod tests {
         block[4 + 2 * 4..4 + 3 * 4].copy_from_slice(&0u32.to_le_bytes());
         db.write_block(meta.blocks[0], &block).unwrap();
         assert!(read_range(&mut db, &meta, 2048, 2050, &mut out).is_err());
+    }
+
+    #[test]
+    fn hostile_meta_block_count_rejected() {
+        // A 32 byte header whose payload length and block count agree
+        // with each other but not with the bytes present: the claimed
+        // list must fail the size check before it sizes an allocation.
+        let block_count = 0x1000_0000u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&(u64::from(block_count) * u64::from(BLOCK_SIZE)).to_le_bytes());
+        bytes.extend_from_slice(&800u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&block_count.to_le_bytes());
+        let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
+        assert!(format!("{err}").contains("truncated block list"));
     }
 
     #[test]

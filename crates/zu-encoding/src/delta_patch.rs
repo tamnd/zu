@@ -29,14 +29,15 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
     out.len() - start
 }
 
-/// Decodes an encoded buffer, appending the values to `out`.
-pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
+/// Decodes an encoded buffer, appending at most `max_values` values to
+/// `out`; a container claiming more is rejected before allocation.
+pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let base_bytes = bytes.get(..8).ok_or_else(|| ZuError::Corrupt {
         what: "delta_patch",
         detail: "truncated base".to_string(),
     })?;
     let mut prev = u64::from_le_bytes(base_bytes.try_into().unwrap());
-    patch::decode_chunks(&bytes[8..], |deltas, take| {
+    patch::decode_chunks(&bytes[8..], max_values, |deltas, take| {
         out.extend(deltas[..take].iter().map(|&d| {
             prev = prev.wrapping_add(unzigzag(d) as u64);
             prev
@@ -53,7 +54,7 @@ mod tests {
         let mut buf = Vec::new();
         let len = encode(values, &mut buf);
         let mut out = Vec::new();
-        decode(&buf, &mut out).unwrap();
+        decode(&buf, values.len(), &mut out).unwrap();
         assert_eq!(values, out.as_slice());
         len
     }
@@ -104,6 +105,6 @@ mod tests {
     #[test]
     fn truncated_base_rejected() {
         let mut out = Vec::new();
-        assert!(decode(&[1, 2, 3], &mut out).is_err());
+        assert!(decode(&[1, 2, 3], 16, &mut out).is_err());
     }
 }

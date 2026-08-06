@@ -73,19 +73,30 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
 }
 
 /// Parses the container and hands each patched chunk to `sink` as
-/// `(values, take)`. Shared with the delta-patch decoder.
-pub(crate) fn decode_chunks(bytes: &[u8], mut sink: impl FnMut(&[u64], usize)) -> Result<usize> {
-    let corrupt = |detail: &str| ZuError::Corrupt {
+/// `(values, take)`. Shared with the delta-patch decoder. `max_values`
+/// is the caller's ceiling; a claimed count above it is rejected before
+/// any work scales with it.
+pub(crate) fn decode_chunks(
+    bytes: &[u8],
+    max_values: usize,
+    mut sink: impl FnMut(&[u64], usize),
+) -> Result<usize> {
+    let corrupt = |detail: String| ZuError::Corrupt {
         what: "patch",
-        detail: detail.to_string(),
+        detail,
     };
     let count = u32::from_le_bytes(
         bytes
             .get(..4)
-            .ok_or_else(|| corrupt("truncated count"))?
+            .ok_or_else(|| corrupt("truncated count".into()))?
             .try_into()
             .unwrap(),
     ) as usize;
+    if count > max_values {
+        return Err(corrupt(format!(
+            "claims {count} values, caller allows {max_values}"
+        )));
+    }
     let mut pos = 4usize;
     let mut low = [0u64; CHUNK];
     let mut excs = [0u64; CHUNK];
@@ -93,10 +104,10 @@ pub(crate) fn decode_chunks(bytes: &[u8], mut sink: impl FnMut(&[u64], usize)) -
     while remaining > 0 {
         let header = bytes
             .get(pos..pos + 2)
-            .ok_or_else(|| corrupt("truncated chunk header"))?;
+            .ok_or_else(|| corrupt("truncated chunk header".into()))?;
         let (width, exc_width) = (u32::from(header[0]), u32::from(header[1]));
         if width > 64 || exc_width > 64 {
-            return Err(corrupt("width > 64"));
+            return Err(corrupt("width > 64".into()));
         }
         pos += 2;
         let take = remaining.min(CHUNK);
@@ -104,21 +115,21 @@ pub(crate) fn decode_chunks(bytes: &[u8], mut sink: impl FnMut(&[u64], usize)) -
         let plen = bitpack::packed_bytes(width, take);
         let packed = bytes
             .get(pos..pos + plen)
-            .ok_or_else(|| corrupt("truncated chunk body"))?;
+            .ok_or_else(|| corrupt("truncated chunk body".into()))?;
         bitpack::unpack(packed, width, &mut low);
         pos += plen;
 
         let blen = bitpack::packed_bytes(1, take);
         let bitmap = bytes
             .get(pos..pos + blen)
-            .ok_or_else(|| corrupt("truncated bitmap"))?;
+            .ok_or_else(|| corrupt("truncated bitmap".into()))?;
         pos += blen;
         let exc_count: usize = bitmap.iter().map(|&b| b.count_ones() as usize).sum();
 
         let elen = bitpack::packed_bytes(exc_width, exc_count);
         let packed_excs = bytes
             .get(pos..pos + elen)
-            .ok_or_else(|| corrupt("truncated exceptions"))?;
+            .ok_or_else(|| corrupt("truncated exceptions".into()))?;
         bitpack::unpack(packed_excs, exc_width, &mut excs);
         pos += elen;
 
@@ -144,9 +155,10 @@ pub(crate) fn decode_chunks(bytes: &[u8], mut sink: impl FnMut(&[u64], usize)) -
     Ok(count)
 }
 
-/// Decodes an encoded buffer, appending the values to `out`.
-pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
-    decode_chunks(bytes, |values, take| {
+/// Decodes an encoded buffer, appending at most `max_values` values to
+/// `out`; a container claiming more is rejected before allocation.
+pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
+    decode_chunks(bytes, max_values, |values, take| {
         out.extend_from_slice(&values[..take]);
     })?;
     Ok(())
@@ -161,7 +173,7 @@ mod tests {
         let len = encode(values, &mut buf);
         assert_eq!(len, buf.len());
         let mut out = Vec::new();
-        decode(&buf, &mut out).unwrap();
+        decode(&buf, values.len(), &mut out).unwrap();
         assert_eq!(values, out.as_slice());
         len
     }
@@ -200,10 +212,10 @@ mod tests {
     #[test]
     fn hostile_input_rejected() {
         let mut out = Vec::new();
-        assert!(decode(&[1, 0], &mut out).is_err());
+        assert!(decode(&[1, 0], 16, &mut out).is_err());
         // Count says one value, then a chunk header claiming width 65.
-        assert!(decode(&[1, 0, 0, 0, 65, 0], &mut out).is_err());
+        assert!(decode(&[1, 0, 0, 0, 65, 0], 16, &mut out).is_err());
         // Valid header, truncated body.
-        assert!(decode(&[100, 0, 0, 0, 8, 8, 1], &mut out).is_err());
+        assert!(decode(&[100, 0, 0, 0, 8, 8, 1], 100, &mut out).is_err());
     }
 }

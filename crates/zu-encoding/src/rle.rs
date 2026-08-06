@@ -41,31 +41,48 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
     out.len() - start
 }
 
-/// Decodes an encoded buffer, appending the values to `out`.
-pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
-    let corrupt = |detail: &str| ZuError::Corrupt {
+/// Decodes an encoded buffer, appending at most `max_values` values to
+/// `out`. The ceiling bounds the run streams (every run carries at
+/// least one value) and the materialized total, and the total is summed
+/// checked so hostile run lengths cannot overflow it past the wall.
+pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
+    let corrupt = |detail: String| ZuError::Corrupt {
         what: "rle",
-        detail: detail.to_string(),
+        detail,
     };
-    let header = bytes.get(..8).ok_or_else(|| corrupt("truncated header"))?;
+    let header = bytes
+        .get(..8)
+        .ok_or_else(|| corrupt("truncated header".into()))?;
     let run_count = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
     let values_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    if run_count > max_values {
+        return Err(corrupt(format!(
+            "claims {run_count} runs, caller allows {max_values} values"
+        )));
+    }
     let values_bytes = bytes
         .get(8..8 + values_len)
-        .ok_or_else(|| corrupt("truncated values"))?;
+        .ok_or_else(|| corrupt("truncated values".into()))?;
     let lengths_bytes = bytes
         .get(8 + values_len..)
-        .ok_or_else(|| corrupt("truncated lengths"))?;
+        .ok_or_else(|| corrupt("truncated lengths".into()))?;
     let mut run_values = Vec::new();
     let mut run_lengths = Vec::new();
-    for_bitpack::decode(values_bytes, &mut run_values)?;
-    for_bitpack::decode(lengths_bytes, &mut run_lengths)?;
+    for_bitpack::decode(values_bytes, max_values, &mut run_values)?;
+    for_bitpack::decode(lengths_bytes, max_values, &mut run_lengths)?;
     if run_values.len() != run_count || run_lengths.len() != run_count {
-        return Err(corrupt("stream length mismatch"));
+        return Err(corrupt("stream length mismatch".into()));
     }
-    let total: u64 = run_lengths.iter().sum();
-    if total > u32::MAX as u64 {
-        return Err(corrupt("total length overflow"));
+    let mut total = 0u64;
+    for &len in &run_lengths {
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| corrupt("total length overflow".into()))?;
+    }
+    if total > max_values as u64 {
+        return Err(corrupt(format!(
+            "claims {total} values, caller allows {max_values}"
+        )));
     }
     out.reserve(total as usize);
     for (&v, &len) in run_values.iter().zip(&run_lengths) {
@@ -94,7 +111,7 @@ mod tests {
             buf.len()
         );
         let mut out = Vec::new();
-        decode(&buf, &mut out).unwrap();
+        decode(&buf, values.len(), &mut out).unwrap();
         assert_eq!(values, out);
     }
 
@@ -104,7 +121,7 @@ mod tests {
         let mut buf = Vec::new();
         encode(&values, &mut buf);
         let mut out = Vec::new();
-        decode(&buf, &mut out).unwrap();
+        decode(&buf, values.len(), &mut out).unwrap();
         assert_eq!(values, out);
     }
 
@@ -113,8 +130,32 @@ mod tests {
         let mut buf = Vec::new();
         encode(&[], &mut buf);
         let mut out = Vec::new();
-        decode(&buf, &mut out).unwrap();
+        decode(&buf, 0, &mut out).unwrap();
         assert!(out.is_empty());
-        assert!(decode(&buf[..3], &mut out).is_err());
+        assert!(decode(&buf[..3], 16, &mut out).is_err());
+    }
+
+    #[test]
+    fn hostile_lengths_cannot_overflow_or_flood() {
+        // Two runs whose lengths sum past u64: the checked sum must
+        // reject them instead of wrapping into a small reservation.
+        let mut buf = 2u32.to_le_bytes().to_vec();
+        let mut values_buf = Vec::new();
+        for_bitpack::encode(&[1, 2], &mut values_buf);
+        buf.extend_from_slice(&(values_buf.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&values_buf);
+        for_bitpack::encode(&[u64::MAX, 2], &mut buf);
+        let mut out = Vec::new();
+        assert!(decode(&buf, 1 << 20, &mut out).is_err());
+
+        // A single run claiming a billion values dies on the ceiling,
+        // not in the allocator.
+        let mut buf = 1u32.to_le_bytes().to_vec();
+        let mut values_buf = Vec::new();
+        for_bitpack::encode(&[7], &mut values_buf);
+        buf.extend_from_slice(&(values_buf.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&values_buf);
+        for_bitpack::encode(&[1_000_000_000], &mut buf);
+        assert!(decode(&buf, 1 << 20, &mut out).is_err());
     }
 }

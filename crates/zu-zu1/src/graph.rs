@@ -20,7 +20,7 @@ use zu_common::{GROUP_ROWS, Result, ZuError};
 
 use crate::file::Zu1File;
 use crate::meta;
-use crate::segment::{SegmentMeta, read_segment, write_segment};
+use crate::segment::{SegmentMeta, read_range, read_segment, write_segment};
 
 const DIRECTORY_VERSION: u16 = 1;
 
@@ -233,6 +233,26 @@ impl GraphReader {
         let hi = offsets[row + 1] as usize;
         Ok(&nbrs[lo..hi])
     }
+
+    /// Point access: appends `node`'s sorted neighbor list to `out`
+    /// without decoding the group. Two offset values locate the list,
+    /// then only the chunks covering it are read, so a 1-hop read
+    /// touches at most `2 + ceil(degree / 1024) + 1` chunk decodes and
+    /// bytes on that order rather than the group's megabytes.
+    pub fn neighbors_into(&self, db: &mut Zu1File, node: u64, out: &mut Vec<u64>) -> Result<()> {
+        if node >= self.directory.node_count {
+            return Err(ZuError::InvalidArgument(format!(
+                "node {node} out of range 0..{}",
+                self.directory.node_count
+            )));
+        }
+        let g = (node / GROUP_ROWS as u64) as usize;
+        let row = node % GROUP_ROWS as u64;
+        let meta = &self.directory.groups[g];
+        let mut offs = Vec::with_capacity(2);
+        read_range(db, &meta.offsets, row, row + 2, &mut offs)?;
+        read_range(db, &meta.neighbors, offs[0], offs[1], out)
+    }
 }
 
 #[cfg(test)]
@@ -339,12 +359,48 @@ mod tests {
         }
         let mut db = Zu1File::open(&path).unwrap();
         let mut reader = GraphReader::load(&mut db).unwrap();
+        let mut point = Vec::new();
         for v in 0..u64::from(n) {
             assert_eq!(
                 reader.neighbors(&mut db, v).unwrap(),
                 reference[v as usize].as_slice(),
                 "node {v}"
             );
+            point.clear();
+            reader.neighbors_into(&mut db, v, &mut point).unwrap();
+            assert_eq!(point, reference[v as usize], "point read node {v}");
+        }
+        assert!(
+            reader
+                .neighbors_into(&mut db, u64::from(n), &mut point)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn point_reads_cross_chunk_and_group_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let rows = GROUP_ROWS;
+        let node_count = u64::from(rows) + 5;
+        // A hub whose list spans several 1024-value chunks, rows sitting
+        // exactly on chunk boundaries of the offsets segment, and a node
+        // in the tail group.
+        let mut edges: Vec<(u32, u32)> = (0..3000).map(|d| (7u32, d * 2)).collect();
+        edges.push((1023, 1));
+        edges.push((1024, 2));
+        edges.push((rows, 3));
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        for node in [7u64, 1023, 1024, u64::from(rows), 0, node_count - 1] {
+            let want = reader.neighbors(&mut db, node).unwrap().to_vec();
+            let mut got = Vec::new();
+            reader.neighbors_into(&mut db, node, &mut got).unwrap();
+            assert_eq!(got, want, "node {node}");
         }
     }
 }

@@ -3,17 +3,17 @@
 //! Uses real data when available: the full soc-LiveJournal1 edge list
 //! (set ZU_DATA to the directory holding soc-LiveJournal1.txt), otherwise
 //! a synthetic power-law-ish graph. Measures bulk_load throughput in
-//! M edges/s (parse excluded, sort included: that is the COPY hot path)
-//! and the on-disk adjacency density in bits/edge. With ZU_GATE=1 the
-//! process exits nonzero when copy_medges_s drops below its floor or
-//! bits_per_edge rises above its ceiling in bench/budgets.toml.
+//! M edges/s (parse excluded, sort included: that is the COPY hot path),
+//! the on-disk adjacency density in bits/edge, and random 1-hop point
+//! reads in K lookups/s. With ZU_GATE=1 the process exits nonzero when a
+//! floor or ceiling in bench/budgets.toml is missed.
 //!
 //! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu-zu1
 
 use std::time::Instant;
 
 use zu_zu1::file::Zu1File;
-use zu_zu1::graph::{bulk_load, read_edge_list};
+use zu_zu1::graph::{GraphReader, bulk_load, read_edge_list};
 use zu_zu1::reorder;
 
 fn load_real(dir: &str) -> Option<Vec<(u32, u32)>> {
@@ -55,8 +55,63 @@ fn budget(key: &str) -> Option<f64> {
     None
 }
 
-/// Sorts, dedups, bulk loads, and verifies; returns (M edges/s, bits/edge).
-fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f64) {
+/// Random 1-hop point reads against a loaded file: measures K lookups/s
+/// with p50/p99 latency, and crosschecks a sample against the full-decode
+/// path so the number cannot come from a broken reader.
+fn run_point_lookups(label: &str, path: &std::path::Path, node_count: u64) -> f64 {
+    let mut db = Zu1File::open(path).expect("open");
+    let reader = GraphReader::load(&mut db).expect("load directory");
+    let lookups = 200_000usize;
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % node_count
+    };
+    let mut nbrs = Vec::new();
+    let mut lat = Vec::with_capacity(lookups);
+    let mut edges_read = 0u64;
+    let started = Instant::now();
+    for _ in 0..lookups {
+        let node = next();
+        nbrs.clear();
+        let t = Instant::now();
+        reader
+            .neighbors_into(&mut db, node, &mut nbrs)
+            .expect("point read");
+        lat.push(t.elapsed());
+        edges_read += nbrs.len() as u64;
+    }
+    let secs = started.elapsed().as_secs_f64();
+    lat.sort_unstable();
+    let klookups_s = lookups as f64 / secs / 1e3;
+    println!(
+        "{label} point: {klookups_s:.0} K lookups/s, p50 {:.1} us, p99 {:.1} us, {edges_read} edges read",
+        lat[lookups / 2].as_secs_f64() * 1e6,
+        lat[lookups * 99 / 100].as_secs_f64() * 1e6
+    );
+    let mut sample: Vec<u64> = (0..100).map(|_| next()).collect();
+    sample.sort_unstable();
+    let mut full = GraphReader::load(&mut db).expect("load directory");
+    for &node in &sample {
+        nbrs.clear();
+        reader
+            .neighbors_into(&mut db, node, &mut nbrs)
+            .expect("point read");
+        assert_eq!(
+            nbrs.as_slice(),
+            full.neighbors(&mut db, node).expect("full read"),
+            "point read disagrees with full decode at node {node}"
+        );
+    }
+    println!("{label} point crosscheck: 100 nodes match the full decode");
+    klookups_s
+}
+
+/// Sorts, dedups, bulk loads, verifies, and runs the point-read phase;
+/// returns (M edges/s, bits/edge, K lookups/s).
+fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f64, f64) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("ingest.zu1");
     let start = Instant::now();
@@ -80,7 +135,8 @@ fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f
     );
     let verified = zu_zu1::verify(&path).expect("verify");
     println!("{label} verify: ok, {verified} payload bytes checked");
-    (medges_s, bits_per_edge)
+    let klookups_s = run_point_lookups(label, &path, directory.node_count);
+    (medges_s, bits_per_edge, klookups_s)
 }
 
 fn main() {
@@ -95,7 +151,7 @@ fn main() {
         .max()
         .unwrap_or(0);
 
-    let (medges_s, bits_raw) = run_load("copy", edges.clone(), node_count);
+    let (medges_s, bits_raw, klookups_s) = run_load("copy", edges.clone(), node_count);
 
     // B8 is defined on the reordered graph (docs/04 §5): BFS relabeling
     // from max-degree roots, timed separately since REORDER is opt-in.
@@ -109,7 +165,7 @@ fn main() {
             "reorder bfs: mapping built in {:.2}s",
             start.elapsed().as_secs_f64()
         );
-        let (_, bits) = run_load("copy+bfs", relabeled, node_count);
+        let (_, bits, _) = run_load("copy+bfs", relabeled, node_count);
         bits_bfs = Some(bits);
     }
 
@@ -134,6 +190,16 @@ fn main() {
         && bits > ceiling
     {
         println!("GATE FAIL density bfs: {bits:.2} bits/edge > ceiling {ceiling}");
+        failed = true;
+    }
+    // The point-read floor is defined against real LiveJournal degrees;
+    // synthetic degree distributions would move the number for reasons
+    // that have nothing to do with the reader.
+    if is_real
+        && let Some(floor) = budget("point_klookups_s")
+        && klookups_s < floor
+    {
+        println!("GATE FAIL point: {klookups_s:.0} K lookups/s < floor {floor}");
         failed = true;
     }
     if gate && failed {

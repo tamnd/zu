@@ -28,6 +28,10 @@ fn main() -> ExitCode {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
         },
+        Some("neighbors") => match (args.get(1), args.get(2).and_then(|s| s.parse::<u64>().ok())) {
+            (Some(path), Some(node)) => neighbors(std::path::Path::new(path), node),
+            _ => usage_error("zu neighbors <file.zu1> <node>"),
+        },
         Some("copy") => {
             let mut reorder = zu::zu1::reorder::Reorder::None;
             let mut rest = &args[1..];
@@ -170,6 +174,28 @@ fn copy(
     }
 }
 
+/// Prints one node's sorted neighbor list via the point-read path, which
+/// decodes only the chunks holding the node's offsets and its list.
+fn neighbors(path: &std::path::Path, node: u64) -> ExitCode {
+    let result = (|| {
+        let mut db = zu::zu1::file::Zu1File::open(path)?;
+        let reader = zu::zu1::graph::GraphReader::load(&mut db)?;
+        let mut nbrs = Vec::new();
+        reader.neighbors_into(&mut db, node, &mut nbrs)?;
+        Ok(nbrs)
+    })();
+    match result {
+        Ok(nbrs) => {
+            println!("node {node}: degree {}", nbrs.len());
+            for n in nbrs {
+                println!("{n}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => command_error("neighbors", &e),
+    }
+}
+
 fn verify(path: &std::path::Path) -> ExitCode {
     match zu::zu1::verify(path) {
         Ok(bytes) => {
@@ -195,6 +221,6 @@ fn print_usage() {
     println!();
     println!("usage: zu <command> [args]");
     println!();
-    println!("commands: shell, query, copy, convert, verify, stat, bench");
+    println!("commands: shell, query, copy, convert, verify, stat, neighbors, bench");
     println!("(implemented milestone by milestone, see the repo issues)");
 }

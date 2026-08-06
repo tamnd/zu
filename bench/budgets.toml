@@ -21,3 +21,9 @@ dict = 1.0
 copy_medges_s = 1.0
 bits_per_edge = 23.0
 bits_per_edge_bfs = 22.5
+
+# Random 1-hop point reads on the loaded LiveJournal file, single core,
+# K lookups/s. Each lookup decodes only the chunks holding the node's two
+# offsets and its neighbor list. Floor set for the slowest gate machine;
+# raise floors, never lower them.
+point_klookups_s = 50.0

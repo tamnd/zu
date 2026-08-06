@@ -275,6 +275,27 @@ impl Zu1File {
         Ok(buf)
     }
 
+    /// Reads `len` bytes at `offset` inside the block at `ptr`. The point
+    /// access path uses this so a random read touches bytes on the order
+    /// of one encoded chunk instead of one 256 KiB block.
+    pub fn read_block_slice(
+        &mut self,
+        ptr: BlockPtr,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        self.check_ptr(ptr)?;
+        assert!(
+            offset + len <= BLOCK_SIZE as usize,
+            "slice crosses the block edge"
+        );
+        let mut buf = vec![0u8; len];
+        self.file
+            .seek(SeekFrom::Start(ptr * u64::from(BLOCK_SIZE) + offset as u64))?;
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
     /// Publishes the staged state: fsync data, bump the epoch, write the
     /// header into the inactive slot, fsync again. A crash between the two
     /// syncs leaves the previous epoch intact.

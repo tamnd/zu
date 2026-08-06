@@ -160,7 +160,7 @@ impl DatabaseHeader {
     }
 }
 
-/// An open zu1 file: block I/O plus the header flip.
+/// An open zu1 file: block I/O, the free list, and the header flip.
 #[derive(Debug)]
 pub struct Zu1File {
     file: File,
@@ -168,6 +168,15 @@ pub struct Zu1File {
     db: DatabaseHeader,
     /// Slot the current header was read from; the flip writes the other one.
     active_slot: usize,
+    /// Committed-free blocks, reusable immediately: the committed epoch
+    /// lists them as free, so a crash after overwriting them loses nothing.
+    free: Vec<BlockPtr>,
+    /// Freed this transaction. Still referenced by the committed epoch, so
+    /// not reusable until the next checkpoint supersedes it.
+    pending_free: Vec<BlockPtr>,
+    /// Blocks holding the committed free-list chain itself; a checkpoint
+    /// writes a fresh chain and recycles these.
+    free_chain: Vec<BlockPtr>,
 }
 
 impl Zu1File {
@@ -194,6 +203,9 @@ impl Zu1File {
             file_header,
             db,
             active_slot: 0,
+            free: Vec::new(),
+            pending_free: Vec::new(),
+            free_chain: Vec::new(),
         })
     }
 
@@ -223,12 +235,22 @@ impl Zu1File {
                 });
             }
         };
-        Ok(Self {
+        let mut this = Self {
             file,
             file_header,
             db,
             active_slot,
-        })
+            free: Vec::new(),
+            pending_free: Vec::new(),
+            free_chain: Vec::new(),
+        };
+        let root = this.db.free_list_root;
+        if root != NULL_BLOCK {
+            let bytes = crate::meta::read_chain(&mut this, root)?;
+            this.free = decode_free_list(&bytes, this.db.block_count)?;
+            this.free_chain = crate::meta::chain_blocks(&mut this, root)?;
+        }
+        Ok(this)
     }
 
     /// Write-once file identity.
@@ -248,11 +270,26 @@ impl Zu1File {
         &mut self.db
     }
 
-    /// Extends the high-water mark by one block and returns its pointer.
-    /// The block becomes durable state only via the next checkpoint.
+    /// Returns a block to write into: a committed-free block when one
+    /// exists, otherwise one past the high-water mark. Either way the
+    /// block becomes durable state only via the next checkpoint.
     pub fn allocate_block(&mut self) -> BlockPtr {
+        if let Some(ptr) = self.free.pop() {
+            return ptr;
+        }
         self.db.block_count += 1;
         self.db.block_count
+    }
+
+    /// Marks `ptr` free. The committed epoch still references it, so it
+    /// becomes allocatable only after the next checkpoint; until then its
+    /// contents must survive a crash. Frees staged on a handle that closes
+    /// without a checkpoint are dropped, which leaks the blocks until
+    /// VACUUM rewrites the file, never corrupts it.
+    pub fn free_block(&mut self, ptr: BlockPtr) -> Result<()> {
+        self.check_ptr(ptr)?;
+        self.pending_free.push(ptr);
+        Ok(())
     }
 
     /// Writes one full block at `ptr`.
@@ -296,10 +333,46 @@ impl Zu1File {
         Ok(buf)
     }
 
-    /// Publishes the staged state: fsync data, bump the epoch, write the
-    /// header into the inactive slot, fsync again. A crash between the two
-    /// syncs leaves the previous epoch intact.
+    /// Publishes the staged state: persist the free list, fsync data, bump
+    /// the epoch, write the header into the inactive slot, fsync again. A
+    /// crash between the two syncs leaves the previous epoch intact.
     pub fn checkpoint(&mut self) -> Result<()> {
+        // Everything already free, everything freed this transaction, and
+        // the old free-list chain itself are all unreferenced once this
+        // checkpoint publishes, so they form the new list. Chain storage
+        // is reserved from the committed-free prefix when it can hold the
+        // whole chain: those blocks are safe to overwrite before the flip
+        // (pending and old-chain blocks are not, the committed epoch still
+        // reads them), and reusing them keeps repeated checkpoints from
+        // growing the file. A reserved block cannot also appear in the
+        // list, so reserved blocks are drained out before serializing.
+        let committed = std::mem::take(&mut self.free);
+        let safe = committed.len();
+        let mut all = committed;
+        all.append(&mut self.pending_free);
+        all.append(&mut self.free_chain);
+        self.db.free_list_root = if all.is_empty() {
+            NULL_BLOCK
+        } else {
+            let mut c = 0usize;
+            while (all.len() - c) * 8 > c * crate::meta::CHAIN_CAPACITY {
+                c += 1;
+            }
+            if c <= safe && all.len() > c {
+                self.free = all.drain(..c).collect();
+            }
+            let mut bytes = Vec::with_capacity(all.len() * 8);
+            for ptr in &all {
+                bytes.extend_from_slice(&ptr.to_le_bytes());
+            }
+            let root = crate::meta::write_chain(self, &bytes)?;
+            // At an exact chain-capacity boundary one reserved block goes
+            // unused. It stays allocatable and the next checkpoint lists
+            // it; only a process that never checkpoints again leaks it,
+            // and VACUUM reclaims that.
+            all.append(&mut self.free);
+            root
+        };
         self.file.sync_all()?;
         self.db.epoch += 1;
         let slot = 1 - self.active_slot;
@@ -308,6 +381,11 @@ impl Zu1File {
         self.file.write_all(&self.db.encode())?;
         self.file.sync_all()?;
         self.active_slot = slot;
+        let root = self.db.free_list_root;
+        if root != NULL_BLOCK {
+            self.free_chain = crate::meta::chain_blocks(self, root)?;
+        }
+        self.free = all;
         Ok(())
     }
 
@@ -320,6 +398,40 @@ impl Zu1File {
         }
         Ok(())
     }
+}
+
+/// Decodes a free-list chain payload: concatenated little-endian u64
+/// block pointers, each nonnull, in range, and unique. `zu verify` uses
+/// this too, so a corrupt list is an open error, not a later overwrite of
+/// live data.
+pub fn decode_free_list(bytes: &[u8], block_count: u64) -> Result<Vec<BlockPtr>> {
+    let corrupt = |detail: String| ZuError::Corrupt {
+        what: "free list",
+        detail,
+    };
+    if !bytes.len().is_multiple_of(8) {
+        return Err(corrupt(format!(
+            "payload of {} bytes is ragged",
+            bytes.len()
+        )));
+    }
+    let mut ptrs = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        let ptr = u64::from_le_bytes(chunk.try_into().unwrap());
+        if ptr == NULL_BLOCK || ptr > block_count {
+            return Err(corrupt(format!(
+                "block {ptr} out of range 1..={block_count}"
+            )));
+        }
+        ptrs.push(ptr);
+    }
+    let mut sorted = ptrs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != ptrs.len() {
+        return Err(corrupt("duplicate block".to_string()));
+    }
+    Ok(ptrs)
 }
 
 /// Random database identity. Not cryptographic: mixed from the clock and
@@ -472,6 +584,107 @@ mod tests {
         assert_eq!(db.read_block(ptr).unwrap(), data);
         assert!(db.read_block(2).is_err());
         assert!(db.read_block(NULL_BLOCK).is_err());
+    }
+
+    #[test]
+    fn freed_blocks_recycle_only_after_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&temp_path(&dir)).unwrap();
+        let a = db.allocate_block();
+        let b = db.allocate_block();
+        db.write_block(a, &vec![1; BLOCK_SIZE as usize]).unwrap();
+        db.write_block(b, &vec![2; BLOCK_SIZE as usize]).unwrap();
+        db.free_block(a).unwrap();
+        // Same transaction: the committed epoch could still need block a,
+        // so allocation must extend the file instead.
+        assert_eq!(db.allocate_block(), 3);
+        db.checkpoint().unwrap();
+        // Published: a is genuinely free now.
+        assert_eq!(db.allocate_block(), a);
+        assert!(db.free_block(NULL_BLOCK).is_err());
+        assert!(db.free_block(99).is_err());
+    }
+
+    #[test]
+    fn free_list_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let (a, b);
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            a = db.allocate_block();
+            b = db.allocate_block();
+            db.write_block(a, &vec![1; BLOCK_SIZE as usize]).unwrap();
+            db.write_block(b, &vec![2; BLOCK_SIZE as usize]).unwrap();
+            db.free_block(a).unwrap();
+            db.free_block(b).unwrap();
+            db.checkpoint().unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut got = [db.allocate_block(), db.allocate_block()];
+        got.sort_unstable();
+        assert_eq!(got, [a, b]);
+        // Both free blocks are handed out; the next one extends the file
+        // past the free-list chain block.
+        assert_eq!(db.allocate_block(), db.db_header().block_count);
+    }
+
+    #[test]
+    fn free_list_chain_recycles_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let a = db.allocate_block();
+        db.write_block(a, &vec![1; BLOCK_SIZE as usize]).unwrap();
+        db.free_block(a).unwrap();
+        db.checkpoint().unwrap();
+        // Every checkpoint rewrites the one-block chain, recycling the old
+        // chain block, so repeated checkpoints cannot grow the file.
+        let watermark = db.db_header().block_count;
+        for _ in 0..5 {
+            db.checkpoint().unwrap();
+        }
+        assert_eq!(db.db_header().block_count, watermark);
+    }
+
+    #[test]
+    fn corrupt_free_list_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let chain_ptr;
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            let a = db.allocate_block();
+            db.write_block(a, &vec![1; BLOCK_SIZE as usize]).unwrap();
+            db.free_block(a).unwrap();
+            db.checkpoint().unwrap();
+            chain_ptr = db.db_header().free_list_root;
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[(chain_ptr * u64::from(BLOCK_SIZE)) as usize + 20] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(Zu1File::open(&path), Err(ZuError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn decode_free_list_rejects_bad_payloads() {
+        assert!(decode_free_list(&[0u8; 7], 10).is_err(), "ragged length");
+        assert!(
+            decode_free_list(&0u64.to_le_bytes(), 10).is_err(),
+            "null block"
+        );
+        assert!(
+            decode_free_list(&11u64.to_le_bytes(), 10).is_err(),
+            "past the high-water mark"
+        );
+        let mut dup = Vec::new();
+        dup.extend_from_slice(&3u64.to_le_bytes());
+        dup.extend_from_slice(&3u64.to_le_bytes());
+        assert!(decode_free_list(&dup, 10).is_err(), "duplicate");
+        let mut good = Vec::new();
+        good.extend_from_slice(&3u64.to_le_bytes());
+        good.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(decode_free_list(&good, 10).unwrap(), vec![3, 7]);
     }
 
     #[test]

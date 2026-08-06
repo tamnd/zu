@@ -31,8 +31,10 @@ pub const MIN_READER_VERSION: u16 = 1;
 
 /// Walks the whole file checking every crc: file header, database
 /// headers, each meta-block chain reachable from the committed roots, and
-/// every column segment listed in the group directory. Returns the number
-/// of payload bytes verified.
+/// every column segment listed in the group directory. Also decodes the
+/// free list and rejects a file whose free list claims a block the graph
+/// still uses, since allocating such a block would overwrite live data.
+/// Returns the number of payload bytes verified.
 pub fn verify(path: &Path) -> Result<u64> {
     let mut db = Zu1File::open(path)?;
     let roots = [
@@ -45,7 +47,15 @@ pub fn verify(path: &Path) -> Result<u64> {
     for root in roots {
         bytes += meta::read_chain(&mut db, root)?.len() as u64;
     }
-    if db.db_header().table_index_root != file::NULL_BLOCK {
+    let free_root = db.db_header().free_list_root;
+    let free_bytes = meta::read_chain(&mut db, free_root)?;
+    let free = file::decode_free_list(&free_bytes, db.db_header().block_count)?;
+    let table_root = db.db_header().table_index_root;
+    if table_root != file::NULL_BLOCK {
+        let mut live: std::collections::HashSet<file::BlockPtr> =
+            meta::chain_blocks(&mut db, table_root)?
+                .into_iter()
+                .collect();
         let reader = graph::GraphReader::load(&mut db)?;
         let groups = reader.directory().groups.clone();
         let mut values = Vec::new();
@@ -59,7 +69,14 @@ pub fn verify(path: &Path) -> Result<u64> {
                 values.clear();
                 segment::read_segment(&mut db, seg, &mut values)?;
                 bytes += seg.payload_len;
+                live.extend(seg.blocks.iter().copied());
             }
+        }
+        if let Some(ptr) = free.iter().find(|ptr| live.contains(ptr)) {
+            return Err(zu_common::ZuError::Corrupt {
+                what: "free list",
+                detail: format!("block {ptr} is listed free but the graph uses it"),
+            });
         }
     }
     Ok(bytes)

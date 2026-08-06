@@ -7,8 +7,10 @@
 
 pub mod bitpack;
 pub mod delta;
+pub mod delta_patch;
 pub mod dict;
 pub mod for_bitpack;
+pub mod patch;
 pub mod rle;
 pub mod segment;
 pub mod validity;
@@ -31,6 +33,7 @@ pub enum EncodingId {
     BoolBitpack = 9,
     Frequency = 10,
     Zstd = 11,
+    DeltaPatch = 12,
 }
 
 impl TryFrom<u8> for EncodingId {
@@ -50,6 +53,7 @@ impl TryFrom<u8> for EncodingId {
             9 => Self::BoolBitpack,
             10 => Self::Frequency,
             11 => Self::Zstd,
+            12 => Self::DeltaPatch,
             other => {
                 return Err(ZuError::Unsupported {
                     what: "encoding",
@@ -72,11 +76,11 @@ mod tests {
 
     #[test]
     fn encoding_id_roundtrip() {
-        for raw in 0u8..=11 {
+        for raw in 0u8..=12 {
             let id = EncodingId::try_from(raw).unwrap();
             assert_eq!(id as u8, raw);
         }
-        assert!(EncodingId::try_from(12).is_err());
+        assert!(EncodingId::try_from(13).is_err());
     }
 
     #[test]

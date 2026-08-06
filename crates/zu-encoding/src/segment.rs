@@ -8,7 +8,7 @@
 
 use zu_common::{Result, ZuError};
 
-use crate::{EncodingId, delta, dict, for_bitpack, rle};
+use crate::{EncodingId, delta, delta_patch, dict, for_bitpack, rle};
 
 const SAMPLE_RUNS: usize = 8;
 const SAMPLE_RUN_LEN: usize = 128;
@@ -43,6 +43,7 @@ pub fn decode_any(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
         EncodingId::Dict => dict::decode(payload, out),
         EncodingId::ForBitPack => for_bitpack::decode(payload, out),
         EncodingId::DeltaBitPack => delta::decode(payload, out),
+        EncodingId::DeltaPatch => delta_patch::decode(payload, out),
         other => Err(ZuError::Unsupported {
             what: "segment encoding",
             id: other as u8 as u32,
@@ -66,6 +67,9 @@ fn encode_with(id: EncodingId, values: &[u64], out: &mut Vec<u8>) {
         EncodingId::DeltaBitPack => {
             delta::encode(values, out);
         }
+        EncodingId::DeltaPatch => {
+            delta_patch::encode(values, out);
+        }
         _ => unreachable!("choose never returns other ids"),
     }
 }
@@ -78,41 +82,57 @@ fn choose(values: &[u64]) -> EncodingId {
     if values.iter().all(|&v| v == first) {
         return EncodingId::Constant;
     }
-    let sample = sample(values);
+    let runs = sample_runs(values);
+    let concat: Vec<u64> = runs.concat();
     // Candidate order breaks ties toward the shallower cascade.
     let candidates = [
         EncodingId::ForBitPack,
         EncodingId::DeltaBitPack,
+        EncodingId::DeltaPatch,
         EncodingId::Rle,
         EncodingId::Dict,
     ];
     let mut best = EncodingId::Plain;
-    let mut best_size = 4 + sample.len() * 8;
+    let mut best_size = 4 + concat.len() * 8;
     let mut buf = Vec::new();
     for id in candidates {
-        buf.clear();
-        encode_with(id, &sample, &mut buf);
-        if buf.len() < best_size {
+        // Delta candidates are sized per run and summed: concatenating the
+        // runs fabricates one wide delta per boundary, which reads as
+        // outliers on data that has none and skews the pick toward the
+        // patched encoding. Value-distribution candidates see the
+        // concatenated sample, since their costs do not depend on
+        // adjacency and the mix of runs is what a real chunk contains.
+        let per_run = matches!(id, EncodingId::DeltaBitPack | EncodingId::DeltaPatch);
+        let mut size = 0usize;
+        if per_run {
+            for run in &runs {
+                buf.clear();
+                encode_with(id, run, &mut buf);
+                size += buf.len();
+            }
+        } else {
+            buf.clear();
+            encode_with(id, &concat, &mut buf);
+            size = buf.len();
+        }
+        if size < best_size {
             best = id;
-            best_size = buf.len();
+            best_size = size;
         }
     }
     best
 }
 
 /// Even-spaced runs so ordered data keeps its local structure in the sample.
-fn sample(values: &[u64]) -> Vec<u64> {
+fn sample_runs(values: &[u64]) -> Vec<&[u64]> {
     let want = SAMPLE_RUNS * SAMPLE_RUN_LEN;
     if values.len() <= want {
-        return values.to_vec();
+        return vec![values];
     }
     let stride = values.len() / SAMPLE_RUNS;
-    let mut out = Vec::with_capacity(want);
-    for run in 0..SAMPLE_RUNS {
-        let start = run * stride;
-        out.extend_from_slice(&values[start..start + SAMPLE_RUN_LEN]);
-    }
-    out
+    (0..SAMPLE_RUNS)
+        .map(|run| &values[run * stride..run * stride + SAMPLE_RUN_LEN])
+        .collect()
 }
 
 fn encode_plain(values: &[u64], out: &mut Vec<u8>) {
@@ -184,6 +204,29 @@ mod tests {
     fn picks_delta_for_sorted() {
         let values: Vec<u64> = (0..10_000u64).map(|i| 1_000_000 + i * 3).collect();
         assert_eq!(roundtrip(&values), EncodingId::DeltaBitPack);
+    }
+
+    #[test]
+    fn picks_delta_patch_for_adjacency() {
+        // Concatenated sorted neighbor lists: tight in-list gaps with a
+        // wide restart and hub jump per list. The wide deltas inside any
+        // 128-value sample run are real outliers, so the patched delta
+        // must win over plain delta's max-width chunks.
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut values = Vec::new();
+        for list in 0..2_000u64 {
+            let anchor = (list.wrapping_mul(0x9E3779B97F4A7C15) % 4_000_000).max(1);
+            values.push(anchor % 1000);
+            let mut v = anchor;
+            for _ in 0..13 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                v += 1 + rng % 30;
+                values.push(v);
+            }
+        }
+        assert_eq!(roundtrip(&values), EncodingId::DeltaPatch);
     }
 
     #[test]

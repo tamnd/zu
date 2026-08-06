@@ -5,6 +5,7 @@
 
 for_bitpack = 1.0
 delta_bitpack = 1.0
+delta_patch = 1.0
 rle = 1.0
 dict = 1.0
 

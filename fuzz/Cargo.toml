@@ -1,0 +1,26 @@
+[package]
+name = "zu-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zu-encoding = { path = "../crates/zu-encoding" }
+
+[[bin]]
+name = "decode_for_bitpack"
+path = "fuzz_targets/decode_for_bitpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_delta"
+path = "fuzz_targets/decode_delta.rs"
+test = false
+doc = false
+bench = false

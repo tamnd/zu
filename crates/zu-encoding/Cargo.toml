@@ -12,5 +12,9 @@ authors.workspace = true
 [dependencies]
 zu-common.workspace = true
 
+[[bench]]
+name = "decode"
+harness = false
+
 [lints]
 workspace = true

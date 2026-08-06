@@ -1,21 +1,24 @@
 //! Fixed-width bit packing over 1024-value chunks.
 //!
-//! Values are packed LSB-first into little-endian u64 words. A chunk of 1024
-//! values at width w occupies exactly 128 * w bytes, so chunk starts are
-//! always word aligned and a point read touches one chunk only.
+//! Values are packed LSB-first into little-endian u64 words. A full chunk
+//! of 1024 values at width w occupies exactly 128 * w bytes, so chunk starts
+//! are always word aligned and a point read touches one chunk only. A short
+//! tail packs into just the words it needs, which keeps tiny streams such as
+//! RLE run values from ballooning to full-chunk size.
 //! The FastLanes transposed lane order is a planned swap behind this same
 //! interface before format freeze; the container layout does not change.
 
 /// Values per chunk. Format-stable.
 pub const CHUNK: usize = 1024;
 
-/// Packed size in bytes of one chunk at `width` bits.
+/// Packed size in bytes of `count` values at `width` bits, rounded up to
+/// whole words. A full chunk is `128 * width`.
 #[inline]
-pub const fn packed_bytes(width: u32) -> usize {
-    CHUNK / 8 * width as usize
+pub const fn packed_bytes(width: u32, count: usize) -> usize {
+    (count * width as usize).div_ceil(64) * 8
 }
 
-/// Packs up to 1024 values at `width` bits, zero-padding a short tail.
+/// Packs up to 1024 values at `width` bits into whole little-endian words.
 /// Values must already fit in `width` bits.
 pub fn pack(values: &[u64], width: u32, out: &mut Vec<u8>) {
     assert!(values.len() <= CHUNK);
@@ -30,8 +33,8 @@ pub fn pack(values: &[u64], width: u32, out: &mut Vec<u8>) {
     };
     let mut acc = 0u64;
     let mut bits = 0u32;
-    for i in 0..CHUNK {
-        let v = values.get(i).copied().unwrap_or(0) & mask;
+    for &raw in values {
+        let v = raw & mask;
         acc |= v << bits;
         bits += width;
         if bits >= 64 {
@@ -40,11 +43,14 @@ pub fn pack(values: &[u64], width: u32, out: &mut Vec<u8>) {
             acc = if bits == 0 { 0 } else { v >> (width - bits) };
         }
     }
-    debug_assert_eq!(bits, 0);
+    if bits > 0 {
+        out.extend_from_slice(&acc.to_le_bytes());
+    }
 }
 
-/// Unpacks one chunk. `out` must be exactly `CHUNK` long and `packed` at
-/// least `packed_bytes(width)`.
+/// Unpacks one chunk. `out` must be exactly `CHUNK` long; `packed` holds
+/// whole words and may cover fewer than 1024 values, in which case the
+/// remainder of `out` is zeroed.
 ///
 /// Dispatches to a const-width loop so every shift is a compile-time
 /// constant; the generic rolling-window fallback is an order of magnitude
@@ -52,15 +58,17 @@ pub fn pack(values: &[u64], width: u32, out: &mut Vec<u8>) {
 pub fn unpack(packed: &[u8], width: u32, out: &mut [u64]) {
     assert_eq!(out.len(), CHUNK);
     assert!(width <= 64);
+    assert_eq!(packed.len() % 8, 0);
     if width == 0 {
         out.fill(0);
         return;
     }
-    assert!(packed.len() >= packed_bytes(width));
     if width == 64 {
+        let n = (packed.len() / 8).min(CHUNK);
         for (chunk, slot) in packed.chunks_exact(8).zip(out.iter_mut()) {
             *slot = u64::from_le_bytes(chunk.try_into().unwrap());
         }
+        out[n..].fill(0);
         return;
     }
     macro_rules! dispatch {
@@ -130,7 +138,7 @@ mod tests {
             let values: Vec<u64> = (0..CHUNK).map(|_| xorshift(&mut rng) & mask).collect();
             let mut packed = Vec::new();
             pack(&values, width, &mut packed);
-            assert_eq!(packed.len(), packed_bytes(width));
+            assert_eq!(packed.len(), packed_bytes(width, CHUNK));
             let mut out = vec![0u64; CHUNK];
             unpack(&packed, width, &mut out);
             assert_eq!(values, out, "width {width}");
@@ -138,13 +146,36 @@ mod tests {
     }
 
     #[test]
-    fn short_tail_pads_with_zeros() {
+    fn short_tail_packs_tight() {
         let values = [7u64, 7, 7];
         let mut packed = Vec::new();
         pack(&values, 3, &mut packed);
-        let mut out = vec![0u64; CHUNK];
+        assert_eq!(packed.len(), packed_bytes(3, 3));
+        assert_eq!(packed.len(), 8);
+        let mut out = vec![1u64; CHUNK];
         unpack(&packed, 3, &mut out);
         assert_eq!(&out[..3], &values);
         assert!(out[3..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn tail_boundaries_every_width() {
+        let mut rng = 0xDEADBEEFu64;
+        for width in 1..=64u32 {
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            for len in [1usize, 63, 64, 65, 1000, CHUNK] {
+                let values: Vec<u64> = (0..len).map(|_| xorshift(&mut rng) & mask).collect();
+                let mut packed = Vec::new();
+                pack(&values, width, &mut packed);
+                assert_eq!(packed.len(), packed_bytes(width, len), "w{width} n{len}");
+                let mut out = vec![0u64; CHUNK];
+                unpack(&packed, width, &mut out);
+                assert_eq!(&out[..len], values.as_slice(), "w{width} n{len}");
+            }
+        }
     }
 }

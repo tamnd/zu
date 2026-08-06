@@ -107,12 +107,18 @@ fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let mut failed = false;
 
-    let cases: [(&str, EncodeFn, DecodeFn); 2] = [
+    let cases: [(&str, EncodeFn, DecodeFn); 4] = [
         ("for_bitpack", zu_encoding::for_bitpack::encode, |b, o| {
             zu_encoding::for_bitpack::decode(b, o).unwrap()
         }),
         ("delta_bitpack", zu_encoding::delta::encode, |b, o| {
             zu_encoding::delta::decode(b, o).unwrap()
+        }),
+        ("rle", zu_encoding::rle::encode, |b, o| {
+            zu_encoding::rle::decode(b, o).unwrap()
+        }),
+        ("dict", zu_encoding::dict::encode, |b, o| {
+            zu_encoding::dict::decode(b, o).unwrap()
         }),
     ];
 

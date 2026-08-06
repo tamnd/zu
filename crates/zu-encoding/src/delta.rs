@@ -1,13 +1,15 @@
 //! Delta plus bit packing (encoding id 5).
 //!
 //! Consecutive differences are zigzag mapped to u64 and fed through the
-//! frame-of-reference container, so the layout is `for_bitpack` over
-//! zigzag deltas with the first delta taken from zero. Sorted inputs such
+//! frame-of-reference container. The layout is `base: u64 LE` holding the
+//! first value, then `for_bitpack` over zigzag deltas with the running
+//! previous seeded from `base`, so the first chunk's width reflects the
+//! gaps and never the absolute magnitude of the start. Sorted inputs such
 //! as CSR neighbor lists produce small non-negative deltas, which is where
 //! the bits-per-edge budget comes from; unsorted input stays correct, just
 //! larger.
 
-use zu_common::Result;
+use zu_common::{Result, ZuError};
 
 use crate::for_bitpack;
 
@@ -23,19 +25,27 @@ fn unzigzag(v: u64) -> i64 {
 
 /// Encodes `values` into `out`, returning the encoded byte length.
 pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
+    let start = out.len();
+    let base = values.first().copied().unwrap_or(0);
+    out.extend_from_slice(&base.to_le_bytes());
     let mut deltas = Vec::with_capacity(values.len());
-    let mut prev = 0u64;
+    let mut prev = base;
     for &v in values {
         deltas.push(zigzag(v.wrapping_sub(prev) as i64));
         prev = v;
     }
-    for_bitpack::encode(&deltas, out)
+    for_bitpack::encode(&deltas, out);
+    out.len() - start
 }
 
 /// Decodes an encoded buffer, appending the values to `out`.
 pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
-    let mut prev = 0u64;
-    for_bitpack::decode_chunks(bytes, |min, scratch, take| {
+    let base_bytes = bytes.get(..8).ok_or_else(|| ZuError::Corrupt {
+        what: "delta",
+        detail: "truncated base".to_string(),
+    })?;
+    let mut prev = u64::from_le_bytes(base_bytes.try_into().unwrap());
+    for_bitpack::decode_chunks(&bytes[8..], |min, scratch, take| {
         out.extend(scratch[..take].iter().map(|&v| {
             prev = prev.wrapping_add(unzigzag(min.wrapping_add(v)) as u64);
             prev

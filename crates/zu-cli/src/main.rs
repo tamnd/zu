@@ -28,10 +28,21 @@ fn main() -> ExitCode {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
         },
-        Some("neighbors") => match (args.get(1), args.get(2).and_then(|s| s.parse::<u64>().ok())) {
-            (Some(path), Some(node)) => neighbors(std::path::Path::new(path), node),
-            _ => usage_error("zu neighbors <file.zu1> <node>"),
-        },
+        Some("neighbors") => {
+            let mut rest = &args[1..];
+            let mut dir = zu::zu1::graph::Direction::Fwd;
+            if rest.first().map(String::as_str) == Some("--in") {
+                dir = zu::zu1::graph::Direction::Bwd;
+                rest = &rest[1..];
+            }
+            match (
+                rest.first(),
+                rest.get(1).and_then(|s| s.parse::<u64>().ok()),
+            ) {
+                (Some(path), Some(node)) => neighbors(std::path::Path::new(path), node, dir),
+                _ => usage_error("zu neighbors [--in] <file.zu1> <node>"),
+            }
+        }
         Some("copy") => {
             let mut reorder = zu::zu1::reorder::Reorder::None;
             let mut rest = &args[1..];
@@ -151,7 +162,15 @@ fn copy(
             let load = load_started.elapsed();
             let total = started.elapsed();
             let file_bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
-            let bits_per_edge = file_bytes as f64 * 8.0 / d.edge_count as f64;
+            // Adjacency density is quoted per direction: the file holds
+            // two CSRs, so bwd payload bytes are carved out of the fwd
+            // number to stay comparable with single-direction figures.
+            let bwd_bytes: u64 = d
+                .groups
+                .iter()
+                .map(|g| g.bwd.offsets.payload_len + g.bwd.neighbors.payload_len)
+                .sum();
+            let per_edge = |bytes: u64| bytes as f64 * 8.0 / d.edge_count as f64;
             println!(
                 "copied {} edges, {} nodes, {} groups",
                 d.edge_count,
@@ -165,8 +184,10 @@ fn copy(
                 total.as_secs_f64()
             );
             println!(
-                "{:.2} M edges/s end to end, {file_bytes} bytes on disk, {bits_per_edge:.2} bits/edge",
-                d.edge_count as f64 / total.as_secs_f64() / 1e6
+                "{:.2} M edges/s end to end, {file_bytes} bytes on disk, {:.2} bits/edge fwd, {:.2} bits/edge bwd",
+                d.edge_count as f64 / total.as_secs_f64() / 1e6,
+                per_edge(file_bytes - bwd_bytes),
+                per_edge(bwd_bytes)
             );
             ExitCode::SUCCESS
         }
@@ -176,17 +197,22 @@ fn copy(
 
 /// Prints one node's sorted neighbor list via the point-read path, which
 /// decodes only the chunks holding the node's offsets and its list.
-fn neighbors(path: &std::path::Path, node: u64) -> ExitCode {
+/// `--in` reads the reverse direction: nodes whose edges point here.
+fn neighbors(path: &std::path::Path, node: u64, dir: zu::zu1::graph::Direction) -> ExitCode {
     let result = (|| {
         let mut db = zu::zu1::file::Zu1File::open(path)?;
         let reader = zu::zu1::graph::GraphReader::load(&mut db)?;
         let mut nbrs = Vec::new();
-        reader.neighbors_into(&mut db, node, &mut nbrs)?;
+        reader.neighbors_dir_into(&mut db, node, dir, &mut nbrs)?;
         Ok(nbrs)
     })();
+    let label = match dir {
+        zu::zu1::graph::Direction::Fwd => "degree",
+        zu::zu1::graph::Direction::Bwd => "in-degree",
+    };
     match result {
         Ok(nbrs) => {
-            println!("node {node}: degree {}", nbrs.len());
+            println!("node {node}: {label} {}", nbrs.len());
             for n in nbrs {
                 println!("{n}");
             }
@@ -221,6 +247,6 @@ fn print_usage() {
     println!();
     println!("usage: zu <command> [args]");
     println!();
-    println!("commands: shell, query, copy, convert, verify, stat, neighbors, bench");
+    println!("commands: shell, query, copy, convert, verify, stat, neighbors [--in], bench");
     println!("(implemented milestone by milestone, see the repo issues)");
 }

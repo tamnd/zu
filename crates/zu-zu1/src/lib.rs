@@ -50,7 +50,12 @@ pub fn verify(path: &Path) -> Result<u64> {
         let groups = reader.directory().groups.clone();
         let mut values = Vec::new();
         for group in &groups {
-            for seg in [&group.offsets, &group.neighbors] {
+            for seg in [
+                &group.fwd.offsets,
+                &group.fwd.neighbors,
+                &group.bwd.offsets,
+                &group.bwd.neighbors,
+            ] {
                 values.clear();
                 segment::read_segment(&mut db, seg, &mut values)?;
                 bytes += seg.payload_len;

@@ -97,7 +97,7 @@ fn main() {
     if let Some(floor) = budget("copy_medges_s")
         && medges_s < floor
     {
-        eprintln!("gate: copy {medges_s:.2} M edges/s below floor {floor}");
+        println!("GATE FAIL copy: {medges_s:.2} M edges/s < floor {floor}");
         failed = true;
     }
     // The density budget is defined against the real LiveJournal ordering.
@@ -107,7 +107,7 @@ fn main() {
         && let Some(ceiling) = budget("bits_per_edge")
         && bits_per_edge > ceiling
     {
-        eprintln!("gate: {bits_per_edge:.2} bits/edge above ceiling {ceiling}");
+        println!("GATE FAIL density: {bits_per_edge:.2} bits/edge > ceiling {ceiling}");
         failed = true;
     }
     if gate && failed {

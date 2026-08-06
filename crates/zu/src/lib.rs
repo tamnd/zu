@@ -9,3 +9,4 @@
 
 pub use zu_common::{Epoch, NodeId, Result, ZuError};
 pub use zu_storage::{CheckpointMode, Direction, GraphStore, Snapshot};
+pub use zu_zu1 as zu1;

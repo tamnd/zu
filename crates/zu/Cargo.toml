@@ -1,0 +1,22 @@
+[package]
+name = "zu"
+description = "Embedded property-graph database: columnar, factorized, three storage engines"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zu-common.workspace = true
+zu-encoding.workspace = true
+zu-storage.workspace = true
+zu-zu1.workspace = true
+zu-sqlite.workspace = true
+zu-s3.workspace = true
+zu-query.workspace = true
+
+[lints]
+workspace = true

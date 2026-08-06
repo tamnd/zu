@@ -1,0 +1,21 @@
+[package]
+name = "zu-zu1"
+description = "Native single-file columnar storage engine for zu"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zu-common.workspace = true
+zu-encoding.workspace = true
+crc32c.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

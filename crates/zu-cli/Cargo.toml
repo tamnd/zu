@@ -1,0 +1,20 @@
+[package]
+name = "zu-cli"
+description = "Command-line interface for zu"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "zu"
+path = "src/main.rs"
+
+[dependencies]
+zu.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,272 @@
+//! End-to-end tests over real temporary database files.
+
+use std::path::PathBuf;
+
+use rusqlite::Connection;
+use tempfile::TempDir;
+use zu_common::ZuError;
+use zu_sqlite::{APPLICATION_ID, ColumnType, Direction, SCHEMA_VERSION, SqliteStore, Value};
+
+fn temp_db() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("graph.db");
+    (dir, path)
+}
+
+const EDGES: [(i64, i64); 8] = [
+    (1, 2),
+    (1, 3),
+    (2, 3),
+    (2, 5),
+    (3, 4),
+    (4, 5),
+    (5, 6),
+    (6, 1),
+];
+
+/// Six people, eight `knows` edges, ids checked to be sequential.
+fn small_graph(store: &mut SqliteStore) {
+    store
+        .create_node_table("person", &[("name", ColumnType::Text)])
+        .unwrap();
+    store
+        .create_rel_table("knows", &[("since", ColumnType::Integer)])
+        .unwrap();
+    for i in 1..=6i64 {
+        let id = store
+            .insert_node("person", &[Value::Text(format!("p{i}"))])
+            .unwrap();
+        assert_eq!(id, i);
+    }
+    for (n, (src, dst)) in EDGES.iter().enumerate() {
+        let year = 2000 + i64::try_from(n).unwrap();
+        let id = store
+            .insert_rel("knows", *src, *dst, &[Value::Int(year)])
+            .unwrap();
+        assert_eq!(id, i64::try_from(n).unwrap() + 1);
+    }
+}
+
+#[test]
+fn open_sets_wal_application_id_and_user_version() {
+    let (_dir, path) = temp_db();
+    drop(SqliteStore::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    let app_id: i32 = conn
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(app_id, APPLICATION_ID);
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
+fn rejects_foreign_application_id() {
+    let (_dir, path) = temp_db();
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "application_id", 0x1234_5678)
+        .unwrap();
+    conn.execute_batch("CREATE TABLE alien (x INTEGER)")
+        .unwrap();
+    drop(conn);
+    let err = SqliteStore::open(&path).unwrap_err();
+    assert!(matches!(
+        err,
+        ZuError::Corrupt {
+            what: "sqlite application_id",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_non_database_file() {
+    let (_dir, path) = temp_db();
+    std::fs::write(&path, vec![0x42u8; 1024]).unwrap();
+    let err = SqliteStore::open(&path).unwrap_err();
+    assert!(matches!(err, ZuError::Corrupt { .. }));
+}
+
+#[test]
+fn create_tables_populate_catalog() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    small_graph(&mut store);
+    let entries = store.catalog_entries().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].kind, "node");
+    assert_eq!(entries[0].name, "person");
+    assert!(entries[0].sql.contains("CREATE TABLE n_person"));
+    assert!(entries[0].sql.contains("p_name TEXT"));
+    assert_eq!(entries[1].kind, "rel");
+    assert_eq!(entries[1].name, "knows");
+    assert!(entries[1].sql.contains("CREATE TABLE r_knows"));
+    assert!(entries[1].sql.contains("CREATE INDEX r_knows_fwd"));
+    assert!(entries[1].sql.contains("CREATE INDEX r_knows_bwd"));
+}
+
+#[test]
+fn neighbors_forward() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    small_graph(&mut store);
+    let fwd = |n| store.neighbors("knows", n, Direction::Fwd).unwrap();
+    assert_eq!(fwd(1), vec![2, 3]);
+    assert_eq!(fwd(2), vec![3, 5]);
+    assert_eq!(fwd(3), vec![4]);
+    assert_eq!(fwd(4), vec![5]);
+    assert_eq!(fwd(5), vec![6]);
+    assert_eq!(fwd(6), vec![1]);
+}
+
+#[test]
+fn neighbors_backward() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    small_graph(&mut store);
+    let bwd = |n| store.neighbors("knows", n, Direction::Bwd).unwrap();
+    assert_eq!(bwd(1), vec![6]);
+    assert_eq!(bwd(2), vec![1]);
+    assert_eq!(bwd(3), vec![1, 2]);
+    assert_eq!(bwd(4), vec![3]);
+    assert_eq!(bwd(5), vec![2, 4]);
+    assert_eq!(bwd(6), vec![5]);
+}
+
+#[test]
+fn neighbors_of_unconnected_node_are_empty() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    small_graph(&mut store);
+    assert!(
+        store
+            .neighbors("knows", 42, Direction::Fwd)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .neighbors("knows", 42, Direction::Bwd)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn counts_match_inserted_graph() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    small_graph(&mut store);
+    assert_eq!(store.node_count("person").unwrap(), 6);
+    assert_eq!(store.rel_count("knows").unwrap(), 8);
+}
+
+#[test]
+fn reopen_preserves_catalog_and_data() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    small_graph(&mut store);
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let entries = store.catalog_entries().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "person");
+    assert_eq!(entries[1].name, "knows");
+    assert_eq!(store.node_count("person").unwrap(), 6);
+    assert_eq!(store.rel_count("knows").unwrap(), 8);
+    assert_eq!(
+        store.neighbors("knows", 2, Direction::Fwd).unwrap(),
+        vec![3, 5]
+    );
+    assert_eq!(
+        store.neighbors("knows", 5, Direction::Bwd).unwrap(),
+        vec![2, 4]
+    );
+}
+
+#[test]
+fn property_values_roundtrip_through_sqlite() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    store
+        .create_node_table(
+            "thing",
+            &[
+                ("i", ColumnType::Integer),
+                ("r", ColumnType::Real),
+                ("t", ColumnType::Text),
+                ("b", ColumnType::Blob),
+            ],
+        )
+        .unwrap();
+    store
+        .insert_node(
+            "thing",
+            &[
+                Value::Int(7),
+                Value::Real(1.5),
+                Value::Text("zu".to_owned()),
+                Value::Blob(vec![1, 2, 3]),
+            ],
+        )
+        .unwrap();
+    store
+        .insert_node(
+            "thing",
+            &[Value::Null, Value::Null, Value::Null, Value::Null],
+        )
+        .unwrap();
+    drop(store);
+    let conn = Connection::open(&path).unwrap();
+    let row: (i64, f64, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT p_i, p_r, p_t, p_b FROM n_thing WHERE zrow = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, 7);
+    assert!((row.1 - 1.5).abs() < f64::EPSILON);
+    assert_eq!(row.2, "zu");
+    assert_eq!(row.3, vec![1, 2, 3]);
+    let null_rows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM n_thing WHERE zrow = 2 AND p_i IS NULL AND p_t IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(null_rows, 1);
+}
+
+#[test]
+fn rejects_invalid_identifiers() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    let err = store.create_node_table("bad name", &[]).unwrap_err();
+    assert!(matches!(err, ZuError::InvalidArgument(_)));
+    let err = store
+        .create_node_table("ok", &[("bad-col", ColumnType::Text)])
+        .unwrap_err();
+    assert!(matches!(err, ZuError::InvalidArgument(_)));
+    let err = store
+        .neighbors("k; DROP TABLE zu_catalog", 1, Direction::Fwd)
+        .unwrap_err();
+    assert!(matches!(err, ZuError::InvalidArgument(_)));
+    assert!(store.catalog_entries().unwrap().is_empty());
+}
+
+#[test]
+fn duplicate_table_name_fails() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.create_node_table("person", &[]).unwrap();
+    assert!(store.create_node_table("person", &[]).is_err());
+    assert_eq!(store.catalog_entries().unwrap().len(), 1);
+}

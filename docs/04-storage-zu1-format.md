@@ -98,7 +98,7 @@ CsrGroup {
 
 ## 6. Zone maps & statistics
 
-- Per segment: min/max/null (16-B truncated) → predicate skip at group and chunk level.
+- Per segment: min/max/null (16-B truncated) → predicate skip at group and chunk level. The u64 min/max pair lives in `SegmentMeta` (directory version 5): an edge probe for a value outside a segment's zone answers absent from the directory alone without reading the payload, and the full-scan path cross-checks the zone against the decoded values the same way it cross-checks every chunk fence.
 - Per table: row/tombstone counts; per rel table: degree histogram (log2 buckets, per direction), edge count; color summaries (§07) refreshed by `ANALYZE` and incrementally at checkpoint.
 
 ## 7. Primary-key index

@@ -76,15 +76,15 @@ impl Budgets {
     }
 }
 
-fn measure(name: &str, encoded: &[u8], count: usize, decode: impl Fn(&[u8], &mut Vec<u64>)) -> f64 {
+fn measure(name: &str, encoded: &[u8], count: usize, decode: DecodeFn) -> f64 {
     let mut out = Vec::with_capacity(count);
     // Warm up, then run for at least a second of wall time.
-    decode(encoded, &mut out);
+    decode(encoded, count, &mut out).unwrap();
     let mut iters = 0u32;
     let start = Instant::now();
     while start.elapsed().as_secs_f64() < 1.0 {
         out.clear();
-        decode(encoded, &mut out);
+        decode(encoded, count, &mut out).unwrap();
         iters += 1;
     }
     let secs = start.elapsed().as_secs_f64();
@@ -96,7 +96,7 @@ fn measure(name: &str, encoded: &[u8], count: usize, decode: impl Fn(&[u8], &mut
 }
 
 type EncodeFn = fn(&[u64], &mut Vec<u8>) -> usize;
-type DecodeFn = fn(&[u8], &mut Vec<u64>);
+type DecodeFn = fn(&[u8], usize, &mut Vec<u64>) -> zu_common::Result<()>;
 
 fn main() {
     let data = std::env::var("ZU_DATA")
@@ -108,21 +108,23 @@ fn main() {
     let mut failed = false;
 
     let cases: [(&str, EncodeFn, DecodeFn); 5] = [
-        ("for_bitpack", zu_encoding::for_bitpack::encode, |b, o| {
-            zu_encoding::for_bitpack::decode(b, o).unwrap()
-        }),
-        ("delta_bitpack", zu_encoding::delta::encode, |b, o| {
-            zu_encoding::delta::decode(b, o).unwrap()
-        }),
-        ("delta_patch", zu_encoding::delta_patch::encode, |b, o| {
-            zu_encoding::delta_patch::decode(b, o).unwrap()
-        }),
-        ("rle", zu_encoding::rle::encode, |b, o| {
-            zu_encoding::rle::decode(b, o).unwrap()
-        }),
-        ("dict", zu_encoding::dict::encode, |b, o| {
-            zu_encoding::dict::decode(b, o).unwrap()
-        }),
+        (
+            "for_bitpack",
+            zu_encoding::for_bitpack::encode,
+            zu_encoding::for_bitpack::decode,
+        ),
+        (
+            "delta_bitpack",
+            zu_encoding::delta::encode,
+            zu_encoding::delta::decode,
+        ),
+        (
+            "delta_patch",
+            zu_encoding::delta_patch::encode,
+            zu_encoding::delta_patch::decode,
+        ),
+        ("rle", zu_encoding::rle::encode, zu_encoding::rle::decode),
+        ("dict", zu_encoding::dict::encode, zu_encoding::dict::decode),
     ];
 
     for (name, encode, decode) in cases {

@@ -9,7 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+tempfile = "3"
 zu-encoding = { path = "../crates/zu-encoding" }
+zu-zu1 = { path = "../crates/zu-zu1" }
 
 [[bin]]
 name = "decode_for_bitpack"
@@ -35,6 +37,27 @@ bench = false
 [[bin]]
 name = "decode_delta_patch"
 path = "fuzz_targets/decode_delta_patch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zu1_decode"
+path = "fuzz_targets/zu1_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zu1_file"
+path = "fuzz_targets/zu1_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seeds"
+path = "src/seeds.rs"
 test = false
 doc = false
 bench = false

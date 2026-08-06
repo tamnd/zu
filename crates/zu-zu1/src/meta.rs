@@ -6,6 +6,8 @@
 //! the payload itself. The chain is written back to front so every `next`
 //! pointer is known before its block is written.
 
+use std::collections::HashSet;
+
 use zu_common::{Result, ZuError};
 
 use crate::BLOCK_SIZE;
@@ -40,8 +42,10 @@ pub fn write_chain(db: &mut Zu1File, payload: &[u8]) -> Result<BlockPtr> {
 }
 
 /// Follows a chain from `head`, validating every block's crc, and calls
-/// `visit` with each block pointer and its payload slice. A chain longer
-/// than the block count is rejected as a cycle.
+/// `visit` with each block pointer and its payload slice. A revisited
+/// pointer is rejected as a cycle; the header's block count is not
+/// trusted for this, since a corrupt header could claim enough blocks to
+/// let a cycle spin arbitrarily long before a hop limit fires.
 fn walk_chain(
     db: &mut Zu1File,
     head: BlockPtr,
@@ -52,10 +56,9 @@ fn walk_chain(
         detail,
     };
     let mut ptr = head;
-    let mut hops = 0u64;
+    let mut visited = HashSet::new();
     while ptr != NULL_BLOCK {
-        hops += 1;
-        if hops > db.db_header().block_count {
+        if !visited.insert(ptr) {
             return Err(corrupt(format!("cycle detected at block {ptr}")));
         }
         let block = db.read_block(ptr)?;

@@ -385,6 +385,11 @@ impl TableIndex {
             });
         }
         let count = u32::from_le_bytes(head[2..6].try_into().unwrap()) as usize;
+        // Twelve bytes per entry; a count the payload cannot hold is
+        // rejected before it sizes an allocation.
+        if count > bytes.len().saturating_sub(6) / 12 {
+            return Err(corrupt(WHAT, "truncated entry".into()));
+        }
         let mut pos = 6;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
@@ -522,5 +527,10 @@ mod tests {
         let mut bad = good.clone();
         bad.push(0);
         assert!(TableIndex::decode(&bad).is_err());
+        // A six byte header claiming u32::MAX entries must die on the
+        // size check, not in the allocator.
+        let mut hostile = TABLE_INDEX_VERSION.to_le_bytes().to_vec();
+        hostile.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(TableIndex::decode(&hostile).is_err());
     }
 }

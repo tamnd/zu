@@ -5,6 +5,10 @@
 //! Encoder and decoder implementations land in M0; this crate starts with the
 //! stable id table so downstream crates can reference it.
 
+pub mod bitpack;
+pub mod delta;
+pub mod for_bitpack;
+
 use zu_common::ZuError;
 
 /// Format-stable encoding identifiers. Never renumber.

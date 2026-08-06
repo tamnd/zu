@@ -1,4 +1,10 @@
-.PHONY: build test lint fmt
+.PHONY: build test lint fmt bench gate
+
+bench:
+	cargo bench -p zu-encoding --bench decode
+
+gate:
+	ZU_GATE=1 cargo bench -p zu-encoding --bench decode
 
 build:
 	cargo build --workspace --all-features

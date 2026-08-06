@@ -1,0 +1,7 @@
+# Decode throughput floors in GB/s of decoded output, single core.
+# The M0 exit gate is 1.0 for every encoding (docs/12-implementation-plan.md).
+# Floors are set for the slowest gate machine (AMD EPYC vCPU, server1);
+# gamingpc numbers run far above them. Raise floors, never lower them.
+
+for_bitpack = 1.0
+delta_bitpack = 1.0

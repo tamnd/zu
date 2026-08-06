@@ -49,6 +49,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
 
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # The interpreter is a few thousand times slower than native, so
+      # this runs the roundtrip distribution sweep, which crosses every
+      # encoder and decoder path at miri-sized inputs, rather than the
+      # whole unit suite with its hundred-thousand-value columns.
+      - run: cargo +nightly miri test -p zu-encoding --test roundtrip
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

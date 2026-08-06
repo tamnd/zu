@@ -11,16 +11,16 @@ dict = 1.0
 
 # COPY ingest floors, single core, sort included, parse excluded (B6/B8).
 # The density keys are ceilings, not floors, set just above the measured
-# LiveJournal numbers with Delta+Patch: raw order 22.77, BFS 22.01.
-# Lower ceilings, never raise them. The 8.0 exit budget from docs/12
-# remains open: patched exceptions removed the outlier tax, but in-list
-# gaps on LiveJournal run 16-18 bits even BFS-reordered, because BFS
-# frontiers on a social graph are millions wide. Getting under 8 needs
-# an LLP-class ordering or copy-list compression, both deferred by
+# LiveJournal numbers with per-chunk MiniBlock cascades: raw order 22.31,
+# BFS 21.52. Lower ceilings, never raise them. The 8.0 exit budget from
+# docs/12 remains open: patched exceptions removed the outlier tax, but
+# in-list gaps on LiveJournal run 16-18 bits even BFS-reordered, because
+# BFS frontiers on a social graph are millions wide. Getting under 8
+# needs an LLP-class ordering or copy-list compression, both deferred by
 # docs/04 section 5.
 copy_medges_s = 1.0
-bits_per_edge = 23.0
-bits_per_edge_bfs = 22.5
+bits_per_edge = 22.5
+bits_per_edge_bfs = 22.0
 
 # Random 1-hop point reads on the loaded LiveJournal file, single core,
 # K lookups/s. Each lookup decodes only the chunks holding the node's two

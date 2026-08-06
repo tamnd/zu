@@ -45,6 +45,10 @@ pub fn pack(values: &[u64], width: u32, out: &mut Vec<u8>) {
 
 /// Unpacks one chunk. `out` must be exactly `CHUNK` long and `packed` at
 /// least `packed_bytes(width)`.
+///
+/// Dispatches to a const-width loop so every shift is a compile-time
+/// constant; the generic rolling-window fallback is an order of magnitude
+/// slower on older cores and exists only in tests as the oracle.
 pub fn unpack(packed: &[u8], width: u32, out: &mut [u64]) {
     assert_eq!(out.len(), CHUNK);
     assert!(width <= 64);
@@ -59,26 +63,47 @@ pub fn unpack(packed: &[u8], width: u32, out: &mut [u64]) {
         }
         return;
     }
-    let mask = (1u64 << width) - 1;
-    let mut words = packed[..packed_bytes(width)]
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()));
-    let mut cur = words.next().unwrap();
-    let mut avail = 64u32;
-    for slot in out.iter_mut() {
-        *slot = if avail >= width {
-            let v = cur & mask;
-            cur >>= width;
-            avail -= width;
-            v
-        } else {
-            let next = words.next().unwrap();
-            let consumed = width - avail;
-            let v = (cur | (next << avail)) & mask;
-            cur = next >> consumed;
-            avail = 64 - consumed;
-            v
+    macro_rules! dispatch {
+        ($($w:literal)*) => {
+            match width {
+                $($w => unpack_const::<$w>(packed, out),)*
+                _ => unreachable!(),
+            }
         };
+    }
+    dispatch!(
+        1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22
+        23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44
+        45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63
+    );
+}
+
+fn unpack_const<const W: u32>(packed: &[u8], out: &mut [u64]) {
+    let mask: u64 = (1u64 << W) - 1;
+    // 16 words per width bit, 8 KiB at the widest, within the 64 KiB
+    // scratch contract.
+    let mut words = [0u64; 16 * 63];
+    for (slot, chunk) in words[..16 * W as usize]
+        .iter_mut()
+        .zip(packed.chunks_exact(8))
+    {
+        *slot = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    // 64 values consume exactly W words, so unroll in blocks of 64 with a
+    // repeating in-block shift pattern the compiler can flatten.
+    for (block, out_block) in out.chunks_exact_mut(64).enumerate() {
+        let base = block * W as usize;
+        for (i, slot) in out_block.iter_mut().enumerate() {
+            let bit = i as u32 * W;
+            let w = base + (bit >> 6) as usize;
+            let s = bit & 63;
+            let lo = words[w] >> s;
+            *slot = if s + W > 64 {
+                (lo | (words[w + 1] << (64 - s))) & mask
+            } else {
+                lo & mask
+            };
+        }
     }
 }
 

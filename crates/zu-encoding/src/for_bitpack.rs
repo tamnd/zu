@@ -30,8 +30,13 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
     out.len() - start
 }
 
-/// Decodes an encoded buffer, appending the values to `out`.
-pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
+/// Parses the container and hands each decoded chunk to `sink` as
+/// `(min, values, take)`. Shared with the delta decoder so both stay
+/// single pass.
+pub(crate) fn decode_chunks(
+    bytes: &[u8],
+    mut sink: impl FnMut(u64, &[u64], usize),
+) -> Result<usize> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "for_bitpack",
         detail: detail.to_string(),
@@ -46,7 +51,6 @@ pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
     let mut pos = 4usize;
     let mut scratch = [0u64; CHUNK];
     let mut remaining = count;
-    out.reserve(count);
     while remaining > 0 {
         let header = bytes
             .get(pos..pos + 9)
@@ -64,11 +68,17 @@ pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
         bitpack::unpack(packed, width, &mut scratch);
         pos += plen;
         let take = remaining.min(CHUNK);
-        for &v in &scratch[..take] {
-            out.push(min.wrapping_add(v));
-        }
+        sink(min, &scratch, take);
         remaining -= take;
     }
+    Ok(count)
+}
+
+/// Decodes an encoded buffer, appending the values to `out`.
+pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
+    decode_chunks(bytes, |min, scratch, take| {
+        out.extend(scratch[..take].iter().map(|&v| min.wrapping_add(v)));
+    })?;
     Ok(())
 }
 

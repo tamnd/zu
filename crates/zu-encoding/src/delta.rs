@@ -34,13 +34,13 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
 
 /// Decodes an encoded buffer, appending the values to `out`.
 pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
-    let start = out.len();
-    for_bitpack::decode(bytes, out)?;
     let mut prev = 0u64;
-    for slot in &mut out[start..] {
-        prev = prev.wrapping_add(unzigzag(*slot) as u64);
-        *slot = prev;
-    }
+    for_bitpack::decode_chunks(bytes, |min, scratch, take| {
+        out.extend(scratch[..take].iter().map(|&v| {
+            prev = prev.wrapping_add(unzigzag(min.wrapping_add(v)) as u64);
+            prev
+        }));
+    })?;
     Ok(())
 }
 

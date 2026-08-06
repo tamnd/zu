@@ -116,10 +116,71 @@ fn run_point_lookups(label: &str, path: &std::path::Path, node_count: u64, dir: 
     klookups_s
 }
 
-/// Sorts, dedups, bulk loads, verifies, and runs both point-read phases;
-/// returns (M edges/s, fwd bits/edge, bwd bits/edge, out K lookups/s,
-/// in K lookups/s).
-fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f64, f64, f64, f64) {
+/// Random edge probes against a loaded file: half the probes are real
+/// edges, half are misses against the same sources, so present and
+/// absent cost both land in the number. A sample is crosschecked against
+/// binary search over the full point-read list.
+fn run_edge_probes(label: &str, path: &std::path::Path, node_count: u64) -> f64 {
+    let mut db = Zu1File::open(path).expect("open");
+    let reader = GraphReader::load(&mut db).expect("load directory");
+    let probes = 200_000usize;
+    let mut rng = 0x6C62272E07BB0142u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    // Build the probe set up front so target selection stays out of the
+    // timed loop: even probes take a real neighbor, odd probes perturb it
+    // into a near miss.
+    let mut nbrs = Vec::new();
+    let mut set = Vec::with_capacity(probes);
+    while set.len() < probes {
+        let src = next() % node_count;
+        nbrs.clear();
+        reader
+            .neighbors_into(&mut db, src, &mut nbrs)
+            .expect("point read");
+        if nbrs.is_empty() {
+            set.push((src, next(), false));
+            continue;
+        }
+        let dst = nbrs[(next() as usize) % nbrs.len()];
+        if set.len() % 2 == 0 {
+            set.push((src, dst, true));
+        } else {
+            let miss = dst.wrapping_add(1);
+            set.push((src, miss, nbrs.binary_search(&miss).is_ok()));
+        }
+    }
+    let mut lat = Vec::with_capacity(probes);
+    let started = Instant::now();
+    for &(src, dst, want) in &set {
+        let t = Instant::now();
+        let got = reader.has_edge(&mut db, src, dst).expect("probe");
+        lat.push(t.elapsed());
+        assert_eq!(got, want, "probe {src}->{dst}");
+    }
+    let secs = started.elapsed().as_secs_f64();
+    lat.sort_unstable();
+    let kprobes_s = probes as f64 / secs / 1e3;
+    println!(
+        "{label} edge-probe: {kprobes_s:.0} K probes/s, p50 {:.1} us, p99 {:.1} us, half present",
+        lat[probes / 2].as_secs_f64() * 1e6,
+        lat[probes * 99 / 100].as_secs_f64() * 1e6
+    );
+    kprobes_s
+}
+
+/// Sorts, dedups, bulk loads, verifies, and runs the point-read and
+/// edge-probe phases; returns (M edges/s, fwd bits/edge, bwd bits/edge,
+/// out K lookups/s, in K lookups/s, K probes/s).
+fn run_load(
+    label: &str,
+    mut edges: Vec<(u32, u32)>,
+    node_count: u64,
+) -> (f64, f64, f64, f64, f64, f64) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("ingest.zu1");
     let start = Instant::now();
@@ -165,7 +226,8 @@ fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f
     println!("{label} verify: ok, {verified} payload bytes checked");
     let k_out = run_point_lookups(label, &path, directory.node_count, Direction::Fwd);
     let k_in = run_point_lookups(label, &path, directory.node_count, Direction::Bwd);
-    (medges_s, bits_fwd, bits_bwd, k_out, k_in)
+    let k_probe = run_edge_probes(label, &path, directory.node_count);
+    (medges_s, bits_fwd, bits_bwd, k_out, k_in, k_probe)
 }
 
 fn main() {
@@ -180,7 +242,7 @@ fn main() {
         .max()
         .unwrap_or(0);
 
-    let (medges_s, bits_raw, bits_bwd, klookups_s, in_klookups_s) =
+    let (medges_s, bits_raw, bits_bwd, klookups_s, in_klookups_s, kprobes_s) =
         run_load("copy", edges.clone(), node_count);
 
     // B8 is defined on the reordered graph (docs/04 §5): BFS relabeling
@@ -195,7 +257,7 @@ fn main() {
             "reorder bfs: mapping built in {:.2}s",
             start.elapsed().as_secs_f64()
         );
-        let (_, bits, _, _, _) = run_load("copy+bfs", relabeled, node_count);
+        let (_, bits, _, _, _, _) = run_load("copy+bfs", relabeled, node_count);
         bits_bfs = Some(bits);
     }
 
@@ -246,6 +308,13 @@ fn main() {
         println!("GATE FAIL point-in: {in_klookups_s:.0} K lookups/s < floor {floor}");
         failed = true;
     }
+    if is_real
+        && let Some(floor) = budget("edge_probe_kprobes_s")
+        && kprobes_s < floor
+    {
+        println!("GATE FAIL edge-probe: {kprobes_s:.0} K probes/s < floor {floor}");
+        failed = true;
+    }
     // B6 is defined at 100 M edges (docs/12) and LiveJournal tops out at
     // 69 M, so the scale check loads com-Orkut (117 M edges) when opted
     // in with ZU_B6=1. The ungraph lists each undirected edge once and is
@@ -266,7 +335,7 @@ fn main() {
                     .map(|&(s, d)| u64::from(s.max(d)) + 1)
                     .max()
                     .unwrap_or(0);
-                let (medges_s, _, _, _, _) = run_load("b6-orkut", edges, node_count);
+                let (medges_s, _, _, _, _, _) = run_load("b6-orkut", edges, node_count);
                 if let Some(floor) = budget("copy_medges_s")
                     && medges_s < floor
                 {

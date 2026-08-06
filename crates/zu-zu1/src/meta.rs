@@ -39,15 +39,18 @@ pub fn write_chain(db: &mut Zu1File, payload: &[u8]) -> Result<BlockPtr> {
     Ok(ptrs[0])
 }
 
-/// Follows a chain from `head` and returns the concatenated payload.
-/// `NULL_BLOCK` reads as empty. Every block's crc is verified, and a chain
-/// longer than the block count is rejected as a cycle.
-pub fn read_chain(db: &mut Zu1File, head: BlockPtr) -> Result<Vec<u8>> {
+/// Follows a chain from `head`, validating every block's crc, and calls
+/// `visit` with each block pointer and its payload slice. A chain longer
+/// than the block count is rejected as a cycle.
+fn walk_chain(
+    db: &mut Zu1File,
+    head: BlockPtr,
+    mut visit: impl FnMut(BlockPtr, &[u8]),
+) -> Result<()> {
     let corrupt = |detail: String| ZuError::Corrupt {
         what: "meta chain",
         detail,
     };
-    let mut payload = Vec::new();
     let mut ptr = head;
     let mut hops = 0u64;
     while ptr != NULL_BLOCK {
@@ -66,10 +69,28 @@ pub fn read_chain(db: &mut Zu1File, head: BlockPtr) -> Result<Vec<u8>> {
         if crc32c::crc32c(part) != stored {
             return Err(corrupt(format!("crc mismatch in block {ptr}")));
         }
-        payload.extend_from_slice(part);
+        visit(ptr, part);
         ptr = next;
     }
+    Ok(())
+}
+
+/// Follows a chain from `head` and returns the concatenated payload.
+/// `NULL_BLOCK` reads as empty. Every block's crc is verified, and a chain
+/// longer than the block count is rejected as a cycle.
+pub fn read_chain(db: &mut Zu1File, head: BlockPtr) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    walk_chain(db, head, |_, part| payload.extend_from_slice(part))?;
     Ok(payload)
+}
+
+/// Follows a chain from `head` and returns the blocks it occupies, with
+/// the same validation as [`read_chain`]. The free path uses this to
+/// recycle a chain's own storage.
+pub fn chain_blocks(db: &mut Zu1File, head: BlockPtr) -> Result<Vec<BlockPtr>> {
+    let mut ptrs = Vec::new();
+    walk_chain(db, head, |ptr, _| ptrs.push(ptr))?;
+    Ok(ptrs)
 }
 
 #[cfg(test)]

@@ -62,7 +62,7 @@ jobs:
         run: cargo run --manifest-path fuzz/Cargo.toml --bin seeds
       - name: Fuzz decoders
         run: |
-          for target in zu1_decode decode_segment decode_for_bitpack decode_delta decode_delta_patch; do
+          for target in zu1_decode decode_segment decode_for_bitpack decode_delta decode_delta_patch decode_bool_bitpack decode_frequency; do
             cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=3072
           done
       - name: Fuzz file verify

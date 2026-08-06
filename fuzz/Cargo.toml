@@ -42,6 +42,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "decode_bool_bitpack"
+path = "fuzz_targets/decode_bool_bitpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_frequency"
+path = "fuzz_targets/decode_frequency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "zu1_decode"
 path = "fuzz_targets/zu1_decode.rs"
 test = false

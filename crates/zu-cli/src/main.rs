@@ -78,7 +78,7 @@ fn main() -> ExitCode {
 
 fn stat(path: &std::path::Path) -> ExitCode {
     match zu::zu1::file::Zu1File::open(path) {
-        Ok(db) => {
+        Ok(mut db) => {
             let fh = db.file_header();
             let dh = db.db_header();
             let u = fh.uuid;
@@ -114,6 +114,29 @@ fn stat(path: &std::path::Path) -> ExitCode {
                 "roots:           catalog={} tables={} free={} stats={}",
                 dh.catalog_root, dh.table_index_root, dh.free_list_root, dh.stats_root
             );
+            match zu::zu1::catalog::Catalog::load(&mut db) {
+                Ok(catalog) => {
+                    for t in catalog.node_tables() {
+                        println!("node table:      {} ({} rows)", t.name, t.node_count);
+                    }
+                    for t in catalog.rel_tables() {
+                        let name = |id| {
+                            catalog
+                                .node_by_id(id)
+                                .map_or("?", |t| t.name.as_str())
+                                .to_string()
+                        };
+                        println!(
+                            "rel table:       {} ({} edges, {} to {})",
+                            t.name,
+                            t.edge_count,
+                            name(t.from),
+                            name(t.to)
+                        );
+                    }
+                }
+                Err(e) => return command_error("stat", &e),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => command_error("stat", &e),

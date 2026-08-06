@@ -31,3 +31,10 @@ path = "fuzz_targets/decode_segment.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_delta_patch"
+path = "fuzz_targets/decode_delta_patch.rs"
+test = false
+doc = false
+bench = false

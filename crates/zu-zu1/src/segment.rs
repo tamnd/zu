@@ -1,17 +1,32 @@
-//! Column segments: one encoded value stream stored across whole blocks.
+//! Column segments in the MiniBlock structural layout of
+//! `docs/04-storage-zu1-format.md` §3: values packed in chunks of 1024,
+//! each chunk an independently decodable `encode_auto` cascade, behind a
+//! chunk index of u32 end offsets. A point read decodes only the chunks
+//! covering the wanted rows and touches bytes on the order of the chunk,
+//! not the segment.
 //!
-//! The payload is `zu_encoding::segment::encode_auto` output, so the
-//! encoding id travels inside the payload and the reader needs no side
-//! channel beyond the `SegmentMeta`. Metas serialize into meta-block
-//! chains with a fixed little-endian layout: `value_count: u64`,
-//! `payload_len: u64`, `uncompressed_bytes: u64`, `crc32c: u32`,
-//! `block_count: u32`, then one `u64` per block pointer.
+//! Payload layout, all little-endian: `chunk_count: u32`, then one `u32`
+//! cumulative end offset per chunk (relative to the body), then the body
+//! of concatenated chunk cascades. The encoding id travels inside each
+//! chunk, so the reader needs no side channel beyond the `SegmentMeta`.
+//! Metas serialize into meta-block chains with a fixed layout:
+//! `value_count: u64`, `payload_len: u64`, `uncompressed_bytes: u64`,
+//! `crc32c: u32`, `block_count: u32`, then one `u64` per block pointer.
+//!
+//! The segment crc covers the whole payload and is verified by the full
+//! scan path and `zu verify`. The point path skips it by design (checking
+//! it would mean reading everything); it bounds every access by the meta
+//! and rejects non-monotone indexes, truncated chunks, and count
+//! mismatches instead.
 
 use zu_common::{Result, ZuError};
 use zu_encoding::segment as enc;
 
 use crate::BLOCK_SIZE;
 use crate::file::{BlockPtr, Zu1File};
+
+/// Rows per MiniBlock chunk, the unit of point access.
+pub const CHUNK_ROWS: usize = 1024;
 
 /// Location and integrity data for one stored segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,13 +95,37 @@ impl SegmentMeta {
             p,
         ))
     }
+
+    fn chunk_count(&self) -> usize {
+        self.value_count.div_ceil(CHUNK_ROWS as u64) as usize
+    }
+
+    /// Rows in chunk `i`: full except possibly the last.
+    fn chunk_rows(&self, i: usize) -> usize {
+        (self.value_count as usize - i * CHUNK_ROWS).min(CHUNK_ROWS)
+    }
 }
 
-/// Encodes `values` with the cascade selector and writes the payload
-/// across freshly allocated blocks.
+/// Encodes `values` chunk by chunk with the cascade selector and writes
+/// the MiniBlock payload across freshly allocated blocks.
 pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
-    let mut payload = Vec::new();
-    enc::encode_auto(values, &mut payload);
+    let mut body = Vec::new();
+    let mut ends = Vec::with_capacity(values.len().div_ceil(CHUNK_ROWS));
+    for chunk in values.chunks(CHUNK_ROWS) {
+        enc::encode_auto(chunk, &mut body);
+        if body.len() > u32::MAX as usize {
+            return Err(ZuError::InvalidArgument(
+                "segment body exceeds the u32 chunk index range".to_string(),
+            ));
+        }
+        ends.push(body.len() as u32);
+    }
+    let mut payload = Vec::with_capacity(4 + ends.len() * 4 + body.len());
+    payload.extend_from_slice(&(ends.len() as u32).to_le_bytes());
+    for e in &ends {
+        payload.extend_from_slice(&e.to_le_bytes());
+    }
+    payload.extend_from_slice(&body);
     let crc = crc32c::crc32c(&payload);
     let mut blocks = Vec::new();
     let mut block = vec![0u8; BLOCK_SIZE as usize];
@@ -109,6 +148,10 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
 /// Reads a segment back, verifying the payload crc, and appends the
 /// decoded values to `out`.
 pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) -> Result<()> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
     let mut payload = Vec::with_capacity(meta.payload_len as usize);
     for &ptr in &meta.blocks {
         let block = db.read_block(ptr)?;
@@ -116,26 +159,132 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
         payload.extend_from_slice(&block[..want]);
     }
     if payload.len() != meta.payload_len as usize {
-        return Err(ZuError::Corrupt {
-            what: "segment",
-            detail: "payload shorter than meta claims".to_string(),
-        });
+        return Err(corrupt("payload shorter than meta claims"));
     }
     if crc32c::crc32c(&payload) != meta.crc {
-        return Err(ZuError::Corrupt {
-            what: "segment",
-            detail: "payload crc mismatch".to_string(),
-        });
+        return Err(corrupt("payload crc mismatch"));
     }
-    let start = out.len();
-    enc::decode_any(&payload, out)?;
-    if (out.len() - start) as u64 != meta.value_count {
-        return Err(ZuError::Corrupt {
-            what: "segment",
-            detail: "decoded count disagrees with meta".to_string(),
-        });
+    let chunks = meta.chunk_count();
+    let head = payload.get(..4).ok_or_else(|| corrupt("truncated index"))?;
+    if u32::from_le_bytes(head.try_into().unwrap()) as usize != chunks {
+        return Err(corrupt("chunk count disagrees with meta"));
+    }
+    let idx_len = 4 + chunks * 4;
+    let index = payload
+        .get(4..idx_len)
+        .ok_or_else(|| corrupt("truncated index"))?;
+    let body = &payload[idx_len..];
+    let mut prev = 0usize;
+    for i in 0..chunks {
+        let end = u32::from_le_bytes(index[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+        if end < prev || end > body.len() {
+            return Err(corrupt("chunk index not monotone"));
+        }
+        let before = out.len();
+        enc::decode_any(&body[prev..end], out)?;
+        if out.len() - before != meta.chunk_rows(i) {
+            return Err(corrupt("chunk count disagrees with meta"));
+        }
+        prev = end;
+    }
+    if prev != body.len() {
+        return Err(corrupt("trailing bytes after last chunk"));
     }
     Ok(())
+}
+
+/// Point access: appends `values[start..end]` to `out`, decoding only the
+/// chunks that cover the range and reading only the bytes they occupy.
+pub fn read_range(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    start: u64,
+    end: u64,
+    out: &mut Vec<u64>,
+) -> Result<()> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    if start > end || end > meta.value_count {
+        return Err(ZuError::InvalidArgument(format!(
+            "range {start}..{end} out of 0..{}",
+            meta.value_count
+        )));
+    }
+    if start == end {
+        return Ok(());
+    }
+    let chunks = meta.chunk_count();
+    let idx_len = 4 + chunks * 4;
+    let first = start as usize / CHUNK_ROWS;
+    let last = (end - 1) as usize / CHUNK_ROWS;
+    // The index span needs the end of chunk `first - 1` to know where
+    // chunk `first` starts; chunk 0 starts at the body.
+    let lo_entry = first.saturating_sub(1);
+    let span = read_payload_span(db, meta, 4 + lo_entry * 4, 4 + (last + 1) * 4)?;
+    let ends: Vec<usize> = span
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .collect();
+    let ent = |chunk: usize| ends[chunk - lo_entry];
+    let body_start = if first == 0 { 0 } else { ent(first - 1) };
+    let body_end = ent(last);
+    if body_start > body_end || idx_len + body_end > meta.payload_len as usize {
+        return Err(corrupt("chunk index not monotone"));
+    }
+    let bytes = read_payload_span(db, meta, idx_len + body_start, idx_len + body_end)?;
+    let mut scratch = Vec::with_capacity(CHUNK_ROWS);
+    let mut prev = body_start;
+    for i in first..=last {
+        let chunk_end = ent(i);
+        if chunk_end < prev {
+            return Err(corrupt("chunk index not monotone"));
+        }
+        scratch.clear();
+        enc::decode_any(
+            &bytes[prev - body_start..chunk_end - body_start],
+            &mut scratch,
+        )?;
+        if scratch.len() != meta.chunk_rows(i) {
+            return Err(corrupt("chunk count disagrees with meta"));
+        }
+        let lo = (start as usize).max(i * CHUNK_ROWS) - i * CHUNK_ROWS;
+        let hi = (end as usize).min((i + 1) * CHUNK_ROWS) - i * CHUNK_ROWS;
+        out.extend_from_slice(&scratch[lo..hi]);
+        prev = chunk_end;
+    }
+    Ok(())
+}
+
+/// Reads payload bytes `[from, to)`, touching only the covering blocks.
+fn read_payload_span(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    from: usize,
+    to: usize,
+) -> Result<Vec<u8>> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    if from > to || to > meta.payload_len as usize {
+        return Err(corrupt("span outside the payload"));
+    }
+    let block = BLOCK_SIZE as usize;
+    let mut buf = Vec::with_capacity(to - from);
+    let mut pos = from;
+    while pos < to {
+        let offset = pos % block;
+        let len = (to - pos).min(block - offset);
+        let ptr = *meta
+            .blocks
+            .get(pos / block)
+            .ok_or_else(|| corrupt("span past the block list"))?;
+        buf.extend_from_slice(&db.read_block_slice(ptr, offset, len)?);
+        pos += len;
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -183,6 +332,46 @@ mod tests {
     }
 
     #[test]
+    fn point_reads_match_full_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        // Mixed-shape values across many chunks so different chunks pick
+        // different encodings.
+        let mut rng = 0xF00Du64;
+        let values: Vec<u64> = (0..10_000u64)
+            .map(|i| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                match (i / CHUNK_ROWS as u64) % 3 {
+                    0 => i * 5,
+                    1 => rng,
+                    _ => rng % 4,
+                }
+            })
+            .collect();
+        let meta = write_segment(&mut db, &values).unwrap();
+        let ranges = [
+            (0u64, 1u64),
+            (0, values.len() as u64),
+            (1023, 1025),
+            (1024, 2048),
+            (2047, 2049),
+            (5000, 5000),
+            (9_999, 10_000),
+            (500, 7_777),
+        ];
+        for (s, e) in ranges {
+            let mut got = Vec::new();
+            read_range(&mut db, &meta, s, e, &mut got).unwrap();
+            assert_eq!(got, values[s as usize..e as usize], "range {s}..{e}");
+        }
+        let mut out = Vec::new();
+        assert!(read_range(&mut db, &meta, 5, 4, &mut out).is_err());
+        assert!(read_range(&mut db, &meta, 0, values.len() as u64 + 1, &mut out).is_err());
+    }
+
+    #[test]
     fn corrupt_payload_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
@@ -196,13 +385,35 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_index_cannot_panic_point_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let values: Vec<u64> = (0..5000u64).map(|i| i * 3).collect();
+        let meta = write_segment(&mut db, &values).unwrap();
+        // Flip the index entry of chunk 2 to a huge end offset; the point
+        // path skips the crc, so it must fail on its own bounds checks.
+        let mut block = db.read_block(meta.blocks[0]).unwrap();
+        block[4 + 2 * 4..4 + 3 * 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        db.write_block(meta.blocks[0], &block).unwrap();
+        let mut out = Vec::new();
+        assert!(read_range(&mut db, &meta, 2048, 2050, &mut out).is_err());
+        // A non-monotone entry (end below the previous chunk's end).
+        let mut block = db.read_block(meta.blocks[0]).unwrap();
+        block[4 + 2 * 4..4 + 3 * 4].copy_from_slice(&0u32.to_le_bytes());
+        db.write_block(meta.blocks[0], &block).unwrap();
+        assert!(read_range(&mut db, &meta, 2048, 2050, &mut out).is_err());
+    }
+
+    #[test]
     fn empty_segment() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
         let meta = write_segment(&mut db, &[]).unwrap();
-        assert_eq!(meta.blocks.len(), 1, "even empty carries the id byte");
+        assert_eq!(meta.blocks.len(), 1, "even empty carries the chunk count");
         let mut out = Vec::new();
         read_segment(&mut db, &meta, &mut out).unwrap();
+        assert!(out.is_empty());
+        read_range(&mut db, &meta, 0, 0, &mut out).unwrap();
         assert!(out.is_empty());
     }
 }

@@ -136,13 +136,18 @@ fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f
     let file_bytes = std::fs::metadata(&path).expect("metadata").len();
     let medges_s = directory.edge_count as f64 / secs / 1e6;
     // The file holds two CSRs, so density is quoted per direction: bwd
-    // payload bytes are carved out of the fwd number, keeping it
-    // comparable with the single-direction figures the ceilings were set
-    // against. Headers and directory overhead stay on the fwd side.
+    // block bytes are carved out of the fwd number, keeping it comparable
+    // with the single-direction figures the ceilings were set against.
+    // Blocks, not payloads: each segment pads to 256 KiB blocks and that
+    // padding is part of the direction's disk footprint. Headers and
+    // directory overhead stay on the fwd side.
     let bwd_bytes: u64 = directory
         .groups
         .iter()
-        .map(|g| g.bwd.offsets.payload_len + g.bwd.neighbors.payload_len)
+        .map(|g| {
+            (g.bwd.offsets.blocks.len() + g.bwd.neighbors.blocks.len()) as u64
+                * u64::from(zu_zu1::BLOCK_SIZE)
+        })
         .sum();
     let bits_fwd = (file_bytes - bwd_bytes) as f64 * 8.0 / directory.edge_count as f64;
     let bits_bwd = bwd_bytes as f64 * 8.0 / directory.edge_count as f64;

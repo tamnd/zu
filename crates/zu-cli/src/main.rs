@@ -163,12 +163,17 @@ fn copy(
             let total = started.elapsed();
             let file_bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
             // Adjacency density is quoted per direction: the file holds
-            // two CSRs, so bwd payload bytes are carved out of the fwd
-            // number to stay comparable with single-direction figures.
+            // two CSRs, so bwd block bytes (payload plus 256 KiB block
+            // padding, the direction's real disk footprint) are carved
+            // out of the fwd number to stay comparable with
+            // single-direction figures.
             let bwd_bytes: u64 = d
                 .groups
                 .iter()
-                .map(|g| g.bwd.offsets.payload_len + g.bwd.neighbors.payload_len)
+                .map(|g| {
+                    (g.bwd.offsets.blocks.len() + g.bwd.neighbors.blocks.len()) as u64
+                        * u64::from(zu::zu1::BLOCK_SIZE)
+                })
                 .sum();
             let per_edge = |bytes: u64| bytes as f64 * 8.0 / d.edge_count as f64;
             println!(

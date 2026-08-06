@@ -44,6 +44,14 @@ point_klookups_s = 30.0
 # machine when it decodes whole groups.
 point_in_klookups_s = 2.0
 
+# Random edge probes on the loaded LiveJournal file, single core,
+# K probes/s, half present and half near misses. A probe reads two
+# offsets and then exactly one neighbor chunk named by the fence array,
+# so hub degrees do not move the number. The floor sits with the point
+# floor: a probe never decodes more than a point read of the same list.
+# Raise floors, never lower them.
+edge_probe_kprobes_s = 30.0
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

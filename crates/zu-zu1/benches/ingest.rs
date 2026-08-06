@@ -121,6 +121,11 @@ fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f
     let directory = bulk_load(&mut db, node_count, &edges).expect("bulk_load");
     let secs = start.elapsed().as_secs_f64();
     drop(db);
+    // Free the half-gigabyte edge vector before the point phase: on the
+    // small-RAM machines it evicts the loaded file from page cache and
+    // every random read becomes a disk seek, which measures the disk,
+    // not the reader.
+    drop(edges);
 
     let file_bytes = std::fs::metadata(&path).expect("metadata").len();
     let medges_s = directory.edge_count as f64 / secs / 1e6;

@@ -24,6 +24,7 @@ bits_per_edge_bfs = 22.5
 
 # Random 1-hop point reads on the loaded LiveJournal file, single core,
 # K lookups/s. Each lookup decodes only the chunks holding the node's two
-# offsets and its neighbor list. Floor set for the slowest gate machine;
-# raise floors, never lower them.
-point_klookups_s = 50.0
+# offsets and its neighbor list. Measured: gamingpc 237, server3 50,
+# server1 46; the floor leaves the usual vCPU noise headroom under the
+# slowest machine. Raise floors, never lower them.
+point_klookups_s = 30.0

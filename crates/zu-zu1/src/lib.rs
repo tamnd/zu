@@ -8,6 +8,7 @@
 pub mod file;
 pub mod graph;
 pub mod meta;
+pub mod reorder;
 pub mod segment;
 
 use std::path::Path;

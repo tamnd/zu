@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{bulk_load, read_edge_list};
+use zu_zu1::reorder;
 
 fn load_real(dir: &str) -> Option<Vec<(u32, u32)>> {
     let path = format!("{dir}/soc-LiveJournal1.txt");
@@ -54,6 +55,34 @@ fn budget(key: &str) -> Option<f64> {
     None
 }
 
+/// Sorts, dedups, bulk loads, and verifies; returns (M edges/s, bits/edge).
+fn run_load(label: &str, mut edges: Vec<(u32, u32)>, node_count: u64) -> (f64, f64) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ingest.zu1");
+    let start = Instant::now();
+    edges.sort_unstable();
+    edges.dedup();
+    let mut db = Zu1File::create(&path).expect("create");
+    let directory = bulk_load(&mut db, node_count, &edges).expect("bulk_load");
+    let secs = start.elapsed().as_secs_f64();
+    drop(db);
+
+    let file_bytes = std::fs::metadata(&path).expect("metadata").len();
+    let medges_s = directory.edge_count as f64 / secs / 1e6;
+    let bits_per_edge = file_bytes as f64 * 8.0 / directory.edge_count as f64;
+    println!(
+        "{label}: {:.2} M edges/s, {bits_per_edge:.2} bits/edge ({} edges, {} nodes, {} groups, {:.2}s, {file_bytes} bytes)",
+        medges_s,
+        directory.edge_count,
+        directory.node_count,
+        directory.groups.len(),
+        secs
+    );
+    let verified = zu_zu1::verify(&path).expect("verify");
+    println!("{label} verify: ok, {verified} payload bytes checked");
+    (medges_s, bits_per_edge)
+}
+
 fn main() {
     let real = std::env::var("ZU_DATA").ok().and_then(|d| load_real(&d));
     let is_real = real.is_some();
@@ -65,33 +94,24 @@ fn main() {
         .map(|&(s, d)| u64::from(s.max(d)) + 1)
         .max()
         .unwrap_or(0);
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("ingest.zu1");
 
-    let start = Instant::now();
-    let mut sorted = edges;
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut db = Zu1File::create(&path).expect("create");
-    let directory = bulk_load(&mut db, node_count, &sorted).expect("bulk_load");
-    let secs = start.elapsed().as_secs_f64();
-    drop(db);
+    let (medges_s, bits_raw) = run_load("copy", edges.clone(), node_count);
 
-    let file_bytes = std::fs::metadata(&path).expect("metadata").len();
-    let medges_s = directory.edge_count as f64 / secs / 1e6;
-    let bits_per_edge = file_bytes as f64 * 8.0 / directory.edge_count as f64;
-    println!(
-        "copy: {:.2} M edges/s ({} edges, {} nodes, {} groups, {:.2}s)",
-        medges_s,
-        directory.edge_count,
-        directory.node_count,
-        directory.groups.len(),
-        secs
-    );
-    println!("adjacency: {bits_per_edge:.2} bits/edge ({file_bytes} bytes on disk)");
-
-    let verified = zu_zu1::verify(&path).expect("verify");
-    println!("verify: ok, {verified} payload bytes checked");
+    // B8 is defined on the reordered graph (docs/04 §5): BFS relabeling
+    // from max-degree roots, timed separately since REORDER is opt-in.
+    let mut bits_bfs = None;
+    if is_real {
+        let start = Instant::now();
+        let map = reorder::bfs_order(node_count, &edges);
+        let mut relabeled = edges;
+        reorder::relabel(&mut relabeled, &map);
+        println!(
+            "reorder bfs: mapping built in {:.2}s",
+            start.elapsed().as_secs_f64()
+        );
+        let (_, bits) = run_load("copy+bfs", relabeled, node_count);
+        bits_bfs = Some(bits);
+    }
 
     let mut failed = false;
     if let Some(floor) = budget("copy_medges_s")
@@ -100,14 +120,20 @@ fn main() {
         println!("GATE FAIL copy: {medges_s:.2} M edges/s < floor {floor}");
         failed = true;
     }
-    // The density budget is defined against the real LiveJournal ordering.
+    // Density budgets are defined against the real LiveJournal file.
     // Random synthetic neighbors sit near 17 bits of entropy per edge, so
-    // the ceiling cannot apply there.
+    // no ceiling can apply there.
     if is_real
         && let Some(ceiling) = budget("bits_per_edge")
-        && bits_per_edge > ceiling
+        && bits_raw > ceiling
     {
-        println!("GATE FAIL density: {bits_per_edge:.2} bits/edge > ceiling {ceiling}");
+        println!("GATE FAIL density: {bits_raw:.2} bits/edge > ceiling {ceiling}");
+        failed = true;
+    }
+    if let (Some(bits), Some(ceiling)) = (bits_bfs, budget("bits_per_edge_bfs"))
+        && bits > ceiling
+    {
+        println!("GATE FAIL density bfs: {bits:.2} bits/edge > ceiling {ceiling}");
         failed = true;
     }
     if gate && failed {

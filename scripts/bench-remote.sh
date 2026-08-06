@@ -8,10 +8,15 @@ set -euo pipefail
 HOST="${1:?usage: bench-remote.sh <host> [ref]}"
 REF="${2:-origin/main}"
 
-# The B7 open bench builds a 10 GB file under ZU_DATA; only gamingpc has
-# the disk for it, the small servers skip.
+# The B7 open bench builds a 10 GB file under ZU_DATA and the B6 phase
+# loads the 117 M edge com-Orkut graph; only gamingpc has the disk and
+# RAM for them, the small servers skip both.
 B7=0
-[ "$HOST" = gamingpc ] && B7=1
+B6=0
+if [ "$HOST" = gamingpc ]; then
+    B7=1
+    B6=1
+fi
 
 REMOTE=$(
     cat <<EOF
@@ -22,7 +27,7 @@ git reset -q --hard "$REF"
 . \$HOME/.cargo/env 2>/dev/null || true
 echo "host: \$(hostname), \$(nproc) cores, \$(rustc --version | cut -d' ' -f1-2)"
 ZU_GATE=1 ZU_DATA=\$HOME/data/zu cargo bench -q -p zu-encoding --bench decode 2>/dev/null
-ZU_GATE=1 ZU_DATA=\$HOME/data/zu cargo bench -q -p zu-zu1 --bench ingest 2>/dev/null
+ZU_GATE=1 ZU_DATA=\$HOME/data/zu ZU_B6=$B6 cargo bench -q -p zu-zu1 --bench ingest 2>/dev/null
 ZU_GATE=1 ZU_DATA=\$HOME/data/zu ZU_B7=$B7 cargo bench -q -p zu-zu1 --bench open 2>/dev/null
 EOF
 )

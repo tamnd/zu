@@ -27,8 +27,10 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
     out.len() - start
 }
 
-/// Decodes an encoded buffer, appending the values to `out`.
-pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
+/// Decodes an encoded buffer, appending at most `max_values` values to
+/// `out`. The ceiling bounds both streams: a real dictionary never
+/// holds more distinct values than the rows it codes.
+pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "dict",
         detail: detail.to_string(),
@@ -47,9 +49,9 @@ pub fn decode(bytes: &[u8], out: &mut Vec<u64>) -> Result<()> {
         .get(4 + dict_len..)
         .ok_or_else(|| corrupt("truncated codes"))?;
     let mut dict = Vec::new();
-    for_bitpack::decode(dict_bytes, &mut dict)?;
+    for_bitpack::decode(dict_bytes, max_values, &mut dict)?;
     let start = out.len();
-    for_bitpack::decode(codes_bytes, out)?;
+    for_bitpack::decode(codes_bytes, max_values, out)?;
     for slot in &mut out[start..] {
         let code = *slot as usize;
         *slot = *dict.get(code).ok_or_else(|| corrupt("code out of range"))?;
@@ -72,7 +74,7 @@ mod tests {
             "3 distinct values should pack below 1 B/row"
         );
         let mut out = Vec::new();
-        decode(&buf, &mut out).unwrap();
+        decode(&buf, values.len(), &mut out).unwrap();
         assert_eq!(values, out);
     }
 
@@ -82,7 +84,7 @@ mod tests {
         let mut buf = Vec::new();
         encode(&values, &mut buf);
         let mut out = Vec::new();
-        decode(&buf, &mut out).unwrap();
+        decode(&buf, values.len(), &mut out).unwrap();
         assert_eq!(values, out);
     }
 
@@ -91,6 +93,6 @@ mod tests {
         let mut buf = Vec::new();
         encode(&[5, 6, 5], &mut buf);
         let mut out = Vec::new();
-        assert!(decode(&buf[..5], &mut out).is_err());
+        assert!(decode(&buf[..5], 16, &mut out).is_err());
     }
 }

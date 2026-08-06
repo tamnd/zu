@@ -91,7 +91,10 @@ impl Directory {
         out
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+    /// Decodes a directory chain payload. Public alongside the other
+    /// container decoders so tooling and the fuzz targets reach it
+    /// without a file around it.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         let corrupt = |detail: &str| ZuError::Corrupt {
             what: "group directory",
             detail: detail.to_string(),
@@ -107,6 +110,12 @@ impl Directory {
         let node_count = u64::from_le_bytes(head[2..10].try_into().unwrap());
         let edge_count = u64::from_le_bytes(head[10..18].try_into().unwrap());
         let group_count = u32::from_le_bytes(head[18..22].try_into().unwrap()) as usize;
+        // A group entry is at least 132 bytes (row count plus four empty
+        // segment metas), so a count the payload cannot hold is rejected
+        // before it sizes an allocation.
+        if group_count > bytes.len().saturating_sub(22) / 132 {
+            return Err(corrupt("truncated group entry"));
+        }
         let mut pos = 22;
         let mut groups = Vec::with_capacity(group_count);
         for _ in 0..group_count {
@@ -739,5 +748,17 @@ mod tests {
                 assert_eq!(got, want, "node {node} {dir:?}");
             }
         }
+    }
+
+    #[test]
+    fn hostile_group_count_rejected() {
+        // A 22 byte header claiming u32::MAX groups must die on the size
+        // check, not in the allocator.
+        let mut bytes = DIRECTORY_VERSION.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&10u64.to_le_bytes());
+        bytes.extend_from_slice(&20u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = Directory::decode(&bytes).unwrap_err();
+        assert!(format!("{err}").contains("truncated group entry"));
     }
 }

@@ -22,9 +22,24 @@ copy_medges_s = 1.0
 bits_per_edge = 22.5
 bits_per_edge_bfs = 22.0
 
+# Reverse-direction CSR density ceiling, block bytes over edge count.
+# Measured 22.13 raw and 21.34 BFS on all three machines; bwd runs
+# slightly denser than fwd because it carries no header or directory
+# overhead. Lower this ceiling, never raise it.
+bits_per_edge_bwd = 22.3
+
 # Random 1-hop point reads on the loaded LiveJournal file, single core,
 # K lookups/s. Each lookup decodes only the chunks holding the node's two
 # offsets and its neighbor list. Measured: gamingpc 237, server3 50,
 # server1 46; the floor leaves the usual vCPU noise headroom under the
 # slowest machine. Raise floors, never lower them.
 point_klookups_s = 30.0
+
+# In-neighbor point reads through the bwd CSR. Measured: gamingpc 233,
+# server3 44 to 45, server1 46 warm but 4 on the pass where the 383 MB
+# dual-direction file no longer fits page cache and the tail goes to the
+# virtio disk (p50 stays 16 us, p99 hits 5 ms). The floor sits under that
+# cold tail until the reader manages its own memory (B3); it still
+# catches a broken point path, which measures well under 1 on every
+# machine when it decodes whole groups.
+point_in_klookups_s = 2.0

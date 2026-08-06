@@ -1,17 +1,20 @@
 //! Bulk-loaded graph storage: node groups of 131,072 rows, per-group CSR
-//! with sorted neighbor lists, and the group directory meta chain.
+//! in both directions, and the group directory meta chain.
 //!
 //! This is the read-optimized COPY path of `docs/04-storage-zu1-format.md`
 //! §2 and §4. Each group stores two segments per direction: slot offsets
 //! (131,073 monotone values, so delta wins the cascade) and neighbor ids
 //! as dense row ids, sorted per list, which is what hits the bits per
-//! edge target. Slack gaps and the spill chain arrive with the updatable
-//! CSR; bulk-built groups are dense.
+//! edge target. Fwd is keyed by source, Bwd by destination, so both
+//! out-neighbors and in-neighbors answer without scanning. Slack gaps and
+//! the spill chain arrive with the updatable CSR; bulk-built groups are
+//! dense.
 //!
 //! Directory layout (version-prefixed, hand-rolled):
 //! `version: u16`, `node_count: u64`, `edge_count: u64`,
 //! `group_count: u32`, then per group `row_count: u32` followed by the
-//! offsets and neighbors `SegmentMeta`.
+//! fwd offsets, fwd neighbors, bwd offsets, and bwd neighbors
+//! `SegmentMeta`.
 
 use std::io::BufRead;
 use std::path::Path;
@@ -22,15 +25,39 @@ use crate::file::Zu1File;
 use crate::meta;
 use crate::segment::{SegmentMeta, read_range, read_segment, write_segment};
 
-const DIRECTORY_VERSION: u16 = 1;
+const DIRECTORY_VERSION: u16 = 2;
 
-/// One node group's forward CSR: `row_count + 1` offsets into the
+/// Traversal direction: Fwd follows edges source to destination, Bwd the
+/// reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Fwd,
+    Bwd,
+}
+
+/// One direction of a group's CSR: `row_count + 1` offsets into the
 /// neighbor segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectionMeta {
+    pub offsets: SegmentMeta,
+    pub neighbors: SegmentMeta,
+}
+
+/// One node group's CSR pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMeta {
     pub row_count: u32,
-    pub offsets: SegmentMeta,
-    pub neighbors: SegmentMeta,
+    pub fwd: DirectionMeta,
+    pub bwd: DirectionMeta,
+}
+
+impl GroupMeta {
+    pub fn dir(&self, dir: Direction) -> &DirectionMeta {
+        match dir {
+            Direction::Fwd => &self.fwd,
+            Direction::Bwd => &self.bwd,
+        }
+    }
 }
 
 /// The per-table group directory, stored as one meta chain.
@@ -50,8 +77,10 @@ impl Directory {
         out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
         for g in &self.groups {
             out.extend_from_slice(&g.row_count.to_le_bytes());
-            g.offsets.encode(&mut out);
-            g.neighbors.encode(&mut out);
+            g.fwd.offsets.encode(&mut out);
+            g.fwd.neighbors.encode(&mut out);
+            g.bwd.offsets.encode(&mut out);
+            g.bwd.neighbors.encode(&mut out);
         }
         out
     }
@@ -80,13 +109,23 @@ impl Directory {
                 .ok_or_else(|| corrupt("truncated group entry"))?;
             let row_count = u32::from_le_bytes(rc.try_into().unwrap());
             pos += 4;
-            let (offsets, next) = SegmentMeta::decode(bytes, pos)?;
-            let (neighbors, end) = SegmentMeta::decode(bytes, next)?;
-            pos = end;
+            let mut metas = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let (meta, next) = SegmentMeta::decode(bytes, pos)?;
+                metas.push(meta);
+                pos = next;
+            }
+            let mut it = metas.into_iter();
             groups.push(GroupMeta {
                 row_count,
-                offsets,
-                neighbors,
+                fwd: DirectionMeta {
+                    offsets: it.next().unwrap(),
+                    neighbors: it.next().unwrap(),
+                },
+                bwd: DirectionMeta {
+                    offsets: it.next().unwrap(),
+                    neighbors: it.next().unwrap(),
+                },
             });
         }
         if pos != bytes.len() {
@@ -134,16 +173,19 @@ pub fn read_edge_list(path: &Path) -> Result<Vec<(u32, u32)>> {
     }
 }
 
-/// Bulk-loads a forward CSR from an edge list into `db` and publishes it
-/// with a checkpoint. `edges` must be sorted by `(src, dst)` and node ids
-/// must be dense row ids below `node_count`. Returns the directory.
-pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Result<Directory> {
+/// Builds one direction's CSR groups from edges sorted by `(key, other)`.
+fn build_direction(
+    db: &mut Zu1File,
+    node_count: u64,
+    edges: &[(u32, u32)],
+) -> Result<Vec<DirectionMeta>> {
+    #[cfg(debug_assertions)]
     for w in edges.windows(2) {
         debug_assert!(w[0] <= w[1], "edges must be sorted");
     }
     let group_rows = GROUP_ROWS as u64;
     let group_count = node_count.div_ceil(group_rows).max(1) as usize;
-    let mut groups = Vec::with_capacity(group_count);
+    let mut dirs = Vec::with_capacity(group_count);
     let mut edge_ix = 0usize;
     let mut offsets = Vec::new();
     let mut neighbors: Vec<u64> = Vec::new();
@@ -161,12 +203,9 @@ pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Res
             }
             offsets.push(neighbors.len() as u64);
         }
-        let offsets_meta = write_segment(db, &offsets)?;
-        let neighbors_meta = write_segment(db, &neighbors)?;
-        groups.push(GroupMeta {
-            row_count,
-            offsets: offsets_meta,
-            neighbors: neighbors_meta,
+        dirs.push(DirectionMeta {
+            offsets: write_segment(db, &offsets)?,
+            neighbors: write_segment(db, &neighbors)?,
         });
     }
     if edge_ix != edges.len() {
@@ -175,6 +214,34 @@ pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Res
             edges.len() - edge_ix
         )));
     }
+    Ok(dirs)
+}
+
+/// Bulk-loads both CSR directions from an edge list into `db` and
+/// publishes them with a checkpoint. `edges` must be sorted by
+/// `(src, dst)` and node ids must be dense row ids below `node_count`.
+/// The reverse direction is built from an internally sorted `(dst, src)`
+/// copy, so peak memory holds the edge list twice. Returns the directory.
+pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Result<Directory> {
+    let fwd = build_direction(db, node_count, edges)?;
+    let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
+    rev.sort_unstable();
+    let bwd = build_direction(db, node_count, &rev)?;
+    drop(rev);
+    let row_counts = |g: u64| {
+        let first_row = g * GROUP_ROWS as u64;
+        (node_count - first_row).min(GROUP_ROWS as u64) as u32
+    };
+    let groups = fwd
+        .into_iter()
+        .zip(bwd)
+        .enumerate()
+        .map(|(g, (fwd, bwd))| GroupMeta {
+            row_count: row_counts(g as u64),
+            fwd,
+            bwd,
+        })
+        .collect();
     let directory = Directory {
         node_count,
         edge_count: edges.len() as u64,
@@ -187,11 +254,11 @@ pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Res
 }
 
 /// Read access to a bulk-loaded graph, caching the most recently decoded
-/// group so sequential scans decode each group once.
+/// group and direction so sequential scans decode each group once.
 #[derive(Debug)]
 pub struct GraphReader {
     directory: Directory,
-    cached_group: Option<(usize, Vec<u64>, Vec<u64>)>,
+    cached_group: Option<(usize, Direction, Vec<u64>, Vec<u64>)>,
 }
 
 impl GraphReader {
@@ -209,49 +276,69 @@ impl GraphReader {
         &self.directory
     }
 
-    /// Returns the sorted neighbor list of `node`, decoding the node's
-    /// group on a cache miss.
-    pub fn neighbors(&mut self, db: &mut Zu1File, node: u64) -> Result<&[u64]> {
+    fn locate(&self, node: u64) -> Result<(usize, usize)> {
         if node >= self.directory.node_count {
             return Err(ZuError::InvalidArgument(format!(
                 "node {node} out of range 0..{}",
                 self.directory.node_count
             )));
         }
-        let g = (node / GROUP_ROWS as u64) as usize;
-        let row = (node % GROUP_ROWS as u64) as usize;
-        if self.cached_group.as_ref().map(|(i, _, _)| *i) != Some(g) {
-            let meta = &self.directory.groups[g];
+        Ok((
+            (node / GROUP_ROWS as u64) as usize,
+            (node % GROUP_ROWS as u64) as usize,
+        ))
+    }
+
+    /// Returns `node`'s sorted list in `dir`, decoding the node's group
+    /// on a cache miss.
+    pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
+        let (g, row) = self.locate(node)?;
+        if self.cached_group.as_ref().map(|(i, d, _, _)| (*i, *d)) != Some((g, dir)) {
+            let meta = self.directory.groups[g].dir(dir);
             let mut offsets = Vec::with_capacity(meta.offsets.value_count as usize);
             let mut nbrs = Vec::with_capacity(meta.neighbors.value_count as usize);
             read_segment(db, &meta.offsets, &mut offsets)?;
             read_segment(db, &meta.neighbors, &mut nbrs)?;
-            self.cached_group = Some((g, offsets, nbrs));
+            self.cached_group = Some((g, dir, offsets, nbrs));
         }
-        let (_, offsets, nbrs) = self.cached_group.as_ref().unwrap();
+        let (_, _, offsets, nbrs) = self.cached_group.as_ref().unwrap();
         let lo = offsets[row] as usize;
         let hi = offsets[row + 1] as usize;
         Ok(&nbrs[lo..hi])
     }
 
-    /// Point access: appends `node`'s sorted neighbor list to `out`
+    /// Returns the sorted out-neighbor list of `node`.
+    pub fn neighbors(&mut self, db: &mut Zu1File, node: u64) -> Result<&[u64]> {
+        self.neighbors_dir(db, node, Direction::Fwd)
+    }
+
+    /// Point access: appends `node`'s sorted list in `dir` to `out`
     /// without decoding the group. Two offset values locate the list,
     /// then only the chunks covering it are read, so a 1-hop read
     /// touches at most `2 + ceil(degree / 1024) + 1` chunk decodes and
     /// bytes on that order rather than the group's megabytes.
-    pub fn neighbors_into(&self, db: &mut Zu1File, node: u64, out: &mut Vec<u64>) -> Result<()> {
-        if node >= self.directory.node_count {
-            return Err(ZuError::InvalidArgument(format!(
-                "node {node} out of range 0..{}",
-                self.directory.node_count
-            )));
-        }
-        let g = (node / GROUP_ROWS as u64) as usize;
-        let row = node % GROUP_ROWS as u64;
-        let meta = &self.directory.groups[g];
+    pub fn neighbors_dir_into(
+        &self,
+        db: &mut Zu1File,
+        node: u64,
+        dir: Direction,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let (g, row) = self.locate(node)?;
+        let meta = self.directory.groups[g].dir(dir);
         let mut offs = Vec::with_capacity(2);
-        read_range(db, &meta.offsets, row, row + 2, &mut offs)?;
+        read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
         read_range(db, &meta.neighbors, offs[0], offs[1], out)
+    }
+
+    /// Point access to the out-neighbor list.
+    pub fn neighbors_into(&self, db: &mut Zu1File, node: u64, out: &mut Vec<u64>) -> Result<()> {
+        self.neighbors_dir_into(db, node, Direction::Fwd, out)
+    }
+
+    /// Point access to the in-neighbor list.
+    pub fn in_neighbors_into(&self, db: &mut Zu1File, node: u64, out: &mut Vec<u64>) -> Result<()> {
+        self.neighbors_dir_into(db, node, Direction::Bwd, out)
     }
 }
 
@@ -266,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_small_graph() {
+    fn roundtrip_small_graph_both_directions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("g.zu1");
         let mut edges = vec![(0u32, 1u32), (0, 3), (1, 2), (3, 0), (3, 1), (4, 4)];
@@ -284,6 +371,18 @@ mod tests {
         assert_eq!(reader.neighbors(&mut db, 3).unwrap(), &[0, 1]);
         assert_eq!(reader.neighbors(&mut db, 4).unwrap(), &[4]);
         assert!(reader.neighbors(&mut db, 5).is_err());
+        // In-neighbors: who points at each node.
+        let cases: &[(u64, &[u64])] = &[(0, &[3]), (1, &[0, 3]), (2, &[1]), (3, &[0]), (4, &[4])];
+        for &(node, want) in cases {
+            assert_eq!(
+                reader.neighbors_dir(&mut db, node, Direction::Bwd).unwrap(),
+                want,
+                "in-neighbors of {node}"
+            );
+            let mut point = Vec::new();
+            reader.in_neighbors_into(&mut db, node, &mut point).unwrap();
+            assert_eq!(point, want, "point in-neighbors of {node}");
+        }
     }
 
     #[test]
@@ -318,6 +417,16 @@ mod tests {
         );
         assert_eq!(reader.neighbors(&mut db, node_count - 1).unwrap(), &[2]);
         assert_eq!(reader.neighbors(&mut db, 5).unwrap(), &[] as &[u64]);
+        // Cross-group in-neighbors: node 0 is pointed at by rows - 1, node
+        // 2 by the last node.
+        assert_eq!(
+            reader.neighbors_dir(&mut db, 0, Direction::Bwd).unwrap(),
+            &[u64::from(rows) - 1]
+        );
+        assert_eq!(
+            reader.neighbors_dir(&mut db, 2, Direction::Bwd).unwrap(),
+            &[node_count - 1]
+        );
     }
 
     #[test]
@@ -327,6 +436,13 @@ mod tests {
         let edges = [(0u32, 1u32), (9, 0)];
         assert!(matches!(
             bulk_load(&mut db, 5, &edges),
+            Err(ZuError::InvalidArgument(_))
+        ));
+        // A destination out of range must fail too, via the bwd build.
+        let mut db2 = Zu1File::create(&dir.path().join("g2.zu1")).unwrap();
+        let edges = [(0u32, 1u32), (1, 9)];
+        assert!(matches!(
+            bulk_load(&mut db2, 5, &edges),
             Err(ZuError::InvalidArgument(_))
         ));
     }
@@ -349,9 +465,14 @@ mod tests {
             })
             .collect();
         let edges = sorted_edges(&mut edges);
-        let mut reference: Vec<Vec<u64>> = vec![Vec::new(); n as usize];
+        let mut out_ref: Vec<Vec<u64>> = vec![Vec::new(); n as usize];
+        let mut in_ref: Vec<Vec<u64>> = vec![Vec::new(); n as usize];
         for &(s, d) in edges.iter() {
-            reference[s as usize].push(u64::from(d));
+            out_ref[s as usize].push(u64::from(d));
+            in_ref[d as usize].push(u64::from(s));
+        }
+        for l in &mut in_ref {
+            l.sort_unstable();
         }
         {
             let mut db = Zu1File::create(&path).unwrap();
@@ -363,12 +484,24 @@ mod tests {
         for v in 0..u64::from(n) {
             assert_eq!(
                 reader.neighbors(&mut db, v).unwrap(),
-                reference[v as usize].as_slice(),
+                out_ref[v as usize].as_slice(),
                 "node {v}"
             );
             point.clear();
             reader.neighbors_into(&mut db, v, &mut point).unwrap();
-            assert_eq!(point, reference[v as usize], "point read node {v}");
+            assert_eq!(point, out_ref[v as usize], "point read node {v}");
+            point.clear();
+            reader.in_neighbors_into(&mut db, v, &mut point).unwrap();
+            assert_eq!(point, in_ref[v as usize], "point in read node {v}");
+        }
+        // The full-decode bwd path against the same reference, exercising
+        // the (group, direction) cache.
+        for v in 0..u64::from(n) {
+            assert_eq!(
+                reader.neighbors_dir(&mut db, v, Direction::Bwd).unwrap(),
+                in_ref[v as usize].as_slice(),
+                "in node {v}"
+            );
         }
         assert!(
             reader
@@ -397,10 +530,14 @@ mod tests {
         let mut db = Zu1File::open(&path).unwrap();
         let mut reader = GraphReader::load(&mut db).unwrap();
         for node in [7u64, 1023, 1024, u64::from(rows), 0, node_count - 1] {
-            let want = reader.neighbors(&mut db, node).unwrap().to_vec();
-            let mut got = Vec::new();
-            reader.neighbors_into(&mut db, node, &mut got).unwrap();
-            assert_eq!(got, want, "node {node}");
+            for dir in [Direction::Fwd, Direction::Bwd] {
+                let want = reader.neighbors_dir(&mut db, node, dir).unwrap().to_vec();
+                let mut got = Vec::new();
+                reader
+                    .neighbors_dir_into(&mut db, node, dir, &mut got)
+                    .unwrap();
+                assert_eq!(got, want, "node {node} {dir:?}");
+            }
         }
     }
 }

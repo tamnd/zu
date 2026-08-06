@@ -23,3 +23,7 @@ workspace = true
 [[bench]]
 name = "ingest"
 harness = false
+
+[[bench]]
+name = "open"
+harness = false

@@ -43,3 +43,11 @@ point_klookups_s = 30.0
 # catches a broken point path, which measures well under 1 on every
 # machine when it decodes whole groups.
 point_in_klookups_s = 2.0
+
+# B7 exit budget straight from docs/12: a 10 GB file opens in under
+# 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
+# free list chain and pages everything else lazily, so this catches any
+# open path that starts scaling with file size. Gated on gamingpc, the
+# host with the disk for the 10 GB build (ZU_B7=1). Lower this ceiling,
+# never raise it.
+open_p99_ms = 10.0

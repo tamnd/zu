@@ -65,7 +65,7 @@ SegmentMeta {
 ```
 
 ### Structural encodings (random access without row groups)
-- **MiniBlock** (types ≤ 16 B): values packed in chunks of 1024 values (FastLanes transposed layout inside); chunk index = one u32 cumulative end offset per chunk (~4 B/chunk metadata; the width byte travels inside the chunk because every chunk is a self-describing cascade). Point read = 1 chunk decode (≤ 4 KiB touch). Matches Lance mini-block ~24–41 B/chunk finding.
+- **MiniBlock** (types ≤ 16 B): values packed in chunks of 1024 values (FastLanes transposed layout inside); chunk index = one u32 cumulative end offset per chunk, followed by one u64 fence per chunk holding the chunk's last value (~12 B/chunk metadata; the width byte travels inside the chunk because every chunk is a self-describing cascade). Point read = 1 chunk decode (≤ 4 KiB touch). Matches Lance mini-block ~24–41 B/chunk finding. The fences double as zone maps for sorted row ranges: within a CSR neighbor list, a binary search over the fences names the single chunk that can hold a value, so an edge probe decodes one chunk regardless of degree, and the full-scan path cross-checks every fence against its chunk's decoded tail.
 - **FullZip** (STRING > dict threshold, BLOB, VECTOR, LIST payloads): values zipped with their lengths so a row range is one contiguous byte range; per-1024-row offset samples for O(1) seek.
 
 ### Value encodings (encoding ids are format-stable)

@@ -6,9 +6,15 @@
 //! not the segment.
 //!
 //! Payload layout, all little-endian: `chunk_count: u32`, then one `u32`
-//! cumulative end offset per chunk (relative to the body), then the body
-//! of concatenated chunk cascades. The encoding id travels inside each
+//! cumulative end offset per chunk (relative to the body), then one `u64`
+//! fence per chunk holding the chunk's last value, then the body of
+//! concatenated chunk cascades. The encoding id travels inside each
 //! chunk, so the reader needs no side channel beyond the `SegmentMeta`.
+//! The fences are what make [`probe`] cheap: inside any sorted row range
+//! the fence of a fully covered chunk is an in-order sample, so a binary
+//! search over fences names the one chunk that could hold a value and the
+//! probe decodes that chunk alone. They cost 8 bytes per 1024 values,
+//! about 0.06 bits per value.
 //! Metas serialize into meta-block chains with a fixed layout:
 //! `value_count: u64`, `payload_len: u64`, `uncompressed_bytes: u64`,
 //! `crc32c: u32`, `block_count: u32`, then one `u64` per block pointer.
@@ -115,7 +121,9 @@ impl SegmentMeta {
 /// the MiniBlock payload across freshly allocated blocks.
 pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
     let mut body = Vec::new();
-    let mut ends = Vec::with_capacity(values.len().div_ceil(CHUNK_ROWS));
+    let chunk_count = values.len().div_ceil(CHUNK_ROWS);
+    let mut ends = Vec::with_capacity(chunk_count);
+    let mut fences = Vec::with_capacity(chunk_count);
     for chunk in values.chunks(CHUNK_ROWS) {
         enc::encode_auto(chunk, &mut body);
         if body.len() > u32::MAX as usize {
@@ -124,11 +132,15 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
             ));
         }
         ends.push(body.len() as u32);
+        fences.push(*chunk.last().unwrap());
     }
-    let mut payload = Vec::with_capacity(4 + ends.len() * 4 + body.len());
+    let mut payload = Vec::with_capacity(4 + ends.len() * 12 + body.len());
     payload.extend_from_slice(&(ends.len() as u32).to_le_bytes());
     for e in &ends {
         payload.extend_from_slice(&e.to_le_bytes());
+    }
+    for f in &fences {
+        payload.extend_from_slice(&f.to_le_bytes());
     }
     payload.extend_from_slice(&body);
     let crc = crc32c::crc32c(&payload);
@@ -180,7 +192,10 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
     let index = payload
         .get(4..idx_len)
         .ok_or_else(|| corrupt("truncated index"))?;
-    let body = &payload[idx_len..];
+    let fences = payload
+        .get(idx_len..idx_len + chunks * 8)
+        .ok_or_else(|| corrupt("truncated fences"))?;
+    let body = &payload[idx_len + chunks * 8..];
     let mut prev = 0usize;
     for i in 0..chunks {
         let end = u32::from_le_bytes(index[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
@@ -191,6 +206,10 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
         enc::decode_any(&body[prev..end], meta.chunk_rows(i), out)?;
         if out.len() - before != meta.chunk_rows(i) {
             return Err(corrupt("chunk count disagrees with meta"));
+        }
+        let fence = u64::from_le_bytes(fences[i * 8..i * 8 + 8].try_into().unwrap());
+        if *out.last().unwrap() != fence {
+            return Err(corrupt("fence disagrees with chunk"));
         }
         prev = end;
     }
@@ -223,7 +242,7 @@ pub fn read_range(
         return Ok(());
     }
     let chunks = meta.chunk_count();
-    let idx_len = 4 + chunks * 4;
+    let body_off = 4 + chunks * 4 + chunks * 8;
     let first = start as usize / CHUNK_ROWS;
     let last = (end - 1) as usize / CHUNK_ROWS;
     // The index span needs the end of chunk `first - 1` to know where
@@ -237,10 +256,10 @@ pub fn read_range(
     let ent = |chunk: usize| ends[chunk - lo_entry];
     let body_start = if first == 0 { 0 } else { ent(first - 1) };
     let body_end = ent(last);
-    if body_start > body_end || idx_len + body_end > meta.payload_len as usize {
+    if body_start > body_end || body_off + body_end > meta.payload_len as usize {
         return Err(corrupt("chunk index not monotone"));
     }
-    let bytes = read_payload_span(db, meta, idx_len + body_start, idx_len + body_end)?;
+    let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
     let mut scratch = Vec::with_capacity(CHUNK_ROWS);
     let mut prev = body_start;
     for i in first..=last {
@@ -263,6 +282,73 @@ pub fn read_range(
         prev = chunk_end;
     }
     Ok(())
+}
+
+/// Membership probe: is `value` among `values[start..end)`? The rows in
+/// that range must be sorted ascending, which CSR neighbor lists are.
+/// The fences of chunks fully covered by the range are in-order samples
+/// of it, so a binary search over them names the single chunk that could
+/// hold `value`, and only that chunk is read and decoded: a probe
+/// touches bytes on the order of one chunk regardless of the degree.
+pub fn probe(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    start: u64,
+    end: u64,
+    value: u64,
+) -> Result<bool> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    if start > end || end > meta.value_count {
+        return Err(ZuError::InvalidArgument(format!(
+            "range {start}..{end} out of 0..{}",
+            meta.value_count
+        )));
+    }
+    if start == end {
+        return Ok(false);
+    }
+    let chunks = meta.chunk_count();
+    let fence_off = 4 + chunks * 4;
+    let body_off = fence_off + chunks * 8;
+    let first = start as usize / CHUNK_ROWS;
+    let last = (end - 1) as usize / CHUNK_ROWS;
+    // Chunks in [first, last) end inside the range, so their fences are
+    // range values in ascending order. The target is the first chunk
+    // whose fence admits `value`; failing all fences it is the tail
+    // chunk, which is the only one whose fence lies outside the range.
+    let target = if first == last {
+        first
+    } else {
+        let span = read_payload_span(db, meta, fence_off + first * 8, fence_off + last * 8)?;
+        let fences: Vec<u64> = span
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        first + fences.partition_point(|&f| f < value)
+    };
+    let lo_entry = target.saturating_sub(1);
+    let span = read_payload_span(db, meta, 4 + lo_entry * 4, 4 + (target + 1) * 4)?;
+    let ends: Vec<usize> = span
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .collect();
+    let body_start = if target == 0 { 0 } else { ends[0] };
+    let body_end = *ends.last().unwrap();
+    if body_start > body_end || body_off + body_end > meta.payload_len as usize {
+        return Err(corrupt("chunk index not monotone"));
+    }
+    let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
+    let mut scratch = Vec::with_capacity(CHUNK_ROWS);
+    enc::decode_any(&bytes, meta.chunk_rows(target), &mut scratch)?;
+    if scratch.len() != meta.chunk_rows(target) {
+        return Err(corrupt("chunk count disagrees with meta"));
+    }
+    let lo = (start as usize).max(target * CHUNK_ROWS) - target * CHUNK_ROWS;
+    let hi = (end as usize).min((target + 1) * CHUNK_ROWS) - target * CHUNK_ROWS;
+    Ok(scratch[lo..hi].binary_search(&value).is_ok())
 }
 
 /// Reads payload bytes `[from, to)`, touching only the covering blocks.
@@ -410,6 +496,57 @@ mod tests {
         block[4 + 2 * 4..4 + 3 * 4].copy_from_slice(&0u32.to_le_bytes());
         db.write_block(meta.blocks[0], &block).unwrap();
         assert!(read_range(&mut db, &meta, 2048, 2050, &mut out).is_err());
+    }
+
+    #[test]
+    fn probe_matches_binary_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        // Sorted evens across several chunks, so odds are always absent
+        // and every present value has known neighbors on both sides.
+        let values: Vec<u64> = (0..5000u64).map(|i| i * 2).collect();
+        let meta = write_segment(&mut db, &values).unwrap();
+        let ranges = [
+            (0u64, values.len() as u64),
+            (0, 1),
+            (1023, 1025),
+            (1024, 2048),
+            (500, 4500),
+            (4999, 5000),
+        ];
+        for (s, e) in ranges {
+            for v in [0u64, 1, 2046, 2047, 2048, 4096, 8998, 9998, 9999, 100_000] {
+                let want = values[s as usize..e as usize].binary_search(&v).is_ok();
+                let got = probe(&mut db, &meta, s, e, v).unwrap();
+                assert_eq!(got, want, "range {s}..{e} value {v}");
+            }
+        }
+        let mut out = Vec::new();
+        assert!(probe(&mut db, &meta, 5, 4, 0).is_err());
+        assert!(probe(&mut db, &meta, 0, values.len() as u64 + 1, 0).is_err());
+        assert!(!probe(&mut db, &meta, 7, 7, 14).unwrap());
+        read_segment(&mut db, &meta, &mut out).unwrap();
+        assert_eq!(out, values);
+    }
+
+    #[test]
+    fn corrupt_fence_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let values: Vec<u64> = (0..5000u64).map(|i| i * 3).collect();
+        let meta = write_segment(&mut db, &values).unwrap();
+        // Flip a bit inside chunk 2's fence. The crc catches it on the
+        // full path, so rewrite the crc too and rely on the fence cross
+        // check instead, which is what protects the probe path.
+        let chunks = values.len().div_ceil(CHUNK_ROWS);
+        let mut block = db.read_block(meta.blocks[0]).unwrap();
+        block[4 + chunks * 4 + 2 * 8] ^= 0xFF;
+        db.write_block(meta.blocks[0], &block).unwrap();
+        let mut patched = meta.clone();
+        patched.crc = crc32c::crc32c(&block[..patched.payload_len as usize]);
+        let mut out = Vec::new();
+        let err = read_segment(&mut db, &patched, &mut out).unwrap_err();
+        assert!(format!("{err}").contains("fence"));
     }
 
     #[test]

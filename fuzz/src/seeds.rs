@@ -63,6 +63,8 @@ fn main() {
         value_count: 5000,
         payload_len: 40_000,
         uncompressed_bytes: 40_000,
+        min: 7,
+        max: 40_000,
         crc: 0xC0FFEE,
         blocks: vec![3],
     };

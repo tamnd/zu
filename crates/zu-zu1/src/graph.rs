@@ -21,7 +21,7 @@ use std::path::Path;
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 
-use crate::file::Zu1File;
+use crate::file::{NULL_BLOCK, Zu1File};
 use crate::meta;
 use crate::segment::{SegmentMeta, read_range, read_segment, write_segment};
 
@@ -217,12 +217,43 @@ fn build_direction(
     Ok(dirs)
 }
 
+/// Frees every block of the graph published at `table_index_root`: all
+/// four segments per group plus the directory chain itself. The blocks
+/// recycle at the next checkpoint per the shadow-publishing rules.
+fn free_previous_graph(db: &mut Zu1File) -> Result<()> {
+    let root = db.db_header().table_index_root;
+    if root == NULL_BLOCK {
+        return Ok(());
+    }
+    let directory = Directory::decode(&meta::read_chain(db, root)?)?;
+    for group in &directory.groups {
+        for seg in [
+            &group.fwd.offsets,
+            &group.fwd.neighbors,
+            &group.bwd.offsets,
+            &group.bwd.neighbors,
+        ] {
+            for &ptr in &seg.blocks {
+                db.free_block(ptr)?;
+            }
+        }
+    }
+    for ptr in meta::chain_blocks(db, root)? {
+        db.free_block(ptr)?;
+    }
+    db.db_header_mut().table_index_root = NULL_BLOCK;
+    Ok(())
+}
+
 /// Bulk-loads both CSR directions from an edge list into `db` and
 /// publishes them with a checkpoint. `edges` must be sorted by
 /// `(src, dst)` and node ids must be dense row ids below `node_count`.
 /// The reverse direction is built from an internally sorted `(dst, src)`
-/// copy, so peak memory holds the edge list twice. Returns the directory.
+/// copy, so peak memory holds the edge list twice. A graph already
+/// published in `db` is freed first; its blocks recycle one checkpoint
+/// later. Returns the directory.
 pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Result<Directory> {
+    free_previous_graph(db)?;
     let fwd = build_direction(db, node_count, edges)?;
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
     rev.sort_unstable();
@@ -508,6 +539,61 @@ mod tests {
                 .neighbors_into(&mut db, u64::from(n), &mut point)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rebuild_recycles_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let make_edges = |salt: u32| {
+            let mut edges: Vec<(u32, u32)> = (0..4000u32)
+                .map(|i| (i.wrapping_mul(31).wrapping_add(salt) % 500, i % 500))
+                .collect();
+            edges.sort_unstable();
+            edges.dedup();
+            edges
+        };
+        let mut db = Zu1File::create(&path).unwrap();
+        // Build 2 frees build 1 but cannot reuse its blocks: they are the
+        // committed graph while build 2 is written. Build 3 reuses build
+        // 1's blocks and the allocator reaches steady state, so from
+        // build 4 on the file stops growing.
+        for salt in 0..3 {
+            bulk_load(&mut db, 500, &make_edges(salt)).unwrap();
+        }
+        let watermark = db.db_header().block_count;
+        for salt in 3..7 {
+            bulk_load(&mut db, 500, &make_edges(salt)).unwrap();
+            assert_eq!(
+                db.db_header().block_count,
+                watermark,
+                "build {salt} grew the file"
+            );
+        }
+        // The surviving graph is the last one written, in both directions.
+        drop(db);
+        let mut db = Zu1File::open(&path).unwrap();
+        let reader = GraphReader::load(&mut db).unwrap();
+        let edges = make_edges(6);
+        let mut out_ref: Vec<Vec<u64>> = vec![Vec::new(); 500];
+        let mut in_ref: Vec<Vec<u64>> = vec![Vec::new(); 500];
+        for &(s, d) in &edges {
+            out_ref[s as usize].push(u64::from(d));
+            in_ref[d as usize].push(u64::from(s));
+        }
+        for l in &mut in_ref {
+            l.sort_unstable();
+        }
+        let mut point = Vec::new();
+        for v in 0..500u64 {
+            point.clear();
+            reader.neighbors_into(&mut db, v, &mut point).unwrap();
+            assert_eq!(point, out_ref[v as usize], "out node {v}");
+            point.clear();
+            reader.in_neighbors_into(&mut db, v, &mut point).unwrap();
+            assert_eq!(point, in_ref[v as usize], "in node {v}");
+        }
+        assert_eq!(reader.directory().edge_count, edges.len() as u64);
     }
 
     #[test]

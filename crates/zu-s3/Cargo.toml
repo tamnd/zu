@@ -1,0 +1,17 @@
+[package]
+name = "zu-s3"
+description = "Object-storage-native engine for zu with fixed-cost batching"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zu-common.workspace = true
+zu-storage.workspace = true
+
+[lints]
+workspace = true

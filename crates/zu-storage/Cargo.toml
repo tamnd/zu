@@ -1,0 +1,17 @@
+[package]
+name = "zu-storage"
+description = "Storage engine trait and shared segment types for zu"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zu-common.workspace = true
+zu-encoding.workspace = true
+
+[lints]
+workspace = true

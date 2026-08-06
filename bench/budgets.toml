@@ -7,3 +7,9 @@ for_bitpack = 1.0
 delta_bitpack = 1.0
 rle = 1.0
 dict = 1.0
+
+# COPY ingest floors, single core, sort included, parse excluded (B6/B8).
+# bits_per_edge is a ceiling, not a floor: the raw LiveJournal ordering
+# must stay at or under the 8 bits/edge budget from docs/12.
+copy_medges_s = 1.0
+bits_per_edge = 8.0

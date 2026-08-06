@@ -8,7 +8,7 @@
 
 use zu_common::{Result, ZuError};
 
-use crate::{EncodingId, delta, delta_patch, dict, for_bitpack, rle};
+use crate::{EncodingId, bool_bitpack, delta, delta_patch, dict, for_bitpack, frequency, rle};
 
 const SAMPLE_RUNS: usize = 8;
 const SAMPLE_RUN_LEN: usize = 128;
@@ -50,6 +50,8 @@ pub fn decode_any(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result
         EncodingId::ForBitPack => for_bitpack::decode(payload, max_values, out),
         EncodingId::DeltaBitPack => delta::decode(payload, max_values, out),
         EncodingId::DeltaPatch => delta_patch::decode(payload, max_values, out),
+        EncodingId::BoolBitpack => bool_bitpack::decode(payload, max_values, out),
+        EncodingId::Frequency => frequency::decode(payload, max_values, out),
         other => Err(ZuError::Unsupported {
             what: "segment encoding",
             id: other as u8 as u32,
@@ -76,6 +78,12 @@ fn encode_with(id: EncodingId, values: &[u64], out: &mut Vec<u8>) {
         EncodingId::DeltaPatch => {
             delta_patch::encode(values, out);
         }
+        EncodingId::BoolBitpack => {
+            bool_bitpack::encode(values, out);
+        }
+        EncodingId::Frequency => {
+            frequency::encode(values, out);
+        }
         _ => unreachable!("choose never returns other ids"),
     }
 }
@@ -91,13 +99,20 @@ fn choose(values: &[u64]) -> EncodingId {
     let runs = sample_runs(values);
     let concat: Vec<u64> = runs.concat();
     // Candidate order breaks ties toward the shallower cascade.
-    let candidates = [
+    // BoolBitpack is only legal when the whole input is binary, not just
+    // the sample, or the encoder would corrupt the values it never saw.
+    let mut candidates = Vec::with_capacity(7);
+    if values.iter().all(|&v| v <= 1) {
+        candidates.push(EncodingId::BoolBitpack);
+    }
+    candidates.extend([
         EncodingId::ForBitPack,
         EncodingId::DeltaBitPack,
         EncodingId::DeltaPatch,
         EncodingId::Rle,
         EncodingId::Dict,
-    ];
+        EncodingId::Frequency,
+    ]);
     let mut best = EncodingId::Plain;
     let mut best_size = 4 + concat.len() * 8;
     let mut buf = Vec::new();
@@ -273,6 +288,42 @@ mod tests {
             .collect();
         let values: Vec<u64> = (0..10_000).map(|i| pool[(i * 7) % pool.len()]).collect();
         assert_eq!(roundtrip(&values), EncodingId::Dict);
+    }
+
+    #[test]
+    fn picks_bool_for_binary() {
+        // Mixed 0/1 noise: Constant does not apply, and BoolBitpack must
+        // beat width-1 FOR on the tie because it sits first in line.
+        let values: Vec<u64> = (0..10_000u64).map(|i| (i * i / 7) & 1).collect();
+        assert_eq!(roundtrip(&values), EncodingId::BoolBitpack);
+    }
+
+    #[test]
+    fn bool_never_picked_when_a_single_value_is_wider() {
+        // Binary everywhere except one value the sample misses: the
+        // legality check scans the whole input, so BoolBitpack must not
+        // be offered at all.
+        let mut values: Vec<u64> = (0..10_000u64).map(|i| i & 1).collect();
+        values[9_999] = 2;
+        let id = roundtrip(&values);
+        assert_ne!(id, EncodingId::BoolBitpack);
+    }
+
+    #[test]
+    fn picks_frequency_for_dominant_scattered() {
+        // 90% one value, 10% wide random exceptions: runs are too short
+        // for RLE, exception cardinality too high for Dict, values too
+        // wide for FOR, and the exceptions are cheap as patches.
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let values: Vec<u64> = (0..10_000)
+            .map(|i| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                if i % 10 == 3 { rng } else { 777 }
+            })
+            .collect();
+        assert_eq!(roundtrip(&values), EncodingId::Frequency);
     }
 
     #[test]

@@ -6,10 +6,12 @@
 //! stable id table so downstream crates can reference it.
 
 pub mod bitpack;
+pub mod bool_bitpack;
 pub mod delta;
 pub mod delta_patch;
 pub mod dict;
 pub mod for_bitpack;
+pub mod frequency;
 pub mod patch;
 pub mod rle;
 pub mod segment;

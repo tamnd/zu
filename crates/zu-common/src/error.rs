@@ -17,4 +17,8 @@ pub enum ZuError {
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// A compare-and-swap or ownership check lost to a concurrent writer.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }

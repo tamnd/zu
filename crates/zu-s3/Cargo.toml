@@ -12,6 +12,14 @@ authors.workspace = true
 [dependencies]
 zu-common.workspace = true
 zu-storage.workspace = true
+crc32c.workspace = true
+object_store.workspace = true
+
+[dev-dependencies]
+# The "fs" feature exists only so tests can pin down what LocalFileSystem
+# does and does not support; the library itself never uses it.
+object_store = { workspace = true, features = ["fs"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

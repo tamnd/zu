@@ -88,7 +88,6 @@ pub(crate) fn decode_chunks(bytes: &[u8], mut sink: impl FnMut(&[u64], usize)) -
     ) as usize;
     let mut pos = 4usize;
     let mut low = [0u64; CHUNK];
-    let mut flags = [0u64; CHUNK];
     let mut excs = [0u64; CHUNK];
     let mut remaining = count;
     while remaining > 0 {
@@ -113,10 +112,9 @@ pub(crate) fn decode_chunks(bytes: &[u8], mut sink: impl FnMut(&[u64], usize)) -
         let bitmap = bytes
             .get(pos..pos + blen)
             .ok_or_else(|| corrupt("truncated bitmap"))?;
-        bitpack::unpack(bitmap, 1, &mut flags);
         pos += blen;
+        let exc_count: usize = bitmap.iter().map(|&b| b.count_ones() as usize).sum();
 
-        let exc_count = flags[..take].iter().map(|&f| f as usize).sum();
         let elen = bitpack::packed_bytes(exc_width, exc_count);
         let packed_excs = bytes
             .get(pos..pos + elen)
@@ -124,11 +122,20 @@ pub(crate) fn decode_chunks(bytes: &[u8], mut sink: impl FnMut(&[u64], usize)) -
         bitpack::unpack(packed_excs, exc_width, &mut excs);
         pos += elen;
 
+        // Walk set bits only: patch work scales with the exception count,
+        // not the chunk size. The encoder never sets padding bits past
+        // `take`; hostile ones are ignored here and cannot index out of
+        // bounds because popcount bounded exc_count above.
         let mut next = 0usize;
-        for i in 0..take {
-            if flags[i] != 0 {
-                low[i] = excs[next];
+        for (word_idx, word_bytes) in bitmap.chunks_exact(8).enumerate() {
+            let mut word = u64::from_le_bytes(word_bytes.try_into().unwrap());
+            while word != 0 {
+                let i = word_idx * 64 + word.trailing_zeros() as usize;
+                if i < take {
+                    low[i] = excs[next];
+                }
                 next += 1;
+                word &= word - 1;
             }
         }
         sink(&low, take);

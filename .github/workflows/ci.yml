@@ -49,6 +49,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
 
+  membudget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p zu-cli
+      # The G6 budget is 32 MiB total for an embedded reader. The build
+      # and the write path run unconstrained; every read path then runs
+      # under a 32 MiB address-space cap, so a decoder or open path that
+      # starts buffering whole segments fails here before it ships.
+      - name: Read paths under 32 MiB
+        run: |
+          printf '1 2\n1 3\n2 3\n3 1\n' > /tmp/edges.txt
+          target/release/zu copy /tmp/edges.txt /tmp/smoke.zu1
+          ulimit -v 32768
+          target/release/zu stat /tmp/smoke.zu1
+          target/release/zu verify /tmp/smoke.zu1
+          target/release/zu neighbors /tmp/smoke.zu1 1
+
   miri:
     runs-on: ubuntu-latest
     steps:

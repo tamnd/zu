@@ -24,3 +24,10 @@ path = "fuzz_targets/decode_delta.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_segment"
+path = "fuzz_targets/decode_segment.rs"
+test = false
+doc = false
+bench = false

@@ -3,3 +3,4 @@ Cargo.lock
 *.zu1
 *.zu1.wal
 .DS_Store
+.claude/

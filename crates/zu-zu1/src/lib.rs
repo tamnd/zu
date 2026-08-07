@@ -11,6 +11,8 @@ pub mod fullzip;
 pub mod graph;
 pub mod keys;
 pub mod meta;
+#[cfg(feature = "arrow")]
+pub mod parquet;
 pub mod reorder;
 pub mod segment;
 

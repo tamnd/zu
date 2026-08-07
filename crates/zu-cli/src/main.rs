@@ -95,9 +95,18 @@ fn main() -> ExitCode {
                     std::path::Path::new(out),
                     reorder,
                 ),
-                _ => usage_error("zu copy [--reorder degree|bfs|none] <edges.txt> <out.zu1>"),
+                _ => {
+                    usage_error("zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1>")
+                }
             }
         }
+        Some("convert") => match (args.get(1), args.get(2)) {
+            (Some(input), Some(output)) => convert(
+                std::path::Path::new(input),
+                std::path::Path::new(output),
+            ),
+            _ => usage_error("zu convert <edges.txt|csv|parquet> <out.csv|parquet>"),
+        },
         Some(cmd) => {
             eprintln!("zu: unknown command '{cmd}' (commands arrive with their milestones)");
             ExitCode::FAILURE
@@ -172,15 +181,38 @@ fn stat(path: &std::path::Path) -> ExitCode {
     }
 }
 
-/// Bulk-loads a whitespace separated `src dst` edge list (SNAP layout,
-/// `#` comments) into a fresh zu1 file and prints the ingest numbers.
+/// Reads an edge list by extension: `.csv` takes the comma layout with
+/// an optional header, `.parquet` needs the `arrow` feature, anything
+/// else is whitespace separated SNAP text with `#` comments.
+fn read_edges(path: &std::path::Path) -> zu::Result<Vec<(u32, u32)>> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("parquet") => {
+            #[cfg(feature = "arrow")]
+            {
+                zu::zu1::parquet::read_edge_parquet(path)
+            }
+            #[cfg(not(feature = "arrow"))]
+            {
+                Err(zu::ZuError::InvalidArgument(
+                    "this zu was built without parquet support, rebuild with --features arrow"
+                        .into(),
+                ))
+            }
+        }
+        Some("csv") => zu::zu1::graph::read_edge_csv(path),
+        _ => zu::zu1::graph::read_edge_list(path),
+    }
+}
+
+/// Bulk-loads an edge list (SNAP text, csv, or parquet, picked by
+/// extension) into a fresh zu1 file and prints the ingest numbers.
 fn copy(
     edges_path: &std::path::Path,
     out_path: &std::path::Path,
     reorder: zu::zu1::reorder::Reorder,
 ) -> ExitCode {
     let started = std::time::Instant::now();
-    let mut edges = match zu::zu1::graph::read_edge_list(edges_path) {
+    let mut edges = match read_edges(edges_path) {
         Ok(e) => e,
         Err(e) => return command_error("copy", &e),
     };
@@ -279,6 +311,58 @@ fn copy(
             ExitCode::SUCCESS
         }
         Err(e) => command_error("copy", &e),
+    }
+}
+
+/// Converts an edge list between the formats copy reads: SNAP text or
+/// csv or parquet in, csv or parquet out. Exists so a SNAP corpus can
+/// become the csv and parquet inputs the copy path is validated with.
+fn convert(input: &std::path::Path, output: &std::path::Path) -> ExitCode {
+    let started = std::time::Instant::now();
+    let edges = match read_edges(input) {
+        Ok(e) => e,
+        Err(e) => return command_error("convert", &e),
+    };
+    let result = match output.extension().and_then(|e| e.to_str()) {
+        Some("csv") => (|| -> zu::Result<()> {
+            use std::io::Write;
+            let file = std::fs::File::create(output)?;
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+            writeln!(w, "src,dst")?;
+            for &(s, d) in &edges {
+                writeln!(w, "{s},{d}")?;
+            }
+            w.flush()?;
+            Ok(())
+        })(),
+        Some("parquet") => {
+            #[cfg(feature = "arrow")]
+            {
+                zu::zu1::parquet::write_edge_parquet(output, &edges)
+            }
+            #[cfg(not(feature = "arrow"))]
+            {
+                Err(zu::ZuError::InvalidArgument(
+                    "this zu was built without parquet support, rebuild with --features arrow"
+                        .into(),
+                ))
+            }
+        }
+        _ => Err(zu::ZuError::InvalidArgument(
+            "convert writes .csv or .parquet, picked by the output extension".into(),
+        )),
+    };
+    match result {
+        Ok(()) => {
+            println!(
+                "converted {} edges to {} in {:.2}s",
+                edges.len(),
+                output.display(),
+                started.elapsed().as_secs_f64()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => command_error("convert", &e),
     }
 }
 

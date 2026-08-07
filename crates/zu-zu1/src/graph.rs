@@ -214,6 +214,42 @@ pub fn read_edge_list(path: &Path) -> Result<Vec<(u32, u32)>> {
     }
 }
 
+/// Reads a comma separated `src,dst` edge list. The first line may be a
+/// header and is skipped when its first two fields do not parse as
+/// integers; a row that fails to parse anywhere else is an error naming
+/// the line, same contract as the SNAP reader. Fields are trimmed, so
+/// `1, 2` and CRLF endings both work, and columns past the second are
+/// ignored the way the SNAP reader ignores trailing fields.
+pub fn read_edge_csv(path: &Path) -> Result<Vec<(u32, u32)>> {
+    let bad = |line_no: usize| {
+        ZuError::InvalidArgument(format!("line {line_no}: expected 'src,dst' integers"))
+    };
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut edges = Vec::new();
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(edges);
+        }
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split(',');
+        let src = parts.next().map(str::trim).and_then(|t| t.parse::<u32>().ok());
+        let dst = parts.next().map(str::trim).and_then(|t| t.parse::<u32>().ok());
+        match (src, dst) {
+            (Some(src), Some(dst)) => edges.push((src, dst)),
+            _ if line_no == 1 => {}
+            _ => return Err(bad(line_no)),
+        }
+    }
+}
+
 /// Builds one direction's CSR groups from edges sorted by `(key, other)`.
 fn build_direction(
     db: &mut Zu1File,
@@ -565,6 +601,41 @@ mod tests {
         edges.sort_unstable();
         edges.dedup();
         edges
+    }
+
+    #[test]
+    fn csv_reader_matches_the_snap_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let txt = dir.path().join("edges.txt");
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&txt, "# comment\n0 1\n0 3\n1 2\n\n3 0\n").unwrap();
+        std::fs::write(&csv, "src,dst\r\n0,1\n0, 3\n1,2\n\n3,0\r\n").unwrap();
+        assert_eq!(read_edge_csv(&csv).unwrap(), read_edge_list(&txt).unwrap());
+    }
+
+    #[test]
+    fn csv_without_header_keeps_the_first_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&csv, "5,6\n7,8\n").unwrap();
+        assert_eq!(read_edge_csv(&csv).unwrap(), vec![(5, 6), (7, 8)]);
+    }
+
+    #[test]
+    fn csv_bad_row_errors_by_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&csv, "src,dst\n1,2\nnope,4\n").unwrap();
+        let err = read_edge_csv(&csv).unwrap_err();
+        assert!(err.to_string().contains("line 3"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn csv_extra_columns_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&csv, "src,dst,weight\n1,2,0.5\n").unwrap();
+        assert_eq!(read_edge_csv(&csv).unwrap(), vec![(1, 2)]);
     }
 
     #[test]

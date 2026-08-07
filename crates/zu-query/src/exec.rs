@@ -20,6 +20,15 @@
 //! producer so the same queries run tuple-at-a-time, as a differential
 //! oracle for the factorized paths.
 //!
+//! `execute_profiled` runs the same pipeline with per-operator
+//! counters and returns a `Profile` next to the result: pulls, rows,
+//! and self time per operator, per stage. Rows over pulls is the
+//! average vector length, the factorization stat: an expand averaging
+//! forty is producing real vectors, one averaging one has degenerated
+//! to tuple-at-a-time. This is the EXPLAIN ANALYZE backend; the
+//! grammar has no EXPLAIN keyword yet, so the facade exposes it as an
+//! API entry point.
+//!
 //! A `Filter` directly above a scan on an `id` equality becomes an
 //! `IndexLookup` that jumps to the offset. This leans on the v0
 //! contract that the `id` property of a node equals its offset; keyed
@@ -31,12 +40,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use zu_common::{Result, ZuError};
 
 use crate::ast::{BinaryOp, Literal, RelDirection, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, Schema};
-use crate::plan::LogicalPlan;
+use crate::plan::{LogicalPlan, expr_text};
 
 /// Vector width of one chunk fill.
 pub const VECTOR_SIZE: usize = 2048;
@@ -85,6 +95,197 @@ pub trait Graph {
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub flat: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Profiling
+// ---------------------------------------------------------------------------
+
+/// One operator line of an EXPLAIN ANALYZE profile.
+#[derive(Debug, Clone)]
+pub struct OpProfile {
+    pub name: String,
+    /// Successful pulls: how many chunks this operator produced.
+    pub pulls: u64,
+    /// Values produced across all pulls. Rows over pulls is the
+    /// average vector length, the factorization stat.
+    pub rows: u64,
+    /// Self time in nanoseconds, child time excluded.
+    pub nanos: u64,
+}
+
+/// One stage of a profiled run: the operator pipeline bottom-up plus
+/// the sink that materialized the rows.
+#[derive(Debug, Clone)]
+pub struct StageProfile {
+    pub ops: Vec<OpProfile>,
+    pub sink: String,
+    pub out_rows: u64,
+    /// Wall time of the whole stage in nanoseconds, sink included.
+    pub nanos: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub stages: Vec<StageProfile>,
+}
+
+fn fmt_time(nanos: u64) -> String {
+    if nanos >= 1_000_000_000 {
+        format!("{:.2} s", nanos as f64 / 1e9)
+    } else if nanos >= 1_000_000 {
+        format!("{:.2} ms", nanos as f64 / 1e6)
+    } else if nanos >= 1_000 {
+        format!("{:.1} us", nanos as f64 / 1e3)
+    } else {
+        format!("{nanos} ns")
+    }
+}
+
+impl Profile {
+    /// Renders one block per stage: the sink with its row count and
+    /// wall time, then each operator top-down with pulls, rows, the
+    /// average vector length per pull, and self time.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for (ix, stage) in self.stages.iter().enumerate() {
+            out.push_str(&format!(
+                "stage {}: {} [{} rows, {}]\n",
+                ix + 1,
+                stage.sink,
+                stage.out_rows,
+                fmt_time(stage.nanos)
+            ));
+            let width = stage.ops.iter().map(|o| o.name.len()).max().unwrap_or(0);
+            for op in stage.ops.iter().rev() {
+                let avg = if op.pulls == 0 {
+                    0.0
+                } else {
+                    op.rows as f64 / op.pulls as f64
+                };
+                out.push_str(&format!(
+                    "  {:width$}  pulls {:>6}  rows {:>8}  avg {:>7.1}  self {}\n",
+                    op.name,
+                    op.pulls,
+                    op.rows,
+                    avg,
+                    fmt_time(op.nanos),
+                ));
+            }
+        }
+        out
+    }
+}
+
+fn slot_names(slots: &[usize], query: &BoundQuery) -> String {
+    slots
+        .iter()
+        .map(|&s| query.variables[s].name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn node_tables_text(tables: &[u32], schema: &Schema) -> String {
+    tables
+        .iter()
+        .map(|&t| schema.node_by_id(t).map_or("?", |d| d.name.as_str()))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn rel_text(
+    from: &str,
+    to: &str,
+    direction: RelDirection,
+    rels: &[RelStep],
+    schema: &Schema,
+) -> String {
+    let names = rels
+        .iter()
+        .map(|r| schema.rel_by_id(r.id).map_or("?", |d| d.name.as_str()))
+        .collect::<Vec<_>>()
+        .join("|");
+    match direction {
+        RelDirection::Out => format!("({from})-[:{names}]->({to})"),
+        RelDirection::In => format!("({from})<-[:{names}]-({to})"),
+        RelDirection::Undirected => format!("({from})-[:{names}]-({to})"),
+    }
+}
+
+fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema) -> String {
+    let var = |slot: usize| query.variables[slot].name.as_str();
+    match desc {
+        OpDesc::Source => "Source".into(),
+        OpDesc::RowSource { chunk } => {
+            format!(
+                "RowSource {}",
+                slot_names(&stage.chunk_slots[*chunk], query)
+            )
+        }
+        OpDesc::Scan { tables, chunk } => format!(
+            "Scan {}: {}",
+            var(stage.chunk_slots[*chunk][0]),
+            node_tables_text(tables, schema)
+        ),
+        OpDesc::IndexLookup { tables, key, chunk } => format!(
+            "IndexLookup {}: {} [id = {}]",
+            var(stage.chunk_slots[*chunk][0]),
+            node_tables_text(tables, schema),
+            expr_text(key, query)
+        ),
+        OpDesc::Flatten { chunk } => {
+            format!("Flatten {}", slot_names(&stage.chunk_slots[*chunk], query))
+        }
+        OpDesc::Expand {
+            from,
+            direction,
+            rels,
+            chunk,
+        } => format!(
+            "Expand {}",
+            rel_text(
+                var(*from),
+                var(stage.chunk_slots[*chunk][0]),
+                *direction,
+                rels,
+                schema
+            )
+        ),
+        OpDesc::ExpandInto {
+            from,
+            to,
+            direction,
+            rels,
+            ..
+        } => format!(
+            "ExpandInto {}",
+            rel_text(var(*from), var(*to), *direction, rels, schema)
+        ),
+        OpDesc::Filter { expr, .. } => format!("Filter {}", expr_text(expr, query)),
+        OpDesc::Unwind { expr, chunk } => format!(
+            "Unwind {} AS {}",
+            expr_text(expr, query),
+            var(stage.chunk_slots[*chunk][0])
+        ),
+    }
+}
+
+fn sink_name(sink: &SinkDef) -> String {
+    let mut name = if sink.aggregate {
+        "Aggregate".to_string()
+    } else {
+        "Project".to_string()
+    };
+    for op in &sink.post {
+        name.push_str(match op {
+            PostOp::Distinct => " + Distinct",
+            PostOp::Filter(_) => " + Filter",
+            PostOp::Sort(_) => " + Sort",
+            PostOp::Skip(_) => " + Skip",
+            PostOp::Limit(_) => " + Limit",
+        });
+    }
+    name
 }
 
 /// Total order over values for grouping, DISTINCT, and ORDER BY:
@@ -725,6 +926,16 @@ struct OpState {
     offset: u64,
 }
 
+/// Per-operator counters, cumulative over the run. `nanos` includes
+/// child time; the profile subtracts the child to report self time,
+/// which is exact because every stage is one linear chain.
+#[derive(Debug, Clone, Copy, Default)]
+struct OpStats {
+    pulls: u64,
+    rows: u64,
+    nanos: u64,
+}
+
 struct StageCtx<'a> {
     graph: &'a mut dyn Graph,
     params: &'a [Value],
@@ -737,6 +948,8 @@ struct StageCtx<'a> {
     /// during materialization, the row snapshot during post filters.
     overlay: BTreeMap<usize, Value>,
     scratch: Vec<u64>,
+    /// One entry per operator when profiling, empty otherwise.
+    stats: Vec<OpStats>,
 }
 
 fn value_of(ctx: &mut StageCtx, slot: usize) -> Result<Value> {
@@ -762,7 +975,46 @@ fn node_value(v: Value, what: &str) -> Result<(u32, u64)> {
     }
 }
 
+/// How many values one successful pull produced: chunk producers
+/// report their chunk size, a compacting filter the surviving size,
+/// and pass-through operators one configuration.
+fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
+    match &descs[i] {
+        OpDesc::Source | OpDesc::Flatten { .. } => 1,
+        OpDesc::Filter { compact: None, .. } => 1,
+        OpDesc::Filter {
+            compact: Some(c), ..
+        } => ctx.chunks[*c].size as u64,
+        OpDesc::RowSource { chunk }
+        | OpDesc::Scan { chunk, .. }
+        | OpDesc::IndexLookup { chunk, .. }
+        | OpDesc::Expand { chunk, .. }
+        | OpDesc::ExpandInto { chunk, .. }
+        | OpDesc::Unwind { chunk, .. } => ctx.chunks[*chunk].size as u64,
+    }
+}
+
+/// The pull entry point: a plain `step` normally, a timed and counted
+/// one when the context carries stats. Recursive pulls inside `step`
+/// come back through here, so every operator gets counted.
 fn next(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
+    if ctx.stats.is_empty() {
+        return step(descs, ctx, i);
+    }
+    let start = Instant::now();
+    let got = step(descs, ctx, i)?;
+    let nanos = start.elapsed().as_nanos() as u64;
+    let rows = if got { produced_rows(descs, ctx, i) } else { 0 };
+    let s = &mut ctx.stats[i];
+    s.nanos += nanos;
+    if got {
+        s.pulls += 1;
+        s.rows += rows;
+    }
+    Ok(got)
+}
+
+fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
     match &descs[i] {
         OpDesc::Source => {
             if ctx.states[i].active {
@@ -1732,14 +1984,40 @@ fn run_stage(stage: &StageDef, query: &BoundQuery, ctx: &mut StageCtx) -> Result
     Ok(rows.into_iter().map(|r| r.values).collect())
 }
 
-/// Runs an optimized plan against a graph and returns the result rows.
-pub fn execute(
+fn stage_profile(
+    stage: &StageDef,
+    query: &BoundQuery,
+    schema: &Schema,
+    stats: &[OpStats],
+    out_rows: u64,
+    nanos: u64,
+) -> StageProfile {
+    let mut ops = Vec::with_capacity(stats.len());
+    for (i, s) in stats.iter().enumerate() {
+        let child = if i == 0 { 0 } else { stats[i - 1].nanos };
+        ops.push(OpProfile {
+            name: op_name(&stage.descs[i], stage, query, schema),
+            pulls: s.pulls,
+            rows: s.rows,
+            nanos: s.nanos.saturating_sub(child),
+        });
+    }
+    StageProfile {
+        ops,
+        sink: sink_name(&stage.sink),
+        out_rows,
+        nanos,
+    }
+}
+
+fn run_stages(
     plan: &LogicalPlan,
     query: &BoundQuery,
     schema: &Schema,
     graph: &mut dyn Graph,
     params: &[Value],
     options: &Options,
+    mut profile: Option<&mut Profile>,
 ) -> Result<QueryResult> {
     let stages = build_stages(plan, query, schema, options)?;
     let counts: BTreeMap<u32, u64> = schema
@@ -1766,13 +2044,66 @@ pub fn execute(
             rows,
             overlay: BTreeMap::new(),
             scratch: Vec::new(),
+            stats: if profile.is_some() {
+                vec![OpStats::default(); stage.descs.len()]
+            } else {
+                Vec::new()
+            },
         };
+        let started = Instant::now();
         rows = run_stage(stage, query, &mut ctx)?;
+        if let Some(p) = profile.as_deref_mut() {
+            p.stages.push(stage_profile(
+                stage,
+                query,
+                schema,
+                &ctx.stats,
+                rows.len() as u64,
+                started.elapsed().as_nanos() as u64,
+            ));
+        }
     }
     Ok(QueryResult {
         columns: query.columns.clone(),
         rows,
     })
+}
+
+/// Runs an optimized plan against a graph and returns the result rows.
+pub fn execute(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+) -> Result<QueryResult> {
+    run_stages(plan, query, schema, graph, params, options, None)
+}
+
+/// Runs an optimized plan with per-operator counters and returns the
+/// result rows next to the EXPLAIN ANALYZE profile. Timing wraps every
+/// pull, so profiled runs pay two clock reads per pull; use `execute`
+/// on the hot path.
+pub fn execute_profiled(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+) -> Result<(QueryResult, Profile)> {
+    let mut profile = Profile { stages: Vec::new() };
+    let result = run_stages(
+        plan,
+        query,
+        schema,
+        graph,
+        params,
+        options,
+        Some(&mut profile),
+    )?;
+    Ok((result, profile))
 }
 
 #[cfg(test)]
@@ -2076,6 +2407,101 @@ mod tests {
             &[],
         );
         assert_eq!(int_rows(&r), [[0]]);
+    }
+
+    fn profiled(source: &str, params: &[(&str, Value)]) -> (QueryResult, Profile) {
+        let schema = schema();
+        let parsed = crate::parser::parse(source).expect("parse");
+        let query = crate::binder::bind(&parsed, &schema).expect("bind");
+        let built = crate::plan::build(&query).expect("plan");
+        let optimized = crate::optimizer::optimize(built, &query, &schema).expect("optimize");
+        let mut args = Vec::new();
+        for name in &query.params {
+            let (_, v) = params
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("missing parameter ${name}"));
+            args.push(v.clone());
+        }
+        let mut graph = mock();
+        execute_profiled(
+            &optimized,
+            &query,
+            &schema,
+            &mut graph,
+            &args,
+            &Options::default(),
+        )
+        .expect("execute profiled")
+    }
+
+    #[test]
+    fn profile_counts_pulls_rows_and_names_ops() {
+        let (r, p) = profiled(
+            "MATCH (a:Person {id: 0})-[:KNOWS]->(b) RETURN b.id AS friend",
+            &[],
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(p.stages.len(), 1);
+        let stage = &p.stages[0];
+        assert_eq!(stage.sink, "Project");
+        assert_eq!(stage.out_rows, 2);
+        assert!(stage.nanos > 0);
+        let names: Vec<&str> = stage.ops.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Source",
+                "IndexLookup a: Person [id = 0]",
+                "Flatten a",
+                "Expand (a)-[:KNOWS]->(b)",
+            ]
+        );
+        let lookup = &stage.ops[1];
+        assert_eq!((lookup.pulls, lookup.rows), (1, 1));
+        let expand = &stage.ops[3];
+        assert_eq!((expand.pulls, expand.rows), (1, 2));
+    }
+
+    #[test]
+    fn profile_shows_the_factorized_second_hop() {
+        let (r, p) = profiled(
+            "MATCH (a:Person {id: 0})-[:KNOWS]->(b)-[:KNOWS]->(c) \
+             RETURN count(c) AS paths",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[3]]);
+        let stage = &p.stages[0];
+        assert_eq!(stage.sink, "Aggregate");
+        assert_eq!(stage.out_rows, 1);
+        let expand_c = stage.ops.last().expect("ops");
+        assert_eq!(expand_c.name, "Expand (b)-[:KNOWS]->(c)");
+        // Two pulls, one per neighbor of node 0, delivering three
+        // values total: an average vector length above one is the
+        // factorized path at work.
+        assert_eq!((expand_c.pulls, expand_c.rows), (2, 3));
+    }
+
+    #[test]
+    fn profile_renders_one_block_per_stage() {
+        let (_, p) = profiled(
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS deg WHERE deg > 1 \
+             RETURN a.id AS person ORDER BY person",
+            &[],
+        );
+        assert_eq!(p.stages.len(), 2);
+        let text = p.render();
+        assert!(text.contains("stage 1: Aggregate + Filter"), "got:\n{text}");
+        assert!(text.contains("stage 2: Project + Sort"), "got:\n{text}");
+        assert!(text.contains("Scan a: Person"), "got:\n{text}");
+        assert!(text.contains("RowSource a, deg"), "got:\n{text}");
+        assert!(text.contains("pulls"), "got:\n{text}");
+        let scan = p.stages[0]
+            .ops
+            .iter()
+            .find(|o| o.name.starts_with("Scan"))
+            .expect("scan op");
+        assert_eq!((scan.pulls, scan.rows), (1, 6));
     }
 
     #[test]

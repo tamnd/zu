@@ -17,8 +17,8 @@ use zu_common::{Result, ZuError};
 
 use crate::file::Zu1File;
 use crate::segment::{
-    ChunkDirectory, SegmentMeta, find_in_sorted, load_chunk_directory, read_range, read_segment,
-    write_segment,
+    ChunkCache, ChunkDirectory, SegmentMeta, find_in_sorted_cached, load_chunk_directory,
+    read_one_cached, read_segment, write_segment,
 };
 
 /// Locations of the two index segments, stored in the group directory.
@@ -51,28 +51,53 @@ pub fn write_key_index(db: &mut Zu1File, key_by_row: &[u64]) -> Result<KeyIndex>
     })
 }
 
-/// Read access to a sealed index: holds the key segment's chunk
-/// directory so every lookup goes straight to its one chunk.
+/// Read access to a sealed index: holds both segments' chunk
+/// directories so every lookup goes straight to its one chunk, and a
+/// decoded-chunk cache per segment so warm lookups that repeat a chunk
+/// skip the read and the decode. That cache is the B2 budget: a warm
+/// point lookup is a fence partition point and a binary search.
 #[derive(Debug)]
 pub struct KeyReader {
     index: KeyIndex,
-    chunks: ChunkDirectory,
+    key_chunks: ChunkDirectory,
+    row_chunks: ChunkDirectory,
+    key_cache: ChunkCache,
+    row_cache: ChunkCache,
 }
 
 impl KeyReader {
     pub fn load(db: &mut Zu1File, index: KeyIndex) -> Result<Self> {
-        let chunks = load_chunk_directory(db, &index.keys)?;
-        Ok(Self { index, chunks })
+        let key_chunks = load_chunk_directory(db, &index.keys)?;
+        let row_chunks = load_chunk_directory(db, &index.rows)?;
+        Ok(Self {
+            index,
+            key_chunks,
+            row_chunks,
+            key_cache: ChunkCache::default(),
+            row_cache: ChunkCache::default(),
+        })
     }
 
     /// Returns the row stored under `key`, or `None`.
-    pub fn lookup(&self, db: &mut Zu1File, key: u64) -> Result<Option<u64>> {
-        let Some(pos) = find_in_sorted(db, &self.index.keys, &self.chunks, key)? else {
+    pub fn lookup(&mut self, db: &mut Zu1File, key: u64) -> Result<Option<u64>> {
+        let Some(pos) = find_in_sorted_cached(
+            db,
+            &self.index.keys,
+            &self.key_chunks,
+            &mut self.key_cache,
+            key,
+        )?
+        else {
             return Ok(None);
         };
-        let mut row = Vec::with_capacity(1);
-        read_range(db, &self.index.rows, pos, pos + 1, &mut row)?;
-        Ok(Some(row[0]))
+        read_one_cached(
+            db,
+            &self.index.rows,
+            &self.row_chunks,
+            &mut self.row_cache,
+            pos,
+        )
+        .map(Some)
     }
 }
 
@@ -127,7 +152,7 @@ mod tests {
         let key_by_row: Vec<u64> = (0..n).map(key_of).collect();
         let index = write_key_index(&mut db, &key_by_row).unwrap();
         verify_key_index(&mut db, &index, n).unwrap();
-        let reader = KeyReader::load(&mut db, index).unwrap();
+        let mut reader = KeyReader::load(&mut db, index).unwrap();
         for row in (0..n).step_by(97) {
             assert_eq!(
                 reader.lookup(&mut db, key_of(row)).unwrap(),

@@ -99,10 +99,17 @@ impl Graph for Zu1Graph<'_> {
             Direction::Fwd
         };
         let Self { db, readers, .. } = self;
-        readers
-            .get(&rel)
+        // The cached-group path, not the point path: scans and expands
+        // revisit the same groups constantly, and B4 lives on the second
+        // hop being a slice copy instead of a chunk decode per row. The
+        // reader holds one decoded group per direction of use; a smarter
+        // policy is the buffer manager's job (docs/09, M3).
+        let nbrs = readers
+            .get_mut(&rel)
             .expect("just loaded")
-            .neighbors_dir_into(db, node, dir, out)
+            .neighbors_dir(db, node, dir)?;
+        out.extend_from_slice(nbrs);
+        Ok(())
     }
 
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool> {

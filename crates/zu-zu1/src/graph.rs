@@ -256,6 +256,99 @@ pub fn read_edge_csv(path: &Path) -> Result<Vec<(u32, u32)>> {
     }
 }
 
+/// Reads a node key list, one u64 per line, skipping empty lines and
+/// `#` comments. Keys are original source ids too wide for dense rows;
+/// LDBC SNB ids are the motivating corpus.
+pub fn read_key_list(path: &Path) -> Result<Vec<u64>> {
+    let bad = |line_no: usize| ZuError::InvalidArgument(format!("line {line_no}: expected a key"));
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut keys = Vec::new();
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(keys);
+        }
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        keys.push(trimmed.parse::<u64>().map_err(|_| bad(line_no))?);
+    }
+}
+
+/// Reads a whitespace separated `src dst` edge list of u64 keys: the
+/// SNAP layout widened to sources whose ids do not fit u32.
+pub fn read_key_edge_list(path: &Path) -> Result<Vec<(u64, u64)>> {
+    let bad = |line_no: usize| {
+        ZuError::InvalidArgument(format!("line {line_no}: expected 'src dst' keys"))
+    };
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut edges = Vec::new();
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(edges);
+        }
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_ascii_whitespace();
+        let src = parts
+            .next()
+            .and_then(|t| t.parse::<u64>().ok())
+            .ok_or_else(|| bad(line_no))?;
+        let dst = parts
+            .next()
+            .and_then(|t| t.parse::<u64>().ok())
+            .ok_or_else(|| bad(line_no))?;
+        edges.push((src, dst));
+    }
+}
+
+/// A densified edge list: the edges over dense rows, plus the original
+/// key of every row in the shape [`bulk_load_keyed`] takes.
+pub type Densified = (Vec<(u32, u32)>, Vec<u64>);
+
+/// Maps keyed edges onto dense rows: each key's rank in the sorted
+/// deduplicated key list becomes its row id, and both endpoints of
+/// every edge resolve through that ranking. Returns the mapped edges in
+/// input order plus the key of every row, which is exactly the
+/// `key_by_row` contract of [`bulk_load_keyed`]. An edge endpoint
+/// absent from the key list is an error naming the key, because a
+/// silently invented node would corrupt the row domain.
+pub fn densify_keyed(keys: &[u64], edges: &[(u64, u64)]) -> Result<Densified> {
+    let mut by_row = keys.to_vec();
+    by_row.sort_unstable();
+    by_row.dedup();
+    if by_row.len() > u32::MAX as usize {
+        return Err(ZuError::InvalidArgument(format!(
+            "{} keys exceed the u32 row domain",
+            by_row.len()
+        )));
+    }
+    let row_of = |key: u64| {
+        by_row.binary_search(&key).map(|r| r as u32).map_err(|_| {
+            ZuError::InvalidArgument(format!(
+                "edge references key {key} absent from the key list"
+            ))
+        })
+    };
+    let mut dense = Vec::with_capacity(edges.len());
+    for &(src, dst) in edges {
+        dense.push((row_of(src)?, row_of(dst)?));
+    }
+    Ok((dense, by_row))
+}
+
 /// Builds one direction's CSR groups from edges sorted by `(key, other)`.
 fn build_direction(
     db: &mut Zu1File,
@@ -502,7 +595,7 @@ impl GraphReader {
             })?;
             self.key_reader = Some(KeyReader::load(db, index)?);
         }
-        self.key_reader.as_ref().unwrap().lookup(db, key)
+        self.key_reader.as_mut().unwrap().lookup(db, key)
     }
 
     pub fn directory(&self) -> &Directory {
@@ -645,6 +738,77 @@ mod tests {
         let csv = dir.path().join("edges.csv");
         std::fs::write(&csv, "src,dst,weight\n1,2,0.5\n").unwrap();
         assert_eq!(read_edge_csv(&csv).unwrap(), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn key_readers_take_ids_past_u32() {
+        let dir = tempfile::tempdir().unwrap();
+        let nodes = dir.path().join("keys.txt");
+        let edges = dir.path().join("edges.txt");
+        std::fs::write(&nodes, "# persons\n14\n4398046517420\n\n16\n").unwrap();
+        std::fs::write(&edges, "# knows\n14 4398046517420\n4398046517420 16\n").unwrap();
+        assert_eq!(read_key_list(&nodes).unwrap(), vec![14, 4398046517420, 16]);
+        assert_eq!(
+            read_key_edge_list(&edges).unwrap(),
+            vec![(14, 4398046517420), (4398046517420, 16)]
+        );
+    }
+
+    #[test]
+    fn key_readers_error_by_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let nodes = dir.path().join("keys.txt");
+        std::fs::write(&nodes, "14\nnope\n").unwrap();
+        let err = read_key_list(&nodes).unwrap_err();
+        assert!(
+            err.to_string().contains("line 2"),
+            "unexpected error: {err}"
+        );
+        let edges = dir.path().join("edges.txt");
+        std::fs::write(&edges, "14 16\n14\n").unwrap();
+        let err = read_key_edge_list(&edges).unwrap_err();
+        assert!(
+            err.to_string().contains("line 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn densify_ranks_keys_and_rejects_strays() {
+        let keys = vec![4398046517420u64, 14, 16, 14];
+        let edges = vec![(14u64, 4398046517420u64), (4398046517420, 16)];
+        let (dense, by_row) = densify_keyed(&keys, &edges).unwrap();
+        assert_eq!(by_row, vec![14, 16, 4398046517420]);
+        assert_eq!(dense, vec![(0, 2), (2, 1)]);
+        let err = densify_keyed(&keys, &[(14, 99)]).unwrap_err();
+        assert!(err.to_string().contains("99"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn densified_load_serves_lookups_by_original_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let keys = vec![14u64, 16, 4398046517420];
+        let edges = vec![(14u64, 4398046517420u64), (4398046517420, 16)];
+        let (mut dense, by_row) = densify_keyed(&keys, &edges).unwrap();
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load_keyed(
+                &mut db,
+                "person",
+                "knows",
+                by_row.len() as u64,
+                sorted_edges(&mut dense),
+                Some(&by_row),
+            )
+            .unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        assert_eq!(reader.lookup_key(&mut db, 4398046517420).unwrap(), Some(2));
+        assert_eq!(reader.lookup_key(&mut db, 15).unwrap(), None);
+        let row = reader.lookup_key(&mut db, 14).unwrap().unwrap();
+        assert_eq!(reader.neighbors(&mut db, row).unwrap(), &[2]);
     }
 
     #[test]

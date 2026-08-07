@@ -21,6 +21,10 @@ zu-query.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[[bench]]
+name = "ldbc"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

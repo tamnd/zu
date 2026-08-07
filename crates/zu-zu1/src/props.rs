@@ -71,7 +71,7 @@ fn corrupt(detail: String) -> ZuError {
 }
 
 impl PropsDirectory {
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&PROPS_VERSION.to_le_bytes());
         out.extend_from_slice(&self.node_count.to_le_bytes());
@@ -147,7 +147,7 @@ impl PropsDirectory {
     }
 }
 
-fn free_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+pub(crate) fn free_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
     let directory = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
     for col in &directory.columns {
         for &ptr in &col.meta.blocks {

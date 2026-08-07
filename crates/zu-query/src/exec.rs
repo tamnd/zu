@@ -103,6 +103,17 @@ pub trait Graph {
         self.neighbors(rel, node, reversed, &mut out)?;
         Ok(out.len() as u64)
     }
+    /// Sum of degrees over a node list, the counting expand's bulk
+    /// read: one call per source vector instead of one per node. The
+    /// default loops over [`Graph::degree`]; engines override to keep
+    /// the whole sum inside one reader.
+    fn degree_sum(&mut self, rel: u32, nodes: &[u64], reversed: bool) -> Result<u64> {
+        let mut total = 0;
+        for &node in nodes {
+            total += self.degree(rel, node, reversed)?;
+        }
+        Ok(total)
+    }
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
@@ -461,6 +472,12 @@ enum OpDesc {
         /// chunk's multiplicity lives inside the degree sum from then
         /// on. `None` reads the flattened source position as usual.
         absorb: Option<usize>,
+        /// False when nothing in the query reads the rel slot, the
+        /// usual case for anonymous rels: the rel column stays empty
+        /// and only the far column materializes. Compaction is safe
+        /// because `Chunk::retain` walks each column by its own
+        /// length.
+        emit_rels: bool,
     },
     /// Variable-length expand under GQL's default DIFFERENT EDGES
     /// semantics: enumerates every trail of `min..=max` hops with no
@@ -848,6 +865,7 @@ fn compile_match_op(
                     chunk,
                     degrees: false,
                     absorb: None,
+                    emit_rels: true,
                 });
                 b.produced(chunk);
             }
@@ -938,17 +956,23 @@ fn compile_optional_group(
     Ok(end)
 }
 
-/// The count-to-degree rewrite (docs/11 B4): when the sink aggregates
-/// and the stage's last producer is a fixed-length `Expand` whose
-/// output chunk nothing reads except at most one bare non-distinct
-/// count argument, the expand switches to degree mode and that count
-/// becomes a star count over the preserved multiplicity. When the
-/// expand's flattened source chunk is also read by nothing else, its
-/// `Flatten` drops too and the expand walks the unflattened source
-/// directly; the absorbed chunk keeps its flat marking so the sink's
-/// multiplicity product skips it, its contribution now living inside
-/// the degree sum. Runs after the sink's own flattens, so a key or
-/// filter that reads either chunk has already shown up in the
+/// Dead-column and count-to-degree rewrites over a finished stage.
+///
+/// First, any fixed-length `Expand` whose rel slot nothing in the
+/// query reads stops materializing its rel column, the usual case for
+/// anonymous rels in a pattern.
+///
+/// Then the count-to-degree rewrite (docs/11 B4): when the sink
+/// aggregates and the stage's last producer is a fixed-length `Expand`
+/// whose output chunk nothing reads except at most one bare
+/// non-distinct count argument, the expand switches to degree mode and
+/// that count becomes a star count over the preserved multiplicity.
+/// When the expand's flattened source chunk is also read by nothing
+/// else, its `Flatten` drops too and the expand walks the unflattened
+/// source directly; the absorbed chunk keeps its flat marking so the
+/// sink's multiplicity product skips it, its contribution now living
+/// inside the degree sum. Runs after the sink's own flattens, so a key
+/// or filter that reads either chunk has already shown up in the
 /// reference walk and blocks the rewrite.
 fn rewrite_count_expand(
     b: &mut StageBuilder,
@@ -956,6 +980,7 @@ fn rewrite_count_expand(
     aggs: &mut [AggSpec],
     post: &[PostOp],
     extra: &BTreeSet<usize>,
+    aggregate: bool,
 ) {
     // Optional groups hold absolute operator indices and their own
     // null semantics; leave their stages alone.
@@ -963,6 +988,54 @@ fn rewrite_count_expand(
         .iter()
         .any(|d| matches!(d, OpDesc::OptionalBegin | OpDesc::OptionalEnd { .. }))
     {
+        return;
+    }
+    // Every slot anything reads, aggregate arguments included: a rel
+    // slot outside this set never gets evaluated, so its column can
+    // stay empty.
+    let mut full_refs = BTreeSet::new();
+    for desc in &b.descs {
+        match desc {
+            OpDesc::IndexLookup { key, .. } => expr_slots(key, &mut full_refs),
+            OpDesc::Expand { from, .. } | OpDesc::VarExpand { from, .. } => {
+                full_refs.insert(*from);
+            }
+            OpDesc::ExpandInto { from, to, .. } => {
+                full_refs.insert(*from);
+                full_refs.insert(*to);
+            }
+            OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => {
+                expr_slots(expr, &mut full_refs)
+            }
+            OpDesc::Source
+            | OpDesc::RowSource { .. }
+            | OpDesc::Scan { .. }
+            | OpDesc::Flatten { .. }
+            | OpDesc::OptionalBegin
+            | OpDesc::OptionalEnd { .. } => {}
+        }
+    }
+    for item in items {
+        expr_slots(&item.expr, &mut full_refs);
+    }
+    for op in post {
+        match op {
+            PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => expr_slots(e, &mut full_refs),
+            PostOp::Sort(keys) => keys.iter().for_each(|(e, _)| expr_slots(e, &mut full_refs)),
+            PostOp::Distinct => {}
+        }
+    }
+    full_refs.extend(extra.iter().copied());
+    for desc in &mut b.descs {
+        if let OpDesc::Expand {
+            chunk, emit_rels, ..
+        } = desc
+            && !full_refs.contains(&b.chunk_slots[*chunk][1])
+        {
+            *emit_rels = false;
+        }
+    }
+    if !aggregate {
         return;
     }
     let Some(target) = b
@@ -1190,9 +1263,7 @@ fn build_stages(
                     i += 1;
                 }
 
-                if aggregate {
-                    rewrite_count_expand(&mut b, &items, &mut aggs, &post, &extra);
-                }
+                rewrite_count_expand(&mut b, &items, &mut aggs, &post, &extra, aggregate);
 
                 let unflat = (0..b.chunk_flat.len())
                     .filter(|&c| !b.chunk_flat[c])
@@ -1602,6 +1673,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             rels,
             chunk,
             degrees: false,
+            emit_rels,
             ..
         } => loop {
             if !next(descs, ctx, i - 1)? {
@@ -1628,11 +1700,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                             table: step.to_table,
                             offset: dst,
                         });
-                        rel_vals.push(Value::Rel {
-                            table: step.id,
-                            src: offset,
-                            dst,
-                        });
+                        if *emit_rels {
+                            rel_vals.push(Value::Rel {
+                                table: step.id,
+                                src: offset,
+                                dst,
+                            });
+                        }
                     }
                     ctx.scratch = scratch;
                 }
@@ -1647,11 +1721,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                             table: step.from_table,
                             offset: src,
                         });
-                        rel_vals.push(Value::Rel {
-                            table: step.id,
-                            src,
-                            dst: offset,
-                        });
+                        if *emit_rels {
+                            rel_vals.push(Value::Rel {
+                                table: step.id,
+                                src,
+                                dst: offset,
+                            });
+                        }
                     }
                     ctx.scratch = scratch;
                 }
@@ -1670,7 +1746,8 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
         // expand sums neighbor counts into the chunk size and
         // materializes no lists. With `absorb` the source chunk never
         // flattened and the expand walks it whole, one pull per
-        // upstream configuration.
+        // upstream configuration, batching the whole vector into one
+        // storage call per step and direction.
         OpDesc::Expand {
             from,
             direction,
@@ -1678,6 +1755,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             chunk,
             degrees: true,
             absorb,
+            ..
         } => loop {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
@@ -1698,19 +1776,47 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         .get(from)
                         .map(|&(_, col)| col)
                         .expect("expand from a bound slot");
-                    let StageCtx { graph, chunks, .. } = ctx;
+                    let StageCtx {
+                        graph,
+                        chunks,
+                        scratch,
+                        ..
+                    } = ctx;
                     let source = &chunks[*f];
-                    for pos in 0..source.size {
-                        match &source.cols[col][pos] {
-                            Value::Null => {}
-                            &Value::Node { table, offset } => {
-                                total += degree_sum(&mut **graph, rels, *direction, table, offset)?;
+                    for step in rels {
+                        let sides = [
+                            (
+                                matches!(direction, RelDirection::Out | RelDirection::Undirected),
+                                step.from_table,
+                                false,
+                            ),
+                            (
+                                matches!(direction, RelDirection::In | RelDirection::Undirected),
+                                step.to_table,
+                                true,
+                            ),
+                        ];
+                        for (applies, step_table, reversed) in sides {
+                            if !applies {
+                                continue;
                             }
-                            other => {
-                                return Err(invalid(format!(
-                                    "expand expects a node, got {other:?}"
-                                )));
+                            scratch.clear();
+                            for pos in 0..source.size {
+                                match &source.cols[col][pos] {
+                                    Value::Null => {}
+                                    &Value::Node { table, offset } => {
+                                        if table == step_table {
+                                            scratch.push(offset);
+                                        }
+                                    }
+                                    other => {
+                                        return Err(invalid(format!(
+                                            "expand expects a node, got {other:?}"
+                                        )));
+                                    }
+                                }
                             }
+                            total += graph.degree_sum(step.id, scratch, reversed)?;
                         }
                     }
                 }
@@ -3187,12 +3293,49 @@ mod tests {
              RETURN count(c) AS n",
             "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a.id < c.id \
              RETURN count(c) AS n",
+            // Bound but unread rels: the dead-column pass leaves their
+            // columns empty on both the project and aggregate paths,
+            // and the compacting filter walks the survivors.
+            "MATCH (a:Person)-[r:KNOWS]->(b) RETURN b.id AS id ORDER BY id",
+            "MATCH (a:Person)-[r:KNOWS]->(b) WHERE b.id > 0 RETURN b.id AS id ORDER BY id",
+            "MATCH (a:Person)-[r:KNOWS]->(b)-[s:KNOWS]->(c) RETURN count(c) AS n",
         ];
         for q in queries {
             let fac = run_with(q, &[], false);
             let flat = run_with(q, &[], true);
             assert_eq!(sorted(fac.rows), sorted(flat.rows), "query: {q}");
         }
+    }
+
+    #[test]
+    fn referenced_rel_columns_still_materialize() {
+        // The one read the dead-column pass must never break: a rel
+        // slot the sink returns keeps its column.
+        let out = run_with(
+            "MATCH (a:Person {id: 0})-[r:KNOWS]->(b) RETURN r AS r",
+            &[],
+            false,
+        );
+        let mut rows = out.rows;
+        rows.sort_by_key(|row| match row[0] {
+            Value::Rel { dst, .. } => dst,
+            _ => u64::MAX,
+        });
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Rel {
+                    table: 2,
+                    src: 0,
+                    dst: 1
+                }],
+                vec![Value::Rel {
+                    table: 2,
+                    src: 0,
+                    dst: 2
+                }],
+            ]
+        );
     }
 
     #[test]

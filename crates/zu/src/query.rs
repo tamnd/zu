@@ -129,6 +129,26 @@ impl Graph for Zu1Graph<'_> {
         Ok(nbrs.len() as u64)
     }
 
+    fn degree_sum(&mut self, rel: u32, nodes: &[u64], reversed: bool) -> Result<u64> {
+        self.ensure_reader(rel)?;
+        let dir = if reversed {
+            Direction::Bwd
+        } else {
+            Direction::Fwd
+        };
+        let Self { db, readers, .. } = self;
+        // One reader lookup for the whole vector; each node then costs
+        // a group locate and an offset difference against the cached
+        // decode, so a counting expand stays out of virtual dispatch
+        // per node.
+        let reader = readers.get_mut(&rel).expect("just loaded");
+        let mut total = 0;
+        for &node in nodes {
+            total += reader.neighbors_dir(db, node, dir)?.len() as u64;
+        }
+        Ok(total)
+    }
+
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool> {
         self.ensure_reader(rel)?;
         let Self { db, readers, .. } = self;

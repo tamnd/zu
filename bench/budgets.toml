@@ -106,6 +106,27 @@ fullzip_row_kreads_s = 20.0
 # the real corpus. Lower this ceiling, never raise it.
 fullzip_ratio = 0.48
 
+# LDBC SNB SF1 latency ceilings straight from docs/11, gated by the
+# ldbc bench in the facade crate over the real person-knows-person
+# graph: 10 K persons, 173 K knows edges, keyed load with the original
+# LDBC ids in the primary-key index. B1 is warm 1-hop expands at
+# deg <= 100 p50 through the storage point path. B2 is warm pk lookups
+# p50 through the sealed index with its decoded-chunk cache; warm means
+# the chunk was touched before, and a warm hit is a fence partition
+# point plus a binary search. Lower these ceilings, never raise them.
+ldbc_hop_p50_us = 10.0
+ldbc_key_p50_us = 2.0
+
+# B4, the 2-hop factorized count on SF1 under 10 ms, is measured by the
+# same bench but not yet enforced. Group-cached expansion took the
+# query from 1.15 s to about 220 ms end to end, and the remainder is
+# the executor materializing every second-hop neighbor list into value
+# vectors, 7.6 M values a run, before the factorized aggregate counts
+# them. Meeting 10 ms needs the count-to-degree rewrite: an unfiltered
+# count over a trailing expand should read degrees, not lists. The key
+# activates with that rewrite.
+# ldbc_two_hop_p50_ms = 10.0
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

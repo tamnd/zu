@@ -16,6 +16,7 @@ pub mod parquet;
 pub mod props;
 pub mod reorder;
 pub mod segment;
+pub mod wal;
 
 use std::path::Path;
 

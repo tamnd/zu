@@ -126,15 +126,23 @@ impl Graph for Zu1Graph<'_> {
     }
 }
 
-/// Parses, plans, optimizes, and executes one query against an open
-/// zu1 file, returning the result rows.
-pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
+/// Everything a query needs before touching graph data: the optimized
+/// plan, the bound query, and the parameter values in binder order.
+struct Prepared {
+    catalog: Catalog,
+    schema: Schema,
+    query: BoundQuery,
+    plan: plan::LogicalPlan,
+    args: Vec<Value>,
+}
+
+fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
     let catalog = Catalog::load(db)?;
     let schema = schema_of(&catalog)?;
     let parsed = parser::parse(source)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
-    let optimized = optimizer::optimize(built, &query, &schema)?;
+    let plan = optimizer::optimize(built, &query, &schema)?;
     let mut args = Vec::with_capacity(query.params.len());
     for name in &query.params {
         match params.iter().find(|(n, _)| n == name) {
@@ -146,15 +154,46 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
             }
         }
     }
-    let mut graph = Zu1Graph::new(db, catalog);
+    Ok(Prepared {
+        catalog,
+        schema,
+        query,
+        plan,
+        args,
+    })
+}
+
+/// Parses, plans, optimizes, and executes one query against an open
+/// zu1 file, returning the result rows.
+pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
+    let p = prepare(source, db, params)?;
+    let mut graph = Zu1Graph::new(db, p.catalog);
     exec::execute(
-        &optimized,
-        &query,
-        &schema,
+        &p.plan,
+        &p.query,
+        &p.schema,
         &mut graph,
-        &args,
+        &p.args,
         &exec::Options::default(),
     )
+}
+
+/// Executes one query with per-operator counters and returns the
+/// rendered EXPLAIN ANALYZE listing: pulls, rows, average vector
+/// length, and self time per operator, per stage. The grammar has no
+/// EXPLAIN keyword yet, so this is the API entry point.
+pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<String> {
+    let p = prepare(source, db, params)?;
+    let mut graph = Zu1Graph::new(db, p.catalog);
+    let (_, profile) = exec::execute_profiled(
+        &p.plan,
+        &p.query,
+        &p.schema,
+        &mut graph,
+        &p.args,
+        &exec::Options::default(),
+    )?;
+    Ok(profile.render())
 }
 
 #[cfg(test)]
@@ -269,5 +308,37 @@ mod tests {
         )
         .expect("undirected count");
         assert_eq!(r.rows, [[Value::Int(undirected)]]);
+    }
+
+    #[test]
+    fn explain_analyze_profiles_a_real_zu1_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("analyze.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = (0..400u32).map(|i| (i % 97, (i * 7 + 3) % 89)).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let src = 3u32;
+        let friends = edges.iter().filter(|(s, _)| *s == src).count();
+        let text = explain_analyze(
+            "MATCH (a:person {id: $src})-[:follows]->(b) RETURN b.id AS friend",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("explain analyze");
+        assert!(
+            text.contains(&format!("stage 1: Project [{friends} rows,")),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("IndexLookup a: person [id = $src]"),
+            "got:\n{text}"
+        );
+        assert!(text.contains("Expand (a)-[:follows]->(b)"), "got:\n{text}");
+        assert!(text.contains("pulls"), "got:\n{text}");
     }
 }

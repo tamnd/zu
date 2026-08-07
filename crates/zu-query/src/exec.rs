@@ -34,9 +34,15 @@
 //! contract that the `id` property of a node equals its offset; keyed
 //! tables get their own lookup path when the column catalog lands.
 //!
-//! Variable-length patterns and OPTIONAL MATCH parse and plan but do
-//! not execute yet; both return a clear error here rather than a wrong
-//! answer.
+//! Variable-length patterns execute as `VarExpand` under GQL's default
+//! DIFFERENT EDGES semantics: a depth-first enumeration of trails, one
+//! output value per trail, with the rel variable bound to the edge
+//! list. That is the correctness-first baseline; the RecursiveBFS
+//! frontier engine with the hybrid morsel policy is milestone 4.
+//! OPTIONAL MATCH parses and plans but does not execute yet; it needs
+//! plan-level outer groups so a WHERE inside the optional part keeps
+//! its null-preserving semantics, and returns a clear error here
+//! rather than a wrong answer.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -251,6 +257,27 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
                 schema
             )
         ),
+        OpDesc::VarExpand {
+            from,
+            direction,
+            rels,
+            min,
+            max,
+            chunk,
+            ..
+        } => {
+            let max = max.map_or(String::new(), |v| v.to_string());
+            format!(
+                "VarExpand *{min}..{max} {}",
+                rel_text(
+                    var(*from),
+                    var(stage.chunk_slots[*chunk][0]),
+                    *direction,
+                    rels,
+                    schema
+                )
+            )
+        }
         OpDesc::ExpandInto {
             from,
             to,
@@ -399,6 +426,22 @@ enum OpDesc {
         from: usize,
         direction: RelDirection,
         rels: Vec<RelStep>,
+        chunk: usize,
+    },
+    /// Variable-length expand under GQL's default DIFFERENT EDGES
+    /// semantics: enumerates every trail of `min..=max` hops with no
+    /// repeated edge, one output value per trail. The rel column holds
+    /// the trail as a list of rels. This is the correctness-first DFS
+    /// baseline; the RecursiveBFS frontier engine is milestone 4.
+    VarExpand {
+        from: usize,
+        direction: RelDirection,
+        rels: Vec<RelStep>,
+        min: u64,
+        max: Option<u64>,
+        /// Candidate tables of the endpoint variable; trails ending
+        /// elsewhere are not emitted.
+        to_tables: Vec<u32>,
         chunk: usize,
     },
     /// Both endpoints bound: an edge probe instead of a list read.
@@ -711,11 +754,6 @@ fn build_stages(
                 if *optional {
                     return Err(invalid("OPTIONAL MATCH does not execute yet".into()));
                 }
-                if range.is_some() {
-                    return Err(invalid(
-                        "variable-length patterns do not execute yet".into(),
-                    ));
-                }
                 let rels = rel_steps(*rel, query, schema)?;
                 let from_chunk = b
                     .slot_loc
@@ -723,7 +761,32 @@ fn build_stages(
                     .map(|&(c, _)| c)
                     .ok_or_else(|| invalid(format!("expand from unbound slot {from}")))?;
                 b.ensure_flat(from_chunk);
-                if *into {
+                if let Some((min, max)) = range {
+                    if *into {
+                        return Err(invalid(
+                            "variable-length patterns into a bound endpoint do not execute yet"
+                                .into(),
+                        ));
+                    }
+                    let to_tables = query.variables[*to].node_tables.clone();
+                    if to_tables.is_empty() {
+                        return Err(invalid(format!(
+                            "variable '{}' has no candidate node tables",
+                            query.variables[*to].name
+                        )));
+                    }
+                    let chunk = b.new_chunk(vec![*to, *rel], false);
+                    b.descs.push(OpDesc::VarExpand {
+                        from: *from,
+                        direction: *direction,
+                        rels,
+                        min: min.unwrap_or(1),
+                        max: *max,
+                        to_tables,
+                        chunk,
+                    });
+                    b.produced(chunk);
+                } else if *into {
                     let to_chunk = b
                         .slot_loc
                         .get(to)
@@ -989,9 +1052,97 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
         | OpDesc::Scan { chunk, .. }
         | OpDesc::IndexLookup { chunk, .. }
         | OpDesc::Expand { chunk, .. }
+        | OpDesc::VarExpand { chunk, .. }
         | OpDesc::ExpandInto { chunk, .. }
         | OpDesc::Unwind { chunk, .. } => ctx.chunks[*chunk].size as u64,
     }
+}
+
+/// Depth-first trail enumeration for `VarExpand`: every path of
+/// `min..=max` hops from the start node with no repeated edge, GQL's
+/// default DIFFERENT EDGES semantics. A trail whose endpoint sits in
+/// `to_tables` emits one node value and its edge list. `path` doubles
+/// as the visited-edge set; trails stay short enough that a linear
+/// scan beats a hash set.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_trails(
+    ctx: &mut StageCtx,
+    rels: &[RelStep],
+    direction: RelDirection,
+    to_tables: &[u32],
+    min: u64,
+    max: Option<u64>,
+    table: u32,
+    offset: u64,
+    path: &mut Vec<Value>,
+    far: &mut Vec<Value>,
+    trails: &mut Vec<Value>,
+) -> Result<()> {
+    let depth = path.len() as u64;
+    if depth >= min && to_tables.contains(&table) {
+        far.push(Value::Node { table, offset });
+        trails.push(Value::List(path.clone()));
+    }
+    if max.is_some_and(|m| depth >= m) {
+        return Ok(());
+    }
+    let mut hops: Vec<(Value, u32, u64)> = Vec::new();
+    let mut nbrs = Vec::new();
+    for step in rels {
+        if matches!(direction, RelDirection::Out | RelDirection::Undirected)
+            && table == step.from_table
+        {
+            ctx.graph.neighbors(step.id, offset, false, &mut nbrs)?;
+            for &dst in &nbrs {
+                hops.push((
+                    Value::Rel {
+                        table: step.id,
+                        src: offset,
+                        dst,
+                    },
+                    step.to_table,
+                    dst,
+                ));
+            }
+        }
+        if matches!(direction, RelDirection::In | RelDirection::Undirected)
+            && table == step.to_table
+        {
+            ctx.graph.neighbors(step.id, offset, true, &mut nbrs)?;
+            for &src in &nbrs {
+                hops.push((
+                    Value::Rel {
+                        table: step.id,
+                        src,
+                        dst: offset,
+                    },
+                    step.from_table,
+                    src,
+                ));
+            }
+        }
+    }
+    for (rel_val, next_table, next_offset) in hops {
+        if path.contains(&rel_val) {
+            continue;
+        }
+        path.push(rel_val);
+        enumerate_trails(
+            ctx,
+            rels,
+            direction,
+            to_tables,
+            min,
+            max,
+            next_table,
+            next_offset,
+            path,
+            far,
+            trails,
+        )?;
+        path.pop();
+    }
+    Ok(())
 }
 
 /// The pull entry point: a plain `step` normally, a timed and counted
@@ -1191,6 +1342,45 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             c.size = far.len();
             c.cols[0] = far;
             c.cols[1] = rel_vals;
+            c.cur = None;
+            return Ok(true);
+        },
+        OpDesc::VarExpand {
+            from,
+            direction,
+            rels,
+            min,
+            max,
+            to_tables,
+            chunk,
+        } => loop {
+            if !next(descs, ctx, i - 1)? {
+                return Ok(false);
+            }
+            let (table, offset) = node_value(value_of(ctx, *from)?, "var expand")?;
+            let mut far = Vec::new();
+            let mut trails = Vec::new();
+            let mut path = Vec::new();
+            enumerate_trails(
+                ctx,
+                rels,
+                *direction,
+                to_tables,
+                *min,
+                *max,
+                table,
+                offset,
+                &mut path,
+                &mut far,
+                &mut trails,
+            )?;
+            if far.is_empty() {
+                continue;
+            }
+            let c = &mut ctx.chunks[*chunk];
+            c.size = far.len();
+            c.cols[0] = far;
+            c.cols[1] = trails;
             c.cur = None;
             return Ok(true);
         },
@@ -2409,6 +2599,69 @@ mod tests {
         assert_eq!(int_rows(&r), [[0]]);
     }
 
+    #[test]
+    fn var_length_reaches_one_and_two_hops() {
+        let r = run(
+            "MATCH (a:Person {id: 0})-[:KNOWS*1..2]->(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        // Depth one reaches 1 and 2; depth two reaches 2 and 3 via 1
+        // and 4 via 2. Node 2 arrives once per trail.
+        assert_eq!(int_rows(&r), [[1], [2], [2], [3], [4]]);
+    }
+
+    #[test]
+    fn var_length_lower_bound_skips_short_trails() {
+        let r = run(
+            "MATCH (a:Person {id: 0})-[:KNOWS*2..2]->(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[2], [3], [4]]);
+    }
+
+    #[test]
+    fn var_length_binds_the_rel_list() {
+        let r = run(
+            "MATCH (a:Person {id: 0})-[r:KNOWS*1..3]->(b) \
+             RETURN b.id AS b, size(r) AS hops ORDER BY b, hops",
+            &[],
+        );
+        assert_eq!(
+            int_rows(&r),
+            [
+                [1, 1],
+                [2, 1],
+                [2, 2],
+                [3, 2],
+                [4, 2],
+                [4, 3],
+                [4, 3],
+                [5, 3],
+            ]
+        );
+    }
+
+    #[test]
+    fn var_length_trails_never_reuse_an_edge() {
+        // Length-six trails from node 0 revisit node 0 through the
+        // 5 -> 0 edge and continue on the still-unused outgoing edge,
+        // so this passes only if uniqueness is per edge, not per node.
+        let r = run(
+            "MATCH (a:Person {id: 0})-[:KNOWS*6..6]->(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[2], [2], [2], [3]]);
+    }
+
+    #[test]
+    fn var_length_undirected_walks_both_ways() {
+        let r = run(
+            "MATCH (a:Person {id: 3})-[:KNOWS*1..2]-(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0], [1], [2], [2], [4], [5]]);
+    }
+
     fn profiled(source: &str, params: &[(&str, Value)]) -> (QueryResult, Profile) {
         let schema = schema();
         let parsed = crate::parser::parse(source).expect("parse");
@@ -2532,6 +2785,11 @@ mod tests {
             (
                 "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS deg WHERE deg > 1 \
                  MATCH (a)-[:IS_LOCATED_IN]->(pl) RETURN a.id AS person, pl.id AS place",
+                &[],
+            ),
+            (
+                "MATCH (a:Person {id: 0})-[r:KNOWS*1..3]->(b) \
+                 RETURN b.id AS b, size(r) AS hops",
                 &[],
             ),
         ];

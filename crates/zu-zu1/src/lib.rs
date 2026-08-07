@@ -13,6 +13,7 @@ pub mod keys;
 pub mod meta;
 #[cfg(feature = "arrow")]
 pub mod parquet;
+pub mod props;
 pub mod reorder;
 pub mod segment;
 
@@ -38,8 +39,10 @@ pub const MIN_READER_VERSION: u16 = 1;
 /// headers, the catalog, the table index, and each rel table's group
 /// directory with every column segment it lists, the primary-key index
 /// included when the table carries one. Cross-checks the three
-/// against each other (every rel table has a directory, every directory
-/// belongs to a rel table, counts agree), then decodes the free list and
+/// against each other (every rel table has a directory, every index
+/// entry belongs to a catalog table, node entries decode as props
+/// directories with row-aligned columns, counts agree), then decodes
+/// the free list and
 /// rejects a file whose free list claims a block a live chain or segment
 /// uses, since allocating such a block would overwrite live data.
 /// Returns the number of payload bytes verified.
@@ -68,12 +71,50 @@ pub fn verify(path: &Path) -> Result<u64> {
     }
     let mut values = Vec::new();
     for &(id, root) in index.entries() {
-        let rel = catalog
-            .rel_by_id(id)
-            .ok_or_else(|| corrupt("table index", format!("entry {id} names no catalog table")))?;
         let chain = meta::read_chain(&mut db, root)?;
         bytes += chain.len() as u64;
         live.extend(meta::chain_blocks(&mut db, root)?);
+        // A node table's entry is its props directory (the M2 column
+        // slice); a rel table's entry is its group directory.
+        if let Some(node) = catalog.node_by_id(id) {
+            let props = props::PropsDirectory::decode(&chain)?;
+            if props.node_count > node.node_count {
+                return Err(corrupt(
+                    "props directory",
+                    format!(
+                        "'{}' props span {} rows, table holds {}",
+                        node.name, props.node_count, node.node_count
+                    ),
+                ));
+            }
+            for col in &props.columns {
+                if col.meta.value_count != props.node_count {
+                    return Err(corrupt(
+                        "props directory",
+                        format!(
+                            "column '{}' holds {} values over {} rows",
+                            col.name, col.meta.value_count, props.node_count
+                        ),
+                    ));
+                }
+                match col.ty {
+                    props::PropType::Str => {
+                        let (mut blob, mut ends) = (Vec::new(), Vec::new());
+                        fullzip::read_blob_segment(&mut db, &col.meta, &mut blob, &mut ends)?;
+                    }
+                    props::PropType::Int => {
+                        values.clear();
+                        segment::read_segment(&mut db, &col.meta, &mut values)?;
+                    }
+                }
+                bytes += col.meta.payload_len;
+                live.extend(col.meta.blocks.iter().copied());
+            }
+            continue;
+        }
+        let rel = catalog
+            .rel_by_id(id)
+            .ok_or_else(|| corrupt("table index", format!("entry {id} names no catalog table")))?;
         let directory = graph::Directory::decode(&chain)?;
         if directory.edge_count != rel.edge_count {
             return Err(corrupt(

@@ -114,6 +114,15 @@ pub trait Graph {
         }
         Ok(total)
     }
+    /// Resolves a user-facing node id to its row offset, `None` when
+    /// the id names no row. The default is the dense-id contract where
+    /// the id is the offset; engines whose loads relabeled rows
+    /// override it to consult the primary-key index, so `{id: ...}`
+    /// lookups and the `id` property stay in the caller's key space.
+    fn lookup_key(&mut self, table: u32, key: u64) -> Result<Option<u64>> {
+        let _ = table;
+        Ok(Some(key))
+    }
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
@@ -1628,8 +1637,11 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             };
             let mut vals = Vec::with_capacity(tables.len());
             for &table in tables {
-                if k < *ctx.counts.get(&table).unwrap_or(&0) {
-                    vals.push(Value::Node { table, offset: k });
+                let Some(offset) = ctx.graph.lookup_key(table, k)? else {
+                    continue;
+                };
+                if offset < *ctx.counts.get(&table).unwrap_or(&0) {
+                    vals.push(Value::Node { table, offset });
                 }
             }
             if vals.is_empty() {

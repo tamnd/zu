@@ -1,29 +1,38 @@
-//! LDBC SNB SF1 gates for B1, B2, and B4 (docs/11, docs/12 M2).
+//! LDBC SNB SF1 gates for B1, B2, B4, and the IS/IC subset (docs/11,
+//! docs/12 M2).
 //!
 //! Runs against the real SF1 person-knows-person graph, preprocessed by
-//! scripts/prep-ldbc.sh into two plain text files under ZU_DATA:
-//! ldbc-sf1-person-keys.txt (one person id per line) and
-//! ldbc-sf1-knows.txt (src dst id pairs). The ids exceed u32, so the
-//! load goes through densify_keyed and the primary-key index carries
-//! the original ids, exactly the path a keyed COPY takes.
+//! scripts/prep-ldbc.sh into three plain text files under ZU_DATA:
+//! ldbc-sf1-person-keys.txt (one person id per line),
+//! ldbc-sf1-knows.txt (src dst id pairs), and
+//! ldbc-sf1-person-props.txt (pipe-delimited person profiles). The ids
+//! exceed u32, so the load goes through densify_keyed and the
+//! primary-key index carries the original ids, exactly the path a
+//! keyed COPY takes; the profiles land as props columns on the person
+//! table, so the query path reads them the way any client would.
 //!
 //! B1 is warm 1-hop expands at deg <= 100 (the G1 workload shape), p50
 //! in us. B2 is warm primary-key lookups, p50 in us. B4 is the 2-hop
 //! factorized count over the whole graph through the query engine, p50
-//! in ms. Every phase crosschecks against a reference computed from the
-//! raw edge list, so a number cannot come from a broken reader or a
-//! wrong plan. With ZU_GATE=1 the process exits nonzero when a ceiling
-//! in bench/budgets.toml is missed, and missing data fails the gate
-//! instead of skipping it.
+//! in ms. IS is the IS1-shaped profile read by original id, all eight
+//! properties through zu::query::run, gated at the G2 1 ms warm p50.
+//! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
+//! ORDER BY, and LIMIT, p50 in ms. Every phase crosschecks against a
+//! reference computed from the raw files, so a number cannot come from
+//! a broken reader or a wrong plan. With ZU_GATE=1 the process exits
+//! nonzero when a ceiling in bench/budgets.toml is missed, and missing
+//! data fails the gate instead of skipping it.
 //!
 //! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu --bench ldbc
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::{
     Direction, GraphReader, bulk_load_keyed, densify_keyed, read_key_edge_list, read_key_list,
 };
+use zu::zu1::props::{PropValues, store_props};
 use zu_query::exec::Value;
 
 fn budget(key: &str) -> Option<f64> {
@@ -46,11 +55,18 @@ fn xorshift(rng: &mut u64) -> u64 {
     *rng
 }
 
+/// The eight person profile fields in query order: firstName,
+/// lastName, gender, birthday, locationIP, browserUsed, cityId,
+/// creationDate. One entry per dense row, the reference the IS and IC
+/// phases assert against.
+type ProfileRows = Vec<[String; 8]>;
+
 /// Loads the preprocessed SF1 files and bulk loads them into a fresh
-/// zu1 file as person/knows with the id key index. Returns the dense
-/// sorted edge list for reference computations plus the key of every
-/// row.
-fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>) {
+/// zu1 file as person/knows with the id key index and the person
+/// profile props columns. Returns the dense sorted edge list for
+/// reference computations, the key of every row, and the profile
+/// fields of every row.
+fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>, ProfileRows) {
     let started = Instant::now();
     let keys = read_key_list(std::path::Path::new(&format!(
         "{data}/ldbc-sf1-person-keys.txt"
@@ -61,6 +77,25 @@ fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>) {
     let (mut dense, by_row) = densify_keyed(&keys, &edges).expect("densify");
     dense.sort_unstable();
     dense.dedup();
+    let text =
+        std::fs::read_to_string(format!("{data}/ldbc-sf1-person-props.txt")).expect("person props");
+    let mut by_key: HashMap<u64, [&str; 8]> = HashMap::with_capacity(by_row.len());
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split('|').collect();
+        let [id, rest @ ..] = fields.as_slice() else {
+            panic!("empty props line");
+        };
+        let profile: [&str; 8] = rest.try_into().expect("nine pipe-delimited fields");
+        let id: u64 = id.parse().expect("numeric person id");
+        assert!(
+            by_key.insert(id, profile).is_none(),
+            "duplicate person {id}"
+        );
+    }
+    let profiles: ProfileRows = by_row
+        .iter()
+        .map(|key| by_key[key].map(str::to_string))
+        .collect();
     let parsed = started.elapsed();
     let load_started = Instant::now();
     let mut db = Zu1File::create(path).expect("create");
@@ -73,14 +108,38 @@ fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>) {
         Some(&by_row),
     )
     .expect("bulk load");
+    let cities: Vec<u64> = profiles
+        .iter()
+        .map(|p| p[6].parse().expect("numeric city id"))
+        .collect();
+    let strs = |i: usize| -> Vec<&[u8]> { profiles.iter().map(|p| p[i].as_bytes()).collect() };
+    let (first, last) = (strs(0), strs(1));
+    let (gender, birthday) = (strs(2), strs(3));
+    let (ip, browser, created) = (strs(4), strs(5), strs(7));
+    store_props(
+        &mut db,
+        "person",
+        &[
+            ("id", PropValues::Int(&by_row)),
+            ("firstName", PropValues::Str(&first)),
+            ("lastName", PropValues::Str(&last)),
+            ("gender", PropValues::Str(&gender)),
+            ("birthday", PropValues::Str(&birthday)),
+            ("locationIP", PropValues::Str(&ip)),
+            ("browserUsed", PropValues::Str(&browser)),
+            ("cityId", PropValues::Int(&cities)),
+            ("creationDate", PropValues::Str(&created)),
+        ],
+    )
+    .expect("store props");
     println!(
-        "sf1: {} persons, {} knows edges, parse {:.2}s, load {:.2}s",
+        "sf1: {} persons, {} knows edges, 9 props columns, parse {:.2}s, load {:.2}s",
         by_row.len(),
         dense.len(),
         parsed.as_secs_f64(),
         load_started.elapsed().as_secs_f64()
     );
-    (dense, by_row)
+    (dense, by_row, profiles)
 }
 
 /// B1: warm 1-hop expands over rows with out-degree at most 100, the G1
@@ -264,12 +323,138 @@ fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
     p50
 }
 
+/// IS: the IS1-shaped profile read, all eight person properties by
+/// original id through zu::query::run, parse to result. Every measured
+/// run is asserted field by field against the raw props file, so the
+/// number cannot come from a reader that returns the wrong row or a
+/// column stored out of order.
+fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) -> f64 {
+    let mut db = Zu1File::open(path).expect("open");
+    let source = "MATCH (p:person {id: $id}) \
+                  RETURN p.firstName AS firstName, p.lastName AS lastName, \
+                         p.gender AS gender, p.birthday AS birthday, \
+                         p.locationIP AS locationIP, p.browserUsed AS browserUsed, \
+                         p.cityId AS cityId, p.creationDate AS creationDate";
+    let n = by_row.len() as u64;
+    let mut rng = 0xD1B5_4A32_D192_ED03u64;
+    for _ in 0..200 {
+        let row = (xorshift(&mut rng) % n) as usize;
+        let id = Value::Int(by_row[row] as i64);
+        zu::query::run(source, &mut db, &[("id", id)]).expect("warmup profile read");
+    }
+    let runs = 2_000usize;
+    let mut lat = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let row = (xorshift(&mut rng) % n) as usize;
+        let id = Value::Int(by_row[row] as i64);
+        let t = Instant::now();
+        let r = zu::query::run(source, &mut db, &[("id", id)]).expect("profile read");
+        lat.push(t.elapsed());
+        let p = &profiles[row];
+        let want = vec![
+            Value::Str(p[0].clone()),
+            Value::Str(p[1].clone()),
+            Value::Str(p[2].clone()),
+            Value::Str(p[3].clone()),
+            Value::Str(p[4].clone()),
+            Value::Str(p[5].clone()),
+            Value::Int(p[6].parse().expect("numeric city id")),
+            Value::Str(p[7].clone()),
+        ];
+        assert_eq!(
+            r.rows,
+            [want],
+            "profile of person {} disagrees with the props file",
+            by_row[row]
+        );
+    }
+    lat.sort_unstable();
+    let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    println!(
+        "sf1 IS profile read: p50 {p50:.3} ms, p99 {:.3} ms over {runs} runs, all rows crosschecked",
+        lat[runs * 99 / 100].as_secs_f64() * 1e3
+    );
+    p50
+}
+
+/// IC: an IC-shaped friends-of-friends read, 2 hops out of one person
+/// with DISTINCT, a property projection, ORDER BY, and LIMIT, parse to
+/// result. The reference recomputes each seed's answer from the raw
+/// edge list and props file.
+fn run_ic_friends_of_friends(
+    path: &std::path::Path,
+    edges: &[(u32, u32)],
+    by_row: &[u64],
+    profiles: &ProfileRows,
+) -> f64 {
+    let n = by_row.len();
+    let mut adj = vec![Vec::new(); n];
+    for &(s, d) in edges {
+        adj[s as usize].push(d as usize);
+    }
+    let seeds: Vec<usize> = (0..n).filter(|&r| !adj[r].is_empty()).collect();
+    let reference = |seed: usize| -> Vec<Vec<Value>> {
+        let mut hits: Vec<usize> = adj[seed]
+            .iter()
+            .flat_map(|&f| adj[f].iter().copied())
+            .filter(|&ff| ff != seed)
+            .collect();
+        hits.sort_unstable_by_key(|&ff| by_row[ff]);
+        hits.dedup();
+        hits.truncate(20);
+        hits.into_iter()
+            .map(|ff| {
+                vec![
+                    Value::Int(by_row[ff] as i64),
+                    Value::Str(profiles[ff][0].clone()),
+                    Value::Str(profiles[ff][1].clone()),
+                ]
+            })
+            .collect()
+    };
+    let mut db = Zu1File::open(path).expect("open");
+    let source = "MATCH (p:person {id: $id})-[:knows]->(f)-[:knows]->(ff) \
+                  WHERE ff.id <> $id \
+                  RETURN DISTINCT ff.id AS id, ff.firstName AS firstName, \
+                         ff.lastName AS lastName \
+                  ORDER BY id LIMIT 20";
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..50 {
+        let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
+        let id = Value::Int(by_row[seed] as i64);
+        zu::query::run(source, &mut db, &[("id", id)]).expect("warmup fof read");
+    }
+    let runs = 500usize;
+    let mut lat = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
+        let id = Value::Int(by_row[seed] as i64);
+        let t = Instant::now();
+        let r = zu::query::run(source, &mut db, &[("id", id)]).expect("fof read");
+        lat.push(t.elapsed());
+        assert_eq!(
+            r.rows,
+            reference(seed),
+            "friends of friends of person {} disagree with the reference",
+            by_row[seed]
+        );
+    }
+    lat.sort_unstable();
+    let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    println!(
+        "sf1 IC friends-of-friends: p50 {p50:.3} ms, p99 {:.3} ms over {runs} runs, all rows crosschecked",
+        lat[runs * 99 / 100].as_secs_f64() * 1e3
+    );
+    p50
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let data = match std::env::var("ZU_DATA") {
         Ok(d)
             if std::path::Path::new(&format!("{d}/ldbc-sf1-person-keys.txt")).exists()
-                && std::path::Path::new(&format!("{d}/ldbc-sf1-knows.txt")).exists() =>
+                && std::path::Path::new(&format!("{d}/ldbc-sf1-knows.txt")).exists()
+                && std::path::Path::new(&format!("{d}/ldbc-sf1-person-props.txt")).exists() =>
         {
             d
         }
@@ -283,12 +468,14 @@ fn main() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("sf1.zu1");
-    let (edges, by_row) = load(&data, &path);
+    let (edges, by_row, profiles) = load(&data, &path);
     let node_count = by_row.len() as u64;
 
     let hop_p50 = run_one_hop(&path, &edges, node_count);
     let key_p50 = run_key_lookups(&path, &by_row);
     let two_hop_p50 = run_two_hop(&path, &edges, node_count);
+    let is_p50 = run_is_reads(&path, &by_row, &profiles);
+    let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
 
     let mut failed = false;
     if let Some(ceiling) = budget("ldbc_hop_p50_us")
@@ -307,6 +494,18 @@ fn main() {
         && two_hop_p50 > ceiling
     {
         println!("GATE FAIL B4 2-hop: p50 {two_hop_p50:.3} ms > ceiling {ceiling}");
+        failed = true;
+    }
+    if let Some(ceiling) = budget("ldbc_is_p50_ms")
+        && is_p50 > ceiling
+    {
+        println!("GATE FAIL IS profile read: p50 {is_p50:.3} ms > ceiling {ceiling}");
+        failed = true;
+    }
+    if let Some(ceiling) = budget("ldbc_ic_p50_ms")
+        && ic_p50 > ceiling
+    {
+        println!("GATE FAIL IC friends-of-friends: p50 {ic_p50:.3} ms > ceiling {ceiling}");
         failed = true;
     }
     if gate && failed {

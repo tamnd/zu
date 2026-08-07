@@ -139,6 +139,25 @@ ldbc_key_p50_us = 2.0
 # raise it.
 ldbc_two_hop_p50_ms = 10.0
 
+# The LDBC IS and IC subset on SF1 (docs/12 M2 exit), parse to result
+# through zu::query::run against the person props columns the loader
+# stores next to the CSR. IS is the IS1-shaped profile read, all eight
+# person properties by original id, gated at the G2 1 ms warm p50 from
+# docs/02. IC is the IC-shaped friends-of-friends read, 2 hops with
+# DISTINCT, string projections, ORDER BY, and LIMIT; its cost is the
+# 2-hop multiset's property reads, held down by the per-column decoded
+# chunk the props reader keeps, and its p99 belongs to hub seeds whose
+# neighborhoods hop across chunks. Measured p50, IS then IC: gamingpc
+# 0.13 and 1.4 ms, local M series 0.16 and 1.4 ms, server1 0.38 and
+# 4.6 ms. Both loaded hosts fit under the ceilings even mid-contention,
+# server2 at 0.59 and 6.1 ms beside a compile job holding load 7.5 on
+# 6 cores and server3 at 0.62 and 8.7 ms under its documented crawl,
+# so unlike B4 these gates hold fleet-wide. Every measured run asserts
+# against a reference recomputed from the raw props and edge files.
+# Lower these ceilings, never raise them.
+ldbc_is_p50_ms = 1.0
+ldbc_ic_p50_ms = 10.0
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

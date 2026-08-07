@@ -1,0 +1,81 @@
+(* zuQL v0 core grammar, frozen per docs/07 §1.
+   This file describes exactly what crates/zu-query/src/parser.rs accepts.
+   Keywords are case-insensitive and are ordinary identifiers to the lexer;
+   the parser gives them meaning by position. `<-` and `->` are not lexer
+   tokens, so `a < -1` lexes as less-than then minus and the parser
+   assembles pattern arrows from single characters. Changes here require a
+   spec change to docs/07 first. *)
+
+query           = { reading_clause } , return_clause , [ ";" ] ;
+
+reading_clause  = match_clause | unwind_clause | with_clause ;
+
+match_clause    = [ "OPTIONAL" ] , "MATCH" , pattern , [ where_clause ] ;
+unwind_clause   = "UNWIND" , expression , "AS" , name ;
+with_clause     = "WITH" , projection , [ where_clause ] ;
+return_clause   = "RETURN" , projection ;
+where_clause    = "WHERE" , expression ;
+
+projection      = [ "DISTINCT" ] , ( "*" | projection_item ) ,
+                  { "," , projection_item } ,
+                  [ order_by ] , [ "SKIP" , expression ] , [ "LIMIT" , expression ] ;
+projection_item = expression , [ "AS" , name ] ;
+order_by        = "ORDER" , "BY" , sort_item , { "," , sort_item } ;
+sort_item       = expression , [ "ASC" | "ASCENDING" | "DESC" | "DESCENDING" ] ;
+
+(* Patterns. *)
+
+pattern         = path , { "," , path } ;
+path            = [ name , "=" ] , node , { relationship , node } ;
+node            = "(" , [ name ] , { ":" , name } , [ property_map ] , ")" ;
+
+relationship    = "<" , "-" , [ rel_detail ] , "-"
+                | "-" , [ rel_detail ] , "-" , [ ">" ] ;
+rel_detail      = "[" , [ name ] , [ ":" , name , { "|" , name } ] ,
+                  [ "*" , [ hop_range ] ] , [ property_map ] , "]" ;
+hop_range       = integer , [ ".." , [ integer ] ]
+                | ".." , integer ;
+(* `*n` alone means exactly n hops; a bare `*` is unbounded. *)
+
+property_map    = "{" , [ name , ":" , expression ,
+                  { "," , name , ":" , expression } ] , "}" ;
+
+(* Expressions, loosest binding first. Nesting is capped at 128. *)
+
+expression      = xor_expr , { "OR" , xor_expr } ;
+xor_expr        = and_expr , { "XOR" , and_expr } ;
+and_expr        = not_expr , { "AND" , not_expr } ;
+not_expr        = { "NOT" } , comparison ;
+comparison      = additive , { comparison_op , additive
+                             | "IS" , [ "NOT" ] , "NULL" } ;
+comparison_op   = "=" | "<>" | "<" | "<=" | ">" | ">=" | "IN"
+                | "STARTS" , "WITH" | "ENDS" , "WITH" | "CONTAINS" ;
+additive        = multiplicative , { ( "+" | "-" ) , multiplicative } ;
+multiplicative  = unary , { ( "*" | "/" | "%" ) , unary } ;
+unary           = { "-" | "+" } , postfix ;
+postfix         = primary , { "." , name } ;
+primary         = literal | parameter | name | function_call
+                | "(" , expression , ")" | list | map ;
+
+function_call   = name , "(" , [ "DISTINCT" ] ,
+                  [ "*" | expression , { "," , expression } ] , ")" ;
+list            = "[" , [ expression , { "," , expression } ] , "]" ;
+map             = property_map ;
+
+literal         = "NULL" | "TRUE" | "FALSE" | integer | float | string ;
+
+(* Lexical shapes. *)
+
+name            = identifier | "`" , { character - "`" } , "`" ;
+identifier      = ( letter | "_" ) , { letter | digit | "_" } ;
+parameter       = "$" , ( letter | digit | "_" ) , { letter | digit | "_" } ;
+integer         = digit , { digit } ;
+float           = digit , { digit } , "." , digit , { digit } , [ exponent ]
+                | digit , { digit } , exponent ;
+exponent        = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
+string          = "'" , { character } , "'" | '"' , { character } , '"' ;
+(* String escapes: \\ \' \" \n \r \t. Comments are // to end of line and
+   /* ... */; both are whitespace to the parser. *)
+
+(* Reserved but not yet parsed; the parser rejects them by name:
+   CREATE, SET, DELETE, DETACH, MERGE, CALL, FILTER, LET, NEXT. *)

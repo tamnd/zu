@@ -240,8 +240,14 @@ pub fn read_edge_csv(path: &Path) -> Result<Vec<(u32, u32)>> {
             continue;
         }
         let mut parts = trimmed.split(',');
-        let src = parts.next().map(str::trim).and_then(|t| t.parse::<u32>().ok());
-        let dst = parts.next().map(str::trim).and_then(|t| t.parse::<u32>().ok());
+        let src = parts
+            .next()
+            .map(str::trim)
+            .and_then(|t| t.parse::<u32>().ok());
+        let dst = parts
+            .next()
+            .map(str::trim)
+            .and_then(|t| t.parse::<u32>().ok());
         match (src, dst) {
             (Some(src), Some(dst)) => edges.push((src, dst)),
             _ if line_no == 1 => {}
@@ -627,7 +633,10 @@ mod tests {
         let csv = dir.path().join("edges.csv");
         std::fs::write(&csv, "src,dst\n1,2\nnope,4\n").unwrap();
         let err = read_edge_csv(&csv).unwrap_err();
-        assert!(err.to_string().contains("line 3"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("line 3"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

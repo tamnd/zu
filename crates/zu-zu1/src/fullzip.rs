@@ -131,9 +131,7 @@ fn unpack_chunk<'a>(
     raw_size: usize,
     scratch: &'a mut Vec<u8>,
 ) -> Result<&'a [u8]> {
-    let (&enc, payload) = chunk
-        .split_first()
-        .ok_or_else(|| corrupt("empty chunk"))?;
+    let (&enc, payload) = chunk.split_first().ok_or_else(|| corrupt("empty chunk"))?;
     match enc {
         e if e == EncodingId::Plain as u8 => {
             if payload.len() != raw_size {
@@ -215,9 +213,7 @@ pub fn decode_payload(
     let base_ends = ends_out.len();
     let run = |bytes_out: &mut Vec<u8>, ends_out: &mut Vec<u64>| -> Result<()> {
         let chunks = value_count.div_ceil(CHUNK_ROWS as u64) as usize;
-        let head = payload
-            .get(..4)
-            .ok_or_else(|| corrupt("truncated index"))?;
+        let head = payload.get(..4).ok_or_else(|| corrupt("truncated index"))?;
         if u32::from_le_bytes(head.try_into().unwrap()) as usize != chunks {
             return Err(corrupt("chunk count disagrees with meta"));
         }
@@ -329,12 +325,8 @@ pub fn read_blob_range(
         // chunk `first` starts; chunk 0 starts at the body.
         let lo = first.saturating_sub(1);
         let comp_span = read_payload_span(db, meta, 4 + lo * 8, 4 + (last + 1) * 8)?;
-        let raw_span = read_payload_span(
-            db,
-            meta,
-            4 + (chunks + lo) * 8,
-            4 + (chunks + last + 1) * 8,
-        )?;
+        let raw_span =
+            read_payload_span(db, meta, 4 + (chunks + lo) * 8, 4 + (chunks + last + 1) * 8)?;
         let ent = |span: &[u8], chunk: usize| {
             let i = chunk - lo;
             u64::from_le_bytes(span[i * 8..i * 8 + 8].try_into().unwrap())
@@ -383,7 +375,12 @@ pub fn read_blob_range(
 }
 
 /// Point access to one row: appends value `row`'s bytes to `out`.
-pub fn read_blob_row(db: &mut Zu1File, meta: &SegmentMeta, row: u64, out: &mut Vec<u8>) -> Result<()> {
+pub fn read_blob_row(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    row: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let end = row
         .checked_add(1)
         .ok_or_else(|| ZuError::InvalidArgument(format!("row {row} out of range")))?;
@@ -399,12 +396,7 @@ mod tests {
     fn urls(n: usize) -> Vec<Vec<u8>> {
         (0..n)
             .map(|i| {
-                format!(
-                    "https://example.com/user/{}/posts?page={}",
-                    i * 37,
-                    i % 12
-                )
-                .into_bytes()
+                format!("https://example.com/user/{}/posts?page={}", i * 37, i % 12).into_bytes()
             })
             .collect()
     }
@@ -498,9 +490,7 @@ mod tests {
         assert_eq!(out, values[4321]);
         let mut ends = Vec::new();
         assert!(read_blob_range(&mut db, &meta, 5, 4, &mut out, &mut ends).is_err());
-        assert!(
-            read_blob_range(&mut db, &meta, 0, 5001, &mut out, &mut ends).is_err()
-        );
+        assert!(read_blob_range(&mut db, &meta, 0, 5001, &mut out, &mut ends).is_err());
     }
 
     #[test]

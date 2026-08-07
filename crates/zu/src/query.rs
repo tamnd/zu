@@ -5,7 +5,7 @@
 
 use zu_common::Result;
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
-use zu_query::parser;
+use zu_query::{optimizer, parser, plan};
 
 use crate::zu1::catalog::Catalog;
 
@@ -38,6 +38,17 @@ pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
 pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
     let parsed = parser::parse(source)?;
     binder::bind(&parsed, &schema_of(catalog)?)
+}
+
+/// Parses, binds, plans, and optimizes one query, returning the
+/// EXPLAIN listing of the plan that would execute.
+pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
+    let schema = schema_of(catalog)?;
+    let parsed = parser::parse(source)?;
+    let query = binder::bind(&parsed, &schema)?;
+    let built = plan::build(&query)?;
+    let optimized = optimizer::optimize(built, &query, &schema)?;
+    Ok(plan::explain(&optimized, &query, &schema))
 }
 
 #[cfg(test)]
@@ -73,5 +84,22 @@ mod tests {
 
         let err = bind("MATCH (a:nope) RETURN a", &catalog).expect_err("unknown label");
         assert!(err.to_string().contains("unknown label"), "got: {err}");
+
+        let text = explain(
+            "MATCH (a:person {id: $src})-[:follows]->(b) RETURN b.id AS friend",
+            &catalog,
+        )
+        .expect("explain");
+        let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+        assert_eq!(
+            lines,
+            [
+                "Project b.id AS friend",
+                "Expand (a)-[#1:follows]->(b)",
+                "Filter a.id = $src",
+                "ScanNodes a: person",
+            ],
+            "got:\n{text}"
+        );
     }
 }

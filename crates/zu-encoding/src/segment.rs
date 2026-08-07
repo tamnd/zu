@@ -101,8 +101,6 @@ fn choose(values: &[u64]) -> EncodingId {
     // Candidate order breaks ties toward the shallower cascade.
     // BoolBitpack is only legal when the whole input is binary, not just
     // the sample, or the encoder would corrupt the values it never saw.
-    // Dict is only legal under the format cap on distinct values, a
-    // property the sample cannot vouch for either.
     let mut candidates = Vec::with_capacity(7);
     if values.iter().all(|&v| v <= 1) {
         candidates.push(EncodingId::BoolBitpack);
@@ -112,15 +110,29 @@ fn choose(values: &[u64]) -> EncodingId {
         EncodingId::DeltaBitPack,
         EncodingId::DeltaPatch,
         EncodingId::Rle,
+        EncodingId::Dict,
+        EncodingId::Frequency,
     ]);
-    if dict_legal(values) {
-        candidates.push(EncodingId::Dict);
+    let best = size_and_pick(&candidates, &runs, &concat);
+    // Dict is only legal under the format cap on distinct values, a
+    // property the sample cannot vouch for. The proof scans the full
+    // input, so it runs only when Dict actually won the sizing; every
+    // other column skips it, and a failed proof re-picks without Dict.
+    if best == EncodingId::Dict && !dict_legal(values) {
+        let rest: Vec<EncodingId> = candidates
+            .into_iter()
+            .filter(|&id| id != EncodingId::Dict)
+            .collect();
+        return size_and_pick(&rest, &runs, &concat);
     }
-    candidates.push(EncodingId::Frequency);
+    best
+}
+
+fn size_and_pick(candidates: &[EncodingId], runs: &[&[u64]], concat: &[u64]) -> EncodingId {
     let mut best = EncodingId::Plain;
     let mut best_size = 4 + concat.len() * 8;
     let mut buf = Vec::new();
-    for id in candidates {
+    for &id in candidates {
         // Delta candidates are sized per run and summed: concatenating the
         // runs fabricates one wide delta per boundary, which reads as
         // outliers on data that has none and skews the pick toward the
@@ -130,14 +142,14 @@ fn choose(values: &[u64]) -> EncodingId {
         let per_run = matches!(id, EncodingId::DeltaBitPack | EncodingId::DeltaPatch);
         let mut size = 0usize;
         if per_run {
-            for run in &runs {
+            for run in runs {
                 buf.clear();
                 encode_with(id, run, &mut buf);
                 size += buf.len();
             }
         } else {
             buf.clear();
-            encode_with(id, &concat, &mut buf);
+            encode_with(id, concat, &mut buf);
             size = buf.len();
         }
         if size < best_size {

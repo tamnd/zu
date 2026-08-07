@@ -112,6 +112,23 @@ impl Graph for Zu1Graph<'_> {
         Ok(())
     }
 
+    fn degree(&mut self, rel: u32, node: u64, reversed: bool) -> Result<u64> {
+        self.ensure_reader(rel)?;
+        let dir = if reversed {
+            Direction::Bwd
+        } else {
+            Direction::Fwd
+        };
+        let Self { db, readers, .. } = self;
+        // On the cached-group path a degree is the difference of two
+        // decoded offsets; the neighbor values never get copied.
+        let nbrs = readers
+            .get_mut(&rel)
+            .expect("just loaded")
+            .neighbors_dir(db, node, dir)?;
+        Ok(nbrs.len() as u64)
+    }
+
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool> {
         self.ensure_reader(rel)?;
         let Self { db, readers, .. } = self;
@@ -395,5 +412,18 @@ mod tests {
         );
         assert!(text.contains("Expand (a)-[:follows]->(b)"), "got:\n{text}");
         assert!(text.contains("pulls"), "got:\n{text}");
+
+        // The unfiltered 2-hop count runs on degrees, not lists, all
+        // the way through real storage.
+        let text = explain_analyze(
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            &mut db,
+            &[],
+        )
+        .expect("explain analyze count");
+        assert!(
+            text.contains("ExpandCount (b)-[:follows]->(c)"),
+            "got:\n{text}"
+        );
     }
 }

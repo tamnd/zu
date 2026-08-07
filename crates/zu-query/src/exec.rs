@@ -95,6 +95,14 @@ pub trait Graph {
     fn neighbors(&mut self, rel: u32, node: u64, reversed: bool, out: &mut Vec<u64>) -> Result<()>;
     /// Edge probe in storage orientation: does `src` point at `dst`?
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool>;
+    /// Neighbor count without the list. The default reads the list and
+    /// counts it; engines whose adjacency stores offsets override this
+    /// so a counting expand never touches neighbor values.
+    fn degree(&mut self, rel: u32, node: u64, reversed: bool) -> Result<u64> {
+        let mut out = Vec::new();
+        self.neighbors(rel, node, reversed, &mut out)?;
+        Ok(out.len() as u64)
+    }
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
@@ -252,8 +260,11 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             direction,
             rels,
             chunk,
+            degrees,
+            ..
         } => format!(
-            "Expand {}",
+            "{} {}",
+            if *degrees { "ExpandCount" } else { "Expand" },
             rel_text(
                 var(*from),
                 var(stage.chunk_slots[*chunk][0]),
@@ -440,6 +451,16 @@ enum OpDesc {
         direction: RelDirection,
         rels: Vec<RelStep>,
         chunk: usize,
+        /// Degree mode, the count-to-degree rewrite: the sink counts
+        /// this chunk and reads no value from it, so the expand sums
+        /// neighbor counts into the chunk size and materializes
+        /// nothing.
+        degrees: bool,
+        /// In degree mode, the unflattened source chunk the expand
+        /// walks directly, one pull per upstream configuration; the
+        /// chunk's multiplicity lives inside the degree sum from then
+        /// on. `None` reads the flattened source position as usual.
+        absorb: Option<usize>,
     },
     /// Variable-length expand under GQL's default DIFFERENT EDGES
     /// semantics: enumerates every trail of `min..=max` hops with no
@@ -825,6 +846,8 @@ fn compile_match_op(
                     direction: *direction,
                     rels,
                     chunk,
+                    degrees: false,
+                    absorb: None,
                 });
                 b.produced(chunk);
             }
@@ -913,6 +936,136 @@ fn compile_optional_group(
     });
     b.compactable = None;
     Ok(end)
+}
+
+/// The count-to-degree rewrite (docs/11 B4): when the sink aggregates
+/// and the stage's last producer is a fixed-length `Expand` whose
+/// output chunk nothing reads except at most one bare non-distinct
+/// count argument, the expand switches to degree mode and that count
+/// becomes a star count over the preserved multiplicity. When the
+/// expand's flattened source chunk is also read by nothing else, its
+/// `Flatten` drops too and the expand walks the unflattened source
+/// directly; the absorbed chunk keeps its flat marking so the sink's
+/// multiplicity product skips it, its contribution now living inside
+/// the degree sum. Runs after the sink's own flattens, so a key or
+/// filter that reads either chunk has already shown up in the
+/// reference walk and blocks the rewrite.
+fn rewrite_count_expand(
+    b: &mut StageBuilder,
+    items: &[BoundItem],
+    aggs: &mut [AggSpec],
+    post: &[PostOp],
+    extra: &BTreeSet<usize>,
+) {
+    // Optional groups hold absolute operator indices and their own
+    // null semantics; leave their stages alone.
+    if b.descs
+        .iter()
+        .any(|d| matches!(d, OpDesc::OptionalBegin | OpDesc::OptionalEnd { .. }))
+    {
+        return;
+    }
+    let Some(target) = b
+        .descs
+        .iter()
+        .rposition(|d| !matches!(d, OpDesc::Flatten { .. }))
+    else {
+        return;
+    };
+    let OpDesc::Expand { from, chunk: c, .. } = b.descs[target] else {
+        return;
+    };
+    // Flat mode, or something read the chunk flat: no factorized count
+    // to serve.
+    if b.chunk_flat[c] {
+        return;
+    }
+    // Every slot something other than this expand reads.
+    let mut refs = BTreeSet::new();
+    for (ix, desc) in b.descs.iter().enumerate() {
+        if ix == target {
+            continue;
+        }
+        match desc {
+            OpDesc::IndexLookup { key, .. } => expr_slots(key, &mut refs),
+            OpDesc::Expand { from, .. } | OpDesc::VarExpand { from, .. } => {
+                refs.insert(*from);
+            }
+            OpDesc::ExpandInto { from, to, .. } => {
+                refs.insert(*from);
+                refs.insert(*to);
+            }
+            OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => {
+                expr_slots(expr, &mut refs)
+            }
+            OpDesc::Source
+            | OpDesc::RowSource { .. }
+            | OpDesc::Scan { .. }
+            | OpDesc::Flatten { .. }
+            | OpDesc::OptionalBegin
+            | OpDesc::OptionalEnd { .. } => {}
+        }
+    }
+    for item in items.iter().filter(|it| !it.aggregate) {
+        expr_slots(&item.expr, &mut refs);
+    }
+    for op in post {
+        match op {
+            PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => expr_slots(e, &mut refs),
+            PostOp::Sort(keys) => keys.iter().for_each(|(e, _)| expr_slots(e, &mut refs)),
+            PostOp::Distinct => {}
+        }
+    }
+    refs.extend(extra.iter().copied());
+    // Aggregates whose argument touches the expand's chunk: at most
+    // one, and it must be a bare non-distinct count of one of the
+    // chunk's slots. Every other argument counts as a reference.
+    let mut counting = Vec::new();
+    for (ix, spec) in aggs.iter().enumerate() {
+        let Some(arg) = &spec.arg else { continue };
+        let mut arg_refs = BTreeSet::new();
+        expr_slots(arg, &mut arg_refs);
+        if arg_refs.iter().any(|s| b.chunk_slots[c].contains(s)) {
+            counting.push(ix);
+        } else {
+            refs.extend(arg_refs);
+        }
+    }
+    if b.chunk_slots[c].iter().any(|s| refs.contains(s)) {
+        return;
+    }
+    match counting.as_slice() {
+        [] => {}
+        &[ix] => {
+            let spec = &mut aggs[ix];
+            let bare = matches!(&spec.arg, Some(BoundExpr::Var(s)) if b.chunk_slots[c].contains(s));
+            if spec.func != Func::Count || spec.distinct || !bare {
+                return;
+            }
+            spec.star = true;
+            spec.arg = None;
+            spec.arg_chunk = None;
+        }
+        _ => return,
+    }
+    let mut absorb = None;
+    if target > 0
+        && let OpDesc::Flatten { chunk: f } = b.descs[target - 1]
+        && b.slot_loc.get(&from).map(|&(fc, _)| fc) == Some(f)
+        && !b.chunk_slots[f].iter().any(|s| refs.contains(s))
+    {
+        absorb = Some(f);
+    }
+    if let OpDesc::Expand {
+        degrees, absorb: a, ..
+    } = &mut b.descs[target]
+    {
+        *degrees = true;
+        *a = absorb;
+    }
+    if absorb.is_some() {
+        b.descs.remove(target - 1);
+    }
 }
 
 fn build_stages(
@@ -1035,6 +1188,10 @@ fn build_stages(
                         _ => break,
                     }
                     i += 1;
+                }
+
+                if aggregate {
+                    rewrite_count_expand(&mut b, &items, &mut aggs, &post, &extra);
                 }
 
                 let unflat = (0..b.chunk_flat.len())
@@ -1165,6 +1322,32 @@ fn node_value(v: Value, what: &str) -> Result<(u32, u64)> {
         Value::Node { table, offset } => Ok((table, offset)),
         other => Err(invalid(format!("{what} expects a node, got {other:?}"))),
     }
+}
+
+/// Total neighbor count of one node across the applicable rel steps:
+/// the degree-mode expand's replacement for list materialization,
+/// mirroring the direction and table matching of the value path.
+fn degree_sum(
+    graph: &mut dyn Graph,
+    rels: &[RelStep],
+    direction: RelDirection,
+    table: u32,
+    offset: u64,
+) -> Result<u64> {
+    let mut total = 0;
+    for step in rels {
+        if matches!(direction, RelDirection::Out | RelDirection::Undirected)
+            && table == step.from_table
+        {
+            total += graph.degree(step.id, offset, false)?;
+        }
+        if matches!(direction, RelDirection::In | RelDirection::Undirected)
+            && table == step.to_table
+        {
+            total += graph.degree(step.id, offset, true)?;
+        }
+    }
+    Ok(total)
 }
 
 /// How many values one successful pull produced: chunk producers
@@ -1418,6 +1601,8 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             direction,
             rels,
             chunk,
+            degrees: false,
+            ..
         } => loop {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
@@ -1478,6 +1663,66 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             c.size = far.len();
             c.cols[0] = far;
             c.cols[1] = rel_vals;
+            c.cur = None;
+            return Ok(true);
+        },
+        // Degree mode: nothing reads this chunk's values, so the
+        // expand sums neighbor counts into the chunk size and
+        // materializes no lists. With `absorb` the source chunk never
+        // flattened and the expand walks it whole, one pull per
+        // upstream configuration.
+        OpDesc::Expand {
+            from,
+            direction,
+            rels,
+            chunk,
+            degrees: true,
+            absorb,
+        } => loop {
+            if !next(descs, ctx, i - 1)? {
+                return Ok(false);
+            }
+            let mut total = 0u64;
+            match absorb {
+                None => {
+                    let v = value_of(ctx, *from)?;
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    let (table, offset) = node_value(v, "expand")?;
+                    total = degree_sum(&mut *ctx.graph, rels, *direction, table, offset)?;
+                }
+                Some(f) => {
+                    let col = ctx
+                        .slot_loc
+                        .get(from)
+                        .map(|&(_, col)| col)
+                        .expect("expand from a bound slot");
+                    let StageCtx { graph, chunks, .. } = ctx;
+                    let source = &chunks[*f];
+                    for pos in 0..source.size {
+                        match &source.cols[col][pos] {
+                            Value::Null => {}
+                            &Value::Node { table, offset } => {
+                                total += degree_sum(&mut **graph, rels, *direction, table, offset)?;
+                            }
+                            other => {
+                                return Err(invalid(format!(
+                                    "expand expects a node, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            if total == 0 {
+                continue;
+            }
+            let c = &mut ctx.chunks[*chunk];
+            c.size = total as usize;
+            for col in &mut c.cols {
+                col.clear();
+            }
             c.cur = None;
             return Ok(true);
         },
@@ -2912,11 +3157,106 @@ mod tests {
         assert_eq!(stage.sink, "Aggregate");
         assert_eq!(stage.out_rows, 1);
         let expand_c = stage.ops.last().expect("ops");
-        assert_eq!(expand_c.name, "Expand (b)-[:KNOWS]->(c)");
-        // Two pulls, one per neighbor of node 0, delivering three
-        // values total: an average vector length above one is the
-        // factorized path at work.
-        assert_eq!((expand_c.pulls, expand_c.rows), (2, 3));
+        assert_eq!(expand_c.name, "ExpandCount (b)-[:KNOWS]->(c)");
+        // One pull for the whole absorbed neighbor vector of node 0,
+        // reporting three counted paths without materializing a list:
+        // the count-to-degree rewrite at work.
+        assert_eq!((expand_c.pulls, expand_c.rows), (1, 3));
+        // No flatten sits between the two expands anymore.
+        assert!(
+            !stage.ops.iter().any(|o| o.name == "Flatten b"),
+            "absorbed source still flattens: {:?}",
+            stage.ops.iter().map(|o| &o.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn count_to_degree_matches_flat_execution() {
+        let queries = [
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(*) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) \
+             RETURN b.id AS id, count(c) AS n ORDER BY id",
+            "MATCH (a:Person {id: 2})-[:KNOWS]-(b)-[:KNOWS]-(c) RETURN count(c) AS n",
+            "MATCH (a:Person)<-[:KNOWS]-(b)<-[:KNOWS]-(c) RETURN count(c) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[r:KNOWS]->(c) RETURN count(r) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH b MATCH (b)-[:KNOWS]->(c) \
+             RETURN count(c) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(DISTINCT c) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE c.id > 1 \
+             RETURN count(c) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a.id < c.id \
+             RETURN count(c) AS n",
+        ];
+        for q in queries {
+            let fac = run_with(q, &[], false);
+            let flat = run_with(q, &[], true);
+            assert_eq!(sorted(fac.rows), sorted(flat.rows), "query: {q}");
+        }
+    }
+
+    #[test]
+    fn count_to_degree_rewrites_only_untouched_chunks() {
+        let cases = [
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS n",
+                true,
+            ),
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(*) AS n",
+                true,
+            ),
+            // A key on b blocks the absorb but not the degree read.
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) \
+                 RETURN b.id AS id, count(c) AS n",
+                true,
+            ),
+            // The trailing expand of a later stage absorbs the row
+            // source feeding it.
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b) WITH b MATCH (b)-[:KNOWS]->(c) \
+                 RETURN count(c) AS n",
+                true,
+            ),
+            // DISTINCT needs the values.
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) \
+                 RETURN count(DISTINCT c) AS n",
+                false,
+            ),
+            // A second aggregate reads the chunk.
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) \
+                 RETURN count(c) AS n, min(c.id) AS m",
+                false,
+            ),
+            // A predicate on one endpoint just flips the pattern: the
+            // optimizer starts the join from the filtered side and the
+            // expand on the far end still counts by degree, which the
+            // differential test above pins as correct.
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE c.id > 1 \
+                 RETURN count(c) AS n",
+                true,
+            ),
+            // A predicate across both ends of the trailing expand
+            // reads its chunk, whichever end the join starts from.
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a.id < c.id \
+                 RETURN count(c) AS n",
+                false,
+            ),
+        ];
+        for (q, want) in cases {
+            let (_, p) = profiled(q, &[]);
+            let got = p
+                .stages
+                .iter()
+                .flat_map(|s| &s.ops)
+                .any(|o| o.name.starts_with("ExpandCount"));
+            assert_eq!(got, want, "query: {q}");
+        }
     }
 
     #[test]

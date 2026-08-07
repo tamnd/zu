@@ -424,7 +424,7 @@ fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
 }
 
 /// Frees a committed meta chain so a rewritten copy replaces it.
-fn free_chain(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+pub(crate) fn free_chain(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
     if root == NULL_BLOCK {
         return Ok(());
     }

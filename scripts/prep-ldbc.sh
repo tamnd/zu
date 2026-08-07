@@ -6,11 +6,14 @@
 #
 #   ldbc-sf1-person-keys.txt   one person id per line
 #   ldbc-sf1-knows.txt         person1Id person2Id per line
+#   ldbc-sf1-person-props.txt  id|firstName|lastName|gender|birthday|
+#                              locationIP|browserUsed|cityId|creationDate
 #
 # The snapshot stores pipe-delimited gzipped parts with a header per
 # part and a creationDate first column; this strips both and keeps the
-# id columns only. Sizes are small: SF1 has about 10 K persons and
-# 173 K knows edges.
+# id columns only, except the props file which carries the IS1 profile
+# columns pipe-delimited in snapshot order. Sizes are small: SF1 has
+# about 10 K persons and 173 K knows edges.
 set -euo pipefail
 
 LDBC_DIR="${ZU_LDBC:-$HOME/ldbc/sf1-bi}"
@@ -35,3 +38,12 @@ for f in "$SNAP"/Person_knows_Person/part-*.csv.gz; do
 done
 mv "$out.part" "$out"
 echo "$(wc -l < "$out" | tr -d ' ') knows edges -> $out"
+
+out="$DATA_DIR/ldbc-sf1-person-props.txt"
+: > "$out.part"
+for f in "$SNAP"/Person/part-*.csv.gz; do
+    gunzip -c "$f" | tail -n +2 |
+        awk -F'|' '{OFS="|"; print $2, $3, $4, $5, $6, $7, $8, $9, $1}' >> "$out.part"
+done
+mv "$out.part" "$out"
+echo "$(wc -l < "$out" | tr -d ' ') person profiles -> $out"

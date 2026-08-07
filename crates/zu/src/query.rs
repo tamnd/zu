@@ -13,6 +13,7 @@ use zu_query::{optimizer, parser, plan};
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
+use crate::zu1::props::{PropType, PropsReader, load_props};
 
 /// Builds the binder schema from a zu1 catalog.
 pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
@@ -57,11 +58,13 @@ pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
 }
 
 /// The executor's view of one open zu1 file: readers load lazily per
-/// rel table and cache their directories across calls.
+/// rel table and cache their directories across calls, and props
+/// readers load lazily per node table the same way.
 pub struct Zu1Graph<'a> {
     db: &'a mut Zu1File,
     catalog: Catalog,
     readers: HashMap<u32, GraphReader>,
+    props: HashMap<u32, Option<PropsReader>>,
 }
 
 impl<'a> Zu1Graph<'a> {
@@ -70,6 +73,7 @@ impl<'a> Zu1Graph<'a> {
             db,
             catalog,
             readers: HashMap::new(),
+            props: HashMap::new(),
         }
     }
 
@@ -85,6 +89,15 @@ impl<'a> Zu1Graph<'a> {
             .clone();
         let reader = GraphReader::load_table(self.db, &name)?;
         self.readers.insert(rel, reader);
+        Ok(())
+    }
+
+    fn ensure_props(&mut self, table: u32) -> Result<()> {
+        if self.props.contains_key(&table) {
+            return Ok(());
+        }
+        let reader = load_props(self.db, table)?.map(PropsReader::new);
+        self.props.insert(table, reader);
         Ok(())
     }
 }
@@ -158,15 +171,56 @@ impl Graph for Zu1Graph<'_> {
             .has_edge(db, src, dst)
     }
 
-    fn property(&mut self, _table: u32, offset: u64, key: &str) -> Result<Value> {
-        // v0 contract: `id` is the offset. Real property columns are
-        // milestone 3's column catalog.
+    fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value> {
+        self.ensure_props(table)?;
+        let Self { db, props, .. } = self;
+        if let Some(reader) = props.get_mut(&table).expect("just loaded")
+            && let Some(col) = reader.col(key)
+        {
+            return match reader.columns()[col].ty {
+                PropType::Int => Ok(Value::Int(reader.read_int(db, col, offset)? as i64)),
+                PropType::Str => {
+                    let mut bytes = Vec::new();
+                    reader.read_str(db, col, offset, &mut bytes)?;
+                    let text = String::from_utf8(bytes).map_err(|_| ZuError::Corrupt {
+                        what: "props column",
+                        detail: format!("'{key}' row {offset} is not UTF-8"),
+                    })?;
+                    Ok(Value::Str(text))
+                }
+            };
+        }
+        // Without a stored `id` column the id is the offset, the dense
+        // contract every load without REORDER keeps.
         match key {
             "id" => Ok(Value::Int(offset as i64)),
             other => Err(ZuError::InvalidArgument(format!(
-                "unknown property '{other}', property columns land with the column catalog"
+                "unknown property '{other}' on table {table}"
             ))),
         }
+    }
+
+    fn lookup_key(&mut self, table: u32, key: u64) -> Result<Option<u64>> {
+        // The primary-key index lives in the group directory of a rel
+        // table loaded over this node table's rows, so find one and ask
+        // it. A table with no keyed rel keeps the dense contract where
+        // the id is the offset.
+        let Some(rel) = self
+            .catalog
+            .rel_tables()
+            .iter()
+            .find(|r| r.from == table)
+            .map(|r| r.id)
+        else {
+            return Ok(Some(key));
+        };
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        let reader = readers.get_mut(&rel).expect("just loaded");
+        if reader.directory().keys.is_none() {
+            return Ok(Some(key));
+        }
+        reader.lookup_key(db, key)
     }
 }
 
@@ -445,5 +499,83 @@ mod tests {
             text.contains("ExpandCount (b)-[:follows]->(c)"),
             "got:\n{text}"
         );
+    }
+
+    #[test]
+    fn keyed_ids_and_stored_props_flow_through_run() {
+        use crate::zu1::props::{PropValues, store_props};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("props.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // Row r holds original id keys[r], the shape a REORDER load
+        // leaves behind: sparse keys in no particular order.
+        let keys: [u64; 5] = [9000, 17, 4025, 333, 12_884_901_888];
+        let edges: [(u32, u32); 4] = [(0, 1), (0, 3), (2, 4), (3, 4)];
+        graph::bulk_load_keyed(&mut db, "person", "knows", 5, &edges, Some(&keys)).expect("load");
+        let names: [&[u8]; 5] = [b"Ada", b"Grace", b"Edsger", b"Barbara", b"Tony"];
+        let cities: [u64; 5] = [608, 707, 608, 411, 500];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("id", PropValues::Int(&keys)),
+                ("firstName", PropValues::Str(&names)),
+                ("cityId", PropValues::Int(&cities)),
+            ],
+        )
+        .expect("store props");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        // The `{id: ...}` predicate resolves through the primary-key
+        // index and the id property reads the stored column, so both
+        // ends of the query stay in the original key space.
+        let r = run(
+            "MATCH (a:person {id: $src})-[:knows]->(b) \
+             RETURN b.firstName AS name, b.id AS id ORDER BY id",
+            &mut db,
+            &[("src", Value::Int(9000))],
+        )
+        .expect("one hop");
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Str("Grace".into()), Value::Int(17)],
+                [Value::Str("Barbara".into()), Value::Int(333)],
+            ]
+        );
+
+        // A key naming no row matches nothing instead of erroring or
+        // treating the key as an offset.
+        let r = run(
+            "MATCH (a:person {id: $src}) RETURN a.firstName AS name",
+            &mut db,
+            &[("src", Value::Int(2))],
+        )
+        .expect("miss");
+        assert!(r.rows.is_empty(), "got: {:?}", r.rows);
+
+        // An integer column other than id, addressed by original key.
+        let r = run(
+            "MATCH (a:person {id: $src}) RETURN a.cityId AS city",
+            &mut db,
+            &[("src", Value::Int(4025))],
+        )
+        .expect("city");
+        assert_eq!(r.rows, [[Value::Int(608)]]);
+
+        // Property filters scan in key space too: both people in city
+        // 608 come back under their original ids.
+        let r = run(
+            "MATCH (a:person) WHERE a.cityId = $c RETURN a.id AS id ORDER BY id",
+            &mut db,
+            &[("c", Value::Int(608))],
+        )
+        .expect("filter");
+        assert_eq!(r.rows, [[Value::Int(4025)], [Value::Int(9000)]]);
+
+        let err = run("MATCH (a:person) RETURN a.nope AS x", &mut db, &[]).expect_err("unknown");
+        assert!(err.to_string().contains("unknown property"), "got: {err}");
     }
 }

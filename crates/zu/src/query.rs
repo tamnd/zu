@@ -308,6 +308,28 @@ mod tests {
         )
         .expect("undirected count");
         assert_eq!(r.rows, [[Value::Int(undirected)]]);
+
+        // Trails of one or two hops: a second edge may repeat a node
+        // but never the first edge.
+        let mut trails = 0i64;
+        for &(s1, d1) in &edges {
+            if s1 != src {
+                continue;
+            }
+            trails += 1;
+            for &(s2, d2) in &edges {
+                if s2 == d1 && (s2, d2) != (s1, d1) {
+                    trails += 1;
+                }
+            }
+        }
+        let r = run(
+            "MATCH (a:person {id: $src})-[:follows*1..2]->(b) RETURN count(b) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("var-length count");
+        assert_eq!(r.rows, [[Value::Int(trails)]]);
     }
 
     #[test]

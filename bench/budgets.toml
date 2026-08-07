@@ -166,11 +166,12 @@ ldbc_ic_p50_ms = 10.0
 # count(*) sink multiplies survivors without a flatten. The run is
 # dominated by the 7.6 M hash probes, about 21 ns each locally with the
 # multiply-xor edge hasher; the accumulate itself is 10 K neighbors
-# calls and 173 K inserts, single-digit ms. Measured p50: gamingpc
-# 124 ms, local M series 165 ms, server1 531 ms with a max of 629 ms
-# from vCPU steal. The loaded hosts run 792 ms (server3, under its
-# crawl) and 881 ms (server2, beside a compile job), information like
-# their B4 numbers until those boxes quiet down. Every measured run
+# calls and 173 K inserts, single-digit ms. Measured p50: gamingpc 120
+# to 124 ms, local M series 139 to 165 ms, server1 531 to 599 ms with
+# vCPU steal spikes to 872 ms. The loaded hosts run 792 ms (server3,
+# under its crawl) and 881 ms (server2, beside a compile job),
+# information like their B4 numbers until those boxes quiet down. The
+# ceiling leaves a third of headroom over server1. Every measured run
 # asserts the count against a reference walked from the raw edge list.
 # Lower this ceiling, never raise it.
 ldbc_triangle_p50_ms = 800.0

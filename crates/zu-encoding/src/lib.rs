@@ -12,6 +12,7 @@ pub mod delta_patch;
 pub mod dict;
 pub mod for_bitpack;
 pub mod frequency;
+pub mod fsst;
 pub mod patch;
 pub mod rle;
 pub mod segment;

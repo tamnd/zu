@@ -155,44 +155,60 @@ pub fn decode(bytes: &[u8], max_bytes: usize, out: &mut Vec<u8>) -> Result<()> {
         .get(5 + count..5 + count + total)
         .ok_or_else(|| corrupt("truncated symbol bytes"))?;
     let payload = &bytes[5 + count + total..];
-    // Every entry is padded to 8 bytes so the hot loop always copies a
-    // fixed-size array and then drops the tail, one store on the fast
-    // path instead of a variable-length copy.
+    // Every entry is padded to 8 bytes so the hot loop is always one
+    // fixed-size copy, and the lengths live in a fixed array so a code
+    // that passed the count check indexes without another bounds test.
     let mut table = [[0u8; MAX_SYMBOL_LEN]; MAX_SYMBOLS];
+    let mut tlen = [0u8; MAX_SYMBOLS];
     let mut sym_pos = 0;
     for (i, &l) in lens.iter().enumerate() {
         table[i][..l as usize].copy_from_slice(&syms[sym_pos..sym_pos + l as usize]);
+        tlen[i] = l;
         sym_pos += l as usize;
     }
+    // The output is sized up front from the validated claim, with 8
+    // bytes of slack so every symbol write stays in bounds while n is
+    // at most raw_len, which the overshoot check below maintains. That
+    // turns the hot loop into indexed stores with no capacity checks or
+    // length updates; hostile payloads cost at most one iteration past
+    // the claim before the error path restores `out` exactly.
     let base = out.len();
-    out.reserve(raw_len + MAX_SYMBOL_LEN);
+    out.resize(base + raw_len + MAX_SYMBOL_LEN, 0);
+    let dst = &mut out[base..];
+    let mut n = 0;
     let mut i = 0;
+    let mut bad: Option<&str> = None;
     while i < payload.len() {
         let code = payload[i] as usize;
         i += 1;
         if code < count {
-            out.extend_from_slice(&table[code]);
-            out.truncate(out.len() - MAX_SYMBOL_LEN + lens[code] as usize);
+            dst[n..n + MAX_SYMBOL_LEN].copy_from_slice(&table[code]);
+            n += tlen[code] as usize;
         } else if code == ESCAPE as usize {
             let Some(&literal) = payload.get(i) else {
-                out.truncate(base);
-                return Err(corrupt("payload ends inside an escape"));
+                bad = Some("payload ends inside an escape");
+                break;
             };
             i += 1;
-            out.push(literal);
+            dst[n] = literal;
+            n += 1;
         } else {
-            out.truncate(base);
-            return Err(corrupt("code past the symbol count"));
+            bad = Some("code past the symbol count");
+            break;
         }
-        if out.len() - base > raw_len {
-            out.truncate(base);
-            return Err(corrupt("decoded past the claimed length"));
+        if n > raw_len {
+            bad = Some("decoded past the claimed length");
+            break;
         }
     }
-    if out.len() - base != raw_len {
+    if bad.is_none() && n != raw_len {
+        bad = Some("decoded length below the claim");
+    }
+    if let Some(detail) = bad {
         out.truncate(base);
-        return Err(corrupt("decoded length below the claim"));
+        return Err(corrupt(detail));
     }
+    out.truncate(base + raw_len);
     Ok(())
 }
 

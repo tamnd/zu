@@ -14,6 +14,16 @@ fsst = 1.0
 alp = 1.0
 alp_rd = 1.0
 
+# The Zstd leaf is the deliberate exception to the 1.0 contract: docs/01
+# adopted the cascade precisely so nothing hot needs general-purpose
+# compression, and the leaf exists for cold string segments where ratio
+# wins over decode speed (docs/04 marks id 11 optional). These floors
+# track regressions in the two read paths, libzstd behind the feature
+# and the pure Rust ruzstd fallback, sized for the EPYC vCPU hosts.
+# Raise floors, never lower them.
+zstd = 0.25
+zstd_fallback = 0.05
+
 # COPY ingest floors, single core, sort included, parse excluded (B6/B8).
 # The density keys are ceilings, not floors, set just above the measured
 # LiveJournal numbers with per-chunk MiniBlock cascades: raw order 22.31,

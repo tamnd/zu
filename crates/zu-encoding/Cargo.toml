@@ -11,6 +11,11 @@ authors.workspace = true
 
 [dependencies]
 zu-common.workspace = true
+ruzstd.workspace = true
+zstd = { workspace = true, optional = true }
+
+[features]
+zstd = ["dep:zstd"]
 
 [[bench]]
 name = "decode"

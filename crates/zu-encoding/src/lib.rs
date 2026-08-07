@@ -19,6 +19,7 @@ pub mod patch;
 pub mod rle;
 pub mod segment;
 pub mod validity;
+pub mod zstd_leaf;
 
 use zu_common::ZuError;
 

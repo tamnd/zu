@@ -99,6 +99,8 @@ type EncodeFn = fn(&[u64], &mut Vec<u8>) -> usize;
 type DecodeFn = fn(&[u8], usize, &mut Vec<u64>) -> zu_common::Result<()>;
 type FloatEncodeFn = fn(&[f64], &mut Vec<u8>) -> usize;
 type FloatDecodeFn = fn(&[u8], usize, &mut Vec<f64>) -> zu_common::Result<()>;
+#[cfg(feature = "zstd")]
+type ByteDecodeFn = fn(&[u8], usize, &mut Vec<u8>) -> zu_common::Result<()>;
 
 fn main() {
     let data = std::env::var("ZU_DATA")
@@ -216,6 +218,44 @@ fn main() {
         println!("GATE FAIL fsst: {gbps:.2} GB/s < floor {floor} GB/s");
         failed = true;
     }
+
+    // The Zstd leaf exists for cold string segments, so honest input is
+    // the same raw edge-list text fsst measures on. Both read paths run:
+    // libzstd behind the feature and the pure Rust ruzstd fallback that
+    // default builds decode with.
+    #[cfg(feature = "zstd")]
+    {
+        let mut encoded = Vec::new();
+        zu_encoding::zstd_leaf::encode(&text, &mut encoded);
+        let leaf_cases: [(&str, ByteDecodeFn); 2] = [
+            ("zstd", zu_encoding::zstd_leaf::decode),
+            ("zstd_fallback", zu_encoding::zstd_leaf::decode_fallback),
+        ];
+        for (name, decode) in leaf_cases {
+            let mut out = Vec::with_capacity(text.len());
+            decode(&encoded, text.len(), &mut out).unwrap();
+            assert_eq!(out, text, "{name} roundtrip broke on the bench corpus");
+            let mut iters = 0u32;
+            let start = Instant::now();
+            while start.elapsed().as_secs_f64() < 1.0 {
+                out.clear();
+                decode(&encoded, text.len(), &mut out).unwrap();
+                iters += 1;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let gbps = (text.len() as f64) * f64::from(iters) / secs / 1e9;
+            let ratio = (text.len() as f64) / (encoded.len() as f64);
+            println!("{name}: {gbps:.2} GB/s decode, {ratio:.1}x vs raw, {iters} iters");
+            if let Some(floor) = budgets.floor(name)
+                && gbps < floor
+            {
+                println!("GATE FAIL {name}: {gbps:.2} GB/s < floor {floor} GB/s");
+                failed = true;
+            }
+        }
+    }
+    #[cfg(not(feature = "zstd"))]
+    println!("zstd: skipped (build without --features zstd)");
 
     // The float encodings measure on real doubles: the latitude and
     // longitude columns of the Gowalla check-ins (SNAP), 12.8 M values

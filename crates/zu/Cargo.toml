@@ -18,6 +18,9 @@ zu-sqlite.workspace = true
 zu-s3.workspace = true
 zu-query.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

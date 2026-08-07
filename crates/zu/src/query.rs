@@ -3,11 +3,16 @@
 //! frontend. The binder itself is engine-agnostic; this is where zu1
 //! table definitions become labels and relationship types.
 
-use zu_common::Result;
+use std::collections::HashMap;
+
+use zu_common::{Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
+use zu_query::exec::{self, Graph, QueryResult, Value};
 use zu_query::{optimizer, parser, plan};
 
 use crate::zu1::catalog::Catalog;
+use crate::zu1::file::Zu1File;
+use crate::zu1::graph::{Direction, GraphReader};
 
 /// Builds the binder schema from a zu1 catalog.
 pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
@@ -49,6 +54,107 @@ pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
     let built = plan::build(&query)?;
     let optimized = optimizer::optimize(built, &query, &schema)?;
     Ok(plan::explain(&optimized, &query, &schema))
+}
+
+/// The executor's view of one open zu1 file: readers load lazily per
+/// rel table and cache their directories across calls.
+pub struct Zu1Graph<'a> {
+    db: &'a mut Zu1File,
+    catalog: Catalog,
+    readers: HashMap<u32, GraphReader>,
+}
+
+impl<'a> Zu1Graph<'a> {
+    pub fn new(db: &'a mut Zu1File, catalog: Catalog) -> Self {
+        Zu1Graph {
+            db,
+            catalog,
+            readers: HashMap::new(),
+        }
+    }
+
+    fn ensure_reader(&mut self, rel: u32) -> Result<()> {
+        if self.readers.contains_key(&rel) {
+            return Ok(());
+        }
+        let name = self
+            .catalog
+            .rel_by_id(rel)
+            .ok_or_else(|| ZuError::InvalidArgument(format!("unknown rel table {rel}")))?
+            .name
+            .clone();
+        let reader = GraphReader::load_table(self.db, &name)?;
+        self.readers.insert(rel, reader);
+        Ok(())
+    }
+}
+
+impl Graph for Zu1Graph<'_> {
+    fn neighbors(&mut self, rel: u32, node: u64, reversed: bool, out: &mut Vec<u64>) -> Result<()> {
+        self.ensure_reader(rel)?;
+        out.clear();
+        let dir = if reversed {
+            Direction::Bwd
+        } else {
+            Direction::Fwd
+        };
+        let Self { db, readers, .. } = self;
+        readers
+            .get(&rel)
+            .expect("just loaded")
+            .neighbors_dir_into(db, node, dir, out)
+    }
+
+    fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        readers
+            .get(&rel)
+            .expect("just loaded")
+            .has_edge(db, src, dst)
+    }
+
+    fn property(&mut self, _table: u32, offset: u64, key: &str) -> Result<Value> {
+        // v0 contract: `id` is the offset. Real property columns are
+        // milestone 3's column catalog.
+        match key {
+            "id" => Ok(Value::Int(offset as i64)),
+            other => Err(ZuError::InvalidArgument(format!(
+                "unknown property '{other}', property columns land with the column catalog"
+            ))),
+        }
+    }
+}
+
+/// Parses, plans, optimizes, and executes one query against an open
+/// zu1 file, returning the result rows.
+pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
+    let catalog = Catalog::load(db)?;
+    let schema = schema_of(&catalog)?;
+    let parsed = parser::parse(source)?;
+    let query = binder::bind(&parsed, &schema)?;
+    let built = plan::build(&query)?;
+    let optimized = optimizer::optimize(built, &query, &schema)?;
+    let mut args = Vec::with_capacity(query.params.len());
+    for name in &query.params {
+        match params.iter().find(|(n, _)| n == name) {
+            Some((_, v)) => args.push(v.clone()),
+            None => {
+                return Err(ZuError::InvalidArgument(format!(
+                    "missing parameter ${name}"
+                )));
+            }
+        }
+    }
+    let mut graph = Zu1Graph::new(db, catalog);
+    exec::execute(
+        &optimized,
+        &query,
+        &schema,
+        &mut graph,
+        &args,
+        &exec::Options::default(),
+    )
 }
 
 #[cfg(test)]
@@ -101,5 +207,67 @@ mod tests {
             ],
             "got:\n{text}"
         );
+    }
+
+    #[test]
+    fn runs_queries_on_a_real_zu1_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = (0..400u32).map(|i| (i % 97, (i * 7 + 3) % 89)).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let src = 3u32;
+
+        let mut friends: Vec<i64> = edges
+            .iter()
+            .filter(|(s, _)| *s == src)
+            .map(|(_, d)| i64::from(*d))
+            .collect();
+        friends.sort_unstable();
+        let r = run(
+            "MATCH (a:person {id: $src})-[:follows]->(b) \
+             RETURN b.id AS friend ORDER BY friend",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("one hop");
+        assert_eq!(r.columns, ["friend"]);
+        let got: Vec<i64> = r
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Int(i) => *i,
+                other => panic!("expected an int, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, friends);
+
+        let two_hop: i64 = edges
+            .iter()
+            .filter(|(s, _)| *s == src)
+            .map(|(_, mid)| edges.iter().filter(|(s, _)| s == mid).count() as i64)
+            .sum();
+        let r = run(
+            "MATCH (a:person {id: $src})-[:follows]->(b)-[:follows]->(c) \
+             RETURN count(c) AS paths",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("two hop count");
+        assert_eq!(r.rows, [[Value::Int(two_hop)]]);
+
+        let undirected = edges.iter().filter(|(s, d)| *s == src || *d == src).count() as i64;
+        let r = run(
+            "MATCH (a:person {id: $src})-[:follows]-(b) RETURN count(b) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("undirected count");
+        assert_eq!(r.rows, [[Value::Int(undirected)]]);
     }
 }

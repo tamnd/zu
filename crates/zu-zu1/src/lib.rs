@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod file;
+pub mod fullzip;
 pub mod graph;
 pub mod keys;
 pub mod meta;

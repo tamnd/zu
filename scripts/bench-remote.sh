@@ -28,6 +28,7 @@ git reset -q --hard "$REF"
 echo "host: \$(hostname), \$(nproc) cores, \$(rustc --version | cut -d' ' -f1-2)"
 ZU_GATE=1 ZU_DATA=\$HOME/data/zu cargo bench -q -p zu-encoding --features zstd --bench decode 2>/dev/null
 ZU_GATE=1 ZU_DATA=\$HOME/data/zu ZU_B6=$B6 cargo bench -q -p zu-zu1 --bench ingest 2>/dev/null
+ZU_GATE=1 ZU_DATA=\$HOME/data/zu cargo bench -q -p zu-zu1 --bench blob 2>/dev/null
 ZU_GATE=1 ZU_DATA=\$HOME/data/zu ZU_B7=$B7 cargo bench -q -p zu-zu1 --bench open 2>/dev/null
 EOF
 )

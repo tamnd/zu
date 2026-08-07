@@ -17,8 +17,11 @@
 //! about 0.06 bits per value.
 //! Metas serialize into meta-block chains with a fixed layout:
 //! `value_count: u64`, `payload_len: u64`, `uncompressed_bytes: u64`,
-//! `min: u64`, `max: u64`, `crc32c: u32`, `block_count: u32`, then one
-//! `u64` per block pointer. The min and max are the segment's zone map
+//! `min: u64`, `max: u64`, `crc32c: u32`, `block_count: u32`,
+//! `structural: u8`, then one `u64` per block pointer. The structural
+//! byte names the payload layout, MiniBlock here or FullZip in
+//! `crate::fullzip`, and an unknown id is an error naming it (docs/04
+//! §10). The min and max are the segment's zone map
 //! (`docs/04` §6): [`probe`] answers absent for any value outside them
 //! without touching the payload, and the full scan cross-checks them
 //! against the decoded values.
@@ -38,6 +41,16 @@ use crate::file::{BlockPtr, Zu1File};
 /// Rows per MiniBlock chunk, the unit of point access.
 pub const CHUNK_ROWS: usize = 1024;
 
+/// Structural layout of a segment payload (docs/04 §3): MiniBlock packs
+/// fixed-width values in 1024-row cascade chunks, FullZip zips
+/// variable-width values with their lengths (`crate::fullzip`). The ids
+/// are format-stable; readers reject any other value by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Structural {
+    MiniBlock = 0,
+    FullZip = 1,
+}
+
 /// Location and integrity data for one stored segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMeta {
@@ -49,13 +62,14 @@ pub struct SegmentMeta {
     /// Zone map: the largest value in the segment, 0 when empty.
     pub max: u64,
     pub crc: u32,
+    pub structural: Structural,
     pub blocks: Vec<BlockPtr>,
 }
 
 impl SegmentMeta {
     /// Serialized size in bytes.
     pub fn encoded_len(&self) -> usize {
-        48 + self.blocks.len() * 8
+        49 + self.blocks.len() * 8
     }
 
     /// Appends the meta to `out`.
@@ -67,6 +81,7 @@ impl SegmentMeta {
         out.extend_from_slice(&self.max.to_le_bytes());
         out.extend_from_slice(&self.crc.to_le_bytes());
         out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
+        out.push(self.structural as u8);
         for b in &self.blocks {
             out.extend_from_slice(&b.to_le_bytes());
         }
@@ -80,7 +95,7 @@ impl SegmentMeta {
             detail: detail.to_string(),
         };
         let head = bytes
-            .get(pos..pos + 48)
+            .get(pos..pos + 49)
             .ok_or_else(|| corrupt("truncated header"))?;
         let word = |i: usize| u64::from_le_bytes(head[i..i + 8].try_into().unwrap());
         let value_count = word(0);
@@ -90,6 +105,16 @@ impl SegmentMeta {
         let max = word(32);
         let crc = u32::from_le_bytes(head[40..44].try_into().unwrap());
         let block_count = u32::from_le_bytes(head[44..48].try_into().unwrap()) as usize;
+        let structural = match head[48] {
+            0 => Structural::MiniBlock,
+            1 => Structural::FullZip,
+            id => {
+                return Err(ZuError::Unsupported {
+                    what: "structural layout",
+                    id: u32::from(id),
+                });
+            }
+        };
         if min > max {
             return Err(corrupt("zone min above max"));
         }
@@ -98,11 +123,11 @@ impl SegmentMeta {
         }
         // The claimed count must fit in the bytes actually present before
         // it sizes an allocation.
-        if block_count > bytes.len().saturating_sub(pos + 48) / 8 {
+        if block_count > bytes.len().saturating_sub(pos + 49) / 8 {
             return Err(corrupt("truncated block list"));
         }
         let mut blocks = Vec::with_capacity(block_count);
-        let mut p = pos + 48;
+        let mut p = pos + 49;
         for _ in 0..block_count {
             let ptr = bytes
                 .get(p..p + 8)
@@ -118,18 +143,19 @@ impl SegmentMeta {
                 min,
                 max,
                 crc,
+                structural,
                 blocks,
             },
             p,
         ))
     }
 
-    fn chunk_count(&self) -> usize {
+    pub(crate) fn chunk_count(&self) -> usize {
         self.value_count.div_ceil(CHUNK_ROWS as u64) as usize
     }
 
     /// Rows in chunk `i`: full except possibly the last.
-    fn chunk_rows(&self, i: usize) -> usize {
+    pub(crate) fn chunk_rows(&self, i: usize) -> usize {
         (self.value_count as usize - i * CHUNK_ROWS).min(CHUNK_ROWS)
     }
 }
@@ -177,6 +203,7 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
         min: values.iter().copied().min().unwrap_or(0),
         max: values.iter().copied().max().unwrap_or(0),
         crc,
+        structural: Structural::MiniBlock,
         blocks,
     })
 }
@@ -188,6 +215,9 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
         what: "segment",
         detail: detail.to_string(),
     };
+    if meta.structural != Structural::MiniBlock {
+        return Err(corrupt("MiniBlock reader given a FullZip segment"));
+    }
     // The claimed length only seeds the reservation; growth past the cap
     // is bounded by the block reads, which fail on the first bad pointer.
     let mut payload = Vec::with_capacity((meta.payload_len as usize).min(1 << 22));
@@ -268,6 +298,9 @@ pub fn read_range(
             meta.value_count
         )));
     }
+    if meta.structural != Structural::MiniBlock {
+        return Err(corrupt("MiniBlock reader given a FullZip segment"));
+    }
     if start == end {
         return Ok(());
     }
@@ -339,6 +372,9 @@ pub fn probe(
             meta.value_count
         )));
     }
+    if meta.structural != Structural::MiniBlock {
+        return Err(corrupt("MiniBlock reader given a FullZip segment"));
+    }
     if start == end {
         return Ok(false);
     }
@@ -399,6 +435,12 @@ pub struct ChunkDirectory {
 
 /// Loads the chunk index and fences of `meta`'s segment.
 pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<ChunkDirectory> {
+    if meta.structural != Structural::MiniBlock {
+        return Err(ZuError::Corrupt {
+            what: "segment",
+            detail: "MiniBlock reader given a FullZip segment".to_string(),
+        });
+    }
     let chunks = meta.chunk_count();
     let span = read_payload_span(db, meta, 4, 4 + chunks * 4)?;
     let ends = span
@@ -427,6 +469,9 @@ pub fn find_in_sorted(
         what: "segment",
         detail: detail.to_string(),
     };
+    if meta.structural != Structural::MiniBlock {
+        return Err(corrupt("MiniBlock reader given a FullZip segment"));
+    }
     if meta.value_count == 0 || value < meta.min || value > meta.max {
         return Ok(None);
     }
@@ -461,7 +506,7 @@ pub fn find_in_sorted(
 }
 
 /// Reads payload bytes `[from, to)`, touching only the covering blocks.
-fn read_payload_span(
+pub(crate) fn read_payload_span(
     db: &mut Zu1File,
     meta: &SegmentMeta,
     from: usize,
@@ -705,8 +750,43 @@ mod tests {
         bytes.extend_from_slice(&99u64.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&block_count.to_le_bytes());
+        bytes.push(0);
         let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
         assert!(format!("{err}").contains("truncated block list"));
+    }
+
+    #[test]
+    fn unknown_structural_id_rejected_by_name() {
+        let meta = SegmentMeta {
+            value_count: 10,
+            payload_len: 80,
+            uncompressed_bytes: 80,
+            min: 0,
+            max: 9,
+            crc: 0,
+            structural: Structural::MiniBlock,
+            blocks: vec![3],
+        };
+        let mut bytes = Vec::new();
+        meta.encode(&mut bytes);
+        bytes[48] = 9;
+        let err = SegmentMeta::decode(&bytes, 0).unwrap_err();
+        assert!(format!("{err}").contains("structural layout"));
+        assert!(format!("{err}").contains('9'));
+    }
+
+    #[test]
+    fn miniblock_readers_reject_fullzip_metas() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let values: Vec<u64> = (0..5000u64).collect();
+        let mut meta = write_segment(&mut db, &values).unwrap();
+        meta.structural = Structural::FullZip;
+        let mut out = Vec::new();
+        assert!(read_segment(&mut db, &meta, &mut out).is_err());
+        assert!(read_range(&mut db, &meta, 0, 10, &mut out).is_err());
+        assert!(probe(&mut db, &meta, 0, 10, 5).is_err());
+        assert!(load_chunk_directory(&mut db, &meta).is_err());
     }
 
     #[test]
@@ -718,6 +798,7 @@ mod tests {
             min: 5,
             max: 4,
             crc: 0,
+            structural: Structural::MiniBlock,
             blocks: vec![3],
         };
         let mut bytes = Vec::new();

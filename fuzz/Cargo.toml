@@ -49,6 +49,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "decode_alp"
+path = "fuzz_targets/decode_alp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_alp_rd"
+path = "fuzz_targets/decode_alp_rd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "decode_fsst"
 path = "fuzz_targets/decode_fsst.rs"
 test = false

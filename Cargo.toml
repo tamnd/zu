@@ -23,6 +23,8 @@ zu = { path = "crates/zu" }
 
 thiserror = "2"
 crc32c = "0.6"
+zstd = "0.13"
+ruzstd = "0.8"
 object_store = { version = "0.14", default-features = false }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"

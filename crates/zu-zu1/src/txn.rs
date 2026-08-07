@@ -310,6 +310,61 @@ impl Mvcc {
             .map(|&(_, s, d)| (s, d))
     }
 
+    /// Node tables holding any overlay state, sorted so a fold walks
+    /// them deterministically.
+    pub fn tables_touched(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.tables.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Rel tables holding overlay edges, sorted like the node tables.
+    pub fn rels_touched(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.rels.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Tombstoned offsets of `table` visible at `epoch`, ascending.
+    pub fn tombstones(&self, table: u32, epoch: Epoch) -> Vec<u64> {
+        self.tables.get(&table).map_or_else(Vec::new, |t| {
+            t.tombstones
+                .iter()
+                .filter(|&(_, &e)| e <= epoch)
+                .map(|(&offset, _)| offset)
+                .collect()
+        })
+    }
+
+    /// Whether any append batch of `table` visible at `epoch` carries
+    /// column values, which a fold must merge into stored props.
+    pub fn appends_carry_columns(&self, table: u32, epoch: Epoch) -> bool {
+        self.tables.get(&table).is_some_and(|t| {
+            t.appended
+                .iter()
+                .any(|b| b.epoch <= epoch && b.rows > 0 && !b.cols.is_empty())
+        })
+    }
+
+    /// Whether `table` holds any update chain entry visible at `epoch`.
+    pub fn has_updates(&self, table: u32, epoch: Epoch) -> bool {
+        self.tables.get(&table).is_some_and(|t| {
+            t.updates
+                .values()
+                .any(|chain| chain.iter().any(|&(e, _)| e <= epoch))
+        })
+    }
+
+    /// Seeds tombstones a checkpoint persisted into the base file. They
+    /// enter at epoch 0 so every reader sees them, matching their state
+    /// as folded rather than freshly deleted.
+    pub fn seed_tombstones(&mut self, table: u32, offsets: &[u64]) {
+        let overlay = self.tables.entry(table).or_default();
+        for &offset in offsets {
+            overlay.tombstones.insert(offset, 0);
+        }
+    }
+
     /// Publishes a committed txn's staged ops at `epoch`.
     fn apply(&mut self, epoch: Epoch, ops: Vec<Op>) {
         for op in ops {

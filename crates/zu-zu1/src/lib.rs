@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod file;
+pub mod fold;
 pub mod fullzip;
 pub mod graph;
 pub mod keys;
@@ -77,7 +78,28 @@ pub fn verify(path: &Path) -> Result<u64> {
         bytes += chain.len() as u64;
         live.extend(meta::chain_blocks(&mut db, root)?);
         // A node table's entry is its props directory (the M2 column
-        // slice); a rel table's entry is its group directory.
+        // slice), a rel table's entry is its group directory, and a
+        // reserved key carries a node table's persisted tombstones.
+        if id & fold::TOMBSTONE_KEY != 0 {
+            let table = id & !fold::TOMBSTONE_KEY;
+            let node = catalog.node_by_id(table).ok_or_else(|| {
+                corrupt(
+                    "table index",
+                    format!("tombstone entry {id} names no node table"),
+                )
+            })?;
+            let offsets = fold::decode_tombstones(&chain)?;
+            if let Some(&offset) = offsets.iter().find(|&&o| o >= node.node_count) {
+                return Err(corrupt(
+                    "tombstone chain",
+                    format!(
+                        "'{}' tombstones row {offset} beyond its {} rows",
+                        node.name, node.node_count
+                    ),
+                ));
+            }
+            continue;
+        }
         if let Some(node) = catalog.node_by_id(id) {
             let props = props::PropsDirectory::decode(&chain)?;
             if props.node_count > node.node_count {

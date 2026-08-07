@@ -7,12 +7,13 @@
 //! `binder`) for the MATCH, WHERE, UNWIND, WITH, RETURN core per
 //! `docs/grammar.ebnf`, the logical plan and EXPLAIN rendering in
 //! `plan`, the DP join ordering and filter placement in `optimizer`,
-//! the CSR adjacency in `csr`, and the table-function kernels in
-//! `kernels`.
+//! the factorized single-threaded executor in `exec`, the CSR
+//! adjacency in `csr`, and the table-function kernels in `kernels`.
 
 pub mod ast;
 pub mod binder;
 pub mod csr;
+pub mod exec;
 pub mod kernels;
 pub mod lexer;
 pub mod optimizer;

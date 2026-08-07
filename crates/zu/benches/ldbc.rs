@@ -84,8 +84,12 @@ fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>) {
 }
 
 /// B1: warm 1-hop expands over rows with out-degree at most 100, the G1
-/// workload shape docs/11 defines the budget on. A sample crosschecks
-/// against the reference adjacency built from the raw edge list.
+/// workload shape docs/11 defines the budget on. The gated number goes
+/// through the cached-group path, the read the executor's Expand makes
+/// once a query is warm; the storage point path prints alongside as
+/// information, its regression floors live with the LiveJournal keys.
+/// A sample crosschecks against the reference adjacency built from the
+/// raw edge list.
 fn run_one_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
     let mut outdeg = vec![0u32; node_count as usize];
     for &(s, _) in edges {
@@ -95,57 +99,86 @@ fn run_one_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
         .filter(|&n| outdeg[n as usize] <= 100)
         .collect();
     let mut db = Zu1File::open(path).expect("open");
-    let reader = GraphReader::load_table(&mut db, "knows").expect("load knows");
+    let mut reader = GraphReader::load_table(&mut db, "knows").expect("load knows");
     let lookups = 200_000usize;
     let mut rng = 0x9E3779B97F4A7C15u64;
     let mut nbrs = Vec::new();
     for _ in 0..10_000 {
         let node = eligible[(xorshift(&mut rng) as usize) % eligible.len()];
-        nbrs.clear();
         reader
-            .neighbors_dir_into(&mut db, node, Direction::Fwd, &mut nbrs)
+            .neighbors_dir(&mut db, node, Direction::Fwd)
             .expect("warmup read");
     }
-    let mut lat = Vec::with_capacity(lookups);
+    // A single warm expand sits at or below timer resolution, so the
+    // clock samples batches of 100 and the quoted latencies are batch
+    // means per expand. That is still a latency gate, not a throughput
+    // one: a regression that makes expands decode per call moves the
+    // p50 three orders of magnitude.
+    let batch = 100usize;
+    let batches = lookups / batch;
+    let mut lat = Vec::with_capacity(batches);
     let mut edges_read = 0u64;
     let started = Instant::now();
-    for _ in 0..lookups {
+    for _ in 0..batches {
+        let t = Instant::now();
+        for _ in 0..batch {
+            let node = eligible[(xorshift(&mut rng) as usize) % eligible.len()];
+            nbrs.clear();
+            let hop = reader
+                .neighbors_dir(&mut db, node, Direction::Fwd)
+                .expect("expand read");
+            nbrs.extend_from_slice(hop);
+            edges_read += nbrs.len() as u64;
+        }
+        lat.push(t.elapsed() / batch as u32);
+    }
+    let secs = started.elapsed().as_secs_f64();
+    lat.sort_unstable();
+    let p50 = lat[batches / 2].as_secs_f64() * 1e6;
+    println!(
+        "sf1 1-hop expand (deg <= 100, {} of {} rows): p50 {p50:.3} us, p99 {:.3} us per expand over batches of {batch}, {:.0} K expands/s, {edges_read} edges read",
+        eligible.len(),
+        node_count,
+        lat[batches * 99 / 100].as_secs_f64() * 1e6,
+        lookups as f64 / secs / 1e3
+    );
+    let mut point_lat = Vec::with_capacity(lookups / 10);
+    for _ in 0..lookups / 10 {
         let node = eligible[(xorshift(&mut rng) as usize) % eligible.len()];
         nbrs.clear();
         let t = Instant::now();
         reader
             .neighbors_dir_into(&mut db, node, Direction::Fwd, &mut nbrs)
             .expect("point read");
-        lat.push(t.elapsed());
-        edges_read += nbrs.len() as u64;
+        point_lat.push(t.elapsed());
     }
-    let secs = started.elapsed().as_secs_f64();
-    lat.sort_unstable();
-    let p50 = lat[lookups / 2].as_secs_f64() * 1e6;
+    point_lat.sort_unstable();
     println!(
-        "sf1 1-hop (deg <= 100, {} of {} rows): p50 {p50:.2} us, p99 {:.2} us, {:.0} K lookups/s, {edges_read} edges read",
-        eligible.len(),
-        node_count,
-        lat[lookups * 99 / 100].as_secs_f64() * 1e6,
-        lookups as f64 / secs / 1e3
+        "sf1 1-hop point path: p50 {:.2} us, p99 {:.2} us (information, floors on LiveJournal)",
+        point_lat[point_lat.len() / 2].as_secs_f64() * 1e6,
+        point_lat[point_lat.len() * 99 / 100].as_secs_f64() * 1e6
     );
     for _ in 0..100 {
         let node = eligible[(xorshift(&mut rng) as usize) % eligible.len()];
-        nbrs.clear();
-        reader
-            .neighbors_dir_into(&mut db, node, Direction::Fwd, &mut nbrs)
-            .expect("point read");
         let want: Vec<u64> = edges
             .iter()
             .filter(|&&(s, _)| u64::from(s) == node)
             .map(|&(_, d)| u64::from(d))
             .collect();
+        let hop = reader
+            .neighbors_dir(&mut db, node, Direction::Fwd)
+            .expect("expand read");
+        assert_eq!(hop, want, "expand of {node} disagrees with the edge list");
+        nbrs.clear();
+        reader
+            .neighbors_dir_into(&mut db, node, Direction::Fwd, &mut nbrs)
+            .expect("point read");
         assert_eq!(
             nbrs, want,
-            "neighbors of {node} disagree with the edge list"
+            "point neighbors of {node} disagree with the edge list"
         );
     }
-    println!("sf1 1-hop crosscheck: 100 nodes match the edge list");
+    println!("sf1 1-hop crosscheck: 100 nodes match the edge list on both paths");
     p50
 }
 

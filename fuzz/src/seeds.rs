@@ -137,6 +137,9 @@ fn main() {
     let mut fs = Vec::new();
     zu_encoding::fsst::encode(&text, &mut fs);
     write_seed(&corpus.join("decode_fsst"), "edge-text", &fs);
+    let mut zs = Vec::new();
+    zu_encoding::zstd_leaf::encode(&text, &mut zs);
+    write_seed(&corpus.join("decode_zstd"), "edge-text", &zs);
     let coords: Vec<f64> = follows
         .iter()
         .map(|&(s, d)| f64::from(s) + f64::from(d) / 1e5)

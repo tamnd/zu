@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 tempfile = "3"
-zu-encoding = { path = "../crates/zu-encoding" }
+zu-encoding = { path = "../crates/zu-encoding", features = ["zstd"] }
 zu-zu1 = { path = "../crates/zu-zu1" }
 
 [[bin]]
@@ -58,6 +58,13 @@ bench = false
 [[bin]]
 name = "decode_alp_rd"
 path = "fuzz_targets/decode_alp_rd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_zstd"
+path = "fuzz_targets/decode_zstd.rs"
 test = false
 doc = false
 bench = false

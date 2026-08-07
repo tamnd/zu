@@ -28,10 +28,14 @@ pub enum LogicalPlan {
     /// One row, no columns: the seed under the first scan or unwind.
     Empty,
     /// Introduces every row of a node slot's candidate tables.
+    /// `optional` carries the OPTIONAL MATCH group this operator
+    /// belongs to, `None` for a required match. Operators and filters
+    /// sharing a group form one left-outer unit at execution: when the
+    /// group produces nothing for an outer row, its slots bind null.
     ScanNodes {
         input: Box<LogicalPlan>,
         slot: usize,
-        optional: bool,
+        optional: Option<usize>,
     },
     /// Walks a rel from a bound slot, introducing (or joining into)
     /// the far node.
@@ -45,11 +49,15 @@ pub enum LogicalPlan {
         /// True when the far node was already bound: the expand joins
         /// into it instead of introducing it.
         into: bool,
-        optional: bool,
+        optional: Option<usize>,
     },
+    /// `optional` ties a filter into its OPTIONAL MATCH group: inline
+    /// props and the clause's WHERE gate matches inside the group
+    /// rather than dropping the null row the group emits on a miss.
     Filter {
         input: Box<LogicalPlan>,
         expr: BoundExpr,
+        optional: Option<usize>,
     },
     Unwind {
         input: Box<LogicalPlan>,
@@ -94,6 +102,8 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
     let mut plan = LogicalPlan::Empty;
     // Slots a plan operator has already introduced.
     let mut bound: HashSet<usize> = HashSet::new();
+    // Each OPTIONAL MATCH clause is its own left-outer group.
+    let mut opt_groups = 0;
     for clause in &query.clauses {
         match clause {
             BoundClause::Match {
@@ -101,13 +111,18 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                 patterns,
                 filter,
             } => {
+                let group = optional.then(|| {
+                    opt_groups += 1;
+                    opt_groups - 1
+                });
                 for path in patterns {
-                    plan = build_path(plan, path, &mut bound, *optional)?;
+                    plan = build_path(plan, path, &mut bound, group)?;
                 }
                 if let Some(expr) = filter {
                     plan = LogicalPlan::Filter {
                         input: plan.boxed(),
                         expr: expr.clone(),
+                        optional: group,
                     };
                 }
             }
@@ -155,6 +170,7 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                     plan = LogicalPlan::Filter {
                         input: plan.boxed(),
                         expr: expr.clone(),
+                        optional: None,
                     };
                 }
                 if !order_by.is_empty() {
@@ -185,7 +201,7 @@ fn build_path(
     mut plan: LogicalPlan,
     path: &crate::binder::BoundPath,
     bound: &mut HashSet<usize>,
-    optional: bool,
+    optional: Option<usize>,
 ) -> Result<LogicalPlan> {
     if path.slot.is_some() {
         return Err(invalid(
@@ -200,7 +216,7 @@ fn build_path(
             optional,
         };
     }
-    plan = prop_filters(plan, path.start.slot, &path.start.props);
+    plan = prop_filters(plan, path.start.slot, &path.start.props, optional);
     let mut from = path.start.slot;
     for (rel, node) in &path.steps {
         let into = bound.contains(&node.slot);
@@ -216,8 +232,8 @@ fn build_path(
             into,
             optional,
         };
-        plan = prop_filters(plan, rel.slot, &rel.props);
-        plan = prop_filters(plan, node.slot, &node.props);
+        plan = prop_filters(plan, rel.slot, &rel.props, optional);
+        plan = prop_filters(plan, node.slot, &node.props, optional);
         from = node.slot;
     }
     Ok(plan)
@@ -225,7 +241,14 @@ fn build_path(
 
 /// Inline `{key: value}` predicates become equality filters right where
 /// the slot appears; this is the pushdown the props form guarantees.
-fn prop_filters(mut plan: LogicalPlan, slot: usize, props: &[(String, BoundExpr)]) -> LogicalPlan {
+/// Inside an OPTIONAL MATCH they carry the group so they gate matches
+/// within the group instead of dropping its null row.
+fn prop_filters(
+    mut plan: LogicalPlan,
+    slot: usize,
+    props: &[(String, BoundExpr)],
+    optional: Option<usize>,
+) -> LogicalPlan {
     for (key, value) in props {
         let expr = BoundExpr::Binary {
             op: BinaryOp::Eq,
@@ -238,6 +261,7 @@ fn prop_filters(mut plan: LogicalPlan, slot: usize, props: &[(String, BoundExpr)
         plan = LogicalPlan::Filter {
             input: plan.boxed(),
             expr,
+            optional,
         };
     }
     plan
@@ -282,7 +306,7 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             slot,
             optional,
         } => {
-            let opt = if *optional { "Optional" } else { "" };
+            let opt = if optional.is_some() { "Optional" } else { "" };
             let _ = writeln!(
                 out,
                 "{pad}{opt}ScanNodes {}: {}",
@@ -314,7 +338,7 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 RelDirection::In => ("<-", "-"),
                 RelDirection::Undirected => ("-", "-"),
             };
-            let opt = if *optional { "Optional" } else { "" };
+            let opt = if optional.is_some() { "Optional" } else { "" };
             let kind = if *into { "ExpandInto" } else { "Expand" };
             let _ = writeln!(
                 out,
@@ -326,8 +350,13 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             );
             render(input, query, schema, depth + 1, out);
         }
-        LogicalPlan::Filter { input, expr } => {
-            let _ = writeln!(out, "{pad}Filter {}", expr_text(expr, query));
+        LogicalPlan::Filter {
+            input,
+            expr,
+            optional,
+        } => {
+            let opt = if optional.is_some() { "Optional" } else { "" };
+            let _ = writeln!(out, "{pad}{opt}Filter {}", expr_text(expr, query));
             render(input, query, schema, depth + 1, out);
         }
         LogicalPlan::Unwind { input, expr, slot } => {

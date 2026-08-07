@@ -86,6 +86,17 @@ edge_probe_kprobes_s = 2.0
 # scans the key column measures well under 1 on every machine.
 key_klookups_s = 20.0
 
+# FullZip string segments over the raw lines of soc-LiveJournal1.txt,
+# single core. The scan floor is GB/s of value bytes through the full
+# read path, crc and all; the point floor is random single-row reads,
+# each a chunk seek through the offset samples plus one chunk decode.
+# Provisional until the first fleet pass; raise floors, never lower
+# them. Writer throughput prints as information only: FSST trains a
+# fresh table per chunk and that cost is a known encoder cost, not a
+# read-path regression signal.
+fullzip_scan_gbs = 0.4
+fullzip_row_kreads_s = 10.0
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

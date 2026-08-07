@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "open"
 harness = false
+
+[[bench]]
+name = "blob"
+harness = false

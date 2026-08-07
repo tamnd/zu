@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use zu_zu1::file::Zu1File;
-use zu_zu1::{graph, meta, segment};
+use zu_zu1::{fullzip, graph, meta, segment};
 
 fn write_seed(dir: &Path, name: &str, bytes: &[u8]) {
     fs::create_dir_all(dir).expect("corpus dir");
@@ -70,6 +70,7 @@ fn main() {
         min: 7,
         max: 40_000,
         crc: 0xC0FFEE,
+        structural: segment::Structural::MiniBlock,
         blocks: vec![3],
     };
     let mut meta_bytes = Vec::new();
@@ -78,6 +79,29 @@ fn main() {
     let mut free_seed = 64u64.to_le_bytes().to_vec();
     free_seed.extend_from_slice(&free_bytes);
     write_seed(&decode_dir, "free-list", &routed(5, &free_seed));
+
+    // A valid FullZip payload behind the claims prefix the target reads:
+    // value count then total value bytes, both u16.
+    let strings: Vec<Vec<u8>> = (0..1200u64)
+        .map(|i| format!("https://example.com/user/{}/posts?page={}", i * 37, i % 12).into_bytes())
+        .collect();
+    let string_refs: Vec<&[u8]> = strings.iter().map(|v| v.as_slice()).collect();
+    let mut fullzip_payload = Vec::new();
+    let value_bytes =
+        fullzip::encode_payload(&string_refs, &mut fullzip_payload).expect("fullzip payload");
+    let mut fullzip_seed = (strings.len() as u16).to_le_bytes().to_vec();
+    fullzip_seed.extend_from_slice(&(value_bytes as u16).to_le_bytes());
+    fullzip_seed.extend_from_slice(&fullzip_payload);
+    write_seed(&decode_dir, "fullzip-payload", &routed(6, &fullzip_seed));
+
+    // The roundtrip target parses u16-length-prefixed rows.
+    let roundtrip_dir = corpus.join("fullzip_roundtrip");
+    let mut roundtrip_seed = Vec::new();
+    for row in string_refs.iter().take(40) {
+        roundtrip_seed.extend_from_slice(&(row.len() as u16).to_le_bytes());
+        roundtrip_seed.extend_from_slice(row);
+    }
+    write_seed(&roundtrip_dir, "urls", &roundtrip_seed);
 
     // Encoded containers: one input per shape the cascade picks between.
     let shapes: &[(&str, Vec<u64>)] = &[

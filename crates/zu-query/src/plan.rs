@@ -49,6 +49,11 @@ pub enum LogicalPlan {
         /// True when the far node was already bound: the expand joins
         /// into it instead of introducing it.
         into: bool,
+        /// Set by the optimizer on closing expands whose estimated
+        /// probe count exceeds the rel's edge count: the executor
+        /// accumulates the edge set once and probes a hash table
+        /// instead of storage (docs/07, ASPJoin).
+        asp: bool,
         optional: Option<usize>,
     },
     /// `optional` ties a filter into its OPTIONAL MATCH group: inline
@@ -230,6 +235,7 @@ fn build_path(
             direction: rel.direction,
             range: rel.range,
             into,
+            asp: false,
             optional,
         };
         plan = prop_filters(plan, rel.slot, &rel.props, optional);
@@ -323,6 +329,7 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             direction,
             range,
             into,
+            asp,
             optional,
         } => {
             let hops = match range {
@@ -339,7 +346,13 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 RelDirection::Undirected => ("-", "-"),
             };
             let opt = if optional.is_some() { "Optional" } else { "" };
-            let kind = if *into { "ExpandInto" } else { "Expand" };
+            let kind = if *asp {
+                "AspJoin"
+            } else if *into {
+                "ExpandInto"
+            } else {
+                "Expand"
+            };
             let _ = writeln!(
                 out,
                 "{pad}{opt}{kind} ({}){open}[{}:{}{hops}]{close}({})",

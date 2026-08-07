@@ -14,7 +14,9 @@
 //! B1 is warm 1-hop expands at deg <= 100 (the G1 workload shape), p50
 //! in us. B2 is warm primary-key lookups, p50 in us. B4 is the 2-hop
 //! factorized count over the whole graph through the query engine, p50
-//! in ms. IS is the IS1-shaped profile read by original id, all eight
+//! in ms. Triangle is the unseeded directed triangle count over the
+//! whole graph, the shape the optimizer closes with AspJoin, p50 in
+//! ms. IS is the IS1-shaped profile read by original id, all eight
 //! properties through zu::query::run, gated at the G2 1 ms warm p50.
 //! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
 //! ORDER BY, and LIMIT, p50 in ms. Every phase crosschecks against a
@@ -323,6 +325,53 @@ fn run_two_hop(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) ->
     p50
 }
 
+/// Triangle: the unseeded directed triangle count over the whole
+/// graph, the shape the optimizer upgrades to AspJoin because closing
+/// every 2-path against storage would cost more probes than the graph
+/// has edges. The reference recomputes the count from the raw edge
+/// list, one adjacency walk with binary search on the sorted dense
+/// pairs, so the number cannot come from a join that drops or invents
+/// closures.
+fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
+    let mut adj = vec![Vec::new(); node_count as usize];
+    for &(s, d) in edges {
+        adj[s as usize].push(d);
+    }
+    let mut expected = 0i64;
+    for &(a, b) in edges {
+        for &c in &adj[b as usize] {
+            if edges.binary_search(&(a, c)).is_ok() {
+                expected += 1;
+            }
+        }
+    }
+    let mut db = Zu1File::open(path).expect("open");
+    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+                  RETURN count(*) AS triangles";
+    let runs = 15usize;
+    for _ in 0..3 {
+        zu::query::run(source, &mut db, &[]).expect("warmup run");
+    }
+    let mut lat = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t = Instant::now();
+        let r = zu::query::run(source, &mut db, &[]).expect("triangle count");
+        lat.push(t.elapsed());
+        assert_eq!(
+            r.rows,
+            [[Value::Int(expected)]],
+            "triangle count disagrees with the edge list reference"
+        );
+    }
+    lat.sort_unstable();
+    let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    println!(
+        "sf1 triangle count: {expected} triangles, p50 {p50:.3} ms, max {:.3} ms over {runs} runs",
+        lat[runs - 1].as_secs_f64() * 1e3
+    );
+    p50
+}
+
 /// IS: the IS1-shaped profile read, all eight person properties by
 /// original id through zu::query::run, parse to result. Every measured
 /// run is asserted field by field against the raw props file, so the
@@ -474,6 +523,7 @@ fn main() {
     let hop_p50 = run_one_hop(&path, &edges, node_count);
     let key_p50 = run_key_lookups(&path, &by_row);
     let two_hop_p50 = run_two_hop(&path, &edges, node_count);
+    let triangle_p50 = run_triangle_count(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
 
@@ -494,6 +544,12 @@ fn main() {
         && two_hop_p50 > ceiling
     {
         println!("GATE FAIL B4 2-hop: p50 {two_hop_p50:.3} ms > ceiling {ceiling}");
+        failed = true;
+    }
+    if let Some(ceiling) = budget("ldbc_triangle_p50_ms")
+        && triangle_p50 > ceiling
+    {
+        println!("GATE FAIL triangle count: p50 {triangle_p50:.3} ms > ceiling {ceiling}");
         failed = true;
     }
     if let Some(ceiling) = budget("ldbc_is_p50_ms")

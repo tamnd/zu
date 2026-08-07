@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 tempfile = "3"
 zu-encoding = { path = "../crates/zu-encoding", features = ["zstd"] }
+zu-query = { path = "../crates/zu-query" }
 zu-zu1 = { path = "../crates/zu-zu1" }
 
 [[bin]]
@@ -100,6 +101,13 @@ bench = false
 [[bin]]
 name = "fullzip_roundtrip"
 path = "fuzz_targets/fullzip_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zuql_parse"
+path = "fuzz_targets/zuql_parse.rs"
 test = false
 doc = false
 bench = false

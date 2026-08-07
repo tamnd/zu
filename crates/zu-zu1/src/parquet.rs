@@ -42,7 +42,9 @@ fn column_to_u32(name: &str, array: &dyn Array, out: &mut Vec<u32>) -> Result<()
             for i in 0..typed.len() {
                 let v = i64::from(typed.value(i));
                 let v = u32::try_from(v).map_err(|_| {
-                    invalid(format!("parquet column '{name}' value {v} is outside the u32 row domain"))
+                    invalid(format!(
+                        "parquet column '{name}' value {v} is outside the u32 row domain"
+                    ))
                 })?;
                 out.push(v);
             }
@@ -60,7 +62,9 @@ fn column_to_u32(name: &str, array: &dyn Array, out: &mut Vec<u32>) -> Result<()
             for i in 0..typed.len() {
                 let v = typed.value(i);
                 let v = u32::try_from(v).map_err(|_| {
-                    invalid(format!("parquet column '{name}' value {v} is outside the u32 row domain"))
+                    invalid(format!(
+                        "parquet column '{name}' value {v} is outside the u32 row domain"
+                    ))
                 })?;
                 out.push(v);
             }
@@ -96,7 +100,9 @@ pub fn read_edge_parquet(path: &Path) -> Result<Vec<(u32, u32)>> {
     }
     let (src_ix, dst_ix) = (find("src", 0), find("dst", 1));
     if src_ix == dst_ix {
-        return Err(invalid("parquet src and dst resolve to the same column".into()));
+        return Err(invalid(
+            "parquet src and dst resolve to the same column".into(),
+        ));
     }
     let reader = builder
         .with_batch_size(BATCH_ROWS)
@@ -158,7 +164,9 @@ mod tests {
     fn roundtrip_matches_the_input() {
         let dir = temp();
         let path = dir.path().join("edges.parquet");
-        let edges: Vec<(u32, u32)> = (0..300_000u32).map(|i| (i / 7, i.wrapping_mul(2_654_435_761) % 999)).collect();
+        let edges: Vec<(u32, u32)> = (0..300_000u32)
+            .map(|i| (i / 7, i.wrapping_mul(2_654_435_761) % 999))
+            .collect();
         write_edge_parquet(&path, &edges).expect("write");
         let back = read_edge_parquet(&path).expect("read");
         assert_eq!(back, edges);
@@ -186,7 +194,10 @@ mod tests {
         .expect("batch");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
-        assert_eq!(read_edge_parquet(&path).expect("read"), vec![(1, 10), (2, 20)]);
+        assert_eq!(
+            read_edge_parquet(&path).expect("read"),
+            vec![(1, 10), (2, 20)]
+        );
     }
 
     #[test]
@@ -211,7 +222,10 @@ mod tests {
         writer.close().expect("close");
         let err = read_edge_parquet(&path).expect_err("out of range");
         let text = err.to_string();
-        assert!(text.contains("src") && text.contains("u32"), "unexpected error: {text}");
+        assert!(
+            text.contains("src") && text.contains("u32"),
+            "unexpected error: {text}"
+        );
     }
 
     #[test]
@@ -242,15 +256,25 @@ mod tests {
     fn one_column_file_is_refused() {
         let dir = temp();
         let path = dir.path().join("one.parquet");
-        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("src", DataType::UInt32, false)]));
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "src",
+            DataType::UInt32,
+            false,
+        )]));
         let file = std::fs::File::create(&path).expect("create");
         let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("writer");
-        let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(UInt32Array::from(vec![1u32]))])
-            .expect("batch");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(UInt32Array::from(vec![1u32]))],
+        )
+        .expect("batch");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
         let err = read_edge_parquet(&path).expect_err("one column");
-        assert!(err.to_string().contains("needs src and dst"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("needs src and dst"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

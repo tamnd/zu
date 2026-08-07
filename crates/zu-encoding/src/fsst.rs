@@ -26,7 +26,10 @@ use zu_common::{Result, ZuError};
 const MAX_SYMBOLS: usize = 255;
 const MAX_SYMBOL_LEN: usize = 8;
 const ESCAPE: u8 = 255;
-const TRAIN_ROUNDS: usize = 5;
+// Symbols double in length once per round, so eight-byte symbols need
+// rounds to grow single bytes into pairs, fours, then eights, plus a
+// couple of rounds for the survivors to settle against each other.
+const TRAIN_ROUNDS: usize = 7;
 const SAMPLE_TARGET: usize = 64 << 10;
 
 /// Longest-match lookup at `pos` against the table; returns the code and
@@ -178,11 +181,20 @@ pub fn decode(bytes: &[u8], max_bytes: usize, out: &mut Vec<u8>) -> Result<()> {
     let mut n = 0;
     let mut i = 0;
     let mut bad: Option<&str> = None;
+    // The write window doubles as the overshoot check: the slack sizing
+    // makes get_mut fail exactly when n has passed the claimed length,
+    // so the hot path is one compare, one 8-byte copy, one add. n can
+    // finish up to 7 bytes past the claim through the slack; the final
+    // equality check catches that with the rest.
     while i < payload.len() {
         let code = payload[i] as usize;
         i += 1;
         if code < count {
-            dst[n..n + MAX_SYMBOL_LEN].copy_from_slice(&table[code]);
+            let Some(w) = dst.get_mut(n..n + MAX_SYMBOL_LEN) else {
+                bad = Some("decoded past the claimed length");
+                break;
+            };
+            w.copy_from_slice(&table[code]);
             n += tlen[code] as usize;
         } else if code == ESCAPE as usize {
             let Some(&literal) = payload.get(i) else {
@@ -190,19 +202,19 @@ pub fn decode(bytes: &[u8], max_bytes: usize, out: &mut Vec<u8>) -> Result<()> {
                 break;
             };
             i += 1;
-            dst[n] = literal;
+            let Some(slot) = dst.get_mut(n) else {
+                bad = Some("decoded past the claimed length");
+                break;
+            };
+            *slot = literal;
             n += 1;
         } else {
             bad = Some("code past the symbol count");
             break;
         }
-        if n > raw_len {
-            bad = Some("decoded past the claimed length");
-            break;
-        }
     }
     if bad.is_none() && n != raw_len {
-        bad = Some("decoded length below the claim");
+        bad = Some("decoded length disagrees with the claim");
     }
     if let Some(detail) = bad {
         out.truncate(base);

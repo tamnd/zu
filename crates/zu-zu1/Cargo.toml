@@ -13,6 +13,12 @@ authors.workspace = true
 zu-common.workspace = true
 zu-encoding.workspace = true
 crc32c.workspace = true
+parquet = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+
+[features]
+arrow = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -324,6 +324,18 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             "ExpandInto {}",
             rel_text(var(*from), var(*to), *direction, rels, schema)
         ),
+        OpDesc::AspJoin {
+            from,
+            to,
+            direction,
+            rels,
+            retain,
+            ..
+        } => format!(
+            "AspJoin{} {}",
+            if retain.is_some() { " (retain)" } else { "" },
+            rel_text(var(*from), var(*to), *direction, rels, schema)
+        ),
         OpDesc::Filter { expr, .. } => format!("Filter {}", expr_text(expr, query)),
         OpDesc::Unwind { expr, chunk } => format!(
             "Unwind {} AS {}",
@@ -511,6 +523,24 @@ enum OpDesc {
         direction: RelDirection,
         rels: Vec<RelStep>,
         chunk: usize,
+    },
+    /// The ASP hash join (docs/07): a closing expand marked by the
+    /// optimizer because its probe count exceeds the rel's edge count.
+    /// The first pull accumulates each rel step's edge set into a hash
+    /// table with one neighbors sweep, and every probe after that is a
+    /// hash lookup instead of a storage read.
+    AspJoin {
+        from: usize,
+        to: usize,
+        direction: RelDirection,
+        rels: Vec<RelStep>,
+        chunk: usize,
+        /// `Some(c)` is the fused semijoin: nothing reads the rel slot
+        /// and nothing reads chunk `c` flat, so the probe retains the
+        /// unflat neighbor vector of `c` in place per configuration
+        /// and the flatten below it is gone. `None` probes one flat
+        /// configuration at a time like `ExpandInto`.
+        retain: Option<usize>,
     },
     /// `compact` names the one unflat chunk this filter may shrink in
     /// place; with `None` every referenced chunk is flat and the
@@ -816,6 +846,7 @@ fn compile_match_op(
             direction,
             range,
             into,
+            asp,
             ..
         } => {
             let rels = rel_steps(*rel, query, schema)?;
@@ -858,13 +889,26 @@ fn compile_match_op(
                 b.ensure_flat(to_chunk);
                 // The probe result is a single edge, born flat.
                 let chunk = b.new_chunk(vec![*rel], true);
-                b.descs.push(OpDesc::ExpandInto {
-                    from: *from,
-                    to: *to,
-                    direction: *direction,
-                    rels,
-                    chunk,
-                });
+                if *asp {
+                    // The retain fusion is decided by the stage-level
+                    // rewrite once every downstream reference is known.
+                    b.descs.push(OpDesc::AspJoin {
+                        from: *from,
+                        to: *to,
+                        direction: *direction,
+                        rels,
+                        chunk,
+                        retain: None,
+                    });
+                } else {
+                    b.descs.push(OpDesc::ExpandInto {
+                        from: *from,
+                        to: *to,
+                        direction: *direction,
+                        rels,
+                        chunk,
+                    });
+                }
             } else {
                 let chunk = b.new_chunk(vec![*to, *rel], false);
                 b.descs.push(OpDesc::Expand {
@@ -965,6 +1009,38 @@ fn compile_optional_group(
     Ok(end)
 }
 
+/// Slots one operator reads.
+fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
+    match desc {
+        OpDesc::IndexLookup { key, .. } => expr_slots(key, out),
+        OpDesc::Expand { from, .. } | OpDesc::VarExpand { from, .. } => {
+            out.insert(*from);
+        }
+        OpDesc::ExpandInto { from, to, .. } | OpDesc::AspJoin { from, to, .. } => {
+            out.insert(*from);
+            out.insert(*to);
+        }
+        OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => expr_slots(expr, out),
+        OpDesc::Source
+        | OpDesc::RowSource { .. }
+        | OpDesc::Scan { .. }
+        | OpDesc::Flatten { .. }
+        | OpDesc::OptionalBegin
+        | OpDesc::OptionalEnd { .. } => {}
+    }
+}
+
+/// Slots the sink's post operators read.
+fn post_refs(post: &[PostOp], out: &mut BTreeSet<usize>) {
+    for op in post {
+        match op {
+            PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => expr_slots(e, out),
+            PostOp::Sort(keys) => keys.iter().for_each(|(e, _)| expr_slots(e, out)),
+            PostOp::Distinct => {}
+        }
+    }
+}
+
 /// Dead-column and count-to-degree rewrites over a finished stage.
 ///
 /// First, any fixed-length `Expand` whose rel slot nothing in the
@@ -1004,36 +1080,12 @@ fn rewrite_count_expand(
     // stay empty.
     let mut full_refs = BTreeSet::new();
     for desc in &b.descs {
-        match desc {
-            OpDesc::IndexLookup { key, .. } => expr_slots(key, &mut full_refs),
-            OpDesc::Expand { from, .. } | OpDesc::VarExpand { from, .. } => {
-                full_refs.insert(*from);
-            }
-            OpDesc::ExpandInto { from, to, .. } => {
-                full_refs.insert(*from);
-                full_refs.insert(*to);
-            }
-            OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => {
-                expr_slots(expr, &mut full_refs)
-            }
-            OpDesc::Source
-            | OpDesc::RowSource { .. }
-            | OpDesc::Scan { .. }
-            | OpDesc::Flatten { .. }
-            | OpDesc::OptionalBegin
-            | OpDesc::OptionalEnd { .. } => {}
-        }
+        desc_refs(desc, &mut full_refs);
     }
     for item in items {
         expr_slots(&item.expr, &mut full_refs);
     }
-    for op in post {
-        match op {
-            PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => expr_slots(e, &mut full_refs),
-            PostOp::Sort(keys) => keys.iter().for_each(|(e, _)| expr_slots(e, &mut full_refs)),
-            PostOp::Distinct => {}
-        }
-    }
+    post_refs(post, &mut full_refs);
     full_refs.extend(extra.iter().copied());
     for desc in &mut b.descs {
         if let OpDesc::Expand {
@@ -1042,6 +1094,65 @@ fn rewrite_count_expand(
             && !full_refs.contains(&b.chunk_slots[*chunk][1])
         {
             *emit_rels = false;
+        }
+    }
+    // The AspJoin retain fusion, the semijoin half of the ASP triple:
+    // when nothing reads the join's rel slot and nothing but the join
+    // reads the probed chunk, the flatten directly below the join
+    // drops and the probe retains the whole neighbor vector in place,
+    // so the closing edge check never enumerates configurations. The
+    // chunk goes back to unflat and the sink's multiplicity product
+    // counts the survivors. Skipped in flat mode, whose whole point is
+    // forcing tuple-at-a-time execution as the differential oracle.
+    while !b.flat {
+        let mut fused = false;
+        for t in 0..b.descs.len() {
+            let OpDesc::AspJoin {
+                from,
+                to,
+                chunk,
+                retain: None,
+                ..
+            } = b.descs[t]
+            else {
+                continue;
+            };
+            let f = match (t > 0).then(|| &b.descs[t - 1]) {
+                Some(&OpDesc::Flatten { chunk: f }) => f,
+                _ => continue,
+            };
+            if b.slot_loc.get(&to).map(|&(c, _)| c) != Some(f)
+                || b.slot_loc.get(&from).map(|&(c, _)| c) == Some(f)
+                || full_refs.contains(&b.chunk_slots[chunk][0])
+            {
+                continue;
+            }
+            // References excluding the join itself: its own flat read
+            // of `to` is exactly what the fusion removes.
+            let mut others = BTreeSet::new();
+            for (ix, desc) in b.descs.iter().enumerate() {
+                if ix != t {
+                    desc_refs(desc, &mut others);
+                }
+            }
+            for item in items {
+                expr_slots(&item.expr, &mut others);
+            }
+            post_refs(post, &mut others);
+            others.extend(extra.iter().copied());
+            if b.chunk_slots[f].iter().any(|s| others.contains(s)) {
+                continue;
+            }
+            if let OpDesc::AspJoin { retain, .. } = &mut b.descs[t] {
+                *retain = Some(f);
+            }
+            b.descs.remove(t - 1);
+            b.chunk_flat[f] = false;
+            fused = true;
+            break;
+        }
+        if !fused {
+            break;
         }
     }
     if !aggregate {
@@ -1065,39 +1176,14 @@ fn rewrite_count_expand(
     // Every slot something other than this expand reads.
     let mut refs = BTreeSet::new();
     for (ix, desc) in b.descs.iter().enumerate() {
-        if ix == target {
-            continue;
-        }
-        match desc {
-            OpDesc::IndexLookup { key, .. } => expr_slots(key, &mut refs),
-            OpDesc::Expand { from, .. } | OpDesc::VarExpand { from, .. } => {
-                refs.insert(*from);
-            }
-            OpDesc::ExpandInto { from, to, .. } => {
-                refs.insert(*from);
-                refs.insert(*to);
-            }
-            OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => {
-                expr_slots(expr, &mut refs)
-            }
-            OpDesc::Source
-            | OpDesc::RowSource { .. }
-            | OpDesc::Scan { .. }
-            | OpDesc::Flatten { .. }
-            | OpDesc::OptionalBegin
-            | OpDesc::OptionalEnd { .. } => {}
+        if ix != target {
+            desc_refs(desc, &mut refs);
         }
     }
     for item in items.iter().filter(|it| !it.aggregate) {
         expr_slots(&item.expr, &mut refs);
     }
-    for op in post {
-        match op {
-            PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => expr_slots(e, &mut refs),
-            PostOp::Sort(keys) => keys.iter().for_each(|(e, _)| expr_slots(e, &mut refs)),
-            PostOp::Distinct => {}
-        }
-    }
+    post_refs(post, &mut refs);
     refs.extend(extra.iter().copied());
     // Aggregates whose argument touches the expand's chunk: at most
     // one, and it must be a bare non-distinct count of one of the
@@ -1365,6 +1451,29 @@ struct OpStats {
     nanos: u64,
 }
 
+/// Hasher for the accumulated edge sets of an ASP join. SipHash costs
+/// more than the whole probe on `(u64, u64)` keys, so edges hash with
+/// one multiply-xor round per word; row offsets are not adversarial
+/// input.
+#[derive(Default)]
+struct EdgeHasher(u64);
+
+impl std::hash::Hasher for EdgeHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("edge keys hash as u64 words");
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0 ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+type EdgeSet = std::collections::HashSet<(u64, u64), std::hash::BuildHasherDefault<EdgeHasher>>;
+
 struct StageCtx<'a> {
     graph: &'a mut dyn Graph,
     params: &'a [Value],
@@ -1377,6 +1486,11 @@ struct StageCtx<'a> {
     /// during materialization, the row snapshot during post filters.
     overlay: BTreeMap<usize, Value>,
     scratch: Vec<u64>,
+    /// The accumulated edge sets of each ASP join, keyed by operator
+    /// index and built on the join's first pull, one set per rel step
+    /// in storage orientation. Deliberately outside `states` so an
+    /// optional group's rearm never throws the accumulate away.
+    edge_sets: BTreeMap<usize, Vec<EdgeSet>>,
     /// One entry per operator when profiling, empty otherwise.
     stats: Vec<OpStats>,
 }
@@ -1441,12 +1555,16 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
         OpDesc::Filter {
             compact: Some(c), ..
         } => ctx.chunks[*c].size as u64,
+        OpDesc::AspJoin {
+            retain: Some(f), ..
+        } => ctx.chunks[*f].size as u64,
         OpDesc::RowSource { chunk }
         | OpDesc::Scan { chunk, .. }
         | OpDesc::IndexLookup { chunk, .. }
         | OpDesc::Expand { chunk, .. }
         | OpDesc::VarExpand { chunk, .. }
         | OpDesc::ExpandInto { chunk, .. }
+        | OpDesc::AspJoin { chunk, .. }
         | OpDesc::Unwind { chunk, .. } => ctx.chunks[*chunk].size as u64,
     }
 }
@@ -1536,6 +1654,45 @@ fn enumerate_trails(
         path.pop();
     }
     Ok(())
+}
+
+/// One probe against the accumulated edge sets of an ASP join,
+/// mirroring the direction and endpoint table checks of the storage
+/// probe in `ExpandInto`.
+fn asp_hit(
+    sets: &[EdgeSet],
+    rels: &[RelStep],
+    direction: RelDirection,
+    ft: u32,
+    fo: u64,
+    tt: u32,
+    to_off: u64,
+) -> Option<Value> {
+    for (step, set) in rels.iter().zip(sets) {
+        if matches!(direction, RelDirection::Out | RelDirection::Undirected)
+            && ft == step.from_table
+            && tt == step.to_table
+            && set.contains(&(fo, to_off))
+        {
+            return Some(Value::Rel {
+                table: step.id,
+                src: fo,
+                dst: to_off,
+            });
+        }
+        if matches!(direction, RelDirection::In | RelDirection::Undirected)
+            && ft == step.to_table
+            && tt == step.from_table
+            && set.contains(&(to_off, fo))
+        {
+            return Some(Value::Rel {
+                table: step.id,
+                src: to_off,
+                dst: fo,
+            });
+        }
+    }
+    None
 }
 
 /// The pull entry point: a plain `step` normally, a timed and counted
@@ -1938,6 +2095,106 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             c.cur = Some(0);
             return Ok(true);
         },
+        OpDesc::AspJoin {
+            from,
+            to,
+            direction,
+            rels,
+            chunk,
+            retain,
+        } => {
+            // Accumulate on the first pull: one neighbors sweep per
+            // rel step in storage orientation, so every probe after
+            // this is a hash lookup instead of a storage read.
+            if !ctx.edge_sets.contains_key(&i) {
+                let mut sets = Vec::with_capacity(rels.len());
+                for step in rels {
+                    let mut set = EdgeSet::default();
+                    let count = *ctx.counts.get(&step.from_table).unwrap_or(&0);
+                    let StageCtx { graph, scratch, .. } = ctx;
+                    for src in 0..count {
+                        graph.neighbors(step.id, src, false, scratch)?;
+                        for &dst in scratch.iter() {
+                            set.insert((src, dst));
+                        }
+                    }
+                    sets.push(set);
+                }
+                ctx.edge_sets.insert(i, sets);
+            }
+            match retain {
+                // Flat probe, one configuration at a time like
+                // `ExpandInto`.
+                None => loop {
+                    if !next(descs, ctx, i - 1)? {
+                        return Ok(false);
+                    }
+                    let fv = value_of(ctx, *from)?;
+                    let tv = value_of(ctx, *to)?;
+                    if matches!(fv, Value::Null) || matches!(tv, Value::Null) {
+                        continue;
+                    }
+                    let (ft, fo) = node_value(fv, "asp join")?;
+                    let (tt, to_off) = node_value(tv, "asp join")?;
+                    let sets = ctx.edge_sets.get(&i).expect("accumulated above");
+                    let Some(rel_val) = asp_hit(sets, rels, *direction, ft, fo, tt, to_off) else {
+                        continue;
+                    };
+                    let c = &mut ctx.chunks[*chunk];
+                    c.size = 1;
+                    c.cols[0] = vec![rel_val];
+                    c.cur = Some(0);
+                    return Ok(true);
+                },
+                // The fused semijoin: probe the whole unflat neighbor
+                // vector and retain the survivors in place.
+                Some(f) => loop {
+                    if !next(descs, ctx, i - 1)? {
+                        return Ok(false);
+                    }
+                    let fv = value_of(ctx, *from)?;
+                    if matches!(fv, Value::Null) {
+                        continue;
+                    }
+                    let (ft, fo) = node_value(fv, "asp join")?;
+                    let col = ctx
+                        .slot_loc
+                        .get(to)
+                        .map(|&(_, col)| col)
+                        .expect("join into a bound slot");
+                    let sets = ctx.edge_sets.get(&i).expect("accumulated above");
+                    let source = &ctx.chunks[*f];
+                    let mut keep = Vec::with_capacity(source.size);
+                    for pos in 0..source.size {
+                        keep.push(match &source.cols[col][pos] {
+                            Value::Null => false,
+                            &Value::Node { table, offset } => {
+                                asp_hit(sets, rels, *direction, ft, fo, table, offset).is_some()
+                            }
+                            other => {
+                                return Err(invalid(format!(
+                                    "asp join expects a node, got {other:?}"
+                                )));
+                            }
+                        });
+                    }
+                    if !keep.iter().any(|k| *k) {
+                        continue;
+                    }
+                    ctx.chunks[*f].retain(&keep);
+                    // The rel column is dead by the fusion's own
+                    // precondition; the chunk still pins one null so
+                    // downstream sees a nonempty flat result.
+                    let c = &mut ctx.chunks[*chunk];
+                    if c.cols[0].is_empty() {
+                        c.cols[0].push(Value::Null);
+                    }
+                    c.size = 1;
+                    c.cur = Some(0);
+                    return Ok(true);
+                },
+            }
+        }
         OpDesc::Filter { expr, compact } => match compact {
             None => loop {
                 if !next(descs, ctx, i - 1)? {
@@ -2781,6 +3038,7 @@ fn run_stages(
             rows,
             overlay: BTreeMap::new(),
             scratch: Vec::new(),
+            edge_sets: BTreeMap::new(),
             stats: if profile.is_some() {
                 vec![OpStats::default(); stage.descs.len()]
             } else {
@@ -3076,6 +3334,55 @@ mod tests {
             &[],
         );
         assert_eq!(int_rows(&r), [[0, 1, 2]]);
+    }
+
+    #[test]
+    fn asp_join_retains_the_neighbor_vector() {
+        // Unseeded triangle count: the closing expand upgrades to the
+        // ASP hash join, and with nothing reading c or the closing rel
+        // the probe retains c's neighbor vector in place, no flatten.
+        let (r, p) = profiled(
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+             RETURN count(*) AS triangles",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[1]]);
+        let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("AspJoin (retain)")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn asp_join_probes_flat_when_the_far_node_is_read() {
+        // Same close, but the projection reads c, so the retain fusion
+        // stays off and the join probes one configuration at a time.
+        let (r, p) = profiled(
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+             RETURN a.id AS a, b.id AS b, c.id AS c",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0, 1, 2]]);
+        let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("AspJoin (") && !n.contains("retain")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn asp_join_closes_undirected_patterns() {
+        // The one undirected triangle {0, 1, 2} counts once per
+        // ordering of its three corners.
+        let r = run(
+            "MATCH (a:Person)-[:KNOWS]-(b)-[:KNOWS]-(c), (a)-[:KNOWS]-(c) \
+             RETURN count(*) AS walks",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[6]]);
     }
 
     #[test]
@@ -3573,6 +3880,16 @@ mod tests {
             (
                 "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
                  RETURN a.id AS a, b.id AS b, c.id AS c",
+                &[],
+            ),
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                 RETURN count(*) AS triangles",
+                &[],
+            ),
+            (
+                "MATCH (a:Person)-[:KNOWS]-(b)-[:KNOWS]-(c), (a)-[:KNOWS]-(c) \
+                 RETURN count(*) AS walks",
                 &[],
             ),
             (

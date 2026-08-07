@@ -33,9 +33,178 @@ use crate::plan::LogicalPlan;
 /// Components larger than this keep their written join order.
 const MAX_DP_RELS: usize = 12;
 
-/// Rewrites a built plan with join ordering and filter placement.
+/// Rewrites a built plan with join ordering and filter placement,
+/// then marks closing expands as ASP hash joins where the estimates
+/// justify the accumulate sweep.
 pub fn optimize(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<LogicalPlan> {
-    rewrite(plan, query, schema)
+    let plan = rewrite(plan, query, schema)?;
+    Ok(mark_asp(plan, query, schema).0)
+}
+
+/// Bottom-up estimated-cardinality walk that turns closing expands
+/// into ASP hash joins (docs/07). A closing expand probes storage once
+/// per input row while the hash join pays one accumulate sweep over
+/// the rel's edges before probes get cheap, so the flag is set exactly
+/// when the estimated input rows exceed the closing rel's edge count.
+/// Optional groups keep their written probe semantics and var-length
+/// closes do not execute yet, so both stay unmarked. Estimates reuse
+/// the DP helpers; an aggregation resets the running estimate to one
+/// row because grouped cardinality is unknown until the column catalog
+/// carries statistics, which only understates and keeps ExpandInto.
+fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalPlan, f64) {
+    match plan {
+        LogicalPlan::Empty => (LogicalPlan::Empty, 1.0),
+        LogicalPlan::ScanNodes {
+            input,
+            slot,
+            optional,
+        } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            let est = est * slot_card(slot, query, schema);
+            (
+                LogicalPlan::ScanNodes {
+                    input: Box::new(input),
+                    slot,
+                    optional,
+                },
+                est,
+            )
+        }
+        LogicalPlan::Expand {
+            input,
+            rel,
+            from,
+            to,
+            direction,
+            range,
+            into,
+            asp: _,
+            optional,
+        } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            let e = ExpandOp {
+                rel,
+                from,
+                to,
+                direction,
+                range,
+                into,
+            };
+            let (asp, est) = if into {
+                let edges: f64 = query.variables[rel]
+                    .rel_tables
+                    .iter()
+                    .filter_map(|id| schema.rel_by_id(*id))
+                    .map(|rd| rd.edge_count as f64)
+                    .sum();
+                let asp = optional.is_none() && range.is_none() && est > edges.max(1.0);
+                (asp, est * into_prob(&e, query, schema))
+            } else {
+                (false, est * degree(&e, from, query, schema))
+            };
+            (
+                LogicalPlan::Expand {
+                    input: Box::new(input),
+                    rel,
+                    from,
+                    to,
+                    direction,
+                    range,
+                    into,
+                    asp,
+                    optional,
+                },
+                est.max(1e-6),
+            )
+        }
+        LogicalPlan::Filter {
+            input,
+            expr,
+            optional,
+        } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            let est = (est * selectivity(&expr, query, schema)).max(1e-6);
+            (
+                LogicalPlan::Filter {
+                    input: Box::new(input),
+                    expr,
+                    optional,
+                },
+                est,
+            )
+        }
+        LogicalPlan::Unwind { input, expr, slot } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            (
+                LogicalPlan::Unwind {
+                    input: Box::new(input),
+                    expr,
+                    slot,
+                },
+                est * 10.0,
+            )
+        }
+        LogicalPlan::Project { input, items } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            (
+                LogicalPlan::Project {
+                    input: Box::new(input),
+                    items,
+                },
+                est,
+            )
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            let (input, _) = mark_asp(*input, query, schema);
+            (
+                LogicalPlan::Aggregate {
+                    input: Box::new(input),
+                    keys,
+                    aggs,
+                },
+                1.0,
+            )
+        }
+        LogicalPlan::Distinct { input } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            (
+                LogicalPlan::Distinct {
+                    input: Box::new(input),
+                },
+                est,
+            )
+        }
+        LogicalPlan::Sort { input, keys } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            (
+                LogicalPlan::Sort {
+                    input: Box::new(input),
+                    keys,
+                },
+                est,
+            )
+        }
+        LogicalPlan::Skip { input, expr } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            (
+                LogicalPlan::Skip {
+                    input: Box::new(input),
+                    expr,
+                },
+                est,
+            )
+        }
+        LogicalPlan::Limit { input, expr } => {
+            let (input, est) = mark_asp(*input, query, schema);
+            (
+                LogicalPlan::Limit {
+                    input: Box::new(input),
+                    expr,
+                },
+                est,
+            )
+        }
+    }
 }
 
 fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<LogicalPlan> {
@@ -75,6 +244,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             direction,
             range,
             into,
+            asp,
             optional,
         } => Ok(LogicalPlan::Expand {
             input: Box::new(rewrite(*input, query, schema)?),
@@ -84,6 +254,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             direction,
             range,
             into,
+            asp,
             optional,
         }),
         LogicalPlan::Unwind { input, expr, slot } => Ok(LogicalPlan::Unwind {
@@ -185,6 +356,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
                 direction,
                 range,
                 into,
+                asp: _,
                 optional: None,
             } => {
                 ops.push(RunOp::Expand(ExpandOp {
@@ -283,6 +455,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
                         direction,
                         range: e.range,
                         into: *into,
+                        asp: false,
                         optional: None,
                     }
                 }
@@ -322,6 +495,7 @@ fn rebuild(ops: Vec<RunOp>, below: LogicalPlan) -> LogicalPlan {
                 direction: e.direction,
                 range: e.range,
                 into: e.into,
+                asp: false,
                 optional: None,
             },
             RunOp::Filter(expr) => LogicalPlan::Filter {
@@ -863,6 +1037,19 @@ mod tests {
         );
         assert_eq!(text.matches("ScanNodes").count(), 1, "got:\n{text}");
         assert_eq!(text.matches("ExpandInto").count(), 1, "got:\n{text}");
+    }
+
+    #[test]
+    fn unseeded_triangles_upgrade_to_asp_join() {
+        // No seed, so the probe side is every 2-path in the graph,
+        // far more rows than the 180 K edges one accumulate sweep
+        // reads: the closing expand becomes the ASP hash join.
+        let text = optimized(
+            "MATCH (a:Person)-[r1:KNOWS]->(b)-[r2:KNOWS]->(c), (a)-[r3:KNOWS]->(c) \
+             RETURN a.id AS id",
+        );
+        assert_eq!(text.matches("AspJoin").count(), 1, "got:\n{text}");
+        assert_eq!(text.matches("ExpandInto").count(), 0, "got:\n{text}");
     }
 
     #[test]

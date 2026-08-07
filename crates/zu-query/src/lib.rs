@@ -5,8 +5,9 @@
 //!
 //! What exists today: the zuQL frontend (`lexer`, `ast`, `parser`,
 //! `binder`) for the MATCH, WHERE, UNWIND, WITH, RETURN core per
-//! `docs/grammar.ebnf`, the CSR adjacency in `csr`, and the
-//! table-function kernels in `kernels`.
+//! `docs/grammar.ebnf`, the logical plan and EXPLAIN rendering in
+//! `plan`, the CSR adjacency in `csr`, and the table-function kernels
+//! in `kernels`.
 
 pub mod ast;
 pub mod binder;
@@ -14,3 +15,4 @@ pub mod csr;
 pub mod kernels;
 pub mod lexer;
 pub mod parser;
+pub mod plan;

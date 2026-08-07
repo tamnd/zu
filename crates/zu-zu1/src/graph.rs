@@ -85,7 +85,7 @@ pub struct Directory {
 }
 
 impl Directory {
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&DIRECTORY_VERSION.to_le_bytes());
         out.extend_from_slice(&self.node_count.to_le_bytes());
@@ -350,7 +350,7 @@ pub fn densify_keyed(keys: &[u64], edges: &[(u64, u64)]) -> Result<Densified> {
 }
 
 /// Builds one direction's CSR groups from edges sorted by `(key, other)`.
-fn build_direction(
+pub(crate) fn build_direction(
     db: &mut Zu1File,
     node_count: u64,
     edges: &[(u32, u32)],
@@ -396,7 +396,7 @@ fn build_direction(
 /// Frees every block of the directory chain at `root` plus all four
 /// segments per group it lists. The blocks recycle at the next
 /// checkpoint per the shadow-publishing rules.
-fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+pub(crate) fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
     let directory = Directory::decode(&meta::read_chain(db, root)?)?;
     if let Some(keys) = &directory.keys {
         for seg in [&keys.keys, &keys.rows] {

@@ -97,6 +97,8 @@ fn measure(name: &str, encoded: &[u8], count: usize, decode: DecodeFn) -> f64 {
 
 type EncodeFn = fn(&[u64], &mut Vec<u8>) -> usize;
 type DecodeFn = fn(&[u8], usize, &mut Vec<u64>) -> zu_common::Result<()>;
+type FloatEncodeFn = fn(&[f64], &mut Vec<u8>) -> usize;
+type FloatDecodeFn = fn(&[u8], usize, &mut Vec<f64>) -> zu_common::Result<()>;
 
 fn main() {
     let data = std::env::var("ZU_DATA")
@@ -213,6 +215,84 @@ fn main() {
     {
         println!("GATE FAIL fsst: {gbps:.2} GB/s < floor {floor} GB/s");
         failed = true;
+    }
+
+    // The float encodings measure on real doubles: the latitude and
+    // longitude columns of the Gowalla check-ins (SNAP), 12.8 M values
+    // with seven decimal digits, which is ALP's shape. ALP_RD gets the
+    // same coordinates in radians: an irrational transform fills the
+    // mantissas, which is exactly the fallback's shape. Without ZU_DATA
+    // both derive from the synthetic ids at the same scale.
+    let floats: Vec<f64> = std::env::var("ZU_DATA")
+        .ok()
+        .and_then(|d| {
+            let text =
+                std::fs::read_to_string(format!("{d}/loc-gowalla_totalCheckins.txt")).ok()?;
+            let mut lat = Vec::new();
+            let mut lon = Vec::new();
+            for line in text.lines() {
+                let mut parts = line.split_whitespace();
+                let (_, _, la, lo) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+                lat.push(la.parse().ok()?);
+                lon.push(lo.parse().ok()?);
+            }
+            lat.extend_from_slice(&lon);
+            println!(
+                "float data: loc-gowalla_totalCheckins.txt, {} coordinates",
+                lat.len()
+            );
+            Some(lat)
+        })
+        .unwrap_or_else(|| {
+            let coords = data
+                .iter()
+                .map(|&v| (v % 3_600_000_000) as f64 / 1e7 - 180.0)
+                .collect::<Vec<f64>>();
+            println!("float data: synthetic coordinates, {} values", coords.len());
+            coords
+        });
+    let radians: Vec<f64> = floats.iter().map(|d| d.to_radians()).collect();
+    let float_cases: [(&str, &[f64], FloatEncodeFn, FloatDecodeFn); 2] = [
+        (
+            "alp",
+            &floats,
+            zu_encoding::alp::encode,
+            zu_encoding::alp::decode,
+        ),
+        (
+            "alp_rd",
+            &radians,
+            zu_encoding::alp_rd::encode,
+            zu_encoding::alp_rd::decode,
+        ),
+    ];
+    for (name, values, encode, decode) in float_cases {
+        let mut encoded = Vec::new();
+        encode(values, &mut encoded);
+        let mut out = Vec::with_capacity(values.len());
+        decode(&encoded, values.len(), &mut out).unwrap();
+        let same = out
+            .iter()
+            .zip(values)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "{name} roundtrip broke on the bench corpus");
+        let mut iters = 0u32;
+        let start = Instant::now();
+        while start.elapsed().as_secs_f64() < 1.0 {
+            out.clear();
+            decode(&encoded, values.len(), &mut out).unwrap();
+            iters += 1;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let gbps = (values.len() as f64) * 8.0 * f64::from(iters) / secs / 1e9;
+        let ratio = (values.len() as f64) * 8.0 / (encoded.len() as f64);
+        println!("{name}: {gbps:.2} GB/s decode, {ratio:.1}x vs raw, {iters} iters");
+        if let Some(floor) = budgets.floor(name)
+            && gbps < floor
+        {
+            println!("GATE FAIL {name}: {gbps:.2} GB/s < floor {floor} GB/s");
+            failed = true;
+        }
     }
 
     if gate && failed {

@@ -30,57 +30,95 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
     out.len() - start
 }
 
+/// A pull cursor over a container's chunks, for decoders that walk two
+/// streams in lockstep or stream chunks straight into typed output.
+/// `next` unpacks the following chunk into `scratch` without the frame
+/// minimum applied and returns `(min, take)`, or None past the end.
+/// The claimed count is rejected against `max_values` up front: width-0
+/// chunks mean 9 bytes of input can claim 1024 values, so nothing may
+/// scale with the claim before that wall.
+pub(crate) struct ChunkCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    remaining: usize,
+    count: usize,
+}
+
+impl<'a> ChunkCursor<'a> {
+    pub(crate) fn new(bytes: &'a [u8], max_values: usize) -> Result<Self> {
+        let corrupt = |detail: String| ZuError::Corrupt {
+            what: "for_bitpack",
+            detail,
+        };
+        let count = u32::from_le_bytes(
+            bytes
+                .get(..4)
+                .ok_or_else(|| corrupt("truncated count".into()))?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if count > max_values {
+            return Err(corrupt(format!(
+                "claims {count} values, caller allows {max_values}"
+            )));
+        }
+        Ok(Self {
+            bytes,
+            pos: 4,
+            remaining: count,
+            count,
+        })
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn next(&mut self, scratch: &mut [u64; CHUNK]) -> Result<Option<(u64, usize)>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let corrupt = |detail: &str| ZuError::Corrupt {
+            what: "for_bitpack",
+            detail: detail.to_string(),
+        };
+        let header = self
+            .bytes
+            .get(self.pos..self.pos + 9)
+            .ok_or_else(|| corrupt("truncated chunk header"))?;
+        let min = u64::from_le_bytes(header[..8].try_into().unwrap());
+        let width = u32::from(header[8]);
+        if width > 64 {
+            return Err(corrupt("width > 64"));
+        }
+        self.pos += 9;
+        let take = self.remaining.min(CHUNK);
+        let plen = bitpack::packed_bytes(width, take);
+        let packed = self
+            .bytes
+            .get(self.pos..self.pos + plen)
+            .ok_or_else(|| corrupt("truncated chunk body"))?;
+        bitpack::unpack(packed, width, scratch);
+        self.pos += plen;
+        self.remaining -= take;
+        Ok(Some((min, take)))
+    }
+}
+
 /// Parses the container and hands each decoded chunk to `sink` as
 /// `(min, values, take)`. Shared with the delta decoder so both stay
-/// single pass. `max_values` is the caller's ceiling: width-0 chunks
-/// mean 9 bytes of input can claim 1024 values, so the claimed count
-/// must be rejected against what the caller expects before any work
-/// scales with it.
+/// single pass.
 pub(crate) fn decode_chunks(
     bytes: &[u8],
     max_values: usize,
     mut sink: impl FnMut(u64, &[u64], usize),
 ) -> Result<usize> {
-    let corrupt = |detail: String| ZuError::Corrupt {
-        what: "for_bitpack",
-        detail,
-    };
-    let count = u32::from_le_bytes(
-        bytes
-            .get(..4)
-            .ok_or_else(|| corrupt("truncated count".into()))?
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    if count > max_values {
-        return Err(corrupt(format!(
-            "claims {count} values, caller allows {max_values}"
-        )));
-    }
-    let mut pos = 4usize;
+    let mut cursor = ChunkCursor::new(bytes, max_values)?;
     let mut scratch = [0u64; CHUNK];
-    let mut remaining = count;
-    while remaining > 0 {
-        let header = bytes
-            .get(pos..pos + 9)
-            .ok_or_else(|| corrupt("truncated chunk header".into()))?;
-        let min = u64::from_le_bytes(header[..8].try_into().unwrap());
-        let width = u32::from(header[8]);
-        if width > 64 {
-            return Err(corrupt("width > 64".into()));
-        }
-        pos += 9;
-        let take = remaining.min(CHUNK);
-        let plen = bitpack::packed_bytes(width, take);
-        let packed = bytes
-            .get(pos..pos + plen)
-            .ok_or_else(|| corrupt("truncated chunk body".into()))?;
-        bitpack::unpack(packed, width, &mut scratch);
-        pos += plen;
+    while let Some((min, take)) = cursor.next(&mut scratch)? {
         sink(min, &scratch, take);
-        remaining -= take;
     }
-    Ok(count)
+    Ok(cursor.count())
 }
 
 /// Decodes an encoded buffer, appending at most `max_values` values to

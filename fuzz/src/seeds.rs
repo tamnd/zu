@@ -137,5 +137,16 @@ fn main() {
     let mut fs = Vec::new();
     zu_encoding::fsst::encode(&text, &mut fs);
     write_seed(&corpus.join("decode_fsst"), "edge-text", &fs);
+    let coords: Vec<f64> = follows
+        .iter()
+        .map(|&(s, d)| f64::from(s) + f64::from(d) / 1e5)
+        .collect();
+    let mut al = Vec::new();
+    zu_encoding::alp::encode(&coords, &mut al);
+    write_seed(&corpus.join("decode_alp"), "coords", &al);
+    let radians: Vec<f64> = coords.iter().map(|d| d.to_radians()).collect();
+    let mut rd = Vec::new();
+    zu_encoding::alp_rd::encode(&radians, &mut rd);
+    write_seed(&corpus.join("decode_alp_rd"), "radians", &rd);
     println!("seeds written under {}", corpus.display());
 }

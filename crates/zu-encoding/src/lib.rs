@@ -5,6 +5,8 @@
 //! Encoder and decoder implementations land in M0; this crate starts with the
 //! stable id table so downstream crates can reference it.
 
+pub mod alp;
+pub mod alp_rd;
 pub mod bitpack;
 pub mod bool_bitpack;
 pub mod delta;

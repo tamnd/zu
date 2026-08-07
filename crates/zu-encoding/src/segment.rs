@@ -101,6 +101,8 @@ fn choose(values: &[u64]) -> EncodingId {
     // Candidate order breaks ties toward the shallower cascade.
     // BoolBitpack is only legal when the whole input is binary, not just
     // the sample, or the encoder would corrupt the values it never saw.
+    // Dict is only legal under the format cap on distinct values, a
+    // property the sample cannot vouch for either.
     let mut candidates = Vec::with_capacity(7);
     if values.iter().all(|&v| v <= 1) {
         candidates.push(EncodingId::BoolBitpack);
@@ -110,9 +112,11 @@ fn choose(values: &[u64]) -> EncodingId {
         EncodingId::DeltaBitPack,
         EncodingId::DeltaPatch,
         EncodingId::Rle,
-        EncodingId::Dict,
-        EncodingId::Frequency,
     ]);
+    if dict_legal(values) {
+        candidates.push(EncodingId::Dict);
+    }
+    candidates.push(EncodingId::Frequency);
     let mut best = EncodingId::Plain;
     let mut best_size = 4 + concat.len() * 8;
     let mut buf = Vec::new();
@@ -142,6 +146,19 @@ fn choose(values: &[u64]) -> EncodingId {
         }
     }
     best
+}
+
+/// Whether the whole input stays under the Dict cardinality cap. Early
+/// exit keeps the scan cheap exactly when Dict is hopeless anyway.
+fn dict_legal(values: &[u64]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(1024);
+    for &v in values {
+        seen.insert(v);
+        if seen.len() > dict::MAX_ENTRIES {
+            return false;
+        }
+    }
+    true
 }
 
 /// Even-spaced runs so ordered data keeps its local structure in the sample.
@@ -307,6 +324,28 @@ mod tests {
         values[9_999] = 2;
         let id = roundtrip(&values);
         assert_ne!(id, EncodingId::BoolBitpack);
+    }
+
+    #[test]
+    fn dict_never_offered_past_the_distinct_cap() {
+        // Sixteen scattered wide values inside any sample window, but a
+        // fresh sixteen every 64 rows: the sample prices Dict as a clear
+        // winner while the full input holds ten thousand distinct
+        // values, past the format cap. The legality gate has to keep
+        // Dict out, or the encoder would ship a dictionary no reader
+        // accepts.
+        let values: Vec<u64> = (0..40_000usize)
+            .map(|i| {
+                let pool = (i / 64 * 16 + (i * 7) % 16) as u64;
+                pool.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            })
+            .collect();
+        let mut buf = Vec::new();
+        let id = encode_auto(&values, &mut buf);
+        assert_ne!(id, EncodingId::Dict);
+        let mut out = Vec::new();
+        decode_any(&buf, values.len(), &mut out).unwrap();
+        assert_eq!(values, out);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 use zu_common::{Result, ZuError};
 
+use crate::bitpack::CHUNK;
 use crate::for_bitpack;
 
 /// Encodes `values` into `out`, returning the encoded byte length.
@@ -43,8 +44,10 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
 
 /// Decodes an encoded buffer, appending at most `max_values` values to
 /// `out`. The count and both exception streams are claims until checked:
-/// the count against the caller ceiling, the streams against the count,
-/// and every position against the materialized range.
+/// the count against the caller ceiling, the streams against each other,
+/// and every position against the materialized range. The exception
+/// streams patch chunk by chunk in lockstep, so scratch stays two
+/// MiniBlock chunks however many exceptions the segment holds.
 pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "frequency",
@@ -63,20 +66,37 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()>
     let values_bytes = bytes
         .get(16 + positions_len..)
         .ok_or_else(|| corrupt("truncated exception values"))?;
-    let mut positions = Vec::new();
-    let mut exceptions = Vec::new();
-    for_bitpack::decode(positions_bytes, count, &mut positions)?;
-    for_bitpack::decode(values_bytes, count, &mut exceptions)?;
-    if positions.len() != exceptions.len() {
+    let mut positions_cur = for_bitpack::ChunkCursor::new(positions_bytes, count)?;
+    let mut values_cur = for_bitpack::ChunkCursor::new(values_bytes, count)?;
+    if positions_cur.count() != values_cur.count() {
         return Err(corrupt("stream length mismatch"));
-    }
-    if positions.iter().any(|&p| p >= count as u64) {
-        return Err(corrupt("position past the value count"));
     }
     let base = out.len();
     out.extend(std::iter::repeat_n(top, count));
-    for (&pos, &v) in positions.iter().zip(&exceptions) {
-        out[base + pos as usize] = v;
+    let mut sp = [0u64; CHUNK];
+    let mut sv = [0u64; CHUNK];
+    let bad = 'chunks: loop {
+        let (pmin, tp) = match positions_cur.next(&mut sp) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break None,
+            Err(e) => break Some(e),
+        };
+        let (vmin, tv) = match values_cur.next(&mut sv) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break Some(corrupt("value stream ended early")),
+            Err(e) => break Some(e),
+        };
+        for (&p, &v) in sp[..tp.min(tv)].iter().zip(&sv) {
+            let pos = pmin.wrapping_add(p);
+            if pos >= count as u64 {
+                break 'chunks Some(corrupt("position past the value count"));
+            }
+            out[base + pos as usize] = vmin.wrapping_add(v);
+        }
+    };
+    if let Some(e) = bad {
+        out.truncate(base);
+        return Err(e);
     }
     Ok(())
 }

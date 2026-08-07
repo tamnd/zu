@@ -123,12 +123,20 @@ ldbc_hop_p50_us = 10.0
 ldbc_key_p50_us = 2.0
 
 # B4, the 2-hop factorized count on SF1 under 10 ms (docs/11, docs/12).
-# The count-to-degree rewrite carries this: an unfiltered count over a
-# trailing expand reads degrees instead of materializing 7.6 M
-# second-hop values, and the absorbed source vector drops its flatten,
-# so the query is one degree sum per first-hop neighbor. That took the
-# measured p50 from about 200 ms to under the ceiling on every host.
-# Lower this ceiling, never raise it.
+# Three executor changes carry it. The count-to-degree rewrite turns an
+# unfiltered count over a trailing expand into degree reads instead of
+# 7.6 M materialized second-hop values, and the absorbed source vector
+# drops its flatten, so the query is one batched degree sum per
+# first-hop vector. Dead rel columns stop materializing, which on this
+# query was 173 K Value::Rel per run for an anonymous rel only the
+# count ever saw. Measured p50 from the 170 to 670 ms baseline:
+# gamingpc 2.8 ms, local M series 3.0 ms, server1 8.6 ms with a p99 of
+# 19.9 ms from vCPU steal. server3 runs a sustained background crawl
+# holding its 8 vCPUs at load 15 to 31 and measures 11.6 to 13 ms
+# under that contention while its idle twin server1 passes, so like
+# the cold tails the CSR point floors document, its number is
+# information until the box quiets down. Lower this ceiling, never
+# raise it.
 ldbc_two_hop_p50_ms = 10.0
 
 # B7 exit budget straight from docs/12: a 10 GB file opens in under

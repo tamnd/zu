@@ -20,6 +20,7 @@
 
 use zu_common::{Result, ZuError};
 
+use crate::bitpack::CHUNK;
 use crate::for_bitpack;
 
 const MAX_DICT: usize = 8;
@@ -185,34 +186,65 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<f64>) -> Result<()>
     if positions.iter().any(|&p| p >= count as u64) {
         return Err(corrupt("position past the value count"));
     }
-    let mut codes = Vec::with_capacity(count);
-    for_bitpack::decode(codes_bytes, count, &mut codes)?;
-    if codes.len() != count {
+    let mut codes_cur = for_bitpack::ChunkCursor::new(codes_bytes, count)?;
+    let mut rights_cur = for_bitpack::ChunkCursor::new(rights_bytes, count)?;
+    if codes_cur.count() != count {
         return Err(corrupt("code stream length mismatch"));
     }
-    if codes.iter().any(|&c| c as usize >= dict_len) {
-        return Err(corrupt("code past the dictionary"));
-    }
-    let mut rights = Vec::with_capacity(count);
-    for_bitpack::decode(rights_bytes, count, &mut rights)?;
-    if rights.len() != count {
+    if rights_cur.count() != count {
         return Err(corrupt("right stream length mismatch"));
     }
+    // The two streams decode one MiniBlock chunk at a time and combine
+    // in the same pass, so nothing the size of the column materializes
+    // besides the output itself. The dictionary is padded to the code
+    // mask so the hot loop indexes without a bounds check, and hostile
+    // codes and stray right bits are caught by running accumulators
+    // checked once after the pass.
+    let mut dict_pad = [0u64; MAX_DICT];
+    dict_pad[..dict.len()].copy_from_slice(&dict);
     let right_mask = (1u64 << right_bits) - 1;
-    if rights.iter().any(|&r| r & !right_mask != 0) {
+    let base = out.len();
+    let mut sc = [0u64; CHUNK];
+    let mut sr = [0u64; CHUNK];
+    let mut max_code = 0u64;
+    let mut stray = 0u64;
+    let bad = loop {
+        let (cmin, tc) = match codes_cur.next(&mut sc) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break None,
+            Err(e) => break Some(e),
+        };
+        let (rmin, tr) = match rights_cur.next(&mut sr) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break Some(corrupt("right stream ended early")),
+            Err(e) => break Some(e),
+        };
+        let take = tc.min(tr);
+        out.extend(sc[..take].iter().zip(&sr[..take]).map(|(&cv, &rv)| {
+            let c = cmin.wrapping_add(cv);
+            let r = rmin.wrapping_add(rv);
+            max_code = max_code.max(c);
+            stray |= r;
+            f64::from_bits(dict_pad[(c & (MAX_DICT as u64 - 1)) as usize] << right_bits | r)
+        }));
+    };
+    if let Some(e) = bad {
+        out.truncate(base);
+        return Err(e);
+    }
+    if max_code as usize >= dict_len {
+        out.truncate(base);
+        return Err(corrupt("code past the dictionary"));
+    }
+    if stray & !right_mask != 0 {
+        out.truncate(base);
         return Err(corrupt("right part wider than the cut"));
     }
-    let base = out.len();
-    out.extend(
-        codes
-            .iter()
-            .zip(&rights)
-            .map(|(&c, &r)| f64::from_bits(dict[c as usize] << right_bits | r)),
-    );
     for (&p, chunk) in positions.iter().zip(exc_bytes.chunks_exact(2)) {
         let left = u64::from(u16::from_le_bytes(chunk.try_into().unwrap()));
-        let bits = left << right_bits | rights[p as usize];
-        out[base + p as usize] = f64::from_bits(bits);
+        let slot = base + p as usize;
+        let bits = left << right_bits | (out[slot].to_bits() & right_mask);
+        out[slot] = f64::from_bits(bits);
     }
     Ok(())
 }

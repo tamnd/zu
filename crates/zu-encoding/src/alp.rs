@@ -10,10 +10,9 @@
 //! is scored by the packed width of the digits it produces plus the
 //! exceptions it fails on, and the smallest estimate wins. Decode is
 //! two multiplies per value after the digit stream unpacks, which is
-//! what keeps it on the 1 GB/s floor. The storage cascade applies ALP
-//! per MiniBlock chunk, so decode scratch there is one chunk of digits;
-//! this standalone container materializes the whole digit stream, which
-//! is the output allocation, not extra scratch.
+//! what keeps it on the 1 GB/s floor. Decode streams the digit chunks
+//! straight into the output, so scratch stays one MiniBlock chunk of
+//! 1024 values no matter how large the container is.
 //!
 //! Layout: `count: u32 LE`, `e: u8`, `f: u8`, `exc_count: u32 LE`,
 //! `positions_len: u32 LE`, positions container, exception bit patterns
@@ -187,21 +186,29 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<f64>) -> Result<()>
     if positions.iter().any(|&p| p >= count as u64) {
         return Err(corrupt("position past the value count"));
     }
-    let mut digits = Vec::with_capacity(count);
-    for_bitpack::decode(digits_bytes, count, &mut digits)?;
-    if digits.len() != count {
-        return Err(corrupt("digit stream length mismatch"));
-    }
     let pow = pow10();
     let inv = inv_pow10();
     let scale_f = pow[f];
     let scale_e = inv[e];
     let base = out.len();
-    out.extend(
-        digits
-            .iter()
-            .map(|&z| (unzigzag(z) as f64) * scale_f * scale_e),
-    );
+    let decoded = for_bitpack::decode_chunks(digits_bytes, count, |min, scratch, take| {
+        out.extend(
+            scratch[..take]
+                .iter()
+                .map(|&v| (unzigzag(min.wrapping_add(v)) as f64) * scale_f * scale_e),
+        );
+    });
+    match decoded {
+        Ok(n) if n == count => {}
+        Ok(_) => {
+            out.truncate(base);
+            return Err(corrupt("digit stream length mismatch"));
+        }
+        Err(e) => {
+            out.truncate(base);
+            return Err(e);
+        }
+    }
     for (&pos, chunk) in positions.iter().zip(patterns_bytes.chunks_exact(8)) {
         out[base + pos as usize] = f64::from_bits(u64::from_le_bytes(chunk.try_into().unwrap()));
     }

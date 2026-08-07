@@ -158,6 +158,23 @@ ldbc_two_hop_p50_ms = 10.0
 ldbc_is_p50_ms = 1.0
 ldbc_ic_p50_ms = 10.0
 
+# The unseeded directed triangle count on SF1, the AspJoin shape from
+# docs/07: the optimizer marks the closing expand because probing 7.6 M
+# 2-paths against storage would cost far more than the 173 K edges the
+# accumulate sweeps once into a hash table. The semijoin fuses into the
+# probe, which retains each unflat neighbor vector in place, so the
+# count(*) sink multiplies survivors without a flatten. The run is
+# dominated by the 7.6 M hash probes, about 21 ns each locally with the
+# multiply-xor edge hasher; the accumulate itself is 10 K neighbors
+# calls and 173 K inserts, single-digit ms. Measured p50: gamingpc
+# 124 ms, local M series 165 ms, server1 531 ms with a max of 629 ms
+# from vCPU steal. The loaded hosts run 792 ms (server3, under its
+# crawl) and 881 ms (server2, beside a compile job), information like
+# their B4 numbers until those boxes quiet down. Every measured run
+# asserts the count against a reference walked from the raw edge list.
+# Lower this ceiling, never raise it.
+ldbc_triangle_p50_ms = 800.0
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

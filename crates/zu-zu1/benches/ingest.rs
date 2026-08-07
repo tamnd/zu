@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use zu_zu1::file::Zu1File;
-use zu_zu1::graph::{Direction, GraphReader, bulk_load, read_edge_list};
+use zu_zu1::graph::{Direction, GraphReader, bulk_load_keyed, read_edge_list};
 use zu_zu1::reorder;
 
 fn load_real(dir: &str) -> Option<Vec<(u32, u32)>> {
@@ -173,21 +173,75 @@ fn run_edge_probes(label: &str, path: &std::path::Path, node_count: u64) -> f64 
     kprobes_s
 }
 
-/// Sorts, dedups, bulk loads, verifies, and runs the point-read and
-/// edge-probe phases; returns (M edges/s, fwd bits/edge, bwd bits/edge,
-/// out K lookups/s, in K lookups/s, K probes/s).
+/// Random key lookups through the primary-key index: three quarters hit
+/// a known key expecting its exact row, one quarter miss above the key
+/// domain, so both costs land in the number.
+fn run_key_lookups(label: &str, path: &std::path::Path, key_by_row: &[u64]) -> f64 {
+    let mut db = Zu1File::open(path).expect("open");
+    let mut reader = GraphReader::load(&mut db).expect("load directory");
+    let lookups = 200_000usize;
+    let mut rng = 0x853C_49E6_748F_EA9Bu64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let n = key_by_row.len() as u64;
+    let set: Vec<(u64, Option<u64>)> = (0..lookups)
+        .map(|i| {
+            if i % 4 == 3 {
+                (n + next() % (1 << 30), None)
+            } else {
+                let row = next() % n;
+                (key_by_row[row as usize], Some(row))
+            }
+        })
+        .collect();
+    let mut lat = Vec::with_capacity(lookups);
+    let started = Instant::now();
+    for &(key, want) in &set {
+        let t = Instant::now();
+        let got = reader.lookup_key(&mut db, key).expect("lookup");
+        lat.push(t.elapsed());
+        assert_eq!(got, want, "key {key}");
+    }
+    let secs = started.elapsed().as_secs_f64();
+    lat.sort_unstable();
+    let klookups_s = lookups as f64 / secs / 1e3;
+    println!(
+        "{label} key-lookup: {klookups_s:.0} K lookups/s, p50 {:.1} us, p99 {:.1} us, quarter absent",
+        lat[lookups / 2].as_secs_f64() * 1e6,
+        lat[lookups * 99 / 100].as_secs_f64() * 1e6
+    );
+    klookups_s
+}
+
+/// Sorts, dedups, bulk loads, verifies, and runs the point-read,
+/// edge-probe, and key-lookup phases; returns (M edges/s, fwd bits/edge,
+/// bwd bits/edge, out K lookups/s, in K lookups/s, K probes/s,
+/// K key lookups/s when keys were given).
 fn run_load(
     label: &str,
     mut edges: Vec<(u32, u32)>,
     node_count: u64,
-) -> (f64, f64, f64, f64, f64, f64) {
+    key_by_row: Option<Vec<u64>>,
+) -> (f64, f64, f64, f64, f64, f64, Option<f64>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("ingest.zu1");
     let start = Instant::now();
     edges.sort_unstable();
     edges.dedup();
     let mut db = Zu1File::create(&path).expect("create");
-    let directory = bulk_load(&mut db, node_count, &edges).expect("bulk_load");
+    let directory = bulk_load_keyed(
+        &mut db,
+        "node",
+        "edge",
+        node_count,
+        &edges,
+        key_by_row.as_deref(),
+    )
+    .expect("bulk_load");
     let secs = start.elapsed().as_secs_f64();
     drop(db);
     // Free the half-gigabyte edge vector before the point phase: on the
@@ -212,7 +266,14 @@ fn run_load(
                 * u64::from(zu_zu1::BLOCK_SIZE)
         })
         .sum();
-    let bits_fwd = (file_bytes - bwd_bytes) as f64 * 8.0 / directory.edge_count as f64;
+    // The key index scales with nodes, not edges, so it is carved out of
+    // the adjacency density and quoted per key below.
+    let key_bytes: u64 = directory
+        .keys
+        .as_ref()
+        .map(|k| (k.keys.blocks.len() + k.rows.blocks.len()) as u64 * u64::from(zu_zu1::BLOCK_SIZE))
+        .unwrap_or(0);
+    let bits_fwd = (file_bytes - bwd_bytes - key_bytes) as f64 * 8.0 / directory.edge_count as f64;
     let bits_bwd = bwd_bytes as f64 * 8.0 / directory.edge_count as f64;
     println!(
         "{label}: {:.2} M edges/s, {bits_fwd:.2} bits/edge fwd, {bits_bwd:.2} bits/edge bwd ({} edges, {} nodes, {} groups, {:.2}s, {file_bytes} bytes)",
@@ -222,12 +283,21 @@ fn run_load(
         directory.groups.len(),
         secs
     );
+    if key_bytes > 0 {
+        println!(
+            "{label} key index: {key_bytes} bytes, {:.1} bits/key",
+            key_bytes as f64 * 8.0 / directory.node_count as f64
+        );
+    }
     let verified = zu_zu1::verify(&path).expect("verify");
     println!("{label} verify: ok, {verified} payload bytes checked");
     let k_out = run_point_lookups(label, &path, directory.node_count, Direction::Fwd);
     let k_in = run_point_lookups(label, &path, directory.node_count, Direction::Bwd);
     let k_probe = run_edge_probes(label, &path, directory.node_count);
-    (medges_s, bits_fwd, bits_bwd, k_out, k_in, k_probe)
+    let k_key = key_by_row
+        .as_deref()
+        .map(|keys| run_key_lookups(label, &path, keys));
+    (medges_s, bits_fwd, bits_bwd, k_out, k_in, k_probe, k_key)
 }
 
 fn main() {
@@ -242,12 +312,16 @@ fn main() {
         .max()
         .unwrap_or(0);
 
-    let (medges_s, bits_raw, bits_bwd, klookups_s, in_klookups_s, kprobes_s) =
-        run_load("copy", edges.clone(), node_count);
+    let (medges_s, bits_raw, bits_bwd, klookups_s, in_klookups_s, kprobes_s, _) =
+        run_load("copy", edges.clone(), node_count, None);
 
     // B8 is defined on the reordered graph (docs/04 §5): BFS relabeling
     // from max-degree roots, timed separately since REORDER is opt-in.
+    // The reordered load also carries the primary-key index over the
+    // original ids, exactly what zu copy --reorder persists, so the
+    // key-lookup floor gates here where the index actually exists.
     let mut bits_bfs = None;
+    let mut key_klookups = None;
     if is_real {
         let start = Instant::now();
         let map = reorder::bfs_order(node_count, &edges);
@@ -257,8 +331,14 @@ fn main() {
             "reorder bfs: mapping built in {:.2}s",
             start.elapsed().as_secs_f64()
         );
-        let (_, bits, _, _, _, _) = run_load("copy+bfs", relabeled, node_count);
+        let mut key_by_row = vec![0u64; node_count as usize];
+        for (old, &new) in map.iter().enumerate() {
+            key_by_row[new as usize] = old as u64;
+        }
+        let (_, bits, _, _, _, _, k_key) =
+            run_load("copy+bfs", relabeled, node_count, Some(key_by_row));
         bits_bfs = Some(bits);
+        key_klookups = k_key;
     }
 
     let mut failed = false;
@@ -315,6 +395,12 @@ fn main() {
         println!("GATE FAIL edge-probe: {kprobes_s:.0} K probes/s < floor {floor}");
         failed = true;
     }
+    if let (Some(k), Some(floor)) = (key_klookups, budget("key_klookups_s"))
+        && k < floor
+    {
+        println!("GATE FAIL key-lookup: {k:.0} K lookups/s < floor {floor}");
+        failed = true;
+    }
     // B6 is defined at 100 M edges (docs/12) and LiveJournal tops out at
     // 69 M, so the scale check loads com-Orkut (117 M edges) when opted
     // in with ZU_B6=1. The ungraph lists each undirected edge once and is
@@ -335,7 +421,7 @@ fn main() {
                     .map(|&(s, d)| u64::from(s.max(d)) + 1)
                     .max()
                     .unwrap_or(0);
-                let (medges_s, _, _, _, _, _) = run_load("b6-orkut", edges, node_count);
+                let (medges_s, _, _, _, _, _, _) = run_load("b6-orkut", edges, node_count, None);
                 if let Some(floor) = budget("copy_medges_s")
                     && medges_s < floor
                 {

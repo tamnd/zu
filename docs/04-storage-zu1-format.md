@@ -103,7 +103,7 @@ CsrGroup {
 
 ## 7. Primary-key index
 
-Two-level static-hybrid hash: per node group a closed-addressing table (~10 bits/key) sealed at checkpoint + a small mutable overlay for the current delta. Point lookup: hash → group candidate(s) → verify against key column chunk (1 chunk decode). No global rebuild on insert.
+Two-level static-hybrid design: a sealed level built at bulk load plus a small mutable overlay for the current delta (the overlay arrives with the updatable CSR). The sealed level stores the `(key, row)` pairs sorted by key as two ordinary MiniBlock segments in the group directory: the keys delta-pack tightly because they are sorted, and a lookup fence-searches the key segment for its one candidate chunk, decodes it, and reads the single matching row value, so it costs two chunk decodes however many keys exist and misses outside the key zone map cost nothing. `COPY ... REORDER` persists the original ids this way, which is what makes relabeling invisible to users. No global rebuild on insert once the overlay exists; a closed-addressing hash (~10 bits/key) remains the candidate for the overlay's sealed compaction if lookup latency ever needs the extra chunk decode removed.
 
 ## 8. Free space & file growth
 

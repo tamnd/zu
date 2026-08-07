@@ -12,9 +12,10 @@
 //!
 //! Directory layout (version-prefixed, hand-rolled):
 //! `version: u16`, `node_count: u64`, `edge_count: u64`,
-//! `group_count: u32`, then per group `row_count: u32` followed by the
-//! fwd offsets, fwd neighbors, bwd offsets, and bwd neighbors
-//! `SegmentMeta`.
+//! `group_count: u32`, `has_keys: u8`, then when `has_keys` is 1 the key
+//! and row `SegmentMeta` of the primary-key index, then per group
+//! `row_count: u32` followed by the fwd offsets, fwd neighbors, bwd
+//! offsets, and bwd neighbors `SegmentMeta`.
 //!
 //! Each rel table's directory is its own meta chain, reached through the
 //! catalog and the table index of `crate::catalog`, so one file holds any
@@ -28,14 +29,15 @@ use zu_common::{GROUP_ROWS, Result, ZuError};
 
 use crate::catalog::{Catalog, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
+use crate::keys::{KeyIndex, KeyReader, write_key_index};
 use crate::meta;
 use crate::segment::{SegmentMeta, probe, read_range, read_segment, write_segment};
 
-// Version 5 widened SegmentMeta with the zone map min and max, which
-// shifts every field behind them, so version 4 files must fail as
-// unsupported here rather than misread downstream. Version 4 had added
-// the per-chunk fence array to segment payloads.
-const DIRECTORY_VERSION: u16 = 5;
+// Version 6 added the has_keys byte and the primary-key index segments
+// to the header, so version 5 files must fail as unsupported here rather
+// than misread downstream. Version 5 had widened SegmentMeta with the
+// zone map, version 4 the per-chunk fence array.
+const DIRECTORY_VERSION: u16 = 6;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -75,6 +77,9 @@ impl GroupMeta {
 pub struct Directory {
     pub node_count: u64,
     pub edge_count: u64,
+    /// Primary-key index over original node ids, present when the load
+    /// relabeled rows.
+    pub keys: Option<KeyIndex>,
     pub groups: Vec<GroupMeta>,
 }
 
@@ -85,6 +90,11 @@ impl Directory {
         out.extend_from_slice(&self.node_count.to_le_bytes());
         out.extend_from_slice(&self.edge_count.to_le_bytes());
         out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
+        out.push(u8::from(self.keys.is_some()));
+        if let Some(keys) = &self.keys {
+            keys.keys.encode(&mut out);
+            keys.rows.encode(&mut out);
+        }
         for g in &self.groups {
             out.extend_from_slice(&g.row_count.to_le_bytes());
             g.fwd.offsets.encode(&mut out);
@@ -103,7 +113,7 @@ impl Directory {
             what: "group directory",
             detail: detail.to_string(),
         };
-        let head = bytes.get(..22).ok_or_else(|| corrupt("truncated header"))?;
+        let head = bytes.get(..23).ok_or_else(|| corrupt("truncated header"))?;
         let version = u16::from_le_bytes(head[..2].try_into().unwrap());
         if version != DIRECTORY_VERSION {
             return Err(ZuError::Unsupported {
@@ -114,13 +124,23 @@ impl Directory {
         let node_count = u64::from_le_bytes(head[2..10].try_into().unwrap());
         let edge_count = u64::from_le_bytes(head[10..18].try_into().unwrap());
         let group_count = u32::from_le_bytes(head[18..22].try_into().unwrap()) as usize;
+        let mut pos = 23usize;
+        let keys = match head[22] {
+            0 => None,
+            1 => {
+                let (keys, next) = SegmentMeta::decode(bytes, pos)?;
+                let (rows, next) = SegmentMeta::decode(bytes, next)?;
+                pos = next;
+                Some(KeyIndex { keys, rows })
+            }
+            flag => return Err(corrupt(&format!("has_keys byte is {flag}"))),
+        };
         // A group entry is at least 196 bytes (row count plus four empty
         // segment metas), so a count the payload cannot hold is rejected
         // before it sizes an allocation.
-        if group_count > bytes.len().saturating_sub(22) / 196 {
+        if group_count > bytes.len().saturating_sub(pos) / 196 {
             return Err(corrupt("truncated group entry"));
         }
-        let mut pos = 22;
         let mut groups = Vec::with_capacity(group_count);
         for _ in 0..group_count {
             let rc = bytes
@@ -153,6 +173,7 @@ impl Directory {
         Ok(Self {
             node_count,
             edge_count,
+            keys,
             groups,
         })
     }
@@ -241,6 +262,13 @@ fn build_direction(
 /// checkpoint per the shadow-publishing rules.
 fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
     let directory = Directory::decode(&meta::read_chain(db, root)?)?;
+    if let Some(keys) = &directory.keys {
+        for seg in [&keys.keys, &keys.rows] {
+            for &ptr in &seg.blocks {
+                db.free_block(ptr)?;
+            }
+        }
+    }
     for group in &directory.groups {
         for seg in [
             &group.fwd.offsets,
@@ -273,7 +301,18 @@ fn free_chain(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
 /// Bulk-loads both CSR directions from an edge list into `db` as the
 /// default tables `node` and `edge`, publishing them with a checkpoint.
 pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Result<Directory> {
-    bulk_load_as(db, "node", "edge", node_count, edges)
+    bulk_load_keyed(db, "node", "edge", node_count, edges, None)
+}
+
+/// [`bulk_load_keyed`] without a key index.
+pub fn bulk_load_as(
+    db: &mut Zu1File,
+    node_table: &str,
+    rel_table: &str,
+    node_count: u64,
+    edges: &[(u32, u32)],
+) -> Result<Directory> {
+    bulk_load_keyed(db, node_table, rel_table, node_count, edges, None)
 }
 
 /// Bulk-loads both CSR directions from an edge list into `db` as the rel
@@ -285,13 +324,25 @@ pub fn bulk_load(db: &mut Zu1File, node_count: u64, edges: &[(u32, u32)]) -> Res
 /// A rel table with the same name is replaced and its blocks recycle one
 /// checkpoint later; other tables in the file are untouched. The node
 /// table's row domain only grows across loads. Returns the directory.
-pub fn bulk_load_as(
+/// `key_by_row`, when given, is the original id of every row (the
+/// pre-`REORDER` labels) and builds the primary-key index alongside the
+/// CSRs; it must hold exactly `node_count` unique keys.
+pub fn bulk_load_keyed(
     db: &mut Zu1File,
     node_table: &str,
     rel_table: &str,
     node_count: u64,
     edges: &[(u32, u32)],
+    key_by_row: Option<&[u64]>,
 ) -> Result<Directory> {
+    if let Some(keys) = key_by_row
+        && keys.len() as u64 != node_count
+    {
+        return Err(ZuError::InvalidArgument(format!(
+            "{} keys over {node_count} nodes",
+            keys.len()
+        )));
+    }
     let mut catalog = Catalog::load(db)?;
     let mut index = TableIndex::load(db)?;
     if let Some(rel) = catalog.rel_by_name(rel_table) {
@@ -323,6 +374,9 @@ pub fn bulk_load_as(
     let directory = Directory {
         node_count,
         edge_count: edges.len() as u64,
+        keys: key_by_row
+            .map(|keys| write_key_index(db, keys))
+            .transpose()?,
         groups,
     };
     let root = meta::write_chain(db, &directory.encode())?;
@@ -347,6 +401,7 @@ pub fn bulk_load_as(
 pub struct GraphReader {
     directory: Directory,
     cached_group: Option<(usize, Direction, Vec<u64>, Vec<u64>)>,
+    key_reader: Option<KeyReader>,
 }
 
 impl GraphReader {
@@ -387,7 +442,24 @@ impl GraphReader {
         Ok(Self {
             directory: Directory::decode(&bytes)?,
             cached_group: None,
+            key_reader: None,
         })
+    }
+
+    /// Resolves an original id through the primary-key index, or errors
+    /// when the file was loaded without one. The key segment's chunk
+    /// directory loads on the first call and is reused after, so a
+    /// lookup costs two chunk decodes.
+    pub fn lookup_key(&mut self, db: &mut Zu1File, key: u64) -> Result<Option<u64>> {
+        if self.key_reader.is_none() {
+            let index = self.directory.keys.clone().ok_or_else(|| {
+                ZuError::InvalidArgument(
+                    "file has no primary-key index, load with REORDER to build one".to_string(),
+                )
+            })?;
+            self.key_reader = Some(KeyReader::load(db, index)?);
+        }
+        self.key_reader.as_ref().unwrap().lookup(db, key)
     }
 
     pub fn directory(&self) -> &Directory {
@@ -815,13 +887,65 @@ mod tests {
 
     #[test]
     fn hostile_group_count_rejected() {
-        // A 22 byte header claiming u32::MAX groups must die on the size
-        // check, not in the allocator.
+        // A header claiming u32::MAX groups must die on the size check,
+        // not in the allocator.
         let mut bytes = DIRECTORY_VERSION.to_le_bytes().to_vec();
         bytes.extend_from_slice(&10u64.to_le_bytes());
         bytes.extend_from_slice(&20u64.to_le_bytes());
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.push(0);
         let err = Directory::decode(&bytes).unwrap_err();
         assert!(format!("{err}").contains("truncated group entry"));
+        // A has_keys byte that is neither 0 nor 1 is corruption, not a
+        // silent skip.
+        let flag_at = bytes.len() - 1;
+        bytes[flag_at] = 7;
+        let err = Directory::decode(&bytes).unwrap_err();
+        assert!(format!("{err}").contains("has_keys byte is 7"));
+    }
+
+    #[test]
+    fn keyed_load_resolves_original_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        // A small graph relabeled by BFS, keys are the original labels,
+        // exactly what zu copy --reorder produces.
+        let mut edges: Vec<(u32, u32)> = (0..4000u32)
+            .map(|i| (i.wrapping_mul(37) % 700, i.wrapping_mul(11) % 700))
+            .collect();
+        let n = 700u64;
+        let map = crate::reorder::bfs_order(n, &edges);
+        crate::reorder::relabel(&mut edges, &map);
+        let edges = sorted_edges(&mut edges);
+        let mut key_by_row = vec![0u64; n as usize];
+        for (old, &new) in map.iter().enumerate() {
+            key_by_row[new as usize] = old as u64;
+        }
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load_keyed(&mut db, "node", "edge", n, edges, Some(&key_by_row)).unwrap();
+        }
+        crate::verify(&path).unwrap();
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        for old in (0..n).step_by(13) {
+            assert_eq!(
+                reader.lookup_key(&mut db, old).unwrap(),
+                Some(u64::from(map[old as usize])),
+                "key {old}"
+            );
+        }
+        assert_eq!(reader.lookup_key(&mut db, n).unwrap(), None);
+        assert_eq!(reader.lookup_key(&mut db, u64::MAX).unwrap(), None);
+        // A file loaded without keys refuses key lookups.
+        let path2 = dir.path().join("g2.zu1");
+        let mut db2 = Zu1File::create(&path2).unwrap();
+        bulk_load(&mut db2, n, edges).unwrap();
+        let mut reader2 = GraphReader::load(&mut db2).unwrap();
+        assert!(reader2.lookup_key(&mut db2, 0).is_err());
+        // A key count that disagrees with the node domain is rejected.
+        let mut db3 = Zu1File::create(&dir.path().join("g3.zu1")).unwrap();
+        let err = bulk_load_keyed(&mut db3, "node", "edge", n, edges, Some(&[1, 2])).unwrap_err();
+        assert!(format!("{err}").contains("2 keys"));
     }
 }

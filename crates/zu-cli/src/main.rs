@@ -31,18 +31,29 @@ fn main() -> ExitCode {
         Some("neighbors") => {
             let mut rest = &args[1..];
             let mut dir = zu::zu1::graph::Direction::Fwd;
-            if rest.first().map(String::as_str) == Some("--in") {
-                dir = zu::zu1::graph::Direction::Bwd;
+            let mut by_key = false;
+            while let Some(flag) = rest.first().map(String::as_str) {
+                match flag {
+                    "--in" => dir = zu::zu1::graph::Direction::Bwd,
+                    "--key" => by_key = true,
+                    _ => break,
+                }
                 rest = &rest[1..];
             }
             match (
                 rest.first(),
                 rest.get(1).and_then(|s| s.parse::<u64>().ok()),
             ) {
-                (Some(path), Some(node)) => neighbors(std::path::Path::new(path), node, dir),
-                _ => usage_error("zu neighbors [--in] <file.zu1> <node>"),
+                (Some(path), Some(node)) => {
+                    neighbors(std::path::Path::new(path), node, dir, by_key)
+                }
+                _ => usage_error("zu neighbors [--in] [--key] <file.zu1> <node>"),
             }
         }
+        Some("lookup") => match (args.get(1), args.get(2).and_then(|s| s.parse::<u64>().ok())) {
+            (Some(path), Some(key)) => lookup(std::path::Path::new(path), key),
+            _ => usage_error("zu lookup <file.zu1> <key>"),
+        },
         Some("edge") => {
             let mut rest = &args[1..];
             let mut dir = zu::zu1::graph::Direction::Fwd;
@@ -179,24 +190,37 @@ fn copy(
         .map(|&(s, d)| u64::from(s.max(d)) + 1)
         .max()
         .unwrap_or(0);
-    match reorder {
-        zu::zu1::reorder::Reorder::None => {}
+    let map = match reorder {
+        zu::zu1::reorder::Reorder::None => None,
         zu::zu1::reorder::Reorder::Degree => {
-            let map = zu::zu1::reorder::degree_order(node_count, &edges);
-            zu::zu1::reorder::relabel(&mut edges, &map);
+            Some(zu::zu1::reorder::degree_order(node_count, &edges))
         }
-        zu::zu1::reorder::Reorder::Bfs => {
-            let map = zu::zu1::reorder::bfs_order(node_count, &edges);
-            zu::zu1::reorder::relabel(&mut edges, &map);
+        zu::zu1::reorder::Reorder::Bfs => Some(zu::zu1::reorder::bfs_order(node_count, &edges)),
+    };
+    // A relabeled load persists the original ids as the primary-key
+    // index, so lookups keep working on the labels the input used.
+    let key_by_row = map.map(|map| {
+        zu::zu1::reorder::relabel(&mut edges, &map);
+        let mut keys = vec![0u64; node_count as usize];
+        for (old, &new) in map.iter().enumerate() {
+            keys[new as usize] = old as u64;
         }
-    }
+        keys
+    });
     let mut sorted = edges;
     sorted.sort_unstable();
     sorted.dedup();
     let load_started = std::time::Instant::now();
     let result = (|| {
         let mut db = zu::zu1::file::Zu1File::create(out_path)?;
-        zu::zu1::graph::bulk_load(&mut db, node_count, &sorted)
+        zu::zu1::graph::bulk_load_keyed(
+            &mut db,
+            "node",
+            "edge",
+            node_count,
+            &sorted,
+            key_by_row.as_deref(),
+        )
     })();
     match result {
         Ok(d) => {
@@ -216,6 +240,16 @@ fn copy(
                         * u64::from(zu::zu1::BLOCK_SIZE)
                 })
                 .sum();
+            // The key index is a node-count structure, so it is carved
+            // out of the adjacency density and quoted per key instead.
+            let key_bytes: u64 = d
+                .keys
+                .as_ref()
+                .map(|k| {
+                    (k.keys.blocks.len() + k.rows.blocks.len()) as u64
+                        * u64::from(zu::zu1::BLOCK_SIZE)
+                })
+                .unwrap_or(0);
             let per_edge = |bytes: u64| bytes as f64 * 8.0 / d.edge_count as f64;
             println!(
                 "copied {} edges, {} nodes, {} groups",
@@ -223,6 +257,13 @@ fn copy(
                 d.node_count,
                 d.groups.len()
             );
+            if key_bytes > 0 {
+                println!(
+                    "key index: {} bytes, {:.1} bits/key",
+                    key_bytes,
+                    key_bytes as f64 * 8.0 / d.node_count as f64
+                );
+            }
             println!(
                 "parse {:.2}s, encode+write {:.2}s, total {:.2}s",
                 parsed.as_secs_f64(),
@@ -232,7 +273,7 @@ fn copy(
             println!(
                 "{:.2} M edges/s end to end, {file_bytes} bytes on disk, {:.2} bits/edge fwd, {:.2} bits/edge bwd",
                 d.edge_count as f64 / total.as_secs_f64() / 1e6,
-                per_edge(file_bytes - bwd_bytes),
+                per_edge(file_bytes - bwd_bytes - key_bytes),
                 per_edge(bwd_bytes)
             );
             ExitCode::SUCCESS
@@ -244,27 +285,71 @@ fn copy(
 /// Prints one node's sorted neighbor list via the point-read path, which
 /// decodes only the chunks holding the node's offsets and its list.
 /// `--in` reads the reverse direction: nodes whose edges point here.
-fn neighbors(path: &std::path::Path, node: u64, dir: zu::zu1::graph::Direction) -> ExitCode {
+/// `--key` resolves the argument through the primary-key index first,
+/// so it takes the original id of a reordered load.
+fn neighbors(
+    path: &std::path::Path,
+    node: u64,
+    dir: zu::zu1::graph::Direction,
+    by_key: bool,
+) -> ExitCode {
     let result = (|| {
         let mut db = zu::zu1::file::Zu1File::open(path)?;
-        let reader = zu::zu1::graph::GraphReader::load(&mut db)?;
+        let mut reader = zu::zu1::graph::GraphReader::load(&mut db)?;
+        let row = if by_key {
+            match reader.lookup_key(&mut db, node)? {
+                Some(row) => row,
+                None => return Ok(None),
+            }
+        } else {
+            node
+        };
         let mut nbrs = Vec::new();
-        reader.neighbors_dir_into(&mut db, node, dir, &mut nbrs)?;
-        Ok(nbrs)
+        reader.neighbors_dir_into(&mut db, row, dir, &mut nbrs)?;
+        Ok(Some((row, nbrs)))
     })();
     let label = match dir {
         zu::zu1::graph::Direction::Fwd => "degree",
         zu::zu1::graph::Direction::Bwd => "in-degree",
     };
     match result {
-        Ok(nbrs) => {
-            println!("node {node}: {label} {}", nbrs.len());
+        Ok(Some((row, nbrs))) => {
+            if by_key {
+                println!("key {node} -> node {row}: {label} {}", nbrs.len());
+            } else {
+                println!("node {node}: {label} {}", nbrs.len());
+            }
             for n in nbrs {
                 println!("{n}");
             }
             ExitCode::SUCCESS
         }
+        Ok(None) => {
+            println!("key {node}: absent");
+            ExitCode::FAILURE
+        }
         Err(e) => command_error("neighbors", &e),
+    }
+}
+
+/// Resolves an original id through the primary-key index. Exits 0 when
+/// the key exists and 1 when it does not, so scripts can branch on it.
+fn lookup(path: &std::path::Path, key: u64) -> ExitCode {
+    let result = (|| {
+        let mut db = zu::zu1::file::Zu1File::open(path)?;
+        let mut reader = zu::zu1::graph::GraphReader::load(&mut db)?;
+        reader.lookup_key(&mut db, key)
+    })();
+    match result {
+        Ok(Some(row)) => {
+            println!("key {key}: node {row}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            println!("key {key}: absent");
+            ExitCode::FAILURE
+        }
+        Err(e) => command_error("lookup", &e),
     }
 }
 
@@ -320,7 +405,7 @@ fn print_usage() {
     println!("usage: zu <command> [args]");
     println!();
     println!(
-        "commands: shell, query, copy, convert, verify, stat, neighbors [--in], edge [--in], bench"
+        "commands: shell, query, copy, convert, verify, stat, neighbors [--in] [--key], edge [--in], lookup, bench"
     );
     println!("(implemented milestone by milestone, see the repo issues)");
 }

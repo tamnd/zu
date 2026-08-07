@@ -388,6 +388,78 @@ pub fn probe(
     Ok(scratch[lo..hi].binary_search(&value).is_ok())
 }
 
+/// The chunk index and fence array of one segment, held in memory so
+/// repeated sorted lookups skip the two span reads a cold [`probe`]
+/// pays. For a 4.8 M value segment this is about 55 KiB.
+#[derive(Debug, Clone)]
+pub struct ChunkDirectory {
+    ends: Vec<u32>,
+    fences: Vec<u64>,
+}
+
+/// Loads the chunk index and fences of `meta`'s segment.
+pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<ChunkDirectory> {
+    let chunks = meta.chunk_count();
+    let span = read_payload_span(db, meta, 4, 4 + chunks * 4)?;
+    let ends = span
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let span = read_payload_span(db, meta, 4 + chunks * 4, 4 + chunks * 12)?;
+    let fences = span
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    Ok(ChunkDirectory { ends, fences })
+}
+
+/// Position of `value` in a segment whose rows are sorted ascending, or
+/// `None` when absent. The fences name the single chunk that could hold
+/// the value, so a hit costs one chunk decode; the zone map answers
+/// misses outside `[min, max]` from the meta alone.
+pub fn find_in_sorted(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    dir: &ChunkDirectory,
+    value: u64,
+) -> Result<Option<u64>> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    if meta.value_count == 0 || value < meta.min || value > meta.max {
+        return Ok(None);
+    }
+    let chunks = meta.chunk_count();
+    if dir.ends.len() != chunks || dir.fences.len() != chunks {
+        return Err(corrupt("chunk directory disagrees with meta"));
+    }
+    let target = dir.fences.partition_point(|&f| f < value);
+    if target == chunks {
+        return Ok(None);
+    }
+    let body_off = 4 + chunks * 12;
+    let body_start = if target == 0 {
+        0
+    } else {
+        dir.ends[target - 1] as usize
+    };
+    let body_end = dir.ends[target] as usize;
+    if body_start > body_end || body_off + body_end > meta.payload_len as usize {
+        return Err(corrupt("chunk index not monotone"));
+    }
+    let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
+    let mut scratch = Vec::with_capacity(CHUNK_ROWS);
+    enc::decode_any(&bytes, meta.chunk_rows(target), &mut scratch)?;
+    if scratch.len() != meta.chunk_rows(target) {
+        return Err(corrupt("chunk count disagrees with meta"));
+    }
+    Ok(scratch
+        .binary_search(&value)
+        .ok()
+        .map(|i| (target * CHUNK_ROWS + i) as u64))
+}
+
 /// Reads payload bytes `[from, to)`, touching only the covering blocks.
 fn read_payload_span(
     db: &mut Zu1File,
@@ -564,6 +636,39 @@ mod tests {
         assert!(!probe(&mut db, &meta, 7, 7, 14).unwrap());
         read_segment(&mut db, &meta, &mut out).unwrap();
         assert_eq!(out, values);
+    }
+
+    #[test]
+    fn find_in_sorted_matches_binary_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        // Sorted evens across several chunks so every odd is a miss with
+        // present values on both sides.
+        let values: Vec<u64> = (0..5000u64).map(|i| i * 2 + 10).collect();
+        let meta = write_segment(&mut db, &values).unwrap();
+        let cd = load_chunk_directory(&mut db, &meta).unwrap();
+        for v in [
+            0u64,
+            9,
+            10,
+            11,
+            2056,
+            2057,
+            2058,
+            5000,
+            10_007,
+            10_008,
+            10_009,
+            u64::MAX,
+        ] {
+            let want = values.binary_search(&v).ok().map(|i| i as u64);
+            let got = find_in_sorted(&mut db, &meta, &cd, v).unwrap();
+            assert_eq!(got, want, "value {v}");
+        }
+        // The empty segment finds nothing.
+        let empty = write_segment(&mut db, &[]).unwrap();
+        let cd = load_chunk_directory(&mut db, &empty).unwrap();
+        assert_eq!(find_in_sorted(&mut db, &empty, &cd, 0).unwrap(), None);
     }
 
     #[test]

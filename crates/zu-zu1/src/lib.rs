@@ -8,6 +8,7 @@
 pub mod catalog;
 pub mod file;
 pub mod graph;
+pub mod keys;
 pub mod meta;
 pub mod reorder;
 pub mod segment;
@@ -32,7 +33,8 @@ pub const MIN_READER_VERSION: u16 = 1;
 
 /// Walks the whole file checking every crc: file header, database
 /// headers, the catalog, the table index, and each rel table's group
-/// directory with every column segment it lists. Cross-checks the three
+/// directory with every column segment it lists, the primary-key index
+/// included when the table carries one. Cross-checks the three
 /// against each other (every rel table has a directory, every directory
 /// belongs to a rel table, counts agree), then decodes the free list and
 /// rejects a file whose free list claims a block a live chain or segment
@@ -98,6 +100,13 @@ pub fn verify(path: &Path) -> Result<u64> {
             ] {
                 values.clear();
                 segment::read_segment(&mut db, seg, &mut values)?;
+                bytes += seg.payload_len;
+                live.extend(seg.blocks.iter().copied());
+            }
+        }
+        if let Some(keys) = &directory.keys {
+            keys::verify_key_index(&mut db, keys, directory.node_count)?;
+            for seg in [&keys.keys, &keys.rows] {
                 bytes += seg.payload_len;
                 live.extend(seg.blocks.iter().copied());
             }

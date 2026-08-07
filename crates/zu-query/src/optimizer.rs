@@ -41,23 +41,22 @@ pub fn optimize(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Resul
 fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<LogicalPlan> {
     if matches!(
         &plan,
-        LogicalPlan::Filter { .. }
-            | LogicalPlan::ScanNodes {
-                optional: false,
-                ..
-            }
-            | LogicalPlan::Expand {
-                optional: false,
-                ..
-            }
+        LogicalPlan::Filter { optional: None, .. }
+            | LogicalPlan::ScanNodes { optional: None, .. }
+            | LogicalPlan::Expand { optional: None, .. }
     ) {
         return reorder_run(plan, query, schema);
     }
     match plan {
         LogicalPlan::Empty => Ok(LogicalPlan::Empty),
-        LogicalPlan::Filter { input, expr } => Ok(LogicalPlan::Filter {
+        LogicalPlan::Filter {
+            input,
+            expr,
+            optional,
+        } => Ok(LogicalPlan::Filter {
             input: Box::new(rewrite(*input, query, schema)?),
             expr,
+            optional,
         }),
         LogicalPlan::ScanNodes {
             input,
@@ -162,14 +161,18 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
     let mut cur = top;
     let rest = loop {
         cur = match cur {
-            LogicalPlan::Filter { input, expr } => {
+            LogicalPlan::Filter {
+                input,
+                expr,
+                optional: None,
+            } => {
                 ops.push(RunOp::Filter(expr));
                 *input
             }
             LogicalPlan::ScanNodes {
                 input,
                 slot,
-                optional: false,
+                optional: None,
             } => {
                 ops.push(RunOp::Scan(slot));
                 *input
@@ -182,7 +185,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
                 direction,
                 range,
                 into,
-                optional: false,
+                optional: None,
             } => {
                 ops.push(RunOp::Expand(ExpandOp {
                     rel,
@@ -259,7 +262,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
                     LogicalPlan::ScanNodes {
                         input: Box::new(plan),
                         slot: *slot,
-                        optional: false,
+                        optional: None,
                     }
                 }
                 Step::Expand { ix, from, to, into } => {
@@ -280,7 +283,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
                         direction,
                         range: e.range,
                         into: *into,
-                        optional: false,
+                        optional: None,
                     }
                 }
             };
@@ -294,6 +297,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 expr: filter.clone(),
+                optional: None,
             };
         }
     }
@@ -308,7 +312,7 @@ fn rebuild(ops: Vec<RunOp>, below: LogicalPlan) -> LogicalPlan {
             RunOp::Scan(slot) => LogicalPlan::ScanNodes {
                 input: Box::new(plan),
                 slot,
-                optional: false,
+                optional: None,
             },
             RunOp::Expand(e) => LogicalPlan::Expand {
                 input: Box::new(plan),
@@ -318,11 +322,12 @@ fn rebuild(ops: Vec<RunOp>, below: LogicalPlan) -> LogicalPlan {
                 direction: e.direction,
                 range: e.range,
                 into: e.into,
-                optional: false,
+                optional: None,
             },
             RunOp::Filter(expr) => LogicalPlan::Filter {
                 input: Box::new(plan),
                 expr,
+                optional: None,
             },
         };
     }
@@ -557,6 +562,7 @@ fn place_filters(
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 expr: filter.clone(),
+                optional: None,
             };
         }
     }

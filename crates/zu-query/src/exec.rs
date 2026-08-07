@@ -39,10 +39,15 @@
 //! output value per trail, with the rel variable bound to the edge
 //! list. That is the correctness-first baseline; the RecursiveBFS
 //! frontier engine with the hybrid morsel policy is milestone 4.
-//! OPTIONAL MATCH parses and plans but does not execute yet; it needs
-//! plan-level outer groups so a WHERE inside the optional part keeps
-//! its null-preserving semantics, and returns a clear error here
-//! rather than a wrong answer.
+//!
+//! OPTIONAL MATCH executes as a left-outer group. Every flatten the
+//! group needs on outer chunks sits below an `OptionalBegin` that
+//! yields each outer configuration exactly once per activation, the
+//! group's operators run above it, and `OptionalEnd` passes matches
+//! through or, when an outer configuration produced nothing, binds the
+//! group's chunks to a single null row. Filters born inside the
+//! optional clause compile into the group, so a WHERE there gates
+//! matches within the group instead of dropping the null row.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -294,6 +299,14 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             expr_text(expr, query),
             var(stage.chunk_slots[*chunk][0])
         ),
+        OpDesc::OptionalBegin => "OptionalBegin".into(),
+        OpDesc::OptionalEnd { chunks, .. } => {
+            let slots: Vec<usize> = chunks
+                .iter()
+                .flat_map(|&c| stage.chunk_slots[c].iter().copied())
+                .collect();
+            format!("Optional {}", slot_names(&slots, query))
+        }
     }
 }
 
@@ -462,6 +475,19 @@ enum OpDesc {
     Unwind {
         expr: BoundExpr,
         chunk: usize,
+    },
+    /// Bottom of an OPTIONAL MATCH group: yields the current outer
+    /// configuration exactly once per activation, so the group's
+    /// operators exhaust per outer row and a miss is detectable.
+    OptionalBegin,
+    /// Top of an OPTIONAL MATCH group: passes group matches through,
+    /// and when an outer configuration produced nothing, binds every
+    /// chunk the group introduced to a single null row.
+    OptionalEnd {
+        /// Index of the matching `OptionalBegin` in the stage.
+        begin: usize,
+        /// Chunks introduced inside the group, nulled on a miss.
+        chunks: Vec<usize>,
     },
 }
 
@@ -685,6 +711,210 @@ fn rel_steps(rel_slot: usize, query: &BoundQuery, schema: &Schema) -> Result<Vec
     Ok(steps)
 }
 
+/// The OPTIONAL MATCH group of a plan operator, `None` for required
+/// operators and for operators that never carry a group.
+fn optional_group(op: &LogicalPlan) -> Option<usize> {
+    match op {
+        LogicalPlan::ScanNodes { optional, .. }
+        | LogicalPlan::Expand { optional, .. }
+        | LogicalPlan::Filter { optional, .. } => *optional,
+        _ => None,
+    }
+}
+
+/// Compiles one ScanNodes, Expand, or Filter into the builder.
+/// `lookahead` is the next linear operator, offered for IndexLookup
+/// fusion; returns true when it was fused and the caller must skip it.
+/// Fusion requires the filter to share the scan's group, otherwise an
+/// optional `{id: k}` filter would fuse into a required scan and turn
+/// the left-outer group inner.
+fn compile_match_op(
+    b: &mut StageBuilder,
+    op: &LogicalPlan,
+    lookahead: Option<&LogicalPlan>,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> Result<bool> {
+    match op {
+        LogicalPlan::ScanNodes { slot, optional, .. } => {
+            let tables = query.variables[*slot].node_tables.clone();
+            if tables.is_empty() {
+                return Err(invalid(format!(
+                    "variable '{}' has no candidate node tables",
+                    query.variables[*slot].name
+                )));
+            }
+            let fused = lookahead.and_then(|next| match next {
+                LogicalPlan::Filter {
+                    expr,
+                    optional: fopt,
+                    ..
+                } if fopt == optional => index_key(expr, *slot),
+                _ => None,
+            });
+            let consumed = fused.is_some();
+            let chunk = b.new_chunk(vec![*slot], false);
+            if let Some(key) = fused {
+                b.descs.push(OpDesc::IndexLookup { tables, key, chunk });
+            } else {
+                b.descs.push(OpDesc::Scan { tables, chunk });
+            }
+            b.produced(chunk);
+            Ok(consumed)
+        }
+        LogicalPlan::Expand {
+            rel,
+            from,
+            to,
+            direction,
+            range,
+            into,
+            ..
+        } => {
+            let rels = rel_steps(*rel, query, schema)?;
+            let from_chunk = b
+                .slot_loc
+                .get(from)
+                .map(|&(c, _)| c)
+                .ok_or_else(|| invalid(format!("expand from unbound slot {from}")))?;
+            b.ensure_flat(from_chunk);
+            if let Some((min, max)) = range {
+                if *into {
+                    return Err(invalid(
+                        "variable-length patterns into a bound endpoint do not execute yet".into(),
+                    ));
+                }
+                let to_tables = query.variables[*to].node_tables.clone();
+                if to_tables.is_empty() {
+                    return Err(invalid(format!(
+                        "variable '{}' has no candidate node tables",
+                        query.variables[*to].name
+                    )));
+                }
+                let chunk = b.new_chunk(vec![*to, *rel], false);
+                b.descs.push(OpDesc::VarExpand {
+                    from: *from,
+                    direction: *direction,
+                    rels,
+                    min: min.unwrap_or(1),
+                    max: *max,
+                    to_tables,
+                    chunk,
+                });
+                b.produced(chunk);
+            } else if *into {
+                let to_chunk = b
+                    .slot_loc
+                    .get(to)
+                    .map(|&(c, _)| c)
+                    .ok_or_else(|| invalid(format!("expand into unbound slot {to}")))?;
+                b.ensure_flat(to_chunk);
+                // The probe result is a single edge, born flat.
+                let chunk = b.new_chunk(vec![*rel], true);
+                b.descs.push(OpDesc::ExpandInto {
+                    from: *from,
+                    to: *to,
+                    direction: *direction,
+                    rels,
+                    chunk,
+                });
+            } else {
+                let chunk = b.new_chunk(vec![*to, *rel], false);
+                b.descs.push(OpDesc::Expand {
+                    from: *from,
+                    direction: *direction,
+                    rels,
+                    chunk,
+                });
+                b.produced(chunk);
+            }
+            Ok(false)
+        }
+        LogicalPlan::Filter { expr, .. } => {
+            let unflat = b.unflat_of(expr)?;
+            let compact = match unflat.as_slice() {
+                [c] if b.compactable == Some(*c) => Some(*c),
+                _ => {
+                    for &c in &unflat {
+                        b.ensure_flat(c);
+                    }
+                    None
+                }
+            };
+            b.descs.push(OpDesc::Filter {
+                expr: expr.clone(),
+                compact,
+            });
+            Ok(false)
+        }
+        _ => unreachable!("compile_match_op only sees pattern operators"),
+    }
+}
+
+/// Compiles one OPTIONAL MATCH group: flattens for the outer chunks
+/// the group reads, then `OptionalBegin`, the group's operators, and
+/// the `OptionalEnd` that binds nulls on a miss. Returns the linear
+/// index just past the group.
+fn compile_optional_group(
+    b: &mut StageBuilder,
+    linear: &[&LogicalPlan],
+    start: usize,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> Result<usize> {
+    let group = optional_group(linear[start]);
+    let mut end = start + 1;
+    while end < linear.len() && optional_group(linear[end]) == group {
+        end += 1;
+    }
+    // Every outer chunk the group reads must flatten below the
+    // boundary, so one `OptionalBegin` activation is exactly one outer
+    // configuration and a miss is detectable per outer row. Slots the
+    // group introduces itself are not bound yet and fall through.
+    let mut read = BTreeSet::new();
+    for op in &linear[start..end] {
+        match op {
+            LogicalPlan::Expand { from, to, into, .. } => {
+                read.insert(*from);
+                if *into {
+                    read.insert(*to);
+                }
+            }
+            LogicalPlan::Filter { expr, .. } => expr_slots(expr, &mut read),
+            _ => {}
+        }
+    }
+    for slot in read {
+        if let Some(&(c, _)) = b.slot_loc.get(&slot) {
+            b.ensure_flat(c);
+        }
+    }
+    let begin = b.descs.len();
+    b.descs.push(OpDesc::OptionalBegin);
+    // Nothing below the boundary may compact through the group, and
+    // nothing above may compact through the `OptionalEnd`.
+    b.compactable = None;
+    let first_chunk = b.chunk_slots.len();
+    let mut i = start;
+    while i < end {
+        let lookahead = if i + 1 < end {
+            Some(linear[i + 1])
+        } else {
+            None
+        };
+        if compile_match_op(b, linear[i], lookahead, query, schema)? {
+            i += 1;
+        }
+        i += 1;
+    }
+    b.descs.push(OpDesc::OptionalEnd {
+        begin,
+        chunks: (first_chunk..b.chunk_slots.len()).collect(),
+    });
+    b.compactable = None;
+    Ok(end)
+}
+
 fn build_stages(
     plan: &LogicalPlan,
     query: &BoundQuery,
@@ -715,119 +945,18 @@ fn build_stages(
 
     let mut i = 0;
     while i < linear.len() {
+        if optional_group(linear[i]).is_some() {
+            i = compile_optional_group(&mut b, &linear, i, query, schema)?;
+            continue;
+        }
         match linear[i] {
             LogicalPlan::Empty => unreachable!("Empty never appears in the linearized ops"),
-            LogicalPlan::ScanNodes { slot, optional, .. } => {
-                if *optional {
-                    return Err(invalid("OPTIONAL MATCH does not execute yet".into()));
-                }
-                let tables = query.variables[*slot].node_tables.clone();
-                if tables.is_empty() {
-                    return Err(invalid(format!(
-                        "variable '{}' has no candidate node tables",
-                        query.variables[*slot].name
-                    )));
-                }
-                let fused = linear.get(i + 1).and_then(|op| match op {
-                    LogicalPlan::Filter { expr, .. } => index_key(expr, *slot),
-                    _ => None,
-                });
-                let chunk = b.new_chunk(vec![*slot], false);
-                if let Some(key) = fused {
-                    b.descs.push(OpDesc::IndexLookup { tables, key, chunk });
+            LogicalPlan::ScanNodes { .. }
+            | LogicalPlan::Expand { .. }
+            | LogicalPlan::Filter { .. } => {
+                if compile_match_op(&mut b, linear[i], linear.get(i + 1).copied(), query, schema)? {
                     i += 1;
-                } else {
-                    b.descs.push(OpDesc::Scan { tables, chunk });
                 }
-                b.produced(chunk);
-            }
-            LogicalPlan::Expand {
-                rel,
-                from,
-                to,
-                direction,
-                range,
-                into,
-                optional,
-                ..
-            } => {
-                if *optional {
-                    return Err(invalid("OPTIONAL MATCH does not execute yet".into()));
-                }
-                let rels = rel_steps(*rel, query, schema)?;
-                let from_chunk = b
-                    .slot_loc
-                    .get(from)
-                    .map(|&(c, _)| c)
-                    .ok_or_else(|| invalid(format!("expand from unbound slot {from}")))?;
-                b.ensure_flat(from_chunk);
-                if let Some((min, max)) = range {
-                    if *into {
-                        return Err(invalid(
-                            "variable-length patterns into a bound endpoint do not execute yet"
-                                .into(),
-                        ));
-                    }
-                    let to_tables = query.variables[*to].node_tables.clone();
-                    if to_tables.is_empty() {
-                        return Err(invalid(format!(
-                            "variable '{}' has no candidate node tables",
-                            query.variables[*to].name
-                        )));
-                    }
-                    let chunk = b.new_chunk(vec![*to, *rel], false);
-                    b.descs.push(OpDesc::VarExpand {
-                        from: *from,
-                        direction: *direction,
-                        rels,
-                        min: min.unwrap_or(1),
-                        max: *max,
-                        to_tables,
-                        chunk,
-                    });
-                    b.produced(chunk);
-                } else if *into {
-                    let to_chunk = b
-                        .slot_loc
-                        .get(to)
-                        .map(|&(c, _)| c)
-                        .ok_or_else(|| invalid(format!("expand into unbound slot {to}")))?;
-                    b.ensure_flat(to_chunk);
-                    // The probe result is a single edge, born flat.
-                    let chunk = b.new_chunk(vec![*rel], true);
-                    b.descs.push(OpDesc::ExpandInto {
-                        from: *from,
-                        to: *to,
-                        direction: *direction,
-                        rels,
-                        chunk,
-                    });
-                } else {
-                    let chunk = b.new_chunk(vec![*to, *rel], false);
-                    b.descs.push(OpDesc::Expand {
-                        from: *from,
-                        direction: *direction,
-                        rels,
-                        chunk,
-                    });
-                    b.produced(chunk);
-                }
-            }
-            LogicalPlan::Filter { expr, .. } => {
-                let unflat = b.unflat_of(expr)?;
-                let compact = match unflat.as_slice() {
-                    [c] if b.compactable == Some(*c) => Some(*c),
-                    _ => {
-                        for &c in &unflat {
-                            b.ensure_flat(c);
-                        }
-                        None
-                    }
-                };
-                b.descs.push(OpDesc::Filter {
-                    expr: expr.clone(),
-                    compact,
-                });
             }
             LogicalPlan::Unwind { expr, slot, .. } => {
                 for c in b.unflat_of(expr)? {
@@ -1045,6 +1174,7 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
     match &descs[i] {
         OpDesc::Source | OpDesc::Flatten { .. } => 1,
         OpDesc::Filter { compact: None, .. } => 1,
+        OpDesc::OptionalBegin | OpDesc::OptionalEnd { .. } => 1,
         OpDesc::Filter {
             compact: Some(c), ..
         } => ctx.chunks[*c].size as u64,
@@ -1292,7 +1422,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
             }
-            let (table, offset) = node_value(value_of(ctx, *from)?, "expand")?;
+            // A null source, from an optional miss upstream, matches
+            // nothing.
+            let v = value_of(ctx, *from)?;
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let (table, offset) = node_value(v, "expand")?;
             let mut far = Vec::new();
             let mut rel_vals = Vec::new();
             for step in rels {
@@ -1357,7 +1493,11 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
             }
-            let (table, offset) = node_value(value_of(ctx, *from)?, "var expand")?;
+            let v = value_of(ctx, *from)?;
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let (table, offset) = node_value(v, "var expand")?;
             let mut far = Vec::new();
             let mut trails = Vec::new();
             let mut path = Vec::new();
@@ -1394,8 +1534,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
             }
-            let (ft, fo) = node_value(value_of(ctx, *from)?, "expand into")?;
-            let (tt, to_off) = node_value(value_of(ctx, *to)?, "expand into")?;
+            let fv = value_of(ctx, *from)?;
+            let tv = value_of(ctx, *to)?;
+            if matches!(fv, Value::Null) || matches!(tv, Value::Null) {
+                continue;
+            }
+            let (ft, fo) = node_value(fv, "expand into")?;
+            let (tt, to_off) = node_value(tv, "expand into")?;
             let mut hit = None;
             for step in rels {
                 if matches!(direction, RelDirection::Out | RelDirection::Undirected)
@@ -1475,6 +1620,45 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             c.cols[0] = items;
             c.cur = None;
             return Ok(true);
+        },
+        OpDesc::OptionalBegin => {
+            if ctx.states[i].active {
+                return Ok(false);
+            }
+            if !next(descs, ctx, i - 1)? {
+                return Ok(false);
+            }
+            ctx.states[i].active = true;
+            Ok(true)
+        }
+        OpDesc::OptionalEnd { begin, chunks } => loop {
+            if next(descs, ctx, i - 1)? {
+                // `pos` doubles as the emitted flag for the current
+                // outer configuration.
+                ctx.states[i].pos = 1;
+                return Ok(true);
+            }
+            if !ctx.states[*begin].active {
+                // The begin never yielded: the outer input is done.
+                return Ok(false);
+            }
+            let missed = ctx.states[i].pos == 0;
+            // Rearm the group for the next outer configuration.
+            for s in &mut ctx.states[*begin..i] {
+                *s = OpState::default();
+            }
+            ctx.states[i].pos = 0;
+            if missed {
+                for &c in chunks {
+                    let chunk = &mut ctx.chunks[c];
+                    for col in &mut chunk.cols {
+                        *col = vec![Value::Null];
+                    }
+                    chunk.size = 1;
+                    chunk.cur = Some(0);
+                }
+                return Ok(true);
+            }
         },
     }
 }
@@ -2758,6 +2942,120 @@ mod tests {
     }
 
     #[test]
+    fn optional_match_keeps_rows_without_a_match() {
+        // Edges into {4, 5}: 2->4, 3->4, 4->5. The other three people
+        // keep their row with a null friend, which is exactly what an
+        // inner gate would destroy.
+        let r = run(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id >= 4 \
+             RETURN a.id AS id, b.id AS friend ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Null],
+                [Value::Int(1), Value::Null],
+                [Value::Int(2), Value::Int(4)],
+                [Value::Int(3), Value::Int(4)],
+                [Value::Int(4), Value::Int(5)],
+                [Value::Int(5), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_props_never_fuse_into_the_outer_scan() {
+        // The `{id: 2}` filter belongs to the optional group. Fusing it
+        // into the outer scan would shrink the scan to one person and
+        // silently turn the left-outer join inner.
+        let r = run(
+            "MATCH (a:Person) OPTIONAL MATCH (a {id: 2})-[:KNOWS]->(b) \
+             RETURN a.id AS id, b.id AS friend ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Null],
+                [Value::Int(1), Value::Null],
+                [Value::Int(2), Value::Int(4)],
+                [Value::Int(3), Value::Null],
+                [Value::Int(4), Value::Null],
+                [Value::Int(5), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_scan_miss_binds_null() {
+        let r = run(
+            "MATCH (a:Person {id: 0}) OPTIONAL MATCH (b:Person {id: 99}) \
+             RETURN a.id AS a, b.id AS b",
+            &[],
+        );
+        assert_eq!(r.rows, [[Value::Int(0), Value::Null]]);
+    }
+
+    #[test]
+    fn chained_optional_matches_propagate_null() {
+        // The second optional expands from b, which is null wherever
+        // the first group missed; a null source matches nothing, so
+        // the place stays null instead of erroring.
+        let r = run(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 \
+             OPTIONAL MATCH (b)-[:IS_LOCATED_IN]->(p) \
+             RETURN a.id AS id, b.id AS friend, p.id AS place ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Null, Value::Null],
+                [Value::Int(1), Value::Null, Value::Null],
+                [Value::Int(2), Value::Int(4), Value::Int(1)],
+                [Value::Int(3), Value::Int(4), Value::Int(1)],
+                [Value::Int(4), Value::Int(5), Value::Int(2)],
+                [Value::Int(5), Value::Null, Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_counts_skip_missing_values() {
+        // count(a) sees every outer row, count(b) skips the nulls the
+        // misses produced.
+        let r = run(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id >= 4 \
+             RETURN count(a) AS people, count(b) AS friends",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[6, 3]]);
+    }
+
+    #[test]
+    fn multi_hop_optional_resets_per_outer_row() {
+        // Two-hop trails ending at 0: only 4 -> 5 -> 0. The in-group
+        // flatten between the expands must rearm per outer row.
+        let r = run(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) \
+             WHERE c.id = 0 RETURN a.id AS id, c.id AS c ORDER BY id",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Null],
+                [Value::Int(1), Value::Null],
+                [Value::Int(2), Value::Null],
+                [Value::Int(3), Value::Null],
+                [Value::Int(4), Value::Int(0)],
+                [Value::Int(5), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
     fn flat_mode_matches_factorized_execution() {
         let cases: &[(&str, &[(&str, Value)])] = &[
             (
@@ -2790,6 +3088,22 @@ mod tests {
             (
                 "MATCH (a:Person {id: 0})-[r:KNOWS*1..3]->(b) \
                  RETURN b.id AS b, size(r) AS hops",
+                &[],
+            ),
+            (
+                "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id >= 4 \
+                 RETURN a.id AS id, b.id AS friend",
+                &[],
+            ),
+            (
+                "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) \
+                 WHERE c.id = 0 RETURN a.id AS id, c.id AS c",
+                &[],
+            ),
+            (
+                "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 \
+                 OPTIONAL MATCH (b)-[:IS_LOCATED_IN]->(p) \
+                 RETURN a.id AS id, count(p) AS places",
                 &[],
             ),
         ];

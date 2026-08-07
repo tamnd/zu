@@ -33,11 +33,12 @@ use crate::keys::{KeyIndex, KeyReader, write_key_index};
 use crate::meta;
 use crate::segment::{SegmentMeta, probe, read_range, read_segment, write_segment};
 
-// Version 6 added the has_keys byte and the primary-key index segments
-// to the header, so version 5 files must fail as unsupported here rather
-// than misread downstream. Version 5 had widened SegmentMeta with the
+// Version 7 widened SegmentMeta with the structural layout byte for
+// FullZip, so version 6 files must fail as unsupported here rather than
+// misread downstream. Version 6 had added the has_keys byte and the
+// primary-key index segments to the header, version 5 the SegmentMeta
 // zone map, version 4 the per-chunk fence array.
-const DIRECTORY_VERSION: u16 = 6;
+const DIRECTORY_VERSION: u16 = 7;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -135,10 +136,10 @@ impl Directory {
             }
             flag => return Err(corrupt(&format!("has_keys byte is {flag}"))),
         };
-        // A group entry is at least 196 bytes (row count plus four empty
+        // A group entry is at least 200 bytes (row count plus four empty
         // segment metas), so a count the payload cannot hold is rejected
         // before it sizes an allocation.
-        if group_count > bytes.len().saturating_sub(pos) / 196 {
+        if group_count > bytes.len().saturating_sub(pos) / 200 {
             return Err(corrupt("truncated group entry"));
         }
         let mut groups = Vec::with_capacity(group_count);

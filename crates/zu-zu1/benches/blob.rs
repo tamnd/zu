@@ -76,9 +76,9 @@ fn synthetic() -> Corpus {
         ends: Vec::new(),
     };
     for i in 0..SYNTHETIC_ROWS {
-        corpus
-            .buf
-            .extend_from_slice(format!("https://example.com/user/{}/posts?page={}", i * 37, i % 12).as_bytes());
+        corpus.buf.extend_from_slice(
+            format!("https://example.com/user/{}/posts?page={}", i * 37, i % 12).as_bytes(),
+        );
         corpus.ends.push(corpus.buf.len() as u64);
     }
     println!("data: synthetic {SYNTHETIC_ROWS} url rows, set ZU_DATA for real input");
@@ -141,9 +141,16 @@ fn main() {
             corpus.ends[gi * GROUP_ROWS - 1] as usize
         };
         let hi = corpus.ends[((gi + 1) * GROUP_ROWS).min(n) - 1] as usize;
-        assert_eq!(bytes, corpus.buf[lo..hi], "segment {gi} disagrees with the source");
+        assert_eq!(
+            bytes,
+            corpus.buf[lo..hi],
+            "segment {gi} disagrees with the source"
+        );
     }
-    println!("fullzip scan crosscheck: {} segments match the source", metas.len());
+    println!(
+        "fullzip scan crosscheck: {} segments match the source",
+        metas.len()
+    );
 
     let mut best = f64::MAX;
     for _ in 0..3 {
@@ -173,8 +180,13 @@ fn main() {
         let row = (rng % n as u64) as usize;
         out.clear();
         let t = Instant::now();
-        fullzip::read_blob_row(&mut db, &metas[row / GROUP_ROWS], (row % GROUP_ROWS) as u64, &mut out)
-            .expect("row read");
+        fullzip::read_blob_row(
+            &mut db,
+            &metas[row / GROUP_ROWS],
+            (row % GROUP_ROWS) as u64,
+            &mut out,
+        )
+        .expect("row read");
         lat.push(t.elapsed());
         assert_eq!(out, corpus.row(row), "row {row} disagrees with the source");
     }

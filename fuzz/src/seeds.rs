@@ -175,5 +175,41 @@ fn main() {
     let mut rd = Vec::new();
     zu_encoding::alp_rd::encode(&radians, &mut rd);
     write_seed(&corpus.join("decode_alp_rd"), "radians", &rd);
+
+    // Real query shapes for the parser target, LDBC interactive style,
+    // so mutation starts from text that reaches deep into the grammar.
+    let queries: &[(&str, &str)] = &[
+        (
+            "is1-profile",
+            "MATCH (n:Person {id: $personId})-[:IS_LOCATED_IN]->(p:Place) \
+             RETURN n.firstName AS firstName, n.lastName AS lastName, p.id AS cityId",
+        ),
+        (
+            "ic1-friends",
+            "MATCH (p:Person {id: $personId})-[:KNOWS*1..3]-(friend:Person {firstName: $firstName}) \
+             WHERE friend.id <> $personId \
+             RETURN DISTINCT friend.id AS friendId, friend.lastName AS lastName \
+             ORDER BY friendId ASC LIMIT 20",
+        ),
+        (
+            "aggregate",
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS friends WHERE friends > 5 \
+             RETURN a.name, friends ORDER BY friends DESC, a.name SKIP 2 LIMIT 10",
+        ),
+        (
+            "unwind-expr",
+            "UNWIND [1, 2.5, 'x', NULL, $p] AS v \
+             MATCH (n) WHERE NOT n.age + 1 * 2 >= 10 AND n.name STARTS WITH 'A' \
+             OR n.id IN [1, 2] AND n.bio IS NOT NULL RETURN v, n LIMIT 1",
+        ),
+        (
+            "paths",
+            "MATCH q = (a)<-[r:LIKES|FOLLOWS {since: 2020}]-(b), (b)-[*..4]-(c:`odd label`) \
+             OPTIONAL MATCH (c)--(d) RETURN *",
+        ),
+    ];
+    for (name, text) in queries {
+        write_seed(&corpus.join("zuql_parse"), name, text.as_bytes());
+    }
     println!("seeds written under {}", corpus.display());
 }

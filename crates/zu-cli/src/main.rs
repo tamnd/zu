@@ -95,16 +95,15 @@ fn main() -> ExitCode {
                     std::path::Path::new(out),
                     reorder,
                 ),
-                _ => {
-                    usage_error("zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1>")
-                }
+                _ => usage_error(
+                    "zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1>",
+                ),
             }
         }
         Some("convert") => match (args.get(1), args.get(2)) {
-            (Some(input), Some(output)) => convert(
-                std::path::Path::new(input),
-                std::path::Path::new(output),
-            ),
+            (Some(input), Some(output)) => {
+                convert(std::path::Path::new(input), std::path::Path::new(output))
+            }
             _ => usage_error("zu convert <edges.txt|csv|parquet> <out.csv|parquet>"),
         },
         Some(cmd) => {

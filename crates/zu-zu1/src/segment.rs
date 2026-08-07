@@ -455,6 +455,102 @@ pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Chun
     Ok(ChunkDirectory { ends, fences })
 }
 
+/// Decoded chunks held by a reader between lookups, one slot per chunk
+/// filled on first touch and kept. Warm means touched before: a lookup
+/// that lands on a held chunk costs a binary search, no block read and
+/// no decode, which is the B2 budget. Memory is bounded by the decoded
+/// segment, the same order as the group cache the graph reader keeps;
+/// eviction is the buffer manager's job (docs/09, M3).
+#[derive(Debug, Default)]
+pub struct ChunkCache {
+    chunks: Vec<Vec<u64>>,
+}
+
+/// Decodes chunk `target` of `meta`'s segment through `cache`, reusing
+/// the held values when the chunk was decoded before.
+pub fn cached_chunk<'a>(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    dir: &ChunkDirectory,
+    cache: &'a mut ChunkCache,
+    target: usize,
+) -> Result<&'a [u64]> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    let chunks = meta.chunk_count();
+    if dir.ends.len() != chunks || target >= chunks {
+        return Err(corrupt("chunk directory disagrees with meta"));
+    }
+    if cache.chunks.is_empty() {
+        cache.chunks.resize(chunks, Vec::new());
+    }
+    if cache.chunks[target].is_empty() {
+        let body_off = 4 + chunks * 12;
+        let body_start = if target == 0 {
+            0
+        } else {
+            dir.ends[target - 1] as usize
+        };
+        let body_end = dir.ends[target] as usize;
+        if body_start > body_end || body_off + body_end > meta.payload_len as usize {
+            return Err(corrupt("chunk index not monotone"));
+        }
+        let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
+        let mut values = Vec::with_capacity(meta.chunk_rows(target));
+        enc::decode_any(&bytes, meta.chunk_rows(target), &mut values)?;
+        if values.len() != meta.chunk_rows(target) {
+            return Err(corrupt("chunk count disagrees with meta"));
+        }
+        cache.chunks[target] = values;
+    }
+    Ok(&cache.chunks[target])
+}
+
+/// [`find_in_sorted`] through a decoded-chunk cache: a warm lookup that
+/// lands on the cached chunk costs a fence partition point and a binary
+/// search, no read and no decode.
+pub fn find_in_sorted_cached(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    dir: &ChunkDirectory,
+    cache: &mut ChunkCache,
+    value: u64,
+) -> Result<Option<u64>> {
+    if meta.value_count == 0 || value < meta.min || value > meta.max {
+        return Ok(None);
+    }
+    let target = dir.fences.partition_point(|&f| f < value);
+    if target == meta.chunk_count() {
+        return Ok(None);
+    }
+    let chunk = cached_chunk(db, meta, dir, cache, target)?;
+    Ok(chunk
+        .binary_search(&value)
+        .ok()
+        .map(|i| (target * CHUNK_ROWS + i) as u64))
+}
+
+/// Reads the single value at `pos` through a decoded-chunk cache, the
+/// warm point companion of [`read_range`].
+pub fn read_one_cached(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    dir: &ChunkDirectory,
+    cache: &mut ChunkCache,
+    pos: u64,
+) -> Result<u64> {
+    if pos >= meta.value_count {
+        return Err(ZuError::InvalidArgument(format!(
+            "position {pos} out of 0..{}",
+            meta.value_count
+        )));
+    }
+    let chunk = cached_chunk(db, meta, dir, cache, pos as usize / CHUNK_ROWS)?;
+    Ok(chunk[pos as usize % CHUNK_ROWS])
+}
+
 /// Position of `value` in a segment whose rows are sorted ascending, or
 /// `None` when absent. The fences name the single chunk that could hold
 /// the value, so a hit costs one chunk decode; the zone map answers

@@ -126,14 +126,29 @@ pub trait Graph {
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
+    /// An independent reader over the same storage for a morsel
+    /// worker, with its own decoded-state caches. The default `None`
+    /// keeps every query on one thread; engines that can open a second
+    /// handle override it. A fork only ever reads.
+    fn fork(&self) -> Option<Box<dyn Graph + Send>> {
+        None
+    }
 }
 
 /// Execution switches. `flat` forces tuple-at-a-time execution by
 /// flattening after every producer, the differential oracle for the
-/// factorized paths.
+/// factorized paths; flat runs also stay single-threaded so the
+/// oracle is the fully sequential baseline.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub flat: bool,
+    /// Worker threads for morsel-parallel stages: 0 picks
+    /// `min(cores, 8)` per docs/02, 1 forces sequential execution.
+    pub threads: usize,
+    /// Rows per morsel, 0 picks the 2048-tuple target from docs/02.
+    /// Smaller values force many morsels on small graphs, which is how
+    /// the tests drive the parallel path over the mock fixtures.
+    pub morsel_rows: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1489,18 @@ impl std::hash::Hasher for EdgeHasher {
 
 type EdgeSet = std::collections::HashSet<(u64, u64), std::hash::BuildHasherDefault<EdgeHasher>>;
 
+/// One unit of parallel work: a row range of one node table, handed
+/// to the stage's driving scan. Ranges are multiples of the 2048-tuple
+/// target, which divides every power-of-two node-group size, so a
+/// morsel never spans groups and each worker's reader decodes a group
+/// exactly once.
+#[derive(Debug, Clone, Copy)]
+struct Morsel {
+    table: u32,
+    start: u64,
+    end: u64,
+}
+
 struct StageCtx<'a> {
     graph: &'a mut dyn Graph,
     params: &'a [Value],
@@ -1489,8 +1516,14 @@ struct StageCtx<'a> {
     /// The accumulated edge sets of each ASP join, keyed by operator
     /// index and built on the join's first pull, one set per rel step
     /// in storage orientation. Deliberately outside `states` so an
-    /// optional group's rearm never throws the accumulate away.
+    /// optional group's rearm never throws the accumulate away, and
+    /// kept across morsels so a worker accumulates once per query.
     edge_sets: BTreeMap<usize, Vec<EdgeSet>>,
+    /// The row range a parallel worker's driving scan is bounded to,
+    /// `None` on sequential runs. Only the scan at operator index 1
+    /// consults it; any later scan in the pipeline still iterates its
+    /// whole domain per pull.
+    morsel: Option<Morsel>,
     /// One entry per operator when profiling, empty otherwise.
     stats: Vec<OpStats>,
 }
@@ -1745,17 +1778,28 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             Ok(true)
         }
         OpDesc::Scan { tables, chunk } => loop {
+            let morsel = if i == 1 { ctx.morsel } else { None };
             if !ctx.states[i].active {
                 if !next(descs, ctx, i - 1)? {
                     return Ok(false);
                 }
                 ctx.states[i] = OpState {
                     active: true,
+                    offset: morsel.map_or(0, |m| m.start),
                     ..OpState::default()
                 };
             }
             let mut vals = Vec::with_capacity(VECTOR_SIZE);
-            {
+            if let Some(m) = morsel {
+                let st = &mut ctx.states[i];
+                while vals.len() < VECTOR_SIZE && st.offset < m.end {
+                    vals.push(Value::Node {
+                        table: m.table,
+                        offset: st.offset,
+                    });
+                    st.offset += 1;
+                }
+            } else {
                 let st = &mut ctx.states[i];
                 while vals.len() < VECTOR_SIZE && st.table_ix < tables.len() {
                     let table = tables[st.table_ix];
@@ -2731,6 +2775,50 @@ impl AggState {
             Acc::Collect(items) => Value::List(items),
         })
     }
+
+    /// Folds the partial state of a later morsel into this one. Merging
+    /// morsel partials in morsel order keeps `collect()` identical to
+    /// the sequential run; both states come from the same spec, so the
+    /// variants always line up.
+    fn merge(&mut self, other: AggState) -> Result<()> {
+        if let (Some(mine), Some(theirs)) = (&mut self.distinct, other.distinct) {
+            mine.extend(theirs);
+            return Ok(());
+        }
+        match (&mut self.acc, other.acc) {
+            (Acc::Count(n), Acc::Count(m)) => *n += m,
+            (Acc::Sum(a), Acc::Sum(b)) => {
+                *a = match (a.take(), b) {
+                    (Some(x), Some(y)) => Some(arith(BinaryOp::Add, x, y)?),
+                    (x, y) => x.or(y),
+                };
+            }
+            (Acc::Avg { sum, n }, Acc::Avg { sum: s2, n: n2 }) => {
+                *sum += s2;
+                *n += n2;
+            }
+            (Acc::Min(cur), Acc::Min(Some(v))) => {
+                if cur
+                    .as_ref()
+                    .is_none_or(|c| OrdValue(v.clone()) < OrdValue(c.clone()))
+                {
+                    *cur = Some(v);
+                }
+            }
+            (Acc::Max(cur), Acc::Max(Some(v))) => {
+                if cur
+                    .as_ref()
+                    .is_none_or(|c| OrdValue(v.clone()) > OrdValue(c.clone()))
+                {
+                    *cur = Some(v);
+                }
+            }
+            (Acc::Min(_), Acc::Min(None)) | (Acc::Max(_), Acc::Max(None)) => {}
+            (Acc::Collect(items), Acc::Collect(more)) => items.extend(more),
+            _ => unreachable!("morsel partials built from the same aggregate spec"),
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2978,6 +3066,238 @@ fn run_stage(stage: &StageDef, query: &BoundQuery, ctx: &mut StageCtx) -> Result
     Ok(rows.into_iter().map(|r| r.values).collect())
 }
 
+// ---------------------------------------------------------------------------
+// Morsel scheduler
+// ---------------------------------------------------------------------------
+
+/// Splits a stage's driving scan into morsels when the stage is driven
+/// by a whole-table scan whose domain spans more than one morsel.
+/// Seeded stages driven by an index lookup and later stages fed by the
+/// previous stage's rows stay sequential: their driver is one probe or
+/// one buffered row set, not a table sweep.
+fn plan_morsels(
+    stage: &StageDef,
+    counts: &BTreeMap<u32, u64>,
+    morsel_rows: usize,
+) -> Option<Vec<Morsel>> {
+    let [OpDesc::Source, OpDesc::Scan { tables, .. }, ..] = &stage.descs[..] else {
+        return None;
+    };
+    let step = if morsel_rows == 0 {
+        VECTOR_SIZE as u64
+    } else {
+        morsel_rows as u64
+    };
+    let mut morsels = Vec::new();
+    for &table in tables {
+        let count = *counts.get(&table).unwrap_or(&0);
+        let mut start = 0;
+        while start < count {
+            let end = (start + step).min(count);
+            morsels.push(Morsel { table, start, end });
+            start = end;
+        }
+    }
+    (morsels.len() > 1).then_some(morsels)
+}
+
+/// What one morsel produced: group partials under an aggregating sink,
+/// materialized rows otherwise. Partials merge on the main thread in
+/// morsel order, which is scan order, so the merged result is exactly
+/// what the sequential run produces.
+enum MorselOut {
+    Groups(BTreeMap<Vec<OrdValue>, Vec<AggState>>),
+    Rows(Vec<Row>),
+}
+
+/// Everything a worker shares read-only while driving a stage.
+struct StageJob<'a> {
+    stage: &'a StageDef,
+    query: &'a BoundQuery,
+    counts: &'a BTreeMap<u32, u64>,
+    params: &'a [Value],
+}
+
+/// The crossbeam work-finding loop: pop the local deque, refill it
+/// from the global injector, steal from a sibling, and retry while any
+/// steal reports contention.
+fn find_task<T>(
+    local: &crossbeam_deque::Worker<T>,
+    injector: &crossbeam_deque::Injector<T>,
+    stealers: &[crossbeam_deque::Stealer<T>],
+) -> Option<T> {
+    local.pop().or_else(|| {
+        std::iter::repeat_with(|| {
+            injector
+                .steal_batch_and_pop(local)
+                .or_else(|| stealers.iter().map(|s| s.steal()).collect())
+        })
+        .find(|s| !s.is_retry())
+        .and_then(|s| s.success())
+    })
+}
+
+/// One worker's life: claim morsels until the pool runs dry, driving
+/// the whole operator pipeline over each with this worker's own graph
+/// reader. Chunks and states reset per morsel; the ASP edge sets
+/// survive across morsels, so each worker accumulates once per query.
+fn drive_worker(
+    job: &StageJob,
+    graph: &mut dyn Graph,
+    local: &crossbeam_deque::Worker<(usize, Morsel)>,
+    injector: &crossbeam_deque::Injector<(usize, Morsel)>,
+    stealers: &[crossbeam_deque::Stealer<(usize, Morsel)>],
+) -> Result<Vec<(usize, MorselOut)>> {
+    let stage = job.stage;
+    let sink = &stage.sink;
+    let top = stage.descs.len() - 1;
+    let mut ctx = StageCtx {
+        graph,
+        params: job.params,
+        counts: job.counts,
+        slot_loc: &stage.slot_loc,
+        chunks: Vec::new(),
+        states: Vec::new(),
+        rows: Vec::new(),
+        overlay: BTreeMap::new(),
+        scratch: Vec::new(),
+        edge_sets: BTreeMap::new(),
+        morsel: None,
+        stats: Vec::new(),
+    };
+    let mut out = Vec::new();
+    while let Some((ix, morsel)) = find_task(local, injector, stealers) {
+        ctx.chunks = stage
+            .chunk_slots
+            .iter()
+            .map(|slots| Chunk {
+                cols: vec![Vec::new(); slots.len()],
+                ..Chunk::default()
+            })
+            .collect();
+        ctx.states = vec![OpState::default(); stage.descs.len()];
+        ctx.overlay.clear();
+        ctx.morsel = Some(morsel);
+        if sink.aggregate {
+            let mut groups = BTreeMap::new();
+            while next(&stage.descs, &mut ctx, top)? {
+                update_groups(sink, &stage.unflat, &mut ctx, &mut groups)?;
+            }
+            out.push((ix, MorselOut::Groups(groups)));
+        } else {
+            let mut rows = Vec::new();
+            while next(&stage.descs, &mut ctx, top)? {
+                each_config(&mut ctx, &stage.unflat, &mut |ctx| {
+                    rows.push(materialize(sink, job.query, ctx)?);
+                    Ok(())
+                })?;
+            }
+            out.push((ix, MorselOut::Rows(rows)));
+        }
+    }
+    Ok(out)
+}
+
+/// Runs one scan-driven stage across the worker pool: morsels go into
+/// a global injector, every worker owns a crossbeam deque and steals
+/// when its own runs dry, the caller's thread drives the caller's
+/// graph as worker zero, and each fork carries one spawned worker.
+/// Partials merge in morsel order and the sink's finalize and post
+/// operators run once on the merged result.
+fn run_stage_parallel(
+    job: &StageJob,
+    graph: &mut dyn Graph,
+    forks: &mut [Box<dyn Graph + Send>],
+    morsels: Vec<Morsel>,
+) -> Result<Vec<Vec<Value>>> {
+    let total = morsels.len();
+    let injector = crossbeam_deque::Injector::new();
+    for task in morsels.into_iter().enumerate() {
+        injector.push(task);
+    }
+    let workers = (forks.len() + 1).min(total);
+    let mut locals: Vec<crossbeam_deque::Worker<(usize, Morsel)>> = (0..workers)
+        .map(|_| crossbeam_deque::Worker::new_lifo())
+        .collect();
+    let stealers: Vec<_> = locals.iter().map(|w| w.stealer()).collect();
+    let main_local = locals.remove(0);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = locals
+            .into_iter()
+            .zip(forks.iter_mut())
+            .map(|(local, fork)| {
+                let injector = &injector;
+                let stealers = &stealers[..];
+                scope.spawn(move || drive_worker(job, fork.as_mut(), &local, injector, stealers))
+            })
+            .collect();
+        let mut all = vec![drive_worker(job, graph, &main_local, &injector, &stealers)];
+        for handle in handles {
+            all.push(
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(invalid("a morsel worker panicked".into()))),
+            );
+        }
+        all
+    });
+    let mut outs: Vec<Option<MorselOut>> = std::iter::repeat_with(|| None).take(total).collect();
+    for result in results {
+        for (ix, out) in result? {
+            outs[ix] = Some(out);
+        }
+    }
+    let stage = job.stage;
+    let sink = &stage.sink;
+    let mut ctx = StageCtx {
+        graph,
+        params: job.params,
+        counts: job.counts,
+        slot_loc: &stage.slot_loc,
+        chunks: Vec::new(),
+        states: Vec::new(),
+        rows: Vec::new(),
+        overlay: BTreeMap::new(),
+        scratch: Vec::new(),
+        edge_sets: BTreeMap::new(),
+        morsel: None,
+        stats: Vec::new(),
+    };
+    let mut rows = Vec::new();
+    if sink.aggregate {
+        let mut groups: BTreeMap<Vec<OrdValue>, Vec<AggState>> = BTreeMap::new();
+        for out in outs.into_iter().flatten() {
+            let MorselOut::Groups(part) = out else {
+                unreachable!("aggregating sinks produce group partials");
+            };
+            for (key, states) in part {
+                if let Some(mine) = groups.get_mut(&key) {
+                    for (state, theirs) in mine.iter_mut().zip(states) {
+                        state.merge(theirs)?;
+                    }
+                } else {
+                    groups.insert(key, states);
+                }
+            }
+        }
+        if groups.is_empty() && sink.items.iter().all(|it| it.aggregate) {
+            groups.insert(Vec::new(), sink.aggs.iter().map(AggState::new).collect());
+        }
+        for (keyvals, states) in groups {
+            rows.push(finalize_group(sink, job.query, &mut ctx, keyvals, states)?);
+        }
+    } else {
+        for out in outs.into_iter().flatten() {
+            let MorselOut::Rows(part) = out else {
+                unreachable!("row sinks produce row partials");
+            };
+            rows.extend(part);
+        }
+    }
+    let rows = apply_post(sink, &mut ctx, rows)?;
+    Ok(rows.into_iter().map(|r| r.values).collect())
+}
+
 fn stage_profile(
     stage: &StageDef,
     query: &BoundQuery,
@@ -3019,8 +3339,41 @@ fn run_stages(
         .iter()
         .map(|n| (n.id, n.node_count))
         .collect();
+    let auto = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    let threads = if options.threads == 0 {
+        auto
+    } else {
+        options.threads
+    };
+    // Worker readers, forked once on the first parallel stage and
+    // reused for the rest of the query. Profiled runs stay sequential
+    // so per-operator counters keep their one-linear-chain meaning,
+    // and flat runs stay sequential because the differential oracle is
+    // the fully sequential baseline.
+    let mut forks: Option<Vec<Box<dyn Graph + Send>>> = None;
     let mut rows = Vec::new();
     for stage in &stages {
+        if threads > 1
+            && profile.is_none()
+            && !options.flat
+            && let Some(morsels) = plan_morsels(stage, &counts, options.morsel_rows)
+        {
+            let forks = forks.get_or_insert_with(|| {
+                (1..threads.min(morsels.len()))
+                    .map_while(|_| graph.fork())
+                    .collect()
+            });
+            if !forks.is_empty() {
+                let job = StageJob {
+                    stage,
+                    query,
+                    counts: &counts,
+                    params,
+                };
+                rows = run_stage_parallel(&job, graph, forks, morsels)?;
+                continue;
+            }
+        }
         let mut ctx = StageCtx {
             graph: &mut *graph,
             params,
@@ -3039,6 +3392,7 @@ fn run_stages(
             overlay: BTreeMap::new(),
             scratch: Vec::new(),
             edge_sets: BTreeMap::new(),
+            morsel: None,
             stats: if profile.is_some() {
                 vec![OpStats::default(); stage.descs.len()]
             } else {
@@ -3195,9 +3549,15 @@ mod tests {
                 other => Err(invalid(format!("unknown property '{other}'"))),
             }
         }
+
+        fn fork(&self) -> Option<Box<dyn Graph + Send>> {
+            Some(Box::new(MockGraph {
+                edges: self.edges.clone(),
+            }))
+        }
     }
 
-    fn run_with(source: &str, params: &[(&str, Value)], flat: bool) -> QueryResult {
+    fn run_opts(source: &str, params: &[(&str, Value)], options: Options) -> QueryResult {
         let schema = schema();
         let parsed = crate::parser::parse(source).expect("parse");
         let query = crate::binder::bind(&parsed, &schema).expect("bind");
@@ -3212,19 +3572,38 @@ mod tests {
             args.push(v.clone());
         }
         let mut graph = mock();
-        execute(
-            &optimized,
-            &query,
-            &schema,
-            &mut graph,
-            &args,
-            &Options { flat },
+        execute(&optimized, &query, &schema, &mut graph, &args, &options).expect("execute")
+    }
+
+    fn run_with(source: &str, params: &[(&str, Value)], flat: bool) -> QueryResult {
+        run_opts(
+            source,
+            params,
+            Options {
+                flat,
+                threads: 1,
+                ..Options::default()
+            },
         )
-        .expect("execute")
     }
 
     fn run(source: &str, params: &[(&str, Value)]) -> QueryResult {
         run_with(source, params, false)
+    }
+
+    /// Runs morsel-parallel with 2-row morsels over four workers, so
+    /// the 6-person mock splits into three morsels and the scheduler
+    /// path actually executes.
+    fn run_par(source: &str, params: &[(&str, Value)]) -> QueryResult {
+        run_opts(
+            source,
+            params,
+            Options {
+                threads: 4,
+                morsel_rows: 2,
+                ..Options::default()
+            },
+        )
     }
 
     fn int_rows(result: &QueryResult) -> Vec<Vec<i64>> {
@@ -3926,6 +4305,48 @@ mod tests {
                 sorted(fac.rows.clone()),
                 sorted(flat.rows.clone()),
                 "flat and factorized disagree on: {source}"
+            );
+        }
+    }
+
+    /// The scheduler's contract is stronger than same-rows: partials
+    /// merge in morsel order, which is scan order, so a parallel run
+    /// must reproduce the sequential result exactly, row order,
+    /// collect() order, and LIMIT cutoffs included.
+    #[test]
+    fn parallel_execution_matches_sequential_exactly() {
+        let cases = [
+            "MATCH (a:Person) RETURN a.id AS id",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, b.id AS b",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, b.id AS b ORDER BY b DESC, a",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, b.id AS b ORDER BY b, a \
+             SKIP 2 LIMIT 3",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN DISTINCT b.id AS b",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS paths",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, count(*) AS deg",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.id AS a, collect(b.id) AS friends",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(DISTINCT b.id) AS heads",
+            "MATCH (a:Person)-[:KNOWS]->(b) \
+             RETURN min(b.id) AS lo, max(b.id) AS hi, avg(b.id) AS mid, sum(b.id) AS total",
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE a.id > 100 RETURN count(*) AS n",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+             RETURN count(*) AS triangles",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+             RETURN a.id AS a, b.id AS b, c.id AS c",
+            "MATCH (a:Person)-[:KNOWS]-(b)-[:KNOWS]-(c), (a)-[:KNOWS]-(c) \
+             RETURN count(*) AS walks",
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS deg WHERE deg > 1 \
+             MATCH (a)-[:IS_LOCATED_IN]->(pl) RETURN a.id AS person, pl.id AS place",
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id >= 4 \
+             RETURN a.id AS id, b.id AS friend",
+            "MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN a.id AS a, b.id AS b, size(r) AS hops",
+        ];
+        for source in cases {
+            let seq = run(source, &[]);
+            let par = run_par(source, &[]);
+            assert_eq!(
+                seq.rows, par.rows,
+                "parallel diverged from sequential on: {source}"
             );
         }
     }

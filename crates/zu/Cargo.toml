@@ -18,5 +18,8 @@ zu-sqlite.workspace = true
 zu-s3.workspace = true
 zu-query.workspace = true
 
+[features]
+arrow = ["zu-zu1/arrow"]
+
 [lints]
 workspace = true

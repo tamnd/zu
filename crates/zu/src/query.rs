@@ -330,6 +330,32 @@ mod tests {
         )
         .expect("var-length count");
         assert_eq!(r.rows, [[Value::Int(trails)]]);
+
+        // Left-outer semantics on real storage: people with no edge
+        // into the high ids keep one row with a null friend, so
+        // count(a) sees every row and count(b) only the matches.
+        let t = 80i64;
+        let mut people = 0i64;
+        let mut matched = 0i64;
+        let mut misses = 0i64;
+        for s in 0..97u32 {
+            let n = edges
+                .iter()
+                .filter(|(a, b)| *a == s && i64::from(*b) >= t)
+                .count() as i64;
+            people += n.max(1);
+            matched += n;
+            misses += i64::from(n == 0);
+        }
+        assert!(misses > 0, "threshold too low to exercise the null path");
+        let r = run(
+            "MATCH (a:person) OPTIONAL MATCH (a)-[:follows]->(b) WHERE b.id >= $t \
+             RETURN count(a) AS people, count(b) AS friends",
+            &mut db,
+            &[("t", Value::Int(t))],
+        )
+        .expect("optional count");
+        assert_eq!(r.rows, [[Value::Int(people), Value::Int(matched)]]);
     }
 
     #[test]

@@ -50,7 +50,11 @@ fn sample(bytes: &[u8]) -> Vec<u8> {
     if bytes.len() <= SAMPLE_TARGET {
         return bytes.to_vec();
     }
-    let chunk = 4 << 10;
+    // 512-byte fragments, following the reference implementation: a
+    // symbol is at most 8 bytes, so a fragment carries plenty of
+    // adjacency context, and many scattered fragments keep the table
+    // from memorizing whatever ids one region of the input holds.
+    let chunk = 512;
     let chunks = SAMPLE_TARGET / chunk;
     let stride = bytes.len() / chunks;
     let mut out = Vec::with_capacity(SAMPLE_TARGET);

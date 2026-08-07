@@ -10,6 +10,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+crossbeam-deque = "0.8.7"
 zu-common.workspace = true
 zu-storage.workspace = true
 

@@ -57,11 +57,38 @@ pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
     Ok(plan::explain(&optimized, &query, &schema))
 }
 
+/// The file handle behind a [`Zu1Graph`]: the caller's borrowed handle
+/// on the main path, an owned reopen on the fork a morsel worker
+/// drives. Both deref to the same [`Zu1File`] surface.
+enum Db<'a> {
+    Borrowed(&'a mut Zu1File),
+    Owned(Box<Zu1File>),
+}
+
+impl std::ops::Deref for Db<'_> {
+    type Target = Zu1File;
+    fn deref(&self) -> &Zu1File {
+        match self {
+            Db::Borrowed(db) => db,
+            Db::Owned(db) => db,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Db<'_> {
+    fn deref_mut(&mut self) -> &mut Zu1File {
+        match self {
+            Db::Borrowed(db) => db,
+            Db::Owned(db) => db,
+        }
+    }
+}
+
 /// The executor's view of one open zu1 file: readers load lazily per
 /// rel table and cache their directories across calls, and props
 /// readers load lazily per node table the same way.
 pub struct Zu1Graph<'a> {
-    db: &'a mut Zu1File,
+    db: Db<'a>,
     catalog: Catalog,
     readers: HashMap<u32, GraphReader>,
     props: HashMap<u32, Option<PropsReader>>,
@@ -70,7 +97,7 @@ pub struct Zu1Graph<'a> {
 impl<'a> Zu1Graph<'a> {
     pub fn new(db: &'a mut Zu1File, catalog: Catalog) -> Self {
         Zu1Graph {
-            db,
+            db: Db::Borrowed(db),
             catalog,
             readers: HashMap::new(),
             props: HashMap::new(),
@@ -87,7 +114,7 @@ impl<'a> Zu1Graph<'a> {
             .ok_or_else(|| ZuError::InvalidArgument(format!("unknown rel table {rel}")))?
             .name
             .clone();
-        let reader = GraphReader::load_table(self.db, &name)?;
+        let reader = GraphReader::load_table(&mut self.db, &name)?;
         self.readers.insert(rel, reader);
         Ok(())
     }
@@ -96,7 +123,7 @@ impl<'a> Zu1Graph<'a> {
         if self.props.contains_key(&table) {
             return Ok(());
         }
-        let reader = load_props(self.db, table)?.map(PropsReader::new);
+        let reader = load_props(&mut self.db, table)?.map(PropsReader::new);
         self.props.insert(table, reader);
         Ok(())
     }
@@ -222,6 +249,22 @@ impl Graph for Zu1Graph<'_> {
         }
         reader.lookup_key(db, key)
     }
+
+    fn fork(&self) -> Option<Box<dyn Graph + Send>> {
+        // Data blocks hit the file as they are staged and only the
+        // header flip waits for the checkpoint, so a reopen carrying
+        // this handle's in-memory header reads exactly what this
+        // handle reads. The fork starts with cold reader caches and
+        // warms its own; a worker sweeps its own morsels' groups, so
+        // sharing decoded state would only add contention.
+        let db = self.db.reopen().ok()?;
+        Some(Box::new(Zu1Graph {
+            db: Db::Owned(Box::new(db)),
+            catalog: self.catalog.clone(),
+            readers: HashMap::new(),
+            props: HashMap::new(),
+        }))
+    }
 }
 
 /// Everything a query needs before touching graph data: the optimized
@@ -262,18 +305,21 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 }
 
 /// Parses, plans, optimizes, and executes one query against an open
-/// zu1 file, returning the result rows.
+/// zu1 file, returning the result rows. Scan-driven stages run on the
+/// morsel scheduler with `min(cores, 8)` workers; `ZU_THREADS` in the
+/// environment overrides the count, `ZU_THREADS=1` forces sequential
+/// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
     let p = prepare(source, db, params)?;
     let mut graph = Zu1Graph::new(db, p.catalog);
-    exec::execute(
-        &p.plan,
-        &p.query,
-        &p.schema,
-        &mut graph,
-        &p.args,
-        &exec::Options::default(),
-    )
+    let mut options = exec::Options::default();
+    if let Some(threads) = std::env::var("ZU_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+    {
+        options.threads = threads;
+    }
+    exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
 }
 
 /// Executes one query with per-operator counters and returns the
@@ -577,5 +623,64 @@ mod tests {
 
         let err = run("MATCH (a:person) RETURN a.nope AS x", &mut db, &[]).expect_err("unknown");
         assert!(err.to_string().contains("unknown property"), "got: {err}");
+    }
+
+    /// The morsel scheduler over a real zu1 file: workers fork their
+    /// own reopened handles, and 64-row morsels split the 500-person
+    /// scan across them. Parallel results must equal the sequential
+    /// run exactly, rows and order both.
+    #[test]
+    fn parallel_scan_matches_sequential_on_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("par.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = (0..3000u32)
+            .map(|i| (i % 499, (i * 13 + 7) % 500))
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", 500, &edges).expect("load");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let sources = [
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            "MATCH (a:person)-[:follows]->(b) RETURN a.id AS a, b.id AS b",
+            "MATCH (a:person)-[:follows]->(b) \
+             RETURN a.id AS a, count(*) AS deg ORDER BY deg DESC, a LIMIT 10",
+        ];
+        for source in sources {
+            let p = prepare(source, &mut db, &[]).expect("prepare");
+            let mut graph = Zu1Graph::new(&mut db, p.catalog);
+            let sequential = exec::execute(
+                &p.plan,
+                &p.query,
+                &p.schema,
+                &mut graph,
+                &p.args,
+                &exec::Options {
+                    threads: 1,
+                    ..exec::Options::default()
+                },
+            )
+            .expect("sequential");
+            let parallel = exec::execute(
+                &p.plan,
+                &p.query,
+                &p.schema,
+                &mut graph,
+                &p.args,
+                &exec::Options {
+                    threads: 4,
+                    morsel_rows: 64,
+                    ..exec::Options::default()
+                },
+            )
+            .expect("parallel");
+            assert_eq!(
+                sequential.rows, parallel.rows,
+                "parallel diverged from sequential on: {source}"
+            );
+        }
     }
 }

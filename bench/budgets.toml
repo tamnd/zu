@@ -62,10 +62,16 @@ point_in_klookups_s = 2.0
 # Random edge probes on the loaded LiveJournal file, single core,
 # K probes/s, half present and half near misses. A probe reads two
 # offsets and then exactly one neighbor chunk named by the fence array,
-# so hub degrees do not move the number. The floor sits with the point
-# floor: a probe never decodes more than a point read of the same list.
-# Raise floors, never lower them.
-edge_probe_kprobes_s = 30.0
+# so hub degrees do not move the number. Measured warm: gamingpc 235
+# to 243, server3 34 to 62, server1 52 to 62. The 30.0 floor was set
+# from warm passes only; server1 then showed the same cold tail the
+# point_in floor already documents, 14 to 15 K with p50 steady at 17 us
+# and p99 at 1 ms of virtio disk, on the raw-order pass after the bwd
+# reads evict the fwd pages from its 850 MB of available memory. Like
+# point_in_klookups_s, the floor sits under that cold tail until the
+# reader manages its own memory (B3); a broken probe path that decodes
+# whole neighbor lists measures well under 1 on every machine.
+edge_probe_kprobes_s = 2.0
 
 # Primary-key lookups through the sealed sorted index on the BFS
 # reordered LiveJournal file, single core, K lookups/s, three quarters

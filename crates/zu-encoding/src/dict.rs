@@ -9,6 +9,13 @@ use zu_common::{Result, ZuError};
 
 use crate::for_bitpack;
 
+/// Format rule: a dictionary holds at most this many entries, which is
+/// exactly the 64 KiB scratch ceiling from the docs/04 decoding
+/// contract once materialized as u64. The selector never offers Dict
+/// past this cardinality, and the decoder rejects a container claiming
+/// more, so readers can size the dictionary buffer before parsing.
+pub const MAX_ENTRIES: usize = 8192;
+
 /// Encodes `values` into `out`, returning the encoded byte length.
 pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
     let start = out.len();
@@ -28,8 +35,9 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
 }
 
 /// Decodes an encoded buffer, appending at most `max_values` values to
-/// `out`. The ceiling bounds both streams: a real dictionary never
-/// holds more distinct values than the rows it codes.
+/// `out`. The caller ceiling bounds the code stream and the format cap
+/// bounds the dictionary, so the one materialized intermediate never
+/// grows past 64 KiB whatever the container claims.
 pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "dict",
@@ -49,7 +57,7 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()>
         .get(4 + dict_len..)
         .ok_or_else(|| corrupt("truncated codes"))?;
     let mut dict = Vec::new();
-    for_bitpack::decode(dict_bytes, max_values, &mut dict)?;
+    for_bitpack::decode(dict_bytes, MAX_ENTRIES.min(max_values), &mut dict)?;
     let start = out.len();
     for_bitpack::decode(codes_bytes, max_values, out)?;
     for slot in &mut out[start..] {
@@ -94,5 +102,23 @@ mod tests {
         encode(&[5, 6, 5], &mut buf);
         let mut out = Vec::new();
         assert!(decode(&buf[..5], 16, &mut out).is_err());
+    }
+
+    #[test]
+    fn dictionary_at_and_past_the_cap() {
+        // Exactly the cap decodes; one entry more is a format violation
+        // the reader must reject however large the caller ceiling is.
+        let at_cap: Vec<u64> = (0..MAX_ENTRIES as u64).map(|i| i * 3).collect();
+        let mut buf = Vec::new();
+        encode(&at_cap, &mut buf);
+        let mut out = Vec::new();
+        decode(&buf, at_cap.len(), &mut out).unwrap();
+        assert_eq!(out, at_cap);
+        let past: Vec<u64> = (0..MAX_ENTRIES as u64 + 1).map(|i| i * 3).collect();
+        let mut buf = Vec::new();
+        encode(&past, &mut buf);
+        let mut out = Vec::new();
+        assert!(decode(&buf, past.len(), &mut out).is_err());
+        assert!(out.is_empty(), "a rejected payload must not touch out");
     }
 }

@@ -111,7 +111,7 @@ fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let mut failed = false;
 
-    let cases: [(&str, EncodeFn, DecodeFn); 5] = [
+    let cases: [(&str, EncodeFn, DecodeFn); 4] = [
         (
             "for_bitpack",
             zu_encoding::for_bitpack::encode,
@@ -128,7 +128,6 @@ fn main() {
             zu_encoding::delta_patch::decode,
         ),
         ("rle", zu_encoding::rle::encode, zu_encoding::rle::decode),
-        ("dict", zu_encoding::dict::encode, zu_encoding::dict::decode),
     ];
 
     for (name, encode, decode) in cases {
@@ -145,12 +144,24 @@ fn main() {
 
     // Derived streams for the typed encodings. The parity bit of each
     // neighbor id models a boolean property column at the real length,
-    // and the gap stream of the sorted ids has a genuinely dominant
-    // value, gap zero from duplicate destinations, which is the shape
-    // Frequency exists for.
+    // the gap stream of the sorted ids has a genuinely dominant value,
+    // gap zero from duplicate destinations, which is the shape Frequency
+    // exists for, and folding each id into a scrambled pool at the
+    // format cap models a categorical column, the shape Dict exists
+    // for, since the cap makes the raw id stream an illegal dictionary.
     let parity: Vec<u64> = data.iter().map(|&v| v & 1).collect();
     let gaps: Vec<u64> = data.windows(2).map(|w| w[1] - w[0]).collect();
-    let typed: [(&str, &[u64], EncodeFn, DecodeFn); 2] = [
+    let categorical: Vec<u64> = data
+        .iter()
+        .map(|&v| (v % zu_encoding::dict::MAX_ENTRIES as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .collect();
+    let typed: [(&str, &[u64], EncodeFn, DecodeFn); 3] = [
+        (
+            "dict",
+            &categorical,
+            zu_encoding::dict::encode,
+            zu_encoding::dict::decode,
+        ),
         (
             "bool_bitpack",
             &parity,

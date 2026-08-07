@@ -113,10 +113,26 @@ fn choose(values: &[u64]) -> EncodingId {
         EncodingId::Dict,
         EncodingId::Frequency,
     ]);
+    let best = size_and_pick(&candidates, &runs, &concat);
+    // Dict is only legal under the format cap on distinct values, a
+    // property the sample cannot vouch for. The proof scans the full
+    // input, so it runs only when Dict actually won the sizing; every
+    // other column skips it, and a failed proof re-picks without Dict.
+    if best == EncodingId::Dict && !dict_legal(values) {
+        let rest: Vec<EncodingId> = candidates
+            .into_iter()
+            .filter(|&id| id != EncodingId::Dict)
+            .collect();
+        return size_and_pick(&rest, &runs, &concat);
+    }
+    best
+}
+
+fn size_and_pick(candidates: &[EncodingId], runs: &[&[u64]], concat: &[u64]) -> EncodingId {
     let mut best = EncodingId::Plain;
     let mut best_size = 4 + concat.len() * 8;
     let mut buf = Vec::new();
-    for id in candidates {
+    for &id in candidates {
         // Delta candidates are sized per run and summed: concatenating the
         // runs fabricates one wide delta per boundary, which reads as
         // outliers on data that has none and skews the pick toward the
@@ -126,14 +142,14 @@ fn choose(values: &[u64]) -> EncodingId {
         let per_run = matches!(id, EncodingId::DeltaBitPack | EncodingId::DeltaPatch);
         let mut size = 0usize;
         if per_run {
-            for run in &runs {
+            for run in runs {
                 buf.clear();
                 encode_with(id, run, &mut buf);
                 size += buf.len();
             }
         } else {
             buf.clear();
-            encode_with(id, &concat, &mut buf);
+            encode_with(id, concat, &mut buf);
             size = buf.len();
         }
         if size < best_size {
@@ -142,6 +158,19 @@ fn choose(values: &[u64]) -> EncodingId {
         }
     }
     best
+}
+
+/// Whether the whole input stays under the Dict cardinality cap. Early
+/// exit keeps the scan cheap exactly when Dict is hopeless anyway.
+fn dict_legal(values: &[u64]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(1024);
+    for &v in values {
+        seen.insert(v);
+        if seen.len() > dict::MAX_ENTRIES {
+            return false;
+        }
+    }
+    true
 }
 
 /// Even-spaced runs so ordered data keeps its local structure in the sample.
@@ -307,6 +336,28 @@ mod tests {
         values[9_999] = 2;
         let id = roundtrip(&values);
         assert_ne!(id, EncodingId::BoolBitpack);
+    }
+
+    #[test]
+    fn dict_never_offered_past_the_distinct_cap() {
+        // Sixteen scattered wide values inside any sample window, but a
+        // fresh sixteen every 64 rows: the sample prices Dict as a clear
+        // winner while the full input holds ten thousand distinct
+        // values, past the format cap. The legality gate has to keep
+        // Dict out, or the encoder would ship a dictionary no reader
+        // accepts.
+        let values: Vec<u64> = (0..40_000usize)
+            .map(|i| {
+                let pool = (i / 64 * 16 + (i * 7) % 16) as u64;
+                pool.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            })
+            .collect();
+        let mut buf = Vec::new();
+        let id = encode_auto(&values, &mut buf);
+        assert_ne!(id, EncodingId::Dict);
+        let mut out = Vec::new();
+        decode_any(&buf, values.len(), &mut out).unwrap();
+        assert_eq!(values, out);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use zu_common::{Result, ZuError};
 
+use crate::bitpack::CHUNK;
 use crate::for_bitpack;
 
 /// Encodes `values` into `out`, returning the encoded byte length.
@@ -45,6 +46,8 @@ pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
 /// `out`. The ceiling bounds the run streams (every run carries at
 /// least one value) and the materialized total, and the total is summed
 /// checked so hostile run lengths cannot overflow it past the wall.
+/// The two containers stream chunk by chunk in lockstep, so scratch
+/// stays two MiniBlock chunks however many runs the segment holds.
 pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()> {
     let corrupt = |detail: String| ZuError::Corrupt {
         what: "rle",
@@ -66,29 +69,43 @@ pub fn decode(bytes: &[u8], max_values: usize, out: &mut Vec<u64>) -> Result<()>
     let lengths_bytes = bytes
         .get(8 + values_len..)
         .ok_or_else(|| corrupt("truncated lengths".into()))?;
-    let mut run_values = Vec::new();
-    let mut run_lengths = Vec::new();
-    for_bitpack::decode(values_bytes, max_values, &mut run_values)?;
-    for_bitpack::decode(lengths_bytes, max_values, &mut run_lengths)?;
-    if run_values.len() != run_count || run_lengths.len() != run_count {
+    let mut values_cur = for_bitpack::ChunkCursor::new(values_bytes, run_count)?;
+    let mut lengths_cur = for_bitpack::ChunkCursor::new(lengths_bytes, run_count)?;
+    if values_cur.count() != run_count || lengths_cur.count() != run_count {
         return Err(corrupt("stream length mismatch".into()));
     }
+    let base = out.len();
+    let mut sv = [0u64; CHUNK];
+    let mut sl = [0u64; CHUNK];
     let mut total = 0u64;
-    for &len in &run_lengths {
-        total = total
-            .checked_add(len)
-            .ok_or_else(|| corrupt("total length overflow".into()))?;
-    }
-    if total > max_values as u64 {
-        return Err(corrupt(format!(
-            "claims {total} values, caller allows {max_values}"
-        )));
-    }
-    out.reserve(total as usize);
-    for (&v, &len) in run_values.iter().zip(&run_lengths) {
-        for _ in 0..len {
-            out.push(v);
+    let bad = 'chunks: loop {
+        let (vmin, tv) = match values_cur.next(&mut sv) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break None,
+            Err(e) => break Some(e),
+        };
+        let (lmin, tl) = match lengths_cur.next(&mut sl) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break Some(corrupt("length stream ended early".into())),
+            Err(e) => break Some(e),
+        };
+        for (&v, &l) in sv[..tv.min(tl)].iter().zip(&sl) {
+            let len = lmin.wrapping_add(l);
+            total = match total.checked_add(len) {
+                Some(t) if t <= max_values as u64 => t,
+                Some(t) => {
+                    break 'chunks Some(corrupt(format!(
+                        "claims {t} values, caller allows {max_values}"
+                    )));
+                }
+                None => break 'chunks Some(corrupt("total length overflow".into())),
+            };
+            out.extend(std::iter::repeat_n(vmin.wrapping_add(v), len as usize));
         }
+    };
+    if let Some(e) = bad {
+        out.truncate(base);
+        return Err(e);
     }
     Ok(())
 }
@@ -157,5 +174,20 @@ mod tests {
         buf.extend_from_slice(&values_buf);
         for_bitpack::encode(&[1_000_000_000], &mut buf);
         assert!(decode(&buf, 1 << 20, &mut out).is_err());
+    }
+
+    #[test]
+    fn rejected_midstream_leaves_out_untouched() {
+        // The first run fits and streams into out before the second
+        // breaks the ceiling; the rejection must roll those writes back.
+        let mut buf = 2u32.to_le_bytes().to_vec();
+        let mut values_buf = Vec::new();
+        for_bitpack::encode(&[9, 8], &mut values_buf);
+        buf.extend_from_slice(&(values_buf.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&values_buf);
+        for_bitpack::encode(&[3, 100], &mut buf);
+        let mut out = vec![1, 2];
+        assert!(decode(&buf, 10, &mut out).is_err());
+        assert_eq!(out, [1, 2], "a rejected payload must not touch out");
     }
 }

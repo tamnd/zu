@@ -71,6 +71,7 @@ SegmentMeta {
 ### Value encodings (encoding ids are format-stable)
 `0 Plain · 1 Constant · 2 RLE · 3 Dict · 4 FOR+BitPack(FastLanes) · 5 Delta+BitPack · 6 ALP · 7 ALP_RD · 8 FSST · 9 BoolBitpack · 10 Frequency · 11 Zstd(leaf, optional) · 12 Delta+Patch(exceptions)`
 - Selection: BtrBlocks-style sampling, 8 runs × 128 values (~0.8%), estimate size for each legal cascade, pick min; tie → fewer stages. Depth ≤ 3.
+- Dict cap (format rule): a dictionary holds at most 8192 entries, exactly the 64 KiB scratch ceiling once materialized as u64. The selector never offers Dict past that cardinality and readers reject a container claiming more.
 - Validity: separate bitmap (RLE if runs) per segment, not interleaved.
 - **Decoding contract**: every encoding decodes ≥ 1 GB/s/core scalar; nothing requires more than 64 KiB scratch; all decoders fuzzed. The optional Zstd leaf (id 11) is the deliberate exception on both counts: it serves cold string segments where ratio wins, libzstd manages its own context, and its floors in budgets.toml track regressions rather than the hot-path contract.
 

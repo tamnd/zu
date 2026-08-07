@@ -10,6 +10,7 @@ rle = 1.0
 dict = 1.0
 bool_bitpack = 1.0
 frequency = 1.0
+fsst = 1.0
 
 # COPY ingest floors, single core, sort included, parse excluded (B6/B8).
 # The density keys are ceilings, not floors, set just above the measured

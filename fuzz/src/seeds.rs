@@ -130,5 +130,12 @@ fn main() {
     let mut fq = Vec::new();
     zu_encoding::frequency::encode(dominant, &mut fq);
     write_seed(&corpus.join("decode_frequency"), "dominant", &fq);
+    let mut text = Vec::new();
+    for &(s, d) in &follows {
+        text.extend_from_slice(format!("{s}\t{d}\n").as_bytes());
+    }
+    let mut fs = Vec::new();
+    zu_encoding::fsst::encode(&text, &mut fs);
+    write_seed(&corpus.join("decode_fsst"), "edge-text", &fs);
     println!("seeds written under {}", corpus.display());
 }

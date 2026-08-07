@@ -172,6 +172,49 @@ fn main() {
         }
     }
 
+    // FSST works on bytes, not u64 values, so it gets its own corpus and
+    // measure loop. Real data is the raw edge-list text itself, which is
+    // honest string input: tab-separated ascii numerals with heavy
+    // digram repetition, the shape id-bearing string columns take.
+    let text = std::env::var("ZU_DATA")
+        .ok()
+        .and_then(|d| {
+            let bytes = std::fs::read(format!("{d}/soc-LiveJournal1.txt")).ok()?;
+            let len = bytes.len().min(64 << 20);
+            println!("fsst data: soc-LiveJournal1.txt raw text, {len} bytes");
+            Some(bytes[..len].to_vec())
+        })
+        .unwrap_or_else(|| {
+            let mut text = Vec::new();
+            for pair in data.chunks_exact(2).take(4 << 20) {
+                text.extend_from_slice(format!("{}\t{}\n", pair[0], pair[1]).as_bytes());
+            }
+            println!("fsst data: synthetic edge-list text, {} bytes", text.len());
+            text
+        });
+    let mut encoded = Vec::new();
+    zu_encoding::fsst::encode(&text, &mut encoded);
+    let mut out = Vec::with_capacity(text.len());
+    zu_encoding::fsst::decode(&encoded, text.len(), &mut out).unwrap();
+    assert_eq!(out, text, "fsst roundtrip broke on the bench corpus");
+    let mut iters = 0u32;
+    let start = Instant::now();
+    while start.elapsed().as_secs_f64() < 1.0 {
+        out.clear();
+        zu_encoding::fsst::decode(&encoded, text.len(), &mut out).unwrap();
+        iters += 1;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    let gbps = (text.len() as f64) * f64::from(iters) / secs / 1e9;
+    let ratio = (text.len() as f64) / (encoded.len() as f64);
+    println!("fsst: {gbps:.2} GB/s decode, {ratio:.1}x vs raw, {iters} iters");
+    if let Some(floor) = budgets.floor("fsst")
+        && gbps < floor
+    {
+        println!("GATE FAIL fsst: {gbps:.2} GB/s < floor {floor} GB/s");
+        failed = true;
+    }
+
     if gate && failed {
         std::process::exit(1);
     }

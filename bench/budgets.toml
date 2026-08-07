@@ -147,11 +147,14 @@ ldbc_two_hop_p50_ms = 10.0
 # DISTINCT, string projections, ORDER BY, and LIMIT; its cost is the
 # 2-hop multiset's property reads, held down by the per-column decoded
 # chunk the props reader keeps, and its p99 belongs to hub seeds whose
-# neighborhoods hop across chunks. Measured p50, IS then IC: local M
-# series 0.16 and 1.4 ms, gamingpc and the EPYC hosts recorded next to
-# the PR. Every measured run asserts against a reference recomputed
-# from the raw props and edge files. Lower these ceilings, never raise
-# them.
+# neighborhoods hop across chunks. Measured p50, IS then IC: gamingpc
+# 0.13 and 1.4 ms, local M series 0.16 and 1.4 ms, server1 0.38 and
+# 4.6 ms. Both loaded hosts fit under the ceilings even mid-contention,
+# server2 at 0.59 and 6.1 ms beside a compile job holding load 7.5 on
+# 6 cores and server3 at 0.62 and 8.7 ms under its documented crawl,
+# so unlike B4 these gates hold fleet-wide. Every measured run asserts
+# against a reference recomputed from the raw props and edge files.
+# Lower these ceilings, never raise them.
 ldbc_is_p50_ms = 1.0
 ldbc_ic_p50_ms = 10.0
 

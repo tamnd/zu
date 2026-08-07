@@ -164,6 +164,10 @@ impl DatabaseHeader {
 #[derive(Debug)]
 pub struct Zu1File {
     file: File,
+    /// Where this handle was opened, kept so [`Self::reopen`] can hand
+    /// a second read handle to a query worker. Block reads seek, so
+    /// workers cannot share one file descriptor.
+    path: std::path::PathBuf,
     file_header: FileHeader,
     db: DatabaseHeader,
     /// Slot the current header was read from; the flip writes the other one.
@@ -200,6 +204,7 @@ impl Zu1File {
         file.sync_all()?;
         Ok(Self {
             file,
+            path: path.to_path_buf(),
             file_header,
             db,
             active_slot: 0,
@@ -237,6 +242,7 @@ impl Zu1File {
         };
         let mut this = Self {
             file,
+            path: path.to_path_buf(),
             file_header,
             db,
             active_slot,
@@ -251,6 +257,27 @@ impl Zu1File {
             this.free_chain = crate::meta::chain_blocks(&mut this, root)?;
         }
         Ok(this)
+    }
+
+    /// A second read handle on the same file carrying this handle's
+    /// current in-memory state. Data blocks are written to the file as
+    /// they are staged and only the header flip waits for the
+    /// checkpoint, so adopting this handle's header lets the new
+    /// handle read exactly what this one reads, staged roots included.
+    /// The free lists stay empty because a reopened handle exists to
+    /// read; the morsel workers are the caller.
+    pub fn reopen(&self) -> Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        Ok(Self {
+            file,
+            path: self.path.clone(),
+            file_header: self.file_header.clone(),
+            db: self.db.clone(),
+            active_slot: self.active_slot,
+            free: Vec::new(),
+            pending_free: Vec::new(),
+            free_chain: Vec::new(),
+        })
     }
 
     /// Write-once file identity.
@@ -700,5 +727,21 @@ mod tests {
         let mut reopened = Zu1File::open(&path).unwrap();
         assert_eq!(reopened.db_header().block_count, 0);
         assert!(reopened.read_block(ptr).is_err());
+    }
+
+    /// The worker-fork handle is the opposite of a fresh open: it
+    /// adopts the caller's in-memory header, so staged blocks that no
+    /// checkpoint has published yet read back through it.
+    #[test]
+    fn reopen_carries_staged_state_to_a_second_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let ptr = db.allocate_block();
+        let data = vec![0xCD; BLOCK_SIZE as usize];
+        db.write_block(ptr, &data).unwrap();
+        let mut fork = db.reopen().unwrap();
+        assert_eq!(fork.db_header(), db.db_header());
+        assert_eq!(fork.read_block(ptr).unwrap(), data);
     }
 }

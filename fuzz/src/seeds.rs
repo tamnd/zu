@@ -33,7 +33,11 @@ fn main() {
     let mut follows: Vec<(u32, u32)> = (0..400u32).map(|i| (i % 97, (i * 7 + 3) % 89)).collect();
     follows.sort_unstable();
     follows.dedup();
-    graph::bulk_load_as(&mut db, "person", "follows", 97, &follows).expect("load follows");
+    // A key index on one of the two tables so the directory seed covers
+    // the has_keys branch; 13 is coprime to 97, so the keys are unique.
+    let keys: Vec<u64> = (0..97u64).map(|i| (i * 13 + 5) % 97).collect();
+    graph::bulk_load_keyed(&mut db, "person", "follows", 97, &follows, Some(&keys))
+        .expect("load follows");
     let mut likes: Vec<(u32, u32)> = (0..200u32).map(|i| (i % 61, (i * 13 + 5) % 97)).collect();
     likes.sort_unstable();
     likes.dedup();

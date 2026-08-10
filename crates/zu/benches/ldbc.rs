@@ -528,6 +528,151 @@ fn run_ic_friends_of_friends(
     p50
 }
 
+/// The M4 table function kernels over the loaded file (docs/07 §4):
+/// pagerank, wcc, sssp, louvain timed as direct kernel calls, each
+/// crosschecked against an independent computation over the raw edge
+/// list, plus one CALL through zuQL so the query surface runs too.
+/// Returns kernel seconds in that order.
+fn run_table_functions(
+    path: &std::path::Path,
+    edges: &[(u32, u32)],
+    node_count: u64,
+) -> (f64, f64, f64, f64) {
+    use zu::zu1::algo;
+    let n = node_count as usize;
+    let mut db = Zu1File::open(path).expect("open");
+    let mut reader = GraphReader::load_table(&mut db, "knows").expect("reader");
+
+    let t = Instant::now();
+    let ranks = algo::pagerank(&mut db, &mut reader, algo::PAGERANK_ITERATIONS).expect("pagerank");
+    let pagerank_s = t.elapsed().as_secs_f64();
+    let sum: f64 = ranks.iter().sum();
+    assert!((sum - 1.0).abs() < 1e-9, "ranks sum to {sum}");
+    let mut reference = vec![1.0 / n as f64; n];
+    let mut outdeg = vec![0u64; n];
+    for &(s, _) in edges {
+        outdeg[s as usize] += 1;
+    }
+    for _ in 0..algo::PAGERANK_ITERATIONS {
+        let dangling: f64 = (0..n)
+            .filter(|&v| outdeg[v] == 0)
+            .map(|v| reference[v])
+            .sum();
+        let base = (1.0 - algo::PAGERANK_DAMPING + algo::PAGERANK_DAMPING * dangling) / n as f64;
+        let mut next = vec![base; n];
+        for &(s, d) in edges {
+            next[d as usize] +=
+                algo::PAGERANK_DAMPING * reference[s as usize] / outdeg[s as usize] as f64;
+        }
+        reference = next;
+    }
+    let drift = ranks
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f64, f64::max);
+    assert!(drift < 1e-12, "pagerank drifts {drift} from the reference");
+    println!(
+        "sf1 pagerank: {} iterations in {pagerank_s:.3} s, ranks sum {sum:.6}, matches the edge-list reference",
+        algo::PAGERANK_ITERATIONS
+    );
+
+    let t = Instant::now();
+    let labels = algo::wcc(&mut db, &mut reader).expect("wcc");
+    let wcc_s = t.elapsed().as_secs_f64();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize];
+            x = parent[x as usize];
+        }
+        x
+    }
+    for &(s, d) in edges {
+        let (a, b) = (find(&mut parent, s), find(&mut parent, d));
+        if a < b {
+            parent[b as usize] = a;
+        } else {
+            parent[a as usize] = b;
+        }
+    }
+    let reference: Vec<u64> = (0..n as u32).map(|v| find(&mut parent, v) as u64).collect();
+    assert_eq!(labels, reference, "wcc labels disagree with the reference");
+    let components = labels
+        .iter()
+        .enumerate()
+        .filter(|(v, l)| **l == *v as u64)
+        .count();
+    println!(
+        "sf1 wcc: {components} components in {wcc_s:.3} s, labels match the edge-list reference"
+    );
+
+    let t = Instant::now();
+    let dist = algo::sssp(&mut db, &mut reader, 0).expect("sssp");
+    let sssp_s = t.elapsed().as_secs_f64();
+    let mut adj = vec![Vec::new(); n];
+    for &(s, d) in edges {
+        adj[s as usize].push(d);
+        adj[d as usize].push(s);
+    }
+    let mut reference = vec![u64::MAX; n];
+    reference[0] = 0;
+    let mut frontier = vec![0u32];
+    let mut depth = 0u64;
+    while !frontier.is_empty() {
+        depth += 1;
+        let mut next = Vec::new();
+        for &v in &frontier {
+            for &w in &adj[v as usize] {
+                if reference[w as usize] == u64::MAX {
+                    reference[w as usize] = depth;
+                    next.push(w);
+                }
+            }
+        }
+        frontier = next;
+    }
+    assert_eq!(
+        dist, reference,
+        "sssp distances disagree with the BFS reference"
+    );
+    let reached = dist.iter().filter(|&&d| d != u64::MAX).count();
+    println!(
+        "sf1 sssp: reached {reached} of {n} from row 0 in {sssp_s:.3} s, matches the edge-list BFS"
+    );
+
+    let t = Instant::now();
+    let communities = algo::louvain(&mut db, &mut reader).expect("louvain");
+    let louvain_s = t.elapsed().as_secs_f64();
+    let again = algo::louvain(&mut db, &mut reader).expect("louvain again");
+    assert_eq!(communities, again, "louvain is not deterministic");
+    let count = communities
+        .iter()
+        .enumerate()
+        .filter(|(v, c)| **c == *v as u64)
+        .count();
+    println!("sf1 louvain: {count} communities in {louvain_s:.3} s, deterministic across two runs");
+
+    let t = Instant::now();
+    let r = zu::query::run(
+        "CALL pagerank('knows') YIELD node, rank RETURN count(node) AS n, sum(rank) AS total",
+        &mut db,
+        &[],
+    )
+    .expect("CALL pagerank");
+    assert_eq!(r.rows[0][0], Value::Int(node_count as i64));
+    let Value::Float(total) = r.rows[0][1] else {
+        panic!("expected a float rank sum");
+    };
+    assert!((total - 1.0).abs() < 1e-9, "CALL rank sum {total}");
+    println!(
+        "sf1 CALL pagerank through zuQL: {node_count} rows aggregated in {:.3} s",
+        t.elapsed().as_secs_f64()
+    );
+
+    (pagerank_s, wcc_s, sssp_s, louvain_s)
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let data = match std::env::var("ZU_DATA") {
@@ -557,6 +702,7 @@ fn main() {
     let triangle_p50 = run_triangle_count(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
+    let (pagerank_s, wcc_s, sssp_s, louvain_s) = run_table_functions(&path, &edges, node_count);
 
     let mut failed = false;
     if let Some(ceiling) = budget("ldbc_hop_p50_us")
@@ -594,6 +740,19 @@ fn main() {
     {
         println!("GATE FAIL IC friends-of-friends: p50 {ic_p50:.3} ms > ceiling {ceiling}");
         failed = true;
+    }
+    for (name, secs, key) in [
+        ("pagerank", pagerank_s, "ldbc_pagerank_s"),
+        ("wcc", wcc_s, "ldbc_wcc_s"),
+        ("sssp", sssp_s, "ldbc_sssp_s"),
+        ("louvain", louvain_s, "ldbc_louvain_s"),
+    ] {
+        if let Some(ceiling) = budget(key)
+            && secs > ceiling
+        {
+            println!("GATE FAIL {name}: {secs:.3} s > ceiling {ceiling}");
+            failed = true;
+        }
     }
     if gate && failed {
         std::process::exit(1);

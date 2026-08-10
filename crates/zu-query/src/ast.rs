@@ -22,6 +22,15 @@ pub enum Clause {
         expr: Expr,
         alias: String,
     },
+    /// `CALL name(args) YIELD col [AS alias], ...`, a table function
+    /// producing rows (docs/07 §4).
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        /// `(column, alias)` pairs; the column names are fixed by the
+        /// function, the alias is what later clauses see.
+        yields: Vec<(String, Option<String>)>,
+    },
     With {
         projection: Projection,
         filter: Option<Expr>,

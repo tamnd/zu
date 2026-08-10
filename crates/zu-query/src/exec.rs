@@ -60,7 +60,7 @@ use std::time::Instant;
 use zu_common::{Result, ZuError};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
-use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema};
+use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
 use crate::plan::{LogicalPlan, expr_text};
 
 /// Vector width of one chunk fill.
@@ -210,6 +210,18 @@ pub trait Graph {
     /// handle override it. A fork only ever reads.
     fn fork(&self) -> Option<Box<dyn Graph + Send>> {
         None
+    }
+    /// Runs a whole-graph table function kernel over one rel table
+    /// (docs/07 §4, `CALL`): one row of YIELD values per node offset of
+    /// the rel's node domain, in offset order, without the node column
+    /// itself, which the executor synthesizes. The sssp source arrives
+    /// as a dense offset, already resolved through [`Graph::lookup_key`].
+    /// Engines without kernels keep the default error.
+    fn table_function(&mut self, name: &str, rel: u32, args: &[Value]) -> Result<Vec<Vec<Value>>> {
+        let _ = (rel, args);
+        Err(invalid(format!(
+            "table function {name} is not supported by this engine"
+        )))
     }
 }
 
@@ -492,6 +504,16 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             expr_text(expr, query),
             var(stage.chunk_slots[*chunk][0])
         ),
+        OpDesc::TableFunction {
+            func, rel, chunk, ..
+        } => {
+            let table = schema
+                .rel_by_id(*rel)
+                .map(|r| r.name.as_str())
+                .unwrap_or("?");
+            let cols: Vec<&str> = stage.chunk_slots[*chunk].iter().map(|&s| var(s)).collect();
+            format!("Call {}({table}) YIELD {}", func.name(), cols.join(", "))
+        }
         OpDesc::OptionalBegin => "OptionalBegin".into(),
         OpDesc::OptionalEnd { chunks, .. } => {
             let slots: Vec<usize> = chunks
@@ -735,6 +757,18 @@ enum OpDesc {
         expr: BoundExpr,
         chunk: usize,
     },
+    /// A table function source: one engine kernel call fills the chunk
+    /// with every row at once, node column first. The kernel sweeps
+    /// whole CSR tables, so the stage stays sequential and downstream
+    /// operators iterate the one chunk.
+    TableFunction {
+        func: TableFunc,
+        rel: u32,
+        /// The rel's node domain, the table of the synthesized nodes.
+        table: u32,
+        args: Vec<BoundExpr>,
+        chunk: usize,
+    },
     /// Bottom of an OPTIONAL MATCH group: yields the current outer
     /// configuration exactly once per activation, so the group's
     /// operators exhaust per outer row and a miss is detectable.
@@ -929,6 +963,7 @@ fn input_of(plan: &LogicalPlan) -> Option<&LogicalPlan> {
         | LogicalPlan::Expand { input, .. }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Unwind { input, .. }
+        | LogicalPlan::TableFunction { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Distinct { input }
@@ -1326,6 +1361,7 @@ fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
             out.insert(*probe);
         }
         OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => expr_slots(expr, out),
+        OpDesc::TableFunction { args, .. } => args.iter().for_each(|e| expr_slots(e, out)),
         OpDesc::Source
         | OpDesc::RowSource { .. }
         | OpDesc::Scan { .. }
@@ -1633,6 +1669,24 @@ fn build_stages(
                 let chunk = b.new_chunk(vec![*slot], false);
                 b.descs.push(OpDesc::Unwind {
                     expr: expr.clone(),
+                    chunk,
+                });
+                b.produced(chunk);
+            }
+            LogicalPlan::TableFunction {
+                func,
+                rel,
+                table,
+                args,
+                slots,
+                ..
+            } => {
+                let chunk = b.new_chunk(slots.clone(), false);
+                b.descs.push(OpDesc::TableFunction {
+                    func: *func,
+                    rel: *rel,
+                    table: *table,
+                    args: args.clone(),
                     chunk,
                 });
                 b.produced(chunk);
@@ -1990,7 +2044,8 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
         | OpDesc::ExpandInto { chunk, .. }
         | OpDesc::AspJoin { chunk, .. }
         | OpDesc::MultiwayIntersect { chunk, .. }
-        | OpDesc::Unwind { chunk, .. } => ctx.chunks[*chunk].size as u64,
+        | OpDesc::Unwind { chunk, .. }
+        | OpDesc::TableFunction { chunk, .. } => ctx.chunks[*chunk].size as u64,
     }
 }
 
@@ -2953,6 +3008,60 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             c.cur = None;
             return Ok(true);
         },
+        OpDesc::TableFunction {
+            func,
+            rel,
+            table,
+            args,
+            chunk,
+        } => {
+            if !next(descs, ctx, i - 1)? {
+                return Ok(false);
+            }
+            let mut vals = Vec::with_capacity(args.len());
+            for arg in args {
+                vals.push(eval(ctx, arg)?);
+            }
+            // The sssp source arrives as a user-facing id; resolve it
+            // to the dense offset the kernel walks.
+            if *func == TableFunc::Sssp {
+                let Some(Value::Int(key)) = vals.first() else {
+                    return Err(invalid(format!(
+                        "sssp's source must be a node id, got {:?}",
+                        vals.first()
+                    )));
+                };
+                let offset = u64::try_from(*key)
+                    .ok()
+                    .and_then(|k| ctx.graph.lookup_key(*table, k).transpose())
+                    .transpose()?
+                    .ok_or_else(|| invalid(format!("sssp source {key} names no node")))?;
+                vals[0] = Value::Int(offset as i64);
+            }
+            let rows = ctx.graph.table_function(func.name(), *rel, &vals)?;
+            if rows.is_empty() {
+                return Ok(false);
+            }
+            let c = &mut ctx.chunks[*chunk];
+            if rows.iter().any(|r| r.len() + 1 != c.cols.len()) {
+                return Err(invalid(format!(
+                    "{} returned a row with the wrong arity",
+                    func.name()
+                )));
+            }
+            c.size = rows.len();
+            c.cols[0] = (0..rows.len())
+                .map(|offset| Value::Node {
+                    table: *table,
+                    offset: offset as u64,
+                })
+                .collect();
+            for (j, col) in c.cols.iter_mut().enumerate().skip(1) {
+                *col = rows.iter().map(|r| r[j - 1].clone()).collect();
+            }
+            c.cur = None;
+            Ok(true)
+        }
         OpDesc::OptionalBegin => {
             if ctx.states[i].active {
                 return Ok(false);
@@ -4232,6 +4341,38 @@ mod tests {
                 edges: self.edges.clone(),
             }))
         }
+
+        /// Stub kernels with recognizable per-offset values: the real
+        /// ones live in the engines, these pin the CALL plumbing.
+        fn table_function(
+            &mut self,
+            name: &str,
+            rel: u32,
+            args: &[Value],
+        ) -> Result<Vec<Vec<Value>>> {
+            let n = if rel == 2 { 6 } else { 3 };
+            match name {
+                "pagerank" => Ok((0..n)
+                    .map(|o| vec![Value::Float(o as f64 / 10.0)])
+                    .collect()),
+                "wcc" | "louvain" => Ok((0..n).map(|o| vec![Value::Int(o % 2)]).collect()),
+                "sssp" => {
+                    let Some(Value::Int(source)) = args.first() else {
+                        return Err(invalid("mock sssp needs a source".into()));
+                    };
+                    Ok((0..n)
+                        .map(|o| {
+                            vec![if o == *source {
+                                Value::Int(0)
+                            } else {
+                                Value::Null
+                            }]
+                        })
+                        .collect())
+                }
+                other => Err(invalid(format!("mock has no kernel '{other}'"))),
+            }
+        }
     }
 
     fn run_opts(source: &str, params: &[(&str, Value)], options: Options) -> QueryResult {
@@ -4835,6 +4976,83 @@ mod tests {
             &[],
         );
         assert_eq!(int_rows(&r), [[2], [1]]);
+    }
+
+    #[test]
+    fn call_yields_a_row_per_node_and_composes_with_sort() {
+        let r = run(
+            "CALL pagerank('KNOWS') YIELD node, rank \
+             RETURN node.id AS id, rank ORDER BY rank DESC LIMIT 2",
+            &[],
+        );
+        assert_eq!(r.columns, ["id", "rank"]);
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(5), Value::Float(0.5)],
+                [Value::Int(4), Value::Float(0.4)],
+            ]
+        );
+    }
+
+    #[test]
+    fn call_output_expands_into_a_following_match() {
+        // Every KNOWS edge appears once when the match starts from the
+        // call's synthesized nodes, so the plumbing produced real node
+        // values the expand can walk.
+        let r = run(
+            "CALL wcc('KNOWS') YIELD node, component \
+             MATCH (node)-[:KNOWS]->(m) \
+             RETURN count(*) AS paths",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[8]]);
+    }
+
+    #[test]
+    fn call_passes_the_sssp_source_through() {
+        let r = run(
+            "CALL sssp('KNOWS', 3) YIELD node, distance \
+             WITH node, distance WHERE distance IS NOT NULL \
+             RETURN node.id AS id, distance",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[3, 0]]);
+    }
+
+    #[test]
+    fn call_rejects_bad_shapes_at_bind_time() {
+        let schema = schema();
+        for (source, want) in [
+            (
+                "CALL pagerank('KNOWS') YIELD node, score RETURN score",
+                "yields the columns node, rank",
+            ),
+            (
+                "CALL nonsense('KNOWS') YIELD node, rank RETURN rank",
+                "unknown table function",
+            ),
+            (
+                "CALL pagerank('IS_LOCATED_IN') YIELD node, rank RETURN rank",
+                "over one node table",
+            ),
+            (
+                "CALL pagerank('KNOWS', 1) YIELD node, rank RETURN rank",
+                "takes only the rel table",
+            ),
+            (
+                "CALL sssp('KNOWS') YIELD node, distance RETURN distance",
+                "source node id",
+            ),
+            (
+                "MATCH (a:Person) CALL wcc('KNOWS') YIELD node, component RETURN component",
+                "first clause",
+            ),
+        ] {
+            let parsed = crate::parser::parse(source).expect("parse");
+            let err = crate::binder::bind(&parsed, &schema).expect_err(source);
+            assert!(err.to_string().contains(want), "{source}: {err}");
+        }
     }
 
     #[test]

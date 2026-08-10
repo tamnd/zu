@@ -5,6 +5,7 @@
 //! flip; `meta` the meta-block chains behind every root pointer. Node
 //! groups, segments, and CSR build on top of these within M1.
 
+pub mod algo;
 pub mod catalog;
 pub mod colors;
 pub mod epoch;

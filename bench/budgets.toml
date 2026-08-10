@@ -185,6 +185,22 @@ ldbc_ic_p50_ms = 10.0
 # ceiling, never raise it.
 ldbc_triangle_p50_ms = 600.0
 
+# Table function kernels on SF1 (docs/07 section 4, docs/12 M4), timed
+# directly against the loaded knows CSR: pagerank is 20 power
+# iterations at damping 0.85, wcc is union-find by minimum with path
+# halving, sssp is an undirected BFS from row 0, louvain runs local
+# moves plus aggregation until no level improves. Every measured run
+# asserts against an independent reference computed from the raw edge
+# list: pagerank within 1e-12 of a fresh power iteration, wcc and sssp
+# exact, louvain checked for determinism across two runs. Measured on
+# the local M series: pagerank 0.003 s, wcc 0.001 s, sssp 0.001 s,
+# louvain 0.073 s; ceilings leave room for the EPYC vCPU hosts and
+# their documented steal. Lower these ceilings, never raise them.
+ldbc_pagerank_s = 0.05
+ldbc_wcc_s = 0.02
+ldbc_sssp_s = 0.02
+ldbc_louvain_s = 0.5
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

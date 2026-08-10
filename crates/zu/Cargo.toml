@@ -27,6 +27,10 @@ name = "ldbc"
 harness = false
 
 [[bench]]
+name = "session"
+harness = false
+
+[[bench]]
 name = "graphalytics"
 harness = false
 

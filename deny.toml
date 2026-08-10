@@ -1,6 +1,11 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # paste is archived but still sits under the arrow crates. Nothing
+    # to act on from here; drop this when arrow moves off it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 allow = [
@@ -12,6 +17,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # tiny-keccak, pulled in through arrow's ahash. A public domain
+    # dedication, as permissive as it gets.
+    "CC0-1.0",
 ]
 
 [sources]

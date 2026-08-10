@@ -12,7 +12,10 @@
 
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -66,12 +69,63 @@ impl RealFile {
 }
 
 impl VfsFile for RealFile {
+    #[cfg(unix)]
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()> {
-        Ok(self.0.read_exact_at(buf, offset)?)
+        Ok(FileExt::read_exact_at(&self.0, buf, offset)?)
     }
 
+    #[cfg(unix)]
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<()> {
-        Ok(self.0.write_all_at(buf, offset)?)
+        Ok(FileExt::write_all_at(&self.0, buf, offset)?)
+    }
+
+    // Windows has no pread/pwrite with exact semantics: seek_read and
+    // seek_write may transfer fewer bytes than asked, so loop until the
+    // buffer is done. They also move the handle's file pointer, which
+    // is harmless here because every read and write in this crate goes
+    // through these positioned calls.
+    #[cfg(windows)]
+    fn read_exact_at(&mut self, mut buf: &mut [u8], mut offset: u64) -> Result<()> {
+        while !buf.is_empty() {
+            match self.0.seek_read(buf, offset) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "read past end of file",
+                    )
+                    .into());
+                }
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn write_all_at(&mut self, mut buf: &[u8], mut offset: u64) -> Result<()> {
+        while !buf.is_empty() {
+            match self.0.seek_write(buf, offset) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "wrote zero bytes",
+                    )
+                    .into());
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     fn set_len(&mut self, len: u64) -> Result<()> {

@@ -134,12 +134,15 @@ fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>, Profi
         ],
     )
     .expect("store props");
+    let analyze_started = Instant::now();
+    zu::zu1::colors::analyze(&mut db).expect("analyze");
     println!(
-        "sf1: {} persons, {} knows edges, 9 props columns, parse {:.2}s, load {:.2}s",
+        "sf1: {} persons, {} knows edges, 9 props columns, parse {:.2}s, load {:.2}s, analyze {:.2}s",
         by_row.len(),
         dense.len(),
         parsed.as_secs_f64(),
-        load_started.elapsed().as_secs_f64()
+        load_started.elapsed().as_secs_f64(),
+        analyze_started.elapsed().as_secs_f64()
     );
     (dense, by_row, profiles)
 }

@@ -1444,6 +1444,20 @@ fn rewrite_count_expand(
             {
                 continue;
             }
+            // The retain filters chunk `f`'s vector in place, so every
+            // probe pull must refill it: the producer has to sit
+            // directly below the removed flatten. With another flatten
+            // in between, several probe rows share one fill and one
+            // row's survivors would narrow the next row's probe.
+            let refills = matches!(
+                (t > 1).then(|| &b.descs[t - 2]),
+                Some(
+                    OpDesc::Expand { chunk: p, .. } | OpDesc::VarExpand { chunk: p, .. }
+                ) if *p == f
+            );
+            if !refills {
+                continue;
+            }
             // References excluding the join itself: its own flat read
             // of `to` is exactly what the fusion removes.
             let mut others = BTreeSet::new();
@@ -4394,6 +4408,113 @@ mod tests {
         let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
         assert!(
             names.iter().any(|n| n.starts_with("AspJoin (retain)")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn asp_join_probes_flat_when_probe_rows_share_a_vector() {
+        // The order the optimizer picks under COLOR summaries on a
+        // real hub graph: scan c, expand both a and b backward from c,
+        // close a to b. The two lists are a cross product over c, so
+        // after flattening a, several probe rows share one b vector
+        // per c. Retaining survivors in place would let the first a's
+        // filter narrow every later a's probe: on this graph a=1 keeps
+        // only b=3 and a=2 then misses b=4, halving the count. The
+        // fusion must stay off and the join probe one configuration at
+        // a time.
+        let schema = Schema::new(
+            vec![NodeDef {
+                id: 0,
+                name: "Person".into(),
+                node_count: 5,
+            }],
+            vec![RelDef {
+                id: 2,
+                name: "KNOWS".into(),
+                from: 0,
+                to: 0,
+                edge_count: 6,
+            }],
+        )
+        .expect("schema");
+        let parsed = crate::parser::parse(
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+             RETURN count(*) AS triangles",
+        )
+        .expect("parse");
+        let query = crate::binder::bind(&parsed, &schema).expect("bind");
+        // Harvest slots and the aggregate wrapper from the built plan,
+        // then rewire the match into the shared-vector order by hand
+        // so the shape cannot drift with the optimizer.
+        let built = crate::plan::build(&query).expect("plan");
+        let LogicalPlan::Aggregate { input, keys, aggs } = built else {
+            panic!("count(*) builds an aggregate");
+        };
+        let LogicalPlan::Expand {
+            rel: close,
+            from: a,
+            to: c,
+            input,
+            ..
+        } = *input
+        else {
+            panic!("the built plan closes a to c");
+        };
+        let LogicalPlan::Expand {
+            rel: hop2,
+            from: b,
+            input,
+            ..
+        } = *input
+        else {
+            panic!("the built plan hops b to c");
+        };
+        let LogicalPlan::Expand { rel: hop1, .. } = *input else {
+            panic!("the built plan hops a to b");
+        };
+        let scan = LogicalPlan::ScanNodes {
+            input: Box::new(LogicalPlan::Empty),
+            slot: c,
+            optional: None,
+        };
+        let expand = |input, rel, from, to, direction, into, asp| LogicalPlan::Expand {
+            input: Box::new(input),
+            rel,
+            from,
+            to,
+            direction,
+            range: None,
+            into,
+            asp,
+            wcoj: false,
+            optional: None,
+        };
+        let b_from_c = expand(scan, hop2, c, b, RelDirection::In, false, false);
+        let a_from_c = expand(b_from_c, close, c, a, RelDirection::In, false, false);
+        let close_a_b = expand(a_from_c, hop1, a, b, RelDirection::Out, true, true);
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(close_a_b),
+            keys,
+            aggs,
+        };
+        // Everyone points at 0, plus 1 knows 3 and 2 knows 4: the
+        // triangles are (1, 3, 0) and (2, 4, 0).
+        let mut graph = MockGraph {
+            edges: BTreeMap::from([(2u32, vec![(1, 0), (2, 0), (3, 0), (4, 0), (1, 3), (2, 4)])]),
+        };
+        let options = Options {
+            threads: 1,
+            ..Options::default()
+        };
+        let (r, p) =
+            execute_profiled(&plan, &query, &schema, &mut graph, &[], &options).expect("execute");
+        assert_eq!(int_rows(&r), [[2]]);
+        let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("AspJoin (") && !n.contains("retain")),
             "got: {names:?}"
         );
     }

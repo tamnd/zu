@@ -82,6 +82,22 @@ jobs:
       # encoder and decoder path at miri-sized inputs, rather than the
       # whole unit suite with its hundred-thousand-value columns.
       - run: cargo +nightly miri test -p zu-encoding --test roundtrip
+      # The vector layer carries the unsafe: arena allocation, the
+      # MaybeUninit compare staging, and StrView. The lib tests plus one
+      # differential compare run cross all of it at miri-sized inputs.
+      - run: cargo +nightly miri test -p zu-vector --lib
+      - run: cargo +nightly miri test -p zu-vector --test reference compare_i64_const
+
+  check-asm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The perf/11 tier 1 gate: every hot kernel that relies on
+      # auto-vectorization must actually vectorize on this toolchain.
+      - run: cargo bench -p zu-vector --no-run
+      - run: bench/check_asm.sh
 
   fuzz:
     runs-on: ubuntu-latest
@@ -96,7 +112,7 @@ jobs:
         run: cargo run --manifest-path fuzz/Cargo.toml --bin seeds
       - name: Fuzz decoders
         run: |
-          for target in zu1_decode decode_segment decode_for_bitpack decode_delta decode_delta_patch decode_bool_bitpack decode_frequency; do
+          for target in zu1_decode decode_segment decode_for_bitpack decode_delta decode_delta_patch decode_bool_bitpack decode_frequency vector_kernels; do
             cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=3072
           done
       - name: Fuzz file verify

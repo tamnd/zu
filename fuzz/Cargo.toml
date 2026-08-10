@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 tempfile = "3"
 zu-encoding = { path = "../crates/zu-encoding", features = ["zstd"] }
 zu-query = { path = "../crates/zu-query" }
+zu-vector = { path = "../crates/zu-vector" }
 zu-zu1 = { path = "../crates/zu-zu1" }
 
 [[bin]]
@@ -115,6 +116,13 @@ bench = false
 [[bin]]
 name = "seeds"
 path = "src/seeds.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vector_kernels"
+path = "fuzz_targets/vector_kernels.rs"
 test = false
 doc = false
 bench = false

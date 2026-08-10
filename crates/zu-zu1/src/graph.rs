@@ -489,9 +489,11 @@ pub fn bulk_load_keyed(
         }
     }
     let fwd = build_direction(db, node_count, edges)?;
+    let out_hist = crate::stats::degree_histogram(edges);
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
     rev.sort_unstable();
     let bwd = build_direction(db, node_count, &rev)?;
+    let in_hist = crate::stats::degree_histogram(&rev);
     drop(rev);
     let row_counts = |g: u64| {
         let first_row = g * GROUP_ROWS as u64;
@@ -519,14 +521,20 @@ pub fn bulk_load_keyed(
     let from = catalog.upsert_node(node_table, node_count)?;
     let rel_id = catalog.upsert_rel(rel_table, from, from, edges.len() as u64)?;
     index.set(rel_id, root);
-    // The catalog and index chains are rewritten whole, freeing the
-    // committed copies first.
+    // The catalog, index, and stats chains are rewritten whole,
+    // freeing the committed copies first.
+    let mut stats = crate::stats::Stats::load(db)?;
+    stats
+        .rels
+        .insert(rel_id, crate::stats::RelStats { out_hist, in_hist });
     free_chain(db, db.db_header().catalog_root)?;
     free_chain(db, db.db_header().table_index_root)?;
+    free_chain(db, db.db_header().stats_root)?;
     let catalog_root = meta::write_chain(db, &catalog.encode())?;
     let index_root = meta::write_chain(db, &index.encode())?;
     db.db_header_mut().catalog_root = catalog_root;
     db.db_header_mut().table_index_root = index_root;
+    stats.store(db)?;
     db.checkpoint()?;
     Ok(directory)
 }

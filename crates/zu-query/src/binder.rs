@@ -48,13 +48,23 @@ pub struct RelDef {
 pub struct Schema {
     nodes: Vec<NodeDef>,
     rels: Vec<RelDef>,
+    /// Per-direction log2 degree histograms per rel table id, forward
+    /// then backward, from the engine's stats blocks (docs/07 §6).
+    /// Bucket `i` counts sources with degree in `[2^i, 2^(i+1))`;
+    /// absent for engines that carry no statistics yet, and every
+    /// estimate then falls back to the count ratios.
+    degree_hists: BTreeMap<u32, [Vec<u64>; 2]>,
 }
 
 impl Schema {
     /// Builds a schema, rejecting duplicate names and rel endpoints
     /// that name no node table.
     pub fn new(nodes: Vec<NodeDef>, rels: Vec<RelDef>) -> Result<Self> {
-        let schema = Schema { nodes, rels };
+        let schema = Schema {
+            nodes,
+            rels,
+            degree_hists: BTreeMap::new(),
+        };
         let mut seen = HashMap::new();
         for n in &schema.nodes {
             if seen.insert(n.name.clone(), ()).is_some() {
@@ -97,6 +107,18 @@ impl Schema {
 
     pub fn rel_by_id(&self, id: u32) -> Option<&RelDef> {
         self.rels.iter().find(|r| r.id == id)
+    }
+
+    /// Attaches the engine's degree histograms, forward then backward
+    /// per rel table id.
+    pub fn set_degree_hists(&mut self, hists: BTreeMap<u32, [Vec<u64>; 2]>) {
+        self.degree_hists = hists;
+    }
+
+    /// The log2 degree histograms of one rel table, forward then
+    /// backward, when the engine carries statistics for it.
+    pub fn degree_hist(&self, rel: u32) -> Option<&[Vec<u64>; 2]> {
+        self.degree_hists.get(&rel)
     }
 }
 

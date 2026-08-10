@@ -1037,21 +1037,36 @@ fn wcoj_fusion(
     else {
         return Ok(None);
     };
-    if *to2 != to
-        || *opt2 != optional
+    if *opt2 != optional
         || !(*wcoj || b.wcoj == Wcoj::Force)
         || matches!(direction, RelDirection::Undirected)
-        || !b.slot_loc.contains_key(from)
     {
         return Ok(None);
     }
+    // The close either points into the expand's endpoint from a bound
+    // source, or the DP oriented it outward from the endpoint. The
+    // mirrored form probes the bound end's lists in the flipped
+    // direction, the same sorted reverse index a reversed expand
+    // reads, so both shapes fuse into the one intersection.
+    let (probe, probe_dir) = if *to2 == to && b.slot_loc.contains_key(from) {
+        (*from, *direction)
+    } else if *from == to && b.slot_loc.contains_key(to2) {
+        let flipped = match direction {
+            RelDirection::Out => RelDirection::In,
+            RelDirection::In => RelDirection::Out,
+            RelDirection::Undirected => return Ok(None),
+        };
+        (*to2, flipped)
+    } else {
+        return Ok(None);
+    };
     let steps = rel_steps(*rel, query, schema)?;
     let [step] = steps[..] else {
         return Ok(None);
     };
-    let probe_chunk = b.slot_loc[from].0;
+    let probe_chunk = b.slot_loc[&probe].0;
     b.ensure_flat(probe_chunk);
-    Ok(Some((*rel, *from, *direction, step)))
+    Ok(Some((*rel, probe, probe_dir, step)))
 }
 
 /// Compiles one ScanNodes, Expand, or Filter into the builder.
@@ -4485,6 +4500,40 @@ mod tests {
         assert!(
             names.iter().any(|n| n.starts_with("MultiwayIntersect")),
             "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn mirrored_closes_fuse_when_the_dp_walks_backwards() {
+        // An in-fanout below the out-fanout flips the DP to the
+        // reversed walk, which orients the close out of the last
+        // introduced node instead of into it. The mirrored fusion
+        // probes the bound end's in-lists and the rows must still
+        // match the pinned binary join.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN a.id AS a, b.id AS b, c.id AS c";
+        let mut schema = schema();
+        schema.set_degree_hists([(2u32, [vec![0, 2], vec![4]])].into_iter().collect());
+        let parsed = crate::parser::parse(source).expect("parse");
+        let query = crate::binder::bind(&parsed, &schema).expect("bind");
+        let built = crate::plan::build(&query).expect("plan");
+        let optimized = crate::optimizer::optimize(built, &query, &schema).expect("optimize");
+        let mut graph = mock();
+        let (r, p) = execute_profiled(
+            &optimized,
+            &query,
+            &schema,
+            &mut graph,
+            &[],
+            &Options::default(),
+        )
+        .expect("execute profiled");
+        assert_eq!(int_rows(&r), [[0, 1, 2]]);
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
+        let names = op_names(&p);
+        assert!(
+            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "the mirrored close must fuse, got: {names:?}"
         );
     }
 

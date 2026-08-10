@@ -580,6 +580,64 @@ mod tests {
         .expect("acyclic count");
         assert_eq!(r.rows, [[Value::Int(acyclic_total)]]);
 
+        // Path returns on real storage, checked structurally against
+        // the BFS levels: every path alternates node, rel, node, its
+        // length is twice the endpoint's level plus one, its rels are
+        // exactly the r list, and each hop's endpoints chain.
+        let r = run(
+            "MATCH p = ANY SHORTEST (a:person {id: $src})-[r:follows*]->(b) \
+             RETURN p, r, b.id AS id ORDER BY id",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("path return");
+        assert_eq!(r.rows.len(), reached.len());
+        for row in &r.rows {
+            let (Value::List(p), Value::List(rels), Value::Int(b)) = (&row[0], &row[1], &row[2])
+            else {
+                panic!("expected a path, a rel list, and an id, got {row:?}");
+            };
+            assert_eq!(p.len(), 2 * level[*b as usize] as usize + 1);
+            assert_eq!(p.len(), 2 * rels.len() + 1);
+            assert_eq!(
+                p[0],
+                Value::Node {
+                    table: 0,
+                    offset: u64::from(src)
+                }
+            );
+            assert_eq!(
+                p[p.len() - 1],
+                Value::Node {
+                    table: 0,
+                    offset: *b as u64
+                }
+            );
+            for (hop, rel) in rels.iter().enumerate() {
+                assert_eq!(&p[2 * hop + 1], rel, "rel {hop} diverges from r");
+                let Value::Rel {
+                    src: rs, dst: rd, ..
+                } = rel
+                else {
+                    panic!("expected a rel at hop {hop}, got {rel:?}");
+                };
+                assert_eq!(
+                    p[2 * hop],
+                    Value::Node {
+                        table: 0,
+                        offset: *rs
+                    }
+                );
+                assert_eq!(
+                    p[2 * hop + 2],
+                    Value::Node {
+                        table: 0,
+                        offset: *rd
+                    }
+                );
+            }
+        }
+
         // Left-outer semantics on real storage: people with no edge
         // into the high ids keep one row with a null friend, so
         // count(a) sees every row and count(b) only the matches.

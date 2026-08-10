@@ -12,14 +12,10 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use zu_common::{Result, ZuError};
+use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
 use crate::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema};
-
-fn invalid(detail: String) -> ZuError {
-    ZuError::InvalidArgument(detail)
-}
 
 /// The hop range of a variable-length expand together with the path
 /// mode and selector that govern its enumeration (docs/07 §1, §5).
@@ -218,11 +214,8 @@ fn build_path(
     bound: &mut HashSet<usize>,
     optional: Option<usize>,
 ) -> Result<LogicalPlan> {
-    if path.slot.is_some() {
-        return Err(invalid(
-            "path variables are not planned yet, they arrive with path returns".into(),
-        ));
-    }
+    // A path variable adds no operator: the binder records its shape
+    // and the executor assembles the value from the pattern's slots.
     if !bound.contains(&path.start.slot) {
         bound.insert(path.start.slot);
         plan = LogicalPlan::ScanNodes {
@@ -732,13 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn path_variables_are_rejected_for_now() {
-        let query = binder::bind(
-            &parse("MATCH p = (a:Person)-[:KNOWS]->(b) RETURN p").expect("parse"),
-            &schema(),
-        )
-        .expect("bind");
-        let err = build(&query).expect_err("path plans later");
-        assert!(err.to_string().contains("path variables"), "got: {err}");
+    fn path_variables_add_no_operators() {
+        let text = explained("MATCH p = (a:Person)-[:KNOWS]->(b) RETURN p");
+        assert!(text.contains("Expand"), "got:\n{text}");
+        assert!(
+            !text.contains("Path"),
+            "a path variable assembles at eval time, got:\n{text}"
+        );
     }
 }

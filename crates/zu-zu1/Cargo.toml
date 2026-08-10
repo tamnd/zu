@@ -23,6 +23,11 @@ arrow = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 [dev-dependencies]
 tempfile.workspace = true
 
+# Compiled only under RUSTFLAGS="--cfg loom" for the suite in
+# tests/loom.rs; a plain build never pulls this in.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true
 

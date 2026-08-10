@@ -187,6 +187,21 @@ impl Snapshot for Zu1Snapshot<'_> {
         pred: Option<&ZonePred>,
         arena: &mut MorselArena,
     ) -> Result<Option<ScanChunk>> {
+        // A bare row-id scan needs only the catalog extent; tables
+        // loaded without properties still scan and expand fine.
+        if cols.is_empty() && pred.is_none() {
+            let total = self.table_rows(table)?;
+            let row_base = chunk * SCAN_ROWS as u64;
+            if row_base >= total {
+                return Ok(None);
+            }
+            return Ok(Some(ScanChunk {
+                row_base,
+                rows: (total - row_base).min(SCAN_ROWS as u64) as u32,
+                sel: None,
+                columns: Vec::new(),
+            }));
+        }
         self.ensure_props(table)?;
         let Self {
             db,

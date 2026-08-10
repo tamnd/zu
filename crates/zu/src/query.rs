@@ -132,6 +132,10 @@ impl<'a> Zu1Graph<'a> {
         &mut self.db
     }
 
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     /// Swaps in a fresh catalog and drops every cached reader; the
     /// session calls this when the header epoch moves, because the
     /// cached directories and decoded groups describe the old epoch.
@@ -437,9 +441,24 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 /// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
     let p = prepare(source, db, params)?;
-    let mut graph = Zu1Graph::new(db, p.catalog);
     let options = env_options();
+    if exec2_enabled() {
+        let mut snap = crate::snapshot::Zu1Snapshot::new(db, p.catalog.clone());
+        if let Some(r) =
+            zu_exec::try_execute(&p.plan, &p.query, &p.schema, &mut snap, &p.args, &options)?
+        {
+            return Ok(r);
+        }
+    }
+    let mut graph = Zu1Graph::new(db, p.catalog);
     exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
+}
+
+/// Whether plans the pipeline executor covers run there. On by
+/// default; `ZU_EXEC2=0` pins every query to the old executor, which
+/// is how the differential tests get their oracle rows.
+pub(crate) fn exec2_enabled() -> bool {
+    std::env::var("ZU_EXEC2").as_deref() != Ok("0")
 }
 
 /// The execution options both entry points honor, so a profile always

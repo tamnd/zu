@@ -43,6 +43,16 @@ pub struct RelDef {
     pub edge_count: u64,
 }
 
+/// One rel table's COLOR summary (docs/07 §6): `counts[c]` nodes hold
+/// color `c` and every triple is `(from_color, to_color, edge_count,
+/// max_degree)`. The optimizer walks these as sparse matrices to keep a
+/// frontier's color distribution through multi-hop chains.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColorSummary {
+    pub counts: Vec<u64>,
+    pub triples: Vec<(u32, u32, u64, u64)>,
+}
+
 /// The table shape the binder resolves against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schema {
@@ -54,6 +64,8 @@ pub struct Schema {
     /// absent for engines that carry no statistics yet, and every
     /// estimate then falls back to the count ratios.
     degree_hists: BTreeMap<u32, [Vec<u64>; 2]>,
+    /// COLOR summaries per rel table id, present after an ANALYZE.
+    color_summaries: BTreeMap<u32, ColorSummary>,
 }
 
 impl Schema {
@@ -64,6 +76,7 @@ impl Schema {
             nodes,
             rels,
             degree_hists: BTreeMap::new(),
+            color_summaries: BTreeMap::new(),
         };
         let mut seen = HashMap::new();
         for n in &schema.nodes {
@@ -119,6 +132,16 @@ impl Schema {
     /// backward, when the engine carries statistics for it.
     pub fn degree_hist(&self, rel: u32) -> Option<&[Vec<u64>; 2]> {
         self.degree_hists.get(&rel)
+    }
+
+    /// Attaches the engine's COLOR summaries per rel table id.
+    pub fn set_color_summaries(&mut self, summaries: BTreeMap<u32, ColorSummary>) {
+        self.color_summaries = summaries;
+    }
+
+    /// The COLOR summary of one rel table, when an ANALYZE built one.
+    pub fn color_summary(&self, rel: u32) -> Option<&ColorSummary> {
+        self.color_summaries.get(&rel)
     }
 }
 

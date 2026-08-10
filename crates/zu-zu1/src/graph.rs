@@ -524,9 +524,14 @@ pub fn bulk_load_keyed(
     // The catalog, index, and stats chains are rewritten whole,
     // freeing the committed copies first.
     let mut stats = crate::stats::Stats::load(db)?;
-    stats
-        .rels
-        .insert(rel_id, crate::stats::RelStats { out_hist, in_hist });
+    stats.rels.insert(
+        rel_id,
+        crate::stats::RelStats {
+            out_hist,
+            in_hist,
+            colors: None,
+        },
+    );
     free_chain(db, db.db_header().catalog_root)?;
     free_chain(db, db.db_header().table_index_root)?;
     free_chain(db, db.db_header().stats_root)?;
@@ -540,13 +545,19 @@ pub fn bulk_load_keyed(
 }
 
 /// Read access to a bulk-loaded graph, caching the most recently decoded
-/// group and direction so sequential scans decode each group once.
+/// group per direction so sequential scans decode each group once. The
+/// two directions cache independently because a plan often walks both
+/// on the same rel row by row, an expand backward feeding a count
+/// forward, and a shared slot would decode a full group per row.
 #[derive(Debug)]
 pub struct GraphReader {
     directory: Directory,
-    cached_group: Option<(usize, Direction, Vec<u64>, Vec<u64>)>,
+    cached_groups: [Option<CachedGroup>; 2],
     key_reader: Option<KeyReader>,
 }
+
+/// One decoded CSR group: its index, offsets, and neighbor values.
+type CachedGroup = (usize, Vec<u64>, Vec<u64>);
 
 impl GraphReader {
     /// Opens the only rel table in the file, the common single-graph
@@ -585,7 +596,7 @@ impl GraphReader {
         let bytes = meta::read_chain(db, root)?;
         Ok(Self {
             directory: Directory::decode(&bytes)?,
-            cached_group: None,
+            cached_groups: [None, None],
             key_reader: None,
         })
     }
@@ -627,15 +638,16 @@ impl GraphReader {
     /// on a cache miss.
     pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
         let (g, row) = self.locate(node)?;
-        if self.cached_group.as_ref().map(|(i, d, _, _)| (*i, *d)) != Some((g, dir)) {
+        let slot = &mut self.cached_groups[dir as usize];
+        if slot.as_ref().map(|(i, _, _)| *i) != Some(g) {
             let meta = self.directory.groups[g].dir(dir);
             let mut offsets = Vec::with_capacity(meta.offsets.value_count as usize);
             let mut nbrs = Vec::with_capacity(meta.neighbors.value_count as usize);
             read_segment(db, &meta.offsets, &mut offsets)?;
             read_segment(db, &meta.neighbors, &mut nbrs)?;
-            self.cached_group = Some((g, dir, offsets, nbrs));
+            *slot = Some((g, offsets, nbrs));
         }
-        let (_, _, offsets, nbrs) = self.cached_group.as_ref().unwrap();
+        let (_, offsets, nbrs) = self.cached_groups[dir as usize].as_ref().unwrap();
         let lo = offsets[row] as usize;
         let hi = offsets[row + 1] as usize;
         Ok(&nbrs[lo..hi])

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use zu_common::{Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
-use zu_query::exec::{self, Graph, QueryResult, Value};
+use zu_query::exec::{self, Graph};
 use zu_query::{optimizer, parser, plan};
 
 use crate::zu1::algo;
@@ -15,6 +15,11 @@ use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
 use crate::zu1::props::{PropType, PropsReader, load_props};
+
+/// The types [`run`] speaks, re-exported here so a caller that depends
+/// on `zu` alone can bind a parameter and read a row back without also
+/// depending on `zu-query`.
+pub use zu_query::exec::{QueryResult, Value};
 
 /// Builds the binder schema from a zu1 catalog.
 pub fn schema_of(catalog: &Catalog) -> Result<Schema> {

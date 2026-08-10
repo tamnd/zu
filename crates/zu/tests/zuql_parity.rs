@@ -155,6 +155,18 @@ fn both_engines_answer_the_corpus_identically() {
              RETURN count(b) AS paths, min(size(r)) AS nearest",
             &[("src", Value::Int(3))],
         ),
+        (
+            "MATCH p = ANY SHORTEST (a:person {id: $src})-[:knows*]->(b) \
+             RETURN size(p) AS len, b.id AS id ORDER BY id LIMIT 20",
+            &[("src", Value::Int(3))],
+        ),
+        // Raw node and rel values carry engine-assigned table ids, so
+        // path comparisons go through sizes and endpoint ids.
+        (
+            "MATCH p = ACYCLIC (a:person {id: $src})-[:knows*1..2]->(b) \
+             RETURN size(p) AS len, count(*) AS n ORDER BY len",
+            &[("src", Value::Int(3))],
+        ),
     ];
     for (source, params) in corpus {
         let z = run_zu1(source, &mut zu, params).unwrap();

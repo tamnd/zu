@@ -265,6 +265,60 @@ impl SqliteStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Inserts one node row at an explicit `zrow`. The zu layer owns
+    /// dense row assignment: bare rowid allocation is `max(zrow) + 1`,
+    /// which silently reuses the id of a deleted tail row, while zu1's
+    /// row domain is append-only with tombstones holding offsets
+    /// stable, so the two would fork exactly there.
+    pub fn insert_node_at(&self, table: &str, row: i64, values: &[Value]) -> Result<()> {
+        let sql = format!(
+            "INSERT INTO n_{} VALUES (?{})",
+            ident(table)?,
+            placeholders(values.len())
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(values.len() + 1);
+        params.push(&row);
+        params.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
+        self.conn
+            .execute(&sql, params.as_slice())
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Sets one property column on one node row. Fails when the row
+    /// does not exist. Node rows carry no adjacency, so the CSR cache
+    /// is untouched.
+    pub fn update_node(&self, table: &str, row: i64, column: &str, value: &Value) -> Result<()> {
+        let sql = format!(
+            "UPDATE n_{} SET p_{} = ? WHERE zrow = ?",
+            ident(table)?,
+            ident(column)?
+        );
+        match self
+            .conn
+            .execute(&sql, rusqlite::params![value, row])
+            .map_err(sql_err)?
+        {
+            1 => Ok(()),
+            _ => Err(ZuError::InvalidArgument(format!(
+                "node table '{table}' has no row {row}"
+            ))),
+        }
+    }
+
+    /// Deletes one node row. Fails when the row does not exist. Edges
+    /// pointing at the row stay in their rel tables; integrity rules
+    /// live above the engine, matching zu1's tombstone semantics.
+    pub fn delete_node(&self, table: &str, row: i64) -> Result<()> {
+        let sql = format!("DELETE FROM n_{} WHERE zrow = ?", ident(table)?);
+        match self.conn.execute(&sql, [row]).map_err(sql_err)? {
+            1 => Ok(()),
+            _ => Err(ZuError::InvalidArgument(format!(
+                "node table '{table}' has no row {row}"
+            ))),
+        }
+    }
+
     /// The CSR adjacency of one node group in one direction, built on
     /// miss from a single index range query and cached until a write
     /// touches the group. Hot traversals read the cached group at

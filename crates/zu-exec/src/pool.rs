@@ -19,13 +19,32 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// How long a worker that ran out of jobs spins on the pending
+/// counter before parking on the condvar. Windows takes anywhere from
+/// half a millisecond to four to wake a parked thread, which is
+/// longer than most queries, so parked workers were missing whole
+/// queries on gamingpc; a spinning worker picks a job up in
+/// microseconds and back-to-back queries stay inside the window.
+#[cfg(windows)]
+const SPIN: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Elsewhere a parked thread wakes in microseconds and spinning only
+/// steals cores from the query still running, so workers park at once.
+#[cfg(not(windows))]
+const SPIN: std::time::Duration = std::time::Duration::ZERO;
+
 struct Queue {
     jobs: Mutex<VecDeque<Job>>,
     ready: Condvar,
     /// Workers alive, capped at the host's parallelism; a submit that
     /// finds every worker busy and the cap unreached spawns one more.
     workers: AtomicUsize,
+    /// Workers spinning or parked, all of them about to pick up the
+    /// next job, so submit does not have to spawn past them.
     idle: AtomicUsize,
+    /// Queued jobs, mirrored outside the mutex so spinning workers
+    /// poll one relaxed load instead of hammering the lock.
+    pending: AtomicUsize,
 }
 
 fn queue() -> &'static Queue {
@@ -35,20 +54,43 @@ fn queue() -> &'static Queue {
         ready: Condvar::new(),
         workers: AtomicUsize::new(0),
         idle: AtomicUsize::new(0),
+        pending: AtomicUsize::new(0),
     })
+}
+
+fn pop(q: &Queue) -> Option<Job> {
+    let job = q.jobs.lock().unwrap().pop_front();
+    if job.is_some() {
+        q.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+    job
 }
 
 fn worker_loop(q: &'static Queue) {
     loop {
-        let job = {
+        let job = 'get: {
+            if let Some(job) = pop(q) {
+                break 'get job;
+            }
+            q.idle.fetch_add(1, Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            while start.elapsed() < SPIN {
+                if q.pending.load(Ordering::Relaxed) > 0
+                    && let Some(job) = pop(q)
+                {
+                    q.idle.fetch_sub(1, Ordering::Relaxed);
+                    break 'get job;
+                }
+                std::hint::spin_loop();
+            }
             let mut jobs = q.jobs.lock().unwrap();
             loop {
                 if let Some(job) = jobs.pop_front() {
-                    break job;
+                    q.pending.fetch_sub(1, Ordering::Relaxed);
+                    q.idle.fetch_sub(1, Ordering::Relaxed);
+                    break 'get job;
                 }
-                q.idle.fetch_add(1, Ordering::Relaxed);
                 jobs = q.ready.wait(jobs).unwrap();
-                q.idle.fetch_sub(1, Ordering::Relaxed);
             }
         };
         // A worker outlives any one job's panic: the unwind stops here
@@ -110,6 +152,7 @@ pub(crate) fn submit<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) -> Pending {
         });
         let mut jobs = q.jobs.lock().unwrap();
         jobs.push_back(wrapped);
+        q.pending.fetch_add(1, Ordering::Relaxed);
         if q.idle.load(Ordering::Relaxed) == 0 && q.workers.load(Ordering::Relaxed) < cap {
             q.workers.fetch_add(1, Ordering::Relaxed);
             std::thread::Builder::new()

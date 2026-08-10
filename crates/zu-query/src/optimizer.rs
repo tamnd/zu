@@ -33,6 +33,11 @@ use crate::plan::{LogicalPlan, VarLength};
 /// Components larger than this keep their written join order.
 const MAX_DP_RELS: usize = 12;
 
+/// When the pessimistic ceiling exceeds the estimate by this factor,
+/// the join order falls back to the ceiling-optimal order (docs/07
+/// §6, robustness first).
+const BOUND_DISAGREEMENT: f64 = 100.0;
+
 /// Rewrites a built plan with join ordering and filter placement,
 /// then marks closing expands: ASP hash joins where the estimates
 /// justify the accumulate sweep, and the WCOJ intersection where the
@@ -594,6 +599,15 @@ fn connect(nodes: &[usize], expands: &[ExpandOp], b0: &HashSet<usize>) -> Vec<Co
 
 /// DP over relationship subsets of one component. Returns the cheapest
 /// step order and its estimated output cardinality.
+///
+/// Every step also carries a pessimistic row ceiling from the degree
+/// histograms (docs/07 §6): the worst degree any single row can
+/// multiply by. The ceiling clamps the estimate, and when the summed
+/// ceilings exceed the summed estimates by [`BOUND_DISAGREEMENT`] the
+/// DP reruns minimizing the ceiling, with the estimate only breaking
+/// near ties, so a skew-blind guess cannot pick an order whose worst
+/// case is catastrophic. Steps without histograms have no usable
+/// ceiling and disable the caps for their order.
 fn order_component(
     comp: &Component,
     expands: &[ExpandOp],
@@ -606,6 +620,10 @@ fn order_component(
     struct Entry {
         cost: f64,
         card: f64,
+        /// Pessimistic ceiling on `card`, None once any step lacks one.
+        bnd: Option<f64>,
+        /// Running sum of the ceilings, the bound analog of `cost`.
+        bcost: f64,
         steps: Vec<Step>,
     }
     let filter_slots: Vec<HashSet<usize>> = filters
@@ -636,105 +654,160 @@ fn order_component(
     } else {
         (1u32 << comp.rels.len()) - 1
     };
-    let mut best: Option<Entry> = None;
-    for seed in seeds {
-        let base_bound = |mask: u32| -> HashSet<usize> {
-            let mut bound = b0.clone();
-            if let Some(slot) = seed {
-                bound.insert(slot);
+    // In bound mode a poisoned order never wins, a clearly lower
+    // ceiling always wins, and near ties within one percent fall to
+    // the estimate: products taken in a different order drift in the
+    // last bits, so exact ceiling ties cannot be trusted.
+    let beats = |by_bound: bool, cand: &Entry, cur: &Entry| -> bool {
+        if !by_bound {
+            return cand.cost < cur.cost;
+        }
+        match (cand.bnd, cur.bnd) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(_), Some(_)) => {
+                cand.bcost < cur.bcost * 0.99
+                    || (cand.bcost <= cur.bcost * 1.01 && cand.cost < cur.cost)
             }
-            for (i, rel) in comp.rels.iter().enumerate() {
-                if mask & (1 << i) != 0 {
-                    let e = &expands[*rel];
-                    bound.insert(e.from);
-                    bound.insert(e.to);
-                    bound.insert(e.rel);
+        }
+    };
+    let run = |by_bound: bool| -> Option<Entry> {
+        let mut best: Option<Entry> = None;
+        for seed in &seeds {
+            let base_bound = |mask: u32| -> HashSet<usize> {
+                let mut bound = b0.clone();
+                if let Some(slot) = seed {
+                    bound.insert(*slot);
                 }
-            }
-            bound
-        };
-        let mut dp: Vec<Option<Entry>> = vec![None; (full as usize) + 1];
-        dp[0] = Some(match seed {
-            None => Entry {
-                cost: 0.0,
-                card: 1.0,
-                steps: Vec::new(),
-            },
-            Some(slot) => {
-                let grown = base_bound(0);
-                let card = (slot_card(slot, query, schema) * newly(b0, &grown)).max(1e-6);
-                Entry {
-                    cost: card,
-                    card,
-                    steps: vec![Step::Scan(slot)],
+                for (i, rel) in comp.rels.iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        let e = &expands[*rel];
+                        bound.insert(e.from);
+                        bound.insert(e.to);
+                        bound.insert(e.rel);
+                    }
                 }
-            }
-        });
-        for mask in 0..=full {
-            let Some(entry) = dp[mask as usize].clone() else {
-                continue;
+                bound
             };
-            let bound = base_bound(mask);
-            for (i, rel) in comp.rels.iter().enumerate() {
-                if mask & (1 << i) != 0 {
-                    continue;
+            let mut dp: Vec<Option<Entry>> = vec![None; (full as usize) + 1];
+            dp[0] = Some(match seed {
+                None => Entry {
+                    cost: 0.0,
+                    card: 1.0,
+                    bnd: Some(1.0),
+                    bcost: 0.0,
+                    steps: Vec::new(),
+                },
+                Some(slot) => {
+                    let grown = base_bound(0);
+                    let card = (slot_card(*slot, query, schema) * newly(b0, &grown)).max(1e-6);
+                    // A key point filter placeable right above the seed
+                    // scan pins the ceiling to one row per candidate
+                    // table; every other filter leaves it alone because
+                    // the worst case keeps every row.
+                    let pinned = filter_slots.iter().zip(filters).any(|(slots, f)| {
+                        slots.is_subset(&grown)
+                            && !slots.is_subset(b0)
+                            && key_point(f, *slot, query)
+                    });
+                    let bnd = if pinned {
+                        query.variables[*slot].node_tables.len() as f64
+                    } else {
+                        slot_card(*slot, query, schema)
+                    };
+                    Entry {
+                        cost: card,
+                        card,
+                        bnd: Some(bnd),
+                        bcost: bnd,
+                        steps: vec![Step::Scan(*slot)],
+                    }
                 }
-                let e = &expands[*rel];
-                let from_bound = bound.contains(&e.from);
-                let to_bound = bound.contains(&e.to);
-                if !from_bound && !to_bound {
+            });
+            for mask in 0..=full {
+                let Some(entry) = dp[mask as usize].clone() else {
                     continue;
-                }
-                let (step, factor) = if from_bound && to_bound {
-                    (
-                        Step::Expand {
-                            ix: *rel,
-                            from: e.from,
-                            to: e.to,
-                            into: true,
-                        },
-                        into_prob(e, query, schema),
-                    )
-                } else if from_bound {
-                    (
-                        Step::Expand {
-                            ix: *rel,
-                            from: e.from,
-                            to: e.to,
-                            into: false,
-                        },
-                        degree(e, e.from, query, schema),
-                    )
-                } else {
-                    (
-                        Step::Expand {
-                            ix: *rel,
-                            from: e.to,
-                            to: e.from,
-                            into: false,
-                        },
-                        degree(e, e.to, query, schema),
-                    )
                 };
-                let next = mask | (1 << i);
-                let grown = base_bound(next);
-                let card = (entry.card * factor * newly(&bound, &grown)).max(1e-6);
-                let cost = entry.cost + card;
-                let slot = &mut dp[next as usize];
-                if slot.as_ref().is_none_or(|s| cost < s.cost) {
-                    let mut steps = entry.steps.clone();
-                    steps.push(step);
-                    *slot = Some(Entry { cost, card, steps });
+                let bound = base_bound(mask);
+                for (i, rel) in comp.rels.iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        continue;
+                    }
+                    let e = &expands[*rel];
+                    let from_bound = bound.contains(&e.from);
+                    let to_bound = bound.contains(&e.to);
+                    if !from_bound && !to_bound {
+                        continue;
+                    }
+                    let (step, factor, bfactor) = if from_bound && to_bound {
+                        (
+                            Step::Expand {
+                                ix: *rel,
+                                from: e.from,
+                                to: e.to,
+                                into: true,
+                            },
+                            into_prob(e, query, schema),
+                            // A close keeps or drops rows, never adds.
+                            Some(1.0),
+                        )
+                    } else if from_bound {
+                        (
+                            Step::Expand {
+                                ix: *rel,
+                                from: e.from,
+                                to: e.to,
+                                into: false,
+                            },
+                            degree(e, e.from, query, schema),
+                            step_bound(e, e.from, query, schema),
+                        )
+                    } else {
+                        (
+                            Step::Expand {
+                                ix: *rel,
+                                from: e.to,
+                                to: e.from,
+                                into: false,
+                            },
+                            degree(e, e.to, query, schema),
+                            step_bound(e, e.to, query, schema),
+                        )
+                    };
+                    let next = mask | (1 << i);
+                    let grown = base_bound(next);
+                    let bnd = entry.bnd.zip(bfactor).map(|(b, f)| (b * f).max(1e-6));
+                    let card = (entry.card * factor * newly(&bound, &grown)).max(1e-6);
+                    let card = bnd.map_or(card, |b| card.min(b));
+                    let cand = Entry {
+                        cost: entry.cost + card,
+                        card,
+                        bnd,
+                        bcost: entry.bcost + bnd.unwrap_or(0.0),
+                        steps: Vec::new(),
+                    };
+                    let slot = &mut dp[next as usize];
+                    if slot.as_ref().is_none_or(|s| beats(by_bound, &cand, s)) {
+                        let mut steps = entry.steps.clone();
+                        steps.push(step);
+                        *slot = Some(Entry { steps, ..cand });
+                    }
                 }
             }
+            let done = dp[full as usize].take();
+            let improves = |done: &Entry| best.as_ref().is_none_or(|b| beats(by_bound, done, b));
+            if done.as_ref().is_some_and(improves) {
+                best = done;
+            }
         }
-        let done = dp[full as usize].take();
-        let improves = |done: &Entry| best.as_ref().is_none_or(|b| done.cost < b.cost);
-        if done.as_ref().is_some_and(improves) {
-            best = done;
-        }
-    }
-    let best = best.expect("connected component always has an order");
+        best
+    };
+    let best = run(false).expect("connected component always has an order");
+    let best = if best.bnd.is_some() && best.bcost > BOUND_DISAGREEMENT * best.cost {
+        run(true).unwrap_or(best)
+    } else {
+        best
+    };
     (best.steps, best.card)
 }
 
@@ -973,6 +1046,70 @@ fn selectivity(filter: &BoundExpr, query: &BoundQuery, schema: &Schema) -> f64 {
     0.5
 }
 
+/// Whether `filter` pins `slot` to one key: equality between the
+/// slot's `id` property and a literal or parameter.
+fn key_point(filter: &BoundExpr, slot: usize, query: &BoundQuery) -> bool {
+    let BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        lhs,
+        rhs,
+    } = filter
+    else {
+        return false;
+    };
+    [(lhs, rhs), (rhs, lhs)].into_iter().any(|(side, other)| {
+        matches!(side.as_ref(), BoundExpr::Property { base, key }
+            if key == "id"
+                && !query.variables[slot].node_tables.is_empty()
+                && matches!(base.as_ref(), BoundExpr::Var(s) if *s == slot))
+            && matches!(other.as_ref(), BoundExpr::Param(_) | BoundExpr::Literal(_))
+    })
+}
+
+/// Ceiling on the largest degree the histogram admits: bucket `i`
+/// holds degrees below `2^(i+1)`. Zero when the table has no edges.
+fn hist_dmax(hist: &[u64]) -> f64 {
+    hist.iter()
+        .rposition(|c| *c > 0)
+        .map_or(0.0, |top| 2f64.powi(top as i32 + 1) - 1.0)
+}
+
+/// Worst-case fan-out of one expand step from `source`: the largest
+/// degree any single row can multiply by, summed over the candidate
+/// rel tables. None disables the caps for the order: a table without
+/// histograms has no usable ceiling and an unbounded var-length step
+/// has none at all.
+fn step_bound(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> Option<f64> {
+    let hops = match e.range {
+        None => 1,
+        Some(v) => v.max?.clamp(1, 8) as i32,
+    };
+    let reversed = source == e.to && source != e.from;
+    let mut worst = 0.0;
+    for rid in &query.variables[e.rel].rel_tables {
+        let [out, inn] = schema.degree_hist(*rid)?;
+        let (fwd, bwd) = (hist_dmax(out), hist_dmax(inn));
+        worst += match e.direction {
+            RelDirection::Out => {
+                if reversed {
+                    bwd
+                } else {
+                    fwd
+                }
+            }
+            RelDirection::In => {
+                if reversed {
+                    fwd
+                } else {
+                    bwd
+                }
+            }
+            RelDirection::Undirected => fwd + bwd,
+        };
+    }
+    Some(worst.powi(hops))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,6 +1302,61 @@ mod tests {
             &skewed,
         );
         assert_eq!(text.matches("AspJoin").count(), 1, "got:\n{text}");
+    }
+
+    #[test]
+    fn hist_dmax_reads_the_top_bucket_ceiling() {
+        assert_eq!(hist_dmax(&[0, 0, 300]), 7.0, "bucket 2 holds up to 7");
+        assert_eq!(hist_dmax(&[5]), 1.0);
+        assert_eq!(hist_dmax(&[]), 0.0, "no edges, no fan-out");
+    }
+
+    #[test]
+    fn mild_skew_keeps_the_estimated_order() {
+        // Placeholder hists: 1400 places holding 4 to 7 people each.
+        // The backward walk is cheaper on average and its worst case
+        // sits within a factor of the estimate, so the plan starts
+        // from the smaller place table.
+        let source = "MATCH (a:Person)-[:IS_LOCATED_IN]->(c:Place) RETURN a.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let mut mild = schema.clone();
+        mild.set_degree_hists(
+            [(3u32, [vec![9000], vec![0, 0, 1400]])]
+                .into_iter()
+                .collect(),
+        );
+        let text = plan::explain(
+            &optimize(built, &query, &mild).expect("optimize"),
+            &query,
+            &mild,
+        );
+        assert!(text.contains("ScanNodes c: Place"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_catastrophic_ceiling_falls_back_to_the_bound_optimal_order() {
+        // Same mean fan-out as the mild case, but one place holds
+        // nearly every person: the backward walk still estimates 6.4
+        // per row while its ceiling is 8191, past the 100x
+        // disagreement, so the DP reruns on the ceilings and starts
+        // from the person side whose worst case is one place each.
+        let source = "MATCH (a:Person)-[:IS_LOCATED_IN]->(c:Place) RETURN a.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let mut skewed = schema.clone();
+        let mut in_hist = vec![0u64; 13];
+        in_hist[0] = 1399;
+        in_hist[12] = 1;
+        skewed.set_degree_hists([(3u32, [vec![9000], in_hist])].into_iter().collect());
+        let text = plan::explain(
+            &optimize(built, &query, &skewed).expect("optimize"),
+            &query,
+            &skewed,
+        );
+        assert!(text.contains("ScanNodes a: Person"), "got:\n{text}");
     }
 
     #[test]

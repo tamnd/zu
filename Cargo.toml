@@ -32,6 +32,11 @@ arrow-array = "56"
 arrow-schema = "56"
 tempfile = "3"
 
+[workspace.lints.rust]
+# The loom suite compiles under RUSTFLAGS="--cfg loom"; teach the
+# checker the cfg exists so plain builds stay warning-free.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 dbg_macro = "warn"

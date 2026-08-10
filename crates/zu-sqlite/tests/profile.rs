@@ -21,7 +21,12 @@ fn small_graph(store: &mut SqliteStore) {
         .create_node_table("person", &[("name", ColumnType::Text)])
         .unwrap();
     store
-        .create_rel_table("knows", &[("since", ColumnType::Integer)])
+        .create_rel_table(
+            "knows",
+            "person",
+            "person",
+            &[("since", ColumnType::Integer)],
+        )
         .unwrap();
     for i in 1..=6i64 {
         store

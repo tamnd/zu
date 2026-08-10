@@ -40,19 +40,24 @@ disasm() {
     return 1
 }
 
-# kernel:expectation. simd means packed compares must appear; scalar
-# kernels are cursor or bit chains where SIMD is not the design.
+# anchor:pattern:expectation. simd means packed operations must appear;
+# scalar kernels are cursor or bit chains where SIMD is not the design.
+# The pattern is a mangled-path fragment that finds the kernel's own
+# symbols in the symbol table. Depending on inlining the loop body sits
+# either inside the anchor or behind a call the disassembler may not
+# name (a GOT jump on GNU objdump), so the union of anchor, named
+# callees, and pattern matches is what always holds it.
 checks="
-zu_asm_cmp_i64_const:simd
-zu_asm_cmp_i64_pair:simd
-zu_asm_cmp_dict_const:simd
-zu_asm_sum_i64:simd
-zu_asm_sum_f64:scalar
-zu_asm_min_i64:simd
-zu_asm_intersect:scalar
-zu_asm_bitmap_to_sel:scalar
-zu_asm_hash:scalar
-zu_asm_gather:scalar
+zu_asm_cmp_i64_const:3cmp7compare:simd
+zu_asm_cmp_i64_pair:3cmp7compare:simd
+zu_asm_cmp_dict_const:3cmp7compare:simd
+zu_asm_sum_i64:3agg7sum_i64:simd
+zu_asm_sum_f64:3agg7sum_f64:scalar
+zu_asm_min_i64:3agg7min_i64:simd
+zu_asm_intersect:6setops:scalar
+zu_asm_bitmap_to_sel:9SelVector11from_bitmap:scalar
+zu_asm_hash:4hash10hash_slice:scalar
+zu_asm_gather:7kernels6gather:scalar
 "
 
 # Anchors are thin wrappers; the kernel loops may sit one call down as
@@ -69,15 +74,23 @@ with_callees() {
         done
 }
 
+symtab=$(objdump -t "$bin" 2>/dev/null | awk '{print $NF}' | sort -u)
+
 failed=0
 for entry in $checks; do
     sym=${entry%%:*}
-    want=${entry##*:}
+    rest=${entry#*:}
+    pat=${rest%%:*}
+    want=${rest##*:}
     if ! asm=$(with_callees "$sym"); then
         echo "FAIL $sym: symbol not found in $bin"
         failed=1
         continue
     fi
+    for s in $(printf '%s\n' "$symtab" | grep -- "$pat" || true); do
+        asm="$asm
+$(disasm "$s" || true)"
+    done
     insns=$(printf '%s\n' "$asm" | grep -cE '^\s*[0-9a-f]+:' || true)
     simd=$(printf '%s\n' "$asm" | grep -cE "$simd_pat" || true)
     if [ "$want" = simd ] && [ "$simd" -eq 0 ]; then

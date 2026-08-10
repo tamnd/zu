@@ -26,6 +26,10 @@ tempfile.workspace = true
 name = "ldbc"
 harness = false
 
+[[bench]]
+name = "graphalytics"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

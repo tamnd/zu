@@ -201,6 +201,21 @@ ldbc_wcc_s = 0.02
 ldbc_sssp_s = 0.02
 ldbc_louvain_s = 0.5
 
+# Graphalytics kernels on kgs (docs/12 M4), 832 K vertices and 17.9 M
+# undirected edges loaded keyed, every output row validated against
+# the reference vectors LDBC publishes with the dataset: pagerank at
+# the published 10 iterations within 1e-9 relative, wcc and bfs exact,
+# louvain deterministic across two runs since Graphalytics has no
+# louvain reference. Measured on the local M series: pagerank 1.60 s,
+# wcc 0.23 s, bfs 1.80 s, louvain 32.1 s; louvain's cost is the
+# adjacency materialization plus level-0 local moves and is the known
+# optimization target. Ceilings leave room for the EPYC vCPU hosts
+# and their documented steal. Lower these ceilings, never raise them.
+graphalytics_pagerank_s = 8.0
+graphalytics_wcc_s = 2.0
+graphalytics_bfs_s = 8.0
+graphalytics_louvain_s = 120.0
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

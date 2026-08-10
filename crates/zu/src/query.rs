@@ -319,9 +319,14 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
     {
         options.threads = threads;
     }
-    // The hand-injected WCOJ switch of the first M4 slice; the
-    // optimizer's cyclic-pattern detection will replace it.
-    options.wcoj = std::env::var("ZU_WCOJ").is_ok_and(|v| v == "1");
+    // The optimizer marks cyclic closes on its own; ZU_WCOJ stays as
+    // a manual override, 1 forcing the fusion wherever it fits and 0
+    // pinning the binary join for baseline comparisons.
+    options.wcoj = match std::env::var("ZU_WCOJ").as_deref() {
+        Ok("1") => exec::Wcoj::Force,
+        Ok("0") => exec::Wcoj::Off,
+        _ => exec::Wcoj::Auto,
+    };
     exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
 }
 
@@ -851,9 +856,11 @@ mod tests {
     }
 
     /// The WCOJ intersection over a real zu1 file: triangle queries
-    /// run once through the binary-join baseline and once through the
-    /// fused MultiwayIntersect, and both must equal each other and a
-    /// reference count computed straight from the edge list.
+    /// run once through the binary-join baseline pinned off and once
+    /// through the default path, where the optimizer's mark routes
+    /// the close through MultiwayIntersect, and both must equal each
+    /// other and a reference count computed straight from the edge
+    /// list.
     #[test]
     fn wcoj_matches_the_binary_join_on_a_real_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -896,7 +903,10 @@ mod tests {
                 &p.schema,
                 &mut graph,
                 &p.args,
-                &exec::Options::default(),
+                &exec::Options {
+                    wcoj: exec::Wcoj::Off,
+                    ..exec::Options::default()
+                },
             )
             .expect("baseline");
             let fused = exec::execute(
@@ -905,10 +915,7 @@ mod tests {
                 &p.schema,
                 &mut graph,
                 &p.args,
-                &exec::Options {
-                    wcoj: true,
-                    ..exec::Options::default()
-                },
+                &exec::Options::default(),
             )
             .expect("wcoj");
             assert_eq!(

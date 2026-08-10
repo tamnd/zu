@@ -227,12 +227,22 @@ pub struct Options {
     /// Smaller values force many morsels on small graphs, which is how
     /// the tests drive the parallel path over the mock fixtures.
     pub morsel_rows: usize,
-    /// Fuses an expand whose endpoint the next operator probes into a
-    /// `MultiwayIntersect`, the WCOJ closing step of docs/07 §4. This
-    /// is the hand-injected switch of the first WCOJ slice; the
-    /// optimizer's cyclic-pattern detection is the next box and will
-    /// mark subplans on its own.
-    pub wcoj: bool,
+    /// How closing-edge probes reach the `MultiwayIntersect`, the
+    /// WCOJ closing step of docs/07 §4.
+    pub wcoj: Wcoj,
+}
+
+/// The WCOJ fusion switch. The optimizer marks cyclic closes on the
+/// plan; `Auto` honors those marks, which is the default path. `Force`
+/// fuses every close the fusion can structurally take, marked or not,
+/// and `Off` pins the binary ExpandInto/AspJoin pair, the baseline for
+/// differential runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wcoj {
+    #[default]
+    Auto,
+    Force,
+    Off,
 }
 
 // ---------------------------------------------------------------------------
@@ -794,7 +804,7 @@ struct StageBuilder {
     compactable: Option<usize>,
     flat: bool,
     /// The WCOJ fusion switch from [`Options`].
-    wcoj: bool,
+    wcoj: Wcoj,
     /// Path variable slot to the slots its shape reads: evaluating a
     /// path assembles from the pattern's slots, a read no expression
     /// walk can see.
@@ -802,7 +812,7 @@ struct StageBuilder {
 }
 
 impl StageBuilder {
-    fn new(flat: bool, wcoj: bool, shapes: BTreeMap<usize, Vec<usize>>) -> Self {
+    fn new(flat: bool, wcoj: Wcoj, shapes: BTreeMap<usize, Vec<usize>>) -> Self {
         StageBuilder {
             descs: Vec::new(),
             chunk_slots: Vec::new(),
@@ -1001,7 +1011,8 @@ fn optional_group(op: &LogicalPlan) -> Option<usize> {
 /// Whether the operator after an expand is an edge probe into that
 /// expand's endpoint that the WCOJ fusion can absorb: a single-step
 /// fixed-direction closing expand in the same optional group whose
-/// other end is already bound. Returns the probe's rel slot, source
+/// other end is already bound, carrying the optimizer's mark unless
+/// the mode forces the fusion. Returns the probe's rel slot, source
 /// slot, direction, and rel step, and flattens the source's chunk so
 /// the fused operator reads one configuration per pull.
 fn wcoj_fusion(
@@ -1019,6 +1030,7 @@ fn wcoj_fusion(
         direction,
         range: None,
         into: true,
+        wcoj,
         optional: opt2,
         ..
     }) = lookahead
@@ -1027,6 +1039,7 @@ fn wcoj_fusion(
     };
     if *to2 != to
         || *opt2 != optional
+        || !(*wcoj || b.wcoj == Wcoj::Force)
         || matches!(direction, RelDirection::Undirected)
         || !b.slot_loc.contains_key(from)
     {
@@ -1104,7 +1117,7 @@ fn compile_match_op(
             // galloping intersection. Restricted to single-step rels
             // with a fixed direction; anything else falls through to
             // the binary pair, which stays the correctness baseline.
-            if b.wcoj
+            if b.wcoj != Wcoj::Off
                 && range.is_none()
                 && !*into
                 && rels.len() == 1
@@ -4352,13 +4365,15 @@ mod tests {
 
     #[test]
     fn asp_join_retains_the_neighbor_vector() {
-        // Unseeded triangle count: the closing expand upgrades to the
-        // ASP hash join, and with nothing reading c or the closing rel
-        // the probe retains c's neighbor vector in place, no flatten.
-        let (r, p) = profiled(
+        // Unseeded triangle count with the WCOJ fusion pinned off, the
+        // binary fallback path: the closing expand upgrades to the ASP
+        // hash join, and with nothing reading c or the closing rel the
+        // probe retains c's neighbor vector in place, no flatten.
+        let (r, p) = profiled_opts(
             "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
              RETURN count(*) AS triangles",
             &[],
+            no_wcoj(),
         );
         assert_eq!(int_rows(&r), [[1]]);
         let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
@@ -4372,10 +4387,11 @@ mod tests {
     fn asp_join_probes_flat_when_the_far_node_is_read() {
         // Same close, but the projection reads c, so the retain fusion
         // stays off and the join probes one configuration at a time.
-        let (r, p) = profiled(
+        let (r, p) = profiled_opts(
             "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
              RETURN a.id AS a, b.id AS b, c.id AS c",
             &[],
+            no_wcoj(),
         );
         assert_eq!(int_rows(&r), [[0, 1, 2]]);
         let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
@@ -4389,7 +4405,14 @@ mod tests {
 
     fn wcoj() -> Options {
         Options {
-            wcoj: true,
+            wcoj: Wcoj::Force,
+            ..Options::default()
+        }
+    }
+
+    fn no_wcoj() -> Options {
+        Options {
+            wcoj: Wcoj::Off,
             ..Options::default()
         }
     }
@@ -4438,7 +4461,7 @@ mod tests {
                       RETURN a.id AS a, b.id AS b, c.id AS c";
         let (r, p) = profiled_opts(source, &[], wcoj());
         assert_eq!(int_rows(&r), [[0, 1, 2]]);
-        assert_eq!(r, run(source, &[]));
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
         let names = op_names(&p);
         assert!(
             names.iter().any(|n| n.starts_with("MultiwayIntersect")),
@@ -4474,7 +4497,7 @@ mod tests {
                       RETURN a.id AS a, b.id AS b, c.id AS c";
         let (r, p) = profiled_opts(source, &[], wcoj());
         assert_eq!(int_rows(&r), [[0, 2, 1]]);
-        assert_eq!(r, run(source, &[]));
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
         let names = op_names(&p);
         assert!(
             names.iter().any(|n| n.starts_with("MultiwayIntersect")),
@@ -4495,7 +4518,7 @@ mod tests {
             [[knows(0, 1), knows(1, 2), knows(0, 2)]],
             "rel orientation diverged"
         );
-        assert_eq!(r, run(source, &[]));
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
     }
 
     #[test]
@@ -4506,7 +4529,7 @@ mod tests {
                       RETURN r AS r, t AS t";
         let r = run_opts(source, &[], wcoj());
         assert_eq!(r.rows, [[knows(0, 2), knows(0, 1)]]);
-        assert_eq!(r, run(source, &[]));
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
         let with_s = "MATCH (a:Person)-[:KNOWS]->(b)<-[s:KNOWS]-(c), (a)-[:KNOWS]->(c) \
                       RETURN s AS s";
         let r = run_opts(with_s, &[], wcoj());
@@ -4520,7 +4543,7 @@ mod tests {
         let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]-(c) \
                       RETURN count(*) AS triangles";
         let (r, p) = profiled_opts(source, &[], wcoj());
-        assert_eq!(r, run(source, &[]));
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
         let names = op_names(&p);
         assert!(
             !names.iter().any(|n| n.starts_with("MultiwayIntersect")),
@@ -4537,7 +4560,7 @@ mod tests {
                       RETURN count(a) AS pairs, count(c) AS closed";
         let r = run_opts(source, &[], wcoj());
         assert_eq!(int_rows(&r), [[8, 1]]);
-        assert_eq!(r, run(source, &[]));
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
     }
 
     #[test]
@@ -4550,7 +4573,7 @@ mod tests {
                       RETURN count(*) AS paths, count(t) AS closed";
         let (r, p) = profiled_opts(source, &[], wcoj());
         assert_eq!(int_rows(&r), [[10, 1]]);
-        assert_eq!(r, run(source, &[]));
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
         let names = op_names(&p);
         assert!(
             !names.iter().any(|n| n.starts_with("MultiwayIntersect")),
@@ -4568,11 +4591,47 @@ mod tests {
             Options {
                 threads: 4,
                 morsel_rows: 2,
-                wcoj: true,
+                wcoj: Wcoj::Force,
                 ..Options::default()
             },
         );
         assert_eq!(int_rows(&r), [[0, 1, 2]]);
+    }
+
+    #[test]
+    fn the_optimizer_marks_the_triangle_close_on_its_own() {
+        // No switch anywhere: default options, and the intersection
+        // still runs because the optimizer marked the cyclic close.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN a.id AS a, b.id AS b, c.id AS c";
+        let (r, p) = profiled(source, &[]);
+        assert_eq!(int_rows(&r), [[0, 1, 2]]);
+        let names = op_names(&p);
+        assert!(
+            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn wcoj_off_pins_the_binary_join() {
+        // The off mode is the differential baseline: the optimizer's
+        // mark is ignored and the close runs the binary pair.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN a.id AS a, b.id AS b, c.id AS c";
+        let (r, p) = profiled_opts(source, &[], no_wcoj());
+        assert_eq!(int_rows(&r), [[0, 1, 2]]);
+        let names = op_names(&p);
+        assert!(
+            !names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("AspJoin") || n.starts_with("ExpandInto")),
+            "got: {names:?}"
+        );
     }
 
     #[test]

@@ -60,6 +60,14 @@ pub enum LogicalPlan {
         /// accumulates the edge set once and probes a hash table
         /// instead of storage (docs/07, ASPJoin).
         asp: bool,
+        /// Set by the optimizer on closing expands eligible for the
+        /// multiway intersection (docs/07 §4). A closing expand is a
+        /// cycle close by construction, both endpoints already bound,
+        /// which is exactly where the WCOJ pays off. The physical
+        /// compiler fuses the close with the expand that feeds it when
+        /// the two are adjacent; when they are not, `asp` still
+        /// decides the binary fallback.
+        wcoj: bool,
         optional: Option<usize>,
     },
     /// `optional` ties a filter into its OPTIONAL MATCH group: inline
@@ -244,6 +252,7 @@ fn build_path(
             }),
             into,
             asp: false,
+            wcoj: false,
             optional,
         };
         plan = prop_filters(plan, rel.slot, &rel.props, optional);
@@ -338,6 +347,7 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             range,
             into,
             asp,
+            wcoj: _,
             optional,
         } => {
             let hops = match range {

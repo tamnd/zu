@@ -49,6 +49,10 @@ pub enum Direction {
     Bwd,
 }
 
+/// A pooled pin of one direction of a group's CSR: the decoded offset
+/// and neighbor arrays as shared handles.
+pub type CsrArrays = (Arc<Vec<u64>>, Arc<Vec<u64>>);
+
 /// One direction of a group's CSR: `row_count + 1` offsets into the
 /// neighbor segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,12 +666,7 @@ impl GraphReader {
     /// neighbor arrays as shared handles. Warm calls are two pool map
     /// probes and two `Arc` clones, no decode and no copy, which is
     /// what the Snapshot csr surface lends out as borrowed slices.
-    pub fn csr_group(
-        &self,
-        db: &mut Zu1File,
-        group: usize,
-        dir: Direction,
-    ) -> Result<(Arc<Vec<u64>>, Arc<Vec<u64>>)> {
+    pub fn csr_group(&self, db: &mut Zu1File, group: usize, dir: Direction) -> Result<CsrArrays> {
         let meta = self
             .directory
             .groups
@@ -1241,6 +1240,50 @@ mod tests {
         let mut sibling = GraphReader::load(&mut fork).unwrap();
         assert_eq!(sibling.neighbors(&mut fork, g1 + 1).unwrap(), &[5]);
         assert_eq!(pools.adjacency.stats().misses, 2, "fork reused the decode");
+    }
+
+    #[test]
+    fn degrees_come_from_offsets_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deg.zu1");
+        let mut edges: Vec<(u32, u32)> = vec![(1, 2), (1, 3), (GROUP_ROWS, 4), (GROUP_ROWS + 1, 5)];
+        let node_count = u64::from(GROUP_ROWS) + 6;
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let reader = GraphReader::load(&mut db).unwrap();
+        let g1 = u64::from(GROUP_ROWS);
+        assert_eq!(reader.degree_of(&mut db, 1, Direction::Fwd).unwrap(), 2);
+        assert_eq!(reader.degree_of(&mut db, 0, Direction::Fwd).unwrap(), 0);
+        assert_eq!(reader.degree_of(&mut db, g1, Direction::Fwd).unwrap(), 1);
+        assert_eq!(reader.degree_of(&mut db, 2, Direction::Bwd).unwrap(), 1);
+        assert!(
+            reader
+                .degree_of(&mut db, node_count, Direction::Fwd)
+                .is_err()
+        );
+        // The batch spans both groups and agrees with the point reads.
+        let nodes = [1u64, 2, g1, g1 + 1];
+        assert_eq!(
+            reader
+                .degree_batch(&mut db, &nodes, Direction::Fwd)
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            reader
+                .degree_batch(&mut db, &nodes, Direction::Bwd)
+                .unwrap(),
+            1
+        );
+        // Counting never decoded a neighbor value: the adjacency pool
+        // saw no traffic at all, only the offsets pool did.
+        let pools = db.pools();
+        let adj = pools.adjacency.stats();
+        assert_eq!(adj.misses + adj.hits, 0, "degrees touched adjacency");
+        assert!(pools.csr_offsets.stats().misses > 0);
     }
 
     #[test]

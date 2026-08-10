@@ -21,8 +21,8 @@ use crate::file::{BlockPtr, Zu1File};
 use crate::fullzip::{read_blob_range, write_blob_segment};
 use crate::meta;
 use crate::segment::{
-    CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, decode_chunk, load_chunk_directory_pooled,
-    read_one_cached, write_segment,
+    CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, chunk_zone, decode_chunk,
+    load_chunk_directory_pooled, read_one_cached, write_segment,
 };
 
 const PROPS_VERSION: u16 = 1;
@@ -270,8 +270,79 @@ impl PropsReader {
         &self.directory.columns
     }
 
+    /// Rows in the table's domain; every column is row-aligned to it.
+    pub fn rows(&self) -> u64 {
+        self.directory.node_count
+    }
+
     pub fn col(&self, name: &str) -> Option<usize> {
         self.directory.columns.iter().position(|c| c.name == name)
+    }
+
+    /// The segment meta of `col`: value count and the segment-level
+    /// zone bounds, what a scan needs to size itself and to skip the
+    /// whole column without reading a block.
+    pub fn meta(&self, col: usize) -> &SegmentMeta {
+        &self.directory.columns[col].meta
+    }
+
+    /// The value bounds of `chunk` in `col`, `None` when the column
+    /// was not written sorted and only the segment-level zone applies.
+    pub fn chunk_bounds(
+        &mut self,
+        db: &mut Zu1File,
+        col: usize,
+        chunk: usize,
+    ) -> Result<Option<(u64, u64)>> {
+        let meta = &self.directory.columns[col].meta;
+        let pools = db.pools();
+        let dir = load_chunk_directory_pooled(db, &pools.fences, meta)?;
+        Ok(chunk_zone(meta, &dir, chunk))
+    }
+
+    /// Decodes `chunk` of an integer column into `out`, the scan unit
+    /// read: one chunk into the caller's reusable buffer, nothing held.
+    pub fn scan_int_chunk(
+        &mut self,
+        db: &mut Zu1File,
+        col: usize,
+        chunk: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let column = &self.directory.columns[col];
+        if column.ty != PropType::Int {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{}' is not an integer column",
+                column.name
+            )));
+        }
+        let pools = db.pools();
+        let dir = load_chunk_directory_pooled(db, &pools.fences, &column.meta)?;
+        decode_chunk(db, &column.meta, &dir, chunk, out)
+    }
+
+    /// Reads the string values of rows `start..end` of `col`, the scan
+    /// unit for string columns: values concatenated in `bytes`, row
+    /// `i - start` ending at `ends[i - start]`.
+    pub fn scan_str_range(
+        &mut self,
+        db: &mut Zu1File,
+        col: usize,
+        start: u64,
+        end: u64,
+        bytes: &mut Vec<u8>,
+        ends: &mut Vec<u64>,
+    ) -> Result<()> {
+        let column = &self.directory.columns[col];
+        if column.ty != PropType::Str {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{}' is not a string column",
+                column.name
+            )));
+        }
+        bytes.clear();
+        ends.clear();
+        read_blob_range(db, &column.meta, start, end, bytes, ends)
     }
 
     pub fn read_int(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<u64> {
@@ -488,6 +559,126 @@ mod tests {
             assert_eq!(reader.read_int(&mut db, col, row as u64).unwrap(), ids[row]);
         }
         assert!(reader.col("lastName").is_none());
+    }
+
+    #[test]
+    fn gathers_batch_across_chunks_in_caller_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("gather.zu1")).unwrap();
+        let n = 3000u64;
+        crate::graph::bulk_load_as(&mut db, "person", "knows", n, &[(0, 1)]).unwrap();
+        let ints: Vec<u64> = (0..n).map(|i| i * 7).collect();
+        let strs: Vec<Vec<u8>> = (0..n).map(|i| format!("v{i}").into_bytes()).collect();
+        let str_refs: Vec<&[u8]> = strs.iter().map(|v| v.as_slice()).collect();
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("i", PropValues::Int(&ints)),
+                ("s", PropValues::Str(&str_refs)),
+            ],
+        )
+        .unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        // Unsorted rows with chunk revisits and a duplicate, so the
+        // scatter back to argument order is what the assertions see.
+        let rows = [2999u64, 0, 1024, 1023, 512, 2048, 0];
+        let icol = reader.col("i").unwrap();
+        let mut out = Vec::new();
+        reader.gather_int(&mut db, icol, &rows, &mut out).unwrap();
+        let want: Vec<u64> = rows.iter().map(|&r| r * 7).collect();
+        assert_eq!(out, want);
+        let scol = reader.col("s").unwrap();
+        let (mut bytes, mut ends) = (Vec::new(), Vec::new());
+        reader
+            .gather_str(&mut db, scol, &rows, &mut bytes, &mut ends)
+            .unwrap();
+        let mut lo = 0usize;
+        for (i, &r) in rows.iter().enumerate() {
+            let hi = ends[i] as usize;
+            assert_eq!(&bytes[lo..hi], format!("v{r}").as_bytes());
+            lo = hi;
+        }
+        // Out-of-range rows fail loud on both types.
+        assert!(reader.gather_int(&mut db, icol, &[n], &mut out).is_err());
+        assert!(
+            reader
+                .gather_str(&mut db, scol, &[n], &mut bytes, &mut ends)
+                .is_err()
+        );
+        // And so does gathering across the type divide.
+        assert!(reader.gather_int(&mut db, scol, &rows, &mut out).is_err());
+    }
+
+    #[test]
+    fn scan_units_decode_one_chunk_and_expose_zones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("scan.zu1")).unwrap();
+        let n = 3000u64;
+        crate::graph::bulk_load_as(&mut db, "person", "knows", n, &[(0, 1)]).unwrap();
+        let sorted: Vec<u64> = (0..n).map(|i| i * 7).collect();
+        let shuffled: Vec<u64> = (0..n).map(|i| (n - 1 - i) * 7).collect();
+        let strs: Vec<Vec<u8>> = (0..n).map(|i| format!("v{i}").into_bytes()).collect();
+        let str_refs: Vec<&[u8]> = strs.iter().map(|v| v.as_slice()).collect();
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("a", PropValues::Int(&sorted)),
+                ("d", PropValues::Int(&shuffled)),
+                ("s", PropValues::Str(&str_refs)),
+            ],
+        )
+        .unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        let (a, d, s) = (
+            reader.col("a").unwrap(),
+            reader.col("d").unwrap(),
+            reader.col("s").unwrap(),
+        );
+        assert!(reader.meta(a).sorted);
+        assert!(!reader.meta(d).sorted);
+        // Chunk 1 holds rows 1024..2048; its zone brackets those values
+        // from the previous fence to its own.
+        let (lo, hi) = reader.chunk_bounds(&mut db, a, 1).unwrap().unwrap();
+        assert_eq!((lo, hi), (1023 * 7, 2047 * 7));
+        // A descending column keeps only the segment-level zone.
+        assert!(reader.chunk_bounds(&mut db, d, 1).unwrap().is_none());
+        // One chunk decodes alone, the short tail included.
+        let mut out = Vec::new();
+        reader.scan_int_chunk(&mut db, a, 2, &mut out).unwrap();
+        assert_eq!(out.len(), (n - 2048) as usize);
+        assert_eq!(out[0], 2048 * 7);
+        assert_eq!(*out.last().unwrap(), (n - 1) * 7);
+        // A string range spanning a chunk boundary reads contiguously.
+        let (mut bytes, mut ends) = (Vec::new(), Vec::new());
+        reader
+            .scan_str_range(&mut db, s, 1022, 1026, &mut bytes, &mut ends)
+            .unwrap();
+        assert_eq!(ends.len(), 4);
+        let mut lo = 0usize;
+        for (i, row) in (1022u64..1026).enumerate() {
+            let hi = ends[i] as usize;
+            assert_eq!(&bytes[lo..hi], format!("v{row}").as_bytes());
+            lo = hi;
+        }
+        // Type confusion fails loud in both directions.
+        assert!(reader.scan_int_chunk(&mut db, s, 0, &mut out).is_err());
+        assert!(
+            reader
+                .scan_str_range(&mut db, a, 0, 4, &mut bytes, &mut ends)
+                .is_err()
+        );
     }
 
     #[test]

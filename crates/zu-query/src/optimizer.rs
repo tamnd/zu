@@ -22,12 +22,12 @@
 //! order, and optional operators are never reordered: left-outer
 //! semantics pin them where the query put them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zu_common::Result;
 
 use crate::ast::{BinaryOp, RelDirection};
-use crate::binder::{BoundExpr, BoundQuery, Schema};
+use crate::binder::{BoundExpr, BoundQuery, ColorSummary, Schema};
 use crate::plan::{LogicalPlan, VarLength};
 
 /// Components larger than this keep their written join order.
@@ -58,6 +58,18 @@ pub fn optimize(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Resul
 /// row because grouped cardinality is unknown until the column catalog
 /// carries statistics, which only understates and keeps ExpandInto.
 fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalPlan, f64) {
+    mark_asp_walk(plan, query, schema, &mut BTreeMap::new())
+}
+
+/// The [`mark_asp`] recursion, threading each slot's color
+/// distribution so a colored close sees the frontier its probe side
+/// actually carries.
+fn mark_asp_walk(
+    plan: LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
+) -> (LogicalPlan, f64) {
     match plan {
         LogicalPlan::Empty => (LogicalPlan::Empty, 1.0),
         LogicalPlan::ScanNodes {
@@ -65,7 +77,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             slot,
             optional,
         } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             let est = est * slot_card(slot, query, schema);
             (
                 LogicalPlan::ScanNodes {
@@ -88,7 +100,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             wcoj: _,
             optional,
         } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             let e = ExpandOp {
                 rel,
                 from,
@@ -119,7 +131,12 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
                     && query.variables[rel].rel_tables.len() == 1;
                 (asp, wcoj, est * into_prob(&e, query, schema))
             } else {
-                (false, false, est * degree(&e, from, query, schema))
+                let (factor, reached) =
+                    expand_estimate(&e, from, dists.get(&from).cloned().as_ref(), query, schema);
+                if let Some(d) = reached {
+                    dists.insert(to, d);
+                }
+                (false, false, est * factor)
             };
             (
                 LogicalPlan::Expand {
@@ -142,7 +159,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             expr,
             optional,
         } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             let est = (est * selectivity(&expr, query, schema)).max(1e-6);
             (
                 LogicalPlan::Filter {
@@ -154,7 +171,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             )
         }
         LogicalPlan::Unwind { input, expr, slot } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             (
                 LogicalPlan::Unwind {
                     input: Box::new(input),
@@ -165,7 +182,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             )
         }
         LogicalPlan::Project { input, items } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             (
                 LogicalPlan::Project {
                     input: Box::new(input),
@@ -175,7 +192,10 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             )
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
-            let (input, _) = mark_asp(*input, query, schema);
+            let (input, _) = mark_asp_walk(*input, query, schema, dists);
+            // Grouping changes what a slot's rows are, so tracked
+            // distributions reset with the estimate.
+            dists.clear();
             (
                 LogicalPlan::Aggregate {
                     input: Box::new(input),
@@ -186,7 +206,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             )
         }
         LogicalPlan::Distinct { input } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             (
                 LogicalPlan::Distinct {
                     input: Box::new(input),
@@ -195,7 +215,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             )
         }
         LogicalPlan::Sort { input, keys } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             (
                 LogicalPlan::Sort {
                     input: Box::new(input),
@@ -205,7 +225,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             )
         }
         LogicalPlan::Skip { input, expr } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             (
                 LogicalPlan::Skip {
                     input: Box::new(input),
@@ -215,7 +235,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             )
         }
         LogicalPlan::Limit { input, expr } => {
-            let (input, est) = mark_asp(*input, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
             (
                 LogicalPlan::Limit {
                     input: Box::new(input),
@@ -624,6 +644,10 @@ fn order_component(
         bnd: Option<f64>,
         /// Running sum of the ceilings, the bound analog of `cost`.
         bcost: f64,
+        /// Color distribution per slot a colored expand reached, tagged
+        /// with the rel table whose color space it lives in; the state
+        /// the next hop's estimate conditions on.
+        dists: BTreeMap<usize, (u32, Vec<f64>)>,
         steps: Vec<Step>,
     }
     let filter_slots: Vec<HashSet<usize>> = filters
@@ -696,6 +720,7 @@ fn order_component(
                     card: 1.0,
                     bnd: Some(1.0),
                     bcost: 0.0,
+                    dists: BTreeMap::new(),
                     steps: Vec::new(),
                 },
                 Some(slot) => {
@@ -720,6 +745,7 @@ fn order_component(
                         card,
                         bnd: Some(bnd),
                         bcost: bnd,
+                        dists: BTreeMap::new(),
                         steps: vec![Step::Scan(*slot)],
                     }
                 }
@@ -739,7 +765,7 @@ fn order_component(
                     if !from_bound && !to_bound {
                         continue;
                     }
-                    let (step, factor, bfactor) = if from_bound && to_bound {
+                    let (step, factor, bfactor, reached) = if from_bound && to_bound {
                         (
                             Step::Expand {
                                 ix: *rel,
@@ -750,8 +776,11 @@ fn order_component(
                             into_prob(e, query, schema),
                             // A close keeps or drops rows, never adds.
                             Some(1.0),
+                            None,
                         )
                     } else if from_bound {
+                        let (factor, dist) =
+                            expand_estimate(e, e.from, entry.dists.get(&e.from), query, schema);
                         (
                             Step::Expand {
                                 ix: *rel,
@@ -759,10 +788,13 @@ fn order_component(
                                 to: e.to,
                                 into: false,
                             },
-                            degree(e, e.from, query, schema),
+                            factor,
                             step_bound(e, e.from, query, schema),
+                            dist.map(|d| (e.to, d)),
                         )
                     } else {
+                        let (factor, dist) =
+                            expand_estimate(e, e.to, entry.dists.get(&e.to), query, schema);
                         (
                             Step::Expand {
                                 ix: *rel,
@@ -770,8 +802,9 @@ fn order_component(
                                 to: e.from,
                                 into: false,
                             },
-                            degree(e, e.to, query, schema),
+                            factor,
                             step_bound(e, e.to, query, schema),
+                            dist.map(|d| (e.from, d)),
                         )
                     };
                     let next = mask | (1 << i);
@@ -779,11 +812,16 @@ fn order_component(
                     let bnd = entry.bnd.zip(bfactor).map(|(b, f)| (b * f).max(1e-6));
                     let card = (entry.card * factor * newly(&bound, &grown)).max(1e-6);
                     let card = bnd.map_or(card, |b| card.min(b));
+                    let mut dists = entry.dists.clone();
+                    if let Some((slot, d)) = reached {
+                        dists.insert(slot, d);
+                    }
                     let cand = Entry {
                         cost: entry.cost + card,
                         card,
                         bnd,
                         bcost: entry.bcost + bnd.unwrap_or(0.0),
+                        dists,
                         steps: Vec::new(),
                     };
                     let slot = &mut dp[next as usize];
@@ -962,6 +1000,13 @@ fn hist_fanout(edges: f64, hist: &[u64]) -> Option<f64> {
 /// the count ratios otherwise. Var-length steps raise the degree to
 /// their minimum hop count as a heuristic.
 fn degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f64 {
+    let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8)) as i32;
+    hop_degree(e, source, query, schema).max(1e-6).powi(hops)
+}
+
+/// [`degree`] for a single hop, the per-step mean the color walk feeds
+/// its first hop.
+fn hop_degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f64 {
     let reversed = source == e.to && source != e.from;
     let mut deg = 0.0;
     for rid in &query.variables[e.rel].rel_tables {
@@ -996,8 +1041,121 @@ fn degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f
             RelDirection::Undirected => fwd + bwd,
         };
     }
-    let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8)) as i32;
-    deg.max(1e-6).powi(hops)
+    deg
+}
+
+/// The single rel table an expand's colors can track: exactly one
+/// candidate, a fixed direction, and a stored COLOR summary.
+fn colored_rel(e: &ExpandOp, query: &BoundQuery, schema: &Schema) -> Option<u32> {
+    if matches!(e.direction, RelDirection::Undirected) {
+        return None;
+    }
+    let [rid] = query.variables[e.rel].rel_tables[..] else {
+        return None;
+    };
+    schema.color_summary(rid).map(|_| rid)
+}
+
+/// A frontier spread evenly over the summarized nodes, the walk's
+/// state when nothing better is known.
+fn color_uniform(sum: &ColorSummary) -> Vec<f64> {
+    let total: u64 = sum.counts.iter().sum();
+    sum.counts
+        .iter()
+        .map(|&c| c as f64 / (total.max(1)) as f64)
+        .collect()
+}
+
+/// One hop of the color walk: rows reached per frontier row when the
+/// frontier's colors are distributed as `dist`, and the reached rows'
+/// distribution. A dead walk is the summary saying no edge continues
+/// from this frontier, so the fan-out floors at the estimator's epsilon
+/// instead of falling back to a mean the summary just refuted.
+fn color_hop(sum: &ColorSummary, dist: &[f64], reversed: bool) -> (f64, Vec<f64>) {
+    let mut next = vec![0.0; sum.counts.len()];
+    for &(f, t, edges, _) in &sum.triples {
+        let (src, tgt) = if reversed {
+            (t as usize, f as usize)
+        } else {
+            (f as usize, t as usize)
+        };
+        let count = sum.counts.get(src).copied().unwrap_or(0);
+        let Some(share) = dist.get(src) else {
+            continue;
+        };
+        if count > 0 {
+            next[tgt] += share * edges as f64 / count as f64;
+        }
+    }
+    let fan: f64 = next.iter().sum();
+    if fan <= 0.0 {
+        return (1e-6, color_uniform(sum));
+    }
+    for v in &mut next {
+        *v /= fan;
+    }
+    (fan, next)
+}
+
+/// The color distribution of the rows one unconditioned hop reaches:
+/// each edge lands on its endpoint, so endpoints weigh by edge count.
+/// None when the summary holds no edges at all.
+fn color_seed(sum: &ColorSummary, reversed: bool) -> Option<Vec<f64>> {
+    let mut v = vec![0.0; sum.counts.len()];
+    for &(f, t, edges, _) in &sum.triples {
+        let tgt = if reversed { f as usize } else { t as usize };
+        v[tgt] += edges as f64;
+    }
+    let total: f64 = v.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    for x in &mut v {
+        *x /= total;
+    }
+    Some(v)
+}
+
+/// Fan-out of one expand step and, when a COLOR summary tracks it, the
+/// reached rows' color distribution (docs/07 §6). The first hop from an
+/// unknown frontier keeps the histogram's positive-source mean and
+/// seeds the distribution with the edge-weighted endpoints; every later
+/// hop walks the color matrix, because a frontier is edge-biased toward
+/// hubs in a way one global mean cannot see and the tracked
+/// distribution is exactly that bias. A distribution recorded by a
+/// different rel table lives in a different color space and is ignored.
+fn expand_estimate(
+    e: &ExpandOp,
+    source: usize,
+    dist: Option<&(u32, Vec<f64>)>,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> (f64, Option<(u32, Vec<f64>)>) {
+    let plain = degree(e, source, query, schema);
+    let Some(rid) = colored_rel(e, query, schema) else {
+        return (plain, None);
+    };
+    let sum = schema.color_summary(rid).expect("colored_rel checked");
+    let reversed = source == e.to && source != e.from;
+    let reversed = match e.direction {
+        RelDirection::Out => reversed,
+        RelDirection::In => !reversed,
+        RelDirection::Undirected => unreachable!("colored_rel rejects undirected"),
+    };
+    let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8));
+    let (mut fan, mut d) = match dist {
+        Some((from_rel, d)) if *from_rel == rid => color_hop(sum, d, reversed),
+        _ => match color_seed(sum, reversed) {
+            Some(seed) => (hop_degree(e, source, query, schema).max(1e-6), seed),
+            None => return (plain, None),
+        },
+    };
+    for _ in 1..hops {
+        let (step, next) = color_hop(sum, &d, reversed);
+        fan *= step;
+        d = next;
+    }
+    (fan.max(1e-6), Some((rid, d)))
 }
 
 /// Probability an edge exists between two already bound endpoints.
@@ -1383,6 +1541,145 @@ mod tests {
             &hubs,
         );
         assert!(text.contains("ScanNodes p: Person"), "got:\n{text}");
+    }
+
+    #[test]
+    fn color_hops_condition_on_the_frontier_and_dead_walks_floor() {
+        // Ten hubs (color 0) hold a thousand edges into the spokes
+        // (color 1), which hold none.
+        let sum = ColorSummary {
+            counts: vec![10, 990],
+            triples: vec![(0, 1, 1000, 100)],
+        };
+        let (fan, dist) = color_hop(&sum, &[1.0, 0.0], false);
+        assert_eq!((fan, dist), (100.0, vec![0.0, 1.0]));
+        let (dead, uniform) = color_hop(&sum, &[0.0, 1.0], false);
+        assert_eq!(dead, 1e-6, "no edge continues from the spokes");
+        assert_eq!(uniform, [0.01, 0.99]);
+        let (back, _) = color_hop(&sum, &[0.0, 1.0], true);
+        assert!((back - 1000.0 / 990.0).abs() < 1e-9, "got {back}");
+        assert_eq!(color_seed(&sum, false), Some(vec![0.0, 1.0]));
+        assert_eq!(color_seed(&sum, true), Some(vec![1.0, 0.0]));
+    }
+
+    #[test]
+    fn distributions_from_another_rel_table_do_not_condition_a_hop() {
+        // A frontier known to sit on the hundred KNOWS hubs expands by
+        // their mean, 1800 wide. The same vector tagged with another
+        // rel table indexes a different color space, so the estimate
+        // must ignore it and reseed from the global mean instead.
+        let source = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.id AS id";
+        let mut schema = schema();
+        schema.set_color_summaries(
+            [(
+                2u32,
+                ColorSummary {
+                    counts: vec![100, 8900],
+                    triples: vec![(0, 1, 180_000, 1800)],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let e = ExpandOp {
+            rel: 1,
+            from: 0,
+            to: 2,
+            direction: RelDirection::Out,
+            range: None,
+            into: false,
+        };
+        assert_eq!(query.variables[e.rel].rel_tables, [2], "slot 1 is r");
+        let hub = (2u32, vec![1.0, 0.0]);
+        let (fan, _) = expand_estimate(&e, 0, Some(&hub), &query, &schema);
+        assert_eq!(fan, 1800.0);
+        let foreign = (3u32, vec![1.0, 0.0]);
+        let (fan, _) = expand_estimate(&e, 0, Some(&foreign), &query, &schema);
+        assert_eq!(fan, 20.0, "foreign space falls back to the mean");
+    }
+
+    #[test]
+    fn a_dead_color_walk_reorders_the_var_length_chain() {
+        // Without colors two KNOWS hops estimate 400 wide, so the plan
+        // runs the location hop first. The summary says every KNOWS
+        // edge lands on a node holding none, the two-hop walk dies, and
+        // the chain becomes the cheap side to run first.
+        let source = "MATCH (a:Person)-[:KNOWS*2..2]->(c:Person), \
+                      (a)-[:IS_LOCATED_IN]->(p:Place) RETURN a.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let text = plan::explain(
+            &optimize(built.clone(), &query, &schema).expect("optimize"),
+            &query,
+            &schema,
+        );
+        assert!(
+            text.find("KNOWS") < text.find("IS_LOCATED_IN"),
+            "location first without colors, got:\n{text}"
+        );
+        let mut colored = schema.clone();
+        colored.set_color_summaries(
+            [(
+                2u32,
+                ColorSummary {
+                    counts: vec![100, 8900],
+                    triples: vec![(0, 1, 180_000, 1800)],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let text = plan::explain(
+            &optimize(built, &query, &colored).expect("optimize"),
+            &query,
+            &colored,
+        );
+        assert!(
+            text.find("IS_LOCATED_IN") < text.find("KNOWS"),
+            "dead two-hop walk first with colors, got:\n{text}"
+        );
+        assert!(!text.contains("ScanNodes p"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_collapsed_color_walk_keeps_the_close_an_expand_into() {
+        // Unseeded, the means say the probe side carries far more rows
+        // than one edge sweep and the close upgrades to the hash join.
+        // The summary says every KNOWS edge lands on a node holding
+        // none, so almost no two-path survives to probe and the upgrade
+        // would pay an accumulate sweep for nothing.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN a.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let text = plan::explain(
+            &optimize(built.clone(), &query, &schema).expect("optimize"),
+            &query,
+            &schema,
+        );
+        assert_eq!(text.matches("AspJoin").count(), 1, "got:\n{text}");
+        let mut colored = schema.clone();
+        colored.set_color_summaries(
+            [(
+                2u32,
+                ColorSummary {
+                    counts: vec![10, 8990],
+                    triples: vec![(0, 1, 180_000, 18_000)],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let text = plan::explain(
+            &optimize(built, &query, &colored).expect("optimize"),
+            &query,
+            &colored,
+        );
+        assert_eq!(text.matches("AspJoin").count(), 0, "got:\n{text}");
+        assert_eq!(text.matches("ExpandInto").count(), 1, "got:\n{text}");
     }
 
     #[test]

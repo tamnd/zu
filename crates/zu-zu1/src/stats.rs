@@ -11,16 +11,23 @@ use std::collections::BTreeMap;
 
 use zu_common::{Result, ZuError};
 
+use crate::colors::ColorSummary;
 use crate::file::Zu1File;
 use crate::meta;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
-/// The degree histograms of one rel table, forward then backward.
+/// The most colors one summary may carry (docs/07 §6).
+pub const COLOR_CAP: usize = 1024;
+
+/// The degree histograms of one rel table, forward then backward, and
+/// the COLOR summary when `ANALYZE` has built one. Bulk load drops the
+/// summary because a reloaded table invalidates its coloring.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RelStats {
     pub out_hist: Vec<u64>,
     pub in_hist: Vec<u64>,
+    pub colors: Option<ColorSummary>,
 }
 
 /// Every rel table's statistics, keyed by catalog table id.
@@ -61,6 +68,20 @@ impl Stats {
                     out.extend_from_slice(&count.to_le_bytes());
                 }
             }
+            let summary = rel.colors.as_ref();
+            let counts = summary.map_or(&[][..], |s| &s.counts);
+            out.extend_from_slice(&(counts.len() as u32).to_le_bytes());
+            for count in counts {
+                out.extend_from_slice(&count.to_le_bytes());
+            }
+            let triples = summary.map_or(&[][..], |s| &s.triples);
+            out.extend_from_slice(&(triples.len() as u32).to_le_bytes());
+            for (f, t, edges, dmax) in triples {
+                out.extend_from_slice(&f.to_le_bytes());
+                out.extend_from_slice(&t.to_le_bytes());
+                out.extend_from_slice(&edges.to_le_bytes());
+                out.extend_from_slice(&dmax.to_le_bytes());
+            }
         }
         out
     }
@@ -79,8 +100,16 @@ impl Stats {
             *at = end;
             Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
         };
+        let u64_at = |payload: &[u8], at: &mut usize| -> Result<u64> {
+            let end = *at + 8;
+            let bytes = payload
+                .get(*at..end)
+                .ok_or_else(|| corrupt(format!("truncated at byte {at}", at = *at)))?;
+            *at = end;
+            Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+        };
         let version = u32_at(payload, &mut at)?;
-        if version != VERSION {
+        if version != 1 && version != VERSION {
             return Err(corrupt(format!("unknown stats version {version}")));
         }
         let rel_count = u32_at(payload, &mut at)?;
@@ -94,16 +123,49 @@ impl Stats {
                     return Err(corrupt(format!("{len} buckets in one histogram")));
                 }
                 for _ in 0..len {
-                    let end = at + 8;
-                    let bytes = payload
-                        .get(at..end)
-                        .ok_or_else(|| corrupt(format!("truncated at byte {at}")))?;
-                    at = end;
-                    hist.push(u64::from_le_bytes(bytes.try_into().unwrap()));
+                    hist.push(u64_at(payload, &mut at)?);
                 }
             }
             let [out_hist, in_hist] = hists;
-            rels.insert(table, RelStats { out_hist, in_hist });
+            // Version 1 predates the color section; its rels carry
+            // histograms only.
+            let mut colors = None;
+            if version >= 2 {
+                let color_count = u32_at(payload, &mut at)? as usize;
+                if color_count > COLOR_CAP {
+                    return Err(corrupt(format!("{color_count} colors in one summary")));
+                }
+                let mut counts = Vec::with_capacity(color_count);
+                for _ in 0..color_count {
+                    counts.push(u64_at(payload, &mut at)?);
+                }
+                let triple_count = u32_at(payload, &mut at)? as usize;
+                if triple_count > color_count * color_count {
+                    return Err(corrupt(format!(
+                        "{triple_count} color pairs over {color_count} colors"
+                    )));
+                }
+                let mut triples = Vec::with_capacity(triple_count);
+                for _ in 0..triple_count {
+                    let f = u32_at(payload, &mut at)?;
+                    let t = u32_at(payload, &mut at)?;
+                    if f as usize >= color_count || t as usize >= color_count {
+                        return Err(corrupt(format!("color pair ({f}, {t}) out of range")));
+                    }
+                    triples.push((f, t, u64_at(payload, &mut at)?, u64_at(payload, &mut at)?));
+                }
+                if color_count > 0 {
+                    colors = Some(ColorSummary { counts, triples });
+                }
+            }
+            rels.insert(
+                table,
+                RelStats {
+                    out_hist,
+                    in_hist,
+                    colors,
+                },
+            );
         }
         Ok(Stats { rels })
     }
@@ -156,6 +218,10 @@ mod tests {
             RelStats {
                 out_hist: vec![5, 3, 0, 1],
                 in_hist: vec![9],
+                colors: Some(ColorSummary {
+                    counts: vec![3, 6],
+                    triples: vec![(0, 1, 9, 4), (1, 1, 2, 1)],
+                }),
             },
         );
         stats.rels.insert(
@@ -163,10 +229,31 @@ mod tests {
             RelStats {
                 out_hist: vec![],
                 in_hist: vec![1, 1],
+                colors: None,
             },
         );
         let decoded = Stats::decode(&stats.encode()).expect("decode");
         assert_eq!(decoded, stats);
+    }
+
+    #[test]
+    fn version_one_payloads_still_carry_their_histograms() {
+        // A version 1 chain as PR #67 wrote it: no color section.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        for count in [7u64, 1] {
+            payload.extend_from_slice(&count.to_le_bytes());
+        }
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&8u64.to_le_bytes());
+        let decoded = Stats::decode(&payload).expect("decode v1");
+        let rel = &decoded.rels[&4];
+        assert_eq!(rel.out_hist, [7, 1]);
+        assert_eq!(rel.in_hist, [8]);
+        assert_eq!(rel.colors, None);
     }
 
     #[test]

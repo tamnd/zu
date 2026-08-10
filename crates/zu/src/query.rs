@@ -284,6 +284,22 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
     // written before stats existed simply attaches nothing and every
     // estimate falls back to the count ratios.
     let stats = crate::zu1::stats::Stats::load(db)?;
+    schema.set_color_summaries(
+        stats
+            .rels
+            .iter()
+            .filter_map(|(id, r)| {
+                let c = r.colors.as_ref()?;
+                Some((
+                    *id,
+                    binder::ColorSummary {
+                        counts: c.counts.clone(),
+                        triples: c.triples.clone(),
+                    },
+                ))
+            })
+            .collect(),
+    );
     schema.set_degree_hists(
         stats
             .rels
@@ -323,6 +339,13 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
     let p = prepare(source, db, params)?;
     let mut graph = Zu1Graph::new(db, p.catalog);
+    let options = env_options();
+    exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
+}
+
+/// The execution options both entry points honor, so a profile always
+/// describes the plan `run` would execute under the same environment.
+fn env_options() -> exec::Options {
     let mut options = exec::Options::default();
     if let Some(threads) = std::env::var("ZU_THREADS")
         .ok()
@@ -338,7 +361,7 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
         Ok("0") => exec::Wcoj::Off,
         _ => exec::Wcoj::Auto,
     };
-    exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
+    options
 }
 
 /// Executes one query with per-operator counters and returns the
@@ -354,7 +377,7 @@ pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)])
         &p.schema,
         &mut graph,
         &p.args,
-        &exec::Options::default(),
+        &env_options(),
     )?;
     Ok(profile.render())
 }
@@ -755,6 +778,32 @@ mod tests {
         // so the plan the optimizer picks runs both expands reversed.
         assert!(text.contains("(c)<-[:follows]-(b)"), "got:\n{text}");
         assert!(text.contains("(b)<-[:follows]-(a)"), "got:\n{text}");
+    }
+
+    #[test]
+    fn analyze_built_colors_steer_the_plan_on_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("colors.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // Ten knows hubs fan into ten sinks that hold no further knows
+        // edges. Both directions average ten wide, so the means say an
+        // unseeded triangle probes two hundred thousand rows and the
+        // close upgrades to the hash join; the coloring sees the walk
+        // die at the sinks, so almost nothing survives to probe and the
+        // upgrade would pay its accumulate sweep for nothing.
+        let knows: Vec<(u32, u32)> = (0..10u32)
+            .flat_map(|h| (0..10u32).map(move |t| (h, 10 + t)))
+            .collect();
+        graph::bulk_load_as(&mut db, "person", "knows", 2010, &knows).expect("load knows");
+        // The undirected close keeps the WCOJ fusion out, so the asp
+        // mark alone decides between the probe and the hash join.
+        let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
+                      RETURN count(*) AS n";
+        let before = explain_analyze(source, &mut db, &[]).expect("explain before");
+        assert!(before.contains("AspJoin"), "got:\n{before}");
+        crate::zu1::colors::analyze(&mut db).expect("analyze");
+        let after = explain_analyze(source, &mut db, &[]).expect("explain after");
+        assert!(!after.contains("AspJoin"), "got:\n{after}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ authors.workspace = true
 crossbeam-deque = "0.8.7"
 zu-common.workspace = true
 zu-storage.workspace = true
+zu-vector.workspace = true
 
 [[bench]]
 name = "kernels"

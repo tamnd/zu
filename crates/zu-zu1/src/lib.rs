@@ -6,6 +6,7 @@
 //! groups, segments, and CSR build on top of these within M1.
 
 pub mod algo;
+pub mod cache;
 pub mod catalog;
 pub mod colors;
 pub mod epoch;

@@ -20,3 +20,4 @@ pub mod optimizer;
 pub mod parser;
 pub mod plan;
 pub mod recursive;
+pub mod snapshot;

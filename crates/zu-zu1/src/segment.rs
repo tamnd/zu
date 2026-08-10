@@ -35,7 +35,10 @@
 use zu_common::{Result, ZuError};
 use zu_encoding::segment as enc;
 
+use std::sync::Arc;
+
 use crate::BLOCK_SIZE;
+use crate::cache::{DecodedPool, SegmentBytes};
 use crate::file::{BlockPtr, Zu1File};
 
 /// Rows per MiniBlock chunk, the unit of point access.
@@ -63,6 +66,12 @@ pub struct SegmentMeta {
     pub max: u64,
     pub crc: u32,
     pub structural: Structural,
+    /// The writer saw the values in ascending order, which upgrades the
+    /// fence array to a per-chunk zone map: chunk `i` holds values in
+    /// `fences[i-1]..=fences[i]` (`min..=fences[0]` for the first), so
+    /// a range scan can skip chunks without reading them. Unsorted
+    /// segments keep only the segment-level min and max.
+    pub sorted: bool,
     pub blocks: Vec<BlockPtr>,
 }
 
@@ -81,7 +90,10 @@ impl SegmentMeta {
         out.extend_from_slice(&self.max.to_le_bytes());
         out.extend_from_slice(&self.crc.to_le_bytes());
         out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
-        out.push(self.structural as u8);
+        // The structural byte carries the sorted flag in bit 1, so the
+        // flag costs no format version: old values 0 and 1 still decode
+        // and a flagged MiniBlock reads back as 2.
+        out.push(self.structural as u8 | (u8::from(self.sorted) << 1));
         for b in &self.blocks {
             out.extend_from_slice(&b.to_le_bytes());
         }
@@ -105,16 +117,17 @@ impl SegmentMeta {
         let max = word(32);
         let crc = u32::from_le_bytes(head[40..44].try_into().unwrap());
         let block_count = u32::from_le_bytes(head[44..48].try_into().unwrap()) as usize;
-        let structural = match head[48] {
+        let structural = match head[48] & !2 {
             0 => Structural::MiniBlock,
             1 => Structural::FullZip,
-            id => {
+            _ => {
                 return Err(ZuError::Unsupported {
                     what: "structural layout",
-                    id: u32::from(id),
+                    id: u32::from(head[48]),
                 });
             }
         };
+        let sorted = head[48] & 2 != 0;
         if min > max {
             return Err(corrupt("zone min above max"));
         }
@@ -144,6 +157,7 @@ impl SegmentMeta {
                 max,
                 crc,
                 structural,
+                sorted,
                 blocks,
             },
             p,
@@ -204,6 +218,7 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
         max: values.iter().copied().max().unwrap_or(0),
         crc,
         structural: Structural::MiniBlock,
+        sorted: values.is_sorted(),
         blocks,
     })
 }
@@ -222,7 +237,7 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
     // is bounded by the block reads, which fail on the first bad pointer.
     let mut payload = Vec::with_capacity((meta.payload_len as usize).min(1 << 22));
     for &ptr in &meta.blocks {
-        let block = db.read_block(ptr)?;
+        let block = db.pin_block(ptr)?;
         let want = (meta.payload_len as usize - payload.len()).min(block.len());
         payload.extend_from_slice(&block[..want]);
     }
@@ -277,6 +292,26 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
         }
     }
     Ok(())
+}
+
+/// Reads a whole segment through `pool`, decoding it at most once per
+/// pooled lifetime. The key is the segment's first block pointer, which
+/// every segment has since even an empty one carries its chunk count,
+/// and which is unique per committed segment version.
+pub fn read_segment_pooled(
+    db: &mut Zu1File,
+    pool: &DecodedPool<Vec<u64>>,
+    meta: &SegmentMeta,
+) -> Result<Arc<Vec<u64>>> {
+    let key = meta.blocks[0];
+    if let Some(values) = pool.get(key) {
+        return Ok(values);
+    }
+    let mut values = Vec::with_capacity(meta.value_count as usize);
+    read_segment(db, meta, &mut values)?;
+    let values = Arc::new(values);
+    pool.insert(key, Arc::clone(&values));
+    Ok(values)
 }
 
 /// Point access: appends `values[start..end]` to `out`, decoding only the
@@ -433,6 +468,12 @@ pub struct ChunkDirectory {
     fences: Vec<u64>,
 }
 
+impl crate::cache::PoolBytes for ChunkDirectory {
+    fn pool_bytes(&self) -> usize {
+        self.ends.len() * 4 + self.fences.len() * 8
+    }
+}
+
 /// Loads the chunk index and fences of `meta`'s segment.
 pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<ChunkDirectory> {
     if meta.structural != Structural::MiniBlock {
@@ -455,6 +496,23 @@ pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Chun
     Ok(ChunkDirectory { ends, fences })
 }
 
+/// Loads `meta`'s chunk directory through `pool`, keyed like
+/// [`read_segment_pooled`], so forked readers decode each directory
+/// once between them instead of once per handle.
+pub fn load_chunk_directory_pooled(
+    db: &mut Zu1File,
+    pool: &DecodedPool<ChunkDirectory>,
+    meta: &SegmentMeta,
+) -> Result<Arc<ChunkDirectory>> {
+    let key = meta.blocks[0];
+    if let Some(dir) = pool.get(key) {
+        return Ok(dir);
+    }
+    let dir = Arc::new(load_chunk_directory(db, meta)?);
+    pool.insert(key, Arc::clone(&dir));
+    Ok(dir)
+}
+
 /// Decoded chunks held by a reader between lookups, one slot per chunk
 /// filled on first touch and kept. Warm means touched before: a lookup
 /// that lands on a held chunk costs a binary search, no block read and
@@ -466,6 +524,56 @@ pub struct ChunkCache {
     chunks: Vec<Vec<u64>>,
 }
 
+/// Decodes chunk `target` of `meta`'s segment into `out`, which is
+/// cleared first. The scan path drives this with one reusable scratch
+/// vector, since a scan touches each chunk once and a per-chunk cache
+/// would only hold memory it never reads again.
+pub fn decode_chunk(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    dir: &ChunkDirectory,
+    target: usize,
+    out: &mut Vec<u64>,
+) -> Result<()> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    let chunks = meta.chunk_count();
+    if dir.ends.len() != chunks || target >= chunks {
+        return Err(corrupt("chunk directory disagrees with meta"));
+    }
+    let body_off = 4 + chunks * 12;
+    let body_start = if target == 0 {
+        0
+    } else {
+        dir.ends[target - 1] as usize
+    };
+    let body_end = dir.ends[target] as usize;
+    if body_start > body_end || body_off + body_end > meta.payload_len as usize {
+        return Err(corrupt("chunk index not monotone"));
+    }
+    let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
+    out.clear();
+    enc::decode_any(&bytes, meta.chunk_rows(target), out)?;
+    if out.len() != meta.chunk_rows(target) {
+        return Err(corrupt("chunk count disagrees with meta"));
+    }
+    Ok(())
+}
+
+/// The inclusive value bounds of chunk `i`, known without decoding when
+/// the writer recorded the segment as sorted: the previous fence floors
+/// the chunk and its own fence caps it. `None` when the segment is
+/// unsorted and the fences are just last values, not bounds.
+pub fn chunk_zone(meta: &SegmentMeta, dir: &ChunkDirectory, i: usize) -> Option<(u64, u64)> {
+    if !meta.sorted || i >= dir.fences.len() {
+        return None;
+    }
+    let lo = if i == 0 { meta.min } else { dir.fences[i - 1] };
+    Some((lo, dir.fences[i]))
+}
+
 /// Decodes chunk `target` of `meta`'s segment through `cache`, reusing
 /// the held values when the chunk was decoded before.
 pub fn cached_chunk<'a>(
@@ -475,34 +583,19 @@ pub fn cached_chunk<'a>(
     cache: &'a mut ChunkCache,
     target: usize,
 ) -> Result<&'a [u64]> {
-    let corrupt = |detail: &str| ZuError::Corrupt {
-        what: "segment",
-        detail: detail.to_string(),
-    };
     let chunks = meta.chunk_count();
-    if dir.ends.len() != chunks || target >= chunks {
-        return Err(corrupt("chunk directory disagrees with meta"));
+    if target >= chunks {
+        return Err(ZuError::Corrupt {
+            what: "segment",
+            detail: "chunk directory disagrees with meta".to_string(),
+        });
     }
     if cache.chunks.is_empty() {
         cache.chunks.resize(chunks, Vec::new());
     }
     if cache.chunks[target].is_empty() {
-        let body_off = 4 + chunks * 12;
-        let body_start = if target == 0 {
-            0
-        } else {
-            dir.ends[target - 1] as usize
-        };
-        let body_end = dir.ends[target] as usize;
-        if body_start > body_end || body_off + body_end > meta.payload_len as usize {
-            return Err(corrupt("chunk index not monotone"));
-        }
-        let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
         let mut values = Vec::with_capacity(meta.chunk_rows(target));
-        enc::decode_any(&bytes, meta.chunk_rows(target), &mut values)?;
-        if values.len() != meta.chunk_rows(target) {
-            return Err(corrupt("chunk count disagrees with meta"));
-        }
+        decode_chunk(db, meta, dir, target, &mut values)?;
         cache.chunks[target] = values;
     }
     Ok(&cache.chunks[target])
@@ -601,13 +694,15 @@ pub fn find_in_sorted(
         .map(|i| (target * CHUNK_ROWS + i) as u64))
 }
 
-/// Reads payload bytes `[from, to)`, touching only the covering blocks.
+/// Reads payload bytes `[from, to)` through the block cache. A span
+/// inside one block, the common case, borrows the pinned frame with no
+/// copy; a span crossing blocks assembles an owned copy.
 pub(crate) fn read_payload_span(
     db: &mut Zu1File,
     meta: &SegmentMeta,
     from: usize,
     to: usize,
-) -> Result<Vec<u8>> {
+) -> Result<SegmentBytes> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "segment",
         detail: detail.to_string(),
@@ -616,19 +711,28 @@ pub(crate) fn read_payload_span(
         return Err(corrupt("span outside the payload"));
     }
     let block = BLOCK_SIZE as usize;
+    let past_list = || corrupt("span past the block list");
+    if to == from {
+        return Ok(SegmentBytes::Owned(Vec::new()));
+    }
+    if from / block == (to - 1) / block {
+        let ptr = *meta.blocks.get(from / block).ok_or_else(past_list)?;
+        return Ok(SegmentBytes::Pinned {
+            block: db.pin_block(ptr)?,
+            start: from % block,
+            len: to - from,
+        });
+    }
     let mut buf = Vec::with_capacity(to - from);
     let mut pos = from;
     while pos < to {
         let offset = pos % block;
         let len = (to - pos).min(block - offset);
-        let ptr = *meta
-            .blocks
-            .get(pos / block)
-            .ok_or_else(|| corrupt("span past the block list"))?;
-        buf.extend_from_slice(&db.read_block_slice(ptr, offset, len)?);
+        let ptr = *meta.blocks.get(pos / block).ok_or_else(past_list)?;
+        buf.extend_from_slice(&db.pin_block(ptr)?[offset..offset + len]);
         pos += len;
     }
-    Ok(buf)
+    Ok(SegmentBytes::Owned(buf))
 }
 
 #[cfg(test)]
@@ -861,6 +965,7 @@ mod tests {
             max: 9,
             crc: 0,
             structural: Structural::MiniBlock,
+            sorted: false,
             blocks: vec![3],
         };
         let mut bytes = Vec::new();
@@ -895,6 +1000,7 @@ mod tests {
             max: 4,
             crc: 0,
             structural: Structural::MiniBlock,
+            sorted: false,
             blocks: vec![3],
         };
         let mut bytes = Vec::new();

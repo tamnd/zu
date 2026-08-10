@@ -118,6 +118,7 @@ pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentM
         max: 0,
         crc,
         structural: Structural::FullZip,
+        sorted: false,
         blocks,
     })
 }
@@ -272,7 +273,7 @@ pub fn read_blob_segment(
     // is bounded by the block reads, which fail on the first bad pointer.
     let mut payload = Vec::with_capacity((meta.payload_len as usize).min(1 << 22));
     for &ptr in &meta.blocks {
-        let block = db.read_block(ptr)?;
+        let block = db.pin_block(ptr)?;
         let want = (meta.payload_len as usize - payload.len()).min(block.len());
         payload.extend_from_slice(&block[..want]);
     }

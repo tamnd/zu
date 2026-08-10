@@ -244,9 +244,10 @@ struct PoolInner<T> {
 
 /// A budgeted pool of decoded objects keyed by the first block pointer
 /// of the segment they decode, the decode-on-touch tier of perf/04
-/// section 2. Block pointers are unique per committed segment version,
-/// so a rewritten table gets fresh keys and stale entries simply age
-/// out; there is no invalidation protocol. Values are `Arc`-handed:
+/// section 2. A dropped table's keys stop being touched and age out;
+/// the one real hazard is the free list recycling a pointer into a new
+/// segment, which `Zu1File::write_block` covers by calling
+/// [`Self::remove`] on every block it rewrites. Values are `Arc`-handed:
 /// eviction drops the map's reference and any reader still holding the
 /// `Arc` keeps its snapshot alive, which is safe because decoded
 /// objects are immutable under MVCC.
@@ -312,6 +313,17 @@ impl<T> DecodedPool<T> {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
+        }
+    }
+
+    /// Drops the entry under `key`, the write-invalidation hook: the
+    /// free list recycles block pointers, so a rewrite of a segment's
+    /// first block can give a new segment an old key. Readers still
+    /// holding the old `Arc` keep their snapshot, same as eviction.
+    pub fn remove(&self, key: BlockPtr) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.map.remove(&key) {
+            inner.bytes -= entry.bytes;
         }
     }
 

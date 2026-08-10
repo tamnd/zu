@@ -642,15 +642,12 @@ impl GraphReader {
     /// on a cache miss.
     pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
         let (g, row) = self.locate(node)?;
-        let slot = &mut self.cached_groups[dir as usize];
-        if slot.as_ref().map(|(i, _, _)| *i) != Some(g) {
-            let meta = self.directory.groups[g].dir(dir);
-            let pools = db.pools();
-            let offsets = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
-            let nbrs = read_segment_pooled(db, &pools.adjacency, &meta.neighbors)?;
-            *slot = Some((g, offsets, nbrs));
+        let idx = dir as usize;
+        if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
+            let (offsets, nbrs) = self.csr_group(db, g, dir)?;
+            self.cached_groups[idx] = Some((g, offsets, nbrs));
         }
-        let (_, offsets, nbrs) = self.cached_groups[dir as usize].as_ref().unwrap();
+        let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().unwrap();
         let lo = offsets[row] as usize;
         let hi = offsets[row + 1] as usize;
         Ok(&nbrs[lo..hi])
@@ -659,6 +656,68 @@ impl GraphReader {
     /// Returns the sorted out-neighbor list of `node`.
     pub fn neighbors(&mut self, db: &mut Zu1File, node: u64) -> Result<&[u64]> {
         self.neighbors_dir(db, node, Direction::Fwd)
+    }
+
+    /// Pool-backed pins of one group's CSR in `dir`: the offset and
+    /// neighbor arrays as shared handles. Warm calls are two pool map
+    /// probes and two `Arc` clones, no decode and no copy, which is
+    /// what the Snapshot csr surface lends out as borrowed slices.
+    pub fn csr_group(
+        &self,
+        db: &mut Zu1File,
+        group: usize,
+        dir: Direction,
+    ) -> Result<(Arc<Vec<u64>>, Arc<Vec<u64>>)> {
+        let meta = self
+            .directory
+            .groups
+            .get(group)
+            .ok_or_else(|| {
+                ZuError::InvalidArgument(format!(
+                    "group {group} out of 0..{}",
+                    self.directory.groups.len()
+                ))
+            })?
+            .dir(dir);
+        let pools = db.pools();
+        Ok((
+            read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?,
+            read_segment_pooled(db, &pools.adjacency, &meta.neighbors)?,
+        ))
+    }
+
+    /// Degree of `node` in `dir` from the pooled offset array alone;
+    /// the neighbor values never decode for a count.
+    pub fn degree_of(&self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<u64> {
+        let (g, row) = self.locate(node)?;
+        let meta = self.directory.groups[g].dir(dir);
+        let pools = db.pools();
+        let offs = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
+        Ok(offs[row + 1] - offs[row])
+    }
+
+    /// Sum of degrees over `nodes` in `dir`, one pooled offset pin per
+    /// group run. This is the counting expand's bulk read: it touches
+    /// the 8% offsets pool and never the 20% adjacency pool, so a
+    /// count over a hub's neighborhood costs offset diffs, not decoded
+    /// neighbor megabytes.
+    pub fn degree_batch(&self, db: &mut Zu1File, nodes: &[u64], dir: Direction) -> Result<u64> {
+        let mut total = 0u64;
+        let mut cur: Option<(usize, Arc<Vec<u64>>)> = None;
+        for &node in nodes {
+            let (g, row) = self.locate(node)?;
+            if cur.as_ref().map(|(i, _)| *i) != Some(g) {
+                let meta = self.directory.groups[g].dir(dir);
+                let pools = db.pools();
+                cur = Some((
+                    g,
+                    read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?,
+                ));
+            }
+            let offs = &cur.as_ref().unwrap().1;
+            total += offs[row + 1] - offs[row];
+        }
+        Ok(total)
     }
 
     /// Point access: appends `node`'s sorted list in `dir` to `out`

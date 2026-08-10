@@ -23,8 +23,9 @@ pub const DEFAULT_MEMORY_LIMIT: usize = 128 << 20;
 
 /// The decoded-object pools of perf/04 section 2, shared by every
 /// handle [`Zu1File::reopen`] forks off one open. Keys are the first
-/// block pointer of the decoded segment, unique per committed segment
-/// version, so a rewritten table simply stops touching its old keys.
+/// block pointer of the decoded segment; [`Zu1File::write_block`]
+/// drops the key of any block it rewrites, so a recycled pointer can
+/// never serve a stale decode.
 #[derive(Debug)]
 pub struct DecodedPools {
     /// Decoded CSR offset arrays, the O(1)-seek side of a group.
@@ -400,6 +401,12 @@ impl Zu1File {
         assert_eq!(data.len(), BLOCK_SIZE as usize, "blocks are fixed size");
         self.check_ptr(ptr)?;
         self.cache.remove(ptr);
+        // The free list recycles pointers, so a rewrite can hand a new
+        // segment an old pool key; dropping the key here keeps the
+        // pools honest the same way the line above keeps the cache.
+        self.pools.csr_offsets.remove(ptr);
+        self.pools.adjacency.remove(ptr);
+        self.pools.fences.remove(ptr);
         self.file.write_all_at(data, ptr * u64::from(BLOCK_SIZE))
     }
 

@@ -66,6 +66,12 @@ pub struct SegmentMeta {
     pub max: u64,
     pub crc: u32,
     pub structural: Structural,
+    /// The writer saw the values in ascending order, which upgrades the
+    /// fence array to a per-chunk zone map: chunk `i` holds values in
+    /// `fences[i-1]..=fences[i]` (`min..=fences[0]` for the first), so
+    /// a range scan can skip chunks without reading them. Unsorted
+    /// segments keep only the segment-level min and max.
+    pub sorted: bool,
     pub blocks: Vec<BlockPtr>,
 }
 
@@ -84,7 +90,10 @@ impl SegmentMeta {
         out.extend_from_slice(&self.max.to_le_bytes());
         out.extend_from_slice(&self.crc.to_le_bytes());
         out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
-        out.push(self.structural as u8);
+        // The structural byte carries the sorted flag in bit 1, so the
+        // flag costs no format version: old values 0 and 1 still decode
+        // and a flagged MiniBlock reads back as 2.
+        out.push(self.structural as u8 | (u8::from(self.sorted) << 1));
         for b in &self.blocks {
             out.extend_from_slice(&b.to_le_bytes());
         }
@@ -108,16 +117,17 @@ impl SegmentMeta {
         let max = word(32);
         let crc = u32::from_le_bytes(head[40..44].try_into().unwrap());
         let block_count = u32::from_le_bytes(head[44..48].try_into().unwrap()) as usize;
-        let structural = match head[48] {
+        let structural = match head[48] & !2 {
             0 => Structural::MiniBlock,
             1 => Structural::FullZip,
-            id => {
+            _ => {
                 return Err(ZuError::Unsupported {
                     what: "structural layout",
-                    id: u32::from(id),
+                    id: u32::from(head[48]),
                 });
             }
         };
+        let sorted = head[48] & 2 != 0;
         if min > max {
             return Err(corrupt("zone min above max"));
         }
@@ -147,6 +157,7 @@ impl SegmentMeta {
                 max,
                 crc,
                 structural,
+                sorted,
                 blocks,
             },
             p,
@@ -207,6 +218,7 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
         max: values.iter().copied().max().unwrap_or(0),
         crc,
         structural: Structural::MiniBlock,
+        sorted: values.is_sorted(),
         blocks,
     })
 }
@@ -512,6 +524,56 @@ pub struct ChunkCache {
     chunks: Vec<Vec<u64>>,
 }
 
+/// Decodes chunk `target` of `meta`'s segment into `out`, which is
+/// cleared first. The scan path drives this with one reusable scratch
+/// vector, since a scan touches each chunk once and a per-chunk cache
+/// would only hold memory it never reads again.
+pub fn decode_chunk(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    dir: &ChunkDirectory,
+    target: usize,
+    out: &mut Vec<u64>,
+) -> Result<()> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    let chunks = meta.chunk_count();
+    if dir.ends.len() != chunks || target >= chunks {
+        return Err(corrupt("chunk directory disagrees with meta"));
+    }
+    let body_off = 4 + chunks * 12;
+    let body_start = if target == 0 {
+        0
+    } else {
+        dir.ends[target - 1] as usize
+    };
+    let body_end = dir.ends[target] as usize;
+    if body_start > body_end || body_off + body_end > meta.payload_len as usize {
+        return Err(corrupt("chunk index not monotone"));
+    }
+    let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
+    out.clear();
+    enc::decode_any(&bytes, meta.chunk_rows(target), out)?;
+    if out.len() != meta.chunk_rows(target) {
+        return Err(corrupt("chunk count disagrees with meta"));
+    }
+    Ok(())
+}
+
+/// The inclusive value bounds of chunk `i`, known without decoding when
+/// the writer recorded the segment as sorted: the previous fence floors
+/// the chunk and its own fence caps it. `None` when the segment is
+/// unsorted and the fences are just last values, not bounds.
+pub fn chunk_zone(meta: &SegmentMeta, dir: &ChunkDirectory, i: usize) -> Option<(u64, u64)> {
+    if !meta.sorted || i >= dir.fences.len() {
+        return None;
+    }
+    let lo = if i == 0 { meta.min } else { dir.fences[i - 1] };
+    Some((lo, dir.fences[i]))
+}
+
 /// Decodes chunk `target` of `meta`'s segment through `cache`, reusing
 /// the held values when the chunk was decoded before.
 pub fn cached_chunk<'a>(
@@ -521,34 +583,19 @@ pub fn cached_chunk<'a>(
     cache: &'a mut ChunkCache,
     target: usize,
 ) -> Result<&'a [u64]> {
-    let corrupt = |detail: &str| ZuError::Corrupt {
-        what: "segment",
-        detail: detail.to_string(),
-    };
     let chunks = meta.chunk_count();
-    if dir.ends.len() != chunks || target >= chunks {
-        return Err(corrupt("chunk directory disagrees with meta"));
+    if target >= chunks {
+        return Err(ZuError::Corrupt {
+            what: "segment",
+            detail: "chunk directory disagrees with meta".to_string(),
+        });
     }
     if cache.chunks.is_empty() {
         cache.chunks.resize(chunks, Vec::new());
     }
     if cache.chunks[target].is_empty() {
-        let body_off = 4 + chunks * 12;
-        let body_start = if target == 0 {
-            0
-        } else {
-            dir.ends[target - 1] as usize
-        };
-        let body_end = dir.ends[target] as usize;
-        if body_start > body_end || body_off + body_end > meta.payload_len as usize {
-            return Err(corrupt("chunk index not monotone"));
-        }
-        let bytes = read_payload_span(db, meta, body_off + body_start, body_off + body_end)?;
         let mut values = Vec::with_capacity(meta.chunk_rows(target));
-        enc::decode_any(&bytes, meta.chunk_rows(target), &mut values)?;
-        if values.len() != meta.chunk_rows(target) {
-            return Err(corrupt("chunk count disagrees with meta"));
-        }
+        decode_chunk(db, meta, dir, target, &mut values)?;
         cache.chunks[target] = values;
     }
     Ok(&cache.chunks[target])
@@ -918,6 +965,7 @@ mod tests {
             max: 9,
             crc: 0,
             structural: Structural::MiniBlock,
+            sorted: false,
             blocks: vec![3],
         };
         let mut bytes = Vec::new();
@@ -952,6 +1000,7 @@ mod tests {
             max: 4,
             crc: 0,
             structural: Structural::MiniBlock,
+            sorted: false,
             blocks: vec![3],
         };
         let mut bytes = Vec::new();

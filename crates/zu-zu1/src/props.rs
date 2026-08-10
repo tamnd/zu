@@ -12,6 +12,7 @@
 //! `type: u8` (0 string, 1 integer), and the column's `SegmentMeta`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use zu_common::{Result, ZuError};
 
@@ -20,8 +21,8 @@ use crate::file::{BlockPtr, Zu1File};
 use crate::fullzip::{read_blob_range, write_blob_segment};
 use crate::meta;
 use crate::segment::{
-    CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, load_chunk_directory, read_one_cached,
-    write_segment,
+    CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, decode_chunk, load_chunk_directory_pooled,
+    read_one_cached, write_segment,
 };
 
 const PROPS_VERSION: u16 = 1;
@@ -245,8 +246,13 @@ struct StrChunk {
 #[derive(Debug)]
 pub struct PropsReader {
     directory: PropsDirectory,
-    int_state: BTreeMap<usize, (ChunkDirectory, ChunkCache)>,
+    int_state: BTreeMap<usize, (Arc<ChunkDirectory>, ChunkCache)>,
     str_state: BTreeMap<usize, StrChunk>,
+    /// Reused by [`Self::gather_int`] so a warm gather decodes into the
+    /// same buffer every call.
+    gather_scratch: Vec<u64>,
+    /// Row order scratch for the gathers, reused the same way.
+    order_scratch: Vec<u32>,
 }
 
 impl PropsReader {
@@ -255,6 +261,8 @@ impl PropsReader {
             directory,
             int_state: BTreeMap::new(),
             str_state: BTreeMap::new(),
+            gather_scratch: Vec::new(),
+            order_scratch: Vec::new(),
         }
     }
 
@@ -269,11 +277,137 @@ impl PropsReader {
     pub fn read_int(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<u64> {
         let meta = &self.directory.columns[col].meta;
         if let std::collections::btree_map::Entry::Vacant(slot) = self.int_state.entry(col) {
-            let dir = load_chunk_directory(db, meta)?;
+            let pools = db.pools();
+            let dir = load_chunk_directory_pooled(db, &pools.fences, meta)?;
             slot.insert((dir, ChunkCache::default()));
         }
         let (dir, cache) = self.int_state.get_mut(&col).expect("just inserted");
         read_one_cached(db, meta, dir, cache, row)
+    }
+
+    /// Gathers `col` for arbitrary `rows`, writing `out[i]` for
+    /// `rows[i]`, the batched read of perf/04 section 5: rows sort by
+    /// position, runs sharing a chunk decode it once into a reused
+    /// scratch, and values scatter back to the caller's order. However
+    /// many rows land in one chunk, it decodes once per call.
+    pub fn gather_int(
+        &mut self,
+        db: &mut Zu1File,
+        col: usize,
+        rows: &[u64],
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let meta = &self.directory.columns[col].meta;
+        if self.directory.columns[col].ty != PropType::Int {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{}' is not an integer column",
+                self.directory.columns[col].name
+            )));
+        }
+        let pools = db.pools();
+        let dir = load_chunk_directory_pooled(db, &pools.fences, meta)?;
+        let order = &mut self.order_scratch;
+        order.clear();
+        order.extend(0..rows.len() as u32);
+        order.sort_unstable_by_key(|&i| rows[i as usize]);
+        out.clear();
+        out.resize(rows.len(), 0);
+        let scratch = &mut self.gather_scratch;
+        let mut i = 0;
+        while i < order.len() {
+            let row = rows[order[i] as usize];
+            if row >= meta.value_count {
+                return Err(ZuError::InvalidArgument(format!(
+                    "row {row} out of 0..{}",
+                    meta.value_count
+                )));
+            }
+            let chunk = (row / CHUNK_ROWS as u64) as usize;
+            decode_chunk(db, meta, &dir, chunk, scratch)?;
+            while i < order.len() {
+                let r = rows[order[i] as usize];
+                if r / CHUNK_ROWS as u64 != chunk as u64 {
+                    break;
+                }
+                out[order[i] as usize] = scratch[(r % CHUNK_ROWS as u64) as usize];
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Gathers a string column for arbitrary `rows`: the values land
+    /// concatenated in `out_bytes` in row-argument order, value `i`
+    /// ending at `out_ends[i]`. Chunk runs decode once, like
+    /// [`Self::gather_int`]; the scatter goes through a span table so
+    /// the output order is the caller's even though decoding walks the
+    /// rows sorted.
+    pub fn gather_str(
+        &mut self,
+        db: &mut Zu1File,
+        col: usize,
+        rows: &[u64],
+        out_bytes: &mut Vec<u8>,
+        out_ends: &mut Vec<u64>,
+    ) -> Result<()> {
+        let meta = &self.directory.columns[col].meta;
+        if self.directory.columns[col].ty != PropType::Str {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{}' is not a string column",
+                self.directory.columns[col].name
+            )));
+        }
+        let order = &mut self.order_scratch;
+        order.clear();
+        order.extend(0..rows.len() as u32);
+        order.sort_unstable_by_key(|&i| rows[i as usize]);
+        let mut staged = Vec::new();
+        let mut spans = vec![(0usize, 0usize); rows.len()];
+        let mut chunk_bytes = Vec::new();
+        let mut chunk_ends: Vec<u64> = Vec::new();
+        let mut cur_chunk = u64::MAX;
+        let mut chunk_start = 0u64;
+        for &ix in order.iter() {
+            let row = rows[ix as usize];
+            if row >= meta.value_count {
+                return Err(ZuError::InvalidArgument(format!(
+                    "row {row} out of 0..{}",
+                    meta.value_count
+                )));
+            }
+            let chunk = row / CHUNK_ROWS as u64;
+            if chunk != cur_chunk {
+                chunk_start = chunk * CHUNK_ROWS as u64;
+                let end = meta.value_count.min(chunk_start + CHUNK_ROWS as u64);
+                chunk_bytes.clear();
+                chunk_ends.clear();
+                read_blob_range(
+                    db,
+                    meta,
+                    chunk_start,
+                    end,
+                    &mut chunk_bytes,
+                    &mut chunk_ends,
+                )?;
+                cur_chunk = chunk;
+            }
+            let local = (row - chunk_start) as usize;
+            let lo = if local == 0 {
+                0
+            } else {
+                chunk_ends[local - 1] as usize
+            };
+            let hi = chunk_ends[local] as usize;
+            spans[ix as usize] = (staged.len(), staged.len() + (hi - lo));
+            staged.extend_from_slice(&chunk_bytes[lo..hi]);
+        }
+        out_bytes.clear();
+        out_ends.clear();
+        for &(lo, hi) in &spans {
+            out_bytes.extend_from_slice(&staged[lo..hi]);
+            out_ends.push(out_bytes.len() as u64);
+        }
+        Ok(())
     }
 
     pub fn read_str(

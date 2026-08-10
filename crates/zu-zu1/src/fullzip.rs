@@ -118,6 +118,7 @@ pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentM
         max: 0,
         crc,
         structural: Structural::FullZip,
+        sorted: false,
         blocks,
     })
 }

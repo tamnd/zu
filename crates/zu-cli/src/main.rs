@@ -5,9 +5,14 @@
 //! Argument parsing is hand-rolled: the surface is small and G7 caps the
 //! binary at 15 MiB, so no clap.
 
+use std::fmt::Write as _;
 use std::process::ExitCode;
 
+use zu::query::{QueryResult, Value};
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const QUERY_USAGE: &str = "zu query <file.zu1> -c <zuQL> [--format table|json] [-p name=value ...]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +29,7 @@ fn main() -> ExitCode {
             Some(path) => stat(std::path::Path::new(path)),
             None => usage_error("zu stat <file.zu1>"),
         },
+        Some("query") => query_command(&args[1..]),
         Some("verify") => match args.get(1) {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
@@ -246,14 +252,30 @@ fn copy(
     let load_started = std::time::Instant::now();
     let result = (|| {
         let mut db = zu::zu1::file::Zu1File::create(out_path)?;
-        zu::zu1::graph::bulk_load_keyed(
+        let d = zu::zu1::graph::bulk_load_keyed(
             &mut db,
             "node",
             "edge",
             node_count,
             &sorted,
             key_by_row.as_deref(),
-        )
+        )?;
+        // A reordered load also stores the original ids as a property
+        // column. The key index alone only answers "which row is key k",
+        // which is enough for `{id: $k}` and for `neighbors --key`, but
+        // `RETURN n.id` reads a property, and with nothing stored the
+        // property path falls back to the row offset. That fallback is
+        // right for a load that kept its order and wrong for one that
+        // did not, so a reordered file that skips this returns the
+        // permuted position where the query asked for the id.
+        if let Some(keys) = key_by_row.as_deref() {
+            zu::zu1::props::store_props(
+                &mut db,
+                "node",
+                &[("id", zu::zu1::props::PropValues::Int(keys))],
+            )?;
+        }
+        Ok(d)
     })();
     match result {
         Ok(d) => {
@@ -490,6 +512,272 @@ fn edge(path: &std::path::Path, src: u64, dst: u64, dir: zu::zu1::graph::Directi
     }
 }
 
+/// How `zu query` prints its rows: a column-aligned table for someone
+/// reading a terminal, or one JSON object for anything parsing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Table,
+    Json,
+}
+
+/// Parses the `query` argument list and runs the statement.
+///
+/// Flags may come before or after the file, because a caller building
+/// the command line programmatically should not have to care. The
+/// statement is required: without `-c` there is nothing to run, and
+/// there is no interactive fallback here (that is `zu shell`).
+fn query_command(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut source: Option<&str> = None;
+    let mut format = Format::Table;
+    let mut params: Vec<(String, Value)> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        // Every flag here takes one value, so consuming it and stepping
+        // past both happens in one place.
+        let next = |i: &mut usize| -> Option<&str> {
+            let v = args.get(*i + 1).map(String::as_str);
+            *i += 2;
+            v
+        };
+        match arg {
+            "-c" | "--command" => match next(&mut i) {
+                Some(s) => source = Some(s),
+                None => return usage_error(QUERY_USAGE),
+            },
+            "-p" | "--param" => match next(&mut i).map(parse_param) {
+                Some(Some(p)) => params.push(p),
+                _ => return usage_error(QUERY_USAGE),
+            },
+            "--format" | "-f" => match next(&mut i) {
+                Some("json") => format = Format::Json,
+                Some("table") => format = Format::Table,
+                _ => return usage_error(QUERY_USAGE),
+            },
+            _ if arg.starts_with('-') => return usage_error(QUERY_USAGE),
+            _ if path.is_none() => {
+                path = Some(arg);
+                i += 1;
+            }
+            _ => return usage_error(QUERY_USAGE),
+        }
+    }
+    match (path, source) {
+        (Some(path), Some(source)) => query(std::path::Path::new(path), source, format, &params),
+        _ => usage_error(QUERY_USAGE),
+    }
+}
+
+/// Splits `name=value` and types the value by what it parses as: an
+/// integer, then a float, then a string.
+///
+/// That covers the `{id: $id}` and `$seed` bindings queries actually
+/// use and needs no shell quoting for any of them. A value meant to
+/// stay a string but spelled like a number cannot be expressed. Fixing
+/// that means a cast syntax on the command line, and the CLI should not
+/// invent one before the grammar has picked its own.
+fn parse_param(arg: &str) -> Option<(String, Value)> {
+    let (name, text) = arg.split_once('=')?;
+    if name.is_empty() {
+        return None;
+    }
+    let value = if let Ok(i) = text.parse::<i64>() {
+        Value::Int(i)
+    } else if let Ok(f) = text.parse::<f64>() {
+        Value::Float(f)
+    } else {
+        Value::Str(text.to_owned())
+    };
+    Some((name.to_owned(), value))
+}
+
+/// Opens the file, runs the statement, and prints the result. Errors go
+/// to stderr and exit 1, in both formats: a caller that reads stdout as
+/// JSON gets either a whole result object or nothing, never a diagnostic
+/// it has to tell apart from data.
+fn query(
+    path: &std::path::Path,
+    source: &str,
+    format: Format,
+    params: &[(String, Value)],
+) -> ExitCode {
+    let bound: Vec<(&str, Value)> = params
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.clone()))
+        .collect();
+    let result = (|| {
+        let mut db = zu::zu1::file::Zu1File::open(path)?;
+        zu::query::run(source, &mut db, &bound)
+    })();
+    match result {
+        Ok(r) => {
+            print!(
+                "{}",
+                match format {
+                    Format::Json => render_json(&r),
+                    Format::Table => render_table(&r),
+                }
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => command_error("query", &e),
+    }
+}
+
+/// Renders a result as one JSON object: `{"columns":[...],"rows":[[...]]}`.
+/// Hand-rolled because the CLI carries no JSON crate; G7 caps the binary
+/// at 15 MiB and this is the only place that needs one.
+fn render_json(r: &QueryResult) -> String {
+    let mut out = String::from("{\"columns\":[");
+    for (i, c) in r.columns.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_json_str(&mut out, c);
+    }
+    out.push_str("],\"rows\":[");
+    for (i, row) in r.rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        for (j, v) in row.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            write_json_value(&mut out, v);
+        }
+        out.push(']');
+    }
+    out.push_str("]}\n");
+    out
+}
+
+fn write_json_value(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(i) => {
+            let _ = write!(out, "{i}");
+        }
+        // JSON has no NaN and no infinity, and a reader that has to
+        // guess what a bare `NaN` token meant is worse off than one
+        // that reads null.
+        Value::Float(f) if f.is_finite() => {
+            let _ = write!(out, "{f}");
+        }
+        Value::Float(_) => out.push_str("null"),
+        Value::Str(s) => write_json_str(out, s),
+        Value::Node { table, offset } => {
+            let _ = write!(out, "{{\"table\":{table},\"offset\":{offset}}}");
+        }
+        Value::Rel { table, src, dst } => {
+            let _ = write!(out, "{{\"table\":{table},\"src\":{src},\"dst\":{dst}}}");
+        }
+        Value::List(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_value(out, item);
+            }
+            out.push(']');
+        }
+        // The executor settles every PMR chain into an edge list before
+        // a value leaves the pipeline, so a result never carries one.
+        Value::Path(_) => out.push_str("null"),
+    }
+}
+
+fn write_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Renders a result as an aligned table with a row count underneath.
+/// Column widths come from the widest cell, so a wide list value widens
+/// its own column and leaves the rest alone.
+fn render_table(r: &QueryResult) -> String {
+    let cells: Vec<Vec<String>> = r
+        .rows
+        .iter()
+        .map(|row| row.iter().map(display_value).collect())
+        .collect();
+    let widths: Vec<usize> = r
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            cells
+                .iter()
+                .filter_map(|row| row.get(i))
+                .map(String::len)
+                .chain(std::iter::once(c.len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    let line = |out: &mut String, row: &[String]| {
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                out.push_str("  ");
+            }
+            let pad = widths
+                .get(i)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(cell.len());
+            out.push_str(cell);
+            if i + 1 < row.len() {
+                for _ in 0..pad {
+                    out.push(' ');
+                }
+            }
+        }
+        out.push('\n');
+    };
+    line(&mut out, &r.columns);
+    for row in &cells {
+        line(&mut out, row);
+    }
+    let n = r.rows.len();
+    let _ = writeln!(out, "({n} row{})", if n == 1 { "" } else { "s" });
+    out
+}
+
+fn display_value(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_owned(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::Node { table, offset } => format!("({table}:{offset})"),
+        Value::Rel { table, src, dst } => format!("[{table}:{src}->{dst}]"),
+        Value::List(items) => {
+            let parts: Vec<String> = items.iter().map(display_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Path(_) => "path".to_owned(),
+    }
+}
+
 fn verify(path: &std::path::Path) -> ExitCode {
     match zu::zu1::verify(path) {
         Ok(bytes) => {
@@ -519,4 +807,178 @@ fn print_usage() {
         "commands: shell, query, copy, convert, verify, stat, neighbors [--in] [--key], edge [--in], lookup, bench"
     );
     println!("(implemented milestone by milestone, see the repo issues)");
+    println!();
+    println!("{QUERY_USAGE}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reordered load must keep answering in the id space the input
+    /// used. The key index already does that for `{id: $k}` lookups;
+    /// this pins the property side, which reads a stored column and
+    /// used to fall back to the row offset and hand back the permuted
+    /// position instead of the id.
+    #[test]
+    fn a_reordered_copy_keeps_ids_readable_as_properties() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edges_path = dir.path().join("edges.txt");
+        let db_path = dir.path().join("out.zu1");
+        // Node 10 is the hub, so degree ordering certainly moves it off
+        // row 10 and the offset fallback cannot pass by coincidence.
+        std::fs::write(&edges_path, "10 11\n10 12\n10 13\n11 13\n12 13\n13 14\n")
+            .expect("write edges");
+        assert_eq!(
+            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::Degree),
+            ExitCode::SUCCESS
+        );
+
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let r = zu::query::run(
+            "MATCH (n:node {id: $id}) RETURN n.id AS id",
+            &mut db,
+            &[("id", Value::Int(10))],
+        )
+        .expect("point read");
+        assert_eq!(r.rows, [[Value::Int(10)]], "id came back as a row offset");
+
+        // Neighbors read the same way, so a traversal reports the ids
+        // the caller can ask about again.
+        let r = zu::query::run(
+            "MATCH (a:node {id: $id})-[:edge]->(b) RETURN b.id AS id ORDER BY id",
+            &mut db,
+            &[("id", Value::Int(10))],
+        )
+        .expect("one hop");
+        assert_eq!(
+            r.rows,
+            [[Value::Int(11)], [Value::Int(12)], [Value::Int(13)],]
+        );
+    }
+
+    #[test]
+    fn params_take_their_type_from_the_text() {
+        assert_eq!(parse_param("id=42"), Some(("id".into(), Value::Int(42))));
+        assert_eq!(
+            parse_param("t=-7"),
+            Some(("t".into(), Value::Int(-7))),
+            "a negative id is an id"
+        );
+        assert_eq!(
+            parse_param("r=0.5"),
+            Some(("r".into(), Value::Float(0.5))),
+            "anything with a point is a float"
+        );
+        assert_eq!(
+            parse_param("name=Ada"),
+            Some(("name".into(), Value::Str("Ada".into())))
+        );
+        // Only the first `=` splits, so a value may contain one.
+        assert_eq!(
+            parse_param("q=a=b"),
+            Some(("q".into(), Value::Str("a=b".into())))
+        );
+        // An empty value is a string, not an error: the query decides
+        // whether an empty name matches anything.
+        assert_eq!(
+            parse_param("s="),
+            Some(("s".into(), Value::Str(String::new())))
+        );
+        assert_eq!(parse_param("nope"), None, "no '=' is not a binding");
+        assert_eq!(
+            parse_param("=5"),
+            None,
+            "a nameless parameter binds nothing"
+        );
+    }
+
+    #[test]
+    fn json_output_is_one_object_per_result() {
+        let r = QueryResult {
+            columns: vec!["n".into(), "name".into()],
+            rows: vec![
+                vec![Value::Int(3), Value::Str("Ada".into())],
+                vec![Value::Null, Value::Bool(true)],
+            ],
+        };
+        assert_eq!(
+            render_json(&r),
+            "{\"columns\":[\"n\",\"name\"],\"rows\":[[3,\"Ada\"],[null,true]]}\n"
+        );
+
+        // Empty is still a well-formed object, so a caller parsing
+        // stdout never has to special-case "no rows".
+        let empty = QueryResult {
+            columns: vec!["d".into()],
+            rows: vec![],
+        };
+        assert_eq!(render_json(&empty), "{\"columns\":[\"d\"],\"rows\":[]}\n");
+    }
+
+    #[test]
+    fn json_escapes_what_json_cannot_carry_raw() {
+        let r = QueryResult {
+            columns: vec!["s".into()],
+            rows: vec![
+                vec![Value::Str("say \"hi\"\n\tpath\\to".into())],
+                vec![Value::Str("bell\u{7}".into())],
+                // NaN and infinity have no JSON spelling; null is the
+                // one a reader cannot misparse.
+                vec![Value::Float(f64::NAN)],
+                vec![Value::Float(f64::INFINITY)],
+            ],
+        };
+        assert_eq!(
+            render_json(&r),
+            "{\"columns\":[\"s\"],\"rows\":[[\"say \\\"hi\\\"\\n\\tpath\\\\to\"],\
+             [\"bell\\u0007\"],[null],[null]]}\n"
+        );
+    }
+
+    #[test]
+    fn json_carries_nodes_rels_and_lists() {
+        let r = QueryResult {
+            columns: vec!["a".into(), "e".into(), "p".into()],
+            rows: vec![vec![
+                Value::Node {
+                    table: 0,
+                    offset: 7,
+                },
+                Value::Rel {
+                    table: 1,
+                    src: 7,
+                    dst: 9,
+                },
+                Value::List(vec![Value::Int(1), Value::List(vec![Value::Int(2)])]),
+            ]],
+        };
+        assert_eq!(
+            render_json(&r),
+            "{\"columns\":[\"a\",\"e\",\"p\"],\"rows\":[[{\"table\":0,\"offset\":7},\
+             {\"table\":1,\"src\":7,\"dst\":9},[1,[2]]]]}\n"
+        );
+    }
+
+    #[test]
+    fn table_output_aligns_on_the_widest_cell() {
+        let r = QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Value::Int(1), Value::Str("Ada".into())],
+                vec![Value::Int(1000), Value::Str("Grace".into())],
+            ],
+        };
+        assert_eq!(
+            render_table(&r),
+            "id    name\n1     Ada\n1000  Grace\n(2 rows)\n"
+        );
+
+        let one = QueryResult {
+            columns: vec!["n".into()],
+            rows: vec![vec![Value::Int(5)]],
+        };
+        assert_eq!(one.rows.len(), 1);
+        assert_eq!(render_table(&one), "n\n5\n(1 row)\n");
+    }
 }

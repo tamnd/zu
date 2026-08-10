@@ -231,6 +231,18 @@ pub enum BoundClause {
         expr: BoundExpr,
         slot: usize,
     },
+    /// A table function call, always the first clause: the kernel runs
+    /// once over `rel` and yields one row per node of its domain.
+    Call {
+        func: TableFunc,
+        rel: u32,
+        /// The rel's node table, the type of the `node` column.
+        table: u32,
+        /// Arguments after the rel name, the sssp source key.
+        args: Vec<BoundExpr>,
+        /// One slot per YIELD column, node first.
+        slots: Vec<usize>,
+    },
     /// `WITH` and `RETURN` share one shape; `RETURN` is the final one.
     Project {
         distinct: bool,
@@ -290,6 +302,51 @@ pub struct BoundRel {
     /// minimum-hop paths.
     pub selector: Option<Selector>,
     pub props: Vec<(String, BoundExpr)>,
+}
+
+/// Whole-graph table functions the binder accepts in `CALL` (docs/07
+/// §4). Each fixes its argument shape and YIELD columns here; the
+/// engine's kernels do the work at execution time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableFunc {
+    Pagerank,
+    Wcc,
+    Sssp,
+    Louvain,
+}
+
+impl TableFunc {
+    fn resolve(name: &str) -> Option<TableFunc> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "pagerank" => TableFunc::Pagerank,
+            "wcc" => TableFunc::Wcc,
+            "sssp" => TableFunc::Sssp,
+            "louvain" => TableFunc::Louvain,
+            _ => return None,
+        })
+    }
+
+    /// The engine-facing kernel name.
+    pub fn name(self) -> &'static str {
+        match self {
+            TableFunc::Pagerank => "pagerank",
+            TableFunc::Wcc => "wcc",
+            TableFunc::Sssp => "sssp",
+            TableFunc::Louvain => "louvain",
+        }
+    }
+
+    /// The YIELD column after the leading `node`, with its type. The
+    /// distance column is an integer that comes back null for nodes
+    /// the source does not reach.
+    fn value_column(self) -> (&'static str, Type) {
+        match self {
+            TableFunc::Pagerank => ("rank", Type::Float),
+            TableFunc::Wcc => ("component", Type::Int),
+            TableFunc::Sssp => ("distance", Type::Int),
+            TableFunc::Louvain => ("community", Type::Int),
+        }
+    }
 }
 
 /// Builtin functions the binder accepts in v0.
@@ -373,7 +430,13 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         path_shapes: BTreeMap::new(),
     };
     let mut clauses = Vec::new();
-    for clause in &query.clauses {
+    for (i, clause) in query.clauses.iter().enumerate() {
+        if i > 0 && matches!(clause, Clause::Call { .. }) {
+            return Err(invalid(
+                "CALL must be the first clause, table functions run once over the whole graph"
+                    .into(),
+            ));
+        }
         clauses.push(binder.bind_clause(clause)?);
     }
     Ok(BoundQuery {
@@ -480,9 +543,103 @@ impl Binder<'_> {
                 let slot = self.declare(alias, element)?;
                 Ok(BoundClause::Unwind { expr: bound, slot })
             }
+            Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
             Clause::With { projection, filter } => self.bind_projection(projection, false, filter),
             Clause::Return { projection } => self.bind_projection(projection, true, &None),
         }
+    }
+
+    fn bind_table_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        yields: &[(String, Option<String>)],
+    ) -> Result<BoundClause> {
+        let func = TableFunc::resolve(name).ok_or_else(|| {
+            invalid(format!(
+                "unknown table function '{name}', the v0 functions are pagerank, wcc, sssp, louvain"
+            ))
+        })?;
+        // The rel table must resolve at bind time, so the first
+        // argument is a string literal, not an expression.
+        let Some(Expr::Literal(Literal::Str(rel_name))) = args.first() else {
+            return Err(invalid(format!(
+                "{}'s first argument must be a string naming a rel table",
+                func.name()
+            )));
+        };
+        let rel = self
+            .schema
+            .rel_by_name(rel_name)
+            .ok_or_else(|| invalid(format!("unknown rel table '{rel_name}'")))?;
+        if rel.from != rel.to {
+            return Err(invalid(format!(
+                "{} needs a rel table over one node table, '{}' connects two",
+                func.name(),
+                rel.name
+            )));
+        }
+        let (rel_id, table) = (rel.id, rel.from);
+        let mut bound_args = Vec::new();
+        for arg in &args[1..] {
+            let mut ctx = ExprCtx::new(false);
+            let (expr, ty) = self.bind_expr(arg, &mut ctx)?;
+            bound_args.push((expr, ty));
+        }
+        match func {
+            TableFunc::Sssp => {
+                if bound_args.len() != 1 {
+                    return Err(invalid(
+                        "sssp takes the rel table and a source node id".into(),
+                    ));
+                }
+                if !matches!(bound_args[0].1, Type::Int | Type::Any) {
+                    return Err(invalid(format!(
+                        "sssp's source must be a node id, got {}",
+                        bound_args[0].1
+                    )));
+                }
+            }
+            _ => {
+                if !bound_args.is_empty() {
+                    return Err(invalid(format!("{} takes only the rel table", func.name())));
+                }
+            }
+        }
+        let (value_name, value_ty) = func.value_column();
+        let expected = ["node", value_name];
+        if yields.len() != expected.len()
+            || yields
+                .iter()
+                .zip(expected)
+                .any(|((col, _), want)| col != want)
+        {
+            return Err(invalid(format!(
+                "{} yields the columns node, {value_name}",
+                func.name()
+            )));
+        }
+        let mut slots = Vec::new();
+        for (column, alias) in yields {
+            let visible = alias.as_deref().unwrap_or(column);
+            let ty = if column == "node" {
+                Type::Node
+            } else {
+                value_ty.clone()
+            };
+            let slot = self.declare(visible, ty)?;
+            if column == "node" {
+                self.variables[slot].node_tables = vec![table];
+            }
+            slots.push(slot);
+        }
+        Ok(BoundClause::Call {
+            func,
+            rel: rel_id,
+            table,
+            args: bound_args.into_iter().map(|(expr, _)| expr).collect(),
+            slots,
+        })
     }
 
     // Projections.

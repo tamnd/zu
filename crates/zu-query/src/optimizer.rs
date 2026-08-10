@@ -181,6 +181,32 @@ fn mark_asp_walk(
                 est * 10.0,
             )
         }
+        LogicalPlan::TableFunction {
+            input,
+            func,
+            rel,
+            table,
+            args,
+            slots,
+        } => {
+            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            // One row per node of the rel's domain, exactly.
+            let rows = schema
+                .node_by_id(table)
+                .map(|n| n.node_count as f64)
+                .unwrap_or(1.0);
+            (
+                LogicalPlan::TableFunction {
+                    input: Box::new(input),
+                    func,
+                    rel,
+                    table,
+                    args,
+                    slots,
+                },
+                (est * rows).max(1.0),
+            )
+        }
         LogicalPlan::Project { input, items } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists);
             (
@@ -303,6 +329,21 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             input: Box::new(rewrite(*input, query, schema)?),
             expr,
             slot,
+        }),
+        LogicalPlan::TableFunction {
+            input,
+            func,
+            rel,
+            table,
+            args,
+            slots,
+        } => Ok(LogicalPlan::TableFunction {
+            input: Box::new(rewrite(*input, query, schema)?),
+            func,
+            rel,
+            table,
+            args,
+            slots,
         }),
         LogicalPlan::Project { input, items } => Ok(LogicalPlan::Project {
             input: Box::new(rewrite(*input, query, schema)?),
@@ -899,6 +940,10 @@ fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
             out.insert(*slot);
             bound_slots(input, out);
         }
+        LogicalPlan::TableFunction { input, slots, .. } => {
+            out.extend(slots.iter().copied());
+            bound_slots(input, out);
+        }
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
@@ -1407,6 +1452,7 @@ mod tests {
                 LogicalPlan::ScanNodes { input, .. }
                 | LogicalPlan::Filter { input, .. }
                 | LogicalPlan::Unwind { input, .. }
+                | LogicalPlan::TableFunction { input, .. }
                 | LogicalPlan::Project { input, .. }
                 | LogicalPlan::Aggregate { input, .. }
                 | LogicalPlan::Distinct { input }

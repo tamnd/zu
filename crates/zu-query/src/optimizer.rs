@@ -28,7 +28,7 @@ use zu_common::Result;
 
 use crate::ast::{BinaryOp, RelDirection};
 use crate::binder::{BoundExpr, BoundQuery, Schema};
-use crate::plan::LogicalPlan;
+use crate::plan::{LogicalPlan, VarLength};
 
 /// Components larger than this keep their written join order.
 const MAX_DP_RELS: usize = 12;
@@ -303,7 +303,7 @@ struct ExpandOp {
     from: usize,
     to: usize,
     direction: RelDirection,
-    range: Option<(Option<u64>, Option<u64>)>,
+    range: Option<VarLength>,
     into: bool,
 }
 
@@ -869,7 +869,7 @@ fn degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f
             RelDirection::Undirected => edges / from_cnt + edges / to_cnt,
         };
     }
-    let hops = e.range.map_or(1, |(min, _)| min.unwrap_or(1).clamp(1, 8)) as i32;
+    let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8)) as i32;
     deg.max(1e-6).powi(hops)
 }
 

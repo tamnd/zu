@@ -26,7 +26,10 @@ sort_item       = expression , [ "ASC" | "ASCENDING" | "DESC" | "DESCENDING" ] ;
 (* Patterns. *)
 
 pattern         = path , { "," , path } ;
-path            = [ name , "=" ] , node , { relationship , node } ;
+path            = [ name , "=" ] , [ selector ] , [ path_mode ] ,
+                  node , { relationship , node } ;
+selector        = ( "ANY" | "ALL" ) , "SHORTEST" ;
+path_mode       = "WALK" | "TRAIL" | "ACYCLIC" ;
 node            = "(" , [ name ] , { ":" , name } , [ property_map ] , ")" ;
 
 relationship    = "<" , "-" , [ rel_detail ] , "-"

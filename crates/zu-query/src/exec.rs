@@ -171,6 +171,25 @@ pub trait Graph {
     /// galloping intersection and every binary probe over a list
     /// depend on it.
     fn neighbors(&mut self, rel: u32, node: u64, reversed: bool, out: &mut Vec<u64>) -> Result<()>;
+    /// Hands `node`'s neighbor list to `f` without copying it out of
+    /// the engine. The default buffers through [`Graph::neighbors`];
+    /// engines whose readers keep decoded lists resident override it
+    /// to lend the slice directly. The galloping intersection's seed
+    /// side reads a fresh list per configuration and touches only the
+    /// elements the gallop lands on, so copying whole lists there is
+    /// the dominant memory traffic on hub-heavy graphs.
+    fn with_neighbors(
+        &mut self,
+        rel: u32,
+        node: u64,
+        reversed: bool,
+        f: &mut dyn FnMut(&[u64]),
+    ) -> Result<()> {
+        let mut out = Vec::new();
+        self.neighbors(rel, node, reversed, &mut out)?;
+        f(&out);
+        Ok(())
+    }
     /// Edge probe in storage orientation: does `src` point at `dst`?
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool>;
     /// Neighbor count without the list. The default reads the list and
@@ -477,11 +496,13 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             probe_dir,
             probe_step,
             chunk,
+            count_only,
             ..
         } => {
             let close = var(stage.chunk_slots[*chunk][0]);
             format!(
-                "MultiwayIntersect {} & {}",
+                "MultiwayIntersect{} {} & {}",
+                if *count_only { " (count)" } else { "" },
                 rel_text(
                     var(*seed),
                     close,
@@ -745,6 +766,11 @@ enum OpDesc {
         /// False when nothing reads either rel slot, the anonymous-rel
         /// case: only the closing-node column materializes.
         emit_rels: bool,
+        /// True when nothing reads any of the three slots under an
+        /// aggregating sink: the chunk carries pure multiplicity, so
+        /// the leapfrog counts survivors instead of materializing
+        /// them. A triangle count pushes no values at all.
+        count_only: bool,
     },
     /// `compact` names the one unflat chunk this filter may shrink in
     /// place; with `None` every referenced chunk is flat and the
@@ -1185,6 +1211,7 @@ fn compile_match_op(
                     probe_step,
                     chunk,
                     emit_rels: true,
+                    count_only: false,
                 });
                 b.produced(chunk);
                 return Ok(true);
@@ -1439,14 +1466,24 @@ fn rewrite_count_expand(
         }
         // The intersect carries two rel slots; both must be dead for
         // the columns to stay empty, and the usual case is exactly
-        // that, two anonymous rels closing a wedge.
+        // that, two anonymous rels closing a wedge. When the closing
+        // node is dead too and the sink aggregates, the multiplicity
+        // product is the only consumer left, so the intersect just
+        // counts. A materializing sink still needs the values, so the
+        // aggregate guard stays.
         if let OpDesc::MultiwayIntersect {
-            chunk, emit_rels, ..
+            chunk,
+            emit_rels,
+            count_only,
+            ..
         } = desc
             && !full_refs.contains(&b.chunk_slots[*chunk][1])
             && !full_refs.contains(&b.chunk_slots[*chunk][2])
         {
             *emit_rels = false;
+            if aggregate && !full_refs.contains(&b.chunk_slots[*chunk][0]) {
+                *count_only = true;
+            }
         }
     }
     // The AspJoin retain fusion, the semijoin half of the ASP triple:
@@ -1908,13 +1945,15 @@ struct StageCtx<'a> {
     /// optional group's rearm never throws the accumulate away, and
     /// kept across morsels so a worker accumulates once per query.
     edge_sets: BTreeMap<usize, Vec<EdgeSet>>,
-    /// Each intersect's cached probe-side adjacency, keyed by operator
-    /// index: the probe node comes from an outer loop, so consecutive
-    /// configurations reread the same sorted list, and caching it
-    /// makes the probe side one storage read per node instead of one
-    /// per pair. Outside `states` for the same rearm reason as the
+    /// Each intersect's cached stable-side adjacency, keyed by
+    /// operator index: one of the two intersected nodes comes from an
+    /// outer loop, so consecutive configurations reread the same
+    /// sorted list, and caching it makes that side one storage read
+    /// per node instead of one per pair. Which side is stable depends
+    /// on how the DP oriented the close, so the cache tracks it at
+    /// run time. Outside `states` for the same rearm reason as the
     /// edge sets.
-    isect: BTreeMap<usize, ((u32, u64), Vec<u64>)>,
+    isect: BTreeMap<usize, IsectCache>,
     /// The row range a parallel worker's driving scan is bounded to,
     /// `None` on sequential runs. Only the scan at operator index 1
     /// consults it; any later scan in the pipeline still iterates its
@@ -2296,6 +2335,35 @@ fn gallop(list: &[u64], target: u64, from: usize) -> usize {
     let lo = from + (span >> 1);
     let hi = (from + span).min(list.len());
     lo + list[lo..hi].partition_point(|&v| v < target)
+}
+
+/// One intersect's adjacency cache. The intersection reads two lists
+/// per configuration; one belongs to an outer-loop node that repeats
+/// across consecutive pulls and the other changes every pull. The DP
+/// decides which role lands on which side when it orients the close,
+/// so the cache watches both nodes and keeps the list of whichever
+/// side held still, while the fresh side's list is borrowed straight
+/// from the engine per pull, never copied. Guessing the wrong side
+/// costs one redundant list read per outer step, not one per pair.
+struct IsectCache {
+    prev_seed: (u32, u64),
+    prev_probe: (u32, u64),
+    /// Whether `list` holds the probe side's adjacency.
+    probe_side: bool,
+    key: (u32, u64),
+    list: Vec<u64>,
+}
+
+impl Default for IsectCache {
+    fn default() -> Self {
+        IsectCache {
+            prev_seed: (u32::MAX, u64::MAX),
+            prev_probe: (u32::MAX, u64::MAX),
+            probe_side: true,
+            key: (u32::MAX, u64::MAX),
+            list: Vec::new(),
+        }
+    }
 }
 
 /// Leapfrog intersection of two sorted lists, galloping both sides.
@@ -2892,6 +2960,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             probe_step,
             chunk,
             emit_rels,
+            count_only,
         } => loop {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
@@ -2915,22 +2984,16 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let mut far = Vec::new();
             let mut seed_rels = Vec::new();
             let mut probe_rels = Vec::new();
+            let mut survivors = 0usize;
             {
-                let StageCtx {
-                    graph,
-                    scratch,
-                    isect,
-                    ..
-                } = ctx;
-                graph.neighbors(seed_step.id, so, srev, scratch)?;
-                let (key, list) = isect
-                    .entry(i)
-                    .or_insert_with(|| ((u32::MAX, u64::MAX), Vec::new()));
-                if *key != (pt, po) {
-                    graph.neighbors(probe_step.id, po, prev, list)?;
-                    *key = (pt, po);
-                }
-                leapfrog(scratch, list, |v| {
+                let StageCtx { graph, isect, .. } = ctx;
+                let cache = isect.entry(i).or_default();
+                let (seed_key, probe_key) = ((st, so), (pt, po));
+                let stable_probe = probe_key == cache.prev_probe;
+                let stable_seed = seed_key == cache.prev_seed;
+                cache.prev_seed = seed_key;
+                cache.prev_probe = probe_key;
+                let mut emit_hit = |v: u64| {
                     far.push(Value::Node {
                         table: sfar,
                         offset: v,
@@ -2949,13 +3012,55 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                             dst: pd,
                         });
                     }
-                });
+                };
+                // The stable side's list is cached across pulls; the
+                // fresh side's is borrowed straight from the engine's
+                // decoded cache, never copied. In count-only mode the
+                // hits are pure multiplicity: nothing downstream reads
+                // the columns, so the chunk ships its size and nothing
+                // else, which on a billion-triangle count is the
+                // difference between counting and materializing.
+                if stable_probe || !stable_seed {
+                    if !(cache.probe_side && cache.key == probe_key) {
+                        graph.neighbors(probe_step.id, po, prev, &mut cache.list)?;
+                        cache.probe_side = true;
+                        cache.key = probe_key;
+                    }
+                    let list: &[u64] = &cache.list;
+                    if *count_only {
+                        graph.with_neighbors(seed_step.id, so, srev, &mut |seed_list| {
+                            leapfrog(seed_list, list, |_| survivors += 1);
+                        })?;
+                    } else {
+                        graph.with_neighbors(seed_step.id, so, srev, &mut |seed_list| {
+                            leapfrog(seed_list, list, &mut emit_hit);
+                        })?;
+                        survivors = far.len();
+                    }
+                } else {
+                    if !(!cache.probe_side && cache.key == seed_key) {
+                        graph.neighbors(seed_step.id, so, srev, &mut cache.list)?;
+                        cache.probe_side = false;
+                        cache.key = seed_key;
+                    }
+                    let list: &[u64] = &cache.list;
+                    if *count_only {
+                        graph.with_neighbors(probe_step.id, po, prev, &mut |probe_list| {
+                            leapfrog(list, probe_list, |_| survivors += 1);
+                        })?;
+                    } else {
+                        graph.with_neighbors(probe_step.id, po, prev, &mut |probe_list| {
+                            leapfrog(list, probe_list, &mut emit_hit);
+                        })?;
+                        survivors = far.len();
+                    }
+                }
             }
-            if far.is_empty() {
+            if survivors == 0 {
                 continue;
             }
             let c = &mut ctx.chunks[*chunk];
-            c.size = far.len();
+            c.size = survivors;
             c.cols[0] = far;
             c.cols[1] = seed_rels;
             c.cols[2] = probe_rels;
@@ -3863,10 +3968,22 @@ fn plan_morsels(
     let [OpDesc::Source, OpDesc::Scan { tables, .. }, ..] = &stage.descs[..] else {
         return None;
     };
-    let step = if morsel_rows == 0 {
-        VECTOR_SIZE as u64
-    } else {
+    let step = if morsel_rows != 0 {
         morsel_rows as u64
+    } else if stage
+        .descs
+        .iter()
+        .any(|d| matches!(d, OpDesc::MultiwayIntersect { .. } | OpDesc::AspJoin { .. }))
+    {
+        // A cyclic join does degree-squared work per driving row, and
+        // real graphs concentrate that work in a few hub ranges, so a
+        // vector-sized morsel there can carry seconds of intersection
+        // while its siblings carry microseconds. Finer slices keep the
+        // stealing pool busy to the end; workers reuse their context
+        // across morsels, so the extra scheduling is a few empty Vecs.
+        (VECTOR_SIZE / 8) as u64
+    } else {
+        VECTOR_SIZE as u64
     };
     let mut morsels = Vec::new();
     for &table in tables {
@@ -4754,15 +4871,21 @@ mod tests {
 
     #[test]
     fn multiway_intersect_counts_triangles() {
+        // Nothing reads the closing node or either rel under count(*),
+        // so the intersect must run count-only: pure multiplicity, no
+        // materialized columns.
         let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
                       RETURN count(*) AS triangles";
         let (r, p) = profiled_opts(source, &[], wcoj());
         assert_eq!(int_rows(&r), [[1]]);
         let names = op_names(&p);
         assert!(
-            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            names
+                .iter()
+                .any(|n| n.starts_with("MultiwayIntersect (count)")),
             "got: {names:?}"
         );
+        assert_eq!(run_opts(source, &[], no_wcoj()), r);
     }
 
     #[test]

@@ -143,13 +143,41 @@ impl Graph for Zu1Graph<'_> {
         // The cached-group path, not the point path: scans and expands
         // revisit the same groups constantly, and B4 lives on the second
         // hop being a slice copy instead of a chunk decode per row. The
-        // reader holds one decoded group per direction of use; a smarter
-        // policy is the buffer manager's job (docs/09, M3).
+        // reader keeps decoded groups resident within its byte budget;
+        // a smarter shared policy is the buffer manager's job (docs/09,
+        // M3).
         let nbrs = readers
             .get_mut(&rel)
             .expect("just loaded")
             .neighbors_dir(db, node, dir)?;
         out.extend_from_slice(nbrs);
+        Ok(())
+    }
+
+    fn with_neighbors(
+        &mut self,
+        rel: u32,
+        node: u64,
+        reversed: bool,
+        f: &mut dyn FnMut(&[u64]),
+    ) -> Result<()> {
+        self.ensure_reader(rel)?;
+        let dir = if reversed {
+            Direction::Bwd
+        } else {
+            Direction::Fwd
+        };
+        let Self { db, readers, .. } = self;
+        // Lends the resident slice instead of copying it out. The
+        // intersection's seed side is the caller that matters: one
+        // fresh list per configuration, most of it skipped by the
+        // gallop, so the copy was the query's dominant memory traffic
+        // on hub-heavy graphs.
+        let nbrs = readers
+            .get_mut(&rel)
+            .expect("just loaded")
+            .neighbors_dir(db, node, dir)?;
+        f(nbrs);
         Ok(())
     }
 

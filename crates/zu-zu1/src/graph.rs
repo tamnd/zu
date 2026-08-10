@@ -544,20 +544,58 @@ pub fn bulk_load_keyed(
     Ok(directory)
 }
 
-/// Read access to a bulk-loaded graph, caching the most recently decoded
-/// group per direction so sequential scans decode each group once. The
-/// two directions cache independently because a plan often walks both
-/// on the same rel row by row, an expand backward feeding a count
-/// forward, and a shared slot would decode a full group per row.
+/// Read access to a bulk-loaded graph, keeping decoded groups resident
+/// per direction within a byte budget so sequential scans decode each
+/// group once and random-order revisits stay in memory. The two
+/// directions cache independently because a plan often walks both on
+/// the same rel row by row, an expand backward feeding a count forward,
+/// and a shared slot would decode a full group per row.
 #[derive(Debug)]
 pub struct GraphReader {
     directory: Directory,
-    cached_groups: [Option<CachedGroup>; 2],
+    caches: [DirCache; 2],
+    cache_budget: usize,
     key_reader: Option<KeyReader>,
 }
 
 /// One decoded CSR group: its index, offsets, and neighbor values.
 type CachedGroup = (usize, Vec<u64>, Vec<u64>);
+
+/// Decoded groups for one direction. Groups pin in arrival order until
+/// the byte budget is spent; after that, one unpinned slot serves the
+/// overflow, so a sweep wider than the budget behaves like the old
+/// single-group cache instead of churning the resident set. Multiway
+/// intersections visit seed groups in effectively random order, and a
+/// one-slot cache turns each of their probes into a full group decode;
+/// a shared pool with real eviction is the buffer manager's job
+/// (docs/09, M3).
+#[derive(Debug, Default)]
+struct DirCache {
+    pinned: Vec<CachedGroup>,
+    bytes: usize,
+    spill: Option<CachedGroup>,
+}
+
+impl DirCache {
+    fn get(&self, g: usize) -> Option<&CachedGroup> {
+        self.pinned
+            .iter()
+            .find(|(i, _, _)| *i == g)
+            .or(self.spill.as_ref().filter(|(i, _, _)| *i == g))
+    }
+}
+
+/// Default decoded-group budget per direction. `ZU_CACHE_MB` overrides
+/// it at reader construction, which reaches every reader a query forks,
+/// morsel workers included.
+const CACHE_BUDGET_BYTES: usize = 256 << 20;
+
+fn cache_budget_from_env() -> usize {
+    match std::env::var("ZU_CACHE_MB") {
+        Ok(v) => v.parse::<usize>().map_or(CACHE_BUDGET_BYTES, |mb| mb << 20),
+        Err(_) => CACHE_BUDGET_BYTES,
+    }
+}
 
 impl GraphReader {
     /// Opens the only rel table in the file, the common single-graph
@@ -596,9 +634,16 @@ impl GraphReader {
         let bytes = meta::read_chain(db, root)?;
         Ok(Self {
             directory: Directory::decode(&bytes)?,
-            cached_groups: [None, None],
+            caches: [DirCache::default(), DirCache::default()],
+            cache_budget: cache_budget_from_env(),
             key_reader: None,
         })
+    }
+
+    /// Caps the decoded-group residency per direction. Groups already
+    /// pinned stay pinned; the budget governs decodes from here on.
+    pub fn set_cache_budget(&mut self, bytes: usize) {
+        self.cache_budget = bytes;
     }
 
     /// Resolves an original id through the primary-key index, or errors
@@ -635,19 +680,25 @@ impl GraphReader {
     }
 
     /// Returns `node`'s sorted list in `dir`, decoding the node's group
-    /// on a cache miss.
+    /// on a cache miss and keeping it resident within the byte budget.
     pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
         let (g, row) = self.locate(node)?;
-        let slot = &mut self.cached_groups[dir as usize];
-        if slot.as_ref().map(|(i, _, _)| *i) != Some(g) {
+        if self.caches[dir as usize].get(g).is_none() {
             let meta = self.directory.groups[g].dir(dir);
             let mut offsets = Vec::with_capacity(meta.offsets.value_count as usize);
             let mut nbrs = Vec::with_capacity(meta.neighbors.value_count as usize);
             read_segment(db, &meta.offsets, &mut offsets)?;
             read_segment(db, &meta.neighbors, &mut nbrs)?;
-            *slot = Some((g, offsets, nbrs));
+            let cache = &mut self.caches[dir as usize];
+            let cost = (offsets.len() + nbrs.len()) * size_of::<u64>();
+            if cache.bytes + cost <= self.cache_budget {
+                cache.bytes += cost;
+                cache.pinned.push((g, offsets, nbrs));
+            } else {
+                cache.spill = Some((g, offsets, nbrs));
+            }
         }
-        let (_, offsets, nbrs) = self.cached_groups[dir as usize].as_ref().unwrap();
+        let (_, offsets, nbrs) = self.caches[dir as usize].get(g).expect("just cached");
         let lo = offsets[row] as usize;
         let hi = offsets[row + 1] as usize;
         Ok(&nbrs[lo..hi])
@@ -906,6 +957,50 @@ mod tests {
             reader.neighbors_dir(&mut db, 2, Direction::Bwd).unwrap(),
             &[node_count - 1]
         );
+    }
+
+    #[test]
+    fn zero_budget_reads_through_spill_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let rows = GROUP_ROWS;
+        let node_count = u64::from(rows) * 2 + 10;
+        let mut edges = vec![
+            (rows - 1, 0),
+            (rows - 1, rows),
+            (rows, rows - 1),
+            (rows, rows + 1),
+            (2 * rows + 9, 2),
+        ];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        reader.set_cache_budget(0);
+        // Sweep groups 0, 1, 2 twice in both directions. With a zero
+        // budget nothing pins, so every group change evicts the spill
+        // slot and re-decodes; the lists must come back identical.
+        for _ in 0..2 {
+            assert_eq!(
+                reader.neighbors(&mut db, u64::from(rows) - 1).unwrap(),
+                &[0, u64::from(rows)]
+            );
+            assert_eq!(
+                reader.neighbors(&mut db, u64::from(rows)).unwrap(),
+                &[u64::from(rows) - 1, u64::from(rows) + 1]
+            );
+            assert_eq!(reader.neighbors(&mut db, node_count - 1).unwrap(), &[2]);
+            assert_eq!(
+                reader.neighbors_dir(&mut db, 0, Direction::Bwd).unwrap(),
+                &[u64::from(rows) - 1]
+            );
+            assert_eq!(
+                reader.neighbors_dir(&mut db, 2, Direction::Bwd).unwrap(),
+                &[node_count - 1]
+            );
+        }
     }
 
     #[test]

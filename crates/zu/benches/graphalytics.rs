@@ -22,8 +22,13 @@
 //! file, so the query surface is exercised on a graph three orders
 //! larger than the exec tests.
 //!
+//! With ZU_B5=1 the bench also runs B5 (docs/11): the worst-case
+//! optimal triangle count over Graph500 scale 22, oriented by degree
+//! and gated against a two-pointer reference computed here.
+//!
 //! Get the data: curl -sO https://datasets.ldbcouncil.org/graphalytics/kgs.tar.zst
-//! && tar --zstd -xf kgs.tar.zst under ZU_DATA.
+//! && tar --zstd -xf kgs.tar.zst under ZU_DATA; same for
+//! graph500-22.tar.zst when running B5.
 //!
 //! Run: ZU_GATE=1 ZU_DATA=~/data/zu cargo bench -p zu --bench graphalytics
 
@@ -80,6 +85,126 @@ fn read_reference<T>(path: &str, parse: impl Fn(&str) -> T) -> HashMap<u64, T> {
         map.insert(v.parse::<u64>().expect("vertex id"), parse(val.trim()));
     }
     map
+}
+
+/// B5 (docs/11): the unseeded triangle count on Graph500-22 through
+/// the query engine's WCOJ close, the gate the Umbra paper's numbers
+/// class-bound. The bench stores the degree-oriented DAG, each
+/// undirected edge pointing from its lower (degree, id) endpoint to
+/// the higher, the standard worst-case optimal formulation where the
+/// variable order supplies the orientation, so every triangle appears
+/// exactly once and the intersection work is bounded by the oriented
+/// degrees, max 1035 on this graph against a raw max degree of
+/// 162768. The count asserts against a two-pointer intersection
+/// reference computed here from the oriented adjacency, an
+/// implementation that shares nothing with the executor's galloping
+/// leapfrog. Runs when ZU_B5=1 because the 64 M edge parse and load
+/// take minutes; a missing dataset under ZU_B5=1 fails the gate
+/// instead of skipping it.
+fn run_b5(data: &str, gate: bool) -> Option<(f64, i64)> {
+    if !std::env::var("ZU_B5").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    if !std::path::Path::new(&format!("{data}/graph500-22.v")).exists() {
+        println!("graph500-22: files not found under ZU_DATA with ZU_B5=1, see the header comment");
+        std::process::exit(i32::from(gate));
+    }
+    if std::env::var_os("ZU_CACHE_MB").is_none() {
+        // The intersection's seed side visits groups in effectively
+        // random order, so the decoded forward CSR, about 530 MB on
+        // this graph, must stay resident per reader or every probe
+        // pays a full group decode. Readers pick the budget up at
+        // construction, which has not happened yet.
+        // SAFETY: the bench is single threaded at this point.
+        unsafe { std::env::set_var("ZU_CACHE_MB", "768") };
+    }
+    let started = Instant::now();
+    let keys =
+        read_key_list(std::path::Path::new(&format!("{data}/graph500-22.v"))).expect("vertices");
+    let edges =
+        read_key_edge_list(std::path::Path::new(&format!("{data}/graph500-22.e"))).expect("edges");
+    let (dense, by_row) = densify_keyed(&keys, &edges).expect("densify");
+    let n = by_row.len();
+    let mut deg = vec![0u32; n];
+    for &(s, d) in &dense {
+        deg[s as usize] += 1;
+        deg[d as usize] += 1;
+    }
+    let mut oriented: Vec<(u32, u32)> = dense
+        .iter()
+        .map(|&(s, d)| {
+            if (deg[s as usize], s) < (deg[d as usize], d) {
+                (s, d)
+            } else {
+                (d, s)
+            }
+        })
+        .collect();
+    oriented.sort_unstable();
+    oriented.dedup();
+    let parsed = started.elapsed();
+    let load_started = Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("graph500-22.zu1");
+    let mut db = Zu1File::create(&path).expect("create");
+    bulk_load_keyed(&mut db, "v", "e", n as u64, &oriented, Some(&by_row)).expect("bulk load");
+    // Stats feed the optimizer the same way any COPY-then-query
+    // session would; the plan must earn its AspJoin, not be handed it.
+    zu::zu1::colors::analyze(&mut db).expect("analyze");
+    println!(
+        "graph500-22: {} vertices, {} oriented edges, parse {:.2}s, load {:.2}s",
+        n,
+        oriented.len(),
+        parsed.as_secs_f64(),
+        load_started.elapsed().as_secs_f64()
+    );
+
+    let t = Instant::now();
+    let mut adj = vec![Vec::new(); n];
+    for &(s, d) in &oriented {
+        adj[s as usize].push(d);
+    }
+    let mut expected = 0i64;
+    for &(a, b) in &oriented {
+        let (mut x, mut y) = (adj[a as usize].as_slice(), adj[b as usize].as_slice());
+        while let (Some(&u), Some(&v)) = (x.first(), y.first()) {
+            match u.cmp(&v) {
+                std::cmp::Ordering::Less => x = &x[1..],
+                std::cmp::Ordering::Greater => y = &y[1..],
+                std::cmp::Ordering::Equal => {
+                    expected += 1;
+                    x = &x[1..];
+                    y = &y[1..];
+                }
+            }
+        }
+    }
+    println!(
+        "graph500-22 reference: {expected} triangles in {:.2}s two-pointer",
+        t.elapsed().as_secs_f64()
+    );
+
+    let source = "MATCH (a:v)-[:e]->(b)-[:e]->(c), (a)-[:e]->(c) RETURN count(*) AS triangles";
+    let runs = 3usize;
+    zu::query::run(source, &mut db, &[]).expect("warmup run");
+    let mut lat = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t = Instant::now();
+        let r = zu::query::run(source, &mut db, &[]).expect("triangle count");
+        lat.push(t.elapsed());
+        assert_eq!(
+            r.rows,
+            [[Value::Int(expected)]],
+            "triangle count disagrees with the two-pointer reference"
+        );
+    }
+    lat.sort_unstable();
+    let p50 = lat[runs / 2].as_secs_f64();
+    println!(
+        "graph500-22 triangle count: {expected} triangles, p50 {p50:.3} s, max {:.3} s over {runs} runs",
+        lat[runs - 1].as_secs_f64()
+    );
+    Some((p50, expected))
 }
 
 fn main() {
@@ -224,6 +349,10 @@ fn main() {
         t.elapsed().as_secs_f64()
     );
 
+    drop(reader);
+    drop(db);
+    let b5 = run_b5(&data, gate);
+
     let mut failed = false;
     for (name, secs, key) in [
         ("pagerank", pagerank_s, "graphalytics_pagerank_s"),
@@ -237,6 +366,13 @@ fn main() {
             println!("GATE FAIL {name}: {secs:.3} s > ceiling {ceiling}");
             failed = true;
         }
+    }
+    if let Some((p50, _)) = b5
+        && let Some(ceiling) = budget("graph500_triangle_s")
+        && p50 > ceiling
+    {
+        println!("GATE FAIL B5 triangle: p50 {p50:.3} s > ceiling {ceiling}");
+        failed = true;
     }
     if gate && failed {
         std::process::exit(1);

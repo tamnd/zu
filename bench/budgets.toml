@@ -216,6 +216,23 @@ graphalytics_wcc_s = 2.0
 graphalytics_bfs_s = 8.0
 graphalytics_louvain_s = 120.0
 
+# B5, the unseeded triangle count on Graph500-22 (docs/11): 2.4 M
+# vertices, 64 M undirected edges oriented by (degree, id) into a DAG
+# of 42.5 M edges, count 2112513173 asserted against a two-pointer
+# reference every run. The plan is the WCOJ shape from docs/07, a
+# MultiwayIntersect closing each 2-path, and the run leans on three
+# executor mechanics: the reader pins decoded groups per direction
+# within a byte budget so the DAG's 19 forward groups stay resident,
+# the intersect caches whichever side's adjacency repeats across the
+# fused pull and borrows the other side zero-copy from the reader, and
+# cyclic-join stages take fine morsels because hub rows concentrate
+# degree-squared work. Measured p50 on the quiet local M series 59.3 s
+# against 99.0 s for the single-core two-pointer reference; desktop
+# contention has pushed identical runs to 155 s, so the ceiling sits
+# above the noisy tail and gates on the fleet. Gated where the 1.1 GB
+# dataset is staged (ZU_B5=1). Lower this ceiling, never raise it.
+graph500_triangle_s = 120.0
+
 # B7 exit budget straight from docs/12: a 10 GB file opens in under
 # 10 ms, p99 over 1000 warm opens. Open reads 12 KiB of headers plus the
 # free list chain and pages everything else lazily, so this catches any

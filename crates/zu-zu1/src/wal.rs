@@ -18,11 +18,13 @@
 //! the sink only once their `TxnCommit` frame has been read, so a tear
 //! after the last commit loses nothing that was promised durable.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use zu_common::{Epoch, Result, ZuError};
+
+use crate::vfs::{RealFile, VfsFile};
 
 /// Frame prefix: `len: u32 | crc32c: u32`.
 const PREFIX: u64 = 8;
@@ -340,7 +342,7 @@ impl<'a> Reader<'a> {
 /// it. Commit durability is one `fdatasync` per commit; the 1 ms
 /// group-commit window from docs/08 arrives with the writer queue.
 pub struct Wal {
-    file: File,
+    file: Box<dyn VfsFile>,
     path: PathBuf,
     len: u64,
 }
@@ -351,14 +353,14 @@ impl Wal {
     /// frame. Crashing mid-append leaves a frame that fails its length
     /// or crc check; everything before it is kept.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        Self::open_on(Box::new(RealFile::open_or_create(path)?), path)
+    }
+
+    /// [`Self::open`] on an explicit file handle; the crash harness
+    /// passes a recording one.
+    pub fn open_on(mut file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
+        let mut bytes = vec![0u8; file.len()? as usize];
+        file.read_exact_at(&mut bytes, 0)?;
         let mut end = 0u64;
         while let Some((body, next)) = next_frame(&bytes, end) {
             let _ = body;
@@ -396,8 +398,7 @@ impl Wal {
         frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
         frame.extend_from_slice(&body);
-        self.file.seek(SeekFrom::Start(self.len))?;
-        self.file.write_all(&frame)?;
+        self.file.write_all_at(&frame, self.len)?;
         self.len += frame.len() as u64;
         Ok(())
     }

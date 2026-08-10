@@ -9,7 +9,7 @@ use std::sync::Arc;
 use zu_common::{Epoch, NodeGroupId, NodeOffset, Result, TableId};
 
 /// Traversal direction for adjacency access.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Direction {
     Fwd,
     Bwd,

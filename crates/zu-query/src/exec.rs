@@ -34,11 +34,14 @@
 //! contract that the `id` property of a node equals its offset; keyed
 //! tables get their own lookup path when the column catalog lands.
 //!
-//! Variable-length patterns execute as `VarExpand` under GQL's default
-//! DIFFERENT EDGES semantics: a depth-first enumeration of trails, one
-//! output value per trail, with the rel variable bound to the edge
-//! list. That is the correctness-first baseline; the RecursiveBFS
-//! frontier engine with the hybrid morsel policy is milestone 4.
+//! Variable-length patterns execute as `VarExpand`: a depth-first
+//! enumeration of paths, one output value per path, with the rel
+//! variable bound to the edge list. The path mode picks the repeat
+//! rule (WALK none, TRAIL no repeated edge, ACYCLIC no repeated node)
+//! and a SHORTEST selector first runs a breadth-first hop-level pass
+//! from the start so only minimum-hop paths enumerate. That is the
+//! correctness-first baseline; wiring the RecursiveBFS frontier engine
+//! underneath is the rest of milestone 4.
 //!
 //! OPTIONAL MATCH executes as a left-outer group. Every flatten the
 //! group needs on outer chunks sits below an `OptionalBegin` that
@@ -55,7 +58,7 @@ use std::time::Instant;
 
 use zu_common::{Result, ZuError};
 
-use crate::ast::{BinaryOp, Literal, RelDirection, UnaryOp};
+use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, Schema};
 use crate::plan::{LogicalPlan, expr_text};
 
@@ -314,12 +317,24 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             rels,
             min,
             max,
+            mode,
+            selector,
             chunk,
             ..
         } => {
             let max = max.map_or(String::new(), |v| v.to_string());
+            let mode = match mode {
+                PathMode::Walk => " walk",
+                PathMode::Trail => "",
+                PathMode::Acyclic => " acyclic",
+            };
+            let sel = match selector {
+                Some(Selector::AnyShortest) => " any shortest",
+                Some(Selector::AllShortest) => " all shortest",
+                None => "",
+            };
             format!(
-                "VarExpand *{min}..{max} {}",
+                "VarExpand *{min}..{max}{mode}{sel} {}",
                 rel_text(
                     var(*from),
                     var(stage.chunk_slots[*chunk][0]),
@@ -515,18 +530,25 @@ enum OpDesc {
         /// length.
         emit_rels: bool,
     },
-    /// Variable-length expand under GQL's default DIFFERENT EDGES
-    /// semantics: enumerates every trail of `min..=max` hops with no
-    /// repeated edge, one output value per trail. The rel column holds
-    /// the trail as a list of rels. This is the correctness-first DFS
-    /// baseline; the RecursiveBFS frontier engine is milestone 4.
+    /// Variable-length expand: enumerates every path of `min..=max`
+    /// hops under the path mode's repeat rule, one output value per
+    /// path. The rel column holds the path as a list of rels. The
+    /// default TRAIL is GQL's DIFFERENT EDGES semantics. This is the
+    /// correctness-first DFS baseline; the RecursiveBFS frontier
+    /// engine is milestone 4.
     VarExpand {
         from: usize,
         direction: RelDirection,
         rels: Vec<RelStep>,
         min: u64,
         max: Option<u64>,
-        /// Candidate tables of the endpoint variable; trails ending
+        /// WALK allows any repeat, TRAIL forbids a repeated edge,
+        /// ACYCLIC forbids a repeated node including the start.
+        mode: PathMode,
+        /// A SHORTEST selector restricts enumeration to minimum-hop
+        /// paths per reached endpoint via a hop-level prepass.
+        selector: Option<Selector>,
+        /// Candidate tables of the endpoint variable; paths ending
         /// elsewhere are not emitted.
         to_tables: Vec<u32>,
         chunk: usize,
@@ -871,7 +893,7 @@ fn compile_match_op(
                 .map(|&(c, _)| c)
                 .ok_or_else(|| invalid(format!("expand from unbound slot {from}")))?;
             b.ensure_flat(from_chunk);
-            if let Some((min, max)) = range {
+            if let Some(v) = range {
                 if *into {
                     return Err(invalid(
                         "variable-length patterns into a bound endpoint do not execute yet".into(),
@@ -889,8 +911,10 @@ fn compile_match_op(
                     from: *from,
                     direction: *direction,
                     rels,
-                    min: min.unwrap_or(1),
-                    max: *max,
+                    min: v.min.unwrap_or(1),
+                    max: v.max,
+                    mode: v.mode,
+                    selector: v.selector,
                     to_tables,
                     chunk,
                 });
@@ -1602,34 +1626,34 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
     }
 }
 
-/// Depth-first trail enumeration for `VarExpand`: every path of
-/// `min..=max` hops from the start node with no repeated edge, GQL's
-/// default DIFFERENT EDGES semantics. A trail whose endpoint sits in
-/// `to_tables` emits one node value and its edge list. `path` doubles
-/// as the visited-edge set; trails stay short enough that a linear
-/// scan beats a hash set.
-#[allow(clippy::too_many_arguments)]
-fn enumerate_trails(
+/// The static shape of one variable-length expansion, shared by every
+/// recursive call of [`enumerate_paths`]. `levels` is set when a
+/// SHORTEST selector is active: the minimum hop count of every node
+/// reachable from the start, and the DFS then only takes hops that
+/// advance exactly one level, which restricts it to the shortest-path
+/// DAG. Minimum-hop paths never repeat a node (a repeat would shortcut
+/// to a shorter path), so the mode's repeat rule is vacuous under a
+/// selector and is skipped.
+struct VarSpec<'a> {
+    rels: &'a [RelStep],
+    direction: RelDirection,
+    to_tables: &'a [u32],
+    min: u64,
+    max: Option<u64>,
+    mode: PathMode,
+    levels: Option<&'a BTreeMap<(u32, u64), u64>>,
+}
+
+/// Every hop leaving `(table, offset)` across the pattern's rel steps
+/// and direction: the rel value, the far table, and the far offset, in
+/// storage order, which keeps enumeration deterministic.
+fn hop_edges(
     ctx: &mut StageCtx,
     rels: &[RelStep],
     direction: RelDirection,
-    to_tables: &[u32],
-    min: u64,
-    max: Option<u64>,
     table: u32,
     offset: u64,
-    path: &mut Vec<Value>,
-    far: &mut Vec<Value>,
-    trails: &mut Vec<Value>,
-) -> Result<()> {
-    let depth = path.len() as u64;
-    if depth >= min && to_tables.contains(&table) {
-        far.push(Value::Node { table, offset });
-        trails.push(Value::List(path.clone()));
-    }
-    if max.is_some_and(|m| depth >= m) {
-        return Ok(());
-    }
+) -> Result<Vec<(Value, u32, u64)>> {
     let mut hops: Vec<(Value, u32, u64)> = Vec::new();
     let mut nbrs = Vec::new();
     for step in rels {
@@ -1666,27 +1690,108 @@ fn enumerate_trails(
             }
         }
     }
-    for (rel_val, next_table, next_offset) in hops {
-        if path.contains(&rel_val) {
-            continue;
+    Ok(hops)
+}
+
+/// Depth-first path enumeration for `VarExpand`: every path of
+/// `min..=max` hops from the start node under the mode's repeat rule,
+/// WALK unrestricted (the binder guarantees a bound), TRAIL with no
+/// repeated edge, ACYCLIC with no repeated node. A path whose endpoint
+/// sits in `to_tables` emits one node value and its edge list. `path`
+/// doubles as the visited-edge set and `nodes` as the visited-node
+/// set, the start included; paths stay short enough that a linear scan
+/// beats a hash set.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_paths(
+    ctx: &mut StageCtx,
+    spec: &VarSpec,
+    table: u32,
+    offset: u64,
+    path: &mut Vec<Value>,
+    nodes: &mut Vec<(u32, u64)>,
+    far: &mut Vec<Value>,
+    trails: &mut Vec<Value>,
+) -> Result<()> {
+    let depth = path.len() as u64;
+    if depth >= spec.min && spec.to_tables.contains(&table) {
+        far.push(Value::Node { table, offset });
+        trails.push(Value::List(path.clone()));
+    }
+    if spec.max.is_some_and(|m| depth >= m) {
+        return Ok(());
+    }
+    for (rel_val, next_table, next_offset) in
+        hop_edges(ctx, spec.rels, spec.direction, table, offset)?
+    {
+        if let Some(levels) = spec.levels {
+            if levels.get(&(next_table, next_offset)) != Some(&(depth + 1)) {
+                continue;
+            }
+        } else {
+            let repeats = match spec.mode {
+                PathMode::Walk => false,
+                PathMode::Trail => path.contains(&rel_val),
+                PathMode::Acyclic => nodes.contains(&(next_table, next_offset)),
+            };
+            if repeats {
+                continue;
+            }
         }
         path.push(rel_val);
-        enumerate_trails(
-            ctx,
-            rels,
-            direction,
-            to_tables,
-            min,
-            max,
-            next_table,
-            next_offset,
-            path,
-            far,
-            trails,
-        )?;
+        nodes.push((next_table, next_offset));
+        enumerate_paths(ctx, spec, next_table, next_offset, path, nodes, far, trails)?;
+        nodes.pop();
         path.pop();
     }
     Ok(())
+}
+
+/// The breadth-first prepass behind the SHORTEST selectors: minimum
+/// hop counts from the start node within the hop window, the first
+/// discovered parent hop per node, and nodes in discovery order.
+/// Frontiers expand in discovery order and neighbors in storage order,
+/// so levels, parents, and order are all deterministic. ANY SHORTEST
+/// walks the parent chain for one canonical path per endpoint; ALL
+/// SHORTEST hands the level map to [`enumerate_paths`].
+struct HopLevels {
+    levels: BTreeMap<(u32, u64), u64>,
+    parents: BTreeMap<(u32, u64), (Value, u32, u64)>,
+    order: Vec<(u32, u64)>,
+}
+
+fn hop_levels(
+    ctx: &mut StageCtx,
+    rels: &[RelStep],
+    direction: RelDirection,
+    max: Option<u64>,
+    table: u32,
+    offset: u64,
+) -> Result<HopLevels> {
+    let mut bfs = HopLevels {
+        levels: BTreeMap::new(),
+        parents: BTreeMap::new(),
+        order: vec![(table, offset)],
+    };
+    bfs.levels.insert((table, offset), 0);
+    let mut frontier = vec![(table, offset)];
+    let mut depth = 0u64;
+    while !frontier.is_empty() && max.is_none_or(|m| depth < m) {
+        depth += 1;
+        let mut next = Vec::new();
+        for (t, o) in frontier {
+            for (rel_val, nt, no) in hop_edges(ctx, rels, direction, t, o)? {
+                if bfs.levels.contains_key(&(nt, no)) {
+                    continue;
+                }
+                bfs.levels.insert((nt, no), depth);
+                bfs.parents.insert((nt, no), (rel_val, t, o));
+                bfs.order.push((nt, no));
+                next.push((nt, no));
+            }
+        }
+        frontier = next;
+    }
+    Ok(bfs)
 }
 
 /// One probe against the accumulated edge sets of an ASP join,
@@ -2051,6 +2156,8 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             rels,
             min,
             max,
+            mode,
+            selector,
             to_tables,
             chunk,
         } => loop {
@@ -2064,20 +2171,71 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let (table, offset) = node_value(v, "var expand")?;
             let mut far = Vec::new();
             let mut trails = Vec::new();
-            let mut path = Vec::new();
-            enumerate_trails(
-                ctx,
-                rels,
-                *direction,
-                to_tables,
-                *min,
-                *max,
-                table,
-                offset,
-                &mut path,
-                &mut far,
-                &mut trails,
-            )?;
+            match selector {
+                Some(Selector::AnyShortest) => {
+                    let bfs = hop_levels(ctx, rels, *direction, *max, table, offset)?;
+                    for &(t, o) in &bfs.order {
+                        if bfs.levels[&(t, o)] < *min || !to_tables.contains(&t) {
+                            continue;
+                        }
+                        let mut hops = Vec::new();
+                        let (mut ct, mut co) = (t, o);
+                        while let Some((rel_val, pt, po)) = bfs.parents.get(&(ct, co)) {
+                            hops.push(rel_val.clone());
+                            (ct, co) = (*pt, *po);
+                        }
+                        hops.reverse();
+                        far.push(Value::Node {
+                            table: t,
+                            offset: o,
+                        });
+                        trails.push(Value::List(hops));
+                    }
+                }
+                Some(Selector::AllShortest) => {
+                    let bfs = hop_levels(ctx, rels, *direction, *max, table, offset)?;
+                    let spec = VarSpec {
+                        rels,
+                        direction: *direction,
+                        to_tables,
+                        min: *min,
+                        max: *max,
+                        mode: *mode,
+                        levels: Some(&bfs.levels),
+                    };
+                    enumerate_paths(
+                        ctx,
+                        &spec,
+                        table,
+                        offset,
+                        &mut Vec::new(),
+                        &mut vec![(table, offset)],
+                        &mut far,
+                        &mut trails,
+                    )?;
+                }
+                None => {
+                    let spec = VarSpec {
+                        rels,
+                        direction: *direction,
+                        to_tables,
+                        min: *min,
+                        max: *max,
+                        mode: *mode,
+                        levels: None,
+                    };
+                    enumerate_paths(
+                        ctx,
+                        &spec,
+                        table,
+                        offset,
+                        &mut Vec::new(),
+                        &mut vec![(table, offset)],
+                        &mut far,
+                        &mut trails,
+                    )?;
+                }
+            }
             if far.is_empty() {
                 continue;
             }
@@ -3893,6 +4051,95 @@ mod tests {
             &[],
         );
         assert_eq!(int_rows(&r), [[0], [1], [2], [2], [4], [5]]);
+    }
+
+    #[test]
+    fn walk_mode_reuses_edges_a_trail_cannot() {
+        // The five-hop trails from 0 are 0-1-2-4-5-0, 0-1-3-4-5-0, and
+        // 0-2-4-5-0-1. A walk adds 0-2-4-5-0-2, reusing the 0->2 edge.
+        let r = run(
+            "MATCH (a:Person {id: 0})-[:KNOWS*5..5]->(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0], [0], [1]]);
+        let r = run(
+            "MATCH WALK (a:Person {id: 0})-[:KNOWS*5..5]->(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0], [0], [1], [2]]);
+    }
+
+    #[test]
+    fn acyclic_mode_never_revisits_a_node() {
+        // The four-hop trails from 0 include the cycle 0-2-4-5-0;
+        // ACYCLIC drops it because the start node repeats.
+        let r = run(
+            "MATCH (a:Person {id: 0})-[:KNOWS*4..4]->(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0], [5], [5]]);
+        let r = run(
+            "MATCH ACYCLIC (a:Person {id: 0})-[:KNOWS*4..4]->(b) RETURN b.id AS b ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[5], [5]]);
+    }
+
+    #[test]
+    fn any_shortest_keeps_one_minimum_hop_path_per_endpoint() {
+        let r = run(
+            "MATCH ANY SHORTEST (a:Person {id: 0})-[r:KNOWS*]->(b) \
+             RETURN b.id AS b, size(r) AS hops ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[1, 1], [2, 1], [3, 2], [4, 2], [5, 3]]);
+    }
+
+    #[test]
+    fn all_shortest_returns_every_minimum_hop_path() {
+        // Undirected from 3, node 2 sits two hops away through both 1
+        // and 4; every other endpoint has one shortest path.
+        let r = run(
+            "MATCH ALL SHORTEST (a:Person {id: 3})-[r:KNOWS*]-(b) \
+             RETURN b.id AS b, size(r) AS hops ORDER BY b, hops",
+            &[],
+        );
+        assert_eq!(
+            int_rows(&r),
+            [[0, 2], [1, 1], [2, 2], [2, 2], [4, 1], [5, 2]]
+        );
+        let r = run(
+            "MATCH ANY SHORTEST (a:Person {id: 3})-[r:KNOWS*]-(b) \
+             RETURN b.id AS b, size(r) AS hops ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0, 2], [1, 1], [2, 2], [4, 1], [5, 2]]);
+    }
+
+    #[test]
+    fn shortest_selectors_agree_with_trail_minimums() {
+        // On the directed graph every endpoint's shortest path is
+        // unique, so ANY, ALL, and a minimum over plain trails agree.
+        let all = run(
+            "MATCH ALL SHORTEST (a:Person {id: 0})-[r:KNOWS*]->(b) \
+             RETURN b.id AS b, size(r) AS hops ORDER BY b",
+            &[],
+        );
+        let any = run(
+            "MATCH ANY SHORTEST (a:Person {id: 0})-[r:KNOWS*]->(b) \
+             RETURN b.id AS b, size(r) AS hops ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&all), int_rows(&any));
+        // Trails reach the start again through the cycle, but a
+        // shortest selector never emits the start: its zero-hop path
+        // sits below the lower bound of one.
+        let trails = run(
+            "MATCH (a:Person {id: 0})-[r:KNOWS*1..8]->(b) WHERE b.id <> a.id \
+             RETURN b.id AS b, min(size(r)) AS hops ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&any), int_rows(&trails));
     }
 
     fn profiled(source: &str, params: &[(&str, Value)]) -> (QueryResult, Profile) {

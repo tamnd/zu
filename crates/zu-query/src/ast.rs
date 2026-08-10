@@ -50,11 +50,38 @@ pub struct ProjectionItem {
     pub alias: Option<String>,
 }
 
+/// GQL path mode: which repeats a variable-length path may contain.
+/// The default is `TRAIL`, GQL's `DIFFERENT EDGES` match mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathMode {
+    /// Edges and nodes may repeat; needs an upper bound or a selector.
+    Walk,
+    /// No repeated edge.
+    #[default]
+    Trail,
+    /// No repeated node.
+    Acyclic,
+}
+
+/// GQL path selector: restricts a variable-length match to minimum-hop
+/// paths per endpoint pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selector {
+    /// One shortest path per reached endpoint.
+    AnyShortest,
+    /// Every shortest path per reached endpoint.
+    AllShortest,
+}
+
 /// One linear path: a node, then rel-node steps left to right.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathPattern {
     /// `p = (a)-[]->(b)` binds the path itself.
     pub var: Option<String>,
+    /// `ANY SHORTEST` / `ALL SHORTEST` before the first node.
+    pub selector: Option<Selector>,
+    /// `WALK` / `TRAIL` / `ACYCLIC` before the first node.
+    pub mode: PathMode,
     pub start: NodePattern,
     pub steps: Vec<(RelPattern, NodePattern)>,
 }

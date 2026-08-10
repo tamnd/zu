@@ -475,6 +475,111 @@ mod tests {
         .expect("var-length count");
         assert_eq!(r.rows, [[Value::Int(trails)]]);
 
+        // ANY SHORTEST against a BFS levels oracle: one row per
+        // reached node, hops equal to its level.
+        let mut level = vec![u32::MAX; 97];
+        level[src as usize] = 0;
+        let mut frontier = vec![src];
+        let mut depth = 0u32;
+        while !frontier.is_empty() {
+            depth += 1;
+            let mut next = Vec::new();
+            for &(s, t) in &edges {
+                if frontier.contains(&s) && level[t as usize] == u32::MAX {
+                    level[t as usize] = depth;
+                    next.push(t);
+                }
+            }
+            frontier = next;
+        }
+        let reached: Vec<u32> = (0..97u32)
+            .filter(|&v| v != src && level[v as usize] != u32::MAX)
+            .collect();
+        let hop_sum: i64 = reached.iter().map(|&v| i64::from(level[v as usize])).sum();
+        let r = run(
+            "MATCH ANY SHORTEST (a:person {id: $src})-[r:follows*]->(b) \
+             RETURN count(b) AS n, sum(size(r)) AS hops",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("any shortest");
+        assert_eq!(
+            r.rows,
+            [[Value::Int(reached.len() as i64), Value::Int(hop_sum)]]
+        );
+
+        // ALL SHORTEST against a path-counting oracle: dynamic
+        // programming over the shortest-path DAG the levels induce.
+        let mut ways = vec![0i64; 97];
+        ways[src as usize] = 1;
+        let mut order = reached.clone();
+        order.sort_unstable_by_key(|&v| level[v as usize]);
+        for &v in &order {
+            ways[v as usize] = edges
+                .iter()
+                .filter(|(s, t)| {
+                    *t == v
+                        && level[*s as usize] != u32::MAX
+                        && level[*s as usize] + 1 == level[v as usize]
+                })
+                .map(|(s, _)| ways[*s as usize])
+                .sum();
+        }
+        let shortest_paths: i64 = reached.iter().map(|&v| ways[v as usize]).sum();
+        let r = run(
+            "MATCH ALL SHORTEST (a:person {id: $src})-[r:follows*]->(b) \
+             RETURN count(b) AS paths",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("all shortest");
+        assert_eq!(r.rows, [[Value::Int(shortest_paths)]]);
+
+        // WALK against an adjacency power oracle: walks of exactly
+        // three hops, edge and node repeats allowed.
+        let mut at = vec![0i64; 97];
+        at[src as usize] = 1;
+        for _ in 0..3 {
+            let mut next = vec![0i64; 97];
+            for &(s, t) in &edges {
+                next[t as usize] += at[s as usize];
+            }
+            at = next;
+        }
+        let walks: i64 = at.iter().sum();
+        let r = run(
+            "MATCH WALK (a:person {id: $src})-[:follows*3..3]->(b) RETURN count(b) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("walk count");
+        assert_eq!(r.rows, [[Value::Int(walks)]]);
+
+        // ACYCLIC against a brute-force node-distinct DFS oracle over
+        // one to three hops.
+        fn acyclic(edges: &[(u32, u32)], path: &mut Vec<u32>, total: &mut i64) {
+            let cur = *path.last().expect("nonempty");
+            for &(s, t) in edges {
+                if s == cur && !path.contains(&t) {
+                    *total += 1;
+                    if path.len() < 3 {
+                        path.push(t);
+                        acyclic(edges, path, total);
+                        path.pop();
+                    }
+                }
+            }
+        }
+        let mut acyclic_total = 0i64;
+        acyclic(&edges, &mut vec![src], &mut acyclic_total);
+        let r = run(
+            "MATCH ACYCLIC (a:person {id: $src})-[:follows*1..3]->(b) RETURN count(b) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("acyclic count");
+        assert_eq!(r.rows, [[Value::Int(acyclic_total)]]);
+
         // Left-outer semantics on real storage: people with no edge
         // into the high ids keep one row with a null friend, so
         // count(a) sees every row and count(b) only the matches.

@@ -12,9 +12,41 @@ use std::sync::Arc;
 
 use zu_common::{Result, ZuError};
 
-use crate::cache::{BlockCache, CacheStats, DEFAULT_BUDGET, PinnedBlock};
+use crate::cache::{BlockCache, CacheStats, DecodedPool, PinnedBlock};
+use crate::segment::ChunkDirectory;
 use crate::vfs::{RealFile, VfsFile};
 use crate::{BLOCK_SIZE, FORMAT_VERSION, MAGIC, MIN_READER_VERSION};
+
+/// Memory limit the caches size themselves from when the caller sets
+/// none, matching the 128 MiB budget the P9 gate runs under.
+pub const DEFAULT_MEMORY_LIMIT: usize = 128 << 20;
+
+/// The decoded-object pools of perf/04 section 2, shared by every
+/// handle [`Zu1File::reopen`] forks off one open. Keys are the first
+/// block pointer of the decoded segment, unique per committed segment
+/// version, so a rewritten table simply stops touching its old keys.
+#[derive(Debug)]
+pub struct DecodedPools {
+    /// Decoded CSR offset arrays, the O(1)-seek side of a group.
+    pub csr_offsets: DecodedPool<Vec<u64>>,
+    /// Decoded neighbor arrays, the bulk of a group.
+    pub adjacency: DecodedPool<Vec<u64>>,
+    /// Chunk directories: per-chunk end offsets and fences, the
+    /// pk-lookup and probe steering data.
+    pub fences: DecodedPool<ChunkDirectory>,
+}
+
+impl DecodedPools {
+    /// Pools sized off `memory_limit` with the perf/04 split: 8% CSR
+    /// offsets, 20% adjacency, 4% fences.
+    fn new(memory_limit: usize) -> Self {
+        Self {
+            csr_offsets: DecodedPool::new(memory_limit * 8 / 100),
+            adjacency: DecodedPool::new(memory_limit / 5),
+            fences: DecodedPool::new(memory_limit / 25),
+        }
+    }
+}
 
 /// Byte index into the file where block `n` starts. Block 0 is the header
 /// region, so index 0 doubles as the null pointer in chains and roots.
@@ -185,6 +217,8 @@ pub struct Zu1File {
     /// The block cache every read goes through, shared with handles
     /// forked by [`Self::reopen`] so workers warm each other.
     cache: Arc<BlockCache>,
+    /// Decoded-object pools above the block cache, shared the same way.
+    pools: Arc<DecodedPools>,
 }
 
 impl Zu1File {
@@ -216,7 +250,8 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
-            cache: Arc::new(BlockCache::new(DEFAULT_BUDGET)),
+            cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
+            pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         })
     }
 
@@ -260,7 +295,8 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
-            cache: Arc::new(BlockCache::new(DEFAULT_BUDGET)),
+            cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
+            pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         };
         let root = this.db.free_list_root;
         if root != NULL_BLOCK {
@@ -290,6 +326,7 @@ impl Zu1File {
             pending_free: Vec::new(),
             free_chain: Vec::new(),
             cache: Arc::clone(&self.cache),
+            pools: Arc::clone(&self.pools),
         })
     }
 
@@ -410,11 +447,17 @@ impl Zu1File {
         self.cache.stats()
     }
 
-    /// Replaces the block cache with a fresh one holding at most
-    /// `budget` bytes of frames. Callers size this off their memory
-    /// limit; forks made before the call keep the old cache.
-    pub fn set_cache_budget(&mut self, budget: usize) {
-        self.cache = Arc::new(BlockCache::new(budget));
+    /// The shared decoded-object pools, cheap to clone per lookup.
+    pub fn pools(&self) -> Arc<DecodedPools> {
+        Arc::clone(&self.pools)
+    }
+
+    /// Rebuilds the caches sized off `memory_limit`: half of it block
+    /// frames per perf/04, 8% CSR offsets, 20% adjacency, 4% fences.
+    /// Forks made before the call keep the old caches.
+    pub fn set_memory_limit(&mut self, memory_limit: usize) {
+        self.cache = Arc::new(BlockCache::new(memory_limit / 2));
+        self.pools = Arc::new(DecodedPools::new(memory_limit));
     }
 
     /// Publishes the staged state: persist the free list, fsync data, bump

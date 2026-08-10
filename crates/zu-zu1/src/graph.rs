@@ -24,6 +24,7 @@
 
 use std::io::BufRead;
 use std::path::Path;
+use std::sync::Arc;
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 
@@ -31,7 +32,7 @@ use crate::catalog::{Catalog, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::keys::{KeyIndex, KeyReader, write_key_index};
 use crate::meta;
-use crate::segment::{SegmentMeta, probe, read_range, read_segment, write_segment};
+use crate::segment::{SegmentMeta, probe, read_range, read_segment_pooled, write_segment};
 
 // Version 7 widened SegmentMeta with the structural layout byte for
 // FullZip, so version 6 files must fail as unsupported here rather than
@@ -556,8 +557,11 @@ pub struct GraphReader {
     key_reader: Option<KeyReader>,
 }
 
-/// One decoded CSR group: its index, offsets, and neighbor values.
-type CachedGroup = (usize, Vec<u64>, Vec<u64>);
+/// One decoded CSR group: its index, offsets, and neighbor values. The
+/// arrays live in the file's decoded pools, so the slot here is just
+/// the last-touched handle and siblings forked off the same file reuse
+/// the decode.
+type CachedGroup = (usize, Arc<Vec<u64>>, Arc<Vec<u64>>);
 
 impl GraphReader {
     /// Opens the only rel table in the file, the common single-graph
@@ -641,10 +645,9 @@ impl GraphReader {
         let slot = &mut self.cached_groups[dir as usize];
         if slot.as_ref().map(|(i, _, _)| *i) != Some(g) {
             let meta = self.directory.groups[g].dir(dir);
-            let mut offsets = Vec::with_capacity(meta.offsets.value_count as usize);
-            let mut nbrs = Vec::with_capacity(meta.neighbors.value_count as usize);
-            read_segment(db, &meta.offsets, &mut offsets)?;
-            read_segment(db, &meta.neighbors, &mut nbrs)?;
+            let pools = db.pools();
+            let offsets = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
+            let nbrs = read_segment_pooled(db, &pools.adjacency, &meta.neighbors)?;
             *slot = Some((g, offsets, nbrs));
         }
         let (_, offsets, nbrs) = self.cached_groups[dir as usize].as_ref().unwrap();
@@ -1148,6 +1151,37 @@ mod tests {
             assert!(!reader.has_edge(&mut db, s, d).unwrap(), "absent {s}->{d}");
         }
         assert!(reader.has_edge(&mut db, node_count, 0).is_err());
+    }
+
+    #[test]
+    fn group_decodes_are_pooled_across_thrash_and_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let mut edges: Vec<(u32, u32)> = vec![(1, 2), (1, 3), (GROUP_ROWS, 4), (GROUP_ROWS + 1, 5)];
+        let node_count = u64::from(GROUP_ROWS) + 6;
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        let g1 = u64::from(GROUP_ROWS);
+        // Alternate groups: the reader's one slot per direction
+        // thrashes, but the pool serves every revisit without a decode.
+        for _ in 0..5 {
+            assert_eq!(reader.neighbors(&mut db, 1).unwrap(), &[2, 3]);
+            assert_eq!(reader.neighbors(&mut db, g1).unwrap(), &[4]);
+        }
+        let pools = db.pools();
+        let s = pools.adjacency.stats();
+        assert_eq!(s.misses, 2, "each group decoded once");
+        assert_eq!(s.hits, 8, "every revisit was a pool hit");
+        // A forked handle shares the pools, so a fresh reader on it
+        // reads a warm group without decoding anything.
+        let mut fork = db.reopen().unwrap();
+        let mut sibling = GraphReader::load(&mut fork).unwrap();
+        assert_eq!(sibling.neighbors(&mut fork, g1 + 1).unwrap(), &[5]);
+        assert_eq!(pools.adjacency.stats().misses, 2, "fork reused the decode");
     }
 
     #[test]

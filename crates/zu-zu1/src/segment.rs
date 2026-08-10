@@ -35,8 +35,10 @@
 use zu_common::{Result, ZuError};
 use zu_encoding::segment as enc;
 
+use std::sync::Arc;
+
 use crate::BLOCK_SIZE;
-use crate::cache::SegmentBytes;
+use crate::cache::{DecodedPool, SegmentBytes};
 use crate::file::{BlockPtr, Zu1File};
 
 /// Rows per MiniBlock chunk, the unit of point access.
@@ -280,6 +282,26 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
     Ok(())
 }
 
+/// Reads a whole segment through `pool`, decoding it at most once per
+/// pooled lifetime. The key is the segment's first block pointer, which
+/// every segment has since even an empty one carries its chunk count,
+/// and which is unique per committed segment version.
+pub fn read_segment_pooled(
+    db: &mut Zu1File,
+    pool: &DecodedPool<Vec<u64>>,
+    meta: &SegmentMeta,
+) -> Result<Arc<Vec<u64>>> {
+    let key = meta.blocks[0];
+    if let Some(values) = pool.get(key) {
+        return Ok(values);
+    }
+    let mut values = Vec::with_capacity(meta.value_count as usize);
+    read_segment(db, meta, &mut values)?;
+    let values = Arc::new(values);
+    pool.insert(key, Arc::clone(&values));
+    Ok(values)
+}
+
 /// Point access: appends `values[start..end]` to `out`, decoding only the
 /// chunks that cover the range and reading only the bytes they occupy.
 pub fn read_range(
@@ -434,6 +456,12 @@ pub struct ChunkDirectory {
     fences: Vec<u64>,
 }
 
+impl crate::cache::PoolBytes for ChunkDirectory {
+    fn pool_bytes(&self) -> usize {
+        self.ends.len() * 4 + self.fences.len() * 8
+    }
+}
+
 /// Loads the chunk index and fences of `meta`'s segment.
 pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<ChunkDirectory> {
     if meta.structural != Structural::MiniBlock {
@@ -454,6 +482,23 @@ pub fn load_chunk_directory(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Chun
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
         .collect();
     Ok(ChunkDirectory { ends, fences })
+}
+
+/// Loads `meta`'s chunk directory through `pool`, keyed like
+/// [`read_segment_pooled`], so forked readers decode each directory
+/// once between them instead of once per handle.
+pub fn load_chunk_directory_pooled(
+    db: &mut Zu1File,
+    pool: &DecodedPool<ChunkDirectory>,
+    meta: &SegmentMeta,
+) -> Result<Arc<ChunkDirectory>> {
+    let key = meta.blocks[0];
+    if let Some(dir) = pool.get(key) {
+        return Ok(dir);
+    }
+    let dir = Arc::new(load_chunk_directory(db, meta)?);
+    pool.insert(key, Arc::clone(&dir));
+    Ok(dir)
 }
 
 /// Decoded chunks held by a reader between lookups, one slot per chunk

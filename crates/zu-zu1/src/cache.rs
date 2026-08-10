@@ -33,10 +33,11 @@ use zu_common::Result;
 use crate::BLOCK_SIZE;
 use crate::file::{BlockPtr, NULL_BLOCK};
 
-/// Cache budget when the caller sets none: 64 MiB, which is the 50% of
-/// the 128 MiB default memory limit that perf/04 gives the compressed
-/// tier.
-pub const DEFAULT_BUDGET: usize = 64 << 20;
+/// Cache budget the unit tests here run under: the 50% of the default
+/// memory limit that perf/04 gives the compressed tier. Production
+/// budgets come from `Zu1File::set_memory_limit`.
+#[cfg(test)]
+const DEFAULT_BUDGET: usize = 64 << 20;
 
 /// Lock striping. Block pointers are sequential, so modulo spreads
 /// neighboring blocks across shards.
@@ -216,6 +217,134 @@ impl BlockCache {
     }
 }
 
+/// Memory footprint of a pooled decoded object, what a
+/// [`DecodedPool`]'s budget counts.
+pub trait PoolBytes {
+    fn pool_bytes(&self) -> usize;
+}
+
+impl PoolBytes for Vec<u64> {
+    fn pool_bytes(&self) -> usize {
+        self.len() * 8
+    }
+}
+
+struct PoolEntry<T> {
+    value: Arc<T>,
+    bytes: usize,
+    /// Last-touch tick for LRU eviction.
+    tick: u64,
+}
+
+struct PoolInner<T> {
+    map: HashMap<BlockPtr, PoolEntry<T>>,
+    bytes: usize,
+    tick: u64,
+}
+
+/// A budgeted pool of decoded objects keyed by the first block pointer
+/// of the segment they decode, the decode-on-touch tier of perf/04
+/// section 2. Block pointers are unique per committed segment version,
+/// so a rewritten table gets fresh keys and stale entries simply age
+/// out; there is no invalidation protocol. Values are `Arc`-handed:
+/// eviction drops the map's reference and any reader still holding the
+/// `Arc` keeps its snapshot alive, which is safe because decoded
+/// objects are immutable under MVCC.
+///
+/// Eviction is plain LRU by touch tick, scanned on demand. Pools hold
+/// tens of entries, whole decoded groups and directories, so the scan
+/// costs less than the bookkeeping a linked LRU would add.
+pub struct DecodedPool<T> {
+    inner: Mutex<PoolInner<T>>,
+    budget: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl<T> std::fmt::Debug for DecodedPool<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedPool")
+            .field("budget", &self.budget)
+            .field("stats", &self.stats())
+            .finish()
+    }
+}
+
+impl<T> DecodedPool<T> {
+    /// A pool holding at most `budget` bytes of decoded objects. A
+    /// single object above the budget is still admitted alone, so a
+    /// pool cannot starve its own hot path.
+    pub fn new(budget: usize) -> Self {
+        Self {
+            inner: Mutex::new(PoolInner {
+                map: HashMap::new(),
+                bytes: 0,
+                tick: 0,
+            }),
+            budget,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The pooled object for `key`, or `None` on a miss.
+    pub fn get(&self, key: BlockPtr) -> Option<Arc<T>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.tick += 1;
+        let tick = inner.tick;
+        match inner.map.get_mut(&key) {
+            Some(entry) => {
+                entry.tick = tick;
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(Arc::clone(&entry.value))
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Pools `value` under `key`, evicting least-recently-touched
+    /// entries until the budget holds it. Racing inserts keep the
+    /// first entry; both racers already hold a usable `Arc`.
+    pub fn insert(&self, key: BlockPtr, value: Arc<T>)
+    where
+        T: PoolBytes,
+    {
+        let bytes = value.pool_bytes();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.map.contains_key(&key) {
+            return;
+        }
+        while inner.bytes + bytes > self.budget && !inner.map.is_empty() {
+            let &oldest = inner
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.tick)
+                .map(|(k, _)| k)
+                .unwrap();
+            let evicted = inner.map.remove(&oldest).unwrap();
+            inner.bytes -= evicted.bytes;
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        inner.tick += 1;
+        let tick = inner.tick;
+        inner.bytes += bytes;
+        inner.map.insert(key, PoolEntry { value, bytes, tick });
+    }
+}
+
 /// A pinned 256 KiB block frame. Holding it keeps the frame alive; the
 /// cache may evict the block meanwhile, which only means the next
 /// reader refills. Dereferences to the full block's bytes.
@@ -328,6 +457,45 @@ mod tests {
         cache.insert(24, fill_with(3)).unwrap();
         assert!(cache.get(16).is_some(), "visited slot survives");
         assert!(cache.get(8).is_none(), "unvisited slot was the victim");
+    }
+
+    #[test]
+    fn pool_serves_arcs_and_keeps_the_first_of_racing_inserts() {
+        let pool: DecodedPool<Vec<u64>> = DecodedPool::new(1 << 20);
+        assert!(pool.get(8).is_none());
+        pool.insert(8, Arc::new(vec![1, 2, 3]));
+        pool.insert(8, Arc::new(vec![9, 9, 9]));
+        assert_eq!(*pool.get(8).unwrap(), vec![1, 2, 3]);
+        let s = pool.stats();
+        assert_eq!((s.hits, s.misses, s.evictions), (1, 1, 0));
+    }
+
+    #[test]
+    fn pool_evicts_least_recently_touched_within_budget() {
+        // Budget fits two of the three 80-byte vectors.
+        let pool: DecodedPool<Vec<u64>> = DecodedPool::new(160);
+        pool.insert(8, Arc::new(vec![1; 10]));
+        pool.insert(16, Arc::new(vec![2; 10]));
+        // Touch 16 then 8, so 16 is the LRU entry when 24 arrives.
+        let held = pool.get(16).unwrap();
+        pool.get(8).unwrap();
+        pool.insert(24, Arc::new(vec![3; 10]));
+        assert!(pool.get(16).is_none(), "LRU entry evicted");
+        assert!(pool.get(8).is_some());
+        assert!(pool.get(24).is_some());
+        // Eviction only dropped the map's reference; the reader's Arc
+        // still holds the values.
+        assert_eq!(*held, vec![2; 10]);
+        assert_eq!(pool.stats().evictions, 1);
+    }
+
+    #[test]
+    fn pool_admits_an_oversized_object_alone() {
+        let pool: DecodedPool<Vec<u64>> = DecodedPool::new(64);
+        pool.insert(8, Arc::new(vec![1; 4]));
+        pool.insert(16, Arc::new(vec![2; 100]));
+        assert!(pool.get(8).is_none(), "everything else made way");
+        assert_eq!(pool.get(16).unwrap().len(), 100);
     }
 
     #[test]

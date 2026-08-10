@@ -13,11 +13,13 @@
 //! The mutable hash overlay of §7 arrives with the updatable CSR; sealed
 //! bulk loads only need the static level.
 
+use std::sync::Arc;
+
 use zu_common::{Result, ZuError};
 
 use crate::file::Zu1File;
 use crate::segment::{
-    ChunkCache, ChunkDirectory, SegmentMeta, find_in_sorted_cached, load_chunk_directory,
+    ChunkCache, ChunkDirectory, SegmentMeta, find_in_sorted_cached, load_chunk_directory_pooled,
     read_one_cached, read_segment, write_segment,
 };
 
@@ -59,16 +61,17 @@ pub fn write_key_index(db: &mut Zu1File, key_by_row: &[u64]) -> Result<KeyIndex>
 #[derive(Debug)]
 pub struct KeyReader {
     index: KeyIndex,
-    key_chunks: ChunkDirectory,
-    row_chunks: ChunkDirectory,
+    key_chunks: Arc<ChunkDirectory>,
+    row_chunks: Arc<ChunkDirectory>,
     key_cache: ChunkCache,
     row_cache: ChunkCache,
 }
 
 impl KeyReader {
     pub fn load(db: &mut Zu1File, index: KeyIndex) -> Result<Self> {
-        let key_chunks = load_chunk_directory(db, &index.keys)?;
-        let row_chunks = load_chunk_directory(db, &index.rows)?;
+        let pools = db.pools();
+        let key_chunks = load_chunk_directory_pooled(db, &pools.fences, &index.keys)?;
+        let row_chunks = load_chunk_directory_pooled(db, &pools.fences, &index.rows)?;
         Ok(Self {
             index,
             key_chunks,

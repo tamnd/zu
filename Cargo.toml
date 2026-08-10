@@ -20,6 +20,7 @@ zu-zu1 = { path = "crates/zu-zu1" }
 zu-sqlite = { path = "crates/zu-sqlite" }
 zu-s3 = { path = "crates/zu-s3" }
 zu-query = { path = "crates/zu-query" }
+zu-exec = { path = "crates/zu-exec" }
 zu = { path = "crates/zu" }
 
 thiserror = "2"

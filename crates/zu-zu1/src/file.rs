@@ -8,9 +8,11 @@
 //! when the next header flip publishes it.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use zu_common::{Result, ZuError};
 
+use crate::cache::{BlockCache, CacheStats, DEFAULT_BUDGET, PinnedBlock};
 use crate::vfs::{RealFile, VfsFile};
 use crate::{BLOCK_SIZE, FORMAT_VERSION, MAGIC, MIN_READER_VERSION};
 
@@ -180,6 +182,9 @@ pub struct Zu1File {
     /// Blocks holding the committed free-list chain itself; a checkpoint
     /// writes a fresh chain and recycles these.
     free_chain: Vec<BlockPtr>,
+    /// The block cache every read goes through, shared with handles
+    /// forked by [`Self::reopen`] so workers warm each other.
+    cache: Arc<BlockCache>,
 }
 
 impl Zu1File {
@@ -211,6 +216,7 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            cache: Arc::new(BlockCache::new(DEFAULT_BUDGET)),
         })
     }
 
@@ -254,6 +260,7 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            cache: Arc::new(BlockCache::new(DEFAULT_BUDGET)),
         };
         let root = this.db.free_list_root;
         if root != NULL_BLOCK {
@@ -270,7 +277,8 @@ impl Zu1File {
     /// checkpoint, so adopting this handle's header lets the new
     /// handle read exactly what this one reads, staged roots included.
     /// The free lists stay empty because a reopened handle exists to
-    /// read; the morsel workers are the caller.
+    /// read; the morsel workers are the caller. The block cache is
+    /// shared, so a fork starts warm and warms its siblings.
     pub fn reopen(&self) -> Result<Self> {
         Ok(Self {
             file: Box::new(RealFile::open_rw(&self.path)?),
@@ -281,6 +289,7 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            cache: Arc::clone(&self.cache),
         })
     }
 
@@ -348,40 +357,64 @@ impl Zu1File {
         Ok(())
     }
 
-    /// Writes one full block at `ptr`.
+    /// Writes one full block at `ptr` and drops any cached frame for it,
+    /// so the next read refills from the file.
     pub fn write_block(&mut self, ptr: BlockPtr, data: &[u8]) -> Result<()> {
         assert_eq!(data.len(), BLOCK_SIZE as usize, "blocks are fixed size");
         self.check_ptr(ptr)?;
+        self.cache.remove(ptr);
         self.file.write_all_at(data, ptr * u64::from(BLOCK_SIZE))
     }
 
-    /// Reads one full block at `ptr`.
-    pub fn read_block(&mut self, ptr: BlockPtr) -> Result<Vec<u8>> {
+    /// Pins the block at `ptr` in the cache. A warm pin is a map probe
+    /// and an `Arc` clone, no allocation, no copy, no I/O; a miss reads
+    /// the block once into a recycled frame. This is the read primitive
+    /// everything else builds on.
+    pub fn pin_block(&mut self, ptr: BlockPtr) -> Result<PinnedBlock> {
         self.check_ptr(ptr)?;
-        let mut buf = vec![0u8; BLOCK_SIZE as usize];
-        self.file
-            .read_exact_at(&mut buf, ptr * u64::from(BLOCK_SIZE))?;
-        Ok(buf)
+        if let Some(pin) = self.cache.get(ptr) {
+            return Ok(pin);
+        }
+        let file = &mut self.file;
+        self.cache.insert(ptr, |buf| {
+            file.read_exact_at(buf, ptr * u64::from(BLOCK_SIZE))
+        })
     }
 
-    /// Reads `len` bytes at `offset` inside the block at `ptr`. The point
-    /// access path uses this so a random read touches bytes on the order
-    /// of one encoded chunk instead of one 256 KiB block.
+    /// Reads one full block at `ptr` into an owned copy. Cold paths and
+    /// tests use this; hot readers pin instead.
+    pub fn read_block(&mut self, ptr: BlockPtr) -> Result<Vec<u8>> {
+        Ok(self.pin_block(ptr)?.to_vec())
+    }
+
+    /// Reads `len` bytes at `offset` inside the block at `ptr` into an
+    /// owned copy. A cold call now faults the whole block into the
+    /// cache, which is the perf/04 trade: the first point read in a
+    /// block pays 256 KiB once so every later read in it pays nothing.
     pub fn read_block_slice(
         &mut self,
         ptr: BlockPtr,
         offset: usize,
         len: usize,
     ) -> Result<Vec<u8>> {
-        self.check_ptr(ptr)?;
         assert!(
             offset + len <= BLOCK_SIZE as usize,
             "slice crosses the block edge"
         );
-        let mut buf = vec![0u8; len];
-        self.file
-            .read_exact_at(&mut buf, ptr * u64::from(BLOCK_SIZE) + offset as u64)?;
-        Ok(buf)
+        Ok(self.pin_block(ptr)?[offset..offset + len].to_vec())
+    }
+
+    /// Block cache hit, miss, and eviction counts for this handle's
+    /// shared cache.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache.stats()
+    }
+
+    /// Replaces the block cache with a fresh one holding at most
+    /// `budget` bytes of frames. Callers size this off their memory
+    /// limit; forks made before the call keep the old cache.
+    pub fn set_cache_budget(&mut self, budget: usize) {
+        self.cache = Arc::new(BlockCache::new(budget));
     }
 
     /// Publishes the staged state: persist the free list, fsync data, bump

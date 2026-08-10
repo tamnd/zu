@@ -36,6 +36,7 @@ use zu_common::{Result, ZuError};
 use zu_encoding::segment as enc;
 
 use crate::BLOCK_SIZE;
+use crate::cache::SegmentBytes;
 use crate::file::{BlockPtr, Zu1File};
 
 /// Rows per MiniBlock chunk, the unit of point access.
@@ -222,7 +223,7 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
     // is bounded by the block reads, which fail on the first bad pointer.
     let mut payload = Vec::with_capacity((meta.payload_len as usize).min(1 << 22));
     for &ptr in &meta.blocks {
-        let block = db.read_block(ptr)?;
+        let block = db.pin_block(ptr)?;
         let want = (meta.payload_len as usize - payload.len()).min(block.len());
         payload.extend_from_slice(&block[..want]);
     }
@@ -601,13 +602,15 @@ pub fn find_in_sorted(
         .map(|i| (target * CHUNK_ROWS + i) as u64))
 }
 
-/// Reads payload bytes `[from, to)`, touching only the covering blocks.
+/// Reads payload bytes `[from, to)` through the block cache. A span
+/// inside one block, the common case, borrows the pinned frame with no
+/// copy; a span crossing blocks assembles an owned copy.
 pub(crate) fn read_payload_span(
     db: &mut Zu1File,
     meta: &SegmentMeta,
     from: usize,
     to: usize,
-) -> Result<Vec<u8>> {
+) -> Result<SegmentBytes> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "segment",
         detail: detail.to_string(),
@@ -616,19 +619,28 @@ pub(crate) fn read_payload_span(
         return Err(corrupt("span outside the payload"));
     }
     let block = BLOCK_SIZE as usize;
+    let past_list = || corrupt("span past the block list");
+    if to == from {
+        return Ok(SegmentBytes::Owned(Vec::new()));
+    }
+    if from / block == (to - 1) / block {
+        let ptr = *meta.blocks.get(from / block).ok_or_else(past_list)?;
+        return Ok(SegmentBytes::Pinned {
+            block: db.pin_block(ptr)?,
+            start: from % block,
+            len: to - from,
+        });
+    }
     let mut buf = Vec::with_capacity(to - from);
     let mut pos = from;
     while pos < to {
         let offset = pos % block;
         let len = (to - pos).min(block - offset);
-        let ptr = *meta
-            .blocks
-            .get(pos / block)
-            .ok_or_else(|| corrupt("span past the block list"))?;
-        buf.extend_from_slice(&db.read_block_slice(ptr, offset, len)?);
+        let ptr = *meta.blocks.get(pos / block).ok_or_else(past_list)?;
+        buf.extend_from_slice(&db.pin_block(ptr)?[offset..offset + len]);
         pos += len;
     }
-    Ok(buf)
+    Ok(SegmentBytes::Owned(buf))
 }
 
 #[cfg(test)]

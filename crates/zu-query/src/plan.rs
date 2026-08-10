@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
-use crate::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema};
+use crate::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 
 /// The hop range of a variable-length expand together with the path
 /// mode and selector that govern its enumeration (docs/07 §1, §5).
@@ -82,6 +82,16 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         expr: BoundExpr,
         slot: usize,
+    },
+    /// A table function source: the engine kernel runs once over `rel`
+    /// and yields one row per node of its domain, node slot first.
+    TableFunction {
+        input: Box<LogicalPlan>,
+        func: TableFunc,
+        rel: u32,
+        table: u32,
+        args: Vec<BoundExpr>,
+        slots: Vec<usize>,
     },
     Project {
         input: Box<LogicalPlan>,
@@ -151,6 +161,23 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                     input: plan.boxed(),
                     expr: expr.clone(),
                     slot: *slot,
+                };
+            }
+            BoundClause::Call {
+                func,
+                rel,
+                table,
+                args,
+                slots,
+            } => {
+                bound.extend(slots.iter().copied());
+                plan = LogicalPlan::TableFunction {
+                    input: plan.boxed(),
+                    func: *func,
+                    rel: *rel,
+                    table: *table,
+                    args: args.clone(),
+                    slots: slots.clone(),
                 };
             }
             BoundClause::Project {
@@ -407,6 +434,26 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 "{pad}Unwind {} AS {}",
                 expr_text(expr, query),
                 slot_name(query, *slot)
+            );
+            render(input, query, schema, depth + 1, out);
+        }
+        LogicalPlan::TableFunction {
+            input,
+            func,
+            rel,
+            slots,
+            ..
+        } => {
+            let rel_name = schema
+                .rel_by_id(*rel)
+                .map(|r| r.name.as_str())
+                .unwrap_or("?");
+            let cols: Vec<&str> = slots.iter().map(|&s| slot_name(query, s)).collect();
+            let _ = writeln!(
+                out,
+                "{pad}Call {}({rel_name}) YIELD {}",
+                func.name(),
+                cols.join(", ")
             );
             render(input, query, schema, depth + 1, out);
         }

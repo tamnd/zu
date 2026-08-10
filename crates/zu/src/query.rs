@@ -10,6 +10,7 @@ use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, Graph, QueryResult, Value};
 use zu_query::{optimizer, parser, plan};
 
+use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
@@ -264,6 +265,46 @@ impl Graph for Zu1Graph<'_> {
             readers: HashMap::new(),
             props: HashMap::new(),
         }))
+    }
+
+    fn table_function(&mut self, name: &str, rel: u32, args: &[Value]) -> Result<Vec<Vec<Value>>> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        let reader = readers.get_mut(&rel).expect("just loaded");
+        match name {
+            "pagerank" => Ok(algo::pagerank(db, reader, algo::PAGERANK_ITERATIONS)?
+                .into_iter()
+                .map(|rank| vec![Value::Float(rank)])
+                .collect()),
+            "wcc" => Ok(algo::wcc(db, reader)?
+                .into_iter()
+                .map(|label| vec![Value::Int(label as i64)])
+                .collect()),
+            "sssp" => {
+                let Some(Value::Int(source)) = args.first() else {
+                    return Err(ZuError::InvalidArgument(
+                        "sssp needs a source node offset".into(),
+                    ));
+                };
+                Ok(algo::sssp(db, reader, *source as u64)?
+                    .into_iter()
+                    .map(|dist| {
+                        vec![if dist == u64::MAX {
+                            Value::Null
+                        } else {
+                            Value::Int(dist as i64)
+                        }]
+                    })
+                    .collect())
+            }
+            "louvain" => Ok(algo::louvain(db, reader)?
+                .into_iter()
+                .map(|label| vec![Value::Int(label as i64)])
+                .collect()),
+            other => Err(ZuError::InvalidArgument(format!(
+                "zu1 has no table function '{other}'"
+            ))),
+        }
     }
 }
 
@@ -882,6 +923,112 @@ mod tests {
 
         let err = run("MATCH (a:person) RETURN a.nope AS x", &mut db, &[]).expect_err("unknown");
         assert!(err.to_string().contains("unknown property"), "got: {err}");
+
+        // A table function source in key space: 9000 is row 0, and the
+        // undirected hop distances come back under stored ids.
+        let r = run(
+            "CALL sssp('knows', 9000) YIELD node, distance \
+             RETURN node.id AS id, distance ORDER BY distance, id",
+            &mut db,
+            &[],
+        )
+        .expect("sssp");
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(9000), Value::Int(0)],
+                [Value::Int(17), Value::Int(1)],
+                [Value::Int(333), Value::Int(1)],
+                [Value::Int(12_884_901_888), Value::Int(2)],
+                [Value::Int(4025), Value::Int(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn table_functions_run_through_call_on_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("call.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // Two components: a chain 0 -> 1 -> 2 and a pair 3 -> 4.
+        let edges: [(u32, u32); 3] = [(0, 1), (1, 2), (3, 4)];
+        graph::bulk_load_as(&mut db, "person", "follows", 5, &edges).expect("load");
+        drop(db);
+        let mut db = Zu1File::open(&path).expect("open");
+
+        let r = run(
+            "CALL wcc('follows') YIELD node, component \
+             RETURN node.id AS id, component ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("wcc");
+        let ints = |r: &QueryResult| -> Vec<Vec<Value>> { r.rows.clone() };
+        assert_eq!(
+            ints(&r),
+            [
+                [Value::Int(0), Value::Int(0)],
+                [Value::Int(1), Value::Int(0)],
+                [Value::Int(2), Value::Int(0)],
+                [Value::Int(3), Value::Int(3)],
+                [Value::Int(4), Value::Int(3)],
+            ]
+        );
+
+        // Distances from row 1 walk both directions; the other
+        // component stays null.
+        let r = run(
+            "CALL sssp('follows', 1) YIELD node, distance \
+             RETURN node.id AS id, distance ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("sssp");
+        assert_eq!(
+            ints(&r),
+            [
+                [Value::Int(0), Value::Int(1)],
+                [Value::Int(1), Value::Int(0)],
+                [Value::Int(2), Value::Int(1)],
+                [Value::Int(3), Value::Null],
+                [Value::Int(4), Value::Null],
+            ]
+        );
+
+        let r = run(
+            "CALL pagerank('follows') YIELD node, rank \
+             RETURN count(node) AS n, sum(rank) AS total",
+            &mut db,
+            &[],
+        )
+        .expect("pagerank");
+        assert_eq!(r.rows[0][0], Value::Int(5));
+        let Value::Float(total) = r.rows[0][1] else {
+            panic!("expected a float, got {:?}", r.rows[0][1]);
+        };
+        assert!((total - 1.0).abs() < 1e-9, "ranks sum to {total}");
+
+        let r = run(
+            "CALL louvain('follows') YIELD node, community \
+             RETURN count(DISTINCT community) AS communities",
+            &mut db,
+            &[],
+        )
+        .expect("louvain");
+        assert_eq!(r.rows, [[Value::Int(2)]]);
+
+        // The yielded nodes are real rows: expanding from the small
+        // component finds exactly its one edge.
+        let r = run(
+            "CALL wcc('follows') YIELD node, component \
+             WITH node, component WHERE component = 3 \
+             MATCH (node)-[:follows]->(m) \
+             RETURN count(*) AS inside",
+            &mut db,
+            &[],
+        )
+        .expect("compose");
+        assert_eq!(r.rows, [[Value::Int(1)]]);
     }
 
     /// The morsel scheduler over a real zu1 file: workers fork their

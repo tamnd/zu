@@ -1,6 +1,6 @@
 //! Hand-written recursive-descent parser for the zuQL core: MATCH,
-//! OPTIONAL MATCH, WHERE, UNWIND, WITH, RETURN (docs/07 §1, grammar in
-//! docs/grammar.ebnf).
+//! OPTIONAL MATCH, WHERE, CALL, UNWIND, WITH, RETURN (docs/07 §1,
+//! grammar in docs/grammar.ebnf).
 //!
 //! Keywords match case-insensitively and errors name the position and
 //! what was expected. Everything the parser cannot know without the
@@ -24,7 +24,7 @@ const MAX_DEPTH: usize = 128;
 /// Clause keywords the surface reserves but the v0 core does not parse
 /// yet; naming them beats "expected MATCH" when someone writes CREATE.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "SET", "DELETE", "DETACH", "MERGE", "CALL", "FILTER", "LET", "NEXT",
+    "CREATE", "SET", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT",
 ];
 
 /// Parses one zuQL query.
@@ -141,6 +141,32 @@ impl Parser<'_> {
                     patterns,
                     filter,
                 });
+            } else if self.eat_kw("CALL") {
+                let name = self.expect_name("a table function name after CALL")?;
+                self.expect(&TokenKind::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&TokenKind::RParen) {
+                    args.push(self.parse_expr()?);
+                    while self.eat(&TokenKind::Comma) {
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                self.expect_kw("YIELD")?;
+                let mut yields = Vec::new();
+                loop {
+                    let column = self.expect_name("a column name after YIELD")?;
+                    let alias = if self.eat_kw("AS") {
+                        Some(self.expect_name("an alias after AS")?)
+                    } else {
+                        None
+                    };
+                    yields.push((column, alias));
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                clauses.push(Clause::Call { name, args, yields });
             } else if self.eat_kw("UNWIND") {
                 let expr = self.parse_expr()?;
                 self.expect_kw("AS")?;
@@ -164,13 +190,13 @@ impl Parser<'_> {
                 return Ok(Query { clauses });
             } else if let Some(kw) = UNIMPLEMENTED.iter().find(|kw| self.at_kw(kw)) {
                 return Err(ZuError::InvalidArgument(format!(
-                    "{}: {kw} is not implemented yet, the v0 core is MATCH, WHERE, UNWIND, WITH, RETURN",
+                    "{}: {kw} is not implemented yet, the v0 core is MATCH, WHERE, CALL, UNWIND, WITH, RETURN",
                     position(self.source, self.peek().expect("peeked").start)
                 )));
             } else if clauses.is_empty() && self.peek().is_none() {
                 return Err(ZuError::InvalidArgument("empty query".into()));
             } else {
-                return Err(self.error("MATCH, OPTIONAL MATCH, UNWIND, WITH, or RETURN"));
+                return Err(self.error("MATCH, OPTIONAL MATCH, CALL, UNWIND, WITH, or RETURN"));
             }
         }
     }
@@ -896,6 +922,35 @@ mod tests {
     }
 
     #[test]
+    fn call_parses_args_and_yield_aliases() {
+        let q = parsed("CALL sssp('KNOWS', 42) YIELD node AS n, distance RETURN n, distance");
+        let Clause::Call { name, args, yields } = &q.clauses[0] else {
+            panic!("CALL");
+        };
+        assert_eq!(name, "sssp");
+        assert_eq!(
+            *args,
+            vec![
+                Expr::Literal(Literal::Str("KNOWS".into())),
+                Expr::Literal(Literal::Int(42)),
+            ]
+        );
+        assert_eq!(
+            *yields,
+            vec![
+                ("node".to_string(), Some("n".to_string())),
+                ("distance".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn call_without_yield_is_an_error() {
+        let err = parse("CALL pagerank('KNOWS') RETURN 1").unwrap_err();
+        assert!(err.to_string().contains("YIELD"), "{err}");
+    }
+
+    #[test]
     fn operator_precedence_and_string_predicates() {
         let q = parsed(
             "MATCH (n) WHERE NOT n.age + 1 * 2 >= 10 AND n.name STARTS WITH 'A' \
@@ -969,7 +1024,7 @@ mod tests {
         );
         assert!(
             parse_err("MATCH (n)")
-                .contains("expected MATCH, OPTIONAL MATCH, UNWIND, WITH, or RETURN")
+                .contains("expected MATCH, OPTIONAL MATCH, CALL, UNWIND, WITH, or RETURN")
         );
         assert!(parse_err("RETURN 1 RETURN 2").contains("nothing may follow RETURN"));
         assert!(parse_err("").contains("empty query"));

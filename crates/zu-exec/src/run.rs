@@ -38,10 +38,14 @@ pub(crate) fn run(
     options: &Options,
 ) -> Result<QueryResult> {
     let total_rows = snap.table_rows(plan.table)?;
-    let threads = if options.threads == 0 {
-        std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
-    } else {
-        options.threads
+    let threads = match options.threads {
+        // A scan under one storage group is a handful of morsels;
+        // forking snapshots and spawning workers costs more than the
+        // scan, so auto stays sequential and only an explicit thread
+        // count forces the parallel path.
+        0 if total_rows <= u64::from(GROUP_ROWS) => 1,
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+        n => n,
     };
     let morsels = make_morsels(total_rows, threads.max(1));
     let quota = match &plan.sink {
@@ -254,6 +258,11 @@ struct Worker<'a> {
     scan_cols: Vec<ColId>,
     /// Row id scratch for degree sums.
     scratch: Vec<u64>,
+    /// Neighbor scratch for the fused expand-then-count path.
+    neigh: Vec<u64>,
+    /// Per-row degree and running product scratch for hub counts.
+    deg: Vec<u64>,
+    prod: Vec<u64>,
     /// Index and row scratch pools for expand iteration, one pair per
     /// recursion depth in steady state.
     idx_pool: Vec<Vec<u32>>,
@@ -273,6 +282,9 @@ impl<'a> Worker<'a> {
             pins: HashMap::new(),
             scan_cols: plan.levels[0].cols.iter().map(|&(id, _)| id).collect(),
             scratch: Vec::new(),
+            neigh: Vec::new(),
+            deg: Vec::new(),
+            prod: Vec::new(),
             idx_pool: Vec::new(),
             row_pool: Vec::new(),
             sink: SinkState::default(),
@@ -363,10 +375,18 @@ impl<'a> Worker<'a> {
                 last.sel = Some(sel);
                 self.run_ops(rest, set)
             }
-            Op::Expand { rel, dirs, to } => self.expand(*rel, *dirs, *to, rest, set),
-            Op::DegreeCount { rel, dirs } => {
-                let sum = self.degree_sum(*rel, *dirs, set)?;
-                self.sink.count += sum as i64;
+            Op::Expand { rel, dirs, to, .. } => {
+                if let [Op::DegreeProduct { steps }] = rest {
+                    return self.expand_degree(*rel, *dirs, steps, set);
+                }
+                self.expand(*rel, *dirs, *to, rest, set)
+            }
+            Op::DegreeProduct { steps } => {
+                self.collect_rows(set.chunks.last().expect("a level under the count"));
+                let rows = std::mem::take(&mut self.scratch);
+                let sum = self.product_sum(steps, &rows);
+                self.scratch = rows;
+                self.sink.count += sum? as i64;
                 Ok(())
             }
         }
@@ -473,14 +493,11 @@ impl<'a> Worker<'a> {
         Ok(DataChunk::new(vecs, part.len() as u32))
     }
 
-    /// Sum of degrees over the newest level's active rows, offsets
-    /// only. Every earlier level is pinned here, so each row counts
-    /// exactly once.
-    fn degree_sum(&mut self, rel: RelId, dirs: Dirs, set: &ChunkSet) -> Result<u64> {
-        let last = set.chunks.last().expect("a level under the count");
-        let vals = last.vecs[0].values::<u64>();
+    /// Copies a chunk's active row ids into the scratch buffer.
+    fn collect_rows(&mut self, chunk: &DataChunk) {
+        let vals = chunk.vecs[0].values::<u64>();
         self.scratch.clear();
-        match &last.sel {
+        match &chunk.sel {
             Some(s) => {
                 for &i in s.as_slice() {
                     self.scratch.push(vals[i as usize]);
@@ -488,11 +505,66 @@ impl<'a> Worker<'a> {
             }
             None => self.scratch.extend_from_slice(vals),
         }
-        let mut sum = 0;
+    }
+
+    /// The two-hop count fast path: an expand whose only consumer is
+    /// the fused degree product never builds levels at all. The whole
+    /// chunk's neighbor lists concatenate into one buffer and the
+    /// product runs over that, so the per-source cost is a slice copy
+    /// instead of a pipeline descent. A morsel never crosses a group,
+    /// so one pin per direction covers every source row in the chunk.
+    fn expand_degree(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        steps: &[(RelId, Dirs)],
+        set: &ChunkSet,
+    ) -> Result<()> {
+        self.collect_rows(set.chunks.last().expect("a level under the expand"));
+        let Some(&first) = self.scratch.first() else {
+            return Ok(());
+        };
+        self.neigh.clear();
         for dir in sides(dirs) {
-            sum += self.snap.get().degree_batch(rel, &self.scratch, dir)?;
+            let pin = self.pin(rel, dir, first)?;
+            for &row in &self.scratch {
+                self.neigh
+                    .extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
+            }
         }
-        Ok(sum)
+        let neigh = std::mem::take(&mut self.neigh);
+        let sum = self.product_sum(steps, &neigh);
+        self.neigh = neigh;
+        self.sink.count += sum? as i64;
+        Ok(())
+    }
+
+    /// Sum over `rows` of each row's per-step degree product, offsets
+    /// only. Every level above the one the rows came from is pinned
+    /// here, so each row counts exactly once. One step is a plain
+    /// degree sum and stays on the bulk `degree_batch` read; several
+    /// steps read per-row degrees and multiply.
+    fn product_sum(&mut self, steps: &[(RelId, Dirs)], rows: &[u64]) -> Result<u64> {
+        if let [(rel, dirs)] = steps {
+            let mut sum = 0;
+            for dir in sides(*dirs) {
+                sum += self.snap.get().degree_batch(*rel, rows, dir)?;
+            }
+            return Ok(sum);
+        }
+        self.prod.clear();
+        self.prod.resize(rows.len(), 1);
+        for &(rel, dirs) in steps {
+            self.deg.clear();
+            self.deg.resize(rows.len(), 0);
+            for dir in sides(dirs) {
+                self.snap.get().degrees(rel, rows, dir, &mut self.deg)?;
+            }
+            for (p, &d) in self.prod.iter_mut().zip(&self.deg) {
+                *p *= d;
+            }
+        }
+        Ok(self.prod.iter().sum())
     }
 
     fn push_sink(&mut self, set: &mut ChunkSet) -> Result<()> {
@@ -960,6 +1032,7 @@ mod tests {
             vec![Op::Expand {
                 rel: 0,
                 dirs: Dirs::One(Dir::Fwd),
+                from: 0,
                 to: 1,
             }],
             SinkSpec::Count,
@@ -967,9 +1040,8 @@ mod tests {
         );
         let fused = plan(
             vec![bare_level(), bare_level()],
-            vec![Op::DegreeCount {
-                rel: 0,
-                dirs: Dirs::One(Dir::Fwd),
+            vec![Op::DegreeProduct {
+                steps: vec![(0, Dirs::One(Dir::Fwd))],
             }],
             SinkSpec::Count,
             &["n"],
@@ -989,11 +1061,11 @@ mod tests {
                 Op::Expand {
                     rel: 0,
                     dirs: Dirs::One(Dir::Fwd),
+                    from: 0,
                     to: 1,
                 },
-                Op::DegreeCount {
-                    rel: 0,
-                    dirs: Dirs::One(Dir::Fwd),
+                Op::DegreeProduct {
+                    steps: vec![(0, Dirs::One(Dir::Fwd))],
                 },
             ],
             SinkSpec::Count,
@@ -1005,6 +1077,24 @@ mod tests {
     }
 
     #[test]
+    fn hub_product_matches_nested_expands() {
+        let mut snap = Mock::new(10, |i| i as i64, false);
+        // The hub two-hop: count in-degree times out-degree per row,
+        // no expand ever runs. Rows 1..9 have one in-neighbor, rows
+        // 0..9 one out-neighbor, so 8 rows see both sides.
+        let fused = plan(
+            vec![bare_level(), bare_level(), bare_level()],
+            vec![Op::DegreeProduct {
+                steps: vec![(0, Dirs::One(Dir::Bwd)), (0, Dirs::One(Dir::Fwd))],
+            }],
+            SinkSpec::Count,
+            &["n"],
+        );
+        let a = run(&fused, &mut snap, &seq()).unwrap();
+        assert_eq!(a.rows, vec![vec![Value::Int(8)]]);
+    }
+
+    #[test]
     fn undirected_walks_both_sides_forward_first() {
         let mut snap = Mock::new(3, |i| i as i64, false);
         let p = plan(
@@ -1012,6 +1102,7 @@ mod tests {
             vec![Op::Expand {
                 rel: 0,
                 dirs: Dirs::Both,
+                from: 0,
                 to: 1,
             }],
             SinkSpec::Rows {

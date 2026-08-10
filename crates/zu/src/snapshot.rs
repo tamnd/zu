@@ -335,9 +335,18 @@ impl Snapshot for Zu1Snapshot<'_> {
         self.ensure_reader(rel)?;
         let Self { db, readers, .. } = self;
         readers
-            .get(&rel)
+            .get_mut(&rel)
             .expect("just loaded")
             .degree_batch(db, nodes, direction(dir))
+    }
+
+    fn degrees(&mut self, rel: RelId, nodes: &[u64], dir: Dir, out: &mut [u64]) -> Result<()> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        readers
+            .get_mut(&rel)
+            .expect("just loaded")
+            .degrees_into(db, nodes, direction(dir), out)
     }
 
     fn fork(&self) -> Option<Box<dyn Snapshot + Send>> {

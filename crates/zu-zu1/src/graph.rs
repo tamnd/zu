@@ -558,6 +558,12 @@ pub fn bulk_load_keyed(
 pub struct GraphReader {
     directory: Directory,
     cached_groups: [Option<CachedGroup>; 2],
+    /// Last pooled offset array per direction, for the degree reads
+    /// that never touch neighbors. The executor asks for degrees one
+    /// 1024-row chunk at a time, so without this slot every chunk
+    /// takes the shared pool's mutex for an array the reader saw a
+    /// chunk ago, and at eight workers that lock is the profile.
+    cached_offsets: [Option<(usize, Arc<Vec<u64>>)>; 2],
     key_reader: Option<KeyReader>,
 }
 
@@ -605,6 +611,7 @@ impl GraphReader {
         Ok(Self {
             directory: Directory::decode(&bytes)?,
             cached_groups: [None, None],
+            cached_offsets: [None, None],
             key_reader: None,
         })
     }
@@ -695,28 +702,61 @@ impl GraphReader {
         Ok(offs[row + 1] - offs[row])
     }
 
+    /// The pooled offset array of `group` in `dir` through the
+    /// reader-local slot, so degree loops over consecutive chunks of
+    /// the same group skip the pool entirely.
+    fn offsets(&mut self, db: &mut Zu1File, group: usize, dir: Direction) -> Result<&Arc<Vec<u64>>> {
+        let idx = dir as usize;
+        if self.cached_offsets[idx].as_ref().map(|(g, _)| *g) != Some(group) {
+            let meta = self.directory.groups[group].dir(dir);
+            let pools = db.pools();
+            let offs = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
+            self.cached_offsets[idx] = Some((group, offs));
+        }
+        Ok(&self.cached_offsets[idx].as_ref().unwrap().1)
+    }
+
     /// Sum of degrees over `nodes` in `dir`, one pooled offset pin per
     /// group run. This is the counting expand's bulk read: it touches
     /// the 8% offsets pool and never the 20% adjacency pool, so a
     /// count over a hub's neighborhood costs offset diffs, not decoded
     /// neighbor megabytes.
-    pub fn degree_batch(&self, db: &mut Zu1File, nodes: &[u64], dir: Direction) -> Result<u64> {
+    pub fn degree_batch(&mut self, db: &mut Zu1File, nodes: &[u64], dir: Direction) -> Result<u64> {
         let mut total = 0u64;
         let mut cur: Option<(usize, Arc<Vec<u64>>)> = None;
         for &node in nodes {
             let (g, row) = self.locate(node)?;
             if cur.as_ref().map(|(i, _)| *i) != Some(g) {
-                let meta = self.directory.groups[g].dir(dir);
-                let pools = db.pools();
-                cur = Some((
-                    g,
-                    read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?,
-                ));
+                cur = Some((g, Arc::clone(self.offsets(db, g, dir)?)));
             }
             let offs = &cur.as_ref().unwrap().1;
             total += offs[row + 1] - offs[row];
         }
         Ok(total)
+    }
+
+    /// Adds each node's degree in `dir` onto `out`, position for
+    /// position, from the pooled offset arrays alone. Same read shape
+    /// as `degree_batch`, kept per row so a caller can multiply
+    /// degrees across rels instead of summing one.
+    pub fn degrees_into(
+        &mut self,
+        db: &mut Zu1File,
+        nodes: &[u64],
+        dir: Direction,
+        out: &mut [u64],
+    ) -> Result<()> {
+        debug_assert_eq!(nodes.len(), out.len());
+        let mut cur: Option<(usize, Arc<Vec<u64>>)> = None;
+        for (slot, &node) in out.iter_mut().zip(nodes) {
+            let (g, row) = self.locate(node)?;
+            if cur.as_ref().map(|(i, _)| *i) != Some(g) {
+                cur = Some((g, Arc::clone(self.offsets(db, g, dir)?)));
+            }
+            let offs = &cur.as_ref().unwrap().1;
+            *slot += offs[row + 1] - offs[row];
+        }
+        Ok(())
     }
 
     /// Point access: appends `node`'s sorted list in `dir` to `out`
@@ -1253,7 +1293,7 @@ mod tests {
             bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
         }
         let mut db = Zu1File::open(&path).unwrap();
-        let reader = GraphReader::load(&mut db).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
         let g1 = u64::from(GROUP_ROWS);
         assert_eq!(reader.degree_of(&mut db, 1, Direction::Fwd).unwrap(), 2);
         assert_eq!(reader.degree_of(&mut db, 0, Direction::Fwd).unwrap(), 0);

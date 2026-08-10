@@ -124,6 +124,14 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person)-[:knows]-(b) RETURN count(b) AS n",
         "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS paths",
         "MATCH (a:person)-[:knows]->(b)<-[:knows]-(c) RETURN count(c) AS n",
+        // Hub shapes: expands fanning out of one scanned level, the
+        // plan the optimizer picks for an unseeded two-hop. The count
+        // is a per-row degree product, no expand runs.
+        "MATCH (b:person)<-[:knows]-(a) MATCH (b)-[:knows]->(c) RETURN count(c) AS n",
+        "MATCH (b:person)<-[:knows]-(a) MATCH (b)-[:knows]->(c) MATCH (b)-[:knows]->(d) \
+         RETURN count(d) AS n",
+        "MATCH (b:person)<-[:knows]-(a) MATCH (b)-[:knows]->(c) WHERE b.age > 80 \
+         RETURN count(c) AS n",
         "MATCH (a:person) WHERE a.age = 13 MATCH (a)-[:knows]->(b) RETURN b.name AS name",
         "MATCH (a:person)-[:knows]->(b) WHERE b.age < 10 RETURN a.id AS a, b.id AS b",
         "MATCH (a:person)-[:knows]->(b) RETURN b.age AS age, count(b) AS n",

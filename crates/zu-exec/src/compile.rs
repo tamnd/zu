@@ -52,13 +52,24 @@ pub(crate) enum Dirs {
 pub(crate) enum Op {
     /// Refine the newest level's selection by a predicate program.
     Filter { prog: Program },
-    /// Pin each active row of the newest level and push its neighbor
-    /// list as level `to`.
-    Expand { rel: RelId, dirs: Dirs, to: usize },
-    /// Terminal fusion of an expand feeding a bare count: sum the
-    /// newest level's degrees off the CSR offsets, no list ever
-    /// materializes.
-    DegreeCount { rel: RelId, dirs: Dirs },
+    /// Pin each active row of level `from` and push its neighbor list
+    /// as level `to`. The walk records any source level the plan
+    /// names; validation at the end only keeps plans where `from` is
+    /// the newest level at the op's position, everything else either
+    /// fuses into a `DegreeProduct` or falls back.
+    Expand {
+        rel: RelId,
+        dirs: Dirs,
+        from: usize,
+        to: usize,
+    },
+    /// Terminal fusion of trailing expands feeding a bare count: each
+    /// active row of the newest level contributes the product of its
+    /// per-step degrees, read off the CSR offsets alone. One step is
+    /// the plain expand-then-count fusion; several steps are a hub
+    /// plan, expands fanning out of one level with nothing reading
+    /// the far ends.
+    DegreeProduct { steps: Vec<(RelId, Dirs)> },
 }
 
 /// A per-row scalar a sink reads out of the chunk set.
@@ -120,7 +131,7 @@ pub(crate) enum PostSpec {
 
 pub(crate) enum SinkSpec {
     /// The bare global count(*): one accumulator, fed by multiplicity
-    /// or by a fused DegreeCount.
+    /// or by a fused DegreeProduct.
     Count,
     Agg {
         /// One flag per output item in clause order: true takes the
@@ -254,10 +265,9 @@ impl Compiler<'_> {
                     ..
                 }) => {
                     it.next();
-                    let newest = self.levels.len() - 1;
-                    if self.slot_level.get(from) != Some(&newest) {
+                    let Some(&src) = self.slot_level.get(from) else {
                         return Ok(None);
-                    }
+                    };
                     let &[rel_id] = self.query.variables[*rel].rel_tables.as_slice() else {
                         return Ok(None);
                     };
@@ -265,19 +275,21 @@ impl Compiler<'_> {
                         return Ok(None);
                     };
                     let Some(dirs) =
-                        expand_dirs(self.schema, rel_id, self.levels[newest].table, *direction)
+                        expand_dirs(self.schema, rel_id, self.levels[src].table, *direction)
                     else {
                         return Ok(None);
                     };
+                    let to_level = self.levels.len();
                     self.levels.push(LevelBuild {
                         table: to_table,
                         cols: Vec::new(),
                     });
-                    self.slot_level.insert(*to, newest + 1);
+                    self.slot_level.insert(*to, to_level);
                     ops.push(Op::Expand {
                         rel: rel_id,
                         dirs,
-                        to: newest + 1,
+                        from: src,
+                        to: to_level,
                     });
                 }
                 _ => break,
@@ -358,15 +370,56 @@ impl Compiler<'_> {
             _ => return Ok(None),
         };
 
-        // Fuse a final expand feeding a bare count into a degree sum
-        // when nothing reads the expanded level's rows or columns.
-        if matches!(sink, SinkSpec::Count)
-            && let Some(Op::Expand { rel, dirs, to }) = ops.last()
-            && self.levels[*to].cols.is_empty()
-        {
-            let (rel, dirs) = (*rel, *dirs);
-            ops.pop();
-            ops.push(Op::DegreeCount { rel, dirs });
+        // Fuse trailing expands feeding a bare count into one degree
+        // product when nothing reads the expanded levels' rows or
+        // columns. The steps must fan out of one source level: a
+        // single popped expand is the plain expand-then-count fusion,
+        // several are a hub, the shape the optimizer picks for an
+        // unseeded two-hop, where the count per source row is the
+        // product of its per-step degrees.
+        if matches!(sink, SinkSpec::Count) {
+            let mut steps = Vec::new();
+            let mut step_from = None;
+            while let Some(Op::Expand { rel, dirs, from, to }) = ops.last()
+            {
+                if !self.levels[*to].cols.is_empty() || step_from.is_some_and(|f| f != *from) {
+                    break;
+                }
+                step_from = Some(*from);
+                steps.push((*rel, *dirs));
+                ops.pop();
+            }
+            if let Some(from) = step_from {
+                let newest_after = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Expand { to, .. } => Some(*to),
+                        _ => None,
+                    })
+                    .next_back()
+                    .unwrap_or(0);
+                if from != newest_after {
+                    // The steps hang off a level the surviving
+                    // pipeline does not end on; validation below
+                    // rejects the unfused shape too.
+                    return Ok(None);
+                }
+                ops.push(Op::DegreeProduct { steps });
+            }
+        }
+
+        // After fusion every surviving expand must walk off the newest
+        // level, the invariant the runner's pin-and-descend loop is
+        // built on. The hub shapes fusion could not absorb fall back
+        // to the old engine here.
+        let mut newest = 0;
+        for op in &ops {
+            if let Op::Expand { from, to, .. } = op {
+                if *from != newest {
+                    return Ok(None);
+                }
+                newest = *to;
+            }
         }
 
         Ok(Some(ExecPlan {

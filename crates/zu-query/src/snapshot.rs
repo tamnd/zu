@@ -151,6 +151,25 @@ pub trait Snapshot {
     /// values never decode for a count.
     fn degree_batch(&mut self, rel: RelId, nodes: &[u64], dir: Dir) -> Result<u64>;
 
+    /// Adds each node's degree in `dir` onto `out`, position for
+    /// position. Adding instead of storing lets an undirected step
+    /// accumulate both sides into one buffer. The default goes through
+    /// pinned CSR groups; backends with a cheaper offsets-only path
+    /// should override it.
+    fn degrees(&mut self, rel: RelId, nodes: &[u64], dir: Dir, out: &mut [u64]) -> Result<()> {
+        debug_assert_eq!(nodes.len(), out.len());
+        let mut cur: Option<(GroupId, CsrPin)> = None;
+        for (slot, &node) in out.iter_mut().zip(nodes) {
+            let group = (node / u64::from(zu_common::GROUP_ROWS)) as GroupId;
+            if cur.as_ref().map(|&(g, _)| g) != Some(group) {
+                cur = Some((group, self.csr(rel, group, dir)?));
+            }
+            let (_, pin) = cur.as_ref().expect("a pinned group");
+            *slot += pin.degree((node % u64::from(zu_common::GROUP_ROWS)) as usize);
+        }
+        Ok(())
+    }
+
     /// A second handle on the same epoch for a parallel worker. Forks
     /// share warm decoded state where the backend can, so a fork is
     /// not a cold reopen: what one worker decodes, the others hit.

@@ -222,7 +222,7 @@ impl Graph for Zu1Graph<'_> {
         // batch: a counting expand touches the offsets pool and never
         // decodes a neighbor value.
         readers
-            .get(&rel)
+            .get_mut(&rel)
             .expect("just loaded")
             .degree_batch(db, nodes, dir)
     }

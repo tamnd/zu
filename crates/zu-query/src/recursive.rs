@@ -302,7 +302,7 @@ fn effective_threads(threads: usize) -> usize {
     if threads > 0 {
         return threads;
     }
-    std::thread::available_parallelism().map_or(1, |p| p.get())
+    crate::exec::detected_parallelism()
 }
 
 #[cfg(test)]

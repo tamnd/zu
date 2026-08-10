@@ -223,3 +223,16 @@ graphalytics_louvain_s = 120.0
 # host with the disk for the 10 GB build (ZU_B7=1). Lower this ceiling,
 # never raise it.
 open_p99_ms = 10.0
+
+# P0 session gates (Spec/2064g/perf/07, zu#73), benches/session.rs on
+# the synthetic 10k-node graph. plan_hit is Session::warm on cached
+# text: epoch check plus cache lookup, the work between receiving a
+# known query and starting execution. point is the full warm point
+# read through the session: plan hit, bind, key lookup, one-hop count.
+# Measured on the local M series: plan hit 0.04 us, point read 2.0 us
+# (the one-shot open+plan+run path on the same file is 133 us, 65x).
+# Ceilings are the perf/07 targets and leave room for the EPYC vCPU
+# hosts and their documented steal. Lower these ceilings, never raise
+# them.
+session_plan_hit_us = 5.0
+session_point_us = 20.0

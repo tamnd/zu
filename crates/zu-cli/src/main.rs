@@ -10,6 +10,9 @@ use std::process::ExitCode;
 
 use zu::query::{QueryResult, Value};
 
+mod json;
+mod shell;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const QUERY_USAGE: &str = "zu query <file.zu1> -c <zuQL> [--format table|json] [-p name=value ...]";
@@ -30,6 +33,7 @@ fn main() -> ExitCode {
             None => usage_error("zu stat <file.zu1>"),
         },
         Some("query") => query_command(&args[1..]),
+        Some("shell") => shell::shell_command(&args[1..]),
         Some("verify") => match args.get(1) {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
@@ -809,6 +813,7 @@ fn print_usage() {
     println!("(implemented milestone by milestone, see the repo issues)");
     println!();
     println!("{QUERY_USAGE}");
+    println!("zu shell <file.zu1> [--format jsonl]");
 }
 
 #[cfg(test)]

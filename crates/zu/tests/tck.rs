@@ -353,7 +353,11 @@ fn tck_subset_scoreboard_holds() {
         std::fs::write(&path, &rendered).unwrap();
         return;
     }
-    let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+    // A Windows checkout may carry CRLF from git's autocrlf; the
+    // comparison is about content, not line endings.
+    let checked_in = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     assert_eq!(
         checked_in, rendered,
         "docs/tck-scoreboard.md is stale; rerun with ZU_UPDATE_SCOREBOARD=1"

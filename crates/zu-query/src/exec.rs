@@ -4123,7 +4123,7 @@ fn run_stages(
         .iter()
         .map(|n| (n.id, n.node_count))
         .collect();
-    let auto = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    let auto = detected_parallelism().min(8);
     let threads = if options.threads == 0 {
         auto
     } else {
@@ -4202,6 +4202,15 @@ fn run_stages(
         columns: query.columns.clone(),
         rows,
     })
+}
+
+/// available_parallelism, resolved once for the process. On Linux the
+/// std call walks the cgroup hierarchy every time (five file opens
+/// plus statx each), which on a vCPU host costs more than a whole
+/// warm point read; the answer does not change under us, so pay once.
+pub(crate) fn detected_parallelism() -> usize {
+    static DETECTED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(|| std::thread::available_parallelism().map_or(1, |p| p.get()))
 }
 
 /// Runs an optimized plan against a graph and returns the result rows.

@@ -167,6 +167,9 @@ pub struct QueryResult {
 pub trait Graph {
     /// Replaces `out` with the neighbor list of `node` in rel table
     /// `rel`: destinations when `reversed` is false, sources when true.
+    /// Lists are ascending, the CSR order every engine stores; the
+    /// galloping intersection and every binary probe over a list
+    /// depend on it.
     fn neighbors(&mut self, rel: u32, node: u64, reversed: bool, out: &mut Vec<u64>) -> Result<()>;
     /// Edge probe in storage orientation: does `src` point at `dst`?
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool>;
@@ -224,6 +227,12 @@ pub struct Options {
     /// Smaller values force many morsels on small graphs, which is how
     /// the tests drive the parallel path over the mock fixtures.
     pub morsel_rows: usize,
+    /// Fuses an expand whose endpoint the next operator probes into a
+    /// `MultiwayIntersect`, the WCOJ closing step of docs/07 §4. This
+    /// is the hand-injected switch of the first WCOJ slice; the
+    /// optimizer's cyclic-pattern detection is the next box and will
+    /// mark subplans on its own.
+    pub wcoj: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +447,35 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             if retain.is_some() { " (retain)" } else { "" },
             rel_text(var(*from), var(*to), *direction, rels, schema)
         ),
+        OpDesc::MultiwayIntersect {
+            seed,
+            seed_dir,
+            seed_step,
+            probe,
+            probe_dir,
+            probe_step,
+            chunk,
+            ..
+        } => {
+            let close = var(stage.chunk_slots[*chunk][0]);
+            format!(
+                "MultiwayIntersect {} & {}",
+                rel_text(
+                    var(*seed),
+                    close,
+                    *seed_dir,
+                    std::slice::from_ref(seed_step),
+                    schema
+                ),
+                rel_text(
+                    var(*probe),
+                    close,
+                    *probe_dir,
+                    std::slice::from_ref(probe_step),
+                    schema
+                )
+            )
+        }
         OpDesc::Filter { expr, .. } => format!("Filter {}", expr_text(expr, query)),
         OpDesc::Unwind { expr, chunk } => format!(
             "Unwind {} AS {}",
@@ -552,7 +590,7 @@ impl Ord for OrdValue {
 
 /// One rel candidate table with its endpoint tables, for orientation
 /// checks at expand time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct RelStep {
     id: u32,
     from_table: u32,
@@ -654,6 +692,28 @@ enum OpDesc {
         /// configuration at a time like `ExpandInto`.
         retain: Option<usize>,
     },
+    /// The WCOJ closing step (docs/07 §4): an expand followed by an
+    /// edge probe into its endpoint, fused into one galloping
+    /// intersection of two sorted neighbor lists. Per flat
+    /// configuration the intersection is the whole closing-node
+    /// vector, so a wedge closes in one leapfrog walk instead of a
+    /// list read plus a probe per candidate. The probe side's list is
+    /// cached per node because it comes from an outer loop.
+    MultiwayIntersect {
+        /// The replaced expand's source, the middle of the wedge.
+        seed: usize,
+        seed_dir: RelDirection,
+        seed_step: RelStep,
+        /// The replaced probe's bound source, the wedge's other end.
+        probe: usize,
+        probe_dir: RelDirection,
+        probe_step: RelStep,
+        /// Columns `[to, seed rel, probe rel]`, born unflat.
+        chunk: usize,
+        /// False when nothing reads either rel slot, the anonymous-rel
+        /// case: only the closing-node column materializes.
+        emit_rels: bool,
+    },
     /// `compact` names the one unflat chunk this filter may shrink in
     /// place; with `None` every referenced chunk is flat and the
     /// filter just gates configurations.
@@ -733,6 +793,8 @@ struct StageBuilder {
     /// invalidated by any flatten between it and the filter.
     compactable: Option<usize>,
     flat: bool,
+    /// The WCOJ fusion switch from [`Options`].
+    wcoj: bool,
     /// Path variable slot to the slots its shape reads: evaluating a
     /// path assembles from the pattern's slots, a read no expression
     /// walk can see.
@@ -740,7 +802,7 @@ struct StageBuilder {
 }
 
 impl StageBuilder {
-    fn new(flat: bool, shapes: BTreeMap<usize, Vec<usize>>) -> Self {
+    fn new(flat: bool, wcoj: bool, shapes: BTreeMap<usize, Vec<usize>>) -> Self {
         StageBuilder {
             descs: Vec::new(),
             chunk_slots: Vec::new(),
@@ -748,6 +810,7 @@ impl StageBuilder {
             slot_loc: BTreeMap::new(),
             compactable: None,
             flat,
+            wcoj,
             shapes,
         }
     }
@@ -935,6 +998,49 @@ fn optional_group(op: &LogicalPlan) -> Option<usize> {
     }
 }
 
+/// Whether the operator after an expand is an edge probe into that
+/// expand's endpoint that the WCOJ fusion can absorb: a single-step
+/// fixed-direction closing expand in the same optional group whose
+/// other end is already bound. Returns the probe's rel slot, source
+/// slot, direction, and rel step, and flattens the source's chunk so
+/// the fused operator reads one configuration per pull.
+fn wcoj_fusion(
+    b: &mut StageBuilder,
+    lookahead: Option<&LogicalPlan>,
+    to: usize,
+    optional: Option<usize>,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> Result<Option<(usize, usize, RelDirection, RelStep)>> {
+    let Some(LogicalPlan::Expand {
+        rel,
+        from,
+        to: to2,
+        direction,
+        range: None,
+        into: true,
+        optional: opt2,
+        ..
+    }) = lookahead
+    else {
+        return Ok(None);
+    };
+    if *to2 != to
+        || *opt2 != optional
+        || matches!(direction, RelDirection::Undirected)
+        || !b.slot_loc.contains_key(from)
+    {
+        return Ok(None);
+    }
+    let steps = rel_steps(*rel, query, schema)?;
+    let [step] = steps[..] else {
+        return Ok(None);
+    };
+    let probe_chunk = b.slot_loc[from].0;
+    b.ensure_flat(probe_chunk);
+    Ok(Some((*rel, *from, *direction, step)))
+}
+
 /// Compiles one ScanNodes, Expand, or Filter into the builder.
 /// `lookahead` is the next linear operator, offered for IndexLookup
 /// fusion; returns true when it was fused and the caller must skip it.
@@ -983,6 +1089,7 @@ fn compile_match_op(
             range,
             into,
             asp,
+            optional,
             ..
         } => {
             let rels = rel_steps(*rel, query, schema)?;
@@ -992,6 +1099,33 @@ fn compile_match_op(
                 .map(|&(c, _)| c)
                 .ok_or_else(|| invalid(format!("expand from unbound slot {from}")))?;
             b.ensure_flat(from_chunk);
+            // The WCOJ fusion: this expand's endpoint is probed by the
+            // very next operator, so the pair collapses into one
+            // galloping intersection. Restricted to single-step rels
+            // with a fixed direction; anything else falls through to
+            // the binary pair, which stays the correctness baseline.
+            if b.wcoj
+                && range.is_none()
+                && !*into
+                && rels.len() == 1
+                && !matches!(direction, RelDirection::Undirected)
+                && let Some(fused) = wcoj_fusion(b, lookahead, *to, *optional, query, schema)?
+            {
+                let (rel2, probe, probe_dir, probe_step) = fused;
+                let chunk = b.new_chunk(vec![*to, *rel, rel2], false);
+                b.descs.push(OpDesc::MultiwayIntersect {
+                    seed: *from,
+                    seed_dir: *direction,
+                    seed_step: rels[0],
+                    probe,
+                    probe_dir,
+                    probe_step,
+                    chunk,
+                    emit_rels: true,
+                });
+                b.produced(chunk);
+                return Ok(true);
+            }
             if let Some(v) = range {
                 if *into {
                     return Err(invalid(
@@ -1159,6 +1293,10 @@ fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
             out.insert(*from);
             out.insert(*to);
         }
+        OpDesc::MultiwayIntersect { seed, probe, .. } => {
+            out.insert(*seed);
+            out.insert(*probe);
+        }
         OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => expr_slots(expr, out),
         OpDesc::Source
         | OpDesc::RowSource { .. }
@@ -1232,6 +1370,17 @@ fn rewrite_count_expand(
             chunk, emit_rels, ..
         } = desc
             && !full_refs.contains(&b.chunk_slots[*chunk][1])
+        {
+            *emit_rels = false;
+        }
+        // The intersect carries two rel slots; both must be dead for
+        // the columns to stay empty, and the usual case is exactly
+        // that, two anonymous rels closing a wedge.
+        if let OpDesc::MultiwayIntersect {
+            chunk, emit_rels, ..
+        } = desc
+            && !full_refs.contains(&b.chunk_slots[*chunk][1])
+            && !full_refs.contains(&b.chunk_slots[*chunk][2])
         {
             *emit_rels = false;
         }
@@ -1417,7 +1566,7 @@ fn build_stages(
         })
         .collect();
     let mut stages = Vec::new();
-    let mut b = StageBuilder::new(options.flat, shapes.clone());
+    let mut b = StageBuilder::new(options.flat, options.wcoj, shapes.clone());
     b.descs.push(OpDesc::Source);
 
     let mut i = 0;
@@ -1542,7 +1691,7 @@ fn build_stages(
                             invalid("WITH item lost its slot, this is a bug".into())
                         })?);
                     }
-                    b = StageBuilder::new(options.flat, shapes.clone());
+                    b = StageBuilder::new(options.flat, options.wcoj, shapes.clone());
                     let chunk = b.new_chunk(slots, false);
                     b.descs.push(OpDesc::RowSource { chunk });
                     b.produced(chunk);
@@ -1663,6 +1812,13 @@ struct StageCtx<'a> {
     /// optional group's rearm never throws the accumulate away, and
     /// kept across morsels so a worker accumulates once per query.
     edge_sets: BTreeMap<usize, Vec<EdgeSet>>,
+    /// Each intersect's cached probe-side adjacency, keyed by operator
+    /// index: the probe node comes from an outer loop, so consecutive
+    /// configurations reread the same sorted list, and caching it
+    /// makes the probe side one storage read per node instead of one
+    /// per pair. Outside `states` for the same rearm reason as the
+    /// edge sets.
+    isect: BTreeMap<usize, ((u32, u64), Vec<u64>)>,
     /// The row range a parallel worker's driving scan is bounded to,
     /// `None` on sequential runs. Only the scan at operator index 1
     /// consults it; any later scan in the pipeline still iterates its
@@ -1791,6 +1947,7 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
         | OpDesc::VarExpand { chunk, .. }
         | OpDesc::ExpandInto { chunk, .. }
         | OpDesc::AspJoin { chunk, .. }
+        | OpDesc::MultiwayIntersect { chunk, .. }
         | OpDesc::Unwind { chunk, .. } => ctx.chunks[*chunk].size as u64,
     }
 }
@@ -2015,6 +2172,56 @@ fn asp_hit(
         }
     }
     None
+}
+
+/// Whether `table` is the near side of `step` under `direction`:
+/// the adjacency read that yields the far node, as the reversed flag
+/// for [`Graph::neighbors`] plus the far node's table. `None` when the
+/// table sits on neither matching side, which makes the intersection
+/// empty for that configuration.
+fn near_side(step: &RelStep, direction: RelDirection, table: u32) -> Option<(bool, u32)> {
+    match direction {
+        RelDirection::Out if table == step.from_table => Some((false, step.to_table)),
+        RelDirection::In if table == step.to_table => Some((true, step.from_table)),
+        _ => None,
+    }
+}
+
+/// First index at or after `from` whose value is at least `target`, in
+/// a sorted list: an exponential probe brackets the answer, a binary
+/// search pins it. This is the galloping step of the intersection,
+/// sublinear in the gap it skips.
+fn gallop(list: &[u64], target: u64, from: usize) -> usize {
+    let mut span = 1;
+    while from + span < list.len() && list[from + span] < target {
+        span <<= 1;
+    }
+    let lo = from + (span >> 1);
+    let hi = (from + span).min(list.len());
+    lo + list[lo..hi].partition_point(|&v| v < target)
+}
+
+/// Leapfrog intersection of two sorted lists, galloping both sides.
+/// Emits one hit per occurrence in `seed`: the seed list is the
+/// replaced expand's output, where a duplicate is a real multi-edge
+/// row, while the probe side is an edge-existence check exactly like
+/// the binary probe it replaces.
+fn leapfrog(seed: &[u64], probe: &[u64], mut emit: impl FnMut(u64)) {
+    let (mut si, mut pi) = (0, 0);
+    while si < seed.len() && pi < probe.len() {
+        let (sv, pv) = (seed[si], probe[pi]);
+        if sv < pv {
+            si = gallop(seed, pv, si);
+        } else if pv < sv {
+            pi = gallop(probe, sv, pi);
+        } else {
+            while si < seed.len() && seed[si] == sv {
+                emit(sv);
+                si += 1;
+            }
+            pi += 1;
+        }
+    }
 }
 
 /// The pull entry point: a plain `step` normally, a timed and counted
@@ -2579,6 +2786,85 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 },
             }
         }
+        OpDesc::MultiwayIntersect {
+            seed,
+            seed_dir,
+            seed_step,
+            probe,
+            probe_dir,
+            probe_step,
+            chunk,
+            emit_rels,
+        } => loop {
+            if !next(descs, ctx, i - 1)? {
+                return Ok(false);
+            }
+            let sv = value_of(ctx, *seed)?;
+            let pv = value_of(ctx, *probe)?;
+            if matches!(sv, Value::Null) || matches!(pv, Value::Null) {
+                continue;
+            }
+            let (st, so) = node_value(sv, "multiway intersect")?;
+            let (pt, po) = node_value(pv, "multiway intersect")?;
+            let (Some((srev, sfar)), Some((prev, pfar))) = (
+                near_side(seed_step, *seed_dir, st),
+                near_side(probe_step, *probe_dir, pt),
+            ) else {
+                continue;
+            };
+            if sfar != pfar {
+                continue;
+            }
+            let mut far = Vec::new();
+            let mut seed_rels = Vec::new();
+            let mut probe_rels = Vec::new();
+            {
+                let StageCtx {
+                    graph,
+                    scratch,
+                    isect,
+                    ..
+                } = ctx;
+                graph.neighbors(seed_step.id, so, srev, scratch)?;
+                let (key, list) = isect
+                    .entry(i)
+                    .or_insert_with(|| ((u32::MAX, u64::MAX), Vec::new()));
+                if *key != (pt, po) {
+                    graph.neighbors(probe_step.id, po, prev, list)?;
+                    *key = (pt, po);
+                }
+                leapfrog(scratch, list, |v| {
+                    far.push(Value::Node {
+                        table: sfar,
+                        offset: v,
+                    });
+                    if *emit_rels {
+                        let (ss, sd) = if srev { (v, so) } else { (so, v) };
+                        seed_rels.push(Value::Rel {
+                            table: seed_step.id,
+                            src: ss,
+                            dst: sd,
+                        });
+                        let (ps, pd) = if prev { (v, po) } else { (po, v) };
+                        probe_rels.push(Value::Rel {
+                            table: probe_step.id,
+                            src: ps,
+                            dst: pd,
+                        });
+                    }
+                });
+            }
+            if far.is_empty() {
+                continue;
+            }
+            let c = &mut ctx.chunks[*chunk];
+            c.size = far.len();
+            c.cols[0] = far;
+            c.cols[1] = seed_rels;
+            c.cols[2] = probe_rels;
+            c.cur = None;
+            return Ok(true);
+        },
         OpDesc::Filter { expr, compact } => match compact {
             None => loop {
                 if !next(descs, ctx, i - 1)? {
@@ -3506,6 +3792,7 @@ fn drive_worker(
         overlay: BTreeMap::new(),
         scratch: Vec::new(),
         edge_sets: BTreeMap::new(),
+        isect: BTreeMap::new(),
         morsel: None,
         stats: Vec::new(),
     };
@@ -3605,6 +3892,7 @@ fn run_stage_parallel(
         overlay: BTreeMap::new(),
         scratch: Vec::new(),
         edge_sets: BTreeMap::new(),
+        isect: BTreeMap::new(),
         morsel: None,
         stats: Vec::new(),
     };
@@ -3738,6 +4026,7 @@ fn run_stages(
             overlay: BTreeMap::new(),
             scratch: Vec::new(),
             edge_sets: BTreeMap::new(),
+            isect: BTreeMap::new(),
             morsel: None,
             stats: if profile.is_some() {
                 vec![OpStats::default(); stage.descs.len()]
@@ -4096,6 +4385,194 @@ mod tests {
                 .any(|n| n.starts_with("AspJoin (") && !n.contains("retain")),
             "got: {names:?}"
         );
+    }
+
+    fn wcoj() -> Options {
+        Options {
+            wcoj: true,
+            ..Options::default()
+        }
+    }
+
+    fn op_names(p: &Profile) -> Vec<&str> {
+        p.stages[0].ops.iter().map(|o| o.name.as_str()).collect()
+    }
+
+    #[test]
+    fn gallop_finds_the_first_index_at_or_after_the_target() {
+        let list = [2, 4, 4, 7, 11, 15, 15, 20];
+        for from in 0..list.len() {
+            for target in 0..25 {
+                let want = (from..list.len())
+                    .find(|&ix| list[ix] >= target)
+                    .unwrap_or(list.len());
+                assert_eq!(
+                    gallop(&list, target, from),
+                    want,
+                    "target {target} from {from}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leapfrog_emits_one_hit_per_seed_occurrence() {
+        // A duplicate in the seed list is a real multi-edge row and
+        // emits twice; a duplicate in the probe list is only an
+        // existence check and adds nothing.
+        let mut hits = Vec::new();
+        leapfrog(&[2, 2, 3, 7, 9, 12], &[1, 2, 7, 7, 8, 12], |v| hits.push(v));
+        assert_eq!(hits, [2, 2, 7, 12]);
+        hits.clear();
+        leapfrog(&[5], &[], |v| hits.push(v));
+        leapfrog(&[], &[5], |v| hits.push(v));
+        assert_eq!(hits, []);
+    }
+
+    #[test]
+    fn multiway_intersect_closes_the_triangle() {
+        // The expand into c and the probe of the closing edge fuse
+        // into one galloping intersection; results must match the
+        // binary-join baseline exactly.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN a.id AS a, b.id AS b, c.id AS c";
+        let (r, p) = profiled_opts(source, &[], wcoj());
+        assert_eq!(int_rows(&r), [[0, 1, 2]]);
+        assert_eq!(r, run(source, &[]));
+        let names = op_names(&p);
+        assert!(
+            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("AspJoin") || n.starts_with("ExpandInto")),
+            "the fused pair must be gone, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn multiway_intersect_counts_triangles() {
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN count(*) AS triangles";
+        let (r, p) = profiled_opts(source, &[], wcoj());
+        assert_eq!(int_rows(&r), [[1]]);
+        let names = op_names(&p);
+        assert!(
+            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn multiway_intersect_takes_an_in_direction_seed() {
+        // Co-citation wedge closed by an out edge: the seed side reads
+        // b's in-neighbors, the probe side a's out-neighbors. The only
+        // hit is a=0, b=2, c=1: 0 and 1 both point at 2, and 0 knows 1.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)<-[:KNOWS]-(c), (a)-[:KNOWS]->(c) \
+                      RETURN a.id AS a, b.id AS b, c.id AS c";
+        let (r, p) = profiled_opts(source, &[], wcoj());
+        assert_eq!(int_rows(&r), [[0, 2, 1]]);
+        assert_eq!(r, run(source, &[]));
+        let names = op_names(&p);
+        assert!(
+            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn multiway_intersect_materializes_rels_when_read() {
+        // Named rels force both rel columns to materialize. The exact
+        // values pin the orientation: the seed rel runs b to c, the
+        // probe rel a to c, never the reverse.
+        let source = "MATCH (a:Person)-[r:KNOWS]->(b)-[s:KNOWS]->(c), (a)-[t:KNOWS]->(c) \
+                      RETURN r AS r, s AS s, t AS t";
+        let r = run_opts(source, &[], wcoj());
+        assert_eq!(
+            r.rows,
+            [[knows(0, 1), knows(1, 2), knows(0, 2)]],
+            "rel orientation diverged"
+        );
+        assert_eq!(r, run(source, &[]));
+    }
+
+    #[test]
+    fn multiway_intersect_orients_an_in_direction_rel() {
+        // The in-direction seed of the co-citation wedge: the stored
+        // edge runs c to b, so the emitted rel must too.
+        let source = "MATCH (a:Person)-[r:KNOWS]->(b)<-[:KNOWS]-(c), (a)-[t:KNOWS]->(c) \
+                      RETURN r AS r, t AS t";
+        let r = run_opts(source, &[], wcoj());
+        assert_eq!(r.rows, [[knows(0, 2), knows(0, 1)]]);
+        assert_eq!(r, run(source, &[]));
+        let with_s = "MATCH (a:Person)-[:KNOWS]->(b)<-[s:KNOWS]-(c), (a)-[:KNOWS]->(c) \
+                      RETURN s AS s";
+        let r = run_opts(with_s, &[], wcoj());
+        assert_eq!(r.rows, [[knows(1, 2)]]);
+    }
+
+    #[test]
+    fn multiway_intersect_leaves_the_undirected_close_alone() {
+        // An undirected closing edge has no single sorted list to
+        // gallop, so the fusion declines and the binary pair runs.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]-(c) \
+                      RETURN count(*) AS triangles";
+        let (r, p) = profiled_opts(source, &[], wcoj());
+        assert_eq!(r, run(source, &[]));
+        let names = op_names(&p);
+        assert!(
+            !names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn multiway_intersect_inside_an_optional_group() {
+        // The fusion fires inside the optional group and a miss still
+        // nulls the whole fused chunk, c and both rels.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b) \
+                      OPTIONAL MATCH (b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN count(a) AS pairs, count(c) AS closed";
+        let r = run_opts(source, &[], wcoj());
+        assert_eq!(int_rows(&r), [[8, 1]]);
+        assert_eq!(r, run(source, &[]));
+    }
+
+    #[test]
+    fn multiway_intersect_declines_an_optional_close() {
+        // The closing probe lives in its own optional group here, so
+        // fusing it into the required expand would turn the left outer
+        // join inner and drop the nine open 2-paths.
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) \
+                      OPTIONAL MATCH (a)-[t:KNOWS]->(c) \
+                      RETURN count(*) AS paths, count(t) AS closed";
+        let (r, p) = profiled_opts(source, &[], wcoj());
+        assert_eq!(int_rows(&r), [[10, 1]]);
+        assert_eq!(r, run(source, &[]));
+        let names = op_names(&p);
+        assert!(
+            !names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn multiway_intersect_runs_morsel_parallel() {
+        let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                      RETURN a.id AS a, b.id AS b, c.id AS c";
+        let r = run_opts(
+            source,
+            &[],
+            Options {
+                threads: 4,
+                morsel_rows: 2,
+                wcoj: true,
+                ..Options::default()
+            },
+        );
+        assert_eq!(int_rows(&r), [[0, 1, 2]]);
     }
 
     #[test]
@@ -4501,6 +4978,7 @@ mod tests {
             overlay: BTreeMap::new(),
             scratch: Vec::new(),
             edge_sets: BTreeMap::new(),
+            isect: BTreeMap::new(),
             morsel: None,
             stats: Vec::new(),
         };
@@ -4543,6 +5021,14 @@ mod tests {
     }
 
     fn profiled(source: &str, params: &[(&str, Value)]) -> (QueryResult, Profile) {
+        profiled_opts(source, params, Options::default())
+    }
+
+    fn profiled_opts(
+        source: &str,
+        params: &[(&str, Value)],
+        options: Options,
+    ) -> (QueryResult, Profile) {
         let schema = schema();
         let parsed = crate::parser::parse(source).expect("parse");
         let query = crate::binder::bind(&parsed, &schema).expect("bind");
@@ -4557,15 +5043,8 @@ mod tests {
             args.push(v.clone());
         }
         let mut graph = mock();
-        execute_profiled(
-            &optimized,
-            &query,
-            &schema,
-            &mut graph,
-            &args,
-            &Options::default(),
-        )
-        .expect("execute profiled")
+        execute_profiled(&optimized, &query, &schema, &mut graph, &args, &options)
+            .expect("execute profiled")
     }
 
     #[test]

@@ -220,6 +220,13 @@ pub struct Zu1File {
     cache: Arc<BlockCache>,
     /// Decoded-object pools above the block cache, shared the same way.
     pools: Arc<DecodedPools>,
+    /// The last block this handle pinned. Segments span a couple of
+    /// 256 KiB blocks, so a chunk scan pins the same pointer hundreds
+    /// of times in a row, and with eight workers doing that the shared
+    /// cache's shard mutex becomes the profile. The memo answers the
+    /// repeat pins handle-locally; [`Self::write_block`] drops it the
+    /// same way it drops the shared entries.
+    pin_memo: Option<(BlockPtr, PinnedBlock)>,
 }
 
 impl Zu1File {
@@ -251,6 +258,7 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            pin_memo: None,
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
             pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         })
@@ -296,6 +304,7 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            pin_memo: None,
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
             pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         };
@@ -326,6 +335,7 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            pin_memo: None,
             cache: Arc::clone(&self.cache),
             pools: Arc::clone(&self.pools),
         })
@@ -400,6 +410,7 @@ impl Zu1File {
     pub fn write_block(&mut self, ptr: BlockPtr, data: &[u8]) -> Result<()> {
         assert_eq!(data.len(), BLOCK_SIZE as usize, "blocks are fixed size");
         self.check_ptr(ptr)?;
+        self.pin_memo = None;
         self.cache.remove(ptr);
         // The free list recycles pointers, so a rewrite can hand a new
         // segment an old pool key; dropping the key here keeps the
@@ -416,13 +427,22 @@ impl Zu1File {
     /// everything else builds on.
     pub fn pin_block(&mut self, ptr: BlockPtr) -> Result<PinnedBlock> {
         self.check_ptr(ptr)?;
-        if let Some(pin) = self.cache.get(ptr) {
-            return Ok(pin);
+        if let Some((p, pin)) = &self.pin_memo
+            && *p == ptr
+        {
+            return Ok(pin.clone());
         }
-        let file = &mut self.file;
-        self.cache.insert(ptr, |buf| {
-            file.read_exact_at(buf, ptr * u64::from(BLOCK_SIZE))
-        })
+        let pin = match self.cache.get(ptr) {
+            Some(pin) => pin,
+            None => {
+                let file = &mut self.file;
+                self.cache.insert(ptr, |buf| {
+                    file.read_exact_at(buf, ptr * u64::from(BLOCK_SIZE))
+                })?
+            }
+        };
+        self.pin_memo = Some((ptr, pin.clone()));
+        Ok(pin)
     }
 
     /// Reads one full block at `ptr` into an owned copy. Cold paths and

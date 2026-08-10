@@ -36,6 +36,10 @@ harness = false
 name = "graphalytics"
 harness = false
 
+[[bench]]
+name = "scale"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

@@ -19,6 +19,7 @@ zu-s3.workspace = true
 zu-query.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [[bench]]

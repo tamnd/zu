@@ -14,6 +14,7 @@ authors = ["Tam Nguyen <tamnd87@gmail.com>"]
 [workspace.dependencies]
 zu-common = { path = "crates/zu-common" }
 zu-encoding = { path = "crates/zu-encoding" }
+zu-vector = { path = "crates/zu-vector" }
 zu-storage = { path = "crates/zu-storage" }
 zu-zu1 = { path = "crates/zu-zu1" }
 zu-sqlite = { path = "crates/zu-sqlite" }
@@ -45,3 +46,8 @@ todo = "warn"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Benches keep symbols so check_asm.sh and profilers can find the
+# kernel anchors; codegen is otherwise identical to release.
+[profile.bench]
+strip = "none"

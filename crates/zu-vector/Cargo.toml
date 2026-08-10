@@ -1,0 +1,23 @@
+[package]
+name = "zu-vector"
+description = "Typed columnar vectors, selection, and expression kernels for zu"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zu-common.workspace = true
+
+[dev-dependencies]
+zu-encoding.workspace = true
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[lints]
+workspace = true

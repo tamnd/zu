@@ -236,3 +236,63 @@ open_p99_ms = 10.0
 # them.
 session_plan_hit_us = 5.0
 session_point_us = 20.0
+
+# P1 vector kernel gates (Spec/2064g/perf/02 and perf/11, zu#74),
+# benches/kernels.rs, single core, all inputs cache resident. The spec
+# targets print next to every measurement; floors sit under the worst
+# observed run on the loaded EPYC vCPU hosts so the gate catches a
+# broken kernel, not a noisy neighbor. Raise floors, never lower them.
+#
+# cmp is the SWAR compare fill, i64 against a constant over 2048-row
+# vectors. The perf/11 target is 8 G rows/s and the local M series
+# runs 8.8 to 9.0; gamingpc 1.67, server1 0.72 to 1.04 under its
+# documented service load, server3 0.56 under its crawl. A devectorized
+# compare measures about 0.1 on the vCPU hosts, well under the floor.
+vec_cmp_grows_s = 0.4
+
+# The dict-code equality speedup over pre-decoded string equality, the
+# 20x target from zu#74. Both sides of the ratio jitter under vCPU
+# steal so the ratio swings widest of all the keys: local M series
+# 27.3, gamingpc 32.9, server3 19.7, server1 10.8 to 18.8 across three
+# back to back runs. The quiet machines clear 20x; the floor holds the
+# structural claim, codes beat strings by a large margin, without
+# gating on a quiet box. The same bench also prints the ratio against
+# today's per-row String materialization path, 86x to 385x measured.
+vec_dict_eq_speedup = 8.0
+
+# Sorted u64 intersect, balanced 4096 x 4096. The perf/11 target is
+# 2 G elems/s; the 4-way split merge lands 1.97 to 1.98 on the local M
+# series, just short, and the cursor chain is the known limit. gamingpc
+# 0.77, server1 0.37 to 0.53, server3 0.33. The skewed case gallops
+# past 2 G everywhere except the loaded vCPU hosts.
+vec_intersect_gelem_s = 0.25
+
+# Bitmap to selection vector at worst-case half density, ns per
+# 2048-row vector, a ceiling. The perf/11 budget is 100 ns but the
+# scalar trailing-zeros loop pays a store per selected row and measures
+# 431 ns on the local M series at 1024 selected rows; gamingpc 719,
+# server1 1053 to 1465, server3 1380. Meeting 100 ns needs a table or
+# SIMD compaction pass, left open on zu#74. Lower this ceiling when
+# that lands, never raise it.
+vec_bitmap_sel_ns = 2000.0
+
+# splitmix64 finalizer over 2048 keys. The perf/11 target of 4 G
+# keys/s is not met anywhere: the local M series runs 2.8 and the two
+# multiply chains per key are the limit at this unroll depth. gamingpc
+# 0.70, server1 0.53 to 0.65, server3 0.50.
+vec_hash_gkeys_s = 0.35
+
+# Selective i64 sum over 128 MiB, GB/s, the B3 scan shape. The 2 GB/s
+# per core target is met on every machine: local M series 68, server1
+# 13.5 to 19.3, gamingpc 10.6, server3 7.1 under its crawl. The floor
+# doubles the B3 target so the gate still asserts the spec number with
+# margin on the slowest host.
+vec_sum_gbs = 4.0
+
+# Width-13 bitpack unpack through the FastLanes style transposed
+# layout, G vals/s. The perf/11 target is 4 G and the local M series
+# runs 4.84, up from 1.73 on the sequential layout; gamingpc 2.63,
+# server1 1.63 to 1.99, server3 1.13. The x86 hosts vectorize (the
+# check_asm gate proves it) but the shared vCPUs do not reach the
+# target; a devectorized unpack measures about 0.4 on them.
+vec_unpack_gvals_s = 0.9

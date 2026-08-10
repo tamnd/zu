@@ -1,8 +1,8 @@
 //! Deterministic crash injection at every syscall boundary.
 //!
-//! A recorded workload runs two committed txns and a checkpoint fold
-//! against recording files that log every write, length change, and
-//! sync. The harness then builds the file image a crash could leave at
+//! A recorded workload runs two committed txns, a checkpoint fold, and
+//! two ingest commits whose payload travels outside the WAL, against
+//! recording files that log every write, length change, and sync. The harness then builds the file image a crash could leave at
 //! every boundary: the full prefix at each cut, the prefix with each
 //! unsynced write dropped (reordering loss), and the prefix with the
 //! final write torn at several lengths. Every image is recovered and
@@ -16,12 +16,17 @@
 //! log length at each acknowledgment and floors the allowed states per
 //! cut, which is sound for every image class because drops only remove
 //! writes issued after a file's last sync and tears only shorten the
-//! newest write, so neither can touch an acknowledged frame.
+//! newest write, so neither can touch an acknowledged frame. The
+//! ingest commits lean on the same argument from the data file's side:
+//! their sealed segments are synced before the WAL reference is, so an
+//! acknowledged ingest has both the frame and the payload out of every
+//! drop window.
 
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::fold::{checkpoint_fold, recover};
 use zu_zu1::graph::{Direction, GraphReader, bulk_load_as};
+use zu_zu1::ingest::{ingest_edges, ingest_nodes};
 use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
 use zu_zu1::txn::{Cell, Mvcc};
 use zu_zu1::vfs::{IoEvent, IoFile, IoLog, RealFile, RecordingFile};
@@ -225,7 +230,26 @@ fn every_cut_recovers_to_a_committed_prefix() {
             s2,
             "the fold must seal exactly the committed state"
         );
-        (person, knows, vec![s0, s1, s2], [ack1, ack2])
+        let names: Vec<&[u8]> = vec![b"zoe"];
+        ingest_nodes(
+            &mut db,
+            &mut wal,
+            &mut mvcc,
+            person,
+            &[(0, PropValues::Int(&[70])), (1, PropValues::Str(&names))],
+        )
+        .unwrap();
+        let ack3 = log.lock().unwrap().len();
+        let s3 = state(&mut db, &mvcc, person, knows);
+        ingest_edges(&mut db, &mut wal, &mut mvcc, knows, &[6, 0], &[0, 6]).unwrap();
+        let ack4 = log.lock().unwrap().len();
+        let s4 = state(&mut db, &mvcc, person, knows);
+        (
+            person,
+            knows,
+            vec![s0, s1, s2, s3, s4],
+            [ack1, ack2, ack3, ack4],
+        )
     };
     let events = log.lock().unwrap().clone();
     assert!(events.len() > 20, "the workload records real syscalls");

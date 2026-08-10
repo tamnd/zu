@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use zu_common::{Epoch, GROUP_ROWS, Result, ZuError};
 
+use crate::file::BlockPtr;
 use crate::wal::{Wal, WalColumn, WalRecord, WalValues};
 
 /// One overlay cell value, the unit of an update chain entry and of an
@@ -55,6 +56,16 @@ struct RelOverlay {
     edges: Vec<(Epoch, u64, u64)>,
 }
 
+/// The payload of one resolved or freshly written ingest: the sealed
+/// data as the overlay will serve it until a fold seals it into the
+/// base. The blocks in the file hold the durable copy; this is the
+/// in-memory image recovery reads back from them.
+#[derive(Debug)]
+pub enum IngestPayload {
+    Nodes { cols: Vec<WalColumn>, rows: u64 },
+    Edges { src: Vec<u64>, dst: Vec<u64> },
+}
+
 /// The committed overlay store and the epoch counter, owned by
 /// whichever handle owns the write side of the database.
 #[derive(Debug, Default)]
@@ -62,6 +73,9 @@ pub struct Mvcc {
     epoch: Epoch,
     tables: HashMap<u32, TableOverlay>,
     rels: HashMap<u32, RelOverlay>,
+    /// Manifest roots of ingests not yet folded, with their commit
+    /// epochs; the fold frees these blocks once the data is sealed.
+    ingests: Vec<(Epoch, BlockPtr)>,
 }
 
 /// One staged mutation, in statement order.
@@ -154,7 +168,27 @@ impl Mvcc {
     /// Rebuilds the overlay store from the log: every committed txn
     /// above `floor` replays into overlays exactly as its commit
     /// published it, and the epoch counter resumes past the last one.
+    /// An `IngestRef` in the log is an error here; recovery with a
+    /// database file at hand goes through [`Self::recover_with`], whose
+    /// resolver reads the referenced sealed segments back.
     pub fn recover(wal: &Wal, floor: Epoch) -> Result<Self> {
+        Self::recover_with(wal, floor, |_, _| {
+            Err(ZuError::Unsupported {
+                what: "resolving an IngestRef without the database file",
+                id: 0,
+            })
+        })
+    }
+
+    /// [`Self::recover`] with a resolver that turns each committed
+    /// `IngestRef` back into its payload by reading the sealed
+    /// segments its manifest names, returning the payload and the
+    /// manifest root for the next fold to free.
+    pub fn recover_with(
+        wal: &Wal,
+        floor: Epoch,
+        mut resolve: impl FnMut(u32, &[u64]) -> Result<(IngestPayload, BlockPtr)>,
+    ) -> Result<Self> {
         let mut mvcc = Mvcc::new(floor);
         wal.replay(floor, |epoch, rec| {
             mvcc.epoch = mvcc.epoch.max(epoch);
@@ -212,12 +246,15 @@ impl Mvcc {
                     }
                     Ok(())
                 }
-                WalRecord::DdlCatalog { .. } | WalRecord::IngestRef { .. } => {
-                    Err(ZuError::Unsupported {
-                        what: "wal replay kind",
-                        id: 0,
-                    })
+                WalRecord::IngestRef { table, ptrs } => {
+                    let (payload, root) = resolve(*table, ptrs)?;
+                    mvcc.publish_ingest(epoch, *table, payload, root);
+                    Ok(())
                 }
+                WalRecord::DdlCatalog { .. } => Err(ZuError::Unsupported {
+                    what: "wal replay kind",
+                    id: 0,
+                }),
                 WalRecord::CheckpointNote => Ok(()),
             }
         })?;
@@ -363,6 +400,45 @@ impl Mvcc {
         for &offset in offsets {
             overlay.tombstones.insert(offset, 0);
         }
+    }
+
+    /// Publishes one committed ingest at `epoch`: the payload enters
+    /// the overlays exactly as a plain committed txn would have put it
+    /// there, and the manifest root is remembered for the fold to
+    /// free. Called by the write path after its WAL frame syncs and by
+    /// recovery when it resolves the frame back.
+    pub(crate) fn publish_ingest(
+        &mut self,
+        epoch: Epoch,
+        table: u32,
+        payload: IngestPayload,
+        root: BlockPtr,
+    ) {
+        match payload {
+            IngestPayload::Nodes { cols, rows } => {
+                self.tables
+                    .entry(table)
+                    .or_default()
+                    .appended
+                    .push(AppendBatch { epoch, cols, rows });
+            }
+            IngestPayload::Edges { src, dst } => {
+                let edges = &mut self.rels.entry(table).or_default().edges;
+                edges.extend(src.into_iter().zip(dst).map(|(s, d)| (epoch, s, d)));
+            }
+        }
+        self.ingests.push((epoch, root));
+        self.epoch = self.epoch.max(epoch);
+    }
+
+    /// Manifest roots of ingests committed at or below `epoch`, for
+    /// the fold to free once their data is sealed into the base.
+    pub fn ingest_roots(&self, epoch: Epoch) -> Vec<BlockPtr> {
+        self.ingests
+            .iter()
+            .filter(|&&(e, _)| e <= epoch)
+            .map(|&(_, root)| root)
+            .collect()
     }
 
     /// Publishes a committed txn's staged ops at `epoch`.

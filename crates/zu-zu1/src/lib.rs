@@ -10,6 +10,7 @@ pub mod file;
 pub mod fold;
 pub mod fullzip;
 pub mod graph;
+pub mod ingest;
 pub mod keys;
 pub mod meta;
 #[cfg(feature = "arrow")]

@@ -279,7 +279,18 @@ struct Prepared {
 
 fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
     let catalog = Catalog::load(db)?;
-    let schema = schema_of(&catalog)?;
+    let mut schema = schema_of(&catalog)?;
+    // The stats chain feeds the optimizer's degree histograms; a file
+    // written before stats existed simply attaches nothing and every
+    // estimate falls back to the count ratios.
+    let stats = crate::zu1::stats::Stats::load(db)?;
+    schema.set_degree_hists(
+        stats
+            .rels
+            .into_iter()
+            .map(|(id, r)| (id, [r.out_hist, r.in_hist]))
+            .collect(),
+    );
     let parsed = parser::parse(source)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
@@ -716,6 +727,34 @@ mod tests {
             text.contains("ExpandCount (b)-[:follows]->(c)"),
             "got:\n{text}"
         );
+    }
+
+    #[test]
+    fn stored_histograms_steer_the_plan_on_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hubs.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // Ten hub sources hold two hundred edges each while every
+        // target holds one, so the stored histograms say fan-out 200
+        // forward and 1 backward. The count ratio alone says 0.67
+        // either way and cannot tell the directions apart.
+        let edges: Vec<(u32, u32)> = (0..10u32)
+            .flat_map(|h| (0..200u32).map(move |k| (h, 1000 + h * 200 + k)))
+            .collect();
+        graph::bulk_load_as(&mut db, "person", "follows", 3000, &edges).expect("load");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let text = explain_analyze(
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS paths",
+            &mut db,
+            &[],
+        )
+        .expect("explain analyze");
+        // Walking backwards multiplies by 1 per hop instead of 200,
+        // so the plan the optimizer picks runs both expands reversed.
+        assert!(text.contains("(c)<-[:follows]-(b)"), "got:\n{text}");
+        assert!(text.contains("(b)<-[:follows]-(a)"), "got:\n{text}");
     }
 
     #[test]

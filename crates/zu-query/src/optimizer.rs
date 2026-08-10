@@ -871,8 +871,23 @@ fn slot_card(slot: usize, query: &BoundQuery, schema: &Schema) -> f64 {
         .max(1.0)
 }
 
-/// Average fan-out of one expand step taken from `source`. Var-length
-/// steps raise the degree to their minimum hop count as a heuristic.
+/// Mean fan-out per source with at least one edge: the histogram's
+/// total is exactly the number of sources holding edges, so the exact
+/// positive-source mean needs no bucket arithmetic. Sources without
+/// edges produce no rows, so this is the fan-out a pipeline actually
+/// sees, where the count ratio dilutes it across isolated nodes.
+fn hist_fanout(edges: f64, hist: &[u64]) -> Option<f64> {
+    let sources: u64 = hist.iter().sum();
+    if sources == 0 {
+        return None;
+    }
+    Some(edges / sources as f64)
+}
+
+/// Average fan-out of one expand step taken from `source`, from the
+/// engine's degree histograms when it carries them (docs/07 §6) and
+/// the count ratios otherwise. Var-length steps raise the degree to
+/// their minimum hop count as a heuristic.
 fn degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f64 {
     let reversed = source == e.to && source != e.from;
     let mut deg = 0.0;
@@ -883,10 +898,29 @@ fn degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f
         let edges = rd.edge_count as f64;
         let from_cnt = node_count(schema, rd.from);
         let to_cnt = node_count(schema, rd.to);
+        let hists = schema.degree_hist(*rid);
+        let fwd = hists
+            .and_then(|[out, _]| hist_fanout(edges, out))
+            .unwrap_or(edges / from_cnt);
+        let bwd = hists
+            .and_then(|[_, inn]| hist_fanout(edges, inn))
+            .unwrap_or(edges / to_cnt);
         deg += match e.direction {
-            RelDirection::Out => edges / if reversed { to_cnt } else { from_cnt },
-            RelDirection::In => edges / if reversed { from_cnt } else { to_cnt },
-            RelDirection::Undirected => edges / from_cnt + edges / to_cnt,
+            RelDirection::Out => {
+                if reversed {
+                    bwd
+                } else {
+                    fwd
+                }
+            }
+            RelDirection::In => {
+                if reversed {
+                    fwd
+                } else {
+                    bwd
+                }
+            }
+            RelDirection::Undirected => fwd + bwd,
         };
     }
     let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8)) as i32;
@@ -1088,6 +1122,75 @@ mod tests {
         }
         marks.reverse();
         marks
+    }
+
+    #[test]
+    fn hist_fanout_averages_over_edge_holding_sources_only() {
+        assert_eq!(hist_fanout(600.0, &[0, 0, 300]), Some(2.0));
+        assert_eq!(hist_fanout(180_000.0, &[100, 0, 200]), Some(600.0));
+        assert_eq!(hist_fanout(0.0, &[]), None, "no stats, fall back");
+    }
+
+    #[test]
+    fn skewed_histograms_raise_the_estimate_and_flip_the_close_to_asp() {
+        // Seeded triangle: the count ratio says fan-out 20, estimate
+        // 400 probes, far under the 180 K edge sweep, so the close
+        // probes storage. The histogram reveals 300 sources holding
+        // all the edges in either direction, fan-out 600 whichever way
+        // the DP walks, estimate 360 K, and the same close upgrades to
+        // the hash join.
+        let source = "MATCH (a:Person {id: $x})-[:KNOWS]->(b)-[:KNOWS]->(c), \
+                      (a)-[:KNOWS]->(c) RETURN a.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let text = plan::explain(
+            &optimize(built.clone(), &query, &schema).expect("optimize"),
+            &query,
+            &schema,
+        );
+        assert_eq!(text.matches("ExpandInto").count(), 1, "got:\n{text}");
+        let mut skewed = schema.clone();
+        skewed.set_degree_hists(
+            [(2u32, {
+                let skew = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 300];
+                [skew.clone(), skew]
+            })]
+            .into_iter()
+            .collect(),
+        );
+        let text = plan::explain(
+            &optimize(built, &query, &skewed).expect("optimize"),
+            &query,
+            &skewed,
+        );
+        assert_eq!(text.matches("AspJoin").count(), 1, "got:\n{text}");
+    }
+
+    #[test]
+    fn direction_specific_histograms_steer_the_scan_side() {
+        // All nine thousand location edges land on 15 hub places, so
+        // walking backwards from a place multiplies by 600 while
+        // walking forwards from a person stays at one. The estimator
+        // reads the two directions separately and the DP starts from
+        // the person side; a swapped or ignored histogram starts from
+        // the smaller place table instead.
+        let source = "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:Place) RETURN p.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let mut hubs = schema.clone();
+        hubs.set_degree_hists(
+            [(3u32, [vec![9000], vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 15]])]
+                .into_iter()
+                .collect(),
+        );
+        let text = plan::explain(
+            &optimize(built, &query, &hubs).expect("optimize"),
+            &query,
+            &hubs,
+        );
+        assert!(text.contains("ScanNodes p: Person"), "got:\n{text}");
     }
 
     #[test]

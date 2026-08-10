@@ -19,6 +19,7 @@ pub mod parquet;
 pub mod props;
 pub mod reorder;
 pub mod segment;
+pub mod stats;
 pub mod txn;
 pub mod vfs;
 pub mod wal;

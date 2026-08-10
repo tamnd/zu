@@ -32,9 +32,38 @@ fn direction(dir: Dir) -> Direction {
     }
 }
 
+/// The file handle behind a snapshot: borrowed for the common case of
+/// reading through an open handle, owned for forks handed to parallel
+/// workers. Forked handles share the block cache and decoded pools
+/// with their parent, so a fork reads warm.
+enum Db<'a> {
+    Borrowed(&'a mut Zu1File),
+    Owned(Box<Zu1File>),
+}
+
+impl std::ops::Deref for Db<'_> {
+    type Target = Zu1File;
+
+    fn deref(&self) -> &Zu1File {
+        match self {
+            Db::Borrowed(db) => db,
+            Db::Owned(db) => db,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Db<'_> {
+    fn deref_mut(&mut self) -> &mut Zu1File {
+        match self {
+            Db::Borrowed(db) => db,
+            Db::Owned(db) => db,
+        }
+    }
+}
+
 /// The vectorized view of one open zu1 file at its current epoch.
 pub struct Zu1Snapshot<'a> {
-    db: &'a mut Zu1File,
+    db: Db<'a>,
     catalog: Catalog,
     readers: HashMap<u32, GraphReader>,
     props: HashMap<u32, Option<PropsReader>>,
@@ -49,7 +78,7 @@ pub struct Zu1Snapshot<'a> {
 impl<'a> Zu1Snapshot<'a> {
     pub fn new(db: &'a mut Zu1File, catalog: Catalog) -> Self {
         Zu1Snapshot {
-            db,
+            db: Db::Borrowed(db),
             catalog,
             readers: HashMap::new(),
             props: HashMap::new(),
@@ -75,7 +104,7 @@ impl<'a> Zu1Snapshot<'a> {
             .ok_or_else(|| ZuError::InvalidArgument(format!("unknown rel table {rel}")))?
             .name
             .clone();
-        let reader = GraphReader::load_table(self.db, &name)?;
+        let reader = GraphReader::load_table(&mut self.db, &name)?;
         self.readers.insert(rel, reader);
         Ok(())
     }
@@ -84,7 +113,7 @@ impl<'a> Zu1Snapshot<'a> {
         if self.props.contains_key(&table) {
             return Ok(());
         }
-        let reader = load_props(self.db, table)?.map(PropsReader::new);
+        let reader = load_props(&mut self.db, table)?.map(PropsReader::new);
         self.props.insert(table, reader);
         Ok(())
     }
@@ -244,7 +273,7 @@ impl Snapshot for Zu1Snapshot<'_> {
     fn csr(&mut self, rel: RelId, group: GroupId, dir: Dir) -> Result<CsrPin> {
         self.ensure_reader(rel)?;
         let reader = self.readers.get(&rel).expect("just loaded");
-        let (offsets, neighbors) = reader.csr_group(self.db, group as usize, direction(dir))?;
+        let (offsets, neighbors) = reader.csr_group(&mut self.db, group as usize, direction(dir))?;
         Ok(CsrPin { offsets, neighbors })
     }
 
@@ -294,6 +323,22 @@ impl Snapshot for Zu1Snapshot<'_> {
             .get(&rel)
             .expect("just loaded")
             .degree_batch(db, nodes, direction(dir))
+    }
+
+    fn fork(&self) -> Option<Box<dyn Snapshot + Send>> {
+        // A reopened handle carries this handle's in-memory header and
+        // shares its block cache and decoded pools, so the fork reads
+        // the same epoch and reads it warm.
+        let db = self.db.reopen().ok()?;
+        Some(Box::new(Zu1Snapshot {
+            db: Db::Owned(Box::new(db)),
+            catalog: self.catalog.clone(),
+            readers: HashMap::new(),
+            props: HashMap::new(),
+            scratch: Vec::new(),
+            str_bytes: Vec::new(),
+            str_ends: Vec::new(),
+        }))
     }
 }
 
@@ -459,5 +504,35 @@ mod tests {
         assert_eq!(snap.lookup_pk(rel, 5 * 2 + 10).unwrap(), Some(5));
         assert_eq!(snap.lookup_pk(rel, 11).unwrap(), None);
         assert_eq!(snap.degree_batch(rel, &[1, 1, 0], Dir::Fwd).unwrap(), 5);
+    }
+
+    #[test]
+    fn forks_read_the_same_epoch_through_shared_pools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, table, rel) = setup(&dir.path().join("fork.zu1"));
+        let pools = db.pools();
+        let mut snap = Zu1Snapshot::open(&mut db).unwrap();
+        let pin = snap.csr(rel, 0, Dir::Fwd).unwrap();
+        assert_eq!(pin.degree(1), 2);
+        let cold = pools.adjacency.stats().misses;
+        let mut fork = snap.fork().expect("zu1 snapshots fork");
+        assert_eq!(fork.epoch(), snap.epoch());
+        // The fork's first pin lands on the decode the parent already
+        // paid for: the pools are shared, so no new miss.
+        let fpin = fork.csr(rel, 0, Dir::Fwd).unwrap();
+        assert_eq!(fpin.list(1), &[2, 3]);
+        assert_eq!(
+            pools.adjacency.stats().misses,
+            cold,
+            "fork should reuse the parent's decode"
+        );
+        // The fork answers the whole surface on its own handle.
+        let mut arena = MorselArena::new();
+        assert_eq!(fork.table_rows(table).unwrap(), N);
+        assert_eq!(fork.lookup_pk(rel, 20).unwrap(), Some(5));
+        let (a, _) = fork.resolve_col(table, "a").unwrap().unwrap();
+        let ints = fork.gather(table, a, &[2999, 0], &mut arena).unwrap();
+        assert_eq!(ints.values::<u64>(), &[2999 * 3, 0]);
+        assert_eq!(fork.degree_batch(rel, &[0, 1], Dir::Fwd).unwrap(), 3);
     }
 }

@@ -705,7 +705,12 @@ impl GraphReader {
     /// The pooled offset array of `group` in `dir` through the
     /// reader-local slot, so degree loops over consecutive chunks of
     /// the same group skip the pool entirely.
-    fn offsets(&mut self, db: &mut Zu1File, group: usize, dir: Direction) -> Result<&Arc<Vec<u64>>> {
+    fn offsets(
+        &mut self,
+        db: &mut Zu1File,
+        group: usize,
+        dir: Direction,
+    ) -> Result<&Arc<Vec<u64>>> {
         let idx = dir as usize;
         if self.cached_offsets[idx].as_ref().map(|(g, _)| *g) != Some(group) {
             let meta = self.directory.groups[group].dir(dir);

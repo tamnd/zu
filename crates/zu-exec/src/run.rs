@@ -25,6 +25,7 @@ use zu_query::snapshot::{ColId, CsrPin, Dir, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector};
 
 use crate::compile::{Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec};
+use crate::pool;
 use crate::sink::{self, Acc, KeyVal, SinkState};
 
 fn invalid(detail: String) -> ZuError {
@@ -70,37 +71,46 @@ pub(crate) fn run(
         }
     }
 
-    let partials: Result<Vec<SinkState>> = std::thread::scope(|s| {
-        let handles: Vec<_> = forks
+    // Extra workers run on the persistent pool; worker 0 is this
+    // thread. Result slots start empty, and a slot still empty after
+    // the latch means that worker panicked.
+    let slots: Vec<Mutex<Option<Result<SinkState>>>> =
+        forks.iter().map(|_| Mutex::new(None)).collect();
+    let main = {
+        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = forks
             .into_iter()
-            .map(|f| {
+            .zip(&slots)
+            .map(|(f, slot)| {
                 let (stop, claim, morsels) = (&stop, &claim, morsels.as_slice());
-                s.spawn(move || {
+                Box::new(move || {
                     let mut w = Worker::new(plan, SnapHandle::Fork(f), stop);
-                    w.work(morsels, claim)?;
-                    Ok(w.sink)
-                })
+                    let res = w.work(morsels, claim).map(|()| w.sink);
+                    *slot.lock().unwrap() = Some(res);
+                }) as Box<dyn FnOnce() + Send + '_>
             })
             .collect();
+        let pending = pool::submit(jobs);
         let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop);
         let main = w.work(&morsels, &claim).map(|()| w.sink);
-        let mut out = Vec::with_capacity(handles.len() + 1);
-        let mut first_err = None;
-        for res in std::iter::once(main).chain(handles.into_iter().map(|h| {
-            h.join()
-                .unwrap_or_else(|_| Err(invalid("executor worker panicked".into())))
-        })) {
-            match res {
-                Ok(p) => out.push(p),
-                Err(e) => first_err = first_err.or(Some(e)),
-            }
+        pending.wait();
+        main
+    };
+    let mut out = Vec::with_capacity(slots.len() + 1);
+    let mut first_err = None;
+    for res in std::iter::once(main).chain(slots.into_iter().map(|slot| {
+        slot.into_inner()
+            .unwrap()
+            .unwrap_or_else(|| Err(invalid("executor worker panicked".into())))
+    })) {
+        match res {
+            Ok(p) => out.push(p),
+            Err(e) => first_err = first_err.or(Some(e)),
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(out),
-        }
-    });
-    let partials = partials?;
+    }
+    let partials = match first_err {
+        Some(e) => return Err(e),
+        None => out,
+    };
 
     match &plan.sink {
         SinkSpec::Count => {

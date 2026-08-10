@@ -339,7 +339,10 @@ impl Zu1File {
     /// this handle's header and a cleared pin memo, so steady-state
     /// forking costs a mutex pop instead of an OS open.
     pub fn reopen(&self) -> Result<Self> {
-        let pool = self.forks.as_ref().expect("only pooled entries lack a pool");
+        let pool = self
+            .forks
+            .as_ref()
+            .expect("only pooled entries lack a pool");
         if let Some(mut fork) = pool.lock().unwrap().pop() {
             fork.db = self.db.clone();
             fork.active_slot = self.active_slot;

@@ -35,7 +35,9 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
     bulk_load_keyed(&mut db, "person", "knows", N, &edges, None).unwrap();
     let age: Vec<u64> = (0..N).map(|i| (i * 37) % 100).collect();
     let score: Vec<u64> = (0..N).map(|i| i * 3).collect();
-    let names: Vec<Vec<u8>> = (0..N).map(|i| format!("p{}", i % 50).into_bytes()).collect();
+    let names: Vec<Vec<u8>> = (0..N)
+        .map(|i| format!("p{}", i % 50).into_bytes())
+        .collect();
     let name_refs: Vec<&[u8]> = names.iter().map(|v| v.as_slice()).collect();
     store_props(
         &mut db,

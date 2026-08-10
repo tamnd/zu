@@ -380,7 +380,12 @@ impl Compiler<'_> {
         if matches!(sink, SinkSpec::Count) {
             let mut steps = Vec::new();
             let mut step_from = None;
-            while let Some(Op::Expand { rel, dirs, from, to }) = ops.last()
+            while let Some(Op::Expand {
+                rel,
+                dirs,
+                from,
+                to,
+            }) = ops.last()
             {
                 if !self.levels[*to].cols.is_empty() || step_from.is_some_and(|f| f != *from) {
                     break;

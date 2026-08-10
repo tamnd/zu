@@ -301,7 +301,8 @@ impl Snapshot for Zu1Snapshot<'_> {
     fn csr(&mut self, rel: RelId, group: GroupId, dir: Dir) -> Result<CsrPin> {
         self.ensure_reader(rel)?;
         let reader = self.readers.get(&rel).expect("just loaded");
-        let (offsets, neighbors) = reader.csr_group(&mut self.db, group as usize, direction(dir))?;
+        let (offsets, neighbors) =
+            reader.csr_group(&mut self.db, group as usize, direction(dir))?;
         Ok(CsrPin { offsets, neighbors })
     }
 

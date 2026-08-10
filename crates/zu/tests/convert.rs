@@ -1,0 +1,233 @@
+//! Engine conversion round trips: the same graph converted zu1 to
+//! sqlite to zu1 and sqlite to zu1 to sqlite, compared logically at
+//! both hops. Losslessness means every node table, property value,
+//! and adjacency list survives, and a query answers identically on
+//! the original and the twice-converted store.
+
+use zu::convert::{sqlite_to_zu1, zu1_to_sqlite};
+use zu::query::run as run_zu1;
+use zu::sqlite::run as run_sqlite;
+use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
+use zu_storage::Direction;
+use zu_zu1::catalog::Catalog;
+use zu_zu1::file::Zu1File;
+use zu_zu1::graph::{Direction as Zu1Direction, GraphReader, bulk_load_as};
+use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
+
+const NAMES: [&str; 6] = ["ada", "bob", "cat", "dan", "eve", "fay"];
+const AGES: [u64; 6] = [20, 30, 30, 40, 50, 25];
+const EDGES: [(u32, u32); 7] = [(0, 1), (0, 2), (1, 3), (2, 3), (2, 5), (3, 4), (4, 0)];
+
+fn seed_zu1(path: &std::path::Path) {
+    let mut zu = Zu1File::create(path).unwrap();
+    bulk_load_as(&mut zu, "person", "knows", 6, &EDGES).unwrap();
+    let names: Vec<&[u8]> = NAMES.iter().map(|n| n.as_bytes()).collect();
+    store_props(
+        &mut zu,
+        "person",
+        &[
+            ("age", PropValues::Int(&AGES)),
+            ("name", PropValues::Str(&names)),
+        ],
+    )
+    .unwrap();
+}
+
+fn seed_sqlite(path: &std::path::Path) {
+    let mut sq = SqliteStore::open(path).unwrap();
+    sq.create_node_table(
+        "person",
+        &[("age", ColumnType::Integer), ("name", ColumnType::Text)],
+    )
+    .unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
+    sq.begin().unwrap();
+    for row in 0..6usize {
+        sq.insert_node_at(
+            "person",
+            row as i64,
+            &[
+                SqlValue::Int(AGES[row] as i64),
+                SqlValue::Text(NAMES[row].to_owned()),
+            ],
+        )
+        .unwrap();
+    }
+    for &(src, dst) in &EDGES {
+        sq.insert_rel("knows", i64::from(src), i64::from(dst), &[])
+            .unwrap();
+    }
+    sq.commit().unwrap();
+}
+
+/// Asserts the zu1 file at `path` holds exactly the fixture graph.
+fn assert_zu1_matches(path: &std::path::Path) {
+    let mut zu = Zu1File::open(path).unwrap();
+    let catalog = Catalog::load(&mut zu).unwrap();
+    let person = catalog.node_by_name("person").expect("person survives");
+    assert_eq!(person.node_count, 6);
+    let knows = catalog.rel_by_name("knows").expect("knows survives");
+    assert_eq!(knows.edge_count, EDGES.len() as u64);
+    assert_eq!(knows.from, person.id);
+    assert_eq!(knows.to, person.id);
+
+    let mut g = GraphReader::load_table(&mut zu, "knows").unwrap();
+    for node in 0..6u64 {
+        let fwd: Vec<u64> = g
+            .neighbors_dir(&mut zu, node, Zu1Direction::Fwd)
+            .unwrap()
+            .to_vec();
+        let want: Vec<u64> = EDGES
+            .iter()
+            .filter(|&&(s, _)| u64::from(s) == node)
+            .map(|&(_, d)| u64::from(d))
+            .collect();
+        assert_eq!(fwd, want, "forward neighbors of {node}");
+        let bwd: Vec<u64> = g
+            .neighbors_dir(&mut zu, node, Zu1Direction::Bwd)
+            .unwrap()
+            .to_vec();
+        let mut want: Vec<u64> = EDGES
+            .iter()
+            .filter(|&&(_, d)| u64::from(d) == node)
+            .map(|&(s, _)| u64::from(s))
+            .collect();
+        want.sort_unstable();
+        assert_eq!(bwd, want, "backward neighbors of {node}");
+    }
+
+    let props = load_props(&mut zu, person.id)
+        .unwrap()
+        .expect("props survive");
+    let mut reader = PropsReader::new(props);
+    let age = reader.col("age").expect("age column");
+    let name = reader.col("name").expect("name column");
+    let mut buf = Vec::new();
+    for row in 0..6u64 {
+        assert_eq!(
+            reader.read_int(&mut zu, age, row).unwrap(),
+            AGES[row as usize]
+        );
+        buf.clear();
+        reader.read_str(&mut zu, name, row, &mut buf).unwrap();
+        assert_eq!(buf, NAMES[row as usize].as_bytes());
+    }
+}
+
+/// Asserts the sqlite store at `path` holds exactly the fixture graph.
+fn assert_sqlite_matches(path: &std::path::Path) {
+    let sq = SqliteStore::open(path).unwrap();
+    let tables = sq.tables().unwrap();
+    let person = tables
+        .iter()
+        .find(|t| t.kind == "node" && t.name == "person")
+        .expect("person survives");
+    let knows = tables
+        .iter()
+        .find(|t| t.kind == "rel" && t.name == "knows")
+        .expect("knows survives");
+    assert_eq!(knows.src_table.as_deref(), Some("person"));
+    assert_eq!(knows.dst_table.as_deref(), Some("person"));
+    assert_eq!(person.kind, "node");
+    assert_eq!(sq.node_count("person").unwrap(), 6);
+    assert_eq!(sq.rel_count("knows").unwrap(), EDGES.len() as i64);
+    assert_eq!(sq.node_columns("person").unwrap(), ["age", "name"]);
+
+    for row in 0..6i64 {
+        assert_eq!(
+            sq.read_node_prop("person", row, "age").unwrap(),
+            SqlValue::Int(AGES[row as usize] as i64)
+        );
+        assert_eq!(
+            sq.read_node_prop("person", row, "name").unwrap(),
+            SqlValue::Text(NAMES[row as usize].to_owned())
+        );
+        let fwd = sq.neighbors("knows", row, Direction::Fwd).unwrap();
+        let want: Vec<i64> = EDGES
+            .iter()
+            .filter(|&&(s, _)| i64::from(s) == row)
+            .map(|&(_, d)| i64::from(d))
+            .collect();
+        assert_eq!(fwd, want, "forward neighbors of {row}");
+    }
+}
+
+#[test]
+fn zu1_round_trips_through_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.zu1"),
+        dir.path().join("b.db"),
+        dir.path().join("c.zu1"),
+    );
+    seed_zu1(&a);
+    zu1_to_sqlite(&a, &b).unwrap();
+    assert_sqlite_matches(&b);
+    sqlite_to_zu1(&b, &c).unwrap();
+    assert_zu1_matches(&c);
+
+    // The twice-converted store answers a query exactly as the source.
+    let q = "MATCH (a:person)-[:knows]->(b) WHERE a.age < b.age \
+             RETURN a.name AS name, b.id AS to ORDER BY name, to";
+    let mut src = Zu1File::open(&a).unwrap();
+    let mut back = Zu1File::open(&c).unwrap();
+    let want = run_zu1(q, &mut src, &[]).unwrap();
+    let mid = run_sqlite(q, &SqliteStore::open(&b).unwrap(), &[]).unwrap();
+    let got = run_zu1(q, &mut back, &[]).unwrap();
+    assert!(!want.rows.is_empty());
+    assert_eq!(want.rows, mid.rows);
+    assert_eq!(want.rows, got.rows);
+}
+
+#[test]
+fn sqlite_round_trips_through_zu1() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    seed_sqlite(&a);
+    sqlite_to_zu1(&a, &b).unwrap();
+    assert_zu1_matches(&b);
+    zu1_to_sqlite(&b, &c).unwrap();
+    assert_sqlite_matches(&c);
+}
+
+#[test]
+fn distinct_endpoint_rels_error_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let mut sq = SqliteStore::open(&db).unwrap();
+    sq.create_node_table("person", &[]).unwrap();
+    sq.create_node_table("city", &[]).unwrap();
+    sq.create_rel_table("lives_in", "person", "city", &[])
+        .unwrap();
+    drop(sq);
+    let err = sqlite_to_zu1(&db, &dir.path().join("b.zu1")).unwrap_err();
+    assert!(
+        format!("{err}").contains("one node table"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn null_properties_error_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let mut sq = SqliteStore::open(&db).unwrap();
+    sq.create_node_table("person", &[("age", ColumnType::Integer)])
+        .unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
+    sq.begin().unwrap();
+    sq.insert_node_at("person", 0, &[SqlValue::Int(31)])
+        .unwrap();
+    sq.insert_node_at("person", 1, &[SqlValue::Null]).unwrap();
+    sq.insert_rel("knows", 0, 1, &[]).unwrap();
+    sq.commit().unwrap();
+    drop(sq);
+    let err = sqlite_to_zu1(&db, &dir.path().join("b.zu1")).unwrap_err();
+    assert!(format!("{err}").contains("null"), "unexpected error: {err}");
+}

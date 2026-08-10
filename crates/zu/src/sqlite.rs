@@ -221,9 +221,13 @@ pub fn run(source: &str, store: &SqliteStore, params: &[(&str, Value)]) -> Resul
     }
     let mut graph = SqliteGraph::new(store)?;
     let options = exec::Options {
-        // The same hand-injected WCOJ switch as the zu1 facade, so the
-        // parity corpus exercises the intersection on both engines.
-        wcoj: std::env::var("ZU_WCOJ").is_ok_and(|v| v == "1"),
+        // The same ZU_WCOJ override as the zu1 facade, so the parity
+        // corpus can pin either path on both engines.
+        wcoj: match std::env::var("ZU_WCOJ").as_deref() {
+            Ok("1") => exec::Wcoj::Force,
+            Ok("0") => exec::Wcoj::Off,
+            _ => exec::Wcoj::Auto,
+        },
         ..exec::Options::default()
     };
     exec::execute(&optimized, &query, &schema, &mut graph, &args, &options)

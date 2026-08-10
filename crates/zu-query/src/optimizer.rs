@@ -34,8 +34,9 @@ use crate::plan::{LogicalPlan, VarLength};
 const MAX_DP_RELS: usize = 12;
 
 /// Rewrites a built plan with join ordering and filter placement,
-/// then marks closing expands as ASP hash joins where the estimates
-/// justify the accumulate sweep.
+/// then marks closing expands: ASP hash joins where the estimates
+/// justify the accumulate sweep, and the WCOJ intersection where the
+/// close completes a cycle the fusion can take.
 pub fn optimize(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<LogicalPlan> {
     let plan = rewrite(plan, query, schema)?;
     Ok(mark_asp(plan, query, schema).0)
@@ -79,6 +80,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
             range,
             into,
             asp: _,
+            wcoj: _,
             optional,
         } => {
             let (input, est) = mark_asp(*input, query, schema);
@@ -90,7 +92,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
                 range,
                 into,
             };
-            let (asp, est) = if into {
+            let (asp, wcoj, est) = if into {
                 let edges: f64 = query.variables[rel]
                     .rel_tables
                     .iter()
@@ -98,9 +100,21 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
                     .map(|rd| rd.edge_count as f64)
                     .sum();
                 let asp = optional.is_none() && range.is_none() && est > edges.max(1.0);
-                (asp, est * into_prob(&e, query, schema))
+                // A closing expand completes a cycle in the join graph
+                // by construction, so docs/07 §4 injects the multiway
+                // intersection here. The fusion reads one sorted list
+                // per side, so undirected closes and multi-table rels
+                // keep the binary probe; the 16x intermediate-to-output
+                // ratio for acyclic marks arrives with the §6
+                // histograms. Optional closes are marked too: the
+                // compiler only fuses within one group, which keeps
+                // left-outer semantics exact.
+                let wcoj = range.is_none()
+                    && !matches!(direction, RelDirection::Undirected)
+                    && query.variables[rel].rel_tables.len() == 1;
+                (asp, wcoj, est * into_prob(&e, query, schema))
             } else {
-                (false, est * degree(&e, from, query, schema))
+                (false, false, est * degree(&e, from, query, schema))
             };
             (
                 LogicalPlan::Expand {
@@ -112,6 +126,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
                     range,
                     into,
                     asp,
+                    wcoj,
                     optional,
                 },
                 est.max(1e-6),
@@ -245,6 +260,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             range,
             into,
             asp,
+            wcoj,
             optional,
         } => Ok(LogicalPlan::Expand {
             input: Box::new(rewrite(*input, query, schema)?),
@@ -255,6 +271,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             range,
             into,
             asp,
+            wcoj,
             optional,
         }),
         LogicalPlan::Unwind { input, expr, slot } => Ok(LogicalPlan::Unwind {
@@ -357,6 +374,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
                 range,
                 into,
                 asp: _,
+                wcoj: _,
                 optional: None,
             } => {
                 ops.push(RunOp::Expand(ExpandOp {
@@ -456,6 +474,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
                         range: e.range,
                         into: *into,
                         asp: false,
+                        wcoj: false,
                         optional: None,
                     }
                 }
@@ -496,6 +515,7 @@ fn rebuild(ops: Vec<RunOp>, below: LogicalPlan) -> LogicalPlan {
                 range: e.range,
                 into: e.into,
                 asp: false,
+                wcoj: false,
                 optional: None,
             },
             RunOp::Filter(expr) => LogicalPlan::Filter {
@@ -1037,6 +1057,60 @@ mod tests {
         );
         assert_eq!(text.matches("ScanNodes").count(), 1, "got:\n{text}");
         assert_eq!(text.matches("ExpandInto").count(), 1, "got:\n{text}");
+    }
+
+    /// Collects `(into, wcoj)` per expand, bottom-up.
+    fn expand_marks(source: &str) -> Vec<(bool, bool)> {
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let mut plan = &optimize(built, &query, &schema).expect("optimize");
+        let mut marks = Vec::new();
+        loop {
+            match plan {
+                LogicalPlan::Empty => break,
+                LogicalPlan::Expand {
+                    input, into, wcoj, ..
+                } => {
+                    marks.push((*into, *wcoj));
+                    plan = input;
+                }
+                LogicalPlan::ScanNodes { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Unwind { input, .. }
+                | LogicalPlan::Project { input, .. }
+                | LogicalPlan::Aggregate { input, .. }
+                | LogicalPlan::Distinct { input }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Skip { input, .. }
+                | LogicalPlan::Limit { input, .. } => plan = input,
+            }
+        }
+        marks.reverse();
+        marks
+    }
+
+    #[test]
+    fn cyclic_closes_carry_the_wcoj_mark() {
+        // The closing expand is the cycle close, so it alone carries
+        // the mark; the two introducing expands stay unmarked.
+        let marks = expand_marks(
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+             RETURN a.id AS id",
+        );
+        assert_eq!(marks, [(false, false), (false, false), (true, true)]);
+    }
+
+    #[test]
+    fn undirected_closes_stay_unmarked() {
+        // Every edge undirected, so whichever edge the DP picks as the
+        // close has no single sorted list to gallop and stays unmarked.
+        let marks = expand_marks(
+            "MATCH (a:Person)-[:KNOWS]-(b)-[:KNOWS]-(c), (a)-[:KNOWS]-(c) \
+             RETURN a.id AS id",
+        );
+        assert!(marks.iter().any(|(into, _)| *into), "got: {marks:?}");
+        assert!(marks.iter().all(|(_, wcoj)| !wcoj), "got: {marks:?}");
     }
 
     #[test]

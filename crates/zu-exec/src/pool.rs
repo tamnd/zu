@@ -105,15 +105,43 @@ fn worker_loop(q: &'static Queue) {
 /// mandatory; dropping it waits too, so a panic on the submitting
 /// thread still keeps borrowed jobs alive until they finish.
 pub(crate) struct Pending {
-    latch: Arc<(Mutex<usize>, Condvar)>,
+    latch: Arc<Latch>,
+}
+
+struct Latch {
+    /// Jobs still running, readable without the mutex so the waiter
+    /// can spin: parking the caller on the condvar costs the same
+    /// milliseconds of Windows wakeup the workers pay, and the jobs
+    /// usually finish within microseconds of the caller's own work.
+    left: AtomicUsize,
+    mu: Mutex<()>,
+    done: Condvar,
+}
+
+impl Latch {
+    fn count_down(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Taking the mutex orders this notify after any waiter's
+            // check of `left`, so the wakeup cannot slip between the
+            // check and the wait.
+            drop(self.mu.lock().unwrap());
+            self.done.notify_all();
+        }
+    }
 }
 
 impl Pending {
     pub(crate) fn wait(&self) {
-        let (left, cv) = &*self.latch;
-        let mut left = left.lock().unwrap();
-        while *left > 0 {
-            left = cv.wait(left).unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < SPIN {
+            if self.latch.left.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        let mut guard = self.latch.mu.lock().unwrap();
+        while self.latch.left.load(Ordering::Acquire) > 0 {
+            guard = self.latch.done.wait(guard).unwrap();
         }
     }
 }
@@ -130,7 +158,11 @@ impl Drop for Pending {
 /// sees the panic as its result slot staying empty.
 pub(crate) fn submit<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) -> Pending {
     let q = queue();
-    let latch = Arc::new((Mutex::new(jobs.len()), Condvar::new()));
+    let latch = Arc::new(Latch {
+        left: AtomicUsize::new(jobs.len()),
+        mu: Mutex::new(()),
+        done: Condvar::new(),
+    });
     let cap = std::thread::available_parallelism().map_or(1, |n| n.get());
     // SAFETY: Pending waits, in wait() or in drop, until every job has
     // run, so the 'a borrows inside the jobs are live for as long as
@@ -139,12 +171,10 @@ pub(crate) fn submit<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) -> Pending {
     for job in jobs {
         let latch = Arc::clone(&latch);
         let wrapped: Job = Box::new(move || {
-            struct CountDown(Arc<(Mutex<usize>, Condvar)>);
+            struct CountDown(Arc<Latch>);
             impl Drop for CountDown {
                 fn drop(&mut self) {
-                    let (left, cv) = &*self.0;
-                    *left.lock().unwrap() -= 1;
-                    cv.notify_all();
+                    self.0.count_down();
                 }
             }
             let _count = CountDown(latch);

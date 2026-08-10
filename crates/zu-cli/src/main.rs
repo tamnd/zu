@@ -252,14 +252,30 @@ fn copy(
     let load_started = std::time::Instant::now();
     let result = (|| {
         let mut db = zu::zu1::file::Zu1File::create(out_path)?;
-        zu::zu1::graph::bulk_load_keyed(
+        let d = zu::zu1::graph::bulk_load_keyed(
             &mut db,
             "node",
             "edge",
             node_count,
             &sorted,
             key_by_row.as_deref(),
-        )
+        )?;
+        // A reordered load also stores the original ids as a property
+        // column. The key index alone only answers "which row is key k",
+        // which is enough for `{id: $k}` and for `neighbors --key`, but
+        // `RETURN n.id` reads a property, and with nothing stored the
+        // property path falls back to the row offset. That fallback is
+        // right for a load that kept its order and wrong for one that
+        // did not, so a reordered file that skips this returns the
+        // permuted position where the query asked for the id.
+        if let Some(keys) = key_by_row.as_deref() {
+            zu::zu1::props::store_props(
+                &mut db,
+                "node",
+                &[("id", zu::zu1::props::PropValues::Int(keys))],
+            )?;
+        }
+        Ok(d)
     })();
     match result {
         Ok(d) => {
@@ -798,6 +814,48 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reordered load must keep answering in the id space the input
+    /// used. The key index already does that for `{id: $k}` lookups;
+    /// this pins the property side, which reads a stored column and
+    /// used to fall back to the row offset and hand back the permuted
+    /// position instead of the id.
+    #[test]
+    fn a_reordered_copy_keeps_ids_readable_as_properties() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edges_path = dir.path().join("edges.txt");
+        let db_path = dir.path().join("out.zu1");
+        // Node 10 is the hub, so degree ordering certainly moves it off
+        // row 10 and the offset fallback cannot pass by coincidence.
+        std::fs::write(&edges_path, "10 11\n10 12\n10 13\n11 13\n12 13\n13 14\n")
+            .expect("write edges");
+        assert_eq!(
+            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::Degree),
+            ExitCode::SUCCESS
+        );
+
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let r = zu::query::run(
+            "MATCH (n:node {id: $id}) RETURN n.id AS id",
+            &mut db,
+            &[("id", Value::Int(10))],
+        )
+        .expect("point read");
+        assert_eq!(r.rows, [[Value::Int(10)]], "id came back as a row offset");
+
+        // Neighbors read the same way, so a traversal reports the ids
+        // the caller can ask about again.
+        let r = zu::query::run(
+            "MATCH (a:node {id: $id})-[:edge]->(b) RETURN b.id AS id ORDER BY id",
+            &mut db,
+            &[("id", Value::Int(10))],
+        )
+        .expect("one hop");
+        assert_eq!(
+            r.rows,
+            [[Value::Int(11)], [Value::Int(12)], [Value::Int(13)],]
+        );
+    }
 
     #[test]
     fn params_take_their_type_from_the_text() {

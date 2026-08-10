@@ -16,6 +16,9 @@ path = "src/main.rs"
 [dependencies]
 zu.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 arrow = ["zu/arrow"]
 

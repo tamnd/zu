@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use zu_query::csr::Csr;
-use zu_query::kernels;
+use zu_query::{kernels, recursive};
 
 const EDGE_CAP: usize = 8_000_000;
 const TRIANGLE_EDGES: usize = 2_000_000;
@@ -109,6 +109,37 @@ fn main() {
     println!(
         "bfs: {:.1} MTEPS from vertex {source} ({reached} of {nodes} reached, {iters} iters)",
         traversed as f64 * f64::from(iters) / secs / 1e6
+    );
+
+    let rev = csr.reversed();
+    let recursive = recursive::recursive_bfs(&csr, Some(&rev), &[source], u32::MAX, 0);
+    assert_eq!(recursive, levels, "recursive_bfs must agree with bfs");
+    let mut iters = 0u32;
+    let start = Instant::now();
+    while start.elapsed().as_secs_f64() < 1.0 {
+        std::hint::black_box(recursive::recursive_bfs(
+            &csr,
+            Some(&rev),
+            &[source],
+            u32::MAX,
+            0,
+        ));
+        iters += 1;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "recursive_bfs: {:.1} MTEPS hybrid frontier, all cores ({iters} iters)",
+        traversed as f64 * f64::from(iters) / secs / 1e6
+    );
+
+    let sources: Vec<u32> = (0..256u32).map(|i| (i * 2654435761) % nodes).collect();
+    let start = Instant::now();
+    let mut pairs = 0u64;
+    recursive::hybrid_bfs(&csr, Some(&rev), &sources, 2, 0, &mut |_, _, _| pairs += 1);
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "hybrid_bfs: {:.1} sources/s multi-source morsels (256 sources to 2 hops, {pairs} pairs, {secs:.3} s)",
+        256.0 / secs
     );
 
     let prefix = edges[..edges.len().min(TRIANGLE_EDGES)].to_vec();

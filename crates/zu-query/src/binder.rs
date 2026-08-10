@@ -11,7 +11,7 @@
 //! types as `Any` once the base is a node, rel, or map; the typed
 //! column catalog tightens this later without changing the shape here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use zu_common::{Result, ZuError};
@@ -171,6 +171,8 @@ pub struct BoundQuery {
     pub variables: Vec<VarDef>,
     pub params: Vec<String>,
     pub columns: Vec<String>,
+    /// Shape of each path variable by slot, for `RETURN p` assembly.
+    pub path_shapes: BTreeMap<usize, Vec<PathPart>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,6 +214,17 @@ pub struct BoundPath {
     pub slot: Option<usize>,
     pub start: BoundNode,
     pub steps: Vec<(BoundRel, BoundNode)>,
+}
+
+/// One element of a path variable's shape: how the executor
+/// reassembles `RETURN p` as the alternating node/rel list from the
+/// pattern's slots (docs/07 §5). A var-length rel slot holds a PMR
+/// chain whose interior nodes splice in between the endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPart {
+    Node(usize),
+    Rel(usize),
+    VarRel(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,6 +325,7 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         scope: HashMap::new(),
         params: Vec::new(),
         columns: Vec::new(),
+        path_shapes: BTreeMap::new(),
     };
     let mut clauses = Vec::new();
     for clause in &query.clauses {
@@ -322,6 +336,7 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         variables: binder.variables,
         params: binder.params,
         columns: binder.columns,
+        path_shapes: binder.path_shapes,
     })
 }
 
@@ -333,6 +348,7 @@ struct Binder<'a> {
     scope: HashMap<String, usize>,
     params: Vec<String>,
     columns: Vec<String>,
+    path_shapes: BTreeMap<usize, Vec<PathPart>>,
 }
 
 /// Expression context: where aggregates are legal and whether one was
@@ -580,6 +596,18 @@ impl Binder<'_> {
             return Err(invalid(
                 "a SHORTEST selector needs a variable-length relationship".into(),
             ));
+        }
+        if let Some(slot) = slot {
+            let mut parts = vec![PathPart::Node(start.slot)];
+            for (rel, node) in &steps {
+                parts.push(if rel.range.is_some() {
+                    PathPart::VarRel(rel.slot)
+                } else {
+                    PathPart::Rel(rel.slot)
+                });
+                parts.push(PathPart::Node(node.slot));
+            }
+            self.path_shapes.insert(slot, parts);
         }
         Ok(BoundPath { slot, start, steps })
     }
@@ -1003,7 +1031,9 @@ impl Binder<'_> {
                 Type::Int
             }
             Func::Size => {
-                if !matches!(arg_ty, Type::List(_) | Type::Str | Type::Any) {
+                // A path is its alternating node and rel list, so
+                // size() applies to it like any other list.
+                if !matches!(arg_ty, Type::List(_) | Type::Str | Type::Path | Type::Any) {
                     return Err(invalid(format!(
                         "size() needs a list or string, got {arg_ty}"
                     )));

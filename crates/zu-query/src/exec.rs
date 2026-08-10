@@ -54,12 +54,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use zu_common::{Result, ZuError};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
-use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, Schema};
+use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema};
 use crate::plan::{LogicalPlan, expr_text};
 
 /// Vector width of one chunk fill.
@@ -78,9 +79,80 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
-    Node { table: u32, offset: u64 },
-    Rel { table: u32, src: u64, dst: u64 },
+    Node {
+        table: u32,
+        offset: u64,
+    },
+    Rel {
+        table: u32,
+        src: u64,
+        dst: u64,
+    },
     List(Vec<Value>),
+    /// A PMR chain (docs/07 §5): the executor-internal form of a
+    /// variable-length path. [`settle`] turns it into the edge list
+    /// before any value leaves the pipeline, so results never hold one.
+    Path(Arc<PathLink>),
+}
+
+/// One link of a PMR chain: a persistent predecessor list. Every DFS
+/// branch shares its parent's links, so holding every path from one
+/// start node costs the tree of links, not one edge list per path.
+/// `prev` and `rel` are `None` only on the root link at the start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathLink {
+    pub prev: Option<Arc<PathLink>>,
+    pub rel: Option<Value>,
+    pub node: Value,
+    pub hops: u64,
+}
+
+/// The settled form of a chain: the rel values root first, which is
+/// what a variable-length rel variable equals outside the executor.
+fn path_rels(link: &PathLink) -> Value {
+    let mut rels = Vec::with_capacity(link.hops as usize);
+    let mut cur = Some(link);
+    while let Some(l) = cur {
+        if let Some(rel) = &l.rel {
+            rels.push(rel.clone());
+        }
+        cur = l.prev.as_deref();
+    }
+    rels.reverse();
+    Value::List(rels)
+}
+
+/// Replaces every PMR chain in a value with its settled edge list.
+/// Runs where values leave the pipeline: projections, grouping keys,
+/// sort keys, and aggregate arguments.
+fn settle(v: Value) -> Value {
+    match v {
+        Value::Path(link) => path_rels(&link),
+        Value::List(items) => Value::List(items.into_iter().map(settle).collect()),
+        other => other,
+    }
+}
+
+fn chain_has_rel(link: &PathLink, rel: &Value) -> bool {
+    let mut cur = Some(link);
+    while let Some(l) = cur {
+        if l.rel.as_ref() == Some(rel) {
+            return true;
+        }
+        cur = l.prev.as_deref();
+    }
+    false
+}
+
+fn chain_has_node(link: &PathLink, table: u32, offset: u64) -> bool {
+    let mut cur = Some(link);
+    while let Some(l) = cur {
+        if l.node == (Value::Node { table, offset }) {
+            return true;
+        }
+        cur = l.prev.as_deref();
+    }
+    false
 }
 
 /// The rows a query returns, one column name per RETURN item.
@@ -425,8 +497,11 @@ impl Ord for OrdValue {
                 Value::Str(_) => 3,
                 Value::Node { .. } => 4,
                 Value::Rel { .. } => 5,
-                Value::List(_) => 6,
+                Value::List(_) | Value::Path(_) => 6,
             }
+        }
+        if matches!(self.0, Value::Path(_)) || matches!(other.0, Value::Path(_)) {
+            return OrdValue(settle(self.0.clone())).cmp(&OrdValue(settle(other.0.clone())));
         }
         match (&self.0, &other.0) {
             (Value::Int(a), Value::Int(b)) => a.cmp(b),
@@ -658,10 +733,14 @@ struct StageBuilder {
     /// invalidated by any flatten between it and the filter.
     compactable: Option<usize>,
     flat: bool,
+    /// Path variable slot to the slots its shape reads: evaluating a
+    /// path assembles from the pattern's slots, a read no expression
+    /// walk can see.
+    shapes: BTreeMap<usize, Vec<usize>>,
 }
 
 impl StageBuilder {
-    fn new(flat: bool) -> Self {
+    fn new(flat: bool, shapes: BTreeMap<usize, Vec<usize>>) -> Self {
         StageBuilder {
             descs: Vec::new(),
             chunk_slots: Vec::new(),
@@ -669,6 +748,22 @@ impl StageBuilder {
             slot_loc: BTreeMap::new(),
             compactable: None,
             flat,
+            shapes,
+        }
+    }
+
+    /// Closes a slot set over path shapes: a path variable this stage
+    /// assembles (its slot bound by no operator here) reads every slot
+    /// of its shape. A path bound by an earlier stage is an ordinary
+    /// column and expands nothing.
+    fn expand_shapes(&self, out: &mut BTreeSet<usize>) {
+        let paths: Vec<usize> = out
+            .iter()
+            .copied()
+            .filter(|s| !self.slot_loc.contains_key(s) && self.shapes.contains_key(s))
+            .collect();
+        for path in paths {
+            out.extend(self.shapes[&path].iter().copied());
         }
     }
 
@@ -704,9 +799,13 @@ impl StageBuilder {
     fn unflat_of(&self, expr: &BoundExpr) -> Result<Vec<usize>> {
         let mut slots = BTreeSet::new();
         expr_slots(expr, &mut slots);
+        self.expand_shapes(&mut slots);
         let mut chunks = BTreeSet::new();
         for slot in slots {
             let Some(&(c, _)) = self.slot_loc.get(&slot) else {
+                if self.shapes.contains_key(&slot) {
+                    continue;
+                }
                 return Err(invalid(format!(
                     "expression references slot {slot} before anything binds it"
                 )));
@@ -1017,6 +1116,7 @@ fn compile_optional_group(
             _ => {}
         }
     }
+    b.expand_shapes(&mut read);
     for slot in read {
         if let Some(&(c, _)) = b.slot_loc.get(&slot) {
             b.ensure_flat(c);
@@ -1126,6 +1226,7 @@ fn rewrite_count_expand(
     }
     post_refs(post, &mut full_refs);
     full_refs.extend(extra.iter().copied());
+    b.expand_shapes(&mut full_refs);
     for desc in &mut b.descs {
         if let OpDesc::Expand {
             chunk, emit_rels, ..
@@ -1179,6 +1280,7 @@ fn rewrite_count_expand(
             }
             post_refs(post, &mut others);
             others.extend(extra.iter().copied());
+            b.expand_shapes(&mut others);
             if b.chunk_slots[f].iter().any(|s| others.contains(s)) {
                 continue;
             }
@@ -1224,6 +1326,7 @@ fn rewrite_count_expand(
     }
     post_refs(post, &mut refs);
     refs.extend(extra.iter().copied());
+    b.expand_shapes(&mut refs);
     // Aggregates whose argument touches the expand's chunk: at most
     // one, and it must be a bare non-distinct count of one of the
     // chunk's slots. Every other argument counts as a reference.
@@ -1232,6 +1335,7 @@ fn rewrite_count_expand(
         let Some(arg) = &spec.arg else { continue };
         let mut arg_refs = BTreeSet::new();
         expr_slots(arg, &mut arg_refs);
+        b.expand_shapes(&mut arg_refs);
         if arg_refs.iter().any(|s| b.chunk_slots[c].contains(s)) {
             counting.push(ix);
         } else {
@@ -1299,8 +1403,21 @@ fn build_stages(
         .collect();
     let mut proj_ix = 0;
 
+    let shapes: BTreeMap<usize, Vec<usize>> = query
+        .path_shapes
+        .iter()
+        .map(|(&slot, parts)| {
+            let read = parts
+                .iter()
+                .map(|p| match p {
+                    PathPart::Node(s) | PathPart::Rel(s) | PathPart::VarRel(s) => *s,
+                })
+                .collect();
+            (slot, read)
+        })
+        .collect();
     let mut stages = Vec::new();
-    let mut b = StageBuilder::new(options.flat);
+    let mut b = StageBuilder::new(options.flat, shapes.clone());
     b.descs.push(OpDesc::Source);
 
     let mut i = 0;
@@ -1425,7 +1542,7 @@ fn build_stages(
                             invalid("WITH item lost its slot, this is a bug".into())
                         })?);
                     }
-                    b = StageBuilder::new(options.flat);
+                    b = StageBuilder::new(options.flat, shapes.clone());
                     let chunk = b.new_chunk(slots, false);
                     b.descs.push(OpDesc::RowSource { chunk });
                     b.produced(chunk);
@@ -1530,6 +1647,9 @@ struct StageCtx<'a> {
     params: &'a [Value],
     counts: &'a BTreeMap<u32, u64>,
     slot_loc: &'a BTreeMap<usize, (usize, usize)>,
+    /// Path variable shapes from the binder, the assembly recipe
+    /// behind [`assemble_path`]. No operator produces a path slot.
+    path_shapes: &'a BTreeMap<usize, Vec<PathPart>>,
     chunks: Vec<Chunk>,
     states: Vec<OpState>,
     rows: Vec<Vec<Value>>,
@@ -1556,16 +1676,65 @@ fn value_of(ctx: &mut StageCtx, slot: usize) -> Result<Value> {
     if let Some(v) = ctx.overlay.get(&slot) {
         return Ok(v.clone());
     }
-    let Some(&(c, col)) = ctx.slot_loc.get(&slot) else {
-        return Err(invalid(format!("slot {slot} is not bound in this stage")));
-    };
-    let chunk = &ctx.chunks[c];
-    let Some(pos) = chunk.cur else {
-        return Err(invalid(
-            "read of an unflattened vector, the planner missed a flatten".into(),
-        ));
-    };
-    Ok(chunk.cols[col][pos].clone())
+    if let Some(&(c, col)) = ctx.slot_loc.get(&slot) {
+        let chunk = &ctx.chunks[c];
+        let Some(pos) = chunk.cur else {
+            return Err(invalid(
+                "read of an unflattened vector, the planner missed a flatten".into(),
+            ));
+        };
+        return Ok(chunk.cols[col][pos].clone());
+    }
+    let shapes = ctx.path_shapes;
+    if let Some(parts) = shapes.get(&slot) {
+        return assemble_path(ctx, parts);
+    }
+    Err(invalid(format!("slot {slot} is not bound in this stage")))
+}
+
+/// Materializes a path variable from its recorded shape: the
+/// alternating node and rel list of docs/07 §5, read straight from the
+/// pattern's slots at eval time. A var-length slot holds a PMR chain;
+/// its hops splice in as rel, node pairs with the final node dropped
+/// because the pattern's next node part supplies it. Any null part
+/// nulls the whole path, the OPTIONAL MATCH contract.
+fn assemble_path(ctx: &mut StageCtx, parts: &[PathPart]) -> Result<Value> {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            PathPart::Node(slot) | PathPart::Rel(slot) => match value_of(ctx, *slot)? {
+                Value::Null => return Ok(Value::Null),
+                v => out.push(v),
+            },
+            PathPart::VarRel(slot) => match value_of(ctx, *slot)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Path(link) => {
+                    let mut hops = Vec::new();
+                    let mut cur = Some(&link);
+                    while let Some(l) = cur {
+                        if let Some(rel) = &l.rel {
+                            hops.push((rel.clone(), l.node.clone()));
+                        }
+                        cur = l.prev.as_ref();
+                    }
+                    hops.reverse();
+                    let last = hops.len().saturating_sub(1);
+                    for (ix, (rel, node)) in hops.into_iter().enumerate() {
+                        out.push(rel);
+                        if ix < last {
+                            out.push(node);
+                        }
+                    }
+                }
+                other => {
+                    return Err(invalid(format!(
+                        "path assembly expects a PMR chain, got {other:?}"
+                    )));
+                }
+            },
+        }
+    }
+    Ok(Value::List(out))
 }
 
 fn node_value(v: Value, what: &str) -> Result<(u32, u64)> {
@@ -1697,25 +1866,25 @@ fn hop_edges(
 /// `min..=max` hops from the start node under the mode's repeat rule,
 /// WALK unrestricted (the binder guarantees a bound), TRAIL with no
 /// repeated edge, ACYCLIC with no repeated node. A path whose endpoint
-/// sits in `to_tables` emits one node value and its edge list. `path`
-/// doubles as the visited-edge set and `nodes` as the visited-node
-/// set, the start included; paths stay short enough that a linear scan
-/// beats a hash set.
-#[allow(clippy::too_many_arguments)]
+/// sits in `to_tables` emits one node value and its PMR chain, which
+/// is one `Arc` clone of the current link; sibling branches share every
+/// ancestor link, so emitting all paths costs one link per path, not
+/// one edge list per path. The chain doubles as the visited set for
+/// the repeat rules; paths stay short enough that the linear chain
+/// scan beats a hash set.
 fn enumerate_paths(
     ctx: &mut StageCtx,
     spec: &VarSpec,
     table: u32,
     offset: u64,
-    path: &mut Vec<Value>,
-    nodes: &mut Vec<(u32, u64)>,
+    link: &Arc<PathLink>,
     far: &mut Vec<Value>,
     trails: &mut Vec<Value>,
 ) -> Result<()> {
-    let depth = path.len() as u64;
+    let depth = link.hops;
     if depth >= spec.min && spec.to_tables.contains(&table) {
         far.push(Value::Node { table, offset });
-        trails.push(Value::List(path.clone()));
+        trails.push(Value::Path(link.clone()));
     }
     if spec.max.is_some_and(|m| depth >= m) {
         return Ok(());
@@ -1730,20 +1899,35 @@ fn enumerate_paths(
         } else {
             let repeats = match spec.mode {
                 PathMode::Walk => false,
-                PathMode::Trail => path.contains(&rel_val),
-                PathMode::Acyclic => nodes.contains(&(next_table, next_offset)),
+                PathMode::Trail => chain_has_rel(link, &rel_val),
+                PathMode::Acyclic => chain_has_node(link, next_table, next_offset),
             };
             if repeats {
                 continue;
             }
         }
-        path.push(rel_val);
-        nodes.push((next_table, next_offset));
-        enumerate_paths(ctx, spec, next_table, next_offset, path, nodes, far, trails)?;
-        nodes.pop();
-        path.pop();
+        let child = Arc::new(PathLink {
+            prev: Some(link.clone()),
+            rel: Some(rel_val),
+            node: Value::Node {
+                table: next_table,
+                offset: next_offset,
+            },
+            hops: depth + 1,
+        });
+        enumerate_paths(ctx, spec, next_table, next_offset, &child, far, trails)?;
     }
     Ok(())
+}
+
+/// The root of a PMR chain: zero hops at the start node.
+fn chain_root(table: u32, offset: u64) -> Arc<PathLink> {
+    Arc::new(PathLink {
+        prev: None,
+        rel: None,
+        node: Value::Node { table, offset },
+        hops: 0,
+    })
 }
 
 /// The breadth-first prepass behind the SHORTEST selectors: minimum
@@ -2173,23 +2357,37 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let mut trails = Vec::new();
             match selector {
                 Some(Selector::AnyShortest) => {
+                    // Chains build in discovery order, so a node's
+                    // parent chain always exists before its own and
+                    // every endpoint's path is one `Arc` clone.
                     let bfs = hop_levels(ctx, rels, *direction, *max, table, offset)?;
+                    let mut chains: BTreeMap<(u32, u64), Arc<PathLink>> = BTreeMap::new();
+                    chains.insert((table, offset), chain_root(table, offset));
                     for &(t, o) in &bfs.order {
+                        if let Some((rel_val, pt, po)) = bfs.parents.get(&(t, o)) {
+                            let parent = chains[&(*pt, *po)].clone();
+                            let hops = parent.hops + 1;
+                            chains.insert(
+                                (t, o),
+                                Arc::new(PathLink {
+                                    prev: Some(parent),
+                                    rel: Some(rel_val.clone()),
+                                    node: Value::Node {
+                                        table: t,
+                                        offset: o,
+                                    },
+                                    hops,
+                                }),
+                            );
+                        }
                         if bfs.levels[&(t, o)] < *min || !to_tables.contains(&t) {
                             continue;
                         }
-                        let mut hops = Vec::new();
-                        let (mut ct, mut co) = (t, o);
-                        while let Some((rel_val, pt, po)) = bfs.parents.get(&(ct, co)) {
-                            hops.push(rel_val.clone());
-                            (ct, co) = (*pt, *po);
-                        }
-                        hops.reverse();
                         far.push(Value::Node {
                             table: t,
                             offset: o,
                         });
-                        trails.push(Value::List(hops));
+                        trails.push(Value::Path(chains[&(t, o)].clone()));
                     }
                 }
                 Some(Selector::AllShortest) => {
@@ -2203,16 +2401,8 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         mode: *mode,
                         levels: Some(&bfs.levels),
                     };
-                    enumerate_paths(
-                        ctx,
-                        &spec,
-                        table,
-                        offset,
-                        &mut Vec::new(),
-                        &mut vec![(table, offset)],
-                        &mut far,
-                        &mut trails,
-                    )?;
+                    let root = chain_root(table, offset);
+                    enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
                 }
                 None => {
                     let spec = VarSpec {
@@ -2224,16 +2414,8 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         mode: *mode,
                         levels: None,
                     };
-                    enumerate_paths(
-                        ctx,
-                        &spec,
-                        table,
-                        offset,
-                        &mut Vec::new(),
-                        &mut vec![(table, offset)],
-                        &mut far,
-                        &mut trails,
-                    )?;
+                    let root = chain_root(table, offset);
+                    enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
                 }
             }
             if far.is_empty() {
@@ -2427,7 +2609,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
             }
-            let items = match eval(ctx, expr)? {
+            let items = match settle(eval(ctx, expr)?) {
                 Value::List(items) => items,
                 Value::Null => continue,
                 other => {
@@ -2703,16 +2885,16 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     })
                 }
                 Eq | Ne => {
-                    let l = eval(ctx, lhs)?;
-                    let r = eval(ctx, rhs)?;
+                    let l = settle(eval(ctx, lhs)?);
+                    let r = settle(eval(ctx, rhs)?);
                     Ok(match cmp_eq(&l, &r) {
                         Some(b) => Value::Bool(if *op == Eq { b } else { !b }),
                         None => Value::Null,
                     })
                 }
                 Lt | Le | Gt | Ge => {
-                    let l = eval(ctx, lhs)?;
-                    let r = eval(ctx, rhs)?;
+                    let l = settle(eval(ctx, lhs)?);
+                    let r = settle(eval(ctx, rhs)?);
                     if matches!(l, Value::Null) || matches!(r, Value::Null) {
                         return Ok(Value::Null);
                     }
@@ -2728,13 +2910,13 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     })
                 }
                 Add | Sub | Mul | Div | Mod => {
-                    let l = eval(ctx, lhs)?;
-                    let r = eval(ctx, rhs)?;
+                    let l = settle(eval(ctx, lhs)?);
+                    let r = settle(eval(ctx, rhs)?);
                     arith(*op, l, r)
                 }
                 In => {
-                    let l = eval(ctx, lhs)?;
-                    match eval(ctx, rhs)? {
+                    let l = settle(eval(ctx, lhs)?);
+                    match settle(eval(ctx, rhs)?) {
                         Value::Null => Ok(Value::Null),
                         Value::List(items) => {
                             let mut saw_null = false;
@@ -2791,6 +2973,9 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     return Err(invalid("size() takes exactly one argument".into()));
                 }
                 match eval(ctx, &args[0])? {
+                    // The chain stores its length, so size(r) on a
+                    // variable-length rel never materializes the list.
+                    Value::Path(link) => Ok(Value::Int(link.hops as i64)),
                     Value::List(items) => Ok(Value::Int(items.len() as i64)),
                     Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
                     Value::Null => Ok(Value::Null),
@@ -3030,7 +3215,7 @@ fn materialize(sink: &SinkDef, query: &BoundQuery, ctx: &mut StageCtx) -> Result
     ctx.overlay.clear();
     let mut values = Vec::with_capacity(sink.items.len());
     for item in &sink.items {
-        values.push(eval(ctx, &item.expr)?);
+        values.push(settle(eval(ctx, &item.expr)?));
     }
     for (item, v) in sink.items.iter().zip(&values) {
         if let Some(slot) = item_slot(item, query) {
@@ -3039,11 +3224,11 @@ fn materialize(sink: &SinkDef, query: &BoundQuery, ctx: &mut StageCtx) -> Result
     }
     let mut keys = Vec::new();
     for (expr, _) in sort_exprs(sink) {
-        keys.push(OrdValue(eval(ctx, expr)?));
+        keys.push(OrdValue(settle(eval(ctx, expr)?)));
     }
     let mut extra = BTreeMap::new();
     for &slot in &sink.extra_slots {
-        extra.insert(slot, value_of(ctx, slot)?);
+        extra.insert(slot, settle(value_of(ctx, slot)?));
     }
     ctx.overlay.clear();
     Ok(Row {
@@ -3061,7 +3246,7 @@ fn update_groups(
 ) -> Result<()> {
     let mut keyvals = Vec::new();
     for item in sink.items.iter().filter(|it| !it.aggregate) {
-        keyvals.push(OrdValue(eval(ctx, &item.expr)?));
+        keyvals.push(OrdValue(settle(eval(ctx, &item.expr)?)));
     }
     let mut mult: i64 = 1;
     for &c in unflat {
@@ -3083,7 +3268,7 @@ fn update_groups(
             .ok_or_else(|| invalid(format!("{:?}() needs an argument", spec.func)))?;
         match spec.arg_chunk {
             None => {
-                let v = eval(ctx, arg)?;
+                let v = settle(eval(ctx, arg)?);
                 state.add(v, mult)?;
             }
             Some(c) => {
@@ -3091,7 +3276,7 @@ fn update_groups(
                 let others = mult / size as i64;
                 for pos in 0..size {
                     ctx.chunks[c].cur = Some(pos);
-                    let v = eval(ctx, arg)?;
+                    let v = settle(eval(ctx, arg)?);
                     state.add(v, others)?;
                 }
                 ctx.chunks[c].cur = None;
@@ -3314,6 +3499,7 @@ fn drive_worker(
         params: job.params,
         counts: job.counts,
         slot_loc: &stage.slot_loc,
+        path_shapes: &job.query.path_shapes,
         chunks: Vec::new(),
         states: Vec::new(),
         rows: Vec::new(),
@@ -3412,6 +3598,7 @@ fn run_stage_parallel(
         params: job.params,
         counts: job.counts,
         slot_loc: &stage.slot_loc,
+        path_shapes: &job.query.path_shapes,
         chunks: Vec::new(),
         states: Vec::new(),
         rows: Vec::new(),
@@ -3537,6 +3724,7 @@ fn run_stages(
             params,
             counts: &counts,
             slot_loc: &stage.slot_loc,
+            path_shapes: &query.path_shapes,
             chunks: stage
                 .chunk_slots
                 .iter()
@@ -4140,6 +4328,218 @@ mod tests {
             &[],
         );
         assert_eq!(int_rows(&any), int_rows(&trails));
+    }
+
+    fn node(offset: u64) -> Value {
+        Value::Node { table: 0, offset }
+    }
+
+    fn knows(src: u64, dst: u64) -> Value {
+        Value::Rel { table: 2, src, dst }
+    }
+
+    #[test]
+    fn path_variables_return_the_alternating_list() {
+        let r = run(
+            "MATCH p = (a:Person {id: $src})-[:KNOWS]->(b) \
+             RETURN p, b.id AS id ORDER BY id",
+            &[("src", Value::Int(0))],
+        );
+        assert_eq!(
+            r.rows,
+            [
+                vec![
+                    Value::List(vec![node(0), knows(0, 1), node(1)]),
+                    Value::Int(1)
+                ],
+                vec![
+                    Value::List(vec![node(0), knows(0, 2), node(2)]),
+                    Value::Int(2)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn var_length_paths_splice_interior_nodes() {
+        // Two hops from 0: through 1 to 2 and 3, through 2 to 4. The
+        // chain's interior node appears between the endpoints.
+        let r = run(
+            "MATCH p = (a:Person {id: 0})-[:KNOWS*2..2]->(b) RETURN p ORDER BY p",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [Value::List(vec![
+                    node(0),
+                    knows(0, 1),
+                    node(1),
+                    knows(1, 2),
+                    node(2)
+                ])],
+                [Value::List(vec![
+                    node(0),
+                    knows(0, 1),
+                    node(1),
+                    knows(1, 3),
+                    node(3)
+                ])],
+                [Value::List(vec![
+                    node(0),
+                    knows(0, 2),
+                    node(2),
+                    knows(2, 4),
+                    node(4)
+                ])],
+            ]
+        );
+    }
+
+    #[test]
+    fn shortest_path_variables_return_whole_paths() {
+        let r = run(
+            "MATCH p = ANY SHORTEST (a:Person {id: 0})-[:KNOWS*]->(b) RETURN p ORDER BY p",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [Value::List(vec![node(0), knows(0, 1), node(1)])],
+                [Value::List(vec![
+                    node(0),
+                    knows(0, 1),
+                    node(1),
+                    knows(1, 3),
+                    node(3)
+                ])],
+                [Value::List(vec![node(0), knows(0, 2), node(2)])],
+                [Value::List(vec![
+                    node(0),
+                    knows(0, 2),
+                    node(2),
+                    knows(2, 4),
+                    node(4)
+                ])],
+                [Value::List(vec![
+                    node(0),
+                    knows(0, 2),
+                    node(2),
+                    knows(2, 4),
+                    node(4),
+                    knows(4, 5),
+                    node(5)
+                ])],
+            ]
+        );
+    }
+
+    #[test]
+    fn with_carries_a_materialized_path() {
+        // The defining stage assembles p once at the WITH boundary;
+        // the next stage reads the settled list from its chunks.
+        let r = run(
+            "MATCH p = (a:Person {id: 0})-[:KNOWS*2..2]->(b) WITH p, b WHERE b.id = 4 \
+             RETURN size(p) AS n, p",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [vec![
+                Value::Int(5),
+                Value::List(vec![node(0), knows(0, 2), node(2), knows(2, 4), node(4)]),
+            ]]
+        );
+    }
+
+    #[test]
+    fn var_length_rel_variables_settle_to_edge_lists() {
+        let r = run(
+            "MATCH (a:Person {id: 0})-[r:KNOWS*2..2]->(b) WHERE b.id = 4 RETURN r",
+            &[],
+        );
+        assert_eq!(r.rows, [[Value::List(vec![knows(0, 2), knows(2, 4)])]]);
+    }
+
+    #[test]
+    fn optional_match_paths_bind_null() {
+        // Node 4 has exactly one 3-hop continuation (4, 5, 0, 1 or 2);
+        // restricting b to an impossible id nulls the whole path.
+        let r = run(
+            "MATCH (a:Person {id: 4}) \
+             OPTIONAL MATCH p = (a)-[:KNOWS]->(b {id: $none}) RETURN a.id AS id, p",
+            &[("none", Value::Int(99))],
+        );
+        assert_eq!(r.rows, [vec![Value::Int(4), Value::Null]]);
+    }
+
+    #[test]
+    fn pmr_chains_share_prefix_links_across_paths() {
+        // Enumerate every trail from node 0 directly and count the
+        // distinct chain links behind the emitted paths. The DFS emits
+        // one link per path plus the shared root, while the settled
+        // lists cost the sum of all path lengths, which is the memory
+        // claim behind the representation.
+        let schema = schema();
+        let counts: BTreeMap<u32, u64> = schema
+            .nodes()
+            .iter()
+            .map(|n| (n.id, n.node_count))
+            .collect();
+        let slot_loc = BTreeMap::new();
+        let shapes = BTreeMap::new();
+        let mut graph = mock();
+        let mut ctx = StageCtx {
+            graph: &mut graph,
+            params: &[],
+            counts: &counts,
+            slot_loc: &slot_loc,
+            path_shapes: &shapes,
+            chunks: Vec::new(),
+            states: Vec::new(),
+            rows: Vec::new(),
+            overlay: BTreeMap::new(),
+            scratch: Vec::new(),
+            edge_sets: BTreeMap::new(),
+            morsel: None,
+            stats: Vec::new(),
+        };
+        let rels = [RelStep {
+            id: 2,
+            from_table: 0,
+            to_table: 0,
+        }];
+        let spec = VarSpec {
+            rels: &rels,
+            direction: RelDirection::Out,
+            to_tables: &[0],
+            min: 1,
+            max: Some(6),
+            mode: PathMode::Trail,
+            levels: None,
+        };
+        let root = chain_root(0, 0);
+        let (mut far, mut trails) = (Vec::new(), Vec::new());
+        enumerate_paths(&mut ctx, &spec, 0, 0, &root, &mut far, &mut trails).expect("enumerate");
+        let mut links = BTreeSet::new();
+        let mut total_hops = 0u64;
+        for trail in &trails {
+            let Value::Path(link) = trail else {
+                panic!("var expand emits chains, got {trail:?}");
+            };
+            total_hops += link.hops;
+            let mut cur = Some(link);
+            while let Some(l) = cur {
+                links.insert(Arc::as_ptr(l) as usize);
+                cur = l.prev.as_ref();
+            }
+        }
+        assert_eq!(links.len(), trails.len() + 1, "one link per path plus root");
+        assert!(
+            total_hops > links.len() as u64,
+            "sharing beats materialized lists: {total_hops} hops in {} links",
+            links.len()
+        );
     }
 
     fn profiled(source: &str, params: &[(&str, Value)]) -> (QueryResult, Profile) {

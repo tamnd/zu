@@ -12,6 +12,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # tiny-keccak, pulled in through arrow's ahash. A public domain
+    # dedication, as permissive as it gets.
+    "CC0-1.0",
 ]
 
 [sources]

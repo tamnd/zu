@@ -1,0 +1,292 @@
+//! Deterministic crash injection at every syscall boundary.
+//!
+//! A recorded workload runs two committed txns and a checkpoint fold
+//! against recording files that log every write, length change, and
+//! sync. The harness then builds the file image a crash could leave at
+//! every boundary: the full prefix at each cut, the prefix with each
+//! unsynced write dropped (reordering loss), and the prefix with the
+//! final write torn at several lengths. Every image is recovered and
+//! its logical state must be a committed prefix of the workload,
+//! pre-txn or post-txn and nothing else, and a fold run on the
+//! recovered image must not change that state.
+
+use zu_zu1::catalog::Catalog;
+use zu_zu1::file::Zu1File;
+use zu_zu1::fold::{checkpoint_fold, recover};
+use zu_zu1::graph::{Direction, GraphReader, bulk_load_as};
+use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
+use zu_zu1::txn::{Cell, Mvcc};
+use zu_zu1::vfs::{IoEvent, IoFile, IoLog, RealFile, RecordingFile};
+use zu_zu1::wal::Wal;
+
+/// Everything a reader can observe about the fixture's tables at the
+/// store's current epoch, base file and overlays merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct State {
+    total: u64,
+    ages: Vec<u64>,
+    names: Vec<Vec<u8>>,
+    deleted: Vec<bool>,
+    out: Vec<Vec<u64>>,
+}
+
+fn state(db: &mut Zu1File, mvcc: &Mvcc, person: u32, knows: u32) -> State {
+    let epoch = mvcc.epoch();
+    let base_count = Catalog::load(db)
+        .unwrap()
+        .node_by_id(person)
+        .unwrap()
+        .node_count;
+    let total = base_count + mvcc.appended_rows(person, epoch);
+    let props = load_props(db, person).unwrap().unwrap();
+    let mut reader = PropsReader::new(props);
+    let mut graph = GraphReader::load_table(db, "knows").unwrap();
+    let graph_rows = graph.directory().node_count;
+    let mut ages = Vec::new();
+    let mut names = Vec::new();
+    let mut deleted = Vec::new();
+    let mut out = Vec::new();
+    for row in 0..total {
+        ages.push(match mvcc.cell(person, base_count, row, 0, epoch) {
+            Some(Cell::Int(x)) => x,
+            Some(Cell::Str(_)) => unreachable!("age is an int column"),
+            None => reader.read_int(db, 0, row).unwrap(),
+        });
+        names.push(match mvcc.cell(person, base_count, row, 1, epoch) {
+            Some(Cell::Str(s)) => s,
+            Some(Cell::Int(_)) => unreachable!("name is a str column"),
+            None => {
+                let mut buf = Vec::new();
+                reader.read_str(db, 1, row, &mut buf).unwrap();
+                buf
+            }
+        });
+        deleted.push(mvcc.is_deleted(person, row, epoch));
+        let mut nbrs = if row < graph_rows {
+            graph
+                .neighbors_dir(db, row, Direction::Fwd)
+                .unwrap()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        mvcc.neighbors(knows, row, false, epoch, &mut nbrs);
+        nbrs.sort_unstable();
+        out.push(nbrs);
+    }
+    State {
+        total,
+        ages,
+        names,
+        deleted,
+        out,
+    }
+}
+
+/// Applies an event prefix to in-memory images of both files.
+fn materialize(initial_db: &[u8], events: &[&IoEvent]) -> (Vec<u8>, Vec<u8>) {
+    let mut db = initial_db.to_vec();
+    let mut wal = Vec::new();
+    for event in events {
+        match event {
+            IoEvent::Write {
+                file,
+                offset,
+                bytes,
+            } => {
+                let image = if *file == IoFile::Db {
+                    &mut db
+                } else {
+                    &mut wal
+                };
+                let end = *offset as usize + bytes.len();
+                if image.len() < end {
+                    image.resize(end, 0);
+                }
+                image[*offset as usize..end].copy_from_slice(bytes);
+            }
+            IoEvent::SetLen { file, len } => {
+                let image = if *file == IoFile::Db {
+                    &mut db
+                } else {
+                    &mut wal
+                };
+                image.resize(*len as usize, 0);
+            }
+            IoEvent::Sync { .. } => {}
+        }
+    }
+    (db, wal)
+}
+
+/// Opens a crash image, recovers it, and returns its logical state; a
+/// second fold on the recovered image must leave the state alone.
+fn recovered_state(dir: &std::path::Path, db: &[u8], wal: &[u8], person: u32, knows: u32) -> State {
+    let db_path = dir.join("image.zu1");
+    let wal_path = dir.join("image.wal");
+    std::fs::write(&db_path, db).unwrap();
+    std::fs::write(&wal_path, wal).unwrap();
+    let mut db = Zu1File::open(&db_path).unwrap();
+    let mut wal = Wal::open(&wal_path).unwrap();
+    let mut mvcc = recover(&mut db, &wal).unwrap();
+    let before = state(&mut db, &mvcc, person, knows);
+    checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+    let after = state(&mut db, &mvcc, person, knows);
+    assert_eq!(before, after, "a fold must not change the logical state");
+    std::fs::remove_file(&db_path).unwrap();
+    std::fs::remove_file(&wal_path).unwrap();
+    before
+}
+
+#[test]
+fn every_cut_recovers_to_a_committed_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("crash.zu1");
+    let wal_path = dir.path().join("crash.wal");
+    // Setup outside the recording: the fixture graph and props are the
+    // committed base every crash image starts from.
+    {
+        let mut db = Zu1File::create(&db_path).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe", b"amy"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20, 30, 40])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .unwrap();
+    }
+    let initial_db = std::fs::read(&db_path).unwrap();
+    let log: IoLog = Default::default();
+    let (person, knows, allowed) = {
+        let mut db = Zu1File::open_on(
+            Box::new(RecordingFile::new(
+                RealFile::open_rw(&db_path).unwrap(),
+                IoFile::Db,
+                log.clone(),
+            )),
+            &db_path,
+        )
+        .unwrap();
+        let mut wal = Wal::open_on(
+            Box::new(RecordingFile::new(
+                RealFile::open_or_create(&wal_path).unwrap(),
+                IoFile::Wal,
+                log.clone(),
+            )),
+            &wal_path,
+        )
+        .unwrap();
+        let catalog = Catalog::load(&mut db).unwrap();
+        let person = catalog.node_by_name("person").unwrap().id;
+        let knows = catalog.rel_by_name("knows").unwrap().id;
+        let mut mvcc = recover(&mut db, &wal).unwrap();
+        let s0 = state(&mut db, &mvcc, person, knows);
+        let mut txn = mvcc.begin();
+        txn.insert_nodes(
+            person,
+            vec![
+                (0, vec![Cell::Int(50), Cell::Int(60)]),
+                (
+                    1,
+                    vec![Cell::Str(b"eva".to_vec()), Cell::Str(b"raj".to_vec())],
+                ),
+            ],
+        )
+        .unwrap();
+        txn.insert_rel(knows, 4, 0);
+        txn.insert_rel(knows, 0, 4);
+        txn.update(person, 1, 0, Cell::Int(21));
+        txn.delete(person, 2);
+        txn.commit(&mut wal).unwrap();
+        let s1 = state(&mut db, &mvcc, person, knows);
+        let mut txn = mvcc.begin();
+        txn.update(person, 0, 0, Cell::Int(11));
+        txn.insert_rel(knows, 3, 4);
+        txn.delete(person, 4);
+        txn.commit(&mut wal).unwrap();
+        let s2 = state(&mut db, &mvcc, person, knows);
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        assert_eq!(
+            state(&mut db, &mvcc, person, knows),
+            s2,
+            "the fold must seal exactly the committed state"
+        );
+        (person, knows, vec![s0, s1, s2])
+    };
+    let events = log.lock().unwrap().clone();
+    assert!(events.len() > 20, "the workload records real syscalls");
+    let check = |image_db: &[u8], image_wal: &[u8], what: String| {
+        let got = recovered_state(dir.path(), image_db, image_wal, person, knows);
+        assert!(
+            allowed.contains(&got),
+            "{what} recovered to a state outside every committed prefix: {got:?}"
+        );
+    };
+    let mut images = 0usize;
+    for cut in 0..=events.len() {
+        let prefix: Vec<&IoEvent> = events[..cut].iter().collect();
+        // The crash with everything issued so far persisted.
+        let (db, wal) = materialize(&initial_db, &prefix);
+        check(&db, &wal, format!("cut {cut}"));
+        images += 1;
+        // The crash that lost one unsynced write: for each file, every
+        // mutating event after its last sync inside the prefix may
+        // vanish independently of the ones around it.
+        for file in [IoFile::Db, IoFile::Wal] {
+            let last_sync = events[..cut]
+                .iter()
+                .rposition(|e| matches!(e, IoEvent::Sync { file: f } if *f == file));
+            let window = last_sync.map_or(0, |i| i + 1);
+            for drop in window..cut {
+                let owner = match &events[drop] {
+                    IoEvent::Write { file: f, .. } | IoEvent::SetLen { file: f, .. } => *f,
+                    IoEvent::Sync { .. } => continue,
+                };
+                if owner != file {
+                    continue;
+                }
+                let survivors: Vec<&IoEvent> = events[..cut]
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != drop)
+                    .map(|(_, e)| e)
+                    .collect();
+                let (db, wal) = materialize(&initial_db, &survivors);
+                check(&db, &wal, format!("cut {cut} dropping event {drop}"));
+                images += 1;
+            }
+        }
+        // The crash that tore the newest write.
+        if cut > 0
+            && let IoEvent::Write {
+                file,
+                offset,
+                bytes,
+            } = &events[cut - 1]
+        {
+            for keep in [1, bytes.len() / 2, bytes.len().saturating_sub(1)] {
+                if keep == 0 || keep >= bytes.len() {
+                    continue;
+                }
+                let torn = IoEvent::Write {
+                    file: *file,
+                    offset: *offset,
+                    bytes: bytes[..keep].to_vec(),
+                };
+                let mut prefix: Vec<&IoEvent> = events[..cut - 1].iter().collect();
+                prefix.push(&torn);
+                let (db, wal) = materialize(&initial_db, &prefix);
+                check(&db, &wal, format!("cut {cut} torn to {keep} bytes"));
+                images += 1;
+            }
+        }
+    }
+    println!(
+        "{images} crash images checked over {} syscalls",
+        events.len()
+    );
+}

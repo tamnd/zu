@@ -24,6 +24,7 @@
 
 use std::io::BufRead;
 use std::path::Path;
+use std::sync::Arc;
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 
@@ -31,7 +32,7 @@ use crate::catalog::{Catalog, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::keys::{KeyIndex, KeyReader, write_key_index};
 use crate::meta;
-use crate::segment::{SegmentMeta, probe, read_range, read_segment, write_segment};
+use crate::segment::{SegmentMeta, probe, read_range, read_segment_pooled, write_segment};
 
 // Version 7 widened SegmentMeta with the structural layout byte for
 // FullZip, so version 6 files must fail as unsupported here rather than
@@ -47,6 +48,10 @@ pub enum Direction {
     Fwd,
     Bwd,
 }
+
+/// A pooled pin of one direction of a group's CSR: the decoded offset
+/// and neighbor arrays as shared handles.
+pub type CsrArrays = (Arc<Vec<u64>>, Arc<Vec<u64>>);
 
 /// One direction of a group's CSR: `row_count + 1` offsets into the
 /// neighbor segment.
@@ -556,8 +561,11 @@ pub struct GraphReader {
     key_reader: Option<KeyReader>,
 }
 
-/// One decoded CSR group: its index, offsets, and neighbor values.
-type CachedGroup = (usize, Vec<u64>, Vec<u64>);
+/// One decoded CSR group: its index, offsets, and neighbor values. The
+/// arrays live in the file's decoded pools, so the slot here is just
+/// the last-touched handle and siblings forked off the same file reuse
+/// the decode.
+type CachedGroup = (usize, Arc<Vec<u64>>, Arc<Vec<u64>>);
 
 impl GraphReader {
     /// Opens the only rel table in the file, the common single-graph
@@ -638,16 +646,12 @@ impl GraphReader {
     /// on a cache miss.
     pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
         let (g, row) = self.locate(node)?;
-        let slot = &mut self.cached_groups[dir as usize];
-        if slot.as_ref().map(|(i, _, _)| *i) != Some(g) {
-            let meta = self.directory.groups[g].dir(dir);
-            let mut offsets = Vec::with_capacity(meta.offsets.value_count as usize);
-            let mut nbrs = Vec::with_capacity(meta.neighbors.value_count as usize);
-            read_segment(db, &meta.offsets, &mut offsets)?;
-            read_segment(db, &meta.neighbors, &mut nbrs)?;
-            *slot = Some((g, offsets, nbrs));
+        let idx = dir as usize;
+        if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
+            let (offsets, nbrs) = self.csr_group(db, g, dir)?;
+            self.cached_groups[idx] = Some((g, offsets, nbrs));
         }
-        let (_, offsets, nbrs) = self.cached_groups[dir as usize].as_ref().unwrap();
+        let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().unwrap();
         let lo = offsets[row] as usize;
         let hi = offsets[row + 1] as usize;
         Ok(&nbrs[lo..hi])
@@ -656,6 +660,63 @@ impl GraphReader {
     /// Returns the sorted out-neighbor list of `node`.
     pub fn neighbors(&mut self, db: &mut Zu1File, node: u64) -> Result<&[u64]> {
         self.neighbors_dir(db, node, Direction::Fwd)
+    }
+
+    /// Pool-backed pins of one group's CSR in `dir`: the offset and
+    /// neighbor arrays as shared handles. Warm calls are two pool map
+    /// probes and two `Arc` clones, no decode and no copy, which is
+    /// what the Snapshot csr surface lends out as borrowed slices.
+    pub fn csr_group(&self, db: &mut Zu1File, group: usize, dir: Direction) -> Result<CsrArrays> {
+        let meta = self
+            .directory
+            .groups
+            .get(group)
+            .ok_or_else(|| {
+                ZuError::InvalidArgument(format!(
+                    "group {group} out of 0..{}",
+                    self.directory.groups.len()
+                ))
+            })?
+            .dir(dir);
+        let pools = db.pools();
+        Ok((
+            read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?,
+            read_segment_pooled(db, &pools.adjacency, &meta.neighbors)?,
+        ))
+    }
+
+    /// Degree of `node` in `dir` from the pooled offset array alone;
+    /// the neighbor values never decode for a count.
+    pub fn degree_of(&self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<u64> {
+        let (g, row) = self.locate(node)?;
+        let meta = self.directory.groups[g].dir(dir);
+        let pools = db.pools();
+        let offs = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
+        Ok(offs[row + 1] - offs[row])
+    }
+
+    /// Sum of degrees over `nodes` in `dir`, one pooled offset pin per
+    /// group run. This is the counting expand's bulk read: it touches
+    /// the 8% offsets pool and never the 20% adjacency pool, so a
+    /// count over a hub's neighborhood costs offset diffs, not decoded
+    /// neighbor megabytes.
+    pub fn degree_batch(&self, db: &mut Zu1File, nodes: &[u64], dir: Direction) -> Result<u64> {
+        let mut total = 0u64;
+        let mut cur: Option<(usize, Arc<Vec<u64>>)> = None;
+        for &node in nodes {
+            let (g, row) = self.locate(node)?;
+            if cur.as_ref().map(|(i, _)| *i) != Some(g) {
+                let meta = self.directory.groups[g].dir(dir);
+                let pools = db.pools();
+                cur = Some((
+                    g,
+                    read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?,
+                ));
+            }
+            let offs = &cur.as_ref().unwrap().1;
+            total += offs[row + 1] - offs[row];
+        }
+        Ok(total)
     }
 
     /// Point access: appends `node`'s sorted list in `dir` to `out`
@@ -1148,6 +1209,81 @@ mod tests {
             assert!(!reader.has_edge(&mut db, s, d).unwrap(), "absent {s}->{d}");
         }
         assert!(reader.has_edge(&mut db, node_count, 0).is_err());
+    }
+
+    #[test]
+    fn group_decodes_are_pooled_across_thrash_and_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let mut edges: Vec<(u32, u32)> = vec![(1, 2), (1, 3), (GROUP_ROWS, 4), (GROUP_ROWS + 1, 5)];
+        let node_count = u64::from(GROUP_ROWS) + 6;
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        let g1 = u64::from(GROUP_ROWS);
+        // Alternate groups: the reader's one slot per direction
+        // thrashes, but the pool serves every revisit without a decode.
+        for _ in 0..5 {
+            assert_eq!(reader.neighbors(&mut db, 1).unwrap(), &[2, 3]);
+            assert_eq!(reader.neighbors(&mut db, g1).unwrap(), &[4]);
+        }
+        let pools = db.pools();
+        let s = pools.adjacency.stats();
+        assert_eq!(s.misses, 2, "each group decoded once");
+        assert_eq!(s.hits, 8, "every revisit was a pool hit");
+        // A forked handle shares the pools, so a fresh reader on it
+        // reads a warm group without decoding anything.
+        let mut fork = db.reopen().unwrap();
+        let mut sibling = GraphReader::load(&mut fork).unwrap();
+        assert_eq!(sibling.neighbors(&mut fork, g1 + 1).unwrap(), &[5]);
+        assert_eq!(pools.adjacency.stats().misses, 2, "fork reused the decode");
+    }
+
+    #[test]
+    fn degrees_come_from_offsets_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deg.zu1");
+        let mut edges: Vec<(u32, u32)> = vec![(1, 2), (1, 3), (GROUP_ROWS, 4), (GROUP_ROWS + 1, 5)];
+        let node_count = u64::from(GROUP_ROWS) + 6;
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let reader = GraphReader::load(&mut db).unwrap();
+        let g1 = u64::from(GROUP_ROWS);
+        assert_eq!(reader.degree_of(&mut db, 1, Direction::Fwd).unwrap(), 2);
+        assert_eq!(reader.degree_of(&mut db, 0, Direction::Fwd).unwrap(), 0);
+        assert_eq!(reader.degree_of(&mut db, g1, Direction::Fwd).unwrap(), 1);
+        assert_eq!(reader.degree_of(&mut db, 2, Direction::Bwd).unwrap(), 1);
+        assert!(
+            reader
+                .degree_of(&mut db, node_count, Direction::Fwd)
+                .is_err()
+        );
+        // The batch spans both groups and agrees with the point reads.
+        let nodes = [1u64, 2, g1, g1 + 1];
+        assert_eq!(
+            reader
+                .degree_batch(&mut db, &nodes, Direction::Fwd)
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            reader
+                .degree_batch(&mut db, &nodes, Direction::Bwd)
+                .unwrap(),
+            1
+        );
+        // Counting never decoded a neighbor value: the adjacency pool
+        // saw no traffic at all, only the offsets pool did.
+        let pools = db.pools();
+        let adj = pools.adjacency.stats();
+        assert_eq!(adj.misses + adj.hits, 0, "degrees touched adjacency");
+        assert!(pools.csr_offsets.stats().misses > 0);
     }
 
     #[test]

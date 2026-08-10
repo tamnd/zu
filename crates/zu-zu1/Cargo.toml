@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "blob"
 harness = false
+
+[[bench]]
+name = "read"
+harness = false

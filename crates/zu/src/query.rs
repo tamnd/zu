@@ -197,13 +197,13 @@ impl Graph for Zu1Graph<'_> {
             Direction::Fwd
         };
         let Self { db, readers, .. } = self;
-        // On the cached-group path a degree is the difference of two
-        // decoded offsets; the neighbor values never get copied.
-        let nbrs = readers
-            .get_mut(&rel)
+        // A degree is the difference of two pooled offsets; neither the
+        // neighbor values nor the offset array get copied or re-decoded
+        // when the group is warm.
+        readers
+            .get(&rel)
             .expect("just loaded")
-            .neighbors_dir(db, node, dir)?;
-        Ok(nbrs.len() as u64)
+            .degree_of(db, node, dir)
     }
 
     fn degree_sum(&mut self, rel: u32, nodes: &[u64], reversed: bool) -> Result<u64> {
@@ -214,16 +214,13 @@ impl Graph for Zu1Graph<'_> {
             Direction::Fwd
         };
         let Self { db, readers, .. } = self;
-        // One reader lookup for the whole vector; each node then costs
-        // a group locate and an offset difference against the cached
-        // decode, so a counting expand stays out of virtual dispatch
-        // per node.
-        let reader = readers.get_mut(&rel).expect("just loaded");
-        let mut total = 0;
-        for &node in nodes {
-            total += reader.neighbors_dir(db, node, dir)?.len() as u64;
-        }
-        Ok(total)
+        // One reader lookup for the whole vector, then the offsets-only
+        // batch: a counting expand touches the offsets pool and never
+        // decodes a neighbor value.
+        readers
+            .get(&rel)
+            .expect("just loaded")
+            .degree_batch(db, nodes, dir)
     }
 
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool> {

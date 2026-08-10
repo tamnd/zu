@@ -843,6 +843,7 @@ mod tests {
             max: 2,
             crc: 0,
             structural: crate::segment::Structural::MiniBlock,
+            sorted: false,
             blocks: vec![7],
         };
         let good = encode_manifest(

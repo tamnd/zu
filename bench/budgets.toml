@@ -289,6 +289,48 @@ vec_hash_gkeys_s = 0.35
 # margin on the slowest host.
 vec_sum_gbs = 4.0
 
+# P1 read path gates (Spec/2064g/perf/04, zu#74), benches/read.rs,
+# single core. hop is the warm 1-hop through a pooled CSR group pin,
+# pin plus list borrow plus sum, the B1 shape at the storage layer.
+# The perf/04 target is 2 us p50 and every machine sits far under it:
+# local M series 0.06, gamingpc 0.07, server1 0.42 to 0.43 under its
+# service load, server3 0.48 to 0.52 under its crawl. Lower this
+# ceiling, never raise it.
+read_hop_p50_us = 2.0
+
+# The decoded-pool speedup on group revisits against decoding the
+# segment fresh, which is what a revisit cost before the pools. The
+# perf/04 exit asks for 20x; measured 9.8 K to 35 K across the fleet,
+# server3 swinging 9765 to 25361 under its crawl, server1 26393 to
+# 35383, gamingpc 26223 to 26884, local M series 10738 to 13338. The
+# floor holds the structural claim with an order of margin under the
+# worst swing: a pool that stops serving revisits measures about 1.
+# Raise this floor, never lower it.
+read_thrash_speedup = 1000.0
+
+# Flat chunk-decode scan with a sum over 100 M sorted i64, GB/s of
+# logical value bytes, the B3 shape. The perf/04 target is 2.0 and
+# every machine clears it: local M series 11.8, gamingpc 5.7 to 6.0,
+# server1 4.6 to 5.2, server3 3.5 to 3.8 under its crawl. Raise this
+# floor, never lower it.
+read_scan_gbs = 2.0
+
+# The same scan under a 1 percent range predicate, effective GB/s of
+# logical bytes with the chunk zone maps skipping the other 99
+# percent; the bench asserts the skip happened by counting decodes,
+# so this floor only tracks the decode and filter cost of the
+# surviving chunks. Measured: local M series 724 to 735, gamingpc 442
+# to 455, server1 300 to 353, server3 232 to 260. Raise this floor,
+# never lower it.
+read_scan_filtered_gbs = 100.0
+
+# Batched int property gathers, 4096 random rows per call over a
+# 524 K row column, M rows/s, one decode per touched chunk run.
+# Measured: local M series 10.9, gamingpc 6.8 and 11.9, server1 3.7
+# to 3.9, server3 2.6 to 3.5. The floor sits under the loaded vCPU
+# hosts' worst run. Raise this floor, never lower it.
+read_gather_mrows_s = 1.5
+
 # Width-13 bitpack unpack through the FastLanes style transposed
 # layout, G vals/s. The perf/11 target is 4 G and the local M series
 # runs 4.84, up from 1.73 on the sequential layout; gamingpc 2.63,

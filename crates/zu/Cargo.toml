@@ -17,6 +17,7 @@ zu-zu1.workspace = true
 zu-sqlite.workspace = true
 zu-s3.workspace = true
 zu-query.workspace = true
+zu-vector.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

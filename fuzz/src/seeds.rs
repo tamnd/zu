@@ -71,6 +71,7 @@ fn main() {
         max: 40_000,
         crc: 0xC0FFEE,
         structural: segment::Structural::MiniBlock,
+        sorted: true,
         blocks: vec![3],
     };
     let mut meta_bytes = Vec::new();

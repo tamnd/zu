@@ -104,7 +104,9 @@ fn main() -> ExitCode {
             (Some(input), Some(output)) => {
                 convert(std::path::Path::new(input), std::path::Path::new(output))
             }
-            _ => usage_error("zu convert <edges.txt|csv|parquet> <out.csv|parquet>"),
+            _ => usage_error(
+                "zu convert <edges.txt|csv|parquet|db.zu1|db.db> <out.csv|parquet|db.zu1|db.db>",
+            ),
         },
         Some(cmd) => {
             eprintln!("zu: unknown command '{cmd}' (commands arrive with their milestones)");
@@ -313,11 +315,37 @@ fn copy(
     }
 }
 
-/// Converts an edge list between the formats copy reads: SNAP text or
-/// csv or parquet in, csv or parquet out. Exists so a SNAP corpus can
-/// become the csv and parquet inputs the copy path is validated with.
+/// Converts an edge list between the formats copy reads (SNAP text or
+/// csv or parquet in, csv or parquet out) or a whole database between
+/// engines (.zu1 to .db and back), picked by the file extensions.
 fn convert(input: &std::path::Path, output: &std::path::Path) -> ExitCode {
     let started = std::time::Instant::now();
+    let ext = |p: &std::path::Path| p.extension().and_then(|e| e.to_str()).map(str::to_owned);
+    let engine = match (ext(input).as_deref(), ext(output).as_deref()) {
+        (Some("zu1"), Some("db")) => Some(zu::convert::zu1_to_sqlite(input, output)),
+        (Some("db"), Some("zu1")) => Some(zu::convert::sqlite_to_zu1(input, output)),
+        (Some("zu1") | Some("db"), _) | (_, Some("zu1") | Some("db")) => {
+            Some(Err(zu::ZuError::InvalidArgument(
+                "engine convert pairs .zu1 with .db; edge list convert writes .csv or .parquet"
+                    .into(),
+            )))
+        }
+        _ => None,
+    };
+    if let Some(result) = engine {
+        return match result {
+            Ok(()) => {
+                println!(
+                    "converted {} to {} in {:.2}s",
+                    input.display(),
+                    output.display(),
+                    started.elapsed().as_secs_f64()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => command_error("convert", &e),
+        };
+    }
     let edges = match read_edges(input) {
         Ok(e) => e,
         Err(e) => return command_error("convert", &e),

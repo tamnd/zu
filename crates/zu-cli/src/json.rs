@@ -103,9 +103,7 @@ fn parse_num(bytes: &[u8], pos: &mut usize) -> Result<Json, String> {
         }
     }
     let text = std::str::from_utf8(&bytes[start..*pos]).map_err(|_| "bad number".to_string())?;
-    if !fractional
-        && let Ok(i) = text.parse::<i64>()
-    {
+    if !fractional && let Ok(i) = text.parse::<i64>() {
         return Ok(Json::Int(i));
     }
     text.parse::<f64>()

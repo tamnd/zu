@@ -100,11 +100,15 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<Vec<u64>> {
 }
 
 /// Rebuilds the overlay store after a crash or reopen: committed txns
-/// above the header's `wal_seq` replay from the log, then every
-/// persisted tombstone chain seeds back in at epoch 0.
+/// above the header's `wal_seq` replay from the log, an `IngestRef`
+/// resolves back into its payload by reading the sealed segments it
+/// names, then every persisted tombstone chain seeds back in at epoch
+/// 0.
 pub fn recover(db: &mut Zu1File, wal: &Wal) -> Result<Mvcc> {
     let floor = db.db_header().wal_seq;
-    let mut mvcc = Mvcc::recover(wal, floor)?;
+    let mut mvcc = Mvcc::recover_with(wal, floor, |table, ptrs| {
+        crate::ingest::resolve(db, table, ptrs)
+    })?;
     seed_persisted_tombstones(db, &mut mvcc)?;
     Ok(mvcc)
 }
@@ -165,6 +169,13 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
         }
         let edge_count = fold_rel(db, mvcc, &catalog, &mut index, &rel, epoch)?;
         catalog.upsert_rel(&rel.name, rel.from, rel.to, edge_count)?;
+        changed = true;
+    }
+    // Ingested segments are sealed into the rebuilt tables above, so
+    // their manifest and data blocks free here and publish with the
+    // same flip; until it lands they stay untouched for replay.
+    for root in mvcc.ingest_roots(epoch) {
+        crate::ingest::free_ingest(db, root)?;
         changed = true;
     }
     if !changed && wal.is_empty() {

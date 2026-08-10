@@ -55,11 +55,16 @@ pub enum PropValues<'a> {
 }
 
 impl PropValues<'_> {
-    fn len(&self) -> usize {
+    /// Rows this column carries.
+    pub fn len(&self) -> usize {
         match self {
             PropValues::Str(v) => v.len(),
             PropValues::Int(v) => v.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

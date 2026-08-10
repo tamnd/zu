@@ -312,6 +312,31 @@ impl Zu1File {
         self.db.block_count
     }
 
+    /// Takes the committed-free list out of allocation, forcing every
+    /// allocation to extend past the high-water mark until
+    /// [`Self::restore_free`] puts it back. The ingest commit protocol
+    /// needs this: after a crash the committed free list still names
+    /// its blocks free, so data whose only reference is a WAL frame
+    /// must not live in them or the next fold could hand them out and
+    /// overwrite it.
+    pub(crate) fn take_free(&mut self) -> Vec<BlockPtr> {
+        std::mem::take(&mut self.free)
+    }
+
+    /// Restores the free list taken by [`Self::take_free`].
+    pub(crate) fn restore_free(&mut self, saved: Vec<BlockPtr>) {
+        debug_assert!(self.free.is_empty(), "nested take_free");
+        self.free = saved;
+    }
+
+    /// Syncs staged data writes without publishing anything: the header
+    /// slots do not move and a plain reopen still sees the committed
+    /// epoch. The ingest path calls this so its sealed segments are
+    /// durable before the WAL frame referencing them is.
+    pub fn sync_data(&mut self) -> Result<()> {
+        self.file.sync_data()
+    }
+
     /// Marks `ptr` free. The committed epoch still references it, so it
     /// becomes allocatable only after the next checkpoint; until then its
     /// contents must survive a crash. Frees staged on a handle that closes

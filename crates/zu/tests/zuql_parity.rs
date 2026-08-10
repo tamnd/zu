@@ -178,4 +178,22 @@ fn both_engines_answer_the_corpus_identically() {
             "corpus query answered nothing, no coverage: {source}"
         );
     }
+
+    // The triangle close again with the WCOJ switch on: both engines
+    // route it through the galloping intersection, and the answer must
+    // match the binary-join run above. This binary holds exactly one
+    // test, so the process-global variable races with nothing.
+    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+                  RETURN count(*) AS triangles";
+    let baseline = run_zu1(source, &mut zu, &[]).unwrap();
+    unsafe { std::env::set_var("ZU_WCOJ", "1") };
+    let z = run_zu1(source, &mut zu, &[]).unwrap();
+    let s = run_sqlite(source, &sq, &[]).unwrap();
+    unsafe { std::env::remove_var("ZU_WCOJ") };
+    assert_eq!(z.rows, s.rows, "wcoj parity diverged on: {source}");
+    assert_eq!(z.rows, baseline.rows, "wcoj diverged from the baseline");
+    assert!(
+        matches!(z.rows[0][0], Value::Int(n) if n > 0),
+        "seed produced no triangles, no coverage"
+    );
 }

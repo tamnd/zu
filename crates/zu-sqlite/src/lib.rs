@@ -2,8 +2,8 @@
 //!
 //! Maps the graph onto an ordinary SQLite database file for interop and durability, and doubles as the differential-testing oracle for zu1.
 //! Schema mapping is specified in `docs/05-storage-sqlite.md`.
-//! Covers open/create with the full docs/05 §3 pragma profile, the `zu_catalog` table, node and rel tables with their adjacency indexes, row inserts, neighbor queries, counts, IMMEDIATE transactions with `wal_checkpoint(TRUNCATE)` as the checkpoint, and the lazy per-group CSR cache from §4.
-//! The `GraphStore` trait implementation lands once the trait itself grows out of its skeleton.
+//! Covers open/create with the full docs/05 §3 pragma profile, the `zu_catalog` table with stable table ids and rel endpoints, node and rel tables with their adjacency indexes, row inserts, updates, deletes, typed property reads, neighbor queries, counts, IMMEDIATE transactions with `wal_checkpoint(TRUNCATE)` as the checkpoint, and the lazy per-group CSR cache from §4.
+//! The zuQL facade over this store lives in the `zu` crate; the byte-level `GraphStore` trait surface waits on the shared buffer manager in `docs/09`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,8 +18,9 @@ pub use zu_storage::Direction;
 /// SQLite `application_id` claimed by zu, the ASCII bytes `ZU1`.
 pub const APPLICATION_ID: i32 = 0x005A_5531;
 
-/// Schema version written to `user_version`.
-pub const SCHEMA_VERSION: i32 = 1;
+/// Schema version written to `user_version`. Version 2 added the rel
+/// endpoint columns to `zu_catalog`; version 1 files migrate on open.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// SQLite column affinity for a property column.
 /// The zu type mapping is specified in `docs/05-storage-sqlite.md` §2.
@@ -70,6 +71,18 @@ pub struct CatalogEntry {
     pub kind: String,
     pub name: String,
     pub sql: String,
+}
+
+/// One table as the query layer sees it: the stable catalog id, its
+/// kind, and for rel tables the endpoint node tables. Endpoints read
+/// `None` only on entries created before schema version 2.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TableDef {
+    pub id: u32,
+    pub kind: String,
+    pub name: String,
+    pub src_table: Option<String>,
+    pub dst_table: Option<String>,
 }
 
 /// One node group's adjacency in CSR form, built lazily from a rel
@@ -146,11 +159,38 @@ impl SqliteStore {
                 let version: i32 = conn
                     .query_row("PRAGMA user_version", [], |row| row.get(0))
                     .map_err(sql_err)?;
-                if version != SCHEMA_VERSION {
-                    return Err(ZuError::Unsupported {
-                        what: "sqlite schema version",
-                        id: version.cast_unsigned(),
-                    });
+                match version {
+                    SCHEMA_VERSION => {}
+                    // Version 1 predates the explicit id and the rel
+                    // endpoint columns. The rebuild keeps each entry's
+                    // old rowid as its id; endpoints stay null until
+                    // the table is recreated, and null reads back as
+                    // unknown rather than wrong.
+                    1 => conn
+                        .execute_batch(
+                            "BEGIN;\
+                             CREATE TABLE zu_catalog_v2 (\
+                               id INTEGER PRIMARY KEY, \
+                               kind TEXT NOT NULL, \
+                               name TEXT NOT NULL, \
+                               sql TEXT NOT NULL, \
+                               src_table TEXT, \
+                               dst_table TEXT, \
+                               UNIQUE (kind, name));\
+                             INSERT INTO zu_catalog_v2 (id, kind, name, sql) \
+                               SELECT rowid, kind, name, sql FROM zu_catalog;\
+                             DROP TABLE zu_catalog;\
+                             ALTER TABLE zu_catalog_v2 RENAME TO zu_catalog;\
+                             PRAGMA user_version = 2;\
+                             COMMIT;",
+                        )
+                        .map_err(sql_err)?,
+                    other => {
+                        return Err(ZuError::Unsupported {
+                            what: "sqlite schema version",
+                            id: other.cast_unsigned(),
+                        });
+                    }
                 }
             }
             other => {
@@ -183,12 +223,18 @@ impl SqliteStore {
         ] {
             conn.pragma_update(None, pragma, value).map_err(sql_err)?;
         }
+        // `id` is a rowid alias rather than a bare rowid so VACUUM can
+        // never renumber it: it is the table id the query layer binds
+        // against and must survive every rewrite of the file.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS zu_catalog (\
+               id INTEGER PRIMARY KEY, \
                kind TEXT NOT NULL, \
                name TEXT NOT NULL, \
                sql TEXT NOT NULL, \
-               PRIMARY KEY (kind, name))",
+               src_table TEXT, \
+               dst_table TEXT, \
+               UNIQUE (kind, name))",
         )
         .map_err(sql_err)?;
         Ok(Self {
@@ -206,12 +252,36 @@ impl SqliteStore {
             sql.push_str(&format!(", p_{} {}", ident(col)?, ty.sql()));
         }
         sql.push_str(");");
-        self.create("node", name, &sql)
+        self.create("node", name, &sql, None)
     }
 
-    /// Creates rel table `r_<name>` with `src`/`dst` endpoint columns, the forward and backward adjacency indexes, and a catalog entry.
-    pub fn create_rel_table(&mut self, name: &str, columns: &[(&str, ColumnType)]) -> Result<()> {
+    /// Creates rel table `r_<name>` from node table `from` to node
+    /// table `to`, with `src`/`dst` endpoint columns, the forward and
+    /// backward adjacency indexes, and a catalog entry recording the
+    /// endpoints so the query layer can bind against them.
+    pub fn create_rel_table(
+        &mut self,
+        name: &str,
+        from: &str,
+        to: &str,
+        columns: &[(&str, ColumnType)],
+    ) -> Result<()> {
         let name = ident(name)?;
+        for endpoint in [from, to] {
+            let known: bool = self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM zu_catalog WHERE kind = 'node' AND name = ?",
+                    [ident(endpoint)?],
+                    |row| row.get::<_, i64>(0).map(|n| n > 0),
+                )
+                .map_err(sql_err)?;
+            if !known {
+                return Err(ZuError::InvalidArgument(format!(
+                    "rel table '{name}' references unknown node table '{endpoint}'"
+                )));
+            }
+        }
         let mut sql = format!(
             "CREATE TABLE r_{name} (zrel INTEGER PRIMARY KEY, \
              src INTEGER NOT NULL, dst INTEGER NOT NULL"
@@ -223,7 +293,7 @@ impl SqliteStore {
             ");\nCREATE INDEX r_{name}_fwd ON r_{name} (src, dst);\
              \nCREATE INDEX r_{name}_bwd ON r_{name} (dst, src);"
         ));
-        self.create("rel", name, &sql)
+        self.create("rel", name, &sql, Some((from, to)))
     }
 
     /// Inserts one node row; `values` bind the property columns in declared order.
@@ -424,6 +494,50 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The property columns of node table `n_<table>` in declared
+    /// order, without their `p_` prefix.
+    pub fn node_columns(&self, table: &str) -> Result<Vec<String>> {
+        let sql = format!("PRAGMA table_info(n_{})", ident(table)?);
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(sql_err)?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(sql_err)?;
+        Ok(names
+            .into_iter()
+            .filter_map(|c| c.strip_prefix("p_").map(str::to_owned))
+            .collect())
+    }
+
+    /// One property of one node row, dynamically typed the way SQLite
+    /// stores it. A missing row is [`ZuError::Corrupt`]: callers hold
+    /// offsets the row domain handed out, so the row must exist.
+    pub fn read_node_prop(&self, table: &str, row: i64, column: &str) -> Result<Value> {
+        let sql = format!(
+            "SELECT p_{} FROM n_{} WHERE zrow = ?",
+            ident(column)?,
+            ident(table)?
+        );
+        self.conn
+            .query_row(&sql, [row], |r| {
+                Ok(match r.get_ref(0)? {
+                    ValueRef::Null => Value::Null,
+                    ValueRef::Integer(v) => Value::Int(v),
+                    ValueRef::Real(v) => Value::Real(v),
+                    ValueRef::Text(v) => Value::Text(String::from_utf8_lossy(v).into_owned()),
+                    ValueRef::Blob(v) => Value::Blob(v.to_vec()),
+                })
+            })
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => ZuError::Corrupt {
+                    what: "sqlite node table",
+                    detail: format!("'{table}' has no row {row}"),
+                },
+                other => sql_err(other),
+            })
+    }
+
     /// Node ids adjacent to `src` in `r_<table>`, sorted ascending.
     /// `Fwd` follows edges leaving `src`; `Bwd` follows edges entering it.
     pub fn neighbors(&self, table: &str, src: i64, dir: Direction) -> Result<Vec<i64>> {
@@ -453,6 +567,27 @@ impl SqliteStore {
         self.count("r", table)
     }
 
+    /// All tables with their stable ids and rel endpoints, ordered by
+    /// id, which is creation order.
+    pub fn tables(&self) -> Result<Vec<TableDef>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind, name, src_table, dst_table FROM zu_catalog ORDER BY id")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TableDef {
+                    id: row.get::<_, i64>(0)? as u32,
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                    src_table: row.get(3)?,
+                    dst_table: row.get(4)?,
+                })
+            })
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(sql_err)
+    }
+
     /// All tables this store created, ordered by kind then name.
     pub fn catalog_entries(&self) -> Result<Vec<CatalogEntry>> {
         let mut stmt = self
@@ -479,12 +614,23 @@ impl SqliteStore {
     }
 
     /// Runs DDL and its catalog insert in one transaction.
-    fn create(&mut self, kind: &str, name: &str, sql: &str) -> Result<()> {
+    fn create(
+        &mut self,
+        kind: &str,
+        name: &str,
+        sql: &str,
+        endpoints: Option<(&str, &str)>,
+    ) -> Result<()> {
         let tx = self.conn.transaction().map_err(sql_err)?;
         tx.execute_batch(sql).map_err(sql_err)?;
+        let (src, dst) = match endpoints {
+            Some((src, dst)) => (Some(src), Some(dst)),
+            None => (None, None),
+        };
         tx.execute(
-            "INSERT INTO zu_catalog (kind, name, sql) VALUES (?1, ?2, ?3)",
-            (kind, name, sql),
+            "INSERT INTO zu_catalog (kind, name, sql, src_table, dst_table) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (kind, name, sql, src, dst),
         )
         .map_err(sql_err)?;
         tx.commit().map_err(sql_err)

@@ -162,7 +162,8 @@ fn run_seed(seed: u64) {
         &[("age", ColumnType::Integer), ("name", ColumnType::Text)],
     )
     .unwrap();
-    sq.create_rel_table("knows", &[]).unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
     for i in 0..BASE_ROWS {
         sq.insert_node(
             "person",

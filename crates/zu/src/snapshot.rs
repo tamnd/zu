@@ -38,7 +38,10 @@ fn direction(dir: Dir) -> Direction {
 /// with their parent, so a fork reads warm.
 enum Db<'a> {
     Borrowed(&'a mut Zu1File),
-    Owned(Box<Zu1File>),
+    /// `Some` for the snapshot's whole life; the option only exists so
+    /// the drop impl can move the handle out and recycle it into the
+    /// file's fork pool instead of paying an OS open per query.
+    Owned(Option<Box<Zu1File>>),
 }
 
 impl std::ops::Deref for Db<'_> {
@@ -47,7 +50,7 @@ impl std::ops::Deref for Db<'_> {
     fn deref(&self) -> &Zu1File {
         match self {
             Db::Borrowed(db) => db,
-            Db::Owned(db) => db,
+            Db::Owned(db) => db.as_ref().expect("present until drop"),
         }
     }
 }
@@ -56,7 +59,17 @@ impl std::ops::DerefMut for Db<'_> {
     fn deref_mut(&mut self) -> &mut Zu1File {
         match self {
             Db::Borrowed(db) => db,
-            Db::Owned(db) => db,
+            Db::Owned(db) => db.as_mut().expect("present until drop"),
+        }
+    }
+}
+
+impl Drop for Db<'_> {
+    fn drop(&mut self) {
+        if let Db::Owned(db) = self
+            && let Some(db) = db.take()
+        {
+            db.recycle();
         }
     }
 }
@@ -355,7 +368,7 @@ impl Snapshot for Zu1Snapshot<'_> {
         // the same epoch and reads it warm.
         let db = self.db.reopen().ok()?;
         Some(Box::new(Zu1Snapshot {
-            db: Db::Owned(Box::new(db)),
+            db: Db::Owned(Some(Box::new(db))),
             catalog: self.catalog.clone(),
             readers: HashMap::new(),
             props: HashMap::new(),

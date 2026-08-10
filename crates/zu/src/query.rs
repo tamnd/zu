@@ -68,7 +68,10 @@ pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
 /// drives. Both deref to the same [`Zu1File`] surface.
 enum Db<'a> {
     Borrowed(&'a mut Zu1File),
-    Owned(Box<Zu1File>),
+    /// `Some` for the graph's whole life; the option only exists so
+    /// the drop impl can move the handle out and recycle it into the
+    /// file's fork pool instead of paying an OS open per query.
+    Owned(Option<Box<Zu1File>>),
 }
 
 impl std::ops::Deref for Db<'_> {
@@ -76,7 +79,7 @@ impl std::ops::Deref for Db<'_> {
     fn deref(&self) -> &Zu1File {
         match self {
             Db::Borrowed(db) => db,
-            Db::Owned(db) => db,
+            Db::Owned(db) => db.as_ref().expect("present until drop"),
         }
     }
 }
@@ -85,7 +88,17 @@ impl std::ops::DerefMut for Db<'_> {
     fn deref_mut(&mut self) -> &mut Zu1File {
         match self {
             Db::Borrowed(db) => db,
-            Db::Owned(db) => db,
+            Db::Owned(db) => db.as_mut().expect("present until drop"),
+        }
+    }
+}
+
+impl Drop for Db<'_> {
+    fn drop(&mut self) {
+        if let Db::Owned(db) = self
+            && let Some(db) = db.take()
+        {
+            db.recycle();
         }
     }
 }
@@ -117,7 +130,7 @@ impl<'a> Zu1Graph<'a> {
     /// [`Session`]: crate::session::Session
     pub fn owned(db: Zu1File, catalog: Catalog) -> Zu1Graph<'static> {
         Zu1Graph {
-            db: Db::Owned(Box::new(db)),
+            db: Db::Owned(Some(Box::new(db))),
             catalog,
             readers: HashMap::new(),
             props: HashMap::new(),
@@ -297,7 +310,7 @@ impl Graph for Zu1Graph<'_> {
         // sharing decoded state would only add contention.
         let db = self.db.reopen().ok()?;
         Some(Box::new(Zu1Graph {
-            db: Db::Owned(Box::new(db)),
+            db: Db::Owned(Some(Box::new(db))),
             catalog: self.catalog.clone(),
             readers: HashMap::new(),
             props: HashMap::new(),

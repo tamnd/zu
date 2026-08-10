@@ -227,6 +227,13 @@ pub struct Zu1File {
     /// repeat pins handle-locally; [`Self::write_block`] drops it the
     /// same way it drops the shared entries.
     pin_memo: Option<(BlockPtr, PinnedBlock)>,
+    /// Retired fork handles waiting for the next [`Self::reopen`].
+    /// Opening a file is cheap on Linux and painfully slow on Windows,
+    /// where eight per-query opens were costing more than the query;
+    /// pooling keeps the descriptors alive across queries. Entries set
+    /// their own slot to `None` before going in, so the pool never
+    /// holds a reference to itself.
+    forks: Option<Arc<std::sync::Mutex<Vec<Zu1File>>>>,
 }
 
 impl Zu1File {
@@ -259,6 +266,7 @@ impl Zu1File {
             pending_free: Vec::new(),
             free_chain: Vec::new(),
             pin_memo: None,
+            forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
             pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         })
@@ -305,6 +313,7 @@ impl Zu1File {
             pending_free: Vec::new(),
             free_chain: Vec::new(),
             pin_memo: None,
+            forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
             pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         };
@@ -325,7 +334,19 @@ impl Zu1File {
     /// The free lists stay empty because a reopened handle exists to
     /// read; the morsel workers are the caller. The block cache is
     /// shared, so a fork starts warm and warms its siblings.
+    ///
+    /// Handles retired through [`Self::recycle`] come back first, with
+    /// this handle's header and a cleared pin memo, so steady-state
+    /// forking costs a mutex pop instead of an OS open.
     pub fn reopen(&self) -> Result<Self> {
+        let pool = self.forks.as_ref().expect("only pooled entries lack a pool");
+        if let Some(mut fork) = pool.lock().unwrap().pop() {
+            fork.db = self.db.clone();
+            fork.active_slot = self.active_slot;
+            fork.pin_memo = None;
+            fork.forks = Some(Arc::clone(pool));
+            return Ok(fork);
+        }
         Ok(Self {
             file: Box::new(RealFile::open_rw(&self.path)?),
             path: self.path.clone(),
@@ -336,9 +357,23 @@ impl Zu1File {
             pending_free: Vec::new(),
             free_chain: Vec::new(),
             pin_memo: None,
+            forks: Some(Arc::clone(pool)),
             cache: Arc::clone(&self.cache),
             pools: Arc::clone(&self.pools),
         })
+    }
+
+    /// Retires a fork into its shared pool for the next
+    /// [`Self::reopen`] to reuse. The handle drops its own reference
+    /// to the pool on the way in, so the pool holding it does not keep
+    /// itself alive. Dropping a fork without recycling is fine, the
+    /// next reopen just pays the OS open again.
+    pub fn recycle(mut self) {
+        // A pooled handle must not sit on a pinned cache frame.
+        self.pin_memo = None;
+        if let Some(pool) = self.forks.take() {
+            pool.lock().unwrap().push(self);
+        }
     }
 
     /// Write-once file identity.

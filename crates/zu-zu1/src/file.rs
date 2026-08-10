@@ -7,12 +7,11 @@
 //! committed state; new data goes to free blocks and becomes visible only
 //! when the next header flip publishes it.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use zu_common::{Result, ZuError};
 
+use crate::vfs::{RealFile, VfsFile};
 use crate::{BLOCK_SIZE, FORMAT_VERSION, MAGIC, MIN_READER_VERSION};
 
 /// Byte index into the file where block `n` starts. Block 0 is the header
@@ -163,7 +162,7 @@ impl DatabaseHeader {
 /// An open zu1 file: block I/O, the free list, and the header flip.
 #[derive(Debug)]
 pub struct Zu1File {
-    file: File,
+    file: Box<dyn VfsFile>,
     /// Where this handle was opened, kept so [`Self::reopen`] can hand
     /// a second read handle to a query worker. Block reads seek, so
     /// workers cannot share one file descriptor.
@@ -187,18 +186,19 @@ impl Zu1File {
     /// Creates a new database file. Fails if `path` already exists, so an
     /// existing database is never silently clobbered.
     pub fn create(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        Self::create_on(Box::new(RealFile::create_new(path)?), path)
+    }
+
+    /// [`Self::create`] on an explicit file handle; the crash harness
+    /// passes a recording one.
+    pub fn create_on(mut file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
         let file_header = FileHeader::fresh();
         let db = DatabaseHeader {
             epoch: 1,
             ..DatabaseHeader::default()
         };
-        file.write_all(&file_header.encode())?;
-        file.write_all(&db.encode())?;
+        file.write_all_at(&file_header.encode(), 0)?;
+        file.write_all_at(&db.encode(), FILE_HEADER_SIZE as u64)?;
         // Slot B stays zeroed; an all-zero slot never passes its crc.
         file.set_len(u64::from(BLOCK_SIZE))?;
         file.sync_all()?;
@@ -217,9 +217,14 @@ impl Zu1File {
     /// Opens an existing database: read 12 KiB, validate the file header,
     /// and adopt the valid database header with the highest epoch.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::open_on(Box::new(RealFile::open_rw(path)?), path)
+    }
+
+    /// [`Self::open`] on an explicit file handle; the crash harness
+    /// passes a recording one.
+    pub fn open_on(mut file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
         let mut head = [0u8; FILE_HEADER_SIZE + 2 * DB_HEADER_SIZE];
-        file.read_exact(&mut head)?;
+        file.read_exact_at(&mut head, 0)?;
         let file_header = FileHeader::decode(&head)?;
         let a = DatabaseHeader::decode(&head[FILE_HEADER_SIZE..FILE_HEADER_SIZE + DB_HEADER_SIZE]);
         let b = DatabaseHeader::decode(&head[FILE_HEADER_SIZE + DB_HEADER_SIZE..]);
@@ -267,9 +272,8 @@ impl Zu1File {
     /// The free lists stay empty because a reopened handle exists to
     /// read; the morsel workers are the caller.
     pub fn reopen(&self) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         Ok(Self {
-            file,
+            file: Box::new(RealFile::open_rw(&self.path)?),
             path: self.path.clone(),
             file_header: self.file_header.clone(),
             db: self.db.clone(),
@@ -323,10 +327,7 @@ impl Zu1File {
     pub fn write_block(&mut self, ptr: BlockPtr, data: &[u8]) -> Result<()> {
         assert_eq!(data.len(), BLOCK_SIZE as usize, "blocks are fixed size");
         self.check_ptr(ptr)?;
-        self.file
-            .seek(SeekFrom::Start(ptr * u64::from(BLOCK_SIZE)))?;
-        self.file.write_all(data)?;
-        Ok(())
+        self.file.write_all_at(data, ptr * u64::from(BLOCK_SIZE))
     }
 
     /// Reads one full block at `ptr`.
@@ -334,8 +335,7 @@ impl Zu1File {
         self.check_ptr(ptr)?;
         let mut buf = vec![0u8; BLOCK_SIZE as usize];
         self.file
-            .seek(SeekFrom::Start(ptr * u64::from(BLOCK_SIZE)))?;
-        self.file.read_exact(&mut buf)?;
+            .read_exact_at(&mut buf, ptr * u64::from(BLOCK_SIZE))?;
         Ok(buf)
     }
 
@@ -355,8 +355,7 @@ impl Zu1File {
         );
         let mut buf = vec![0u8; len];
         self.file
-            .seek(SeekFrom::Start(ptr * u64::from(BLOCK_SIZE) + offset as u64))?;
-        self.file.read_exact(&mut buf)?;
+            .read_exact_at(&mut buf, ptr * u64::from(BLOCK_SIZE) + offset as u64)?;
         Ok(buf)
     }
 
@@ -404,8 +403,7 @@ impl Zu1File {
         self.db.epoch += 1;
         let slot = 1 - self.active_slot;
         let offset = (FILE_HEADER_SIZE + slot * DB_HEADER_SIZE) as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&self.db.encode())?;
+        self.file.write_all_at(&self.db.encode(), offset)?;
         self.file.sync_all()?;
         self.active_slot = slot;
         let root = self.db.free_list_root;

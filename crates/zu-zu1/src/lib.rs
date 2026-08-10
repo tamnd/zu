@@ -18,6 +18,7 @@ pub mod props;
 pub mod reorder;
 pub mod segment;
 pub mod txn;
+pub mod vfs;
 pub mod wal;
 
 use std::path::Path;

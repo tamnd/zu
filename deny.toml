@@ -1,6 +1,11 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # paste is archived but still sits under the arrow crates. Nothing
+    # to act on from here; drop this when arrow moves off it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 allow = [

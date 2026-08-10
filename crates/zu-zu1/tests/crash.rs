@@ -9,6 +9,14 @@
 //! its logical state must be a committed prefix of the workload,
 //! pre-txn or post-txn and nothing else, and a fold run on the
 //! recovered image must not change that state.
+//!
+//! Durability rides on top of the corruption invariant: once a commit
+//! has been acknowledged, meaning its WAL sync returned, every later
+//! cut must recover to that commit or newer. The harness records the
+//! log length at each acknowledgment and floors the allowed states per
+//! cut, which is sound for every image class because drops only remove
+//! writes issued after a file's last sync and tears only shorten the
+//! newest write, so neither can touch an acknowledged frame.
 
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
@@ -161,7 +169,7 @@ fn every_cut_recovers_to_a_committed_prefix() {
     }
     let initial_db = std::fs::read(&db_path).unwrap();
     let log: IoLog = Default::default();
-    let (person, knows, allowed) = {
+    let (person, knows, allowed, acks) = {
         let mut db = Zu1File::open_on(
             Box::new(RecordingFile::new(
                 RealFile::open_rw(&db_path).unwrap(),
@@ -202,12 +210,14 @@ fn every_cut_recovers_to_a_committed_prefix() {
         txn.update(person, 1, 0, Cell::Int(21));
         txn.delete(person, 2);
         txn.commit(&mut wal).unwrap();
+        let ack1 = log.lock().unwrap().len();
         let s1 = state(&mut db, &mvcc, person, knows);
         let mut txn = mvcc.begin();
         txn.update(person, 0, 0, Cell::Int(11));
         txn.insert_rel(knows, 3, 4);
         txn.delete(person, 4);
         txn.commit(&mut wal).unwrap();
+        let ack2 = log.lock().unwrap().len();
         let s2 = state(&mut db, &mvcc, person, knows);
         checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
         assert_eq!(
@@ -215,23 +225,29 @@ fn every_cut_recovers_to_a_committed_prefix() {
             s2,
             "the fold must seal exactly the committed state"
         );
-        (person, knows, vec![s0, s1, s2])
+        (person, knows, vec![s0, s1, s2], [ack1, ack2])
     };
     let events = log.lock().unwrap().clone();
     assert!(events.len() > 20, "the workload records real syscalls");
-    let check = |image_db: &[u8], image_wal: &[u8], what: String| {
+    let check = |image_db: &[u8], image_wal: &[u8], what: String, floor: usize| {
         let got = recovered_state(dir.path(), image_db, image_wal, person, knows);
         assert!(
-            allowed.contains(&got),
-            "{what} recovered to a state outside every committed prefix: {got:?}"
+            allowed[floor..].contains(&got),
+            "{what} recovered to {got:?}, outside the committed prefixes at or after \
+             the last acknowledged commit (floor {floor})"
         );
     };
     let mut images = 0usize;
     for cut in 0..=events.len() {
+        // Every commit acknowledged before this cut must survive it:
+        // its frames sit before a WAL sync that the prefix keeps, the
+        // drops start after that sync, and tears only shorten the
+        // newest write, which postdates the sync as well.
+        let floor = acks.iter().filter(|&&ack| cut >= ack).count();
         let prefix: Vec<&IoEvent> = events[..cut].iter().collect();
         // The crash with everything issued so far persisted.
         let (db, wal) = materialize(&initial_db, &prefix);
-        check(&db, &wal, format!("cut {cut}"));
+        check(&db, &wal, format!("cut {cut}"), floor);
         images += 1;
         // The crash that lost one unsynced write: for each file, every
         // mutating event after its last sync inside the prefix may
@@ -256,7 +272,7 @@ fn every_cut_recovers_to_a_committed_prefix() {
                     .map(|(_, e)| e)
                     .collect();
                 let (db, wal) = materialize(&initial_db, &survivors);
-                check(&db, &wal, format!("cut {cut} dropping event {drop}"));
+                check(&db, &wal, format!("cut {cut} dropping event {drop}"), floor);
                 images += 1;
             }
         }
@@ -280,7 +296,7 @@ fn every_cut_recovers_to_a_committed_prefix() {
                 let mut prefix: Vec<&IoEvent> = events[..cut - 1].iter().collect();
                 prefix.push(&torn);
                 let (db, wal) = materialize(&initial_db, &prefix);
-                check(&db, &wal, format!("cut {cut} torn to {keep} bytes"));
+                check(&db, &wal, format!("cut {cut} torn to {keep} bytes"), floor);
                 images += 1;
             }
         }

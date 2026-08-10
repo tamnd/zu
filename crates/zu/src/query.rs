@@ -319,6 +319,9 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
     {
         options.threads = threads;
     }
+    // The hand-injected WCOJ switch of the first M4 slice; the
+    // optimizer's cyclic-pattern detection will replace it.
+    options.wcoj = std::env::var("ZU_WCOJ").is_ok_and(|v| v == "1");
     exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
 }
 
@@ -844,6 +847,77 @@ mod tests {
                 sequential.rows, parallel.rows,
                 "parallel diverged from sequential on: {source}"
             );
+        }
+    }
+
+    /// The WCOJ intersection over a real zu1 file: triangle queries
+    /// run once through the binary-join baseline and once through the
+    /// fused MultiwayIntersect, and both must equal each other and a
+    /// reference count computed straight from the edge list.
+    #[test]
+    fn wcoj_matches_the_binary_join_on_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wcoj.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = (0..4000u32)
+            .map(|i| (i % 397, (i * 31 + 11) % 400))
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", 400, &edges).expect("load");
+
+        let set: std::collections::HashSet<(u32, u32)> = edges.iter().copied().collect();
+        let mut by_src: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        for &(src, dst) in &edges {
+            by_src.entry(src).or_default().push(dst);
+        }
+        let mut reference = 0i64;
+        for &(a, b) in &edges {
+            for &c in by_src.get(&b).map_or(&[][..], |v| v) {
+                if set.contains(&(a, c)) {
+                    reference += 1;
+                }
+            }
+        }
+        assert!(reference > 0, "seed produced no triangles, no coverage");
+
+        let sources = [
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c), (a)-[:follows]->(c) \
+             RETURN count(*) AS triangles",
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c), (a)-[:follows]->(c) \
+             RETURN a.id AS a, b.id AS b, c.id AS c ORDER BY a, b, c LIMIT 50",
+        ];
+        for (ix, source) in sources.into_iter().enumerate() {
+            let p = prepare(source, &mut db, &[]).expect("prepare");
+            let mut graph = Zu1Graph::new(&mut db, p.catalog);
+            let baseline = exec::execute(
+                &p.plan,
+                &p.query,
+                &p.schema,
+                &mut graph,
+                &p.args,
+                &exec::Options::default(),
+            )
+            .expect("baseline");
+            let fused = exec::execute(
+                &p.plan,
+                &p.query,
+                &p.schema,
+                &mut graph,
+                &p.args,
+                &exec::Options {
+                    wcoj: true,
+                    ..exec::Options::default()
+                },
+            )
+            .expect("wcoj");
+            assert_eq!(
+                baseline.rows, fused.rows,
+                "wcoj diverged from the binary join on: {source}"
+            );
+            if ix == 0 {
+                assert_eq!(fused.rows, vec![vec![Value::Int(reference)]]);
+            }
         }
     }
 }

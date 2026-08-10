@@ -1,0 +1,25 @@
+[package]
+name = "zu-capi"
+description = "C API for zu: libzu, the in-process query surface"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The artifact is libzu.{dylib,so}; the lib target takes the name `zu`,
+# so the facade crate (also `zu`) comes in under its crates.io name.
+[lib]
+name = "zu"
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+zudb = { package = "zu", path = "../zu" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

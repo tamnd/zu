@@ -13,4 +13,5 @@ pub use zu_zu1 as zu1;
 
 pub mod convert;
 pub mod query;
+pub mod session;
 pub mod sqlite;

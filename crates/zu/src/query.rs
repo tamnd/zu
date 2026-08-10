@@ -110,6 +110,37 @@ impl<'a> Zu1Graph<'a> {
         }
     }
 
+    /// A graph that owns its handle outright, the shape a [`Session`]
+    /// keeps alive across queries so decoded groups and directories
+    /// stay warm instead of dying with each call.
+    ///
+    /// [`Session`]: crate::session::Session
+    pub fn owned(db: Zu1File, catalog: Catalog) -> Zu1Graph<'static> {
+        Zu1Graph {
+            db: Db::Owned(Box::new(db)),
+            catalog,
+            readers: HashMap::new(),
+            props: HashMap::new(),
+        }
+    }
+
+    pub fn file(&self) -> &Zu1File {
+        &self.db
+    }
+
+    pub fn file_mut(&mut self) -> &mut Zu1File {
+        &mut self.db
+    }
+
+    /// Swaps in a fresh catalog and drops every cached reader; the
+    /// session calls this when the header epoch moves, because the
+    /// cached directories and decoded groups describe the old epoch.
+    pub fn set_catalog(&mut self, catalog: Catalog) {
+        self.catalog = catalog;
+        self.readers.clear();
+        self.props.clear();
+    }
+
     fn ensure_reader(&mut self, rel: u32) -> Result<()> {
         if self.readers.contains_key(&rel) {
             return Ok(());
@@ -323,7 +354,13 @@ struct Prepared {
     args: Vec<Value>,
 }
 
-fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
+/// Loads the catalog and stats chains from disk and builds the binder
+/// schema with the optimizer's statistics attached. This is the whole
+/// per-query disk cost of the one-shot entry points; a [`Session`]
+/// calls it once and then only when the header epoch moves.
+///
+/// [`Session`]: crate::session::Session
+pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
     let catalog = Catalog::load(db)?;
     let mut schema = schema_of(&catalog)?;
     // The stats chain feeds the optimizer's degree histograms; a file
@@ -353,12 +390,24 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
             .map(|(id, r)| (id, [r.out_hist, r.in_hist]))
             .collect(),
     );
+    Ok((catalog, schema))
+}
+
+/// Parses, binds, plans, and optimizes one query against a schema.
+/// Everything here depends only on the query text and the schema, so
+/// the result is what a plan cache stores.
+pub(crate) fn compile(source: &str, schema: &Schema) -> Result<(BoundQuery, plan::LogicalPlan)> {
     let parsed = parser::parse(source)?;
-    let query = binder::bind(&parsed, &schema)?;
+    let query = binder::bind(&parsed, schema)?;
     let built = plan::build(&query)?;
-    let plan = optimizer::optimize(built, &query, &schema)?;
-    let mut args = Vec::with_capacity(query.params.len());
-    for name in &query.params {
+    let plan = optimizer::optimize(built, &query, schema)?;
+    Ok((query, plan))
+}
+
+/// Resolves caller parameters against the binder's parameter order.
+pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Vec<Value>> {
+    let mut args = Vec::with_capacity(names.len());
+    for name in names {
         match params.iter().find(|(n, _)| n == name) {
             Some((_, v)) => args.push(v.clone()),
             None => {
@@ -368,6 +417,13 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
             }
         }
     }
+    Ok(args)
+}
+
+fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
+    let (catalog, schema) = load_schema(db)?;
+    let (query, plan) = compile(source, &schema)?;
+    let args = bind_args(&query.params, params)?;
     Ok(Prepared {
         catalog,
         schema,
@@ -391,7 +447,7 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
 
 /// The execution options both entry points honor, so a profile always
 /// describes the plan `run` would execute under the same environment.
-fn env_options() -> exec::Options {
+pub(crate) fn env_options() -> exec::Options {
     let mut options = exec::Options::default();
     if let Some(threads) = std::env::var("ZU_THREADS")
         .ok()

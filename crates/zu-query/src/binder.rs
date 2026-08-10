@@ -17,8 +17,8 @@ use std::fmt;
 use zu_common::{Result, ZuError};
 
 use crate::ast::{
-    self, BinaryOp, Clause, Expr, Literal, NodePattern, Projection, RelDirection, RelPattern,
-    UnaryOp,
+    self, BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, Projection, RelDirection,
+    RelPattern, Selector, UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
@@ -226,6 +226,11 @@ pub struct BoundRel {
     pub slot: usize,
     pub direction: RelDirection,
     pub range: Option<(Option<u64>, Option<u64>)>,
+    /// The path's mode, consulted only by variable-length expansion.
+    pub mode: PathMode,
+    /// The path's selector, restricting a variable-length rel to
+    /// minimum-hop paths.
+    pub selector: Option<Selector>,
     pub props: Vec<(String, BoundExpr)>,
 }
 
@@ -567,9 +572,14 @@ impl Binder<'_> {
         let start = self.bind_node(&path.start)?;
         let mut steps = Vec::new();
         for (rel, node) in &path.steps {
-            let rel = self.bind_rel(rel)?;
+            let rel = self.bind_rel(rel, path.mode, path.selector)?;
             let node = self.bind_node(node)?;
             steps.push((rel, node));
+        }
+        if path.selector.is_some() && steps.iter().all(|(rel, _)| rel.range.is_none()) {
+            return Err(invalid(
+                "a SHORTEST selector needs a variable-length relationship".into(),
+            ));
         }
         Ok(BoundPath { slot, start, steps })
     }
@@ -634,7 +644,12 @@ impl Binder<'_> {
         Ok(BoundNode { slot, props })
     }
 
-    fn bind_rel(&mut self, pat: &RelPattern) -> Result<BoundRel> {
+    fn bind_rel(
+        &mut self,
+        pat: &RelPattern,
+        mode: PathMode,
+        selector: Option<Selector>,
+    ) -> Result<BoundRel> {
         let mut candidates = Vec::new();
         if pat.types.is_empty() {
             candidates.extend(self.schema.rels.iter().map(|r| r.id));
@@ -656,6 +671,20 @@ impl Binder<'_> {
             if min.zip(max).is_some_and(|(min, max)| max < min) {
                 let (min, max) = (min.unwrap_or(0), max.unwrap_or(0));
                 return Err(invalid(format!("hop range *{min}..{max} is empty")));
+            }
+            if selector.is_some() && min.is_some_and(|m| m > 1) {
+                return Err(invalid(
+                    "a SHORTEST selector needs a lower bound of 1; a minimum-hop \
+                     path cannot be forced longer"
+                        .into(),
+                ));
+            }
+            if mode == PathMode::Walk && max.is_none() && selector.is_none() {
+                return Err(invalid(
+                    "an unbounded WALK matches infinitely many paths; add an upper \
+                     bound or a SHORTEST selector"
+                        .into(),
+                ));
             }
         }
         let ty = if pat.range.is_some() {
@@ -682,6 +711,8 @@ impl Binder<'_> {
             slot,
             direction: pat.direction,
             range: pat.range,
+            mode,
+            selector,
             props,
         })
     }
@@ -1363,5 +1394,28 @@ mod tests {
     #[test]
     fn two_labels_are_rejected_in_v0() {
         assert!(bind_err("MATCH (n:Person:Place) RETURN n").contains("exactly one table"));
+    }
+
+    #[test]
+    fn path_mode_and_selector_rules() {
+        // An unbounded WALK is infinite; a selector or a bound tames it.
+        let e = bind_err("MATCH WALK (a:Person)-[:KNOWS*]->(b) RETURN b");
+        assert!(e.contains("unbounded WALK"), "got: {e}");
+        bound("MATCH WALK (a:Person)-[:KNOWS*1..3]->(b) RETURN b");
+        bound("MATCH ANY SHORTEST WALK (a:Person)-[:KNOWS*]->(b) RETURN b");
+        // A selector without a variable-length rel selects nothing.
+        let e = bind_err("MATCH ANY SHORTEST (a:Person)-[:KNOWS]->(b) RETURN b");
+        assert!(e.contains("variable-length"), "got: {e}");
+        // Minimum-hop paths cannot be forced longer than one hop.
+        let e = bind_err("MATCH ALL SHORTEST (a:Person)-[:KNOWS*2..3]->(b) RETURN b");
+        assert!(e.contains("lower bound of 1"), "got: {e}");
+        // The plain modes carry through to the bound rel.
+        let q = bound("MATCH ACYCLIC (a:Person)-[:KNOWS*1..3]->(b) RETURN b");
+        let BoundClause::Match { patterns, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        let (rel, _) = &patterns[0].steps[0];
+        assert_eq!(rel.mode, PathMode::Acyclic);
+        assert_eq!(rel.selector, None);
     }
 }

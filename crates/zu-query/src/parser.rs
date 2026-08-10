@@ -12,8 +12,8 @@
 use zu_common::{Result, ZuError};
 
 use crate::ast::{
-    BinaryOp, Clause, Expr, Literal, NodePattern, PathPattern, Projection, ProjectionItem, Query,
-    RelDirection, RelPattern, UnaryOp,
+    BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, PathPattern, Projection,
+    ProjectionItem, Query, RelDirection, RelPattern, Selector, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 
@@ -259,6 +259,32 @@ impl Parser<'_> {
         } else {
             None
         };
+        let selector = if self.eat_kw("ANY") {
+            self.expect_kw("SHORTEST")?;
+            Some(Selector::AnyShortest)
+        } else if self.eat_kw("ALL") {
+            self.expect_kw("SHORTEST")?;
+            Some(Selector::AllShortest)
+        } else if self.at_kw("SHORTEST") {
+            return Err(ZuError::InvalidArgument(
+                "SHORTEST needs a quantity: write ANY SHORTEST or ALL SHORTEST".into(),
+            ));
+        } else {
+            None
+        };
+        let mode = if self.eat_kw("WALK") {
+            PathMode::Walk
+        } else if self.eat_kw("TRAIL") {
+            PathMode::Trail
+        } else if self.eat_kw("ACYCLIC") {
+            PathMode::Acyclic
+        } else if self.at_kw("SIMPLE") {
+            return Err(ZuError::InvalidArgument(
+                "the SIMPLE path mode is not supported yet; use ACYCLIC".into(),
+            ));
+        } else {
+            PathMode::default()
+        };
         let start = self.parse_node()?;
         let mut steps = Vec::new();
         while self.at(&TokenKind::Minus) || self.at(&TokenKind::Lt) {
@@ -266,7 +292,13 @@ impl Parser<'_> {
             let node = self.parse_node()?;
             steps.push((rel, node));
         }
-        Ok(PathPattern { var, start, steps })
+        Ok(PathPattern {
+            var,
+            selector,
+            mode,
+            start,
+            steps,
+        })
     }
 
     fn parse_node(&mut self) -> Result<NodePattern> {
@@ -759,6 +791,36 @@ mod tests {
             panic!("RETURN");
         };
         assert!(projection.star);
+    }
+
+    #[test]
+    fn path_modes_and_selectors_parse() {
+        let q = parsed(
+            "MATCH p = ANY SHORTEST TRAIL (a)-[:KNOWS*]->(b), \
+             ALL SHORTEST (a)-[:KNOWS*]->(c), \
+             WALK (a)-[:KNOWS*1..2]->(d), \
+             ACYCLIC (a)-[:KNOWS*]->(e) RETURN *",
+        );
+        let Clause::Match { patterns, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        assert_eq!(patterns[0].var.as_deref(), Some("p"));
+        assert_eq!(patterns[0].selector, Some(Selector::AnyShortest));
+        assert_eq!(patterns[0].mode, PathMode::Trail);
+        assert_eq!(patterns[1].selector, Some(Selector::AllShortest));
+        assert_eq!(patterns[1].mode, PathMode::Trail);
+        assert_eq!(patterns[2].selector, None);
+        assert_eq!(patterns[2].mode, PathMode::Walk);
+        assert_eq!(patterns[3].mode, PathMode::Acyclic);
+    }
+
+    #[test]
+    fn bare_shortest_and_simple_read_as_errors() {
+        assert!(
+            parse_err("MATCH SHORTEST (a)-[:KNOWS*]->(b) RETURN *")
+                .contains("ANY SHORTEST or ALL SHORTEST")
+        );
+        assert!(parse_err("MATCH SIMPLE (a)-[:KNOWS*]->(b) RETURN *").contains("use ACYCLIC"));
     }
 
     #[test]

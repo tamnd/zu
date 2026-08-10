@@ -137,6 +137,24 @@ fn both_engines_answer_the_corpus_identically() {
              RETURN b.name AS name, b.age AS age ORDER BY age, name",
             &[("src", Value::Int(11))],
         ),
+        (
+            "MATCH WALK (a:person {id: $src})-[:knows*3..3]->(b) RETURN count(b) AS n",
+            &[("src", Value::Int(3))],
+        ),
+        (
+            "MATCH ACYCLIC (a:person {id: $src})-[:knows*1..3]->(b) RETURN count(b) AS n",
+            &[("src", Value::Int(3))],
+        ),
+        (
+            "MATCH ANY SHORTEST (a:person {id: $src})-[r:knows*]->(b) \
+             RETURN count(b) AS n, sum(size(r)) AS hops",
+            &[("src", Value::Int(3))],
+        ),
+        (
+            "MATCH ALL SHORTEST (a:person {id: $src})-[r:knows*]->(b) \
+             RETURN count(b) AS paths, min(size(r)) AS nearest",
+            &[("src", Value::Int(3))],
+        ),
     ];
     for (source, params) in corpus {
         let z = run_zu1(source, &mut zu, params).unwrap();

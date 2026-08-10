@@ -14,11 +14,21 @@ use std::fmt::Write as _;
 
 use zu_common::{Result, ZuError};
 
-use crate::ast::{BinaryOp, Literal, RelDirection, UnaryOp};
+use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
 use crate::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema};
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
+}
+
+/// The hop range of a variable-length expand together with the path
+/// mode and selector that govern its enumeration (docs/07 §1, §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VarLength {
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+    pub mode: PathMode,
+    pub selector: Option<Selector>,
 }
 
 /// One operator tree. Children are boxed inputs; `Empty` is the single
@@ -45,7 +55,7 @@ pub enum LogicalPlan {
         from: usize,
         to: usize,
         direction: RelDirection,
-        range: Option<(Option<u64>, Option<u64>)>,
+        range: Option<VarLength>,
         /// True when the far node was already bound: the expand joins
         /// into it instead of introducing it.
         into: bool,
@@ -233,7 +243,12 @@ fn build_path(
             from,
             to: node.slot,
             direction: rel.direction,
-            range: rel.range,
+            range: rel.range.map(|(min, max)| VarLength {
+                min,
+                max,
+                mode: rel.mode,
+                selector: rel.selector,
+            }),
             into,
             asp: false,
             optional,
@@ -334,10 +349,21 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
         } => {
             let hops = match range {
                 None => String::new(),
-                Some((min, max)) => {
-                    let min = min.map_or(String::new(), |v| v.to_string());
-                    let max = max.map_or(String::new(), |v| v.to_string());
-                    format!("*{min}..{max}")
+                Some(v) => {
+                    let min = v.min.map_or(String::new(), |v| v.to_string());
+                    let max = v.max.map_or(String::new(), |v| v.to_string());
+                    let mut s = format!("*{min}..{max}");
+                    match v.mode {
+                        PathMode::Walk => s.push_str(" walk"),
+                        PathMode::Trail => {}
+                        PathMode::Acyclic => s.push_str(" acyclic"),
+                    }
+                    match v.selector {
+                        Some(Selector::AnyShortest) => s.push_str(" any shortest"),
+                        Some(Selector::AllShortest) => s.push_str(" all shortest"),
+                        None => {}
+                    }
+                    s
                 }
             };
             let (open, close) = match direction {
@@ -642,6 +668,16 @@ mod tests {
         let text = explained("MATCH (a:Person)<-[:KNOWS*1..3]-(b) RETURN b LIMIT 1");
         assert!(
             text.contains("Expand (a)<-[#1:KNOWS*1..3]-(b)"),
+            "got:\n{text}"
+        );
+        let text = explained("MATCH ACYCLIC (a:Person)-[:KNOWS*1..3]->(b) RETURN b LIMIT 1");
+        assert!(
+            text.contains("Expand (a)-[#1:KNOWS*1..3 acyclic]->(b)"),
+            "got:\n{text}"
+        );
+        let text = explained("MATCH ANY SHORTEST (a:Person)-[:KNOWS*]->(b) RETURN b LIMIT 1");
+        assert!(
+            text.contains("Expand (a)-[#1:KNOWS*.. any shortest]->(b)"),
             "got:\n{text}"
         );
         let text = explained("MATCH (a:Person)--(b:Person) RETURN a");

@@ -30,7 +30,12 @@ fn small_graph(store: &mut SqliteStore) {
         .create_node_table("person", &[("name", ColumnType::Text)])
         .unwrap();
     store
-        .create_rel_table("knows", &[("since", ColumnType::Integer)])
+        .create_rel_table(
+            "knows",
+            "person",
+            "person",
+            &[("since", ColumnType::Integer)],
+        )
         .unwrap();
     for i in 1..=6i64 {
         let id = store
@@ -269,4 +274,75 @@ fn duplicate_table_name_fails() {
     store.create_node_table("person", &[]).unwrap();
     assert!(store.create_node_table("person", &[]).is_err());
     assert_eq!(store.catalog_entries().unwrap().len(), 1);
+}
+
+/// A schema version 1 file, built byte for byte the way the old code
+/// left it, migrates on open: entries keep their rowids as ids, the
+/// endpoint columns arrive null, and new rel tables record endpoints.
+#[test]
+fn version_one_files_migrate_on_open() {
+    let (_dir, path) = temp_db();
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "application_id", APPLICATION_ID)
+        .unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE zu_catalog (\
+           kind TEXT NOT NULL, name TEXT NOT NULL, sql TEXT NOT NULL, \
+           PRIMARY KEY (kind, name));\
+         INSERT INTO zu_catalog VALUES ('node', 'person', 'CREATE TABLE n_person (zrow INTEGER PRIMARY KEY)');\
+         INSERT INTO zu_catalog VALUES ('rel', 'knows', 'CREATE TABLE r_knows (zrel INTEGER PRIMARY KEY, src INTEGER NOT NULL, dst INTEGER NOT NULL)');\
+         CREATE TABLE n_person (zrow INTEGER PRIMARY KEY);\
+         CREATE TABLE r_knows (zrel INTEGER PRIMARY KEY, src INTEGER NOT NULL, dst INTEGER NOT NULL);",
+    )
+    .unwrap();
+    let old_ids: Vec<(i64, String)> = conn
+        .prepare("SELECT rowid, name FROM zu_catalog ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    drop(conn);
+
+    let mut store = SqliteStore::open(&path).unwrap();
+    let version: i32 = store
+        .raw()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let tables = store.tables().unwrap();
+    let ids: Vec<(i64, String)> = tables
+        .iter()
+        .map(|t| (i64::from(t.id), t.name.clone()))
+        .collect();
+    assert_eq!(ids, old_ids, "migration must keep table ids");
+    for t in &tables {
+        assert_eq!(t.src_table, None);
+        assert_eq!(t.dst_table, None);
+    }
+    store
+        .create_rel_table("likes", "person", "person", &[])
+        .unwrap();
+    let likes = store
+        .tables()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "likes")
+        .unwrap();
+    assert_eq!(likes.src_table.as_deref(), Some("person"));
+    assert_eq!(likes.dst_table.as_deref(), Some("person"));
+}
+
+/// Rel endpoints must name existing node tables.
+#[test]
+fn rel_table_rejects_unknown_endpoints() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.create_node_table("person", &[]).unwrap();
+    let err = store
+        .create_rel_table("knows", "person", "city", &[])
+        .unwrap_err();
+    assert!(matches!(err, ZuError::InvalidArgument(_)));
+    assert_eq!(store.tables().unwrap().len(), 1);
 }

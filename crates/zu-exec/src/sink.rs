@@ -387,6 +387,12 @@ const NORM_STR_MAX: usize = 24;
 /// place and moves only the position.
 const NORM_WORD: usize = 16;
 
+/// The widest key at all. The buffer costs this per row on top of the
+/// rows themselves, and an ORDER BY this long is deciding on its first
+/// few columns anyway, so past here the row comparator is the honest
+/// answer: it reads the columns it needs and stops.
+const NORM_MAX: usize = 64;
+
 /// How a sort column turns into bytes that sort the way its values do.
 #[derive(Clone, Copy, PartialEq)]
 enum NormKind {
@@ -428,7 +434,8 @@ fn norm_kind(v: &Value) -> Option<NormKind> {
 
 /// The key layout for these sort columns, or None when the set has no
 /// rows, a column holds a type with no byte form, a column changes type
-/// from row to row, or a text column runs past what padding is worth.
+/// from row to row, a text column runs past what padding is worth, or
+/// the columns together run past what a key is worth carrying.
 /// The type has to hold for every row because a column of integers and
 /// floats mixed compares through f64, which no fixed byte form gives.
 fn norm_plan(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<Vec<NormField>> {
@@ -472,6 +479,9 @@ fn norm_plan(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<Vec<NormFiel
             width,
         });
         at += width;
+        if at > NORM_MAX {
+            return None;
+        }
     }
     Some(fields)
 }
@@ -975,6 +985,26 @@ mod tests {
                 by_comparator(&rows, &keys)
             );
         }
+    }
+
+    #[test]
+    fn an_order_by_wider_than_the_key_falls_back_too() {
+        let cols = NORM_MAX / 8 + 1;
+        let rows: Vec<Vec<Value>> = (0..40i64)
+            .map(|i| (0..cols as i64).map(|c| Value::Int((i * c) % 6)).collect())
+            .collect();
+        let fits: Vec<(usize, bool)> = (0..cols - 1).map(|c| (c, c % 2 == 0)).collect();
+        let over: Vec<(usize, bool)> = (0..cols).map(|c| (c, c % 2 == 0)).collect();
+        assert_eq!(
+            key_width(&rows, &fits),
+            Some(NORM_MAX),
+            "the last key that fits"
+        );
+        assert_eq!(key_width(&rows, &over), None, "one column too many");
+        assert_eq!(
+            apply_post(&[PostSpec::Sort(over.clone())], rows.clone()),
+            by_comparator(&rows, &over)
+        );
     }
 
     #[test]

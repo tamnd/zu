@@ -15,25 +15,56 @@ use crate::colors::ColorSummary;
 use crate::file::Zu1File;
 use crate::meta;
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 /// The most colors one summary may carry (docs/07 §6).
 pub const COLOR_CAP: usize = 1024;
 
-/// The degree histograms of one rel table, forward then backward, and
-/// the COLOR summary when `ANALYZE` has built one. Bulk load drops the
-/// summary because a reloaded table invalidates its coloring.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The degree histograms of one rel table, forward then backward, the
+/// degree-sequence norms of the same two directions, and the COLOR
+/// summary when `ANALYZE` has built one. Bulk load drops the summary
+/// because a reloaded table invalidates its coloring.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RelStats {
     pub out_hist: Vec<u64>,
     pub in_hist: Vec<u64>,
+    /// All zero for a table loaded before the norms existed, which
+    /// reads as absent.
+    pub norms: DegreeStats,
     pub colors: Option<ColorSummary>,
+}
+
+/// The lp norms of one direction's degree sequence (perf/12 section 1),
+/// the inputs to the LpBound-style ceilings the DP clamps with. Every
+/// one of them is over nodes that hold at least one edge; a node with
+/// no edges contributes nothing to any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DegreeNorms {
+    /// Sum of degrees, which is the edge count.
+    pub l1: f64,
+    /// Square root of the sum of squared degrees.
+    pub l2: f64,
+    /// Cube root of the sum of cubed degrees.
+    pub l3: f64,
+    /// The largest degree of any one node.
+    pub linf: f64,
+}
+
+/// Both degree sequences of one rel table plus the one number that
+/// mixes them. `cross` is the sum over nodes of out-degree times
+/// in-degree, which is the exact count of two hop paths through the
+/// table and the mixed norm perf/12 section 2.3 asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DegreeStats {
+    pub out: DegreeNorms,
+    pub inn: DegreeNorms,
+    pub cross: f64,
 }
 
 /// Every rel table's statistics, keyed by catalog table id, and every
 /// node table's property column statistics, keyed by table id then
 /// column name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stats {
     pub rels: BTreeMap<u32, RelStats>,
     pub cols: BTreeMap<u32, BTreeMap<String, ColStats>>,
@@ -71,6 +102,12 @@ impl Stats {
                     out.extend_from_slice(&count.to_le_bytes());
                 }
             }
+            for norms in [rel.norms.out, rel.norms.inn] {
+                for v in [norms.l1, norms.l2, norms.l3, norms.linf] {
+                    out.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&rel.norms.cross.to_bits().to_le_bytes());
             let summary = rel.colors.as_ref();
             let counts = summary.map_or(&[][..], |s| &s.counts);
             out.extend_from_slice(&(counts.len() as u32).to_le_bytes());
@@ -152,6 +189,26 @@ impl Stats {
                 }
             }
             let [out_hist, in_hist] = hists;
+            // Versions 1 to 3 predate the norms; zeros read as absent
+            // and the DP falls back to the histogram ceilings.
+            let mut norms = DegreeStats::default();
+            if version >= 4 {
+                for side in [&mut norms.out, &mut norms.inn] {
+                    side.l1 = f64::from_bits(u64_at(payload, &mut at)?);
+                    side.l2 = f64::from_bits(u64_at(payload, &mut at)?);
+                    side.l3 = f64::from_bits(u64_at(payload, &mut at)?);
+                    side.linf = f64::from_bits(u64_at(payload, &mut at)?);
+                }
+                norms.cross = f64::from_bits(u64_at(payload, &mut at)?);
+                let sane = |v: f64| v.is_finite() && v >= 0.0;
+                if ![norms.out, norms.inn]
+                    .iter()
+                    .all(|n| [n.l1, n.l2, n.l3, n.linf].into_iter().all(sane))
+                    || !sane(norms.cross)
+                {
+                    return Err(corrupt(format!("degree norms {norms:?} on table {table}")));
+                }
+            }
             // Version 1 predates the color section; its rels carry
             // histograms only.
             let mut colors = None;
@@ -188,6 +245,7 @@ impl Stats {
                 RelStats {
                     out_hist,
                     in_hist,
+                    norms,
                     colors,
                 },
             );
@@ -423,9 +481,99 @@ pub fn degree_histogram(sorted: &[(u32, u32)]) -> Vec<u64> {
     hist
 }
 
+/// The lp norms of one direction's degree sequence, from the same
+/// source-sorted edge list the histogram reads. The power sums run in
+/// u128 because a hub-heavy graph can put the cube past what a u64
+/// holds, and only the roots come back as f64.
+pub fn degree_norms(sorted: &[(u32, u32)]) -> DegreeNorms {
+    let mut sums = [0u128; 3];
+    let mut linf = 0u64;
+    let mut i = 0;
+    while i < sorted.len() {
+        let src = sorted[i].0;
+        let mut j = i;
+        while j < sorted.len() && sorted[j].0 == src {
+            j += 1;
+        }
+        let d = (j - i) as u128;
+        sums[0] += d;
+        sums[1] += d * d;
+        sums[2] += d * d * d;
+        linf = linf.max((j - i) as u64);
+        i = j;
+    }
+    DegreeNorms {
+        l1: sums[0] as f64,
+        l2: (sums[1] as f64).sqrt(),
+        l3: (sums[2] as f64).cbrt(),
+        linf: linf as f64,
+    }
+}
+
+/// Sum over nodes of out-degree times in-degree, which is the number
+/// of two hop paths the table holds. Both lists are sorted on their
+/// first component, so the runs line up with a merge and a node
+/// missing from either side contributes nothing.
+pub fn degree_cross(out: &[(u32, u32)], inn: &[(u32, u32)]) -> f64 {
+    let run = |v: &[(u32, u32)], i: usize| {
+        let src = v[i].0;
+        let mut j = i;
+        while j < v.len() && v[j].0 == src {
+            j += 1;
+        }
+        (src, j - i, j)
+    };
+    let (mut i, mut j, mut total) = (0, 0, 0u128);
+    while i < out.len() && j < inn.len() {
+        let (a, da, ni) = run(out, i);
+        let (b, db, nj) = run(inn, j);
+        match a.cmp(&b) {
+            std::cmp::Ordering::Less => i = ni,
+            std::cmp::Ordering::Greater => j = nj,
+            std::cmp::Ordering::Equal => {
+                total += da as u128 * db as u128;
+                i = ni;
+                j = nj;
+            }
+        }
+    }
+    total as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn norms_read_the_degree_sequence() {
+        // Degrees 1, 2, 3, 4. l1 is 10, l2 is sqrt(30), l3 is cbrt(100),
+        // and the largest degree is 4.
+        let mut edges = Vec::new();
+        for (src, deg) in [(0u32, 1u32), (1, 2), (2, 3), (3, 4)] {
+            for d in 0..deg {
+                edges.push((src, d));
+            }
+        }
+        let norms = degree_norms(&edges);
+        assert_eq!(norms.l1, 10.0);
+        assert!((norms.l2 - 30f64.sqrt()).abs() < 1e-9);
+        assert!((norms.l3 - 100f64.cbrt()).abs() < 1e-9);
+        assert_eq!(norms.linf, 4.0);
+        assert_eq!(degree_norms(&[]), DegreeNorms::default());
+    }
+
+    #[test]
+    fn the_cross_norm_counts_two_hop_paths() {
+        // A path 0 -> 1 -> 2 and a second edge into 1, so node 1 has
+        // in-degree 2 and out-degree 1 and every other node has a zero
+        // on one side. Two paths of two hops run through the table,
+        // 0 -> 1 -> 2 and 3 -> 1 -> 2.
+        let out = [(0u32, 1u32), (1, 2), (3, 1)];
+        let mut inn: Vec<(u32, u32)> = out.iter().map(|&(s, d)| (d, s)).collect();
+        inn.sort_unstable();
+        assert_eq!(degree_cross(&out, &inn), 2.0);
+        assert_eq!(degree_cross(&[], &inn), 0.0);
+    }
 
     #[test]
     fn histogram_buckets_by_log2_degree() {
@@ -449,6 +597,16 @@ mod tests {
             RelStats {
                 out_hist: vec![5, 3, 0, 1],
                 in_hist: vec![9],
+                norms: DegreeStats {
+                    out: DegreeNorms {
+                        l1: 21.0,
+                        l2: 30f64.sqrt(),
+                        l3: 100f64.cbrt(),
+                        linf: 9.0,
+                    },
+                    inn: DegreeNorms::default(),
+                    cross: 12.0,
+                },
                 colors: Some(ColorSummary {
                     counts: vec![3, 6],
                     triples: vec![(0, 1, 9, 4), (1, 1, 2, 1)],
@@ -460,6 +618,7 @@ mod tests {
             RelStats {
                 out_hist: vec![],
                 in_hist: vec![1, 1],
+                norms: DegreeStats::default(),
                 colors: None,
             },
         );

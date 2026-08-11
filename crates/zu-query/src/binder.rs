@@ -51,6 +51,46 @@ pub struct RelDef {
 pub struct ColorSummary {
     pub counts: Vec<u64>,
     pub triples: Vec<(u32, u32, u64, u64)>,
+    /// The committed epoch `ANALYZE` built this at, and the edges the
+    /// table held then. Writes land in the table without touching the
+    /// summary, so this pair is what [`ColorSummary::scale`] measures
+    /// the drift against. Both zero on a file written before the stamp
+    /// existed, which reads as no drift rather than as infinite drift.
+    pub epoch: u64,
+    pub edges: u64,
+}
+
+/// How far a rel table may move away from the COLOR summary built over
+/// it before the optimizer stops steering by it at all (docs/07 §6).
+///
+/// A summary sits between builds while writes land under it, and COLOR
+/// degrades gracefully rather than breaking: the coloring goes on
+/// describing the shape of the graph long after the counts under it
+/// have moved, so a scale correction carries it most of the way. That
+/// only holds while the graph is still recognizably the one that was
+/// colored. Past this factor it is not, and the degree histograms,
+/// coarse as they are, describe the table better than a precise
+/// statement about a graph that no longer exists.
+pub const COLOR_DRIFT_LIMIT: f64 = 8.0;
+
+impl ColorSummary {
+    /// What this summary's edge counts have to be multiplied by to
+    /// speak for a table that now holds `edges`. One when the table has
+    /// not moved, when the summary carries no stamp, and when either
+    /// side is empty and there is no ratio to take.
+    pub fn scale(&self, edges: u64) -> f64 {
+        match self.edges > 0 && edges > 0 {
+            true => edges as f64 / self.edges as f64,
+            false => 1.0,
+        }
+    }
+
+    /// Whether the summary still describes the table closely enough to
+    /// order joins by, meaning it has drifted less than
+    /// [`COLOR_DRIFT_LIMIT`] in either direction.
+    pub fn fresh_enough(&self, edges: u64) -> bool {
+        (1.0 / COLOR_DRIFT_LIMIT..=COLOR_DRIFT_LIMIT).contains(&self.scale(edges))
+    }
 }
 
 /// The lp norms of one rel table's degree sequence in one direction
@@ -1620,6 +1660,32 @@ pub fn text(expr: &Expr) -> String {
 mod tests {
     use super::*;
     use crate::parser::parse;
+
+    #[test]
+    fn a_summary_scales_to_the_table_until_it_no_longer_describes_it() {
+        let built = |edges| ColorSummary {
+            counts: vec![10, 90],
+            triples: vec![(0, 1, 400, 40)],
+            epoch: 3,
+            edges,
+        };
+        let sum = built(1000);
+        assert_eq!(sum.scale(1000), 1.0);
+        assert_eq!(sum.scale(2500), 2.5, "grown, so every count is short");
+        assert_eq!(sum.scale(500), 0.5, "shrunk, so every count is long");
+        assert!(sum.fresh_enough(1000) && sum.fresh_enough(8000) && sum.fresh_enough(125));
+        assert!(!sum.fresh_enough(8001), "past the limit going up");
+        assert!(!sum.fresh_enough(124), "past the limit going down");
+
+        // A file written before the stamp existed carries no counts to
+        // take a ratio of, and neither does an empty table. Both read
+        // as no drift rather than as infinite drift, so an old file
+        // plans exactly as it did.
+        assert_eq!(built(0).scale(1000), 1.0);
+        assert!(built(0).fresh_enough(1000));
+        assert_eq!(sum.scale(0), 1.0);
+        assert!(sum.fresh_enough(0));
+    }
 
     #[test]
     fn the_weighted_mean_counts_a_hub_once_per_edge() {

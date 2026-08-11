@@ -32,6 +32,14 @@ use crate::stats::{COLOR_CAP, Stats};
 pub struct ColorSummary {
     pub counts: Vec<u64>,
     pub triples: Vec<(u32, u32, u64, u64)>,
+    /// The committed epoch `ANALYZE` read to build this. Nothing after
+    /// it moves the summary, so a reader comparing this against the
+    /// file's epoch knows how much has happened since.
+    pub epoch: u64,
+    /// The edges the table held at that epoch. Folds move the catalog's
+    /// edge count and leave the summary where it was, so the two counts
+    /// together are how far the table has walked away from its coloring.
+    pub edges: u64,
 }
 
 /// Colors `n` nodes over `edges` (sorted by source) into at most `cap`
@@ -85,7 +93,9 @@ pub fn quasi_stable_coloring(n: u32, edges: &[(u32, u32)], cap: usize) -> Vec<u3
 }
 
 /// Builds the sparse summary of `edges` (sorted by source) under
-/// `colors`, one run-length pass per source.
+/// `colors`, one run-length pass per source. The staleness stamp is
+/// left at zero, since only the caller holding the file knows which
+/// epoch these edges were read at.
 pub fn summarize(colors: &[u32], edges: &[(u32, u32)]) -> ColorSummary {
     let mut counts = Vec::new();
     for &c in colors {
@@ -116,6 +126,8 @@ pub fn summarize(colors: &[u32], edges: &[(u32, u32)]) -> ColorSummary {
             .into_iter()
             .map(|((f, t), (edges, dmax))| (f, t, edges, dmax))
             .collect(),
+        epoch: 0,
+        edges: 0,
     }
 }
 
@@ -124,9 +136,14 @@ pub fn summarize(colors: &[u32], edges: &[(u32, u32)]) -> ColorSummary {
 /// degree histograms written at load stay as they are. Coloring reads
 /// each forward group once in row order, so the pass is one sequential
 /// sweep per table plus the in-memory refinement.
+///
+/// Every summary is stamped with the epoch this read and the edge count
+/// the table held at it, which is what lets a later query tell a fresh
+/// summary from one the writes have moved on from.
 pub fn analyze(db: &mut Zu1File) -> Result<()> {
     let catalog = Catalog::load(db)?;
     let mut stats = Stats::load(db)?;
+    let epoch = db.db_header().epoch;
     for rel in catalog.rel_tables() {
         let mut reader = GraphReader::load_table(db, &rel.name)?;
         let n = reader.directory().node_count;
@@ -140,7 +157,9 @@ pub fn analyze(db: &mut Zu1File) -> Result<()> {
             }
         }
         let colors = quasi_stable_coloring(n as u32, &edges, COLOR_CAP);
-        let summary = summarize(&colors, &edges);
+        let mut summary = summarize(&colors, &edges);
+        summary.epoch = epoch;
+        summary.edges = reader.directory().edge_count;
         stats.rels.entry(rel.id).or_default().colors = Some(summary);
     }
     free_chain(db, db.db_header().stats_root)?;
@@ -214,6 +233,58 @@ mod tests {
             panic!("one color pair, got {:?}", summary.triples);
         };
         assert_eq!((edge_count, dmax), (4, 4));
+        assert_eq!(summary.edges, 4, "the edges the coloring was built over");
+        assert!(summary.epoch > 0, "stamped with the epoch analyze read");
+        assert!(
+            summary.epoch < db.db_header().epoch,
+            "analyze checkpoints, so the file has moved past the stamp"
+        );
+    }
+
+    /// The point of the stamp: edges committed after an ANALYZE move
+    /// the catalog and leave the summary where it was, and the two
+    /// counts read side by side are how a planner finds that out.
+    #[test]
+    fn edges_committed_after_analyze_leave_the_summary_behind() {
+        use crate::txn::Mvcc;
+        use crate::wal::Wal;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Zu1File::create(&dir.path().join("drift.zu1")).expect("create");
+        crate::graph::bulk_load_as(&mut db, "person", "knows", 8, &star()).expect("load");
+        analyze(&mut db).expect("analyze");
+        let knows = Catalog::load(&mut db)
+            .expect("catalog")
+            .rel_by_name("knows")
+            .expect("knows")
+            .id;
+
+        let mut wal = Wal::open(&dir.path().join("drift.wal")).expect("wal");
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        for src in 5..8 {
+            txn.insert_rel(knows, src, 0);
+        }
+        txn.commit(&mut wal).expect("commit");
+        crate::fold::checkpoint_fold(&mut db, &mut mvcc, &mut wal).expect("fold");
+
+        let catalog = Catalog::load(&mut db).expect("catalog");
+        let stats = Stats::load(&mut db).expect("stats");
+        let summary = stats.rels[&knows].colors.as_ref().expect("summary");
+        assert_eq!(catalog.rel_by_id(knows).expect("knows").edge_count, 7);
+        assert_eq!(summary.edges, 4, "the fold does not rebuild the coloring");
+        assert!(
+            summary.epoch < db.db_header().epoch,
+            "the file has moved past the epoch the summary was read at"
+        );
+
+        // And a second ANALYZE catches it back up.
+        analyze(&mut db).expect("reanalyze");
+        let stats = Stats::load(&mut db).expect("stats");
+        assert_eq!(
+            stats.rels[&knows].colors.as_ref().expect("summary").edges,
+            7
+        );
     }
 
     #[test]

@@ -22,12 +22,12 @@
 //! order, and optional operators are never reordered: left-outer
 //! semantics pin them where the query put them.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, RelDirection};
-use crate::binder::{BoundExpr, BoundQuery, ColStats, ColorSummary, Schema};
+use crate::binder::{BoundExpr, BoundQuery, COLOR_DRIFT_LIMIT, ColStats, ColorSummary, Schema};
 use crate::plan::{LogicalPlan, VarLength};
 
 /// Components larger than this keep their written join order.
@@ -54,8 +54,44 @@ pub fn optimize_noted(
     schema: &Schema,
 ) -> Result<(LogicalPlan, Vec<Note>)> {
     let mut notes = Vec::new();
+    staleness_notes(query, schema, &mut notes);
     let plan = rewrite(plan, query, schema, &mut notes)?;
     Ok((mark_asp(plan, query, schema).0, notes))
+}
+
+/// One note per rel table in the query whose COLOR summary the writes
+/// have moved on from. A stale summary is not an error and the plan is
+/// still a plan, but it is the difference between a join order the
+/// statistics chose and one they only half chose, so EXPLAIN says which
+/// table it was and what would fix it.
+fn staleness_notes(query: &BoundQuery, schema: &Schema, notes: &mut Vec<Note>) {
+    let mut seen = BTreeSet::new();
+    for var in &query.variables {
+        for rid in &var.rel_tables {
+            if !seen.insert(*rid) {
+                continue;
+            }
+            let (Some(sum), Some(rel)) = (schema.color_summary(*rid), schema.rel_by_id(*rid))
+            else {
+                continue;
+            };
+            let scale = sum.scale(rel.edge_count);
+            if scale == 1.0 {
+                continue;
+            }
+            let built = format!(
+                "color summary for {} was built at epoch {} over {} edges and the table now holds {}",
+                rel.name, sum.epoch, sum.edges, rel.edge_count
+            );
+            notes.push(match sum.fresh_enough(rel.edge_count) {
+                true => format!("{built}, per color counts scaled by {scale:.2}x"),
+                false => format!(
+                    "{built}, {scale:.2}x past what the {COLOR_DRIFT_LIMIT:.0}x limit trusts, \
+                     estimates fall back to the degree histograms until ANALYZE runs again"
+                ),
+            });
+        }
+    }
 }
 
 /// Bottom-up estimated-cardinality walk that turns closing expands
@@ -1387,16 +1423,20 @@ fn lone_rel(e: &ExpandOp, query: &BoundQuery) -> Option<u32> {
     }
 }
 
-/// The single rel table an expand's colors can track: exactly one
-/// candidate, a fixed direction, and a stored COLOR summary.
-fn colored_rel(e: &ExpandOp, query: &BoundQuery, schema: &Schema) -> Option<u32> {
+/// The single rel table an expand's colors can track, and what its
+/// per-color counts have to be scaled by to speak for the table as it
+/// stands: exactly one candidate, a fixed direction, and a stored COLOR
+/// summary the table has not walked away from since it was built.
+fn colored_rel(e: &ExpandOp, query: &BoundQuery, schema: &Schema) -> Option<(u32, f64)> {
     if matches!(e.direction, RelDirection::Undirected) {
         return None;
     }
     let [rid] = query.variables[e.rel].rel_tables[..] else {
         return None;
     };
-    schema.color_summary(rid).map(|_| rid)
+    let sum = schema.color_summary(rid)?;
+    let edges = schema.rel_by_id(rid).map_or(0, |r| r.edge_count);
+    sum.fresh_enough(edges).then(|| (rid, sum.scale(edges)))
 }
 
 /// A frontier spread evenly over the summarized nodes, the walk's
@@ -1476,7 +1516,7 @@ fn expand_estimate(
     schema: &Schema,
 ) -> (f64, Option<(u32, Vec<f64>)>) {
     let plain = degree(e, source, spread, query, schema);
-    let Some(rid) = colored_rel(e, query, schema) else {
+    let Some((rid, scale)) = colored_rel(e, query, schema) else {
         return (plain, None);
     };
     let sum = schema.color_summary(rid).expect("colored_rel checked");
@@ -1487,8 +1527,17 @@ fn expand_estimate(
         RelDirection::Undirected => unreachable!("colored_rel rejects undirected"),
     };
     let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8));
+    // Every fan-out the summary itself produces carries the scale, which
+    // is the graceful part of the degradation: the coloring is trusted
+    // for the shape of the frontier and the counts under it are pulled
+    // up to the table as it stands. The seeded first hop reads the
+    // degree histograms instead, and those are not this summary's to
+    // correct.
     let (mut fan, mut d) = match dist {
-        Some((from_rel, d)) if *from_rel == rid => color_hop(sum, d, reversed),
+        Some((from_rel, d)) if *from_rel == rid => {
+            let (fan, next) = color_hop(sum, d, reversed);
+            (fan * scale, next)
+        }
         _ => match color_seed(sum, reversed) {
             Some(seed) => (hop_degree(e, source, spread, query, schema).max(1e-6), seed),
             None => return (plain, None),
@@ -1496,7 +1545,7 @@ fn expand_estimate(
     };
     for _ in 1..hops {
         let (step, next) = color_hop(sum, &d, reversed);
-        fan *= step;
+        fan *= step * scale;
         d = next;
     }
     (fan.max(1e-6), Some((rid, d)))
@@ -2032,6 +2081,7 @@ mod tests {
         let sum = ColorSummary {
             counts: vec![10, 990],
             triples: vec![(0, 1, 1000, 100)],
+            ..Default::default()
         };
         let (fan, dist) = color_hop(&sum, &[1.0, 0.0], false);
         assert_eq!((fan, dist), (100.0, vec![0.0, 1.0]));
@@ -2058,6 +2108,7 @@ mod tests {
                 ColorSummary {
                     counts: vec![100, 8900],
                     triples: vec![(0, 1, 180_000, 1800)],
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -2108,6 +2159,7 @@ mod tests {
                 ColorSummary {
                     counts: vec![100, 8900],
                     triples: vec![(0, 1, 180_000, 1800)],
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -2150,6 +2202,7 @@ mod tests {
                 ColorSummary {
                     counts: vec![10, 8990],
                     triples: vec![(0, 1, 180_000, 18_000)],
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -2162,6 +2215,83 @@ mod tests {
         );
         assert_eq!(text.matches("AspJoin").count(), 0, "got:\n{text}");
         assert_eq!(text.matches("ExpandInto").count(), 1, "got:\n{text}");
+    }
+
+    #[test]
+    fn a_summary_the_table_walked_away_from_stops_steering_and_says_so() {
+        // The same dead two-hop walk that flips the chain to the front
+        // above, stamped three ways. Over the edge count the table
+        // really holds it steers as it did and says nothing. Scaled by
+        // a factor the coloring survives, it still steers and the note
+        // names the factor. Built over a table an eighteenth the size,
+        // it is a precise statement about a graph that is not this one,
+        // and the plan goes back to what the histograms say.
+        let source = "MATCH (a:Person)-[:KNOWS*2..2]->(c:Person), \
+                      (a)-[:IS_LOCATED_IN]->(p:Place) RETURN a.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let colored = |edges| {
+            let mut s = schema.clone();
+            s.set_color_summaries(
+                [(
+                    2u32,
+                    ColorSummary {
+                        counts: vec![100, 8900],
+                        triples: vec![(0, 1, 180_000, 1800)],
+                        epoch: 7,
+                        edges,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+            s
+        };
+        // The dual run of PR #89 has its own opinion about this plan
+        // and its own note; only the staleness ones are under test.
+        let run = |schema: &Schema| {
+            let (plan, notes) =
+                optimize_noted(built.clone(), &query, schema).expect("optimize noted");
+            let colors: Vec<String> = notes
+                .into_iter()
+                .filter(|n| n.starts_with("color summary"))
+                .collect();
+            (plan::explain(&plan, &query, schema), colors)
+        };
+
+        let (text, notes) = run(&colored(180_000));
+        assert!(
+            text.find("IS_LOCATED_IN") < text.find("KNOWS"),
+            "got:\n{text}"
+        );
+        assert!(
+            notes.is_empty(),
+            "a current summary says nothing: {notes:?}"
+        );
+
+        let (text, notes) = run(&colored(90_000));
+        assert!(
+            text.find("IS_LOCATED_IN") < text.find("KNOWS"),
+            "two times over is still the same graph, got:\n{text}"
+        );
+        let [note] = &notes[..] else {
+            panic!("one note, got {notes:?}");
+        };
+        assert!(note.contains("scaled by 2.00x"), "got {note}");
+
+        let (text, notes) = run(&colored(10_000));
+        assert!(
+            text.find("KNOWS") < text.find("IS_LOCATED_IN"),
+            "eighteen times over is not, got:\n{text}"
+        );
+        let [note] = &notes[..] else {
+            panic!("one note, got {notes:?}");
+        };
+        assert!(
+            note.contains("built at epoch 7 over 10000 edges") && note.contains("ANALYZE"),
+            "got {note}"
+        );
     }
 
     #[test]

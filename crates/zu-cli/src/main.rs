@@ -32,6 +32,10 @@ fn main() -> ExitCode {
             Some(path) => stat(std::path::Path::new(path)),
             None => usage_error("zu stat <file.zu1>"),
         },
+        Some("analyze") => match args.get(1) {
+            Some(path) => analyze(std::path::Path::new(path)),
+            None => usage_error("zu analyze <file.zu1>"),
+        },
         Some("query") => query_command(&args[1..]),
         Some("shell") => shell::shell_command(&args[1..]),
         Some("verify") => match args.get(1) {
@@ -163,6 +167,7 @@ fn stat(path: &std::path::Path) -> ExitCode {
                 "roots:           catalog={} tables={} free={} stats={}",
                 dh.catalog_root, dh.table_index_root, dh.free_list_root, dh.stats_root
             );
+            let stats = zu::zu1::stats::Stats::load(&mut db).unwrap_or_default();
             match zu::zu1::catalog::Catalog::load(&mut db) {
                 Ok(catalog) => {
                     for t in catalog.node_tables() {
@@ -182,6 +187,7 @@ fn stat(path: &std::path::Path) -> ExitCode {
                             name(t.from),
                             name(t.to)
                         );
+                        println!("  colors:        {}", color_line(&stats, t));
                     }
                 }
                 Err(e) => return command_error("stat", &e),
@@ -782,6 +788,67 @@ fn display_value(v: &Value) -> String {
     }
 }
 
+/// One line describing a rel table's COLOR summary: how many colors it
+/// holds, when it was built, and how far the table has moved since.
+/// The drift is the number that decides whether the optimizer is still
+/// steering by the coloring, so it is the point of the line.
+fn color_line(stats: &zu::zu1::stats::Stats, rel: &zu::zu1::catalog::RelTable) -> String {
+    let Some(colors) = stats.rels.get(&rel.id).and_then(|r| r.colors.as_ref()) else {
+        return "none, run zu analyze".to_string();
+    };
+    let built = format!(
+        "{} colors, built at epoch {} over {} edges",
+        colors.counts.len(),
+        colors.epoch,
+        colors.edges
+    );
+    if colors.edges == 0 || colors.edges == rel.edge_count {
+        return format!("{built}, current");
+    }
+    let drift = rel.edge_count as f64 / colors.edges as f64;
+    format!("{built}, {drift:.2}x off the table, run zu analyze")
+}
+
+/// Rebuilds every rel table's COLOR summary and checkpoints. This is
+/// the only way to refresh them: writes land under a summary without
+/// moving it, and the optimizer scales what it can and then stops
+/// trusting the coloring altogether once the table has drifted far
+/// enough, so a graph that has taken a lot of writes wants this run.
+fn analyze(path: &std::path::Path) -> ExitCode {
+    let mut db = match zu::zu1::file::Zu1File::open(path) {
+        Ok(db) => db,
+        Err(e) => return command_error("analyze", &e),
+    };
+    let started = std::time::Instant::now();
+    if let Err(e) = zu::zu1::colors::analyze(&mut db) {
+        return command_error("analyze", &e);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let stats = match zu::zu1::stats::Stats::load(&mut db) {
+        Ok(stats) => stats,
+        Err(e) => return command_error("analyze", &e),
+    };
+    let catalog = match zu::zu1::catalog::Catalog::load(&mut db) {
+        Ok(catalog) => catalog,
+        Err(e) => return command_error("analyze", &e),
+    };
+    for rel in catalog.rel_tables() {
+        let colors = stats.rels.get(&rel.id).and_then(|r| r.colors.as_ref());
+        match colors {
+            Some(c) => println!(
+                "{}: {} colors over {} edges at epoch {}",
+                rel.name,
+                c.counts.len(),
+                c.edges,
+                c.epoch
+            ),
+            None => println!("{}: no summary, the table holds no edges", rel.name),
+        }
+    }
+    println!("analyzed {} in {elapsed:.2}s", path.display());
+    ExitCode::SUCCESS
+}
+
 fn verify(path: &std::path::Path) -> ExitCode {
     match zu::zu1::verify(path) {
         Ok(bytes) => {
@@ -808,7 +875,7 @@ fn print_usage() {
     println!("usage: zu <command> [args]");
     println!();
     println!(
-        "commands: shell, query, copy, convert, verify, stat, neighbors [--in] [--key], edge [--in], lookup, bench"
+        "commands: shell, query, copy, convert, verify, stat, analyze, neighbors [--in] [--key], edge [--in], lookup, bench"
     );
     println!("(implemented milestone by milestone, see the repo issues)");
     println!();

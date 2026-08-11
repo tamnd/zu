@@ -158,16 +158,17 @@ ldbc_two_hop_p50_ms = 8.0
 # DISTINCT, string projections, ORDER BY, and LIMIT; its cost is the
 # 2-hop multiset's property reads, held down by the per-column decoded
 # chunk the props reader keeps, and its p99 belongs to hub seeds whose
-# neighborhoods hop across chunks. Measured p50, IS then IC: gamingpc
-# 0.13 and 1.4 ms, local M series 0.16 and 1.4 ms, server1 0.38 and
-# 4.6 ms. Both loaded hosts fit under the ceilings even mid-contention,
-# server2 at 0.59 and 6.1 ms beside a compile job holding load 7.5 on
-# 6 cores and server3 at 0.62 and 8.7 ms under its documented crawl,
-# so unlike B4 these gates hold fleet-wide. Every measured run asserts
+# neighborhoods hop across chunks. The IC ceiling comes down from 10 to
+# 6 now that the second hop batches its descent instead of pinning one
+# friend at a time: measured p50 before and after on the same files,
+# gamingpc 0.88 to 0.46, server1 3.11 to 1.39, server3 2.77 to 1.49.
+# Six leaves the loaded hosts the room they need, server1 ran a 23 ms
+# p99 on hub seeds in the same pass, and it is still under half of what
+# the slowest machine measured before. Every measured run asserts
 # against a reference recomputed from the raw props and edge files.
 # Lower these ceilings, never raise them.
 ldbc_is_p50_ms = 1.0
-ldbc_ic_p50_ms = 10.0
+ldbc_ic_p50_ms = 6.0
 
 # The unseeded directed triangle count on SF1, the AspJoin shape from
 # docs/07: the optimizer marks the closing expand because probing 7.6 M

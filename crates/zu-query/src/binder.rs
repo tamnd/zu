@@ -53,6 +53,93 @@ pub struct ColorSummary {
     pub triples: Vec<(u32, u32, u64, u64)>,
 }
 
+/// The lp norms of one rel table's degree sequence in one direction
+/// (perf/12 §1), over the nodes that hold at least one edge. These are
+/// the inputs to the LpBound-style ceilings the DP clamps its estimates
+/// with; all zero means the table predates them and the DP falls back
+/// to the coarser histogram ceilings.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DegreeNorms {
+    /// Sum of degrees, which is the edge count.
+    pub l1: f64,
+    /// Square root of the sum of squared degrees.
+    pub l2: f64,
+    /// Cube root of the sum of cubed degrees.
+    pub l3: f64,
+    /// The largest degree of any one node.
+    pub linf: f64,
+}
+
+impl DegreeNorms {
+    /// Whether the table carries norms at all. A table loaded before
+    /// they existed decodes to zeros, and so does an empty table, and
+    /// both mean there is no ceiling here to work with.
+    pub fn known(&self) -> bool {
+        self.l1 > 0.0
+    }
+
+    /// Ceiling on the sum of the `n` largest degrees, which is the most
+    /// rows an expand can produce when the side being expanded holds
+    /// `n` rows whose join keys are all distinct.
+    ///
+    /// By Holder that sum is at most `n^(1-1/p) * lp` for every p, so
+    /// the tightest of the four wins. l1 caps them all, because the
+    /// whole sequence is only so big, and once `n` passes the node
+    /// count l1 is the only one left saying anything.
+    pub fn top_sum(&self, n: f64) -> f64 {
+        let n = n.max(1.0);
+        [
+            self.l1,
+            n.sqrt() * self.l2,
+            n.powf(2.0 / 3.0) * self.l3,
+            n * self.linf,
+        ]
+        .into_iter()
+        .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// Both degree sequences of one rel table plus the number that mixes
+/// them, the sum over nodes of out-degree times in-degree.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DegreeStats {
+    pub out: DegreeNorms,
+    pub inn: DegreeNorms,
+    pub cross: f64,
+}
+
+impl DegreeStats {
+    /// The norms of one side: 0 is out-degree, 1 is in-degree.
+    pub fn side(&self, side: usize) -> DegreeNorms {
+        if side == 0 { self.out } else { self.inn }
+    }
+
+    /// Mean degree on `side` seen by rows that hold one edge each and
+    /// therefore sit on a node drawn in proportion to its degree on
+    /// `spread`.
+    ///
+    /// A row per edge means node v carries `d_spread(v) / l1` of the
+    /// rows, so the mean it sees is `sum(d_spread * d_side) / l1`. When
+    /// the two sides are the same that sum is `l2^2`, and when they
+    /// differ it is exactly `cross`, which is the two hop path count.
+    /// That is what makes a chain through a hub come out right: the hub
+    /// is counted once per edge into it, not once.
+    pub fn weighted(&self, spread: usize, side: usize) -> f64 {
+        let top = if spread == side {
+            let l2 = self.side(side).l2;
+            l2 * l2
+        } else {
+            self.cross
+        };
+        top / self.out.l1
+    }
+
+    /// Whether the table carries norms at all. See [`DegreeNorms::known`].
+    pub fn known(&self) -> bool {
+        self.out.known() && self.inn.known()
+    }
+}
+
 /// One property column's statistics (perf/12 §1): the row count, the
 /// distinct count, the most frequent values, and equi-depth bucket
 /// boundaries over the rest.
@@ -136,7 +223,7 @@ impl ColStats {
 pub const VALUE_CAP: usize = 32;
 
 /// The table shape the binder resolves against.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Schema {
     nodes: Vec<NodeDef>,
     rels: Vec<RelDef>,
@@ -146,6 +233,10 @@ pub struct Schema {
     /// absent for engines that carry no statistics yet, and every
     /// estimate then falls back to the count ratios.
     degree_hists: BTreeMap<u32, [Vec<u64>; 2]>,
+    /// The lp degree norms per rel table id. Absent for a table loaded
+    /// before they existed, and the DP then falls back to the
+    /// histogram's power-of-two ceilings.
+    degree_norms: BTreeMap<u32, DegreeStats>,
     /// COLOR summaries per rel table id, present after an ANALYZE.
     color_summaries: BTreeMap<u32, ColorSummary>,
     /// Property column statistics per node table id, then column name,
@@ -163,6 +254,7 @@ impl Schema {
             nodes,
             rels,
             degree_hists: BTreeMap::new(),
+            degree_norms: BTreeMap::new(),
             color_summaries: BTreeMap::new(),
             col_stats: BTreeMap::new(),
         };
@@ -220,6 +312,20 @@ impl Schema {
     /// backward, when the engine carries statistics for it.
     pub fn degree_hist(&self, rel: u32) -> Option<&[Vec<u64>; 2]> {
         self.degree_hists.get(&rel)
+    }
+
+    /// Attaches the engine's lp degree norms per rel table id.
+    pub fn set_degree_norms(&mut self, norms: BTreeMap<u32, DegreeStats>) {
+        self.degree_norms = norms;
+    }
+
+    /// The lp degree norms of one rel table, when the table was loaded
+    /// since they existed.
+    pub fn degree_norm(&self, rel: u32) -> Option<DegreeStats> {
+        self.degree_norms
+            .get(&rel)
+            .copied()
+            .filter(DegreeStats::known)
     }
 
     /// Attaches the engine's COLOR summaries per rel table id.

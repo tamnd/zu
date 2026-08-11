@@ -420,6 +420,26 @@ pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
             })
             .collect(),
     );
+    let norm = |n: crate::zu1::stats::DegreeNorms| binder::DegreeNorms {
+        l1: n.l1,
+        l2: n.l2,
+        l3: n.l3,
+        linf: n.linf,
+    };
+    schema.set_degree_norms(
+        stats
+            .rels
+            .iter()
+            .map(|(id, r)| {
+                let s = binder::DegreeStats {
+                    out: norm(r.norms.out),
+                    inn: norm(r.norms.inn),
+                    cross: r.norms.cross,
+                };
+                (*id, s)
+            })
+            .collect(),
+    );
     schema.set_degree_hists(
         stats
             .rels
@@ -996,14 +1016,16 @@ mod tests {
     }
 
     #[test]
-    fn stored_histograms_steer_the_plan_on_a_real_file() {
+    fn stored_statistics_bound_the_hop_on_a_real_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("hubs.zu1");
         let mut db = Zu1File::create(&path).expect("create");
         // Ten hub sources hold two hundred edges each while every
         // target holds one, so the stored histograms say fan-out 200
         // forward and 1 backward. The count ratio alone says 0.67
-        // either way and cannot tell the directions apart.
+        // either way and cannot tell the directions apart, and taking
+        // the forward fan-out at face value puts 600000 rows on a hop
+        // that produces 2000.
         let edges: Vec<(u32, u32)> = (0..10u32)
             .flat_map(|h| (0..200u32).map(move |k| (h, 1000 + h * 200 + k)))
             .collect();
@@ -1017,10 +1039,16 @@ mod tests {
             &[],
         )
         .expect("explain analyze");
-        // Walking backwards multiplies by 1 per hop instead of 200,
-        // so the plan the optimizer picks runs both expands reversed.
-        assert!(text.contains("(c)<-[:follows]-(b)"), "got:\n{text}");
-        assert!(text.contains("(b)<-[:follows]-(a)"), "got:\n{text}");
+        // Three thousand distinct scanned nodes cannot expand into more
+        // rows than the table holds edges, whichever way they walk, so
+        // the stored norms cap the hop at 2000 and it comes out exact.
+        // The direction is a genuine tie once both sides cap there, so
+        // there is nothing left to assert about which way it goes.
+        assert!(
+            text.contains("rows     2000  flat      2000  est      2000  q    1.0"),
+            "got:\n{text}"
+        );
+        assert!(!text.contains("600000"), "got:\n{text}");
     }
 
     #[test]
@@ -1028,20 +1056,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("colors.zu1");
         let mut db = Zu1File::create(&path).expect("create");
-        // Ten knows hubs fan into ten sinks that hold no further knows
-        // edges. Both directions average ten wide, so the means say an
-        // unseeded triangle probes two hundred thousand rows and the
-        // close upgrades to the hash join; the coloring sees the walk
-        // die at the sinks, so almost nothing survives to probe and the
-        // upgrade would pay its accumulate sweep for nothing.
-        let knows: Vec<(u32, u32)> = (0..10u32)
-            .flat_map(|h| (0..10u32).map(move |t| (h, 10 + t)))
+        // Two ranks of ten knows hubs each, feeding ten sinks that hold
+        // no further knows edges. Two hops really do run a thousand
+        // ways, so the norms are right to say so, but the third hop
+        // lands on the sinks and dies. Nothing but the coloring knows
+        // that, so the means send a three hop walk five thousand rows
+        // wide into the close and it upgrades to the hash join for an
+        // accumulate sweep over nothing.
+        let knows: Vec<(u32, u32)> = (0..20u32)
+            .flat_map(|h| (0..10u32).map(move |t| (h, 10 + (h / 10) * 10 + t)))
             .collect();
         graph::bulk_load_as(&mut db, "person", "knows", 2010, &knows).expect("load knows");
         // The undirected close keeps the WCOJ fusion out, so the asp
         // mark alone decides between the probe and the hash join.
-        let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
-                      RETURN count(*) AS n";
+        let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c)-[:knows]->(d), \
+                      (a)-[:knows]-(d) RETURN count(*) AS n";
         let before = explain_analyze(source, &mut db, &[]).expect("explain before");
         assert!(before.contains("AspJoin"), "got:\n{before}");
         crate::zu1::colors::analyze(&mut db).expect("analyze");

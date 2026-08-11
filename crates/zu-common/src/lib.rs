@@ -4,9 +4,11 @@
 
 mod error;
 mod id;
+mod order;
 
 pub use error::ZuError;
 pub use id::{Epoch, GROUP_ROWS, NodeGroupId, NodeId, NodeOffset, RelId, TableId};
+pub use order::int_key;
 
 /// Result alias used across the workspace.
 pub type Result<T> = std::result::Result<T, ZuError>;

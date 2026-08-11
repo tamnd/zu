@@ -53,6 +53,88 @@ pub struct ColorSummary {
     pub triples: Vec<(u32, u32, u64, u64)>,
 }
 
+/// One property column's statistics (perf/12 §1): the row count, the
+/// distinct count, the most frequent values, and equi-depth bucket
+/// boundaries over the rest.
+///
+/// Values are order-preserving byte keys, [`zu_common::int_key`] for
+/// an integer column and the raw bytes for a string one, so a
+/// boundary, a top value, and the literal a query compares against all
+/// meet as bytes and the comparison means what the query means.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColStats {
+    pub rows: u64,
+    pub ndv: u64,
+    pub top: Vec<(Vec<u8>, u64)>,
+    pub bounds: Vec<Vec<u8>>,
+}
+
+impl ColStats {
+    /// Rows the top values account for.
+    pub fn top_rows(&self) -> u64 {
+        self.top.iter().map(|(_, n)| *n).sum()
+    }
+
+    /// Selectivity of `col = value` for a value the query knows. A hit
+    /// in the top list is its own frequency; anything else shares what
+    /// the top list left behind between the values it left behind,
+    /// which is the uniformity assumption made where it does the least
+    /// damage, over the tail after the skew has been taken out.
+    pub fn eq_selectivity(&self, value: &[u8]) -> f64 {
+        if self.rows == 0 {
+            return 0.0;
+        }
+        if let Some((_, n)) = self.top.iter().find(|(v, _)| v == value) {
+            return *n as f64 / self.rows as f64;
+        }
+        // When the top list already holds every distinct value, and
+        // the literal is short enough that it would have been in the
+        // list if it were in the column, the predicate matches
+        // nothing. Claim one row rather than none: an estimate of zero
+        // is a claim no statistic earns, and one row is already the
+        // smallest thing the DP can order around.
+        if self.ndv <= self.top.len() as u64 && value.len() <= VALUE_CAP {
+            return 1.0 / self.rows as f64;
+        }
+        let rest_rows = self.rows.saturating_sub(self.top_rows()) as f64;
+        let rest_ndv = self.ndv.saturating_sub(self.top.len() as u64).max(1) as f64;
+        (rest_rows / rest_ndv / self.rows as f64).clamp(0.0, 1.0)
+    }
+
+    /// Selectivity of `col = ?` for a value the query does not know
+    /// yet, which is every parameter: the average value's share.
+    pub fn eq_average(&self) -> f64 {
+        1.0 / self.ndv.max(1) as f64
+    }
+
+    /// Share of rows below `value`, read off the equi-depth buckets.
+    /// A boundary is only a prefix of the value that set it, so the
+    /// bucket the value falls inside counts as half rather than
+    /// pretending to a precision the truncation threw away.
+    pub fn below(&self, value: &[u8]) -> Option<f64> {
+        let buckets = self.bounds.len().checked_sub(1)?;
+        if buckets == 0 {
+            return None;
+        }
+        if value <= self.bounds[0].as_slice() {
+            return Some(0.0);
+        }
+        let full = self.bounds[1..]
+            .iter()
+            .filter(|b| b.as_slice() < value)
+            .count();
+        if full == buckets {
+            return Some(1.0);
+        }
+        Some((full as f64 + 0.5) / buckets as f64)
+    }
+}
+
+/// Longest value a column statistic stores. Anything longer is left
+/// out of the top list rather than truncated into it, so a miss on a
+/// value this long says nothing about whether the column holds it.
+pub const VALUE_CAP: usize = 32;
+
 /// The table shape the binder resolves against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schema {
@@ -66,6 +148,11 @@ pub struct Schema {
     degree_hists: BTreeMap<u32, [Vec<u64>; 2]>,
     /// COLOR summaries per rel table id, present after an ANALYZE.
     color_summaries: BTreeMap<u32, ColorSummary>,
+    /// Property column statistics per node table id, then column name,
+    /// present for any table whose properties have been stored since
+    /// perf/12 §1 landed. Absent means the estimator falls back to the
+    /// fixed selectivities it used before.
+    col_stats: BTreeMap<u32, BTreeMap<String, ColStats>>,
 }
 
 impl Schema {
@@ -77,6 +164,7 @@ impl Schema {
             rels,
             degree_hists: BTreeMap::new(),
             color_summaries: BTreeMap::new(),
+            col_stats: BTreeMap::new(),
         };
         let mut seen = HashMap::new();
         for n in &schema.nodes {
@@ -142,6 +230,18 @@ impl Schema {
     /// The COLOR summary of one rel table, when an ANALYZE built one.
     pub fn color_summary(&self, rel: u32) -> Option<&ColorSummary> {
         self.color_summaries.get(&rel)
+    }
+
+    /// Attaches the engine's property column statistics, per node
+    /// table id then column name.
+    pub fn set_col_stats(&mut self, stats: BTreeMap<u32, BTreeMap<String, ColStats>>) {
+        self.col_stats = stats;
+    }
+
+    /// The statistics of one property column, when the engine carries
+    /// them for it.
+    pub fn col_stats(&self, table: u32, column: &str) -> Option<&ColStats> {
+        self.col_stats.get(&table)?.get(column)
     }
 }
 
@@ -1447,6 +1547,64 @@ mod tests {
             .iter()
             .find(|v| v.name == name)
             .unwrap_or_else(|| panic!("variable {name}"))
+    }
+
+    #[test]
+    fn a_top_value_is_estimated_by_its_own_frequency() {
+        // The SF1 gender column: two values over ten thousand rows, so
+        // uniformity and the top list happen to agree, and the browser
+        // column, where they do not.
+        let gender = ColStats {
+            rows: 10_000,
+            ndv: 2,
+            top: vec![(b"female".to_vec(), 6000), (b"male".to_vec(), 4000)],
+            bounds: Vec::new(),
+        };
+        assert_eq!(gender.eq_selectivity(b"female"), 0.6);
+        assert_eq!(gender.eq_selectivity(b"male"), 0.4);
+        assert_eq!(gender.eq_average(), 0.5, "a parameter gets the average");
+        // Every value is in the list, so a miss is a value the column
+        // does not hold, and that is worth one row rather than none.
+        assert_eq!(gender.eq_selectivity(b"other"), 1.0 / 10_000.0);
+    }
+
+    #[test]
+    fn a_value_off_the_top_list_shares_what_the_list_left_behind() {
+        // 1000 rows, 101 distinct. The one top value takes 500 rows,
+        // so the other 100 values split the remaining 500.
+        let skewed = ColStats {
+            rows: 1000,
+            ndv: 101,
+            top: vec![(b"hub".to_vec(), 500)],
+            bounds: Vec::new(),
+        };
+        assert_eq!(skewed.eq_selectivity(b"hub"), 0.5);
+        assert_eq!(skewed.eq_selectivity(b"tail"), 5.0 / 1000.0);
+        assert!(
+            skewed.eq_selectivity(b"tail") < skewed.eq_average(),
+            "taking the skew out first leaves the tail below the average"
+        );
+        assert_eq!(ColStats::default().eq_selectivity(b"anything"), 0.0);
+    }
+
+    #[test]
+    fn a_range_reads_off_the_bucket_boundaries() {
+        // Four buckets over the values 0, 10, 20, 30, 40.
+        let stat = ColStats {
+            rows: 400,
+            ndv: 400,
+            top: Vec::new(),
+            bounds: (0..5).map(|b| vec![b * 10u8]).collect(),
+        };
+        assert_eq!(stat.below(&[0]), Some(0.0), "at or under the low bound");
+        assert_eq!(stat.below(&[45]), Some(1.0), "over the high bound");
+        assert_eq!(stat.below(&[20]), Some(0.375), "one whole bucket and half");
+        assert_eq!(stat.below(&[35]), Some(0.875), "three whole and half");
+        assert_eq!(
+            ColStats::default().below(&[1]),
+            None,
+            "no buckets, no answer, and the caller keeps its fallback"
+        );
     }
 
     #[test]

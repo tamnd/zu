@@ -122,12 +122,13 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
 ///
 /// The statistics only carry means, and a mean is the wrong number for
 /// a point seed. SF1 hands `{id: $id}` a person with 335 friends while
-/// the mean degree over the table is 20, so the first step off the seed
-/// is out by the whole skew of the graph no matter how good the
-/// histogram is. Reading the seed's own degree costs one offsets probe
-/// and is exact, so that is what the estimate uses when a reader is
-/// there to ask. Planning never gets one: the plan is cached across
-/// parameter values and this answer is not the same for two of them.
+/// the histogram's mean over the edge holding persons is 20, so the
+/// first step off that seed is out by the whole skew of the graph no
+/// matter how good the histogram is. Reading the seed's own degree
+/// costs one offsets probe and is exact, so that is what the estimate
+/// uses when a reader is there to ask. Planning never gets one: the
+/// plan is cached across parameter values and this answer is not the
+/// same for two of them.
 pub trait Probe {
     /// The row `key` names in `table`, None when no row carries it or
     /// the key is not a constant this run can resolve.

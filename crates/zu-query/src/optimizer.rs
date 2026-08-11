@@ -79,6 +79,18 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
     )
 }
 
+/// What the optimizer expects of one operator: the estimate it
+/// settled on and the pessimistic ceiling that clamped it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Estimate {
+    /// The rows this operator is expected to produce.
+    pub est: f64,
+    /// The most rows it can produce, when the statistics are there to
+    /// say. Real rows above this is a bound violation, which perf/12
+    /// §6 makes a hard fail: the ceiling is a promise, not a guess.
+    pub bnd: Option<f64>,
+}
+
 /// The per-operator row estimate the optimizer settled on, one entry
 /// per operator, bottom-up, in the same order `exec` linearizes the
 /// plan into its operator pipeline. This is what EXPLAIN ANALYZE holds
@@ -88,7 +100,7 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
 /// numbers on the plan. The walk is a few dozen float operations over
 /// a tree that has already survived the DP, and keeping the estimate
 /// off `LogicalPlan` keeps plan equality meaning what it means today.
-pub fn estimates(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Vec<f64> {
+pub fn estimates(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Vec<Estimate> {
     let mut out = Vec::new();
     mark_asp_walk(
         plan.clone(),
@@ -155,11 +167,11 @@ fn mark_asp_walk(
     schema: &Schema,
     dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
     ceil: &mut Ceiling,
-    out: &mut Vec<f64>,
+    out: &mut Vec<Estimate>,
 ) -> (LogicalPlan, f64) {
     let (plan, est) = mark_asp_node(plan, query, schema, dists, ceil, out);
     if !matches!(plan, LogicalPlan::Empty) {
-        out.push(est);
+        out.push(Estimate { est, bnd: ceil.bnd });
     }
     (plan, est)
 }
@@ -170,7 +182,7 @@ fn mark_asp_node(
     schema: &Schema,
     dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
     ceil: &mut Ceiling,
-    out: &mut Vec<f64>,
+    out: &mut Vec<Estimate>,
 ) -> (LogicalPlan, f64) {
     match plan {
         LogicalPlan::Empty => (LogicalPlan::Empty, 1.0),

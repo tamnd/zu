@@ -2200,11 +2200,13 @@ fn flat_rows(ctx: &StageCtx, i: usize) -> u64 {
 /// optional brackets pass rows through without producing any, so
 /// their count belongs to whatever is under them.
 fn counts_rows(desc: &OpDesc) -> bool {
-    match desc {
-        OpDesc::Source | OpDesc::Flatten { .. } => false,
-        OpDesc::OptionalBegin | OpDesc::OptionalEnd { .. } => false,
-        _ => true,
-    }
+    !matches!(
+        desc,
+        OpDesc::Source
+            | OpDesc::Flatten { .. }
+            | OpDesc::OptionalBegin
+            | OpDesc::OptionalEnd { .. }
+    )
 }
 
 /// How many values one successful pull produced: chunk producers

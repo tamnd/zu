@@ -535,6 +535,10 @@ fn run_ic_friends_of_friends(
     p50
 }
 
+/// One entry of the cardinality corpus: a name for the printout, the
+/// query text, and the parameters it wants bound.
+type CardQuery = (&'static str, &'static str, Vec<(&'static str, Value)>);
+
 /// Cardinality quality over the SF1 corpus (perf/12 §4): every query
 /// below runs profiled, and each operator whose measured row count is
 /// a real output cardinality contributes one q-error,
@@ -563,7 +567,7 @@ fn run_cardinality(
     let first = Value::Str(profiles[0][0].clone());
     let birthday = Value::Str(profiles[by_row.len() / 2][3].clone());
 
-    let corpus: Vec<(&str, &str, Vec<(&str, Value)>)> = vec![
+    let corpus: Vec<CardQuery> = vec![
         ("scan", "MATCH (p:person) RETURN count(p) AS n", vec![]),
         (
             "hop",

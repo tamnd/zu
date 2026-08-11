@@ -24,7 +24,7 @@ use zu_query::exec::{Options, QueryResult, Value};
 use zu_query::snapshot::{ColId, CsrPin, Dir, GroupId, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector};
 
-use crate::compile::{AggSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source};
+use crate::compile::{AggSpec, Close, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source};
 use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::pool;
 use crate::sink::{self, Acc, SinkState};
@@ -88,6 +88,17 @@ enum Work {
         dir: Dir,
         to: usize,
     },
+}
+
+/// The parts of an `Op::Expand` the walk itself reads, lifted out of
+/// the opcode so the call does not hand over five loose scalars.
+#[derive(Clone, Copy)]
+struct Hop {
+    rel: RelId,
+    dirs: Dirs,
+    to: usize,
+    batch: bool,
+    close: Option<Close>,
 }
 
 /// One query's morsels: what a morsel means, the ranges themselves,
@@ -678,12 +689,20 @@ impl<'a> Worker<'a> {
                 dirs,
                 to,
                 batch,
+                close,
                 ..
             } => {
-                if let [Op::DegreeProduct { steps }] = rest {
+                if let ([Op::DegreeProduct { steps }], None) = (rest, close) {
                     return self.expand_degree(*rel, *dirs, steps, set);
                 }
-                self.expand(*rel, *dirs, *to, *batch, rest, set)
+                let hop = Hop {
+                    rel: *rel,
+                    dirs: *dirs,
+                    to: *to,
+                    batch: *batch,
+                    close: *close,
+                };
+                self.expand(hop, rest, set)
             }
             Op::Intersect {
                 seed,
@@ -707,16 +726,33 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn expand(
-        &mut self,
-        rel: RelId,
-        dirs: Dirs,
-        to: usize,
-        batch: bool,
-        rest: &[Op],
-        set: &mut ChunkSet,
-    ) -> Result<()> {
+    fn expand(&mut self, hop: Hop, rest: &[Op], set: &mut ChunkSet) -> Result<()> {
+        let Hop {
+            rel,
+            dirs,
+            to,
+            batch,
+            close,
+        } = hop;
         let src = set.chunks.len() - 1;
+        // A fused close reads its probe list once for the whole expand.
+        // That level sits below the one being walked, so its pin does
+        // not move while this runs, and a probe side with no edges at
+        // all rejects every neighbor before any of them is built.
+        let mut close_pins = Vec::new();
+        let mut close_at = 0;
+        if let Some(c) = close {
+            let far = &set.chunks[c.probe_level];
+            let prow = row_at(far, pinned_pos(far));
+            close_at = (prow % u64::from(GROUP_ROWS)) as usize;
+            for dir in sides(c.dirs) {
+                close_pins.push(self.pin(c.rel, dir, prow)?);
+            }
+            if close_pins.iter().all(|p| p.list(close_at).is_empty()) {
+                return Ok(());
+            }
+        }
+        let close_lists: Vec<&[u64]> = close_pins.iter().map(|p| p.list(close_at)).collect();
         // Copy the active rows out first: pinning mutates the chunk the
         // selection and values are read from.
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -754,6 +790,9 @@ impl<'a> Worker<'a> {
         // multiplicity at one and any active row does that.
         let mut fill = self.row_pool.pop().unwrap_or_default();
         fill.clear();
+        // Where a fused close puts the neighbors it kept.
+        let mut masked = self.row_pool.pop().unwrap_or_default();
+        let mut cursors = [0usize; 2];
         if batch {
             set.chunks[src].cur = idxs.first().copied();
         }
@@ -774,6 +813,24 @@ impl<'a> Worker<'a> {
                 }
                 let pin = &held[slot].as_ref().expect("just pinned").1;
                 let list = pin.list((row % u64::from(GROUP_ROWS)) as usize);
+                // The close judges the neighbors here, where they are
+                // still a sorted list and nothing has been built for
+                // them. Both lists ascend, so the probe walks forward
+                // and the whole source list costs one merge.
+                let list = if close.is_some() {
+                    masked.clear();
+                    let cur = &mut cursors[..close_lists.len()];
+                    cur.fill(0);
+                    let mut prev = 0;
+                    for &v in list {
+                        if member(&close_lists, cur, &mut prev, v) {
+                            masked.push(v);
+                        }
+                    }
+                    &masked[..]
+                } else {
+                    list
+                };
                 if batch {
                     let mut tail = list;
                     while !tail.is_empty() {
@@ -809,6 +866,7 @@ impl<'a> Worker<'a> {
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
         self.row_pool.push(fill);
+        self.row_pool.push(masked);
         result
     }
 
@@ -1838,6 +1896,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 batch: false,
+                close: None,
             }],
             SinkSpec::Count,
             &["n"],
@@ -1868,6 +1927,7 @@ mod tests {
                     from: 0,
                     to: 1,
                     batch: false,
+                    close: None,
                 },
                 Op::DegreeProduct {
                     steps: vec![(0, Dirs::One(Dir::Fwd))],
@@ -1910,6 +1970,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 batch: false,
+                close: None,
             }],
             SinkSpec::Rows {
                 items: vec![ScalarRef::RowId { level: 1 }],
@@ -1945,6 +2006,7 @@ mod tests {
                         from: 0,
                         to: 1,
                         batch,
+                        close: None,
                     },
                     Op::Filter { prog: gt_prog(20) },
                 ],
@@ -1978,6 +2040,7 @@ mod tests {
                         from: 0,
                         to: 1,
                         batch,
+                        close: None,
                     },
                     Op::Filter { prog: gt_prog(-1) },
                 ],

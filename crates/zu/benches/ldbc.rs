@@ -16,8 +16,11 @@
 //! factorized count over the whole graph through the query engine, p50
 //! in ms. Triangle is the unseeded directed triangle count over the
 //! whole graph, the shape the optimizer closes with AspJoin, p50 in
-//! ms. IS is the IS1-shaped profile read by original id, all eight
-//! properties through zu::query::run, gated at the G2 1 ms warm p50.
+//! ms. Close is the same triangle walked undirected, the shape that
+//! keeps the binary probe and so runs the semijoin folded into the
+//! expand, p50 in ms. IS is the IS1-shaped profile read by original
+//! id, all eight properties through zu::query::run, gated at the G2 1
+//! ms warm p50.
 //! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
 //! ORDER BY, and LIMIT, p50 in ms. Every phase crosschecks against a
 //! reference computed from the raw files, so a number cannot come from
@@ -406,6 +409,61 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
         "sf1 triangle count (binary): p50 {:.3} ms, max {:.3} ms over {runs} runs",
         blat[runs / 2].as_secs_f64() * 1e3,
         blat[runs - 1].as_secs_f64() * 1e3
+    );
+    p50
+}
+
+/// Close: the same triangle walked undirected, which is the shape the
+/// optimizer keeps on the binary probe because the fusion reads one
+/// sorted list per side and an undirected end has two. The closing
+/// probe compiles to a semijoin the pipeline folds into the expand
+/// that produced the rows it judges, so this is the number that moves
+/// when that fusion changes. The reference walks the undirected
+/// adjacency and binary searches the sorted pair list, counting the
+/// same ordered triples the query counts.
+fn run_undirected_close(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
+    let mut both: Vec<(u32, u32)> = Vec::with_capacity(edges.len() * 2);
+    for &(s, d) in edges {
+        both.push((s, d));
+        both.push((d, s));
+    }
+    both.sort_unstable();
+    both.dedup();
+    let mut adj = vec![Vec::new(); node_count as usize];
+    for &(s, d) in &both {
+        adj[s as usize].push(d);
+    }
+    let mut expected = 0i64;
+    for &(a, b) in &both {
+        for &c in &adj[b as usize] {
+            if both.binary_search(&(a, c)).is_ok() {
+                expected += 1;
+            }
+        }
+    }
+    let mut db = Zu1File::open(path).expect("open");
+    let source = "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+                  RETURN count(*) AS closed";
+    let runs = 15usize;
+    for _ in 0..3 {
+        zu::query::run(source, &mut db, &[]).expect("warmup run");
+    }
+    let mut lat = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t = Instant::now();
+        let r = zu::query::run(source, &mut db, &[]).expect("undirected close");
+        lat.push(t.elapsed());
+        assert_eq!(
+            r.rows,
+            [[Value::Int(expected)]],
+            "undirected close disagrees with the edge list reference"
+        );
+    }
+    lat.sort_unstable();
+    let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    println!(
+        "sf1 undirected close: {expected} closed paths, p50 {p50:.3} ms, max {:.3} ms over {runs} runs",
+        lat[runs - 1].as_secs_f64() * 1e3
     );
     p50
 }
@@ -852,6 +910,7 @@ fn main() {
     let key_p50 = run_key_lookups(&path, &by_row);
     let two_hop_p50 = run_two_hop(&path, &edges, node_count);
     let triangle_p50 = run_triangle_count(&path, &edges, node_count);
+    let close_p50 = run_undirected_close(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
     let (q50, q90, q99, qmax, violations) = run_cardinality(&path, &by_row, &profiles);
@@ -880,6 +939,12 @@ fn main() {
         && triangle_p50 > ceiling
     {
         println!("GATE FAIL triangle count: p50 {triangle_p50:.3} ms > ceiling {ceiling}");
+        failed = true;
+    }
+    if let Some(ceiling) = budget("ldbc_close_p50_ms")
+        && close_p50 > ceiling
+    {
+        println!("GATE FAIL undirected close: p50 {close_p50:.3} ms > ceiling {ceiling}");
         failed = true;
     }
     if let Some(ceiling) = budget("ldbc_is_p50_ms")

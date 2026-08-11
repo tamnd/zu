@@ -1595,6 +1595,53 @@ mod tests {
     use super::*;
     use crate::parser::parse;
 
+    #[test]
+    fn the_weighted_mean_counts_a_hub_once_per_edge() {
+        // One hub with three out-edges and one in-edge, plus three
+        // leaves holding one out-edge each, so six edges in all. Four
+        // sources hold out-edges and the plain mean is 1.5, but a row
+        // that already holds an edge sits on the hub half the time.
+        let out = DegreeNorms {
+            l1: 6.0,
+            l2: 18f64.sqrt(),
+            l3: 30f64.cbrt(),
+            linf: 3.0,
+        };
+        let inn = DegreeNorms {
+            l1: 6.0,
+            l2: 10f64.sqrt(),
+            l3: 12f64.cbrt(),
+            linf: 3.0,
+        };
+        let stats = DegreeStats {
+            out,
+            inn,
+            cross: 3.0,
+        };
+        // Arriving by in-degree and leaving by out-degree is the two
+        // hop chain, and 6 rows times 3/6 is the 3 paths there are.
+        assert_eq!(stats.weighted(1, 0), 0.5);
+        // Arriving and leaving by the same side is l2 squared over l1,
+        // and squaring a root does not land on 3 exactly.
+        assert!((stats.weighted(0, 0) - 3.0).abs() < 1e-9);
+        assert_eq!(stats.side(1), inn);
+    }
+
+    #[test]
+    fn the_top_sum_never_promises_more_than_the_whole_sequence() {
+        let n = DegreeNorms {
+            l1: 6.0,
+            l2: 18f64.sqrt(),
+            l3: 30f64.cbrt(),
+            linf: 3.0,
+        };
+        // One row can only take the largest degree there is, and the
+        // whole table can only hand back every edge it holds.
+        assert_eq!(n.top_sum(1.0), 3.0);
+        assert_eq!(n.top_sum(1000.0), 6.0);
+        assert!(!DegreeNorms::default().known());
+    }
+
     /// person(0), place(1), person-KNOWS->person, person-IS_LOCATED_IN->place,
     /// place-PART_OF->place, mirroring the LDBC SF1 core.
     fn schema() -> Schema {

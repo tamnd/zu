@@ -227,7 +227,7 @@ fn mark_asp_node(
                     && !matches!(direction, RelDirection::Undirected)
                     && query.variables[rel].rel_tables.len() == 1;
                 // A close keeps or drops rows, never adds, so the
-                // ceiling below it still holds.
+                // ceiling under it stands and only the spread moves.
                 ceil.walked(&e, from, to, query);
                 (asp, wcoj, est * into_prob(&e, query, schema))
             } else {

@@ -69,6 +69,20 @@ pub(crate) enum Dirs {
     Both,
 }
 
+/// A semijoin folded into the expand that produces the rows it judges
+/// (perf/13 section 1): the mask a join build passes sideways, in the
+/// one shape the compiled pipeline can produce it today. The probe
+/// side's list is the filter, the expand is the consumer, and the rows
+/// it drops never reach the gather that would have read their columns.
+#[derive(Clone, Copy)]
+pub(crate) struct Close {
+    pub rel: RelId,
+    pub dirs: Dirs,
+    /// The level holding the end that stays fixed, pinned for the whole
+    /// expand because it sits below the level the expand walks off.
+    pub probe_level: usize,
+}
+
 pub(crate) enum Op {
     /// Refine the newest level's selection by a predicate program.
     Filter { prog: Program },
@@ -86,6 +100,10 @@ pub(crate) enum Op {
         /// source row's neighbors. Set by `batch_expands` once the
         /// pipeline is final, false while the plan is still growing.
         batch: bool,
+        /// A semijoin that judged this expand's rows one operator later
+        /// and now judges them as they are emitted. Set by
+        /// `fuse_closes`, None while the plan is still growing.
+        close: Option<Close>,
     },
     /// The WCOJ close (docs/07 section 4, perf/05 section 3): the
     /// expand that would build the closing node and the probe back
@@ -227,18 +245,76 @@ fn sink_reads(sink: &SinkSpec, level: usize) -> bool {
 /// past this one is none of this decision's business.
 fn batch_expands(ops: &mut [Op], sink: &SinkSpec) {
     for i in 0..ops.len() {
-        let Op::Expand { from, .. } = ops[i] else {
+        let Op::Expand { from, close, .. } = ops[i] else {
             continue;
         };
-        let probed = ops[i + 1..].iter().any(|op| match op {
+        let reads = |op: &Op| match op {
             Op::Intersect { probe_level, .. } | Op::Semi { probe_level, .. } => {
                 *probe_level == from
             }
+            Op::Expand { close: Some(c), .. } => c.probe_level == from,
             _ => false,
-        });
+        };
+        // The expand's own fused close counts: it reads the probe
+        // level through that level's pin like a standalone semi does.
+        let probed = close.is_some_and(|c| c.probe_level == from) || ops[i + 1..].iter().any(reads);
         if let Op::Expand { batch, .. } = &mut ops[i] {
             *batch = !probed && !sink_reads(sink, from);
         }
+    }
+}
+
+/// Folds a semijoin into the expand that produced the rows it judges.
+///
+/// A closing semi refines the newest level, and the expand right below
+/// it is what built that level: every neighbor it emitted got a chunk
+/// row and every property column the pipeline reads on that level, and
+/// then the semi threw most of them away. perf/13 section 1 calls this
+/// the mask flowing sideways into the expand and the gather, and here
+/// the two are the same operator, so the mask goes in at the emit and
+/// the columns are read for the survivors only.
+///
+/// The probe list is what the semi would have read anyway, once for the
+/// vector, and it does not move while the expand runs because its level
+/// sits below the one the expand walks off. So the fusion costs nothing
+/// and saves whatever the close rejects.
+///
+/// Only an immediately following semi folds in. One with a filter
+/// between them judges rows that filter has already thinned, and moving
+/// it above the filter would run the probe on rows the pipeline no
+/// longer cares about.
+fn fuse_closes(ops: &mut Vec<Op>) {
+    let mut i = 0;
+    while i + 1 < ops.len() {
+        let (
+            Op::Expand { close: None, .. },
+            &Op::Semi {
+                rel,
+                dirs,
+                probe_level,
+            },
+        ) = (&ops[i], &ops[i + 1])
+        else {
+            i += 1;
+            continue;
+        };
+        let Op::Expand { to, close, .. } = &mut ops[i] else {
+            unreachable!("matched an expand just above");
+        };
+        // A semi probing the level the expand is building would have to
+        // read rows that do not exist yet. Validation rejects that
+        // shape, and this pass leaves it alone rather than relying on
+        // the order the two run in.
+        if probe_level == *to {
+            i += 1;
+            continue;
+        }
+        *close = Some(Close {
+            rel,
+            dirs,
+            probe_level,
+        });
+        ops.remove(i + 1);
     }
 }
 
@@ -412,6 +488,7 @@ impl Compiler<'_> {
                         from: src,
                         to: to_level,
                         batch: false,
+                        close: None,
                     });
                 }
                 Some(LogicalPlan::Expand {
@@ -611,6 +688,7 @@ impl Compiler<'_> {
             }
         }
 
+        fuse_closes(&mut ops);
         batch_expands(&mut ops, &sink);
 
         Ok(Some(ExecPlan {
@@ -1256,6 +1334,7 @@ mod tests {
             from,
             to,
             batch: false,
+            close: None,
         }
     }
 
@@ -1266,6 +1345,65 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn semi(probe_level: usize) -> Op {
+        Op::Semi {
+            rel: 0,
+            dirs: Dirs::One(Dir::Fwd),
+            probe_level,
+        }
+    }
+
+    fn closes(ops: &[Op]) -> Vec<Option<usize>> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Expand { close, .. } => Some(close.map(|c| c.probe_level)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_semi_right_above_an_expand_folds_into_it() {
+        let mut ops = vec![hop(0, 1), hop(1, 2), semi(0)];
+        fuse_closes(&mut ops);
+        assert_eq!(ops.len(), 2, "the semi is gone from the chain");
+        assert_eq!(
+            closes(&ops),
+            [None, Some(0)],
+            "the close belongs to the expand that built the rows it judges"
+        );
+    }
+
+    #[test]
+    fn a_filter_between_them_keeps_the_semi_where_it_is() {
+        let mut ops = vec![
+            hop(0, 1),
+            hop(1, 2),
+            Op::Filter {
+                prog: Program {
+                    ops: Vec::new(),
+                    regs: 0,
+                },
+            },
+            semi(0),
+        ];
+        fuse_closes(&mut ops);
+        assert_eq!(ops.len(), 4, "the chain is untouched");
+        assert_eq!(closes(&ops), [None, None], "neither expand took the close");
+    }
+
+    #[test]
+    fn a_folded_close_keeps_the_probe_levels_pin() {
+        let mut ops = vec![hop(0, 1), hop(1, 2), semi(1)];
+        fuse_closes(&mut ops);
+        batch_expands(&mut ops, &SinkSpec::Count);
+        assert_eq!(
+            batched(&ops),
+            [true, false],
+            "the close reads level 1 through its pin, fused or not"
+        );
     }
 
     #[test]

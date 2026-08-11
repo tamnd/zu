@@ -37,7 +37,7 @@ Plans cached by (query text, catalog epoch, param types), LDBC short reads are p
 | ShortestPath | bidirectional BFS/Dijkstra (point-to-point); MS-BFS variant when ≥ 1024 sources |
 | VectorTopK | HNSW scan as a MATCH seed (feature `vector`) |
 | FtsScan | BM25 seed (feature `fts`) |
-| HashAggregate / Sort / TopN / Limit / Distinct | factorization-aware |
+| HashAggregate / Sort / TopN / Limit / Distinct | factorization-aware; an ORDER BY under a LIMIT of k runs as a bounded buffer per worker, which reads a row's sort keys, drops it against the k it already holds, and only materializes the row when it wins, so the ordered query builds k rows where the unordered one builds the whole fan |
 | TableFunction | `pagerank()`, `wcc()`, `louvain()`, `sssp()` … return relations, composable with MATCH (GraphAlg direction; no Pregel API) |
 
 **WCOJ policy** (Umbra/Free Join findings): binary ASPJoins by default; the optimizer marks a subplan for MultiwayIntersect iff the pattern is cyclic (triangle+) *or* estimated intermediate/output ratio exceeds a threshold (default 16×). Sorted CSR gives us the tries for free, no runtime trie build for pure-adjacency intersections (cheaper than Umbra's lazy hash tries).

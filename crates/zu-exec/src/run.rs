@@ -339,6 +339,18 @@ fn make_morsels(rows: u64, workers: usize) -> Vec<(u64, u64)> {
     out
 }
 
+/// The bounded buffer a worker runs its row sink with, on the plans
+/// whose ORDER BY sits under a small enough LIMIT. Every worker builds
+/// it off the same plan, so they all agree on whether the run is
+/// bounded before any of them emits a row.
+fn bounded_sink(plan: &ExecPlan) -> Option<sink::TopN> {
+    let SinkSpec::Rows { post, .. } = &plan.sink else {
+        return None;
+    };
+    let (keys, need) = sink::topn_of(post)?;
+    Some(sink::TopN::new(keys, need))
+}
+
 /// Rows a LIMIT query needs before every later row is dead weight,
 /// `None` when early stop is not sound for this post chain.
 fn quota_of(post: &[PostSpec]) -> Option<u64> {
@@ -472,6 +484,12 @@ struct Worker<'a> {
     work: Work,
     /// Rows emitted in the morsel in flight, for the quota check.
     local_rows: u64,
+    /// The morsel in flight, which with `local_rows` says where a row
+    /// would have sat had the batches been stitched.
+    morsel: usize,
+    /// Sort key scratch for the bounded sink, refilled per row so a
+    /// row the buffer rejects costs no allocation at all.
+    keybuf: Vec<Value>,
 }
 
 impl<'a> Worker<'a> {
@@ -493,10 +511,15 @@ impl<'a> Worker<'a> {
             batch: KeyBatch::default(),
             gids: Vec::new(),
             args: Vec::new(),
-            sink: SinkState::default(),
+            sink: SinkState {
+                top: bounded_sink(plan),
+                ..SinkState::default()
+            },
             stop,
             work,
             local_rows: 0,
+            morsel: 0,
+            keybuf: Vec::new(),
         }
     }
 
@@ -516,7 +539,8 @@ impl<'a> Worker<'a> {
     fn run_morsel(&mut self, idx: usize, range: (u64, u64)) -> Result<()> {
         self.arena.reset();
         self.local_rows = 0;
-        let rows_sink = matches!(self.plan.sink, SinkSpec::Rows { .. });
+        self.morsel = idx;
+        let rows_sink = matches!(self.plan.sink, SinkSpec::Rows { .. }) && self.sink.top.is_none();
         match self.work {
             Work::Scan => self.scan_morsel(idx, range)?,
             Work::Seek(seed) => self.seek_morsel(seed)?,
@@ -1129,14 +1153,31 @@ impl<'a> Worker<'a> {
                 Ok(())
             }
             SinkSpec::Rows { items, .. } => {
+                let plan = self.plan;
                 let last = set.chunks.len() - 1;
                 for pos in active_positions(&set.chunks[last]) {
+                    let at = (self.morsel as u32, self.local_rows as u32);
+                    self.local_rows += 1;
+                    // Under a LIMIT the buffer judges the row on its
+                    // sort keys alone, and a row that loses to the k it
+                    // already holds is never built.
+                    if let Some(top) = self.sink.top.as_mut() {
+                        self.keybuf.clear();
+                        for &(col, _) in top.keys() {
+                            self.keybuf.push(scalar(plan, set, items[col], pos)?);
+                        }
+                        if !top.wants(&self.keybuf) {
+                            continue;
+                        }
+                    }
                     let mut row = Vec::with_capacity(items.len());
                     for &r in items {
-                        row.push(scalar(self.plan, set, r, pos)?);
+                        row.push(scalar(plan, set, r, pos)?);
                     }
-                    self.sink.rows.push(row);
-                    self.local_rows += 1;
+                    match self.sink.top.as_mut() {
+                        Some(top) => top.keep(&self.keybuf, at, row),
+                        None => self.sink.rows.push(row),
+                    }
                 }
                 Ok(())
             }

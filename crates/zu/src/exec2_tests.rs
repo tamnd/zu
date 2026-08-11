@@ -208,6 +208,16 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person)-[:knows]->(b) WHERE b.age < 10 RETURN a.id AS a, b.id AS b",
         "MATCH (a:person)-[:knows]->(b) RETURN b.age AS age, count(b) AS n",
         "MATCH (a:person)-[:knows]->(b) WHERE a.score = 300 RETURN sum(b.score) AS s",
+        // Undirected closes, the shape that keeps the binary probe and
+        // so runs the semijoin folded into the expand above it. Once
+        // over a scan, once under a key seek, and once with the closed
+        // node's properties read, so the fold is checked where the
+        // rows it drops would have been materialized.
+        "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) RETURN count(*) AS n",
+        "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+         RETURN count(c) AS n",
+        "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+         RETURN b.id AS b, c.id AS c ORDER BY b, c LIMIT 20",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);

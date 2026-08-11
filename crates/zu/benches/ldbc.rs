@@ -549,12 +549,12 @@ type CardQuery = (&'static str, &'static str, Vec<(&'static str, Value)>);
 ///
 /// Profiled runs are sequential by construction, so this phase is
 /// about estimate quality and says nothing about speed. Returns the
-/// p50, p90, and p99 of the pooled q-errors.
+/// p50, p90, p99, and worst of the pooled q-errors.
 fn run_cardinality(
     path: &std::path::Path,
     by_row: &[u64],
     profiles: &ProfileRows,
-) -> (f64, f64, f64) {
+) -> (f64, f64, f64, f64) {
     let mut db = Zu1File::open(path).expect("open");
 
     // Literals lifted out of the loaded data so every predicate below
@@ -655,14 +655,13 @@ fn run_cardinality(
 
     all.sort_by(f64::total_cmp);
     let pick = |pct: usize| all[(all.len() - 1) * pct / 100];
-    let (p50, p90, p99) = (pick(50), pick(90), pick(99));
+    let (p50, p90, p99, max) = (pick(50), pick(90), pick(99), all[all.len() - 1]);
     println!(
-        "sf1 cardinality: {} operators over {} queries, q-error p50 {p50:.2}, p90 {p90:.2}, p99 {p99:.2}, max {:.2}",
+        "sf1 cardinality: {} operators over {} queries, q-error p50 {p50:.2}, p90 {p90:.2}, p99 {p99:.2}, max {max:.2}",
         all.len(),
         corpus.len(),
-        all[all.len() - 1]
     );
-    (p50, p90, p99)
+    (p50, p90, p99, max)
 }
 
 /// The M4 table function kernels over the loaded file (docs/07 §4):
@@ -839,7 +838,7 @@ fn main() {
     let triangle_p50 = run_triangle_count(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
-    let (q50, q90, q99) = run_cardinality(&path, &by_row, &profiles);
+    let (q50, q90, q99, qmax) = run_cardinality(&path, &by_row, &profiles);
     let (pagerank_s, wcc_s, sssp_s, louvain_s) = run_table_functions(&path, &edges, node_count);
 
     let mut failed = false;
@@ -883,6 +882,7 @@ fn main() {
         ("p50", q50, "card_qerror_p50"),
         ("p90", q90, "card_qerror_p90"),
         ("p99", q99, "card_qerror_p99"),
+        ("max", qmax, "card_qerror_max"),
     ] {
         if let Some(ceiling) = budget(key)
             && got > ceiling

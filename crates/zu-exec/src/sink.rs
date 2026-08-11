@@ -147,6 +147,9 @@ pub(crate) struct SinkState {
     pub rows: Vec<Vec<Value>>,
     /// Finished morsels: (morsel index, its rows).
     pub batches: Vec<(usize, Vec<Vec<Value>>)>,
+    /// The bounded buffer, on the plans whose ORDER BY sits under a
+    /// LIMIT. A worker running with one never fills `rows`.
+    pub top: Option<TopN>,
 }
 
 /// Post steps over materialized rows, exactly the old apply_post.
@@ -217,6 +220,159 @@ fn needed_after(post: &[PostSpec]) -> usize {
         };
     }
     need
+}
+
+/// The widest answer a bounded sink will hold. Past this every worker
+/// is carrying more rows than the fan usually has, and a selection
+/// over the whole fan costs about what pruning a buffer that wide
+/// does, so the plan keeps the materializing path.
+const TOPN_MAX: usize = 16384;
+
+/// The smallest buffer a bounded sink prunes, so a LIMIT of one does
+/// not run a selection every time a row wins.
+const TOPN_FLOOR: usize = 64;
+
+/// The ORDER BY under a LIMIT a bounded sink can serve: its keys and
+/// the number of ordered rows anything above the sort can still use.
+/// The sort has to be the first step above the sink, because a dedup
+/// under it changes which rows the limit lands on, and the limit has
+/// to be one a worker can hold.
+pub(crate) fn topn_of(post: &[PostSpec]) -> Option<(&[(usize, bool)], usize)> {
+    let PostSpec::Sort(keys) = post.first()? else {
+        return None;
+    };
+    let need = needed_after(&post[1..]);
+    (need <= TOPN_MAX).then_some((keys.as_slice(), need))
+}
+
+/// A row a worker is still holding for the answer, with where it sat
+/// in the scan: the morsel it came out of and its position inside it.
+/// That pair is the order the stitched result would have had, so it is
+/// what breaks ties between equal keys, and the answer reads the same
+/// whichever worker happened to claim which morsel.
+pub(crate) struct Kept {
+    key: Vec<Value>,
+    at: (u32, u32),
+    row: Vec<Value>,
+}
+
+/// One worker's bounded buffer for ORDER BY under a LIMIT.
+///
+/// The sink knows k before the first row arrives, so a row that loses
+/// to the k rows already held is dead on arrival: the buffer reads its
+/// key columns, drops it, and the row itself is never built. On the IS
+/// shape that is ten rows materialized out of ten thousand candidates,
+/// and the ordered query ends up doing less work than the same query
+/// with no ORDER BY on it.
+///
+/// The buffer holds up to 2k rows and prunes back to k by selection
+/// instead of sifting a heap on every winner. Both are linear in the
+/// rows and both spend one compare on a loser, which is the compare
+/// that matters here; the buffer gets to reuse the comparator the full
+/// sort already uses rather than carry a second one.
+pub(crate) struct TopN {
+    keys: Vec<(usize, bool)>,
+    need: usize,
+    kept: Vec<Kept>,
+    /// The key of the k-th best row so far, once k rows are in hand. A
+    /// row that does not beat it cannot reach the answer: k rows
+    /// already order ahead of it and none of them leave.
+    worst: Option<Vec<Value>>,
+}
+
+impl TopN {
+    pub(crate) fn new(keys: &[(usize, bool)], need: usize) -> TopN {
+        TopN {
+            keys: keys.to_vec(),
+            need,
+            kept: Vec::new(),
+            worst: None,
+        }
+    }
+
+    /// The columns a row has to produce before the buffer can judge it,
+    /// in the order the key is built.
+    pub(crate) fn keys(&self) -> &[(usize, bool)] {
+        &self.keys
+    }
+
+    /// Whether a row with this key, arriving after everything the
+    /// buffer holds, can still reach the answer. Equal to the worst
+    /// kept key is not good enough: the tie breaks on scan position
+    /// and this row sits behind every row already held.
+    pub(crate) fn wants(&self, key: &[Value]) -> bool {
+        self.need > 0
+            && self
+                .worst
+                .as_ref()
+                .is_none_or(|w| key_order(&self.keys, key, w) == Ordering::Less)
+    }
+
+    /// Takes a row the buffer wants, with the morsel and the position
+    /// inside it the row was emitted at.
+    pub(crate) fn keep(&mut self, key: &[Value], at: (u32, u32), row: Vec<Value>) {
+        self.kept.push(Kept {
+            key: key.to_vec(),
+            at,
+            row,
+        });
+        if self.kept.len() >= self.need.saturating_mul(2).max(TOPN_FLOOR) {
+            self.prune();
+        }
+    }
+
+    /// Cuts the buffer back to the k best rows and records the new
+    /// worst of them, which is the reject test every later row meets.
+    fn prune(&mut self) {
+        if self.need == 0 {
+            self.kept.clear();
+            return;
+        }
+        if self.kept.len() < self.need {
+            return;
+        }
+        let TopN {
+            keys,
+            need,
+            kept,
+            worst,
+        } = self;
+        let by = |x: &Kept, y: &Kept| key_order(keys, &x.key, &y.key).then(x.at.cmp(&y.at));
+        kept.select_nth_unstable_by(*need - 1, by);
+        kept.truncate(*need);
+        *worst = Some(kept[*need - 1].key.clone());
+    }
+}
+
+/// The answer out of the workers' buffers: every row they kept, put in
+/// key order and then in scan order, cut to k. The tie break is the
+/// order the materializing path would have stitched, so both paths
+/// return the same rows the same way round.
+pub(crate) fn merge_topn(keys: &[(usize, bool)], need: usize, tops: Vec<TopN>) -> Vec<Vec<Value>> {
+    let mut kept: Vec<Kept> = tops
+        .into_iter()
+        .flat_map(|mut t| {
+            t.prune();
+            t.kept
+        })
+        .collect();
+    kept.sort_unstable_by(|x, y| key_order(keys, &x.key, &y.key).then(x.at.cmp(&y.at)));
+    kept.truncate(need);
+    kept.into_iter().map(|k| k.row).collect()
+}
+
+/// Two sort keys compared the way the ORDER BY reads them. The values
+/// are already in key order, so the column each one came from is spent
+/// and only the direction is left.
+fn key_order(keys: &[(usize, bool)], a: &[Value], b: &[Value]) -> Ordering {
+    for (at, &(_, asc)) in keys.iter().enumerate() {
+        let ord = val_cmp(&a[at], &b[at]);
+        let ord = if asc { ord } else { ord.reverse() };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// One order-preserving 128 bit key per row, when every sort column is
@@ -434,8 +590,19 @@ pub(crate) fn finish_agg(
 pub(crate) fn finish_rows(
     columns: Vec<String>,
     post: &[PostSpec],
-    partials: Vec<SinkState>,
+    mut partials: Vec<SinkState>,
 ) -> QueryResult {
+    // The workers all read the same post chain, so either every one of
+    // them ran bounded or none did, and the sort is already served.
+    if let Some((keys, need)) = topn_of(post)
+        && partials.iter().all(|p| p.top.is_some())
+    {
+        let tops = partials.iter_mut().filter_map(|p| p.top.take()).collect();
+        return QueryResult {
+            columns,
+            rows: apply_post(&post[1..], merge_topn(keys, need, tops)),
+        };
+    }
     let mut batches: Vec<(usize, Vec<Vec<Value>>)> =
         partials.into_iter().flat_map(|p| p.batches).collect();
     batches.sort_by_key(|&(ix, _)| ix);
@@ -506,6 +673,86 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["e", "b", "f", "d", "g", "c", "a"]);
+    }
+
+    /// The workers' side of a bounded run: rows are dealt to `workers`
+    /// buffers one morsel each, in scan order, exactly as a worker
+    /// claiming morsels sees them.
+    fn bounded(
+        data: &[(i64, &str)],
+        keys: &[(usize, bool)],
+        need: usize,
+        workers: usize,
+    ) -> Vec<Vec<Value>> {
+        let mut tops: Vec<TopN> = (0..workers).map(|_| TopN::new(keys, need)).collect();
+        for (at, row) in rows(data).into_iter().enumerate() {
+            let top = &mut tops[at % workers];
+            let key: Vec<Value> = keys.iter().map(|&(c, _)| row[c].clone()).collect();
+            if top.wants(&key) {
+                top.keep(&key, (at as u32, 0), row);
+            }
+        }
+        merge_topn(keys, need, tops)
+    }
+
+    #[test]
+    fn the_bounded_buffer_answers_what_the_full_sort_answers() {
+        for keys in [
+            vec![(0usize, true)],
+            vec![(0usize, false)],
+            vec![(0usize, true), (1usize, false)],
+            vec![(1usize, true), (0usize, false)],
+        ] {
+            for need in 1..=DATA.len() + 2 {
+                let want = apply_post(
+                    &[PostSpec::Sort(keys.clone()), PostSpec::Limit(need as u64)],
+                    rows(&DATA),
+                );
+                for workers in 1..=4 {
+                    assert_eq!(
+                        bounded(&DATA, &keys, need, workers),
+                        want,
+                        "keys {keys:?}, need {need}, {workers} workers"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_that_ties_the_worst_kept_key_loses() {
+        let mut top = TopN::new(&[(0, true)], 2);
+        for (at, row) in rows(&[(1, "a"), (2, "b")]).into_iter().enumerate() {
+            let key = vec![row[0].clone()];
+            assert!(top.wants(&key));
+            top.keep(&key, (at as u32, 0), row);
+        }
+        // The reject test is the k-th best key, which a prune records:
+        // in a run that is the buffer filling, here it is by hand.
+        top.prune();
+        assert!(!top.wants(&[Value::Int(2)]), "later row, same key, loses");
+        assert!(top.wants(&[Value::Int(1)]), "a better key still wins");
+    }
+
+    #[test]
+    fn only_a_sort_a_worker_can_bound_takes_the_buffer() {
+        let keys = vec![(0usize, true)];
+        let sort = || PostSpec::Sort(keys.clone());
+        assert!(topn_of(&[]).is_none(), "no sort, nothing to bound");
+        assert!(topn_of(&[sort()]).is_none(), "no limit, nothing to bound");
+        assert!(
+            topn_of(&[PostSpec::Distinct, sort(), PostSpec::Limit(3)]).is_none(),
+            "a dedup under the sort still materializes"
+        );
+        assert_eq!(
+            topn_of(&[sort(), PostSpec::Skip(2), PostSpec::Limit(3)]),
+            Some((&keys[..], 5)),
+            "a skip widens what the buffer has to hold"
+        );
+        assert!(
+            topn_of(&[sort(), PostSpec::Limit(TOPN_MAX as u64 + 1)]).is_none(),
+            "a limit past the ceiling is no cheaper bounded"
+        );
     }
 
     #[test]

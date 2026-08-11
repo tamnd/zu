@@ -10,6 +10,11 @@
 //! the LIMIT, so the difference between them is what ordering costs,
 //! and the third says what the same order costs when nothing bounds it.
 //!
+//! The share reads negative when the ordered query is the cheaper one,
+//! which is what a bounded sink does to it: the plain projection builds
+//! ten thousand rows and the top ten builds ten, so the ORDER BY more
+//! than pays for itself and the LIMIT is why.
+//!
 //! The top ten rows are crosschecked against a reference sort of the
 //! candidates the bench computes itself, so an ordering that drops a
 //! tie or reverses one fails here rather than printing a fast number.

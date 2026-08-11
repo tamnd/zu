@@ -396,18 +396,27 @@ exec_group_mrows_s_core = 5.0
 # and the share is what the ORDER BY and the LIMIT add over the plain
 # projection. perf/05 asks for under 5 percent.
 #
-# Measured at 6b34892: gamingpc 3.5 and 4.1, server2 4.1, local M
-# series 4.4 and 5.0, server3 6.7, server1 1.9 quiet and 9.4 loaded.
-# The spread is the measurement, not the sort. The share is a
-# difference of two timings a few milliseconds apart, so it carries
-# the noise of both, and on the loaded hosts that noise is bigger than
-# what is being measured: server1's fully ordered run came in at 11.29
-# ms against 11.58 for the top ten, which is the strictly larger job
-# finishing first. The ceiling therefore has to sit above the noise
-# rather than at the target, and the answer to perf/05 is the quiet
-# host median of 4 percent. The top ten rows are crosschecked against
-# a reference sort on every run. Lower this ceiling, never raise it.
-exec_sort_share_pct = 15.0
+# Measured at feb4a69, the bench run on its own: gamingpc -2.3,
+# server1 -2.5, local M series -2.3, against 3.9, 3.8 and 5.9 for the
+# same three hosts the commit before. The share is negative because
+# the ordered query is now the cheaper of the two: the sink knows the
+# limit before the first row arrives, so it builds ten rows where the
+# plain projection builds ten thousand, and the ORDER BY more than
+# pays for what it asks.
+#
+# The share is a difference of two timings a few milliseconds apart,
+# so it carries the noise of both, and at 6b34892 that noise ran to
+# five points either way on a loaded host: server1 read 1.9 quiet and
+# 9.4 loaded, and one of its fully ordered runs came in at 11.29 ms
+# against 11.58 for the top ten, the strictly larger job finishing
+# first. The spread is still there, the four runs at the end of the
+# full gate read -0.9 and -1.2 on gamingpc and -0.8 and -4.7 on
+# server1, but it now sits around a negative number instead of around
+# 4, so the ceiling can be the target perf/05 named rather than a
+# number picked to clear the noise. The top ten rows are crosschecked
+# against a reference sort on every run. Lower this ceiling, never
+# raise it.
+exec_sort_share_pct = 5.0
 
 # The unchained join table probed on distinct keys, M rows/s (perf/05
 # section 2): a million build rows, four million probes, every one of

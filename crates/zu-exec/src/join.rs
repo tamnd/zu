@@ -9,6 +9,12 @@
 //! directory holds one word per bucket with a 16-bit Bloom tag folded
 //! into the pointer's unused high bits.
 //!
+//! A key is stored once however many rows it owns, next to the offset
+//! where its run of rows starts, and the directory addresses those keys
+//! rather than the rows. So a probe compares a key per distinct key in
+//! the bucket, and a hit reads its run bounds off two offsets instead of
+//! reading the rows themselves to find where its own stop.
+//!
 //! That folding is the point. A probe reads one directory word, and a key
 //! with no match usually dies on the tag inside that same load, so a miss
 //! costs one cache line and nothing else. A hit walks a contiguous range
@@ -77,18 +83,23 @@ fn tag_bits(h: u64) -> u64 {
 /// A build-once probe-many hash table over `u64` keys.
 ///
 /// Keys need not be distinct. Duplicates of the same key land in the
-/// same bucket and therefore next to each other in `keys`, so an inner
-/// join over a hot key emits its matches straight down a run of the
-/// buffer.
+/// same bucket and therefore next to each other in `payload`, so an
+/// inner join over a hot key emits its matches straight down a run of
+/// the buffer and the key itself is stored once.
 pub struct JoinTable {
     /// One word per bucket plus a sentinel: `tag:16 | offset:48`. The
-    /// offset is where the bucket's rows start in `keys`, and the next
-    /// entry's offset is where they end, which is why the sentinel is
-    /// there. The sentinel's tag is zero and is never read.
+    /// offset is where the bucket's entries start in `entries`, and the
+    /// next word's offset is where they end, which is why the sentinel
+    /// is there. The sentinel's tag is zero and is never read.
     dir: Vec<u64>,
-    /// The build keys in bucket order.
+    /// The distinct build keys in bucket order, one word each however
+    /// many rows the key owns.
     keys: Vec<u64>,
-    /// The build payloads, in the same order as `keys`.
+    /// Where each key's rows start in `payload`, plus a sentinel, so
+    /// key `i` owns `payload[at[i]..at[i + 1]]`.
+    at: Vec<u32>,
+    /// The build payloads in bucket order, a key's rows contiguous and
+    /// in build order inside that.
     payload: Vec<u64>,
     /// `buckets - 1`, the mask that turns a hash into a bucket.
     mask: u64,
@@ -98,16 +109,19 @@ impl JoinTable {
     /// Build over `keys`, carrying `payload[i]` for `keys[i]`.
     ///
     /// # Panics
-    /// If the two slices are different lengths.
+    /// If the two slices are different lengths, or if the build side is
+    /// longer than `u32::MAX` rows, which a run offset cannot address.
     pub fn build(keys: &[u64], payload: &[u64]) -> Self {
         assert_eq!(keys.len(), payload.len(), "a payload per key");
         let n = keys.len();
+        assert!(n <= u32::MAX as usize, "a build side under 4 billion rows");
         if n == 0 {
             // One empty bucket and its sentinel, so probe needs no
             // special case for a build side that produced nothing.
             return Self {
                 dir: vec![0, 0],
                 keys: Vec::new(),
+                at: vec![0],
                 payload: Vec::new(),
                 mask: 0,
             };
@@ -182,16 +196,51 @@ impl JoinTable {
             }
         }
 
-        // Fold the tags in. The sentinel keeps its bare offset, which is
-        // `n`, because the last bucket's range has to end somewhere.
-        for (b, tag) in tags.into_iter().enumerate() {
-            dir[b] |= tag << PTR_BITS;
+        // Every bucket is ordered by key now, so a key's rows are one
+        // run of the payload, and that run can be described once instead
+        // of being spelt out again beside every row it holds. Keep the
+        // key once and where its run starts, and point the directory at
+        // those rather than at the rows: a probe then compares one key
+        // per distinct key in the bucket, which is usually one key, and
+        // takes the run bounds off the two offsets rather than reading
+        // the rows to find where its own stop. The runs tile the payload
+        // in order, so the next key's offset is this key's end and one
+        // sentinel closes the last of them. The tags fold in on the way
+        // past, and the directory sentinel keeps its bare offset because
+        // the last bucket's range has to end somewhere.
+        let mut keys = Vec::with_capacity(n);
+        let mut at = Vec::with_capacity(n + 1);
+        let mut start = dir[0] as usize;
+        for b in 0..buckets {
+            let end = dir[b + 1] as usize;
+            dir[b] = keys.len() as u64 | (tags[b] << PTR_BITS);
+            let mut row = start;
+            while row < end {
+                let key = sorted_keys[row];
+                keys.push(key);
+                at.push(row as u32);
+                row += 1;
+                while row < end && sorted_keys[row] == key {
+                    row += 1;
+                }
+            }
+            start = end;
         }
-        debug_assert_eq!(dir[buckets], n as u64);
+        debug_assert_eq!(start, n);
+        at.push(n as u32);
+        dir[buckets] = keys.len() as u64;
+        if keys.len() * 2 <= n {
+            // A build side of mostly duplicates leaves both of these
+            // holding a multiple of what they need, which a probe would
+            // then carry around as untouched pages.
+            keys.shrink_to_fit();
+            at.shrink_to_fit();
+        }
 
         Self {
             dir,
-            keys: sorted_keys,
+            keys,
+            at,
             payload: sorted_payload,
             mask,
         }
@@ -199,6 +248,12 @@ impl JoinTable {
 
     /// Rows on the build side.
     pub fn rows(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// Distinct keys on the build side, which is how many keys a probe
+    /// can walk past in total.
+    pub fn distinct(&self) -> usize {
         self.keys.len()
     }
 
@@ -216,25 +271,23 @@ impl JoinTable {
         }
         let start = (entry & PTR_MASK) as usize;
         let end = (self.dir[b + 1] & PTR_MASK) as usize;
-        // A bucket holds about one row, so this is a short forward walk
-        // over keys already in the line the directory word pulled in.
-        let mut lo = start;
-        while lo < end && self.keys[lo] != key {
-            lo += 1;
+        // A bucket holds about one distinct key, so this is a short walk
+        // over keys in the line the directory word pulled in, and the
+        // key that matches says where its rows are without the walk
+        // having to read a single one of them.
+        for i in start..end {
+            if self.keys[i] == key {
+                let lo = self.at[i] as usize;
+                let hi = self.at[i + 1] as usize;
+                return &self.payload[lo..hi];
+            }
         }
-        if lo == end {
-            return &[];
-        }
-        let mut hi = lo + 1;
-        while hi < end && self.keys[hi] == key {
-            hi += 1;
-        }
-        &self.payload[lo..hi]
+        &[]
     }
 
     /// Whether `key` is on the build side. This is the semijoin and
-    /// antijoin question, and unlike [`lookup`](Self::lookup) it stops
-    /// at the first equal key rather than measuring the run.
+    /// antijoin question, and unlike [`lookup`](Self::lookup) it never
+    /// touches the payload at all.
     pub fn contains(&self, key: u64) -> bool {
         let h = hash64(key);
         let b = (h & self.mask) as usize;
@@ -384,6 +437,33 @@ mod tests {
         for k in 0..50u64 {
             assert_eq!(t.lookup(k), reference(&keys, &payload, k), "key {k}");
         }
+    }
+
+    #[test]
+    fn runs_of_different_lengths_keep_their_own_bounds() {
+        // A key's rows end where the next key's begin, and the next key
+        // is usually in another bucket, so a run whose length is read
+        // off the following offset is only right if the runs tile the
+        // payload in order. Uneven lengths are what would catch that:
+        // key k owns k rows, so a bound that ran one long or one short
+        // lands in a neighbour that looks nothing like it.
+        let mut keys = Vec::new();
+        let mut payload = Vec::new();
+        for k in 1..200u64 {
+            for r in 0..k {
+                keys.push(k);
+                payload.push(k * 1000 + r);
+            }
+        }
+        let t = JoinTable::build(&keys, &payload);
+        assert_eq!(t.rows(), keys.len());
+        assert_eq!(t.distinct(), 199);
+        for k in 1..200u64 {
+            assert_eq!(t.lookup(k), reference(&keys, &payload, k), "key {k}");
+            assert_eq!(t.lookup(k).len(), k as usize, "key {k}");
+        }
+        assert!(t.lookup(0).is_empty());
+        assert!(t.lookup(200).is_empty());
     }
 
     #[test]

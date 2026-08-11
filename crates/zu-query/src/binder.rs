@@ -244,7 +244,16 @@ pub struct Schema {
     /// perf/12 §1 landed. Absent means the estimator falls back to the
     /// fixed selectivities it used before.
     col_stats: BTreeMap<u32, BTreeMap<String, ColStats>>,
+    /// How far the summed ceilings may run past the summed estimates
+    /// before the join order DP reruns minimizing the ceiling instead
+    /// (perf/12 §2.4). Higher trusts the estimates further, lower
+    /// reaches for the robust order sooner.
+    bound_disagreement: f64,
 }
+
+/// The factor the ceilings have to beat the estimates by before the
+/// join order DP takes the robust order, when nothing overrides it.
+pub const DEFAULT_BOUND_DISAGREEMENT: f64 = 100.0;
 
 impl Schema {
     /// Builds a schema, rejecting duplicate names and rel endpoints
@@ -257,6 +266,7 @@ impl Schema {
             degree_norms: BTreeMap::new(),
             color_summaries: BTreeMap::new(),
             col_stats: BTreeMap::new(),
+            bound_disagreement: DEFAULT_BOUND_DISAGREEMENT,
         };
         let mut seen = HashMap::new();
         for n in &schema.nodes {
@@ -312,6 +322,22 @@ impl Schema {
     /// backward, when the engine carries statistics for it.
     pub fn degree_hist(&self, rel: u32) -> Option<&[Vec<u64>; 2]> {
         self.degree_hists.get(&rel)
+    }
+
+    /// Retunes the dual run threshold. A value that is not finite and
+    /// above one is ignored, since a threshold at or below one would
+    /// hand every order to the ceilings and there would be no point
+    /// estimating anything.
+    pub fn set_bound_disagreement(&mut self, factor: f64) {
+        if factor.is_finite() && factor > 1.0 {
+            self.bound_disagreement = factor;
+        }
+    }
+
+    /// How far the ceilings may run past the estimates before the join
+    /// order DP reruns on the ceilings.
+    pub fn bound_disagreement(&self) -> f64 {
+        self.bound_disagreement
     }
 
     /// Attaches the engine's lp degree norms per rel table id.

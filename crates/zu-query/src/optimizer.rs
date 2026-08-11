@@ -33,18 +33,29 @@ use crate::plan::{LogicalPlan, VarLength};
 /// Components larger than this keep their written join order.
 const MAX_DP_RELS: usize = 12;
 
-/// When the pessimistic ceiling exceeds the estimate by this factor,
-/// the join order falls back to the ceiling-optimal order (docs/07
-/// §6, robustness first).
-const BOUND_DISAGREEMENT: f64 = 100.0;
+/// One line EXPLAIN prints above the plan when the optimizer took a
+/// decision the tree itself does not show.
+pub type Note = String;
 
 /// Rewrites a built plan with join ordering and filter placement,
 /// then marks closing expands: ASP hash joins where the estimates
 /// justify the accumulate sweep, and the WCOJ intersection where the
 /// close completes a cycle the fusion can take.
 pub fn optimize(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<LogicalPlan> {
-    let plan = rewrite(plan, query, schema)?;
-    Ok(mark_asp(plan, query, schema).0)
+    Ok(optimize_noted(plan, query, schema)?.0)
+}
+
+/// The same optimization handing back the notes the run produced, for
+/// callers that render EXPLAIN and want to show what the tree cannot:
+/// today that is only the dual run of perf/12 §2.4 firing.
+pub fn optimize_noted(
+    plan: LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> Result<(LogicalPlan, Vec<Note>)> {
+    let mut notes = Vec::new();
+    let plan = rewrite(plan, query, schema, &mut notes)?;
+    Ok((mark_asp(plan, query, schema).0, notes))
 }
 
 /// Bottom-up estimated-cardinality walk that turns closing expands
@@ -397,14 +408,19 @@ fn mark_asp_node(
     }
 }
 
-fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<LogicalPlan> {
+fn rewrite(
+    plan: LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    notes: &mut Vec<Note>,
+) -> Result<LogicalPlan> {
     if matches!(
         &plan,
         LogicalPlan::Filter { optional: None, .. }
             | LogicalPlan::ScanNodes { optional: None, .. }
             | LogicalPlan::Expand { optional: None, .. }
     ) {
-        return reorder_run(plan, query, schema);
+        return reorder_run(plan, query, schema, notes);
     }
     match plan {
         LogicalPlan::Empty => Ok(LogicalPlan::Empty),
@@ -413,7 +429,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             expr,
             optional,
         } => Ok(LogicalPlan::Filter {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
             optional,
         }),
@@ -422,7 +438,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             slot,
             optional,
         } => Ok(LogicalPlan::ScanNodes {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             slot,
             optional,
         }),
@@ -438,7 +454,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             wcoj,
             optional,
         } => Ok(LogicalPlan::Expand {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             rel,
             from,
             to,
@@ -450,7 +466,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             optional,
         }),
         LogicalPlan::Unwind { input, expr, slot } => Ok(LogicalPlan::Unwind {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
             slot,
         }),
@@ -462,7 +478,7 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             args,
             slots,
         } => Ok(LogicalPlan::TableFunction {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             func,
             rel,
             table,
@@ -470,27 +486,27 @@ fn rewrite(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<Log
             slots,
         }),
         LogicalPlan::Project { input, items } => Ok(LogicalPlan::Project {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             items,
         }),
         LogicalPlan::Aggregate { input, keys, aggs } => Ok(LogicalPlan::Aggregate {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             keys,
             aggs,
         }),
         LogicalPlan::Distinct { input } => Ok(LogicalPlan::Distinct {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
         }),
         LogicalPlan::Sort { input, keys } => Ok(LogicalPlan::Sort {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             keys,
         }),
         LogicalPlan::Skip { input, expr } => Ok(LogicalPlan::Skip {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
         }),
         LogicalPlan::Limit { input, expr } => Ok(LogicalPlan::Limit {
-            input: Box::new(rewrite(*input, query, schema)?),
+            input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
         }),
     }
@@ -534,7 +550,12 @@ struct Component {
     anchored: bool,
 }
 
-fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<LogicalPlan> {
+fn reorder_run(
+    top: LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    notes: &mut Vec<Note>,
+) -> Result<LogicalPlan> {
     let mut ops: Vec<RunOp> = Vec::new();
     let mut cur = top;
     let rest = loop {
@@ -580,7 +601,7 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
             other => break other,
         };
     };
-    let below = rewrite(rest, query, schema)?;
+    let below = rewrite(rest, query, schema, notes)?;
     ops.reverse();
 
     let mut b0 = HashSet::new();
@@ -620,7 +641,13 @@ fn reorder_run(top: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Result<
 
     let mut planned: Vec<(Vec<Step>, f64, bool)> = Vec::new();
     for comp in &components {
-        let (steps, card) = order_component(comp, &expands, &filters, &b0, query, schema);
+        let (steps, card, apart) = order_component(comp, &expands, &filters, &b0, query, schema);
+        if let Some(apart) = apart {
+            notes.push(format!(
+                "bound disagreement {apart:.0}x over the {:.0}x threshold, join order taken off the ceilings",
+                schema.bound_disagreement()
+            ));
+        }
         planned.push((steps, card, comp.anchored));
     }
     // Anchored components extend existing rows and go first; the rest
@@ -783,16 +810,17 @@ fn connect(nodes: &[usize], expands: &[ExpandOp], b0: &HashSet<usize>) -> Vec<Co
 }
 
 /// DP over relationship subsets of one component. Returns the cheapest
-/// step order and its estimated output cardinality.
+/// step order, its estimated output cardinality, and how far the two
+/// disagreed when that disagreement is what chose the order.
 ///
 /// Every step also carries a pessimistic row ceiling from the degree
 /// histograms (docs/07 §6): the worst degree any single row can
 /// multiply by. The ceiling clamps the estimate, and when the summed
-/// ceilings exceed the summed estimates by [`BOUND_DISAGREEMENT`] the
-/// DP reruns minimizing the ceiling, with the estimate only breaking
-/// near ties, so a skew-blind guess cannot pick an order whose worst
-/// case is catastrophic. Steps without histograms have no usable
-/// ceiling and disable the caps for their order.
+/// ceilings exceed the summed estimates by the schema's dual run
+/// threshold the DP reruns minimizing the ceiling, with the estimate
+/// only breaking near ties, so a skew-blind guess cannot pick an order
+/// whose worst case is catastrophic. Steps without histograms have no
+/// usable ceiling and disable the caps for their order.
 fn order_component(
     comp: &Component,
     expands: &[ExpandOp],
@@ -800,7 +828,7 @@ fn order_component(
     b0: &HashSet<usize>,
     query: &BoundQuery,
     schema: &Schema,
-) -> (Vec<Step>, f64) {
+) -> (Vec<Step>, f64, Option<f64>) {
     #[derive(Clone)]
     struct Entry {
         cost: f64,
@@ -1070,13 +1098,17 @@ fn order_component(
         Some(Step::Scan(slot)) => filters.iter().any(|f| key_point(f, *slot, query)),
         _ => false,
     };
-    let best = if !pinned_seed && best.bnd.is_some() && best.bcost > BOUND_DISAGREEMENT * best.cost
-    {
-        run(true).unwrap_or(best)
-    } else {
-        best
+    // A zero cost order is free by the estimates and any ceiling above
+    // it is infinitely far away, which is the disagreement the dual run
+    // exists for, so the divide is left to hand back infinity.
+    let apart = (!pinned_seed && best.bnd.is_some())
+        .then(|| best.bcost / best.cost)
+        .filter(|apart| *apart > schema.bound_disagreement());
+    let best = match apart {
+        Some(_) => run(true).unwrap_or(best),
+        None => best,
     };
-    (best.steps, best.card)
+    (best.steps, best.card, apart)
 }
 
 /// Emits every not yet placed filter whose slots are all bound.
@@ -1912,6 +1944,47 @@ mod tests {
             &skewed,
         );
         assert!(text.contains("ScanNodes a: Person"), "got:\n{text}");
+    }
+
+    #[test]
+    fn the_dual_run_threshold_is_a_knob_and_says_when_it_fires() {
+        // The one hub place above clears the default 100x, so the
+        // order comes off the ceilings and the note says so. Winding
+        // the threshold past the ratio the two are actually apart
+        // hands the same query back to the estimates.
+        let source = "MATCH (a:Person)-[:IS_LOCATED_IN]->(c:Place) RETURN a.id AS id";
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let mut skewed = schema.clone();
+        let mut in_hist = vec![0u64; 13];
+        in_hist[0] = 1399;
+        in_hist[12] = 1;
+        skewed.set_degree_hists([(3u32, [vec![9000], in_hist])].into_iter().collect());
+
+        let (plan, notes) = optimize_noted(built.clone(), &query, &skewed).expect("optimize");
+        assert_eq!(notes.len(), 1, "got {notes:?}");
+        assert!(notes[0].contains("bound disagreement"), "got {notes:?}");
+        assert!(notes[0].contains("100x threshold"), "got {notes:?}");
+        assert!(
+            plan::explain(&plan, &query, &skewed).contains("ScanNodes a: Person"),
+            "the default threshold takes the robust order"
+        );
+
+        let mut trusting = skewed.clone();
+        trusting.set_bound_disagreement(1.0e9);
+        let (plan, notes) = optimize_noted(built, &query, &trusting).expect("optimize");
+        assert!(notes.is_empty(), "nothing fired, got {notes:?}");
+        assert!(
+            plan::explain(&plan, &query, &trusting).contains("ScanNodes c: Place"),
+            "a trusting threshold leaves the estimated order alone"
+        );
+
+        // A threshold at or under one would hand every order to the
+        // ceilings, so it is refused and the last good value stands.
+        trusting.set_bound_disagreement(0.5);
+        trusting.set_bound_disagreement(f64::NAN);
+        assert_eq!(trusting.bound_disagreement(), 1.0e9);
     }
 
     #[test]

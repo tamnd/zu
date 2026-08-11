@@ -43,6 +43,41 @@
 //! larger probe side streams past it. Two bytes a key for a bloom, or
 //! an eighth of a byte per id of span for a mask, can.
 //!
+//! What the bench says, a million build keys and four million probes
+//! with one row in sixteen a real match, the misses sitting inside the
+//! build side's own range so the range check cannot answer them.
+//! Selecting the probe side runs, in M rows/s on the local M series,
+//! gamingpc and server1: the mask 797, 496 to 517 and 114 to 207, the
+//! bloom 401 to 406, 302 to 360 and 76 to 101, the tags 574 to 653, 270
+//! to 351 and 19 to 25. server1's spread is the box and not the filter,
+//! it runs a gate with no free page cache and every line on it moves
+//! together.
+//!
+//! Read the third line carefully, because it is not the argument it
+//! looks like. The tags beat the bloom on the local M series, where a
+//! 28 MB directory nearly fits in the system cache and the bloom's
+//! extra shifts are then the only thing either side pays. They draw on
+//! gamingpc. On server1, which has neither the cache nor the memory
+//! headroom, the same test costs four times as much, and that is the
+//! host a filter has to be right for. The accuracy is not close
+//! anywhere: the bloom let 0.48 percent of the strangers through and
+//! the tags let 2.36, on every host, since that is a property of the
+//! keys and not the machine. The mask let none through, being exact.
+//! Memory went 0.38 MB for the mask, 2.10 for the bloom and 28.39 for
+//! the table whose tags the third line measured.
+//!
+//! End to end, the reason any of this is here rather than in the join.
+//! Every probe row costs a property gather, a random read into a
+//! column, and then the join, which is the order the plan runs in.
+//! Gathering all four million and joining all four million is what the
+//! engine does today. Selecting first and gathering only the survivors
+//! runs it in 18.74 ms against 48.75 locally, 27.60 against 85.73 on
+//! gamingpc and 105.75 against 538.71 on server1, so 2.6 to 5.1x
+//! depending on the host, and 1.9x in the worst round server1 turned
+//! in. That factor is the hit rate more than the filter, which is the
+//! point: the filter is worth having where the rows are produced, not
+//! where they are joined.
+//!
 //! Nothing consumes one of these yet. Nothing compiles to a join, so
 //! there is no build to produce a filter, and the scan and expand take
 //! no filter argument. [`SipFilter::zone`] is the one join already

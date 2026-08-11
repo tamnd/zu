@@ -448,6 +448,29 @@ exec_join_probe_mrows_s = 6.0
 # thirds of the worst run seen there. Raise this floor, never lower it.
 exec_join_dup_mpairs_s = 100.0
 
+# The filter a join build passes sideways, M probe rows/s selected
+# (perf/13 section 1): a million build keys scattered over the whole
+# word, so the filter is the bloom rather than the exact bitmap, and
+# four million probe rows of which one in sixteen matches. The misses
+# sit inside the build side's own range on purpose, so the range check
+# cannot answer them and the membership test has to earn the number.
+#
+# The bloom is floored rather than the mask because it is the general
+# case and the slower of the two. Measured, in M rows/s on the local M
+# series, gamingpc and server1: the mask 797, 496 to 517 and 114 to 207,
+# the bloom 401 to 406, 302 to 360 and 76 to 101. The join table's own
+# directory tags, which perf/13 suggests reusing instead, read 574 to
+# 653, 270 to 351 and 19 to 25 on the same hosts and let 2.36 percent of
+# the strangers through against the bloom's 0.48, which is why the
+# filter is its own structure rather than a view of the table.
+#
+# The floor is set off server1, the slowest of them and the one that
+# runs a gate with no free page cache, at about two thirds of the worst
+# run seen there. That box swings widely, 76 to 101 on this line inside
+# one afternoon, so the margin is the spread and not slack. Raise this
+# floor, never lower it.
+exec_sip_select_mrows_s = 50.0
+
 # Cardinality quality over the SF1 corpus, q-error percentiles
 # (perf/12 section 4). Twelve queries run profiled, every operator that
 # carries an estimate contributes one max(est/act, act/est), and the

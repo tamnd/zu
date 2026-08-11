@@ -22,7 +22,8 @@
 //! tag lie fails here rather than printing a fast number.
 //!
 //! exec_join_probe_mrows_s floors the distinct probe, which is the
-//! shape with the least room to hide.
+//! shape with the least room to hide, and exec_join_dup_mpairs_s floors
+//! the duplicate one, which is the shape a graph join produces.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu-exec --bench join
 
@@ -226,14 +227,22 @@ fn main() {
         map_ms / dup_ms
     );
 
-    if std::env::var("ZU_GATE").as_deref() == Ok("1")
-        && let Some(floor) = budget("exec_join_probe_mrows_s")
-    {
-        let rate = PROBE as f64 / 1e3 / hit_ms;
-        assert!(
-            rate >= floor,
-            "distinct probe at {rate:.0} M rows/s under the {floor} M floor"
-        );
-        println!("gate: join probe floor met");
+    if std::env::var("ZU_GATE").as_deref() == Ok("1") {
+        if let Some(floor) = budget("exec_join_probe_mrows_s") {
+            let rate = PROBE as f64 / 1e3 / hit_ms;
+            assert!(
+                rate >= floor,
+                "distinct probe at {rate:.0} M rows/s under the {floor} M floor"
+            );
+            println!("gate: join probe floor met");
+        }
+        if let Some(floor) = budget("exec_join_dup_mpairs_s") {
+            let rate = pairs as f64 / 1e3 / dup_ms;
+            assert!(
+                rate >= floor,
+                "duplicate probe at {rate:.0} M pairs/s under the {floor} M floor"
+            );
+            println!("gate: join duplicate floor met");
+        }
     }
 }

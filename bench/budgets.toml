@@ -420,22 +420,33 @@ exec_sort_share_pct = 5.0
 
 # The unchained join table probed on distinct keys, M rows/s (perf/05
 # section 2): a million build rows, four million probes, every one of
-# them a hit. It floors the probe rather than the build or the
-# duplicate-heavy join because it is the shape with the least room to
-# hide, one directory word and one short range per row with nothing
-# amortized over a match list.
+# them a hit. It floors the probe rather than the build because it is
+# the shape with the least room to hide, one directory word and one
+# short range per row with nothing amortized over a match list.
 #
-# Measured: local M series 78 to 93, gamingpc 77 to 79, server1 10. The
-# same probe on a std HashSet, which is what exec.rs uses today, is 1.1
-# to 2.1x slower on every host, and the miss probe that the folded
-# Bloom tag is actually there for is 2.0 to 3.5x slower. Those are the
-# two shapes this table was chosen for and it wins both. The
-# duplicate-heavy inner join does not win yet and is deliberately not
-# floored here, because a floor holds ground and there is no ground
-# held. Nothing compiles to a join yet either, so this gate guards a
-# primitive and not a query. The bench crosschecks every timed run
-# against a scan of the build side. Raise this floor, never lower it.
+# Measured: local M series 78 to 93, gamingpc 73 to 82, server1 7 to 10.
+# The same probe on a std HashSet, which is what exec.rs uses today, is
+# 1.1 to 2.6x slower on every host, and the miss probe that the folded
+# Bloom tag is actually there for is 2.0 to 4.9x slower. Those are the
+# two shapes this table was chosen for and it wins both. Nothing
+# compiles to a join yet, so this gate guards a primitive and not a
+# query. The bench crosschecks every timed run against a scan of the
+# build side. Raise this floor, never lower it.
 exec_join_probe_mrows_s = 6.0
+
+# The same table on the duplicate-heavy join, M pairs/s: forty build
+# rows to a key, so a probe that hits reads a run of forty. This is the
+# shape a join on a graph key produces once a hub is in the data, and
+# perf/05 section 2 quotes its largest number on it.
+#
+# It used to run at a third of a HashMap<u64, Vec<u64>> and was left
+# unfloored for it. Storing a key once and pointing at its run of rows
+# put it level with that map, so there is ground to hold now. Measured
+# after that: local M series 3300 to 3600, gamingpc 2260 to 2490,
+# server1 166 to 242. The floor is set off server1, the slowest of them
+# and the one that runs a gate under memory pressure, at about two
+# thirds of the worst run seen there. Raise this floor, never lower it.
+exec_join_dup_mpairs_s = 100.0
 
 # Cardinality quality over the SF1 corpus, q-error percentiles
 # (perf/12 section 4). Twelve queries run profiled, every operator that

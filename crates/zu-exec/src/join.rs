@@ -13,7 +13,10 @@
 //! where its run of rows starts, and the directory addresses those keys
 //! rather than the rows. So a probe compares a key per distinct key in
 //! the bucket, and a hit reads its run bounds off two offsets instead of
-//! reading the rows themselves to find where its own stop.
+//! reading the rows themselves to find where its own stop. That also
+//! decides how large the table is: a build side of mostly duplicates
+//! gets its directory sized for the keys it ended up with rather than
+//! the rows it was handed.
 //!
 //! That folding is the point. A probe reads one directory word, and a key
 //! with no match usually dies on the tag inside that same load, so a miss
@@ -21,8 +24,9 @@
 //! rather than chasing a pointer chain.
 //!
 //! The build is a counting sort, two passes over the keys with a
-//! histogram in between, and it happens once. The table is meant to be
-//! wrapped in an `Arc` and shared by every probe worker.
+//! histogram in between, then one walk that orders each bucket and
+//! collapses it, and it happens once. The table is meant to be wrapped
+//! in an `Arc` and shared by every probe worker.
 //!
 //! Probing is a vector at a time for the same reason the group table
 //! probes a vector at a time: the directory load is a dependent random
@@ -39,20 +43,34 @@
 //! distinct keys run 1.1 to 2.1x. Both of those hold on every host, and
 //! the margin is widest on the slow ones, which is the right direction.
 //!
-//! Two things are behind. The duplicate-heavy inner join, which is the
-//! shape perf/05 quotes the largest number on, runs at a third of a
-//! `HashMap<u64, Vec<u64>>` everywhere. That layout checks a key once
-//! per probe and then reads a compact payload run, while this one
-//! carries the key beside every build row and re-checks it per row to
-//! find where the run ends, so it moves twice the memory. Storing a run
-//! length per distinct key rather than repeating the key is the obvious
-//! answer and is not written. The build is behind on the fast hosts,
-//! 0.3x locally and 0.7x on gamingpc, and ahead on the slow ones, 1.8
-//! to 2.6x on server1: the histogram and the scatter are random access
-//! over a directory the size of the build side, so this is bandwidth
-//! against the standard library's slower per-key hash. The
-//! write-combining radix pass perf/05 section 2 calls for is the named
-//! fix for that half and is not written either.
+//! The duplicate-heavy inner join, forty rows to a key, is the shape
+//! perf/05 quotes the largest number on, and it used to run at a third
+//! of a `HashMap<u64, Vec<u64>>` everywhere, because it read the key
+//! beside every row it returned and then read the rows again to find
+//! where its own run stopped. Storing the key once put it level with
+//! that map and 3.6 to 6.3x its own old self: 292.56 to 46.60 ms on the
+//! local M series, 240 to 66.58 on gamingpc, 2740 to 747 on server1.
+//! Part of that is the second seating rather than the collapse alone.
+//! Left in the directory the rows asked for, the same probe reads 90.34
+//! on gamingpc against 66.58 seated and 1166 on server1 against 747,
+//! while on the local M series, where the whole oversized directory
+//! still sits in cache, the seating costs about a tenth and is kept for
+//! the memory.
+//!
+//! The distinct probe, the miss probe and the build all come out where
+//! they were, within the spread of a host. The memory moved both ways.
+//! The bench's duplicate table went 24.4 MB to 8.6, since neither the
+//! repeated keys nor a directory sized for them are there any more, and
+//! its distinct table went 24.4 to 28.4, which is four bytes a key for a
+//! run offset on a table whose runs are all one row long.
+//!
+//! The build is still behind on the fast hosts, 0.3x locally and 0.6x
+//! on gamingpc, and ahead on the slow ones, 1.2 to 1.6x on server1: the
+//! histogram and the scatter are random access over a directory the size
+//! of the build side, so this is bandwidth against the standard
+//! library's slower per-key hash. The write-combining radix pass perf/05
+//! section 2 calls for is the named fix for that half and is not
+//! written.
 //!
 //! None of it is load bearing yet. Nothing compiles to a join, so this
 //! table is reachable only from its own tests and its own bench.
@@ -95,9 +113,9 @@ fn tag_bits(h: u64) -> u64 {
 /// the buffer and the key itself is stored once.
 pub struct JoinTable {
     /// One word per bucket plus a sentinel: `tag:16 | offset:48`. The
-    /// offset is where the bucket's entries start in `entries`, and the
-    /// next word's offset is where they end, which is why the sentinel
-    /// is there. The sentinel's tag is zero and is never read.
+    /// offset is where the bucket's keys start in `keys`, and the next
+    /// word's offset is where they end, which is why the sentinel is
+    /// there. The sentinel's tag is zero and is never read.
     dir: Vec<u64>,
     /// The distinct build keys in bucket order, one word each however
     /// many rows the key owns.
@@ -256,7 +274,7 @@ impl JoinTable {
         // a mostly empty array, and once in the memory it holds for the
         // whole life of the table. Seat the keys again in a directory
         // sized for them.
-        if kept * FIT_SLACK <= buckets && std::env::var("ZU_JOIN_FIT").as_deref() != Ok("0") {
+        if kept * FIT_SLACK <= buckets {
             return seat(&keys, &at, &sorted_payload);
         }
         // Short of that the buffers still hold what the rows asked for
@@ -570,6 +588,39 @@ mod tests {
         }
         assert!(t.lookup(0).is_empty());
         assert!(t.lookup(200).is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_heavy_table_is_sized_by_its_keys() {
+        // A hundred rows a key, so the directory the rows asked for
+        // addresses a hundred times the keys it needs to and the table
+        // is seated a second time over those keys. The answers have to
+        // survive that move, payload runs and all, and the table has to
+        // come out smaller than the first directory alone would have
+        // been.
+        let mut keys = Vec::new();
+        let mut payload = Vec::new();
+        for k in 0..100u64 {
+            for r in 0..100u64 {
+                keys.push(k * 13 + 1);
+                payload.push(k * 1000 + r);
+            }
+        }
+        let t = JoinTable::build(&keys, &payload);
+        assert_eq!(t.rows(), 10_000);
+        assert_eq!(t.distinct(), 100);
+        for k in 0..100u64 {
+            let k = k * 13 + 1;
+            assert_eq!(t.lookup(k), reference(&keys, &payload, k), "key {k}");
+        }
+        assert!(t.lookup(2).is_empty());
+        let rowsized = keys.len().next_power_of_two() * 8;
+        assert!(
+            t.bytes() < rowsized + keys.len() * 8,
+            "table is {} bytes, a row sized directory and its keys is {}",
+            t.bytes(),
+            rowsized + keys.len() * 8
+        );
     }
 
     #[test]

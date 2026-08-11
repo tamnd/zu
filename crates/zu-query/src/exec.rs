@@ -1707,10 +1707,43 @@ fn rewrite_count_expand(
     }
 }
 
+/// The estimator's reader, over the same storage the query is about to
+/// run on and the same parameter values it was called with. Every
+/// answer is a lookup or an offsets subtraction, so asking costs about
+/// what one point lookup costs and there is at most one of those per
+/// pinned slot per plan.
+struct GraphProbe<'a> {
+    graph: &'a mut dyn Graph,
+    params: &'a [Value],
+}
+
+impl crate::optimizer::Probe for GraphProbe<'_> {
+    fn seed(&mut self, table: u32, key: &BoundExpr) -> Option<u64> {
+        let key = match key {
+            BoundExpr::Literal(Literal::Int(i)) => *i,
+            BoundExpr::Param(ix) => match self.params.get(*ix)? {
+                Value::Int(i) => *i,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.graph
+            .lookup_key(table, u64::try_from(key).ok()?)
+            .ok()
+            .flatten()
+    }
+
+    fn degree(&mut self, rel: u32, node: u64, reversed: bool) -> Option<u64> {
+        self.graph.degree(rel, node, reversed).ok()
+    }
+}
+
 fn build_stages(
     plan: &LogicalPlan,
     query: &BoundQuery,
     schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
     options: &Options,
 ) -> Result<Vec<StageDef>> {
     let mut linear = Vec::new();
@@ -1747,8 +1780,13 @@ fn build_stages(
     // One estimate per linearized operator, in the same bottom-up
     // order, so `est[i]` belongs to `linear[i]`. The optimizer is the
     // only thing that knows these numbers and it does not write them
-    // onto the plan, so ask it again here.
-    let est = crate::optimizer::estimates(plan, query, schema);
+    // onto the plan, so ask it again here. This time it gets a reader,
+    // which the join ordering never does: a plan is cached across
+    // parameter values and a seed's real degree is not the same for two
+    // of them, but by here the values are in hand and the numbers
+    // EXPLAIN ANALYZE prints are about this run.
+    let mut probe = GraphProbe { graph, params };
+    let est = crate::optimizer::probed_estimates(plan, query, schema, Some(&mut probe));
 
     let mut stages = Vec::new();
     let mut b = StageBuilder::new(options.flat, options.wcoj, shapes.clone());
@@ -4341,7 +4379,7 @@ fn run_stages(
     options: &Options,
     mut profile: Option<&mut Profile>,
 ) -> Result<QueryResult> {
-    let stages = build_stages(plan, query, schema, options)?;
+    let stages = build_stages(plan, query, schema, graph, params, options)?;
     let counts: BTreeMap<u32, u64> = schema
         .nodes()
         .iter()

@@ -55,9 +55,23 @@ impl ExecPlan {
 /// One factorization level: the scan at index 0, one per expand after.
 pub(crate) struct Level {
     pub table: TableId,
-    /// Property columns this level materializes; entry i lives at chunk
-    /// vector i + 1, vector 0 is always the row id.
-    pub cols: Vec<(ColId, ColType)>,
+    /// Columns this level materializes; entry i lives at chunk vector
+    /// i + 1, vector 0 is always the row id.
+    pub cols: Vec<ColSpec>,
+}
+
+/// One column of a level's chunk: a stored property gathered from the
+/// snapshot, or a value computed from the columns registered before it.
+///
+/// A computed column is the projection port (perf/05 section 5): the
+/// expression compiles once into a register program and runs over the
+/// whole vector where the level is built, so the sink and everything
+/// above it read it as an ordinary column. A program only ever loads
+/// columns registered ahead of it, which is what makes one pass over
+/// this list enough to build the chunk.
+pub(crate) enum ColSpec {
+    Stored(ColId, ColType),
+    Computed(Program),
 }
 
 /// Traversal sides of one expand: `Both` is an undirected step over a
@@ -344,7 +358,10 @@ pub(crate) fn compile(
 /// stable indices.
 struct LevelBuild {
     table: TableId,
-    cols: Vec<(String, ColId, ColType)>,
+    /// The property name a stored column answers to, so a second
+    /// reader of it reuses the position instead of gathering twice.
+    /// Computed columns carry no name: nothing looks them up by one.
+    cols: Vec<(String, ColSpec)>,
 }
 
 struct Compiler<'a> {
@@ -704,7 +721,7 @@ impl Compiler<'_> {
                 .drain(..)
                 .map(|l| Level {
                     table: l.table,
-                    cols: l.cols.into_iter().map(|(_, id, ty)| (id, ty)).collect(),
+                    cols: l.cols.into_iter().map(|(_, spec)| spec).collect(),
                 })
                 .collect(),
             columns: self.query.columns.clone(),
@@ -902,19 +919,115 @@ impl Compiler<'_> {
     /// Registers a property column on a level, returning its chunk
     /// vector position.
     fn register_col(&mut self, level: usize, key: &str) -> Result<Option<(usize, ColType)>> {
-        if let Some(ix) = self.levels[level].cols.iter().position(|(k, ..)| k == key) {
-            let (_, _, ty) = self.levels[level].cols[ix];
+        if let Some(ix) = self.levels[level].cols.iter().position(|(k, _)| k == key) {
+            let ColSpec::Stored(_, ty) = self.levels[level].cols[ix].1 else {
+                unreachable!("only stored columns carry a name");
+            };
             return Ok(Some((ix + 1, ty)));
         }
         let Some((id, ty)) = self.snap.resolve_col(self.levels[level].table, key)? else {
             return Ok(None);
         };
-        self.levels[level].cols.push((key.to_string(), id, ty));
+        self.levels[level]
+            .cols
+            .push((key.to_string(), ColSpec::Stored(id, ty)));
         Ok(Some((self.levels[level].cols.len(), ty)))
     }
 
+    /// Compiles an arithmetic projection into a computed column on the
+    /// level its properties come from, returning the scalar the sink
+    /// reads it back through. The program is registered after every
+    /// column it reads, which is what lets one walk of the list build
+    /// the chunk.
+    ///
+    /// Integer results only. A property is an int or a string here, so
+    /// a float can only come from a literal, and a literal float
+    /// against an int column already fails the program builder's type
+    /// check; restricting the column keeps the sink reading the two
+    /// types it knows.
+    ///
+    /// Division and modulo decline. The kernel is total and clears the
+    /// row's validity when the divisor is zero, the old engine raises,
+    /// and a computed column runs before the filter that would have
+    /// dropped the offending row, so there is no way to match the old
+    /// answer here. They stay with the old engine until the error is
+    /// carried out of the kernel.
+    fn register_expr(&mut self, expr: &BoundExpr) -> Result<Option<ScalarRef>> {
+        if !matches!(expr, BoundExpr::Binary { .. }) {
+            return Ok(None);
+        }
+        let Some(level) = self.expr_level(expr) else {
+            return Ok(None);
+        };
+        let mut b = ProgBuilder {
+            ops: Vec::new(),
+            types: Vec::new(),
+        };
+        let Some(root) = self.value_reg(&mut b, expr, level)? else {
+            return Ok(None);
+        };
+        if b.types[root as usize] != PhysType::Int64 {
+            return Ok(None);
+        }
+        if b.ops.iter().any(|op| {
+            matches!(
+                op,
+                ExprOp::Binary {
+                    op: BinOp::Div | BinOp::Mod,
+                    ..
+                }
+            )
+        }) {
+            return Ok(None);
+        }
+        let prog = Program {
+            ops: b.ops,
+            regs: b.types.len() as Reg,
+        };
+        self.levels[level]
+            .cols
+            .push((String::new(), ColSpec::Computed(prog)));
+        Ok(Some(ScalarRef::Col {
+            level,
+            vec: self.levels[level].cols.len(),
+            ty: ColType::Int,
+        }))
+    }
+
+    /// The one level an expression reads, or None when it reads none or
+    /// spans two. A program runs against a single level's chunk, and a
+    /// join of two levels' columns is not a projection.
+    fn expr_level(&self, expr: &BoundExpr) -> Option<usize> {
+        let mut level = None;
+        let mut ok = true;
+        self.walk_slots(expr, &mut |slot| {
+            let found = self.slot_level.get(&slot).copied();
+            match (level, found) {
+                (_, None) => ok = false,
+                (None, Some(l)) => level = Some(l),
+                (Some(l), Some(f)) if l != f => ok = false,
+                _ => {}
+            }
+        });
+        ok.then_some(level).flatten()
+    }
+
+    /// Every variable an expression names, in no particular order.
+    fn walk_slots(&self, expr: &BoundExpr, f: &mut impl FnMut(usize)) {
+        match expr {
+            BoundExpr::Var(slot) => f(*slot),
+            BoundExpr::Property { base, .. } => self.walk_slots(base, f),
+            BoundExpr::Binary { lhs, rhs, .. } => {
+                self.walk_slots(lhs, f);
+                self.walk_slots(rhs, f);
+            }
+            _ => {}
+        }
+    }
+
     /// Maps a projection, key, or argument expression to a scalar the
-    /// sink can read: a node slot, a property column, or the dense id.
+    /// sink can read: a node slot, a property column, the dense id, or
+    /// a value computed from one level's columns.
     fn item_ref(&mut self, expr: &BoundExpr) -> Result<Option<ScalarRef>> {
         match expr {
             BoundExpr::Var(slot) => Ok(self
@@ -937,7 +1050,7 @@ impl Compiler<'_> {
                     None => Ok(None),
                 }
             }
-            _ => Ok(None),
+            _ => self.register_expr(expr),
         }
     }
 
@@ -1144,6 +1257,13 @@ impl Compiler<'_> {
         if c < 0 {
             return Ok(None);
         }
+        // A stored property and nothing else. The zone map holds the
+        // min and max of what is on disk, so a computed value has no
+        // summary to answer against, and asking `item_ref` for one
+        // would register a column no one reads.
+        if !matches!(**col_expr, BoundExpr::Property { .. }) {
+            return Ok(None);
+        }
         let Some(ScalarRef::Col {
             level: 0,
             vec,
@@ -1152,7 +1272,9 @@ impl Compiler<'_> {
         else {
             return Ok(None);
         };
-        let col = self.levels[0].cols[vec - 1].1;
+        let &ColSpec::Stored(col, _) = &self.levels[0].cols[vec - 1].1 else {
+            unreachable!("a property registers as a stored column");
+        };
         let c = c as u64;
         let (lo, hi) = match op {
             BinaryOp::Eq => (c, c),

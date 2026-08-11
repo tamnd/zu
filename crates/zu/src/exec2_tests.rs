@@ -218,6 +218,18 @@ fn covered_shapes_match_the_old_engine() {
          RETURN count(c) AS n",
         "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
          RETURN b.id AS b, c.id AS c ORDER BY b, c LIMIT 20",
+        // Computed projections, which run as a column of the level
+        // their properties come from instead of a per-row evaluation
+        // over the sink. Once bare, once sorted on the computed value,
+        // once grouped by it, once aggregated over it, and once on an
+        // expanded level.
+        "MATCH (p:person) RETURN p.age + 1 AS b",
+        "MATCH (p:person) RETURN p.age * 2 - p.score AS b, p.id AS id ORDER BY b, id LIMIT 20",
+        "MATCH (p:person) RETURN p.age * 3 AS b, count(p) AS n ORDER BY b",
+        "MATCH (p:person) RETURN sum(p.age + p.score) AS s, max(p.score - p.age) AS hi",
+        "MATCH (p:person) RETURN DISTINCT p.age + p.age AS b ORDER BY b",
+        "MATCH (a:person {id: 1})-[:knows]->(b) RETURN b.age + 1 AS b ORDER BY b",
+        "MATCH (a:person)-[:knows]->(b) RETURN sum(b.score + 1) AS s",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -235,7 +247,11 @@ fn unclaimed_shapes_fall_back() {
         // A sort inside a WITH orders rows the pipeline is not the
         // last reader of, so the whole chain goes back.
         "MATCH (p:person) WITH p.age AS age ORDER BY age LIMIT 5 RETURN age AS age",
-        "MATCH (p:person) RETURN p.age + 1 AS b",
+        // Division and modulo in a projection: the old engine raises
+        // on a zero divisor and the kernel returns null instead, so
+        // the shape stays where the error is, divisor constant or not.
+        "MATCH (p:person) RETURN p.score / 3 AS b",
+        "MATCH (p:person) RETURN p.age % 10 AS b, p.id AS id",
         "MATCH (p:person) RETURN collect(p.age) AS ages",
         "MATCH (p:person) RETURN count(DISTINCT p.age) AS n",
         "MATCH (a:person)-[r:knows]->(b) RETURN count(r) AS n",

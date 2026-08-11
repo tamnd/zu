@@ -52,6 +52,10 @@ harness = false
 name = "cardinality"
 harness = false
 
+[[bench]]
+name = "project"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

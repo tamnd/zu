@@ -77,6 +77,8 @@
 
 use zu_vector::kernels::{hash_slice, hash64};
 
+use crate::sip::SipFilter;
+
 /// Rows per bucket the table is sized for. One keeps the average
 /// bucket inside a single cache line, which is what makes the
 /// contiguous scan cheaper than a chain walk.
@@ -312,6 +314,30 @@ impl JoinTable {
             + size_of_val(self.payload.as_slice())
     }
 
+    /// The filter this build side publishes for the operators below it
+    /// (perf/13 section 1). Built over the distinct keys, which the
+    /// table already holds in one array, so this walks the keys once
+    /// and reads no rows at all.
+    pub fn sip(&self) -> SipFilter {
+        SipFilter::over(&self.keys)
+    }
+
+    /// Whether `key` could be on the build side, off the directory tag
+    /// alone and without looking at a single key.
+    ///
+    /// This is the bloom the table already has, and it is here so that
+    /// [`SipFilter`] can be measured against it rather than argued
+    /// about. It loses that comparison, for the reason the sip module
+    /// docs give: the tag is cheap to test but it lives in a directory
+    /// sized by the build side, so testing it touches a structure far
+    /// too large to stay resident while a probe side streams past.
+    pub fn may_contain(&self, key: u64) -> bool {
+        let h = hash64(key);
+        let entry = self.dir[(h & self.mask) as usize];
+        let want = tag_bits(h);
+        entry >> PTR_BITS & want == want
+    }
+
     /// The payloads `key` matched, empty when it matched nothing.
     ///
     /// The common miss returns here off the tag alone, having read one
@@ -475,7 +501,7 @@ fn seat(keys: &[u64], at: &[u32], payload: &[u64]) -> JoinTable {
 /// On anything else this is a no-op and the loop just runs one load at
 /// a time, which is correct, only slower.
 #[inline(always)]
-fn prefetch(at: &u64) {
+pub(crate) fn prefetch(at: &u64) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: the pointer comes from a live reference, and the
     // instruction only warms a cache line. It cannot fault and it

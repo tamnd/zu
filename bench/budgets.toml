@@ -469,6 +469,21 @@ exec_join_probe_mrows_s = 6.0
 # thirds of the worst run seen there. Raise this floor, never lower it.
 exec_join_dup_mpairs_s = 100.0
 
+# The build of that same table, M rows/s over a million distinct keys.
+# Every probe worker waits on this before it reads a row, so it is the
+# serial part of a join and the one that does not divide by the number
+# of cores.
+#
+# The build is a counting sort, and until the rows were dealt into
+# partitions of the directory first it wrote at random over a structure
+# the size of the build side. Measured with the deal in: local M series
+# 61 to 67, gamingpc 37 to 45, server1 10.6 to 14.3, against 43 to 55,
+# 37 to 40 and 9.7 to 13.0 without it. The floor is set off server1, the
+# slowest of them and the one that runs a gate under memory pressure,
+# under the worst median seen there, since a build under memory pressure
+# is the run most likely to wander. Raise this floor, never lower it.
+exec_join_build_mrows_s = 8.0
+
 # The filter a join build passes sideways, M probe rows/s selected
 # (perf/13 section 1): a million build keys scattered over the whole
 # word, so the filter is the bloom rather than the exact bitmap, and

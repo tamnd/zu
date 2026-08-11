@@ -24,6 +24,8 @@
 //! exec_join_probe_mrows_s floors the distinct probe, which is the
 //! shape with the least room to hide, and exec_join_dup_mpairs_s floors
 //! the duplicate one, which is the shape a graph join produces.
+//! exec_join_build_mrows_s floors the build, which every worker waits
+//! on before it probes anything.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu-exec --bench join
 
@@ -235,6 +237,14 @@ fn main() {
                 "distinct probe at {rate:.0} M rows/s under the {floor} M floor"
             );
             println!("gate: join probe floor met");
+        }
+        if let Some(floor) = budget("exec_join_build_mrows_s") {
+            let rate = BUILD as f64 / 1e3 / build_ms;
+            assert!(
+                rate >= floor,
+                "build at {rate:.0} M rows/s under the {floor} M floor"
+            );
+            println!("gate: join build floor met");
         }
         if let Some(floor) = budget("exec_join_dup_mpairs_s") {
             let rate = pairs as f64 / 1e3 / dup_ms;

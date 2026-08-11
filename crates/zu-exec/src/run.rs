@@ -21,12 +21,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
-use zu_query::snapshot::{ColId, CsrPin, Dir, RelId, SCAN_ROWS, Snapshot};
+use zu_query::snapshot::{ColId, CsrPin, Dir, GroupId, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector};
 
-use crate::compile::{Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec};
+use crate::compile::{AggSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source};
+use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::pool;
-use crate::sink::{self, Acc, KeyVal, SinkState};
+use crate::sink::{self, Acc, SinkState};
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
@@ -38,23 +39,217 @@ pub(crate) fn run(
     snap: &mut dyn Snapshot,
     options: &Options,
 ) -> Result<QueryResult> {
+    let sched = match plan.source {
+        Source::Seek(key) => seek_work(plan, snap, options, key)?,
+        Source::Scan(_) => scan_work(plan, snap, options)?,
+    };
+    let partials = drive(plan, snap, &sched)?;
+
+    match &plan.sink {
+        SinkSpec::Count => {
+            let total: i64 = partials.iter().map(|p| p.count).sum();
+            Ok(QueryResult {
+                columns: plan.columns.clone(),
+                rows: vec![vec![Value::Int(total)]],
+            })
+        }
+        SinkSpec::Agg {
+            item_agg,
+            keys,
+            aggs,
+            post,
+        } => sink::finish_agg(
+            plan.columns.clone(),
+            item_agg,
+            aggs,
+            post,
+            partials,
+            keys.is_empty(),
+        ),
+        SinkSpec::Rows { post, .. } => Ok(sink::finish_rows(plan.columns.clone(), post, partials)),
+    }
+}
+
+/// What a worker does with a morsel. Both kinds split the same way,
+/// contiguous ranges claimed in order and stitched back by index, so
+/// the parallel answer is the sequential one either way.
+#[derive(Clone, Copy)]
+enum Work {
+    /// Rows of the driving scan.
+    Scan,
+    /// The whole seeded plan on one morsel; `None` is a key that hit
+    /// no row, which still owes the sink its empty batch.
+    Seek(Option<u64>),
+    /// One slice of a seeded plan's first frontier: the seed row is
+    /// fixed and the morsel owns a range of its neighbor list.
+    Frontier {
+        seed: u64,
+        rel: RelId,
+        dir: Dir,
+        to: usize,
+    },
+}
+
+/// One query's morsels: what a morsel means, the ranges themselves,
+/// and how many workers to put on them.
+struct Schedule {
+    work: Work,
+    morsels: Vec<(u64, u64)>,
+    threads: usize,
+}
+
+/// The driving scan, split into morsels, with the worker count the
+/// table size justifies.
+fn scan_work(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    options: &Options,
+) -> Result<Schedule> {
     let total_rows = snap.table_rows(plan.table)?;
     let threads = match options.threads {
         // A scan under one storage group is a handful of morsels;
         // forking snapshots and spawning workers costs more than the
         // scan, so auto stays sequential and only an explicit thread
-        // count forces the parallel path.
-        0 if total_rows <= u64::from(GROUP_ROWS) => 1,
+        // count forces the parallel path. An intersection is the
+        // exception: it walks a neighbor list per edge leaving every
+        // scanned row, so the row count says nothing about what the
+        // query costs and a small table can still be minutes of work.
+        0 if total_rows <= u64::from(GROUP_ROWS) && !intersects(plan) => 1,
         0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
         n => n,
     };
-    let morsels = make_morsels(total_rows, threads.max(1));
+    Ok(Schedule {
+        work: Work::Scan,
+        morsels: make_morsels(total_rows, threads.max(1)),
+        threads,
+    })
+}
+
+/// A morsel is worth handing to another core once it is this many rows
+/// of work: below it the fork and the handoff cost more than the split
+/// saves. Measured on the LDBC friends-of-friends read, where the split
+/// starts paying at a few tens of thousands of paths.
+const SPLIT_ROWS: u64 = 2 * 1024;
+
+/// The seeded plan's morsels. A seek touches one row, so there is
+/// normally nothing to split and the whole pipeline runs on the calling
+/// thread. The exception is the celebrity seed (perf/13 section 2): a
+/// person with a huge two-hop frontier is one query's worth of work
+/// behind one row, and left alone it sets the p99 of the whole class.
+/// The frontier splits into morsels weighted by each neighbor's own
+/// degree, so the workers get equal work rather than equal neighbors.
+fn seek_work(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    options: &Options,
+    key: u64,
+) -> Result<Schedule> {
+    let one = |work| {
+        Ok(Schedule {
+            work,
+            morsels: vec![(0, 0)],
+            threads: 1,
+        })
+    };
+    let Some(seed) = snap.seek_key(plan.table, key)? else {
+        return one(Work::Seek(None));
+    };
+    if options.threads == 1 {
+        return one(Work::Seek(Some(seed)));
+    }
+    let Some(&Op::Expand {
+        rel,
+        dirs: Dirs::One(dir),
+        from: 0,
+        to,
+    }) = plan.ops.first()
+    else {
+        return one(Work::Seek(Some(seed)));
+    };
+    // Weigh the frontier by the next hop when there is one, so a
+    // neighbor with a thousand edges counts for a thousand.
+    let list = snap.csr(rel, group_of(seed), dir)?;
+    let list = list.list((seed % u64::from(GROUP_ROWS)) as usize).to_vec();
+    let mut weight = vec![1u64; list.len()];
+    if let Some(&Op::Expand {
+        rel: next,
+        dirs: Dirs::One(next_dir),
+        from: 1,
+        ..
+    }) = plan.ops.get(1)
+    {
+        snap.degrees(next, &list, next_dir, &mut weight)?;
+        for w in &mut weight {
+            // `degrees` adds onto the slot, so the seed of 1 above is
+            // still in there; that floor is what keeps a zero-degree
+            // neighbor from disappearing out of the weighting.
+            *w = (*w).max(1);
+        }
+    }
+    let total: u64 = weight.iter().sum();
+    if total < SPLIT_ROWS {
+        return one(Work::Seek(Some(seed)));
+    }
+    let threads = match options.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+        n => n,
+    };
+    if threads < 2 {
+        return one(Work::Seek(Some(seed)));
+    }
+    // Four morsels a worker, the same oversubscription the scan uses:
+    // the weights are estimates, and a short tail morsel is what lets
+    // a worker that drew a heavy one be overtaken.
+    let target = (total / (threads as u64 * 4)).max(1);
+    let mut morsels = Vec::new();
+    let (mut lo, mut acc) = (0u64, 0u64);
+    for (i, w) in weight.iter().enumerate() {
+        acc += w;
+        if acc >= target && i as u64 + 1 < list.len() as u64 {
+            morsels.push((lo, i as u64 + 1));
+            lo = i as u64 + 1;
+            acc = 0;
+        }
+    }
+    morsels.push((lo, list.len() as u64));
+    Ok(Schedule {
+        work: Work::Frontier {
+            seed,
+            rel,
+            dir,
+            to,
+        },
+        morsels,
+        threads,
+    })
+}
+
+fn group_of(row: u64) -> GroupId {
+    (row / u64::from(GROUP_ROWS)) as GroupId
+}
+
+/// Runs the morsels across workers and returns each worker's partial
+/// sink.
+fn drive(plan: &ExecPlan, snap: &mut dyn Snapshot, sched: &Schedule) -> Result<Vec<SinkState>> {
+    let Schedule {
+        work,
+        morsels,
+        threads,
+    } = sched;
+    let (work, threads) = (*work, *threads);
     let quota = match &plan.sink {
         SinkSpec::Rows { post, .. } => quota_of(post),
         _ => None,
     };
     let stop = StopState::new(quota, morsels.len());
     let claim = AtomicUsize::new(0);
+
+    // A single worker needs none of the handoff machinery, and a point
+    // read is short enough that setting it up shows in the latency.
+    if threads <= 1 || morsels.len() <= 1 {
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
+        return w.work(morsels, &claim).map(|()| vec![w.sink]);
+    }
 
     // Fork one handle per extra worker; a backend that cannot fork
     // runs the query on this thread alone.
@@ -81,17 +276,17 @@ pub(crate) fn run(
             .into_iter()
             .zip(&slots)
             .map(|(f, slot)| {
-                let (stop, claim, morsels) = (&stop, &claim, morsels.as_slice());
+                let (stop, claim) = (&stop, &claim);
                 Box::new(move || {
-                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop);
+                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop, work);
                     let res = w.work(morsels, claim).map(|()| w.sink);
                     *slot.lock().unwrap() = Some(res);
                 }) as Box<dyn FnOnce() + Send + '_>
             })
             .collect();
         let pending = pool::submit(jobs);
-        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop);
-        let main = w.work(&morsels, &claim).map(|()| w.sink);
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
+        let main = w.work(morsels, &claim).map(|()| w.sink);
         pending.wait();
         main
     };
@@ -107,34 +302,16 @@ pub(crate) fn run(
             Err(e) => first_err = first_err.or(Some(e)),
         }
     }
-    let partials = match first_err {
-        Some(e) => return Err(e),
-        None => out,
-    };
-
-    match &plan.sink {
-        SinkSpec::Count => {
-            let total: i64 = partials.iter().map(|p| p.count).sum();
-            Ok(QueryResult {
-                columns: plan.columns.clone(),
-                rows: vec![vec![Value::Int(total)]],
-            })
-        }
-        SinkSpec::Agg {
-            item_agg,
-            keys,
-            aggs,
-            post,
-        } => sink::finish_agg(
-            plan.columns.clone(),
-            item_agg,
-            aggs,
-            post,
-            partials,
-            keys.is_empty(),
-        ),
-        SinkSpec::Rows { post, .. } => Ok(sink::finish_rows(plan.columns.clone(), post, partials)),
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(out),
     }
+}
+
+/// Whether the pipeline closes a cycle, the one shape whose cost is
+/// set by the edges under the scan rather than by the rows in it.
+fn intersects(plan: &ExecPlan) -> bool {
+    plan.ops.iter().any(|op| matches!(op, Op::Intersect { .. }))
 }
 
 /// Splits the scan into morsels: chunk-multiple sizes targeting eight
@@ -177,7 +354,9 @@ fn quota_of(post: &[PostSpec]) -> Option<u64> {
     let mut limit = None;
     for p in post {
         match p {
-            PostSpec::Distinct => return None,
+            // Ordered output has no early stop: the last row scanned
+            // can still sort into the answer.
+            PostSpec::Distinct | PostSpec::Sort(_) => return None,
             PostSpec::Skip(n) => skip = *n,
             PostSpec::Limit(n) => limit = Some(*n),
         }
@@ -278,6 +457,10 @@ struct Worker<'a> {
     scratch: Vec<u64>,
     /// Neighbor scratch for the fused expand-then-count path.
     neigh: Vec<u64>,
+    /// Intersection scratch for the WCOJ close.
+    hits: Vec<u64>,
+    /// Survivor scratch for the binary close.
+    keep: Vec<u16>,
     /// Per-row degree and running product scratch for hub counts.
     deg: Vec<u64>,
     prod: Vec<u64>,
@@ -285,14 +468,22 @@ struct Worker<'a> {
     /// recursion depth in steady state.
     idx_pool: Vec<Vec<u32>>,
     row_pool: Vec<Vec<u64>>,
+    /// Grouping scratch, all reused down the whole run so a GROUP BY
+    /// vector never allocates: the packed keys, the group index the
+    /// table gave each row, and one aggregate's arguments.
+    batch: KeyBatch,
+    gids: Vec<u32>,
+    args: Vec<i64>,
     sink: SinkState,
     stop: &'a StopState,
+    /// What this worker's morsels mean.
+    work: Work,
     /// Rows emitted in the morsel in flight, for the quota check.
     local_rows: u64,
 }
 
 impl<'a> Worker<'a> {
-    fn new(plan: &'a ExecPlan, snap: SnapHandle<'a>, stop: &'a StopState) -> Self {
+    fn new(plan: &'a ExecPlan, snap: SnapHandle<'a>, stop: &'a StopState, work: Work) -> Self {
         Worker {
             plan,
             snap,
@@ -301,12 +492,18 @@ impl<'a> Worker<'a> {
             scan_cols: plan.levels[0].cols.iter().map(|&(id, _)| id).collect(),
             scratch: Vec::new(),
             neigh: Vec::new(),
+            hits: Vec::new(),
+            keep: Vec::new(),
             deg: Vec::new(),
             prod: Vec::new(),
             idx_pool: Vec::new(),
             row_pool: Vec::new(),
+            batch: KeyBatch::default(),
+            gids: Vec::new(),
+            args: Vec::new(),
             sink: SinkState::default(),
             stop,
+            work,
             local_rows: 0,
         }
     }
@@ -324,9 +521,84 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn run_morsel(&mut self, idx: usize, (lo, hi): (u64, u64)) -> Result<()> {
+    fn run_morsel(&mut self, idx: usize, range: (u64, u64)) -> Result<()> {
         self.arena.reset();
         self.local_rows = 0;
+        let rows_sink = matches!(self.plan.sink, SinkSpec::Rows { .. });
+        match self.work {
+            Work::Scan => self.scan_morsel(idx, range)?,
+            Work::Seek(seed) => self.seek_morsel(seed)?,
+            Work::Frontier {
+                seed,
+                rel,
+                dir,
+                to,
+            } => self.frontier_morsel(seed, rel, dir, to, range)?,
+        }
+        if rows_sink {
+            let batch = std::mem::take(&mut self.sink.rows);
+            self.sink.batches.push((idx, batch));
+        }
+        self.stop.morsel_done(idx, self.local_rows);
+        Ok(())
+    }
+
+    /// The seeded plan on one worker: the key index already found the
+    /// row, so level 0 is that row and everything above it is the
+    /// pipeline a scan runs. A key that hit nothing runs no ops and
+    /// still leaves the sink an empty batch.
+    fn seek_morsel(&mut self, seed: Option<u64>) -> Result<()> {
+        let Some(seed) = seed else { return Ok(()) };
+        let plan = self.plan;
+        let level0 = self.make_level(0, &[seed])?;
+        let mut set = ChunkSet::new(vec![level0]);
+        self.run_ops(&plan.ops, &mut set)
+    }
+
+    /// One slice of a celebrity seed's frontier. The seed's level 0 is
+    /// rebuilt per morsel, which is one row's gather, and the first
+    /// expand is unrolled here so the morsel can own a range of the
+    /// neighbor list instead of the whole of it. Slices are contiguous
+    /// and claimed in order, so the batches stitch back into exactly
+    /// the order one worker walking the list would have emitted.
+    fn frontier_morsel(
+        &mut self,
+        seed: u64,
+        rel: RelId,
+        dir: Dir,
+        to: usize,
+        (lo, hi): (u64, u64),
+    ) -> Result<()> {
+        let plan = self.plan;
+        let mut level0 = self.make_level(0, &[seed])?;
+        level0.cur = Some(0);
+        let mut set = ChunkSet::new(vec![level0]);
+        let pin = self.pin(rel, dir, seed)?;
+        let list = pin.list((seed % u64::from(GROUP_ROWS)) as usize);
+        let mut result = Ok(());
+        for part in list[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
+            let chunk = match self.make_level(to, part) {
+                Ok(c) => c,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            set.chunks.push(chunk);
+            let res = self.run_ops(&plan.ops[1..], &mut set);
+            set.chunks.pop();
+            if let Err(e) = res {
+                result = Err(e);
+                break;
+            }
+            if self.stop.stopped() {
+                break;
+            }
+        }
+        result
+    }
+
+    fn scan_morsel(&mut self, idx: usize, (lo, hi): (u64, u64)) -> Result<()> {
         let plan = self.plan;
         let rows_sink = matches!(plan.sink, SinkSpec::Rows { .. });
         for chunk in lo / SCAN_ROWS as u64..hi.div_ceil(SCAN_ROWS as u64) {
@@ -337,7 +609,7 @@ impl<'a> Worker<'a> {
                 plan.table,
                 chunk,
                 &self.scan_cols,
-                plan.pred.as_ref(),
+                plan.zone(),
                 &mut self.arena,
             )?
             else {
@@ -367,11 +639,6 @@ impl<'a> Worker<'a> {
                 break;
             }
         }
-        if rows_sink {
-            let batch = std::mem::take(&mut self.sink.rows);
-            self.sink.batches.push((idx, batch));
-        }
-        self.stop.morsel_done(idx, self.local_rows);
         Ok(())
     }
 
@@ -399,6 +666,17 @@ impl<'a> Worker<'a> {
                 }
                 self.expand(*rel, *dirs, *to, rest, set)
             }
+            Op::Intersect {
+                seed,
+                probe,
+                probe_level,
+                to,
+            } => self.intersect(*seed, *probe, *probe_level, *to, rest, set),
+            Op::Semi {
+                rel,
+                dirs,
+                probe_level,
+            } => self.semi(*rel, *dirs, *probe_level, rest, set),
             Op::DegreeProduct { steps } => {
                 self.collect_rows(set.chunks.last().expect("a level under the count"));
                 let rows = std::mem::take(&mut self.scratch);
@@ -477,6 +755,170 @@ impl<'a> Worker<'a> {
         set.chunks[src].cur = None;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
+        result
+    }
+
+    /// The WCOJ close: every row of the newest level is a wedge middle
+    /// and the far end is pinned above, so the closing node is the
+    /// intersection of two sorted neighbor lists. The far end's list is
+    /// read once for the whole vector, both lists are borrowed out of
+    /// their CSR pins with nothing copied, and the walk galloping past
+    /// the runs it cannot match is what replaces a storage probe per
+    /// candidate.
+    fn intersect(
+        &mut self,
+        seed: (RelId, Dir),
+        probe: (RelId, Dir),
+        probe_level: usize,
+        to: usize,
+        rest: &[Op],
+        set: &mut ChunkSet,
+    ) -> Result<()> {
+        let src = set.chunks.len() - 1;
+        let far = &set.chunks[probe_level];
+        let prow = row_at(far, pinned_pos(far));
+        let ppin = self.pin(probe.0, probe.1, prow)?;
+        let plist = ppin.list((prow % u64::from(GROUP_ROWS)) as usize);
+        if plist.is_empty() {
+            return Ok(());
+        }
+        // Copy the active rows out first: pinning mutates the chunk the
+        // selection and values are read from.
+        let mut idxs = self.idx_pool.pop().unwrap_or_default();
+        let mut rows = self.row_pool.pop().unwrap_or_default();
+        idxs.clear();
+        rows.clear();
+        {
+            let chunk = &set.chunks[src];
+            let vals = chunk.vecs[0].values::<u64>();
+            match &chunk.sel {
+                Some(s) => {
+                    for &i in s.as_slice() {
+                        idxs.push(u32::from(i));
+                        rows.push(vals[i as usize]);
+                    }
+                }
+                None => {
+                    idxs.extend(0..chunk.count);
+                    rows.extend_from_slice(vals);
+                }
+            }
+        }
+        let mut hits = std::mem::take(&mut self.hits);
+        let mut result = Ok(());
+        // One seed pin covers a whole storage group, and a neighbor
+        // list rarely leaves the group it started in, so the pin is
+        // held across rows rather than looked up per row: the lookup
+        // is a hash of the pin key and this loop runs once per edge
+        // under the scan.
+        let mut held: Option<(u32, CsrPin)> = None;
+        'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
+            set.chunks[src].cur = Some(phys);
+            let group = (row / u64::from(GROUP_ROWS)) as u32;
+            if held.as_ref().is_none_or(|&(g, _)| g != group) {
+                match self.pin(seed.0, seed.1, row) {
+                    Ok(p) => held = Some((group, p)),
+                    Err(e) => {
+                        result = Err(e);
+                        break 'srcs;
+                    }
+                }
+            }
+            let spin = &held.as_ref().expect("just pinned").1;
+            hits.clear();
+            leapfrog(
+                spin.list((row % u64::from(GROUP_ROWS)) as usize),
+                plist,
+                &mut hits,
+            );
+            for part in hits.chunks(zu_vector::VECTOR_SIZE) {
+                let chunk = match self.make_level(to, part) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        result = Err(e);
+                        break 'srcs;
+                    }
+                };
+                set.chunks.push(chunk);
+                let res = self.run_ops(rest, set);
+                set.chunks.pop();
+                if let Err(e) = res {
+                    result = Err(e);
+                    break 'srcs;
+                }
+            }
+            if self.stop.stopped() {
+                break;
+            }
+        }
+        set.chunks[src].cur = None;
+        self.hits = hits;
+        self.idx_pool.push(idxs);
+        self.row_pool.push(rows);
+        result
+    }
+
+    /// The binary close: both ends of the edge are already bound, so
+    /// the newest level keeps the rows with an edge back to the pinned
+    /// end and nothing else changes. The pinned end's neighbor list is
+    /// read once for the whole vector and each row galloped into it,
+    /// the cursor carried across rows because an expand hands its rows
+    /// over in list order.
+    fn semi(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        probe_level: usize,
+        rest: &[Op],
+        set: &mut ChunkSet,
+    ) -> Result<()> {
+        let far = &set.chunks[probe_level];
+        let prow = row_at(far, pinned_pos(far));
+        let mut pins = Vec::with_capacity(2);
+        for dir in sides(dirs) {
+            pins.push(self.pin(rel, dir, prow)?);
+        }
+        let at = (prow % u64::from(GROUP_ROWS)) as usize;
+        let lists: Vec<&[u64]> = pins.iter().map(|p| p.list(at)).collect();
+        if lists.iter().all(|l| l.is_empty()) {
+            return Ok(());
+        }
+        let last = set.chunks.len() - 1;
+        let mut keep = std::mem::take(&mut self.keep);
+        keep.clear();
+        {
+            let chunk = &set.chunks[last];
+            let vals = chunk.vecs[0].values::<u64>();
+            let mut cur = [0usize; 2];
+            let mut prev = 0;
+            let cur = &mut cur[..lists.len()];
+            match &chunk.sel {
+                Some(s) => {
+                    for &i in s.as_slice() {
+                        if member(&lists, cur, &mut prev, vals[i as usize]) {
+                            keep.push(i);
+                        }
+                    }
+                }
+                None => {
+                    for i in 0..chunk.count {
+                        if member(&lists, cur, &mut prev, vals[i as usize]) {
+                            keep.push(i as u16);
+                        }
+                    }
+                }
+            }
+        }
+        let mut result = Ok(());
+        if !keep.is_empty() {
+            let mut sel = SelVector::with_capacity(&mut self.arena, keep.len());
+            for &i in &keep {
+                sel.push(i);
+            }
+            set.chunks[last].sel = Some(sel);
+            result = self.run_ops(rest, set);
+        }
+        self.keep = keep;
         result
     }
 
@@ -585,6 +1027,61 @@ impl<'a> Worker<'a> {
         Ok(self.prod.iter().sum())
     }
 
+    /// Keyed aggregation for one chunk set, a column at a time: pack the
+    /// key vector, probe the whole vector in one call, then walk the
+    /// group indices once per aggregate. Nothing in here dispatches on
+    /// the plan per row, which is the point; the per-row work left is a
+    /// hash, a probe, and an accumulator update.
+    fn group_vector(&mut self, set: &ChunkSet, keys: &[ScalarRef], aggs: &[AggSpec]) -> Result<()> {
+        let last = set.chunks.len() - 1;
+        let live = &set.chunks[last];
+        debug_assert!(live.cur.is_none(), "sink level is never pinned");
+        // An unfiltered vector reads straight down its columns; only a
+        // selection sends the reads through the survivor list.
+        let sel = live.sel.as_ref().map(|s| s.as_slice());
+        let rows = sel.map_or(live.count as usize, |s| s.len());
+        if rows == 0 {
+            return Ok(());
+        }
+        let table = self
+            .sink
+            .groups
+            .get_or_insert_with(|| GroupTable::new(key_parts(keys), aggs.len()));
+        self.batch.reset(table.stride(), rows);
+        let mut off = 0;
+        for &r in keys {
+            fill_key_col(self.plan, set, r, sel, rows, off, &mut self.batch)?;
+            off += part_kind(r).words();
+        }
+        table.probe(&self.batch, aggs, &mut self.gids);
+        let n = aggs.len();
+        for (j, spec) in aggs.iter().enumerate() {
+            // Dense columns and required nodes are never null, so
+            // count(x) counts rows exactly like count(*).
+            let counting = spec.arg().is_none() || matches!(spec, AggSpec::CountRef(_));
+            if counting {
+                let accs = table.accs_mut();
+                // Warming the states the way the probe warms slots
+                // measured slower here, so the loop stays plain: the
+                // group indices repeat far more than slots do, and the
+                // states are already in cache most of the time.
+                for &g in &self.gids {
+                    accs[g as usize * n + j].add_star(1);
+                }
+                continue;
+            }
+            let r = spec
+                .arg()
+                .expect("a non counting aggregate has an argument");
+            gather_ints(set, r, sel, rows, &mut self.args);
+            let accs = table.accs_mut();
+            for (&g, &v) in self.gids.iter().zip(&self.args) {
+                accs[g as usize * n + j].add_int(v, 1)?;
+            }
+        }
+        Ok(())
+    }
+
     fn push_sink(&mut self, set: &mut ChunkSet) -> Result<()> {
         match &self.plan.sink {
             SinkSpec::Count => {
@@ -610,12 +1107,10 @@ impl<'a> Worker<'a> {
                     return Ok(());
                 }
                 if keys.is_empty() {
-                    let states = self
-                        .sink
-                        .groups
-                        .entry(Vec::new())
-                        .or_insert_with(|| aggs.iter().map(Acc::new).collect());
-                    for (spec, acc) in aggs.iter().zip(states) {
+                    if self.sink.bare.is_empty() {
+                        self.sink.bare = aggs.iter().map(Acc::new).collect();
+                    }
+                    for (spec, acc) in aggs.iter().zip(&mut self.sink.bare) {
                         match spec.arg() {
                             None => acc.add_star(mult),
                             Some(r) if matches!(spec, crate::compile::AggSpec::CountRef(_)) => {
@@ -637,38 +1132,67 @@ impl<'a> Worker<'a> {
                     }
                     Ok(())
                 } else {
-                    for pos in active_positions(&set.chunks[last]) {
-                        let mut key = Vec::with_capacity(keys.len());
-                        for &r in keys {
-                            key.push(key_val(self.plan, set, r, pos)?);
-                        }
-                        let states = self
-                            .sink
-                            .groups
-                            .entry(key)
-                            .or_insert_with(|| aggs.iter().map(Acc::new).collect());
-                        for (spec, acc) in aggs.iter().zip(states) {
-                            match spec.arg() {
-                                None => acc.add_star(1),
-                                Some(_) if matches!(spec, crate::compile::AggSpec::CountRef(_)) => {
-                                    acc.add_star(1);
-                                }
-                                Some(r) => {
-                                    let p = if r.level() == last {
-                                        pos
-                                    } else {
-                                        pinned_pos(&set.chunks[r.level()])
-                                    };
-                                    acc.add_int(int_scalar(set, r, p), 1)?;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
+                    self.group_vector(set, keys, aggs)
                 }
             }
         }
     }
+}
+
+/// Intersects two sorted neighbor lists, galloping past the runs
+/// neither side can match. A repeat in the seed list is a real
+/// multi-edge row and emits again; a repeat in the probe list is only
+/// the existence check answering twice, so it adds nothing. That is
+/// the old engine's rule and the counts depend on it.
+fn leapfrog(seed: &[u64], probe: &[u64], out: &mut Vec<u64>) {
+    let (mut si, mut pi) = (0, 0);
+    while si < seed.len() && pi < probe.len() {
+        let (sv, pv) = (seed[si], probe[pi]);
+        if sv < pv {
+            si = gallop(seed, pv, si);
+        } else if pv < sv {
+            pi = gallop(probe, sv, pi);
+        } else {
+            while si < seed.len() && seed[si] == sv {
+                out.push(sv);
+                si += 1;
+            }
+            pi += 1;
+        }
+    }
+}
+
+/// Whether `v` sits in any of the pinned lists, carrying each list's
+/// cursor forward. Rows arrive in list order out of an expand, so the
+/// cursor usually starts within a step or two of the answer; a row that
+/// goes backwards rewinds it, which is what keeps a filtered or scanned
+/// level correct here too.
+fn member(lists: &[&[u64]], cur: &mut [usize], prev: &mut u64, v: u64) -> bool {
+    if v < *prev {
+        cur.fill(0);
+    }
+    *prev = v;
+    let mut hit = false;
+    for (list, c) in lists.iter().zip(cur.iter_mut()) {
+        *c = gallop(list, v, *c);
+        hit |= list.get(*c) == Some(&v);
+    }
+    hit
+}
+
+/// First position at or after `from` whose value is at least `target`,
+/// found by doubling the step and then bisecting the bracket it
+/// overshot. Doubling is what keeps a long list against a short one
+/// logarithmic in the answer rather than linear in the list.
+fn gallop(list: &[u64], target: u64, from: usize) -> usize {
+    let mut step = 1;
+    let mut lo = from;
+    while lo + step < list.len() && list[lo + step] < target {
+        lo += step;
+        step *= 2;
+    }
+    let hi = (lo + step + 1).min(list.len());
+    lo + list[lo..hi].partition_point(|&v| v < target)
 }
 
 /// Which CSR sides one expand walks, forward first.
@@ -747,28 +1271,208 @@ fn int_scalar(set: &ChunkSet, r: ScalarRef, pos: usize) -> i64 {
     }
 }
 
-fn key_val(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<KeyVal> {
-    Ok(match scalar(plan, set, r, pos)? {
-        Value::Int(n) => KeyVal::Int(n),
-        Value::Str(s) => KeyVal::Str(s),
-        Value::Node { table, offset } => KeyVal::Node(table, offset),
-        other => return Err(invalid(format!("unexpected grouping key {other:?}"))),
-    })
+/// What one key ref packs into: a node takes two words, a string a byte
+/// range, everything else one word.
+fn part_kind(r: ScalarRef) -> PartKind {
+    match r {
+        ScalarRef::Node { .. } => PartKind::Node,
+        ScalarRef::RowId { .. } => PartKind::Int,
+        ScalarRef::Col { ty, .. } => match ty {
+            zu_query::snapshot::ColType::Int => PartKind::Int,
+            zu_query::snapshot::ColType::Str => PartKind::Str,
+        },
+    }
 }
 
-fn str_at(v: &ValueVector, idx: usize) -> Result<String> {
+fn key_parts(keys: &[ScalarRef]) -> Vec<PartKind> {
+    keys.iter().copied().map(part_kind).collect()
+}
+
+/// Packs one key column of the whole vector. A ref on the newest level
+/// reads one value per active position; a ref on a pinned level is the
+/// same value for every row of the vector, and the fill says so.
+fn fill_key_col(
+    plan: &ExecPlan,
+    set: &ChunkSet,
+    r: ScalarRef,
+    sel: Option<&[u16]>,
+    rows: usize,
+    off: usize,
+    batch: &mut KeyBatch,
+) -> Result<()> {
+    let level = r.level();
+    let chunk = &set.chunks[level];
+    let live = level + 1 == set.chunks.len();
+    match r {
+        ScalarRef::Node { .. } | ScalarRef::RowId { .. } => {
+            // The node's table is the level's table, one word for the
+            // whole vector; the row id is the varying half.
+            let at = match r {
+                ScalarRef::Node { .. } => {
+                    batch.fill_word(off, u64::from(plan.levels[level].table));
+                    off + 1
+                }
+                _ => off,
+            };
+            if live {
+                fill_col(batch, at, chunk.vecs[0].values::<u64>(), sel, rows, |v| v);
+            } else {
+                batch.fill_word(at, row_at(chunk, pinned_pos(chunk)));
+            }
+        }
+        ScalarRef::Col { vec, ty, .. } => match ty {
+            zu_query::snapshot::ColType::Int => {
+                if live {
+                    fill_col(
+                        batch,
+                        off,
+                        chunk.vecs[vec].values::<i64>(),
+                        sel,
+                        rows,
+                        |v| v as u64,
+                    );
+                } else {
+                    let v = chunk.vecs[vec].values::<i64>()[pinned_pos(chunk)];
+                    batch.fill_word(off, v as u64);
+                }
+            }
+            zu_query::snapshot::ColType::Str => {
+                // The view array and the string buffers are the same
+                // for every row of the vector, so they are read once
+                // here rather than per row through with_str_bytes.
+                let v = &chunk.vecs[vec];
+                let views = v.values::<StrView>();
+                let bufs = v.str_buffers();
+                for row in 0..rows {
+                    let idx = match (live, sel) {
+                        (false, _) => pinned_pos(chunk),
+                        (true, None) => row,
+                        (true, Some(pos)) => pos[row] as usize,
+                    };
+                    let view = views[idx];
+                    let bytes = match bufs {
+                        Some(b) => view.bytes(b),
+                        None => view.inline_bytes(),
+                    };
+                    if std::str::from_utf8(bytes).is_err() {
+                        return Err(invalid("string property is not UTF-8".to_string()));
+                    }
+                    batch.set_str(row, off, bytes);
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Writes one column of the key vector out of a column's values, either
+/// straight down or through the selection.
+fn fill_col<T: Copy>(
+    batch: &mut KeyBatch,
+    off: usize,
+    vals: &[T],
+    sel: Option<&[u16]>,
+    rows: usize,
+    word: impl Fn(T) -> u64,
+) {
+    let (words, stride) = batch.words_mut();
+    let dst = words.iter_mut().skip(off).step_by(stride);
+    match sel {
+        None => {
+            for (w, &v) in dst.zip(&vals[..rows]) {
+                *w = word(v);
+            }
+        }
+        Some(pos) => {
+            for (w, &p) in dst.zip(pos) {
+                *w = word(vals[p as usize]);
+            }
+        }
+    }
+}
+
+/// Gathers an aggregate's integer argument for the whole vector, the
+/// pinned case being one value repeated.
+fn gather_ints(set: &ChunkSet, r: ScalarRef, sel: Option<&[u16]>, rows: usize, out: &mut Vec<i64>) {
+    out.clear();
+    let level = r.level();
+    let chunk = &set.chunks[level];
+    if level + 1 != set.chunks.len() {
+        out.resize(rows, int_scalar(set, r, pinned_pos(chunk)));
+        return;
+    }
+    match r {
+        ScalarRef::Col { vec, .. } => {
+            let vals = chunk.vecs[vec].values::<i64>();
+            match sel {
+                None => out.extend_from_slice(&vals[..rows]),
+                Some(pos) => out.extend(pos.iter().map(|&p| vals[p as usize])),
+            }
+        }
+        ScalarRef::RowId { .. } => {
+            let ids = chunk.vecs[0].values::<u64>();
+            match sel {
+                None => out.extend(ids[..rows].iter().map(|&v| v as i64)),
+                Some(pos) => out.extend(pos.iter().map(|&p| ids[p as usize] as i64)),
+            }
+        }
+        ScalarRef::Node { .. } => unreachable!("nodes are not integer arguments"),
+    }
+}
+
+/// Hands the bytes of a string cell to `f`, checked for UTF-8 first so
+/// the group table can turn them back into a String without checking
+/// again and so a bad property errors on the query the old engine errors
+/// on. A short string lives inside the view, which is a value on the
+/// stack here, so the bytes cannot outlive the call and every reader
+/// takes a closure rather than a slice.
+fn with_str_bytes<T>(v: &ValueVector, idx: usize, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
     let view = v.values::<StrView>()[idx];
     let bytes = match v.str_buffers() {
         Some(bufs) => view.bytes(bufs),
         None => view.inline_bytes(),
     };
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| invalid("string property is not UTF-8".to_string()))
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Ok(f(bytes)),
+        Err(_) => Err(invalid("string property is not UTF-8".to_string())),
+    }
+}
+
+fn str_at(v: &ValueVector, idx: usize) -> Result<String> {
+    with_str_bytes(v, idx, |b| String::from_utf8_lossy(b).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn gallop_finds_the_first_index_at_or_after_the_target() {
+        let list = [2, 4, 4, 7, 11, 15, 15, 20];
+        for from in 0..list.len() {
+            for target in 0..25 {
+                let want = (from..list.len())
+                    .find(|&ix| list[ix] >= target)
+                    .unwrap_or(list.len());
+                assert_eq!(
+                    gallop(&list, target, from),
+                    want,
+                    "target {target} from {from}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leapfrog_emits_one_hit_per_seed_occurrence() {
+        let mut hits = Vec::new();
+        leapfrog(&[2, 2, 3, 7, 9, 12], &[1, 2, 7, 7, 8, 12], &mut hits);
+        assert_eq!(hits, [2, 2, 7, 12]);
+        hits.clear();
+        leapfrog(&[5], &[], &mut hits);
+        leapfrog(&[], &[5], &mut hits);
+        assert_eq!(hits, []);
+    }
 
     use zu_query::snapshot::{ColId, GroupId, ScanChunk, TableId, ZonePred};
     use zu_vector::{ExprOp, OwnedValue};
@@ -894,8 +1598,8 @@ mod tests {
             Ok(ValueVector::flat_from(arena, PhysType::Int64, &vals))
         }
 
-        fn lookup_pk(&mut self, _rel: RelId, _key: u64) -> Result<Option<u64>> {
-            Ok(None)
+        fn seek_key(&mut self, _table: TableId, key: u64) -> Result<Option<u64>> {
+            Ok((key < self.rows).then_some(key))
         }
 
         fn degree_batch(&mut self, _rel: RelId, nodes: &[u64], dir: Dir) -> Result<u64> {
@@ -915,7 +1619,7 @@ mod tests {
     fn plan(levels: Vec<Level>, ops: Vec<Op>, sink: SinkSpec, columns: &[&str]) -> ExecPlan {
         ExecPlan {
             table: 0,
-            pred: None,
+            source: Source::Scan(None),
             ops,
             sink,
             levels,
@@ -1033,11 +1737,11 @@ mod tests {
     fn zone_pred_skips_chunks() {
         let mut snap = Mock::new(10, |i| i as i64, false);
         let mut p = plan(vec![age_level()], Vec::new(), SinkSpec::Count, &["n"]);
-        p.pred = Some(ZonePred {
+        p.source = Source::Scan(Some(ZonePred {
             col: 0,
             lo: 1000,
             hi: u64::MAX,
-        });
+        }));
         let r = run(&p, &mut snap, &seq()).unwrap();
         assert_eq!(r.rows, vec![vec![Value::Int(0)]], "every chunk zoned out");
     }

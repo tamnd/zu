@@ -5,9 +5,9 @@
 //! The supported shape today is the linear read pipeline: a single
 //! non-optional node scan, filters, single-hop expands that walk off
 //! the newest level, and one final Project or Aggregate with its
-//! absorbed Distinct, Skip, and Limit. Everything the old executor
-//! also covers, variable-length expands, optional groups, closing
-//! joins, unwind, table functions, sorts, and rel values, falls back.
+//! absorbed Distinct, Sort, Skip, and Limit. Everything the old
+//! executor also covers, variable-length expands, optional groups,
+//! closing joins, unwind, table functions, and rel values, falls back.
 //! The bar for anything compiled here is exact old-engine output:
 //! same rows, same order, same errors on overflow.
 
@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use zu_common::Result;
 use zu_query::ast::{BinaryOp, Literal, RelDirection};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema};
-use zu_query::exec::Value;
+use zu_query::exec::{Options, Value, Wcoj};
 use zu_query::plan::LogicalPlan;
 use zu_query::snapshot::{ColId, ColType, Dir, RelId, Snapshot, TableId, ZonePred};
 use zu_vector::{BinOp, CmpOp, ExprOp, OwnedValue, PhysType, Program, Reg};
@@ -24,12 +24,32 @@ use zu_vector::{BinOp, CmpOp, ExprOp, OwnedValue, PhysType, Program, Reg};
 /// One compiled pipeline over one driving scan.
 pub(crate) struct ExecPlan {
     pub table: TableId,
-    /// Zone pushdown for the scan, extracted from a level 0 filter.
-    pub pred: Option<ZonePred>,
+    pub source: Source,
     pub ops: Vec<Op>,
     pub sink: SinkSpec,
     pub levels: Vec<Level>,
     pub columns: Vec<String>,
+}
+
+/// Where level 0 comes from.
+pub(crate) enum Source {
+    /// The driving scan, carrying any zone pushdown a level 0 filter
+    /// gave up.
+    Scan(Option<ZonePred>),
+    /// The primary-key seek an `{id: k}` predicate folds into: one row
+    /// or none, and no scan at all.
+    Seek(u64),
+}
+
+impl ExecPlan {
+    /// The zone pushdown the scan runs with; a seek has no chunks to
+    /// skip.
+    pub fn zone(&self) -> Option<&ZonePred> {
+        match &self.source {
+            Source::Scan(pred) => pred.as_ref(),
+            Source::Seek(_) => None,
+        }
+    }
 }
 
 /// One factorization level: the scan at index 0, one per expand after.
@@ -62,6 +82,30 @@ pub(crate) enum Op {
         dirs: Dirs,
         from: usize,
         to: usize,
+    },
+    /// The WCOJ close (docs/07 section 4, perf/05 section 3): the
+    /// expand that would build the closing node and the probe back
+    /// into it are one intersection of two sorted neighbor lists. The
+    /// seed list hangs off the newest level, the probe list off a
+    /// level pinned above it, so a wedge closes in one leapfrog walk
+    /// instead of a storage probe per candidate.
+    Intersect {
+        seed: (RelId, Dir),
+        probe: (RelId, Dir),
+        /// The level holding the wedge's far end, always pinned when
+        /// the op runs.
+        probe_level: usize,
+        to: usize,
+    },
+    /// The binary close (perf/05 section 6): both ends of the edge are
+    /// already bound, so nothing is built and the newest level only
+    /// loses the rows with no edge back to the pinned end. One list is
+    /// read for the whole vector and every row is galloped into it.
+    Semi {
+        rel: RelId,
+        dirs: Dirs,
+        /// The level holding the end that stays fixed for the vector.
+        probe_level: usize,
     },
     /// Terminal fusion of trailing expands feeding a bare count: each
     /// active row of the newest level contributes the product of its
@@ -125,6 +169,10 @@ impl AggSpec {
 /// Post steps above the sink, in plan order.
 pub(crate) enum PostSpec {
     Distinct,
+    /// ORDER BY over output columns: the column each key reads and
+    /// whether it ascends. A key that names something the projection
+    /// does not output falls back to the old engine.
+    Sort(Vec<(usize, bool)>),
     Skip(u64),
     Limit(u64),
 }
@@ -154,12 +202,14 @@ pub(crate) fn compile(
     schema: &Schema,
     snap: &mut dyn Snapshot,
     params: &[Value],
+    options: &Options,
 ) -> Result<Option<ExecPlan>> {
     let mut c = Compiler {
         query,
         schema,
         snap,
         params,
+        wcoj: options.wcoj,
         levels: Vec::new(),
         slot_level: HashMap::new(),
     };
@@ -179,6 +229,10 @@ struct Compiler<'a> {
     schema: &'a Schema,
     snap: &'a mut dyn Snapshot,
     params: &'a [Value],
+    /// `Wcoj::Off` pins the binary join, the baseline the fused close
+    /// is measured against, so the whole plan goes back to the old
+    /// engine rather than closing the cycle here.
+    wcoj: Wcoj,
     levels: Vec<LevelBuild>,
     slot_level: HashMap<usize, usize>,
 }
@@ -227,20 +281,24 @@ impl Compiler<'_> {
             _ => return Ok(None),
         };
         // A point predicate on the driving slot's id is the one shape
-        // the old engine does not scan at all: it folds the filter into
-        // the scan and seeks the primary-key index, so it touches one
-        // row. The pipeline has no seek source, so compiling this here
-        // reads the whole table to find that row, which measured 20 us
-        // against the old engine's 1.5 on a ten thousand node table.
-        // Hand the shape back until a seek operator exists.
+        // that never scans: the key index answers it with one row, so
+        // the filter turns into the source instead of running over
+        // every chunk. A key that is not a constant here, or one that
+        // does not fit a row id, goes back to the old engine rather
+        // than reading the whole table to find one row.
+        let mut seek = None;
         if let Some(LogicalPlan::Filter {
             expr,
             optional: None,
             ..
         }) = it.peek()
-            && id_point(expr, scan_slot)
+            && let Some(key) = id_point(expr, scan_slot)
         {
-            return Ok(None);
+            let Some(k) = self.const_int(key).and_then(|k| u64::try_from(k).ok()) else {
+                return Ok(None);
+            };
+            it.next();
+            seek = Some(k);
         }
         self.levels.push(LevelBuild {
             table,
@@ -263,7 +321,7 @@ impl Compiler<'_> {
                     let Some(prog) = self.build_prog(expr, level)? else {
                         return Ok(None);
                     };
-                    if level == 0 && ops.is_empty() && pred.is_none() {
+                    if level == 0 && ops.is_empty() && pred.is_none() && seek.is_none() {
                         pred = self.zone_pred(expr)?;
                     }
                     ops.push(Op::Filter { prog });
@@ -308,6 +366,50 @@ impl Compiler<'_> {
                         to: to_level,
                     });
                 }
+                Some(LogicalPlan::Expand {
+                    rel,
+                    from,
+                    to,
+                    direction,
+                    range: None,
+                    into: true,
+                    wcoj: true,
+                    optional: None,
+                    ..
+                }) => {
+                    // Filters the optimizer pushed onto the closing
+                    // node sit between the two halves of the pair.
+                    // They read the level the intersection produces,
+                    // so they step aside and go back on top of it.
+                    let mut held = Vec::new();
+                    while matches!(ops.last(), Some(Op::Filter { .. })) {
+                        held.push(ops.pop().expect("just matched"));
+                    }
+                    let Some(op) = self.fuse_close(&ops, *rel, *from, *to, *direction) else {
+                        return Ok(None);
+                    };
+                    it.next();
+                    ops.pop();
+                    ops.push(op);
+                    ops.extend(held.into_iter().rev());
+                }
+                Some(LogicalPlan::Expand {
+                    rel,
+                    from,
+                    to,
+                    direction,
+                    range: None,
+                    into: true,
+                    wcoj: false,
+                    optional: None,
+                    ..
+                }) => {
+                    let Some(op) = self.close_semi(*rel, *from, *to, *direction) else {
+                        return Ok(None);
+                    };
+                    it.next();
+                    ops.push(op);
+                }
                 _ => break,
             }
         }
@@ -330,8 +432,13 @@ impl Compiler<'_> {
                     };
                     post.push(PostSpec::Limit(n));
                 }
-                // ORDER BY and HAVING-style filters land with the
-                // parallel sort sink; fall back for now.
+                LogicalPlan::Sort { keys, .. } => {
+                    let Some(cols) = self.sort_cols(keys) else {
+                        return Ok(None);
+                    };
+                    post.push(PostSpec::Sort(cols));
+                }
+                // HAVING-style filters above the sink still fall back.
                 _ => return Ok(None),
             }
         }
@@ -435,17 +542,32 @@ impl Compiler<'_> {
         // to the old engine here.
         let mut newest = 0;
         for op in &ops {
-            if let Op::Expand { from, to, .. } = op {
-                if *from != newest {
-                    return Ok(None);
+            match op {
+                Op::Expand { from, to, .. } => {
+                    if *from != newest {
+                        return Ok(None);
+                    }
+                    newest = *to;
                 }
-                newest = *to;
+                Op::Intersect {
+                    probe_level, to, ..
+                } => {
+                    if *probe_level >= newest {
+                        return Ok(None);
+                    }
+                    newest = *to;
+                }
+                Op::Semi { probe_level, .. } if *probe_level >= newest => return Ok(None),
+                _ => {}
             }
         }
 
         Ok(Some(ExecPlan {
             table,
-            pred,
+            source: match seek {
+                Some(key) => Source::Seek(key),
+                None => Source::Scan(pred),
+            },
             ops,
             sink,
             levels: self
@@ -472,6 +594,166 @@ impl Compiler<'_> {
             return None;
         }
         Some(items.iter().map(|it| it.aggregate).collect())
+    }
+
+    /// Fuses a closing expand into the expand that built the node it
+    /// closes on, or None when the pair is not a shape the intersection
+    /// covers: both sides one direction over one rel table, one of the
+    /// two lists hanging off the newest level so it is walked row by
+    /// row, and the other hanging off a level below it so it is pinned
+    /// and read once for the whole vector.
+    ///
+    /// Which of the two is which depends on where the optimizer put the
+    /// scan. Starting at the wedge tip leaves the built expand walking
+    /// off the newest level and the close reaching back down; starting
+    /// at the closing node itself mirrors that, the close walks off the
+    /// newest level and the built expand reaches down. Both are the
+    /// same intersection with the roles swapped.
+    fn fuse_close(
+        &self,
+        ops: &[Op],
+        rel: usize,
+        from: usize,
+        to: usize,
+        direction: RelDirection,
+    ) -> Option<Op> {
+        let &Op::Expand {
+            rel: built_rel,
+            dirs: Dirs::One(built_dir),
+            from: built_from,
+            to: built_to,
+        } = ops.last()?
+        else {
+            return None;
+        };
+        if matches!(self.wcoj, Wcoj::Off) || built_to + 1 != self.levels.len() {
+            return None;
+        }
+        // The end of the closing pattern that names the node the expand
+        // above just built, and the walk direction read from its other
+        // end, which is the one already on a level.
+        let (far_slot, far_dir) = if self.slot_level.get(&to) == Some(&built_to) {
+            (from, direction)
+        } else if self.slot_level.get(&from) == Some(&built_to) {
+            (to, flip(direction))
+        } else {
+            return None;
+        };
+        let &far_level = self.slot_level.get(&far_slot)?;
+        let &[close_rel] = self.query.variables[rel].rel_tables.as_slice() else {
+            return None;
+        };
+        let Dirs::One(close_dir) = expand_dirs(
+            self.schema,
+            close_rel,
+            self.levels[far_level].table,
+            far_dir,
+        )?
+        else {
+            return None;
+        };
+        if far_table(self.schema, close_rel, close_dir)? != self.levels[built_to].table {
+            return None;
+        }
+        // The newest level is the one the pipeline ends on before this
+        // pair, and the other list has to sit strictly below it.
+        let newest = built_to - 1;
+        let (seed, probe, probe_level) = if built_from == newest && far_level < newest {
+            ((built_rel, built_dir), (close_rel, close_dir), far_level)
+        } else if far_level == newest && built_from < newest {
+            ((close_rel, close_dir), (built_rel, built_dir), built_from)
+        } else {
+            return None;
+        };
+        Some(Op::Intersect {
+            seed,
+            probe,
+            probe_level,
+            to: built_to,
+        })
+    }
+
+    /// Compiles a closing expand the intersection did not take into a
+    /// semijoin, or None when neither end sits on the newest level.
+    /// Both the storage probe and the accumulated edge set the old
+    /// engine picks between are the same test here, whether an edge
+    /// exists, and the answer is one row either way, so the two plan
+    /// flavors compile to the same operator.
+    fn close_semi(
+        &self,
+        rel: usize,
+        from: usize,
+        to: usize,
+        direction: RelDirection,
+    ) -> Option<Op> {
+        let newest = self.levels.len() - 1;
+        let &from_level = self.slot_level.get(&from)?;
+        let &to_level = self.slot_level.get(&to)?;
+        let &[rel_id] = self.query.variables[rel].rel_tables.as_slice() else {
+            return None;
+        };
+        // The pinned end is the one below the newest level: its list is
+        // read once and the rows of the newest level are probed into it.
+        let (probe_level, probe_dir) = if from_level < newest && to_level == newest {
+            (from_level, direction)
+        } else if to_level < newest && from_level == newest {
+            (to_level, flip(direction))
+        } else {
+            return None;
+        };
+        let dirs = expand_dirs(
+            self.schema,
+            rel_id,
+            self.levels[probe_level].table,
+            probe_dir,
+        )?;
+        // The walk has to land on the table the probed rows come from.
+        let lands = match dirs {
+            Dirs::One(d) => far_table(self.schema, rel_id, d)? == self.levels[newest].table,
+            Dirs::Both => self.levels[probe_level].table == self.levels[newest].table,
+        };
+        lands.then_some(Op::Semi {
+            rel: rel_id,
+            dirs,
+            probe_level,
+        })
+    }
+
+    /// Resolves ORDER BY keys to output columns. A key either names a
+    /// projected item, which is how `ORDER BY alias` binds, or repeats
+    /// the item's own expression, which is how `ORDER BY p.name` binds
+    /// when p is still in scope. Anything else, an expression over a
+    /// column the query does not return, needs the key materialized
+    /// next to the row and goes back to the old engine.
+    fn sort_cols(&self, keys: &[(BoundExpr, bool)]) -> Option<Vec<(usize, bool)>> {
+        let BoundClause::Project { items, .. } = self.query.clauses.last()? else {
+            return None;
+        };
+        let mut cols = Vec::with_capacity(keys.len());
+        for (expr, asc) in keys {
+            let at = items.iter().position(|item| {
+                item.expr == *expr
+                    || matches!(expr, BoundExpr::Var(slot) if self.item_slot(item) == Some(*slot))
+            })?;
+            cols.push((at, *asc));
+        }
+        Some(cols)
+    }
+
+    /// The slot a projected item answers to after the projection, the
+    /// same rule the old engine's sink uses: WITH items carry it, RETURN
+    /// items lose theirs in the binder and get it back by name.
+    fn item_slot(&self, item: &BoundItem) -> Option<usize> {
+        if item.slot.is_some() {
+            return item.slot;
+        }
+        if let BoundExpr::Var(slot) = item.expr {
+            return Some(slot);
+        }
+        self.query
+            .variables
+            .iter()
+            .rposition(|v| v.name == item.name)
     }
 
     /// A SKIP or LIMIT count that is a plain non-negative integer.
@@ -821,19 +1103,19 @@ fn bin_op(op: BinaryOp) -> Option<BinOp> {
     }
 }
 
-/// Whether a filter is the `{id: k}` point predicate the old engine
-/// fuses into a seek: `slot.id = k` or `id(slot) = k` in either operand
+/// The key side of an `{id: k}` point predicate, the shape both engines
+/// answer with a seek: `slot.id = k` or `id(slot) = k` in either operand
 /// order against a constant. The old engine accepts any key expression
 /// that names no slot; a literal or a parameter is what people write,
 /// and a wider key only costs the seek, never an answer.
-fn id_point(expr: &BoundExpr, slot: usize) -> bool {
+fn id_point(expr: &BoundExpr, slot: usize) -> Option<&BoundExpr> {
     let BoundExpr::Binary {
         op: BinaryOp::Eq,
         lhs,
         rhs,
     } = expr
     else {
-        return false;
+        return None;
     };
     for (side, key) in [(lhs, rhs), (rhs, lhs)] {
         let on_id = match side.as_ref() {
@@ -849,10 +1131,10 @@ fn id_point(expr: &BoundExpr, slot: usize) -> bool {
             _ => false,
         };
         if on_id && matches!(key.as_ref(), BoundExpr::Literal(_) | BoundExpr::Param(_)) {
-            return true;
+            return Some(key);
         }
     }
-    false
+    None
 }
 
 /// `c op x` rewritten as `x op' c`.
@@ -865,6 +1147,24 @@ fn flip_cmp(op: BinaryOp) -> Option<BinaryOp> {
         BinaryOp::Gt => Some(BinaryOp::Lt),
         BinaryOp::Ge => Some(BinaryOp::Le),
         _ => None,
+    }
+}
+
+/// The table on the far side of one CSR walk.
+fn far_table(schema: &Schema, rel: RelId, dir: Dir) -> Option<TableId> {
+    let def = schema.rel_by_id(rel)?;
+    Some(match dir {
+        Dir::Fwd => def.to,
+        Dir::Bwd => def.from,
+    })
+}
+
+/// The same pattern edge read from its other end.
+fn flip(direction: RelDirection) -> RelDirection {
+    match direction {
+        RelDirection::Out => RelDirection::In,
+        RelDirection::In => RelDirection::Out,
+        RelDirection::Undirected => RelDirection::Undirected,
     }
 }
 

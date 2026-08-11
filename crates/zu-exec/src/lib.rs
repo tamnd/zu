@@ -22,6 +22,7 @@
 //! [`Snapshot`]: zu_query::snapshot::Snapshot
 
 mod compile;
+mod group;
 mod pool;
 mod run;
 mod sink;
@@ -47,7 +48,7 @@ pub fn try_execute(
     if options.flat {
         return Ok(None);
     }
-    let Some(exec_plan) = compile::compile(plan, query, schema, snap, params)? else {
+    let Some(exec_plan) = compile::compile(plan, query, schema, snap, params, options)? else {
         return Ok(None);
     };
     run::run(&exec_plan, snap, options).map(Some)

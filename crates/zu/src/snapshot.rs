@@ -336,13 +336,32 @@ impl Snapshot for Zu1Snapshot<'_> {
         }
     }
 
-    fn lookup_pk(&mut self, rel: RelId, key: u64) -> Result<Option<u64>> {
-        self.ensure_reader(rel)?;
-        let Self { db, readers, .. } = self;
-        readers
-            .get_mut(&rel)
-            .expect("just loaded")
-            .lookup_key(db, key)
+    fn seek_key(&mut self, table: TableId, key: u64) -> Result<Option<u64>> {
+        // The key index lives in the group directory of a rel table
+        // loaded over this node table's rows, so find one and ask it.
+        // No keyed rel means the dense contract, where the id is the
+        // offset.
+        let row = match self
+            .catalog
+            .rel_tables()
+            .iter()
+            .find(|r| r.from == table)
+            .map(|r| r.id)
+        {
+            Some(rel) => {
+                self.ensure_reader(rel)?;
+                let Self { db, readers, .. } = self;
+                let reader = readers.get_mut(&rel).expect("just loaded");
+                if reader.directory().keys.is_none() {
+                    Some(key)
+                } else {
+                    reader.lookup_key(db, key)?
+                }
+            }
+            None => Some(key),
+        };
+        let rows = self.table_rows(table)?;
+        Ok(row.filter(|&r| r < rows))
     }
 
     fn degree_batch(&mut self, rel: RelId, nodes: &[u64], dir: Dir) -> Result<u64> {
@@ -539,8 +558,8 @@ mod tests {
         }
         // Primary keys resolve to dense rows; a value between keys is
         // absent, not an error.
-        assert_eq!(snap.lookup_pk(rel, 5 * 2 + 10).unwrap(), Some(5));
-        assert_eq!(snap.lookup_pk(rel, 11).unwrap(), None);
+        assert_eq!(snap.seek_key(table, 5 * 2 + 10).unwrap(), Some(5));
+        assert_eq!(snap.seek_key(table, 11).unwrap(), None);
         assert_eq!(snap.degree_batch(rel, &[1, 1, 0], Dir::Fwd).unwrap(), 5);
     }
 
@@ -567,7 +586,7 @@ mod tests {
         // The fork answers the whole surface on its own handle.
         let mut arena = MorselArena::new();
         assert_eq!(fork.table_rows(table).unwrap(), N);
-        assert_eq!(fork.lookup_pk(rel, 20).unwrap(), Some(5));
+        assert_eq!(fork.seek_key(table, 20).unwrap(), Some(5));
         let (a, _) = fork.resolve_col(table, "a").unwrap().unwrap();
         let ints = fork.gather(table, a, &[2999, 0], &mut arena).unwrap();
         assert_eq!(ints.values::<u64>(), &[2999 * 3, 0]);

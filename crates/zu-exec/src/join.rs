@@ -64,13 +64,17 @@
 //! its distinct table went 24.4 to 28.4, which is four bytes a key for a
 //! run offset on a table whose runs are all one row long.
 //!
-//! The build is still behind on the fast hosts, 0.3x locally and 0.6x
-//! on gamingpc, and ahead on the slow ones, 1.2 to 1.6x on server1: the
-//! histogram and the scatter are random access over a directory the size
-//! of the build side, so this is bandwidth against the standard
-//! library's slower per-key hash. The write-combining radix pass perf/05
-//! section 2 calls for is the named fix for that half and is not
-//! written.
+//! The build used to be behind on the fast hosts, 0.3x locally and 0.6x
+//! on gamingpc, and ahead on the slow ones, 1.2 to 1.6x on server1,
+//! because the histogram and the scatter were random access over a
+//! directory the size of the build side. The radix pass perf/05 section
+//! 2 calls for fixes that half: the rows are dealt into partitions of
+//! the directory first, and the counting sort then runs a partition at a
+//! time over a slice of the directory small enough to stay in cache. A
+//! million rows build in 15.0 to 16.5 ms locally against 18.3 to 23.5
+//! without it, 22.3 to 27.0 on gamingpc against 24.8 to 26.9, and 69.8
+//! to 94.0 on server1 against 77.1 to 103.0. The write-combining buffer
+//! the same section asks for is not here; `deal` says what it measured.
 //!
 //! None of it is load bearing yet. Nothing compiles to a join, so this
 //! table is reachable only from its own tests and its own bench.
@@ -87,6 +91,13 @@ const ROWS_PER_BUCKET: usize = 1;
 /// How far ahead the probe loop warms directory lines. Eight is what
 /// the group table settled on for the same dependent-load problem.
 const PREFETCH: usize = 8;
+
+/// Buckets one partition of the build owns. The counting sort writes
+/// at random inside a partition's slice of the directory, its cursors
+/// and its tags, and at four thousand buckets those three come to about
+/// seventy kilobytes, which sits in a core's own cache next to the
+/// partition's rows instead of streaming through it.
+const PART_BUCKETS: usize = 4096;
 
 /// How far past the keys it addresses the first directory has to be
 /// before the table is seated again in one sized for them. Four, so
@@ -156,45 +167,72 @@ impl JoinTable {
         let buckets = (n / ROWS_PER_BUCKET).max(1).next_power_of_two();
         let mask = buckets as u64 - 1;
 
-        let mut hashes = vec![0u64; n];
-        hash_slice(keys, &mut hashes);
+        // Pass one, deal the rows into partitions of the directory, so
+        // that the counting sort after it only ever writes inside one
+        // partition's slice of a structure the size of the build side.
+        // A build side small enough to keep the whole directory in cache
+        // has one partition and skips the deal.
+        let per_part = PART_BUCKETS.min(buckets);
+        let parts = buckets / per_part;
+        let (mut sorted_keys, mut sorted_payload, part_at) = if parts == 1 {
+            (keys.to_vec(), payload.to_vec(), vec![0, n])
+        } else {
+            deal(keys, payload, mask, parts, per_part.trailing_zeros())
+        };
 
-        // Pass one, count the rows per bucket. `dir` holds the running
-        // counts first, then the offsets, then the packed words, so the
-        // build allocates it once.
+        // Pass two, the counting sort, one partition at a time. Each
+        // partition's rows go to a scratch buffer and come back in
+        // bucket order, so the buffers the sort walks at random are the
+        // partition's own and not the whole table's.
+        //
+        // `dir` holds the running counts first, then the offsets, then
+        // the packed words, so the build allocates it once. A tag is 16
+        // bits and is written at random, so it is held at its own width:
+        // a word apiece would put four times the pages under those
+        // writes for no more information.
         let mut dir = vec![0u64; buckets + 1];
-        for &h in &hashes {
-            dir[(h & mask) as usize] += 1;
-        }
-        let mut acc = 0u64;
-        for slot in &mut dir {
-            let count = *slot;
-            *slot = acc;
-            acc += count;
-        }
-        // The sentinel counted nothing, so it took the running total
-        // and left it alone, which is exactly the end of the last
-        // bucket's range.
-        debug_assert_eq!(acc, n as u64);
-
-        // Pass two, scatter into bucket order and collect the tags. The
-        // cursor walks a copy of the offsets so `dir` keeps the starts.
-        let mut cursor: Vec<u64> = dir[..buckets].to_vec();
-        // A tag is 16 bits, and this is written at random, so it is held
-        // at its own width: a word apiece would put four times the pages
-        // under the scatter's random writes for no more information.
         let mut tags = vec![0u16; buckets];
-        let mut sorted_keys = vec![0u64; n];
-        let mut sorted_payload = vec![0u64; n];
-        for i in 0..n {
-            let h = hashes[i];
-            let b = (h & mask) as usize;
-            let at = cursor[b] as usize;
-            cursor[b] += 1;
-            sorted_keys[at] = keys[i];
-            sorted_payload[at] = payload[i];
-            tags[b] |= tag_bits(h) as u16;
+        let widest = part_at.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        let mut cursor = vec![0u64; per_part];
+        let mut part_keys = vec![0u64; widest];
+        let mut part_payload = vec![0u64; widest];
+        let mut hashes = vec![0u64; widest];
+        for p in 0..parts {
+            let (from, to) = (part_at[p], part_at[p + 1]);
+            let rows = to - from;
+            let b0 = p * per_part;
+            part_keys[..rows].copy_from_slice(&sorted_keys[from..to]);
+            part_payload[..rows].copy_from_slice(&sorted_payload[from..to]);
+            hash_slice(&part_keys[..rows], &mut hashes[..rows]);
+            for &h in &hashes[..rows] {
+                dir[(h & mask) as usize] += 1;
+            }
+            // The partition's rows start where the deal put them, so
+            // the bucket offsets run on from there and the last of them
+            // ends where the next partition starts.
+            let mut acc = from as u64;
+            for slot in &mut dir[b0..b0 + per_part] {
+                let count = *slot;
+                *slot = acc;
+                acc += count;
+            }
+            debug_assert_eq!(acc as usize, to);
+            // The cursor walks a copy of the offsets so `dir` keeps the
+            // starts.
+            cursor.copy_from_slice(&dir[b0..b0 + per_part]);
+            for i in 0..rows {
+                let h = hashes[i];
+                let b = (h & mask) as usize;
+                let at = cursor[b - b0] as usize;
+                cursor[b - b0] += 1;
+                sorted_keys[at] = part_keys[i];
+                sorted_payload[at] = part_payload[i];
+                tags[b] |= tag_bits(h) as u16;
+            }
         }
+        // The sentinel is where the last bucket's range ends, which is
+        // every row.
+        dir[buckets] = n as u64;
 
         // Pass three, one walk over the buckets that orders each one and
         // then collapses it, since both halves want the same bucket in
@@ -428,6 +466,59 @@ impl JoinTable {
     }
 }
 
+/// Deal the build rows into partitions of the directory, returning the
+/// rows in partition order and where each partition starts.
+///
+/// This is the one random write the build has left, and it goes to as
+/// many places as there are partitions rather than as many as there are
+/// buckets. Two hundred and fifty six write cursors is few enough that
+/// each one keeps its line, which is the whole reason this pass is
+/// cheaper than the scatter it replaces.
+///
+/// perf/05 section 2 asks for a write-combining buffer here, a small
+/// staging area per partition flushed a cache line at a time so the
+/// write never pulls a line back to change eight bytes of it. It was
+/// written and measured at eight rows a partition and it earned nothing:
+/// on gamingpc 22.4, 23.2, 22.4 and 26.4 ms against 23.7, 26.3, 22.4 and
+/// 23.1 without it, on server1 68.1, 71.3, 72.9 and 70.6 against 69.7,
+/// 76.3, 65.6 and 68.5, rounds interleaved on both hosts. At this
+/// fanout the store buffer is already doing the job, so the buffer is
+/// not here.
+///
+/// Rows keep their build order inside a partition, which is what lets
+/// the counting sort after this one stay stable.
+fn deal(
+    keys: &[u64],
+    payload: &[u64],
+    mask: u64,
+    parts: usize,
+    shift: u32,
+) -> (Vec<u64>, Vec<u64>, Vec<usize>) {
+    let n = keys.len();
+    let mut hashes = vec![0u64; n];
+    hash_slice(keys, &mut hashes);
+
+    let mut at = vec![0usize; parts + 1];
+    for &h in &hashes {
+        at[((h & mask) >> shift) as usize + 1] += 1;
+    }
+    for p in 0..parts {
+        at[p + 1] += at[p];
+    }
+
+    let mut out_keys = vec![0u64; n];
+    let mut out_payload = vec![0u64; n];
+    let mut cursor = at[..parts].to_vec();
+    for i in 0..n {
+        let p = ((hashes[i] & mask) >> shift) as usize;
+        let to = cursor[p];
+        cursor[p] = to + 1;
+        out_keys[to] = keys[i];
+        out_payload[to] = payload[i];
+    }
+    (out_keys, out_payload, at)
+}
+
 /// Seat already collapsed keys in a directory sized for the keys
 /// themselves, moving each key's run of rows with it.
 ///
@@ -647,6 +738,40 @@ mod tests {
             t.bytes(),
             rowsized + keys.len() * 8
         );
+    }
+
+    #[test]
+    fn a_build_side_past_one_partition_answers_the_same() {
+        // Wide enough that the directory is dealt into partitions, with
+        // runs of every length from one row to eight so the deal's
+        // buffers flush part full as well as whole, and keys strided so
+        // consecutive rows land in unrelated partitions.
+        let mut keys = Vec::new();
+        let mut payload = Vec::new();
+        for k in 0..20_000u64 {
+            for r in 0..=(k % 8) {
+                keys.push(k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 16);
+                payload.push(k * 8 + r);
+            }
+        }
+        let t = JoinTable::build(&keys, &payload);
+        assert!(
+            t.rows() > PART_BUCKETS,
+            "{} rows, past one partition",
+            t.rows()
+        );
+        assert_eq!(t.distinct(), 20_000);
+        for k in 0..20_000u64 {
+            let k = k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 16;
+            assert_eq!(t.lookup(k), reference(&keys, &payload, k), "key {k}");
+        }
+        // Keys that were never built have to miss, whichever partition
+        // they hash into.
+        let mut misses = 0;
+        for k in 0..20_000u64 {
+            misses += usize::from(!t.contains(k.wrapping_mul(3) | 1));
+        }
+        assert!(misses > 19_000, "{misses} of 20000 strangers missed");
     }
 
     #[test]

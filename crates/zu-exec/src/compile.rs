@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use zu_common::Result;
 use zu_query::ast::{BinaryOp, Literal, RelDirection};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema};
-use zu_query::exec::Value;
+use zu_query::exec::{Options, Value, Wcoj};
 use zu_query::plan::LogicalPlan;
 use zu_query::snapshot::{ColId, ColType, Dir, RelId, Snapshot, TableId, ZonePred};
 use zu_vector::{BinOp, CmpOp, ExprOp, OwnedValue, PhysType, Program, Reg};
@@ -61,6 +61,20 @@ pub(crate) enum Op {
         rel: RelId,
         dirs: Dirs,
         from: usize,
+        to: usize,
+    },
+    /// The WCOJ close (docs/07 section 4, perf/05 section 3): the
+    /// expand that would build the closing node and the probe back
+    /// into it are one intersection of two sorted neighbor lists. The
+    /// seed list hangs off the newest level, the probe list off a
+    /// level pinned above it, so a wedge closes in one leapfrog walk
+    /// instead of a storage probe per candidate.
+    Intersect {
+        seed: (RelId, Dir),
+        probe: (RelId, Dir),
+        /// The level holding the wedge's far end, always pinned when
+        /// the op runs.
+        probe_level: usize,
         to: usize,
     },
     /// Terminal fusion of trailing expands feeding a bare count: each
@@ -158,12 +172,14 @@ pub(crate) fn compile(
     schema: &Schema,
     snap: &mut dyn Snapshot,
     params: &[Value],
+    options: &Options,
 ) -> Result<Option<ExecPlan>> {
     let mut c = Compiler {
         query,
         schema,
         snap,
         params,
+        wcoj: options.wcoj,
         levels: Vec::new(),
         slot_level: HashMap::new(),
     };
@@ -183,6 +199,10 @@ struct Compiler<'a> {
     schema: &'a Schema,
     snap: &'a mut dyn Snapshot,
     params: &'a [Value],
+    /// `Wcoj::Off` pins the binary join, the baseline the fused close
+    /// is measured against, so the whole plan goes back to the old
+    /// engine rather than closing the cycle here.
+    wcoj: Wcoj,
     levels: Vec<LevelBuild>,
     slot_level: HashMap<usize, usize>,
 }
@@ -311,6 +331,33 @@ impl Compiler<'_> {
                         from: src,
                         to: to_level,
                     });
+                }
+                Some(LogicalPlan::Expand {
+                    rel,
+                    from,
+                    to,
+                    direction,
+                    range: None,
+                    into: true,
+                    wcoj: true,
+                    optional: None,
+                    ..
+                }) => {
+                    // Filters the optimizer pushed onto the closing
+                    // node sit between the two halves of the pair.
+                    // They read the level the intersection produces,
+                    // so they step aside and go back on top of it.
+                    let mut held = Vec::new();
+                    while matches!(ops.last(), Some(Op::Filter { .. })) {
+                        held.push(ops.pop().expect("just matched"));
+                    }
+                    let Some(op) = self.fuse_close(&ops, *rel, *from, *to, *direction) else {
+                        return Ok(None);
+                    };
+                    it.next();
+                    ops.pop();
+                    ops.push(op);
+                    ops.extend(held.into_iter().rev());
                 }
                 _ => break,
             }
@@ -444,11 +491,22 @@ impl Compiler<'_> {
         // to the old engine here.
         let mut newest = 0;
         for op in &ops {
-            if let Op::Expand { from, to, .. } = op {
-                if *from != newest {
-                    return Ok(None);
+            match op {
+                Op::Expand { from, to, .. } => {
+                    if *from != newest {
+                        return Ok(None);
+                    }
+                    newest = *to;
                 }
-                newest = *to;
+                Op::Intersect {
+                    probe_level, to, ..
+                } => {
+                    if *probe_level >= newest {
+                        return Ok(None);
+                    }
+                    newest = *to;
+                }
+                _ => {}
             }
         }
 
@@ -481,6 +539,83 @@ impl Compiler<'_> {
             return None;
         }
         Some(items.iter().map(|it| it.aggregate).collect())
+    }
+
+    /// Fuses a closing expand into the expand that built the node it
+    /// closes on, or None when the pair is not a shape the intersection
+    /// covers: both sides one direction over one rel table, one of the
+    /// two lists hanging off the newest level so it is walked row by
+    /// row, and the other hanging off a level below it so it is pinned
+    /// and read once for the whole vector.
+    ///
+    /// Which of the two is which depends on where the optimizer put the
+    /// scan. Starting at the wedge tip leaves the built expand walking
+    /// off the newest level and the close reaching back down; starting
+    /// at the closing node itself mirrors that, the close walks off the
+    /// newest level and the built expand reaches down. Both are the
+    /// same intersection with the roles swapped.
+    fn fuse_close(
+        &self,
+        ops: &[Op],
+        rel: usize,
+        from: usize,
+        to: usize,
+        direction: RelDirection,
+    ) -> Option<Op> {
+        let &Op::Expand {
+            rel: built_rel,
+            dirs: Dirs::One(built_dir),
+            from: built_from,
+            to: built_to,
+        } = ops.last()?
+        else {
+            return None;
+        };
+        if matches!(self.wcoj, Wcoj::Off) || built_to + 1 != self.levels.len() {
+            return None;
+        }
+        // The end of the closing pattern that names the node the expand
+        // above just built, and the walk direction read from its other
+        // end, which is the one already on a level.
+        let (far_slot, far_dir) = if self.slot_level.get(&to) == Some(&built_to) {
+            (from, direction)
+        } else if self.slot_level.get(&from) == Some(&built_to) {
+            (to, flip(direction))
+        } else {
+            return None;
+        };
+        let &far_level = self.slot_level.get(&far_slot)?;
+        let &[close_rel] = self.query.variables[rel].rel_tables.as_slice() else {
+            return None;
+        };
+        let Dirs::One(close_dir) = expand_dirs(
+            self.schema,
+            close_rel,
+            self.levels[far_level].table,
+            far_dir,
+        )?
+        else {
+            return None;
+        };
+        if far_table(self.schema, close_rel, close_dir)? != self.levels[built_to].table {
+            return None;
+        }
+        // The newest level is the one the pipeline ends on before this
+        // pair, and the other list has to sit strictly below it.
+        let newest = built_to - 1;
+        let (seed, probe, probe_level) = if built_from == newest && far_level < newest {
+            ((built_rel, built_dir), (close_rel, close_dir), far_level)
+        } else if far_level == newest && built_from < newest {
+            ((close_rel, close_dir), (built_rel, built_dir), built_from)
+        } else {
+            return None;
+        };
+        Some(Op::Intersect {
+            seed,
+            probe,
+            probe_level,
+            to: built_to,
+        })
     }
 
     /// Resolves ORDER BY keys to output columns. A key either names a
@@ -918,6 +1053,24 @@ fn flip_cmp(op: BinaryOp) -> Option<BinaryOp> {
 /// orientation checks: forward applies when the source table is the
 /// rel's from side, backward when it is the to side, and an undirected
 /// step over a self-referencing rel walks both, forward first.
+/// The table on the far side of one CSR walk.
+fn far_table(schema: &Schema, rel: RelId, dir: Dir) -> Option<TableId> {
+    let def = schema.rel_by_id(rel)?;
+    Some(match dir {
+        Dir::Fwd => def.to,
+        Dir::Bwd => def.from,
+    })
+}
+
+/// The same pattern edge read from its other end.
+fn flip(direction: RelDirection) -> RelDirection {
+    match direction {
+        RelDirection::Out => RelDirection::In,
+        RelDirection::In => RelDirection::Out,
+        RelDirection::Undirected => RelDirection::Undirected,
+    }
+}
+
 fn expand_dirs(
     schema: &Schema,
     rel: RelId,

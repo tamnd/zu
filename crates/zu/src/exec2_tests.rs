@@ -121,6 +121,18 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (p:person) WHERE p.age > 50 RETURN p.id AS id ORDER BY id DESC SKIP 3 LIMIT 5",
         "MATCH (p:person) RETURN DISTINCT p.age AS age ORDER BY age DESC",
         "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY age, name LIMIT 4",
+        // The cyclic close, which fuses into one intersection.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         RETURN a.id AS a, b.id AS b, c.id AS c",
+        // The same close with the scan at the far side: a filter on the
+        // closing node moves the scan there, and the intersection comes
+        // back with the two lists in the other order.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         WHERE c.age > 40 RETURN c.id AS c, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         WHERE c.age > 40 RETURN a.id AS a, b.id AS b, c.id AS c",
         // Aggregation, keyed and bare.
         "MATCH (p:person) RETURN p.age AS age, count(p) AS n",
         "MATCH (p:person) RETURN p.name AS name, count(p) AS n",

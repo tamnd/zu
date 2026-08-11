@@ -44,8 +44,11 @@ pub(crate) fn run(
         // A scan under one storage group is a handful of morsels;
         // forking snapshots and spawning workers costs more than the
         // scan, so auto stays sequential and only an explicit thread
-        // count forces the parallel path.
-        0 if total_rows <= u64::from(GROUP_ROWS) => 1,
+        // count forces the parallel path. An intersection is the
+        // exception: it walks a neighbor list per edge leaving every
+        // scanned row, so the row count says nothing about what the
+        // query costs and a small table can still be minutes of work.
+        0 if total_rows <= u64::from(GROUP_ROWS) && !intersects(plan) => 1,
         0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
         n => n,
     };
@@ -136,6 +139,12 @@ pub(crate) fn run(
         ),
         SinkSpec::Rows { post, .. } => Ok(sink::finish_rows(plan.columns.clone(), post, partials)),
     }
+}
+
+/// Whether the pipeline closes a cycle, the one shape whose cost is
+/// set by the edges under the scan rather than by the rows in it.
+fn intersects(plan: &ExecPlan) -> bool {
+    plan.ops.iter().any(|op| matches!(op, Op::Intersect { .. }))
 }
 
 /// Splits the scan into morsels: chunk-multiple sizes targeting eight
@@ -281,6 +290,8 @@ struct Worker<'a> {
     scratch: Vec<u64>,
     /// Neighbor scratch for the fused expand-then-count path.
     neigh: Vec<u64>,
+    /// Intersection scratch for the WCOJ close.
+    hits: Vec<u64>,
     /// Per-row degree and running product scratch for hub counts.
     deg: Vec<u64>,
     prod: Vec<u64>,
@@ -310,6 +321,7 @@ impl<'a> Worker<'a> {
             scan_cols: plan.levels[0].cols.iter().map(|&(id, _)| id).collect(),
             scratch: Vec::new(),
             neigh: Vec::new(),
+            hits: Vec::new(),
             deg: Vec::new(),
             prod: Vec::new(),
             idx_pool: Vec::new(),
@@ -411,6 +423,12 @@ impl<'a> Worker<'a> {
                 }
                 self.expand(*rel, *dirs, *to, rest, set)
             }
+            Op::Intersect {
+                seed,
+                probe,
+                probe_level,
+                to,
+            } => self.intersect(*seed, *probe, *probe_level, *to, rest, set),
             Op::DegreeProduct { steps } => {
                 self.collect_rows(set.chunks.last().expect("a level under the count"));
                 let rows = std::mem::take(&mut self.scratch);
@@ -487,6 +505,106 @@ impl<'a> Worker<'a> {
             }
         }
         set.chunks[src].cur = None;
+        self.idx_pool.push(idxs);
+        self.row_pool.push(rows);
+        result
+    }
+
+    /// The WCOJ close: every row of the newest level is a wedge middle
+    /// and the far end is pinned above, so the closing node is the
+    /// intersection of two sorted neighbor lists. The far end's list is
+    /// read once for the whole vector, both lists are borrowed out of
+    /// their CSR pins with nothing copied, and the walk galloping past
+    /// the runs it cannot match is what replaces a storage probe per
+    /// candidate.
+    fn intersect(
+        &mut self,
+        seed: (RelId, Dir),
+        probe: (RelId, Dir),
+        probe_level: usize,
+        to: usize,
+        rest: &[Op],
+        set: &mut ChunkSet,
+    ) -> Result<()> {
+        let src = set.chunks.len() - 1;
+        let far = &set.chunks[probe_level];
+        let prow = row_at(far, pinned_pos(far));
+        let ppin = self.pin(probe.0, probe.1, prow)?;
+        let plist = ppin.list((prow % u64::from(GROUP_ROWS)) as usize);
+        if plist.is_empty() {
+            return Ok(());
+        }
+        // Copy the active rows out first: pinning mutates the chunk the
+        // selection and values are read from.
+        let mut idxs = self.idx_pool.pop().unwrap_or_default();
+        let mut rows = self.row_pool.pop().unwrap_or_default();
+        idxs.clear();
+        rows.clear();
+        {
+            let chunk = &set.chunks[src];
+            let vals = chunk.vecs[0].values::<u64>();
+            match &chunk.sel {
+                Some(s) => {
+                    for &i in s.as_slice() {
+                        idxs.push(u32::from(i));
+                        rows.push(vals[i as usize]);
+                    }
+                }
+                None => {
+                    idxs.extend(0..chunk.count);
+                    rows.extend_from_slice(vals);
+                }
+            }
+        }
+        let mut hits = std::mem::take(&mut self.hits);
+        let mut result = Ok(());
+        // One seed pin covers a whole storage group, and a neighbor
+        // list rarely leaves the group it started in, so the pin is
+        // held across rows rather than looked up per row: the lookup
+        // is a hash of the pin key and this loop runs once per edge
+        // under the scan.
+        let mut held: Option<(u32, CsrPin)> = None;
+        'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
+            set.chunks[src].cur = Some(phys);
+            let group = (row / u64::from(GROUP_ROWS)) as u32;
+            if held.as_ref().is_none_or(|&(g, _)| g != group) {
+                match self.pin(seed.0, seed.1, row) {
+                    Ok(p) => held = Some((group, p)),
+                    Err(e) => {
+                        result = Err(e);
+                        break 'srcs;
+                    }
+                }
+            }
+            let spin = &held.as_ref().expect("just pinned").1;
+            hits.clear();
+            leapfrog(
+                spin.list((row % u64::from(GROUP_ROWS)) as usize),
+                plist,
+                &mut hits,
+            );
+            for part in hits.chunks(zu_vector::VECTOR_SIZE) {
+                let chunk = match self.make_level(to, part) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        result = Err(e);
+                        break 'srcs;
+                    }
+                };
+                set.chunks.push(chunk);
+                let res = self.run_ops(rest, set);
+                set.chunks.pop();
+                if let Err(e) = res {
+                    result = Err(e);
+                    break 'srcs;
+                }
+            }
+            if self.stop.stopped() {
+                break;
+            }
+        }
+        set.chunks[src].cur = None;
+        self.hits = hits;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
         result
@@ -640,7 +758,9 @@ impl<'a> Worker<'a> {
                 }
                 continue;
             }
-            let r = spec.arg().expect("a non counting aggregate has an argument");
+            let r = spec
+                .arg()
+                .expect("a non counting aggregate has an argument");
             gather_ints(set, r, sel, rows, &mut self.args);
             let accs = table.accs_mut();
             for (&g, &v) in self.gids.iter().zip(&self.args) {
@@ -705,6 +825,44 @@ impl<'a> Worker<'a> {
             }
         }
     }
+}
+
+/// Intersects two sorted neighbor lists, galloping past the runs
+/// neither side can match. A repeat in the seed list is a real
+/// multi-edge row and emits again; a repeat in the probe list is only
+/// the existence check answering twice, so it adds nothing. That is
+/// the old engine's rule and the counts depend on it.
+fn leapfrog(seed: &[u64], probe: &[u64], out: &mut Vec<u64>) {
+    let (mut si, mut pi) = (0, 0);
+    while si < seed.len() && pi < probe.len() {
+        let (sv, pv) = (seed[si], probe[pi]);
+        if sv < pv {
+            si = gallop(seed, pv, si);
+        } else if pv < sv {
+            pi = gallop(probe, sv, pi);
+        } else {
+            while si < seed.len() && seed[si] == sv {
+                out.push(sv);
+                si += 1;
+            }
+            pi += 1;
+        }
+    }
+}
+
+/// First position at or after `from` whose value is at least `target`,
+/// found by doubling the step and then bisecting the bracket it
+/// overshot. Doubling is what keeps a long list against a short one
+/// logarithmic in the answer rather than linear in the list.
+fn gallop(list: &[u64], target: u64, from: usize) -> usize {
+    let mut step = 1;
+    let mut lo = from;
+    while lo + step < list.len() && list[lo + step] < target {
+        lo += step;
+        step *= 2;
+    }
+    let hi = (lo + step + 1).min(list.len());
+    lo + list[lo..hi].partition_point(|&v| v < target)
 }
 
 /// Which CSR sides one expand walks, forward first.
@@ -835,9 +993,14 @@ fn fill_key_col(
         ScalarRef::Col { vec, ty, .. } => match ty {
             zu_query::snapshot::ColType::Int => {
                 if live {
-                    fill_col(batch, off, chunk.vecs[vec].values::<i64>(), sel, rows, |v| {
-                        v as u64
-                    });
+                    fill_col(
+                        batch,
+                        off,
+                        chunk.vecs[vec].values::<i64>(),
+                        sel,
+                        rows,
+                        |v| v as u64,
+                    );
                 } else {
                     let v = chunk.vecs[vec].values::<i64>()[pinned_pos(chunk)];
                     batch.fill_word(off, v as u64);
@@ -952,6 +1115,34 @@ fn str_at(v: &ValueVector, idx: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn gallop_finds_the_first_index_at_or_after_the_target() {
+        let list = [2, 4, 4, 7, 11, 15, 15, 20];
+        for from in 0..list.len() {
+            for target in 0..25 {
+                let want = (from..list.len())
+                    .find(|&ix| list[ix] >= target)
+                    .unwrap_or(list.len());
+                assert_eq!(
+                    gallop(&list, target, from),
+                    want,
+                    "target {target} from {from}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leapfrog_emits_one_hit_per_seed_occurrence() {
+        let mut hits = Vec::new();
+        leapfrog(&[2, 2, 3, 7, 9, 12], &[1, 2, 7, 7, 8, 12], &mut hits);
+        assert_eq!(hits, [2, 2, 7, 12]);
+        hits.clear();
+        leapfrog(&[5], &[], &mut hits);
+        leapfrog(&[], &[5], &mut hits);
+        assert_eq!(hits, []);
+    }
 
     use zu_query::snapshot::{ColId, GroupId, ScanChunk, TableId, ZonePred};
     use zu_vector::{ExprOp, OwnedValue};

@@ -1,0 +1,18 @@
+[package]
+name = "zu-exec"
+description = "Push-based morsel-parallel pipeline executor for zu"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zu-common.workspace = true
+zu-vector.workspace = true
+zu-query.workspace = true
+
+[lints]
+workspace = true

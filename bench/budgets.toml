@@ -142,8 +142,13 @@ ldbc_key_p50_us = 2.0
 # load 7 to 8, and under that oversubscription parallel runs measure
 # 10 to 18 ms with sequential at 8.2 ms and a 20 ms p99, so its
 # number joins server3's as information until the box quiets down.
+# The pipeline executor of zu#75 then fused the trailing counting
+# expands into a degree product that reads CSR offsets and never
+# touches a neighbor value, which took the quiet hosts to 0.24 ms
+# locally. The ceiling comes down to 8 ms rather than to anything near
+# that measurement because the two loaded hosts still have to pass it.
 # Lower this ceiling, never raise it.
-ldbc_two_hop_p50_ms = 10.0
+ldbc_two_hop_p50_ms = 8.0
 
 # The LDBC IS and IC subset on SF1 (docs/12 M2 exit), parse to result
 # through zu::query::run against the person props columns the loader
@@ -338,3 +343,19 @@ read_gather_mrows_s = 1.5
 # check_asm gate proves it) but the shared vCPUs do not reach the
 # target; a devectorized unpack measures about 0.4 on them.
 vec_unpack_gvals_s = 0.9
+
+# Speedup of the 8-worker expand-filter-count over the 1-worker run in
+# the scale bench, 1 M persons over 8 storage groups with 4.1 M edges.
+# The gate only arms on hosts with at least 8 cores, so server1 with
+# its 4 prints information numbers instead. What the fleet measures is
+# a story about the hosts, not about the executor: the local M series
+# has 4 performance cores and 6 efficiency cores and runs 4.6 to 4.8x,
+# which is 86 percent of what those cores can add up to; gamingpc runs
+# 3.6 to 3.7x under WSL and 4.0x pinned to its 8 performance cores,
+# while native Windows swings between 1.0 and 1.9x because the
+# scheduler keeps moving the threads between performance and
+# efficiency cores mid-query; server3's 8 shared vCPUs measure 2.3 to
+# 3.9x with the 1-worker time itself moving 12 percent run to run.
+# Nothing in the fleet is 8 quiet equal cores, so the floor sits under
+# server3's worst run. Raise this floor, never lower it.
+exec_scale_8x = 2.0

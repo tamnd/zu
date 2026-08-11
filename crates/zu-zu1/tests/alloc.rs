@@ -82,7 +82,7 @@ fn warm_group_pins_and_degrees_allocate_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Zu1File::create(&dir.path().join("csr.zu1")).unwrap();
     bulk_load(&mut db, 8, &[(0, 1), (1, 2), (1, 3), (2, 3)]).unwrap();
-    let reader = GraphReader::load(&mut db).unwrap();
+    let mut reader = GraphReader::load(&mut db).unwrap();
     // Cold pass decodes the group into the pools.
     let nodes = [1u64, 2, 0, 3];
     reader.csr_group(&mut db, 0, Direction::Fwd).unwrap();

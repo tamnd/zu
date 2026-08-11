@@ -12,6 +12,8 @@ pub use zu_storage::{CheckpointMode, Direction, GraphStore, Snapshot};
 pub use zu_zu1 as zu1;
 
 pub mod convert;
+#[cfg(test)]
+mod exec2_tests;
 pub mod query;
 pub mod session;
 pub mod snapshot;

@@ -68,7 +68,10 @@ pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
 /// drives. Both deref to the same [`Zu1File`] surface.
 enum Db<'a> {
     Borrowed(&'a mut Zu1File),
-    Owned(Box<Zu1File>),
+    /// `Some` for the graph's whole life; the option only exists so
+    /// the drop impl can move the handle out and recycle it into the
+    /// file's fork pool instead of paying an OS open per query.
+    Owned(Option<Box<Zu1File>>),
 }
 
 impl std::ops::Deref for Db<'_> {
@@ -76,7 +79,7 @@ impl std::ops::Deref for Db<'_> {
     fn deref(&self) -> &Zu1File {
         match self {
             Db::Borrowed(db) => db,
-            Db::Owned(db) => db,
+            Db::Owned(db) => db.as_ref().expect("present until drop"),
         }
     }
 }
@@ -85,7 +88,17 @@ impl std::ops::DerefMut for Db<'_> {
     fn deref_mut(&mut self) -> &mut Zu1File {
         match self {
             Db::Borrowed(db) => db,
-            Db::Owned(db) => db,
+            Db::Owned(db) => db.as_mut().expect("present until drop"),
+        }
+    }
+}
+
+impl Drop for Db<'_> {
+    fn drop(&mut self) {
+        if let Db::Owned(db) = self
+            && let Some(db) = db.take()
+        {
+            db.recycle();
         }
     }
 }
@@ -117,7 +130,7 @@ impl<'a> Zu1Graph<'a> {
     /// [`Session`]: crate::session::Session
     pub fn owned(db: Zu1File, catalog: Catalog) -> Zu1Graph<'static> {
         Zu1Graph {
-            db: Db::Owned(Box::new(db)),
+            db: Db::Owned(Some(Box::new(db))),
             catalog,
             readers: HashMap::new(),
             props: HashMap::new(),
@@ -130,6 +143,10 @@ impl<'a> Zu1Graph<'a> {
 
     pub fn file_mut(&mut self) -> &mut Zu1File {
         &mut self.db
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 
     /// Swaps in a fresh catalog and drops every cached reader; the
@@ -218,7 +235,7 @@ impl Graph for Zu1Graph<'_> {
         // batch: a counting expand touches the offsets pool and never
         // decodes a neighbor value.
         readers
-            .get(&rel)
+            .get_mut(&rel)
             .expect("just loaded")
             .degree_batch(db, nodes, dir)
     }
@@ -293,7 +310,7 @@ impl Graph for Zu1Graph<'_> {
         // sharing decoded state would only add contention.
         let db = self.db.reopen().ok()?;
         Some(Box::new(Zu1Graph {
-            db: Db::Owned(Box::new(db)),
+            db: Db::Owned(Some(Box::new(db))),
             catalog: self.catalog.clone(),
             readers: HashMap::new(),
             props: HashMap::new(),
@@ -437,9 +454,24 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 /// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
     let p = prepare(source, db, params)?;
-    let mut graph = Zu1Graph::new(db, p.catalog);
     let options = env_options();
+    if exec2_enabled() {
+        let mut snap = crate::snapshot::Zu1Snapshot::new(db, p.catalog.clone());
+        if let Some(r) =
+            zu_exec::try_execute(&p.plan, &p.query, &p.schema, &mut snap, &p.args, &options)?
+        {
+            return Ok(r);
+        }
+    }
+    let mut graph = Zu1Graph::new(db, p.catalog);
     exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
+}
+
+/// Whether plans the pipeline executor covers run there. On by
+/// default; `ZU_EXEC2=0` pins every query to the old executor, which
+/// is how the differential tests get their oracle rows.
+pub(crate) fn exec2_enabled() -> bool {
+    std::env::var("ZU_EXEC2").as_deref() != Ok("0")
 }
 
 /// The execution options both entry points honor, so a profile always

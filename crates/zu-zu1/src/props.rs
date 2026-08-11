@@ -294,10 +294,23 @@ impl PropsReader {
         col: usize,
         chunk: usize,
     ) -> Result<Option<(u64, u64)>> {
+        let dir = self.int_dir(db, col)?;
         let meta = &self.directory.columns[col].meta;
-        let pools = db.pools();
-        let dir = load_chunk_directory_pooled(db, &pools.fences, meta)?;
         Ok(chunk_zone(meta, &dir, chunk))
+    }
+
+    /// The chunk directory of an integer column, loaded through the
+    /// shared pool once and held on this reader after. A scan calls
+    /// per chunk, and the pool lock is shared across every worker, so
+    /// the reader-local copy keeps the hot loop off it.
+    fn int_dir(&mut self, db: &mut Zu1File, col: usize) -> Result<Arc<ChunkDirectory>> {
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.int_state.entry(col) {
+            let meta = &self.directory.columns[col].meta;
+            let pools = db.pools();
+            let dir = load_chunk_directory_pooled(db, &pools.fences, meta)?;
+            slot.insert((dir, ChunkCache::default()));
+        }
+        Ok(Arc::clone(&self.int_state[&col].0))
     }
 
     /// Decodes `chunk` of an integer column into `out`, the scan unit
@@ -316,9 +329,9 @@ impl PropsReader {
                 column.name
             )));
         }
-        let pools = db.pools();
-        let dir = load_chunk_directory_pooled(db, &pools.fences, &column.meta)?;
-        decode_chunk(db, &column.meta, &dir, chunk, out)
+        let dir = self.int_dir(db, col)?;
+        let meta = &self.directory.columns[col].meta;
+        decode_chunk(db, meta, &dir, chunk, out)
     }
 
     /// Reads the string values of rows `start..end` of `col`, the scan

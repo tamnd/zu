@@ -68,6 +68,20 @@ impl Session {
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
         let options = query::env_options();
+        if query::exec2_enabled() {
+            let catalog = self.graph.catalog().clone();
+            let mut snap = crate::snapshot::Zu1Snapshot::new(self.graph.file_mut(), catalog);
+            if let Some(r) = zu_exec::try_execute(
+                &cached.plan,
+                &cached.query,
+                &self.schema,
+                &mut snap,
+                &args,
+                &options,
+            )? {
+                return Ok(r);
+            }
+        }
         exec::execute(
             &cached.plan,
             &cached.query,

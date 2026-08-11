@@ -157,6 +157,12 @@ fn unclaimed_shapes_fall_back() {
         "MATCH (a:person)-[:knows*1..2]->(b) RETURN count(b) AS n",
         "OPTIONAL MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",
         "UNWIND [1, 2, 3] AS x RETURN x",
+        // An id point predicate is the shape the old engine seeks
+        // instead of scanning; the pipeline has no seek source, so
+        // claiming these would read the table to find one row.
+        "MATCH (p:person {id: 42}) RETURN p.name AS name",
+        "MATCH (p:person) WHERE p.id = 42 RETURN count(p) AS n",
+        "MATCH (p:person {id: 42})-[:knows]->(b) RETURN count(b) AS n",
     ];
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);

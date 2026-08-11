@@ -211,7 +211,7 @@ impl Compiler<'_> {
         }
 
         // The driving scan: one required node slot over one table.
-        let table = match it.next() {
+        let (table, scan_slot) = match it.next() {
             Some(LogicalPlan::ScanNodes {
                 slot,
                 optional: None,
@@ -222,10 +222,26 @@ impl Compiler<'_> {
                     return Ok(None);
                 };
                 self.slot_level.insert(*slot, 0);
-                table
+                (table, *slot)
             }
             _ => return Ok(None),
         };
+        // A point predicate on the driving slot's id is the one shape
+        // the old engine does not scan at all: it folds the filter into
+        // the scan and seeks the primary-key index, so it touches one
+        // row. The pipeline has no seek source, so compiling this here
+        // reads the whole table to find that row, which measured 20 us
+        // against the old engine's 1.5 on a ten thousand node table.
+        // Hand the shape back until a seek operator exists.
+        if let Some(LogicalPlan::Filter {
+            expr,
+            optional: None,
+            ..
+        }) = it.peek()
+            && id_point(expr, scan_slot)
+        {
+            return Ok(None);
+        }
         self.levels.push(LevelBuild {
             table,
             cols: Vec::new(),
@@ -803,6 +819,40 @@ fn bin_op(op: BinaryOp) -> Option<BinOp> {
         BinaryOp::Mod => Some(BinOp::Mod),
         _ => None,
     }
+}
+
+/// Whether a filter is the `{id: k}` point predicate the old engine
+/// fuses into a seek: `slot.id = k` or `id(slot) = k` in either operand
+/// order against a constant. The old engine accepts any key expression
+/// that names no slot; a literal or a parameter is what people write,
+/// and a wider key only costs the seek, never an answer.
+fn id_point(expr: &BoundExpr, slot: usize) -> bool {
+    let BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        lhs,
+        rhs,
+    } = expr
+    else {
+        return false;
+    };
+    for (side, key) in [(lhs, rhs), (rhs, lhs)] {
+        let on_id = match side.as_ref() {
+            BoundExpr::Property { base, key } => {
+                key == "id" && matches!(base.as_ref(), BoundExpr::Var(s) if *s == slot)
+            }
+            BoundExpr::Call {
+                func: Func::Id,
+                star: false,
+                args,
+                ..
+            } => matches!(args.as_slice(), [BoundExpr::Var(s)] if *s == slot),
+            _ => false,
+        };
+        if on_id && matches!(key.as_ref(), BoundExpr::Literal(_) | BoundExpr::Param(_)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `c op x` rewritten as `x op' c`.

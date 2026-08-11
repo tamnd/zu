@@ -30,7 +30,7 @@ Plans cached by (query text, catalog epoch, param types), LDBC short reads are p
 |---|---|
 | ScanNodeGroups | zone-map skip; predicate on compressed dict codes |
 | IndexLookup | pk hash; drives point-query pipelines |
-| Expand(CSR) | factorized neighbor expansion; direction fwd/bwd; label/type mask; slack/tombstone aware |
+| Expand(CSR) | factorized neighbor expansion; direction fwd/bwd; label/type mask; slack/tombstone aware; the pin is held per storage group rather than per source row, and when nothing above the expand reads the source level the neighbor lists concatenate across source rows so the pipeline below runs on full vectors |
 | ASPJoin | default hash join: Accumulate → Semijoin-mask → Probe (sideways info passing pushes the mask into Expand/Scan below build side) |
 | MultiwayIntersect (WCOJ) | galloping intersection over sorted CSR lists; injected for cyclic subpatterns only |
 | RecursiveBFS | fixpoint operator, hybrid source/frontier morsels (see §5) |

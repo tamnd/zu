@@ -158,6 +158,7 @@ fn seek_work(
         dirs: Dirs::One(dir),
         from: 0,
         to,
+        ..
     }) = plan.ops.first()
     else {
         return one(Work::Seek(Some(seed)));
@@ -648,11 +649,17 @@ impl<'a> Worker<'a> {
                 last.sel = Some(sel);
                 self.run_ops(rest, set)
             }
-            Op::Expand { rel, dirs, to, .. } => {
+            Op::Expand {
+                rel,
+                dirs,
+                to,
+                batch,
+                ..
+            } => {
                 if let [Op::DegreeProduct { steps }] = rest {
                     return self.expand_degree(*rel, *dirs, steps, set);
                 }
-                self.expand(*rel, *dirs, *to, rest, set)
+                self.expand(*rel, *dirs, *to, *batch, rest, set)
             }
             Op::Intersect {
                 seed,
@@ -681,6 +688,7 @@ impl<'a> Worker<'a> {
         rel: RelId,
         dirs: Dirs,
         to: usize,
+        batch: bool,
         rest: &[Op],
         set: &mut ChunkSet,
     ) -> Result<()> {
@@ -708,29 +716,59 @@ impl<'a> Worker<'a> {
             }
         }
         let mut result = Ok(());
+        // One pin covers a whole storage group and the rows arrive in
+        // row order, so the pin is held across rows the way the WCOJ
+        // close holds its seed. Without this the loop pays a hash of
+        // the pin key and two atomic refcount bumps per row per
+        // direction, around a body whose real work is one slice of the
+        // group's neighbor array. One slot per side, since an
+        // undirected expand reads two pins that move together.
+        let mut held: [Option<(u32, CsrPin)>; 2] = [None, None];
+        // The batched descent fills this across source rows and hands
+        // it down whole. Nothing above the expand reads the source
+        // level in that case, so the pin only has to keep the level's
+        // multiplicity at one and any active row does that.
+        let mut fill = self.row_pool.pop().unwrap_or_default();
+        fill.clear();
+        if batch {
+            set.chunks[src].cur = idxs.first().copied();
+        }
         'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
-            set.chunks[src].cur = Some(phys);
-            for dir in sides(dirs) {
-                let pin = match self.pin(rel, dir, row) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        result = Err(e);
-                        break 'srcs;
-                    }
-                };
-                let list = pin.list((row % u64::from(GROUP_ROWS)) as usize);
-                for part in list.chunks(zu_vector::VECTOR_SIZE) {
-                    let chunk = match self.make_level(to, part) {
-                        Ok(c) => c,
+            if !batch {
+                set.chunks[src].cur = Some(phys);
+            }
+            let group = (row / u64::from(GROUP_ROWS)) as u32;
+            for (slot, dir) in sides(dirs).enumerate() {
+                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
+                    match self.pin(rel, dir, row) {
+                        Ok(p) => held[slot] = Some((group, p)),
                         Err(e) => {
                             result = Err(e);
                             break 'srcs;
                         }
-                    };
-                    set.chunks.push(chunk);
-                    let res = self.run_ops(rest, set);
-                    set.chunks.pop();
-                    if let Err(e) = res {
+                    }
+                }
+                let pin = &held[slot].as_ref().expect("just pinned").1;
+                let list = pin.list((row % u64::from(GROUP_ROWS)) as usize);
+                if batch {
+                    let mut tail = list;
+                    while !tail.is_empty() {
+                        let take = (zu_vector::VECTOR_SIZE - fill.len()).min(tail.len());
+                        fill.extend_from_slice(&tail[..take]);
+                        tail = &tail[take..];
+                        if fill.len() == zu_vector::VECTOR_SIZE {
+                            let res = self.descend(to, &fill, rest, set);
+                            fill.clear();
+                            if let Err(e) = res {
+                                result = Err(e);
+                                break 'srcs;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                for part in list.chunks(zu_vector::VECTOR_SIZE) {
+                    if let Err(e) = self.descend(to, part, rest, set) {
                         result = Err(e);
                         break 'srcs;
                     }
@@ -740,10 +778,24 @@ impl<'a> Worker<'a> {
                 break;
             }
         }
+        if result.is_ok() && !fill.is_empty() {
+            result = self.descend(to, &fill, rest, set);
+        }
         set.chunks[src].cur = None;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
+        self.row_pool.push(fill);
         result
+    }
+
+    /// Pushes one vector of expanded rows through the rest of the
+    /// pipeline as the newest level.
+    fn descend(&mut self, to: usize, part: &[u64], rest: &[Op], set: &mut ChunkSet) -> Result<()> {
+        let chunk = self.make_level(to, part)?;
+        set.chunks.push(chunk);
+        let res = self.run_ops(rest, set);
+        set.chunks.pop();
+        res
     }
 
     /// The WCOJ close: every row of the newest level is a wedge middle
@@ -1744,6 +1796,7 @@ mod tests {
                 dirs: Dirs::One(Dir::Fwd),
                 from: 0,
                 to: 1,
+                batch: false,
             }],
             SinkSpec::Count,
             &["n"],
@@ -1773,6 +1826,7 @@ mod tests {
                     dirs: Dirs::One(Dir::Fwd),
                     from: 0,
                     to: 1,
+                    batch: false,
                 },
                 Op::DegreeProduct {
                     steps: vec![(0, Dirs::One(Dir::Fwd))],
@@ -1814,6 +1868,7 @@ mod tests {
                 dirs: Dirs::Both,
                 from: 0,
                 to: 1,
+                batch: false,
             }],
             SinkSpec::Rows {
                 items: vec![ScalarRef::RowId { level: 1 }],
@@ -1829,6 +1884,75 @@ mod tests {
             [1, 2, 0, 1].map(Value::Int).to_vec(),
             "forward list lands before the backward list"
         );
+    }
+
+    /// The batched descent is only worth having if it is invisible:
+    /// same rows, same order, same count, whether the neighbors go
+    /// down one source row at a time or packed into vectors. The
+    /// filter is in the plan because it refines a selection over the
+    /// packed vector, which is the part the row at a time shape never
+    /// exercises.
+    #[test]
+    fn batching_an_expand_changes_nothing_it_hands_down() {
+        let shape = |batch| {
+            plan(
+                vec![bare_level(), age_level()],
+                vec![
+                    Op::Expand {
+                        rel: 0,
+                        dirs: Dirs::Both,
+                        from: 0,
+                        to: 1,
+                        batch,
+                    },
+                    Op::Filter { prog: gt_prog(20) },
+                ],
+                SinkSpec::Rows {
+                    items: vec![ScalarRef::RowId { level: 1 }],
+                    post: Vec::new(),
+                },
+                &["m"],
+            )
+        };
+        let mut snap = Mock::new(64, |i| i as i64, false);
+        let one = run(&shape(false), &mut snap, &seq()).unwrap();
+        let packed = run(&shape(true), &mut snap, &seq()).unwrap();
+        // 43 forward neighbors over 20 and 42 backward ones.
+        assert_eq!(one.rows.len(), 85, "the filter kept the wrong rows");
+        assert_eq!(packed.rows, one.rows, "batching reordered or dropped rows");
+    }
+
+    /// The count sink reads no level, so the multiplicity is the only
+    /// thing the source pin still carries and a batched expand has to
+    /// keep it at one.
+    #[test]
+    fn a_batched_expand_still_counts_one_path_per_neighbor() {
+        let shape = |batch| {
+            plan(
+                vec![bare_level(), age_level()],
+                vec![
+                    Op::Expand {
+                        rel: 0,
+                        dirs: Dirs::Both,
+                        from: 0,
+                        to: 1,
+                        batch,
+                    },
+                    Op::Filter { prog: gt_prog(-1) },
+                ],
+                SinkSpec::Count,
+                &["n"],
+            )
+        };
+        let mut snap = Mock::new(64, |i| i as i64, false);
+        let one = run(&shape(false), &mut snap, &seq()).unwrap();
+        let packed = run(&shape(true), &mut snap, &seq()).unwrap();
+        assert_eq!(
+            one.rows,
+            vec![vec![Value::Int(126)]],
+            "63 edges, both sides"
+        );
+        assert_eq!(packed.rows, one.rows, "batching changed the path count");
     }
 
     #[test]

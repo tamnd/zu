@@ -18,6 +18,7 @@ zu-sqlite.workspace = true
 zu-s3.workspace = true
 zu-query.workspace = true
 zu-vector.workspace = true
+zu-exec.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
@@ -33,6 +34,10 @@ harness = false
 
 [[bench]]
 name = "graphalytics"
+harness = false
+
+[[bench]]
+name = "scale"
 harness = false
 
 [features]

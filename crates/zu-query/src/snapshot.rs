@@ -4,10 +4,12 @@
 //! [`Graph`] trait stays underneath the row-at-a-time paths; operators
 //! move here as the pipeline executor lands in P2.
 //!
-//! Everything takes `&mut self` because the zu1 file handle is
-//! single-threaded until P2 makes page pins shareable across workers;
-//! the signatures are written so that move is a bound change, not a
-//! redesign.
+//! Methods take `&mut self` because a handle carries per-worker state:
+//! the file descriptor it seeks, lazily opened readers, and decode
+//! scratch. Parallel workers each hold their own handle via
+//! [`Snapshot::fork`]; the sharing happens one layer down, where forks
+//! point at the same block cache and decoded pools, so one worker's
+//! decode warms every other worker.
 //!
 //! [`Graph`]: crate::exec::Graph
 
@@ -148,4 +150,31 @@ pub trait Snapshot {
     /// Sum of degrees over `nodes` in `dir`, offsets only; neighbor
     /// values never decode for a count.
     fn degree_batch(&mut self, rel: RelId, nodes: &[u64], dir: Dir) -> Result<u64>;
+
+    /// Adds each node's degree in `dir` onto `out`, position for
+    /// position. Adding instead of storing lets an undirected step
+    /// accumulate both sides into one buffer. The default goes through
+    /// pinned CSR groups; backends with a cheaper offsets-only path
+    /// should override it.
+    fn degrees(&mut self, rel: RelId, nodes: &[u64], dir: Dir, out: &mut [u64]) -> Result<()> {
+        debug_assert_eq!(nodes.len(), out.len());
+        let mut cur: Option<(GroupId, CsrPin)> = None;
+        for (slot, &node) in out.iter_mut().zip(nodes) {
+            let group = (node / u64::from(zu_common::GROUP_ROWS)) as GroupId;
+            if cur.as_ref().map(|&(g, _)| g) != Some(group) {
+                cur = Some((group, self.csr(rel, group, dir)?));
+            }
+            let (_, pin) = cur.as_ref().expect("a pinned group");
+            *slot += pin.degree((node % u64::from(zu_common::GROUP_ROWS)) as usize);
+        }
+        Ok(())
+    }
+
+    /// A second handle on the same epoch for a parallel worker. Forks
+    /// share warm decoded state where the backend can, so a fork is
+    /// not a cold reopen: what one worker decodes, the others hit.
+    /// `None` keeps execution single threaded.
+    fn fork(&self) -> Option<Box<dyn Snapshot + Send>> {
+        None
+    }
 }

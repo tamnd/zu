@@ -40,8 +40,11 @@ use crate::file::{BlockPtr, NULL_BLOCK};
 const DEFAULT_BUDGET: usize = 64 << 20;
 
 /// Lock striping. Block pointers are sequential, so modulo spreads
-/// neighboring blocks across shards.
-const SHARDS: usize = 8;
+/// neighboring blocks across shards. Sized for eight workers hitting
+/// the cache from the morsel executor: at eight shards the mutex wait
+/// dominated a parallel scan's profile, at sixty four collisions are
+/// rare.
+const SHARDS: usize = 64;
 
 /// Hit, miss, and eviction counts since the cache was built. Tests use
 /// these to prove a warm read never reached the file and that a
@@ -431,44 +434,49 @@ mod tests {
         assert_eq!(pin[0], 2);
     }
 
+    /// Pointers that all land in shard 0 no matter the shard count.
+    const P1: u64 = SHARDS as u64;
+    const P2: u64 = 2 * SHARDS as u64;
+    const P3: u64 = 3 * SHARDS as u64;
+
     #[test]
     fn eviction_respects_pins_and_bounds_frames() {
         // Budget of one frame per shard; pointers all land in shard 0.
         let cache = BlockCache::new(0);
-        let pinned = cache.insert(8, fill_with(1)).unwrap();
+        let pinned = cache.insert(P1, fill_with(1)).unwrap();
         // The only slot is pinned, so this read bypasses the pool and
         // evicts nothing.
-        let transient = cache.insert(16, fill_with(2)).unwrap();
+        let transient = cache.insert(P2, fill_with(2)).unwrap();
         assert_eq!(transient[0], 2);
         assert_eq!(cache.stats().evictions, 0);
-        assert!(cache.get(16).is_none(), "transient frames are not cached");
+        assert!(cache.get(P2).is_none(), "transient frames are not cached");
         assert_eq!(pinned[0], 1);
         drop(pinned);
         drop(transient);
-        // Unpinned now: 16 takes 8's frame.
-        cache.insert(16, fill_with(3)).unwrap();
+        // Unpinned now: P2 takes P1's frame.
+        cache.insert(P2, fill_with(3)).unwrap();
         assert_eq!(cache.stats().evictions, 1);
-        assert!(cache.get(8).is_none());
-        assert_eq!(cache.get(16).unwrap()[0], 3);
+        assert!(cache.get(P1).is_none());
+        assert_eq!(cache.get(P2).unwrap()[0], 3);
     }
 
     #[test]
     fn visited_bit_gives_hot_blocks_a_second_chance() {
         let cache = BlockCache::new(0);
-        cache.insert(8, fill_with(1)).unwrap();
+        cache.insert(P1, fill_with(1)).unwrap();
         // Not visited since insert: the hand takes it directly.
-        cache.insert(16, fill_with(2)).unwrap();
-        assert!(cache.get(8).is_none());
-        // Visit 16, then insert 24: the hand clears 16's bit and keeps
+        cache.insert(P2, fill_with(2)).unwrap();
+        assert!(cache.get(P1).is_none());
+        // Visit P2, then insert P3: the hand clears P2's bit and keeps
         // scanning, but with one slot it wraps and takes it anyway;
         // with two slots in the shard the visited one survives.
         let cache = BlockCache::new(2 * SHARDS * BLOCK_SIZE as usize);
-        cache.insert(8, fill_with(1)).unwrap();
-        cache.insert(16, fill_with(2)).unwrap();
-        cache.get(16).unwrap();
-        cache.insert(24, fill_with(3)).unwrap();
-        assert!(cache.get(16).is_some(), "visited slot survives");
-        assert!(cache.get(8).is_none(), "unvisited slot was the victim");
+        cache.insert(P1, fill_with(1)).unwrap();
+        cache.insert(P2, fill_with(2)).unwrap();
+        cache.get(P2).unwrap();
+        cache.insert(P3, fill_with(3)).unwrap();
+        assert!(cache.get(P2).is_some(), "visited slot survives");
+        assert!(cache.get(P1).is_none(), "unvisited slot was the victim");
     }
 
     #[test]

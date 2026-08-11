@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zu_common::Result;
 
-use crate::ast::{BinaryOp, RelDirection};
-use crate::binder::{BoundExpr, BoundQuery, ColorSummary, Schema};
+use crate::ast::{BinaryOp, Literal, RelDirection};
+use crate::binder::{BoundExpr, BoundQuery, ColStats, ColorSummary, Schema};
 use crate::plan::{LogicalPlan, VarLength};
 
 /// Components larger than this keep their written join order.
@@ -1261,30 +1261,110 @@ fn into_prob(e: &ExpandOp, query: &BoundQuery, schema: &Schema) -> f64 {
     p.clamp(1e-9, 1.0)
 }
 
-/// Fixed selectivities until the column catalog carries statistics.
-/// Equality on `id` against a literal or parameter is a point lookup.
+/// The order-preserving byte key of a literal, the form column
+/// statistics store their values in. Anything that is not a string or
+/// an integer has no key and falls back to the fixed selectivities.
+fn literal_key(value: &Literal) -> Option<Vec<u8>> {
+    match value {
+        Literal::Str(s) => Some(s.as_bytes().to_vec()),
+        Literal::Int(i) => Some(zu_common::int_key(*i).to_vec()),
+        _ => None,
+    }
+}
+
+/// The column statistics behind `slot.key`, weighted across the node
+/// tables the slot can be. A slot bound to two labels reads as one
+/// column: the rows add up and each table's answer counts for as many
+/// rows as it has, which is what a scan over both would see.
+fn col_selectivity(
+    slot: usize,
+    key: &str,
+    query: &BoundQuery,
+    schema: &Schema,
+    of: impl Fn(&ColStats) -> f64,
+) -> Option<f64> {
+    let mut rows = 0.0;
+    let mut matched = 0.0;
+    let mut found = false;
+    for table in &query.variables[slot].node_tables {
+        let Some(stats) = schema.col_stats(*table, key) else {
+            continue;
+        };
+        found = true;
+        rows += stats.rows as f64;
+        matched += of(stats) * stats.rows as f64;
+    }
+    if !found || rows <= 0.0 {
+        return None;
+    }
+    Some((matched / rows).clamp(0.0, 1.0))
+}
+
+/// Selectivity of one filter (perf/12 §2.1). Equality reads the top
+/// value frequencies when the query names a literal and the distinct
+/// count when it names a parameter, ranges read the equi-depth
+/// buckets, and anything a statistic does not cover keeps the fixed
+/// guesses this used to be made of. Equality on `id` stays a point
+/// lookup off the table count, because the key index is exact and no
+/// sample beats it.
 fn selectivity(filter: &BoundExpr, query: &BoundQuery, schema: &Schema) -> f64 {
     if let BoundExpr::Binary { op, lhs, rhs } = filter {
+        let sides = [(lhs, rhs), (rhs, lhs)];
         match op {
             BinaryOp::Eq => {
-                for (side, other) in [(lhs, rhs), (rhs, lhs)] {
+                for (side, other) in sides {
                     let BoundExpr::Property { base, key } = side.as_ref() else {
                         continue;
                     };
                     let BoundExpr::Var(slot) = base.as_ref() else {
                         continue;
                     };
-                    if !matches!(other.as_ref(), BoundExpr::Param(_) | BoundExpr::Literal(_)) {
-                        continue;
-                    }
+                    let known = match other.as_ref() {
+                        BoundExpr::Literal(v) => literal_key(v),
+                        BoundExpr::Param(_) => None,
+                        _ => continue,
+                    };
                     if key == "id" && !query.variables[*slot].node_tables.is_empty() {
                         return 1.0 / slot_card(*slot, query, schema);
                     }
-                    return 0.1;
+                    let got = match &known {
+                        Some(k) => {
+                            col_selectivity(*slot, key, query, schema, |s| s.eq_selectivity(k))
+                        }
+                        None => col_selectivity(*slot, key, query, schema, ColStats::eq_average),
+                    };
+                    return got.unwrap_or(0.1);
                 }
                 return 0.1;
             }
-            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => return 0.3,
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                for (side, other) in sides {
+                    let BoundExpr::Property { base, key } = side.as_ref() else {
+                        continue;
+                    };
+                    let BoundExpr::Var(slot) = base.as_ref() else {
+                        continue;
+                    };
+                    let BoundExpr::Literal(v) = other.as_ref() else {
+                        continue;
+                    };
+                    let Some(k) = literal_key(v) else { continue };
+                    // `side` is the column, so the comparison reads in
+                    // the direction the operator was written when the
+                    // column is on the left and the other way when the
+                    // literal is.
+                    let below = col_selectivity(*slot, key, query, schema, |s| {
+                        s.below(&k).unwrap_or(f64::NAN)
+                    });
+                    let Some(below) = below.filter(|b| b.is_finite()) else {
+                        continue;
+                    };
+                    let column_left = std::ptr::eq(side.as_ref(), lhs.as_ref());
+                    let lower = matches!(op, BinaryOp::Lt | BinaryOp::Le) == column_left;
+                    return if lower { below } else { 1.0 - below };
+                }
+                return 0.3;
+            }
             _ => {}
         }
     }

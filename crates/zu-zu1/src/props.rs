@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use zu_common::{Result, ZuError};
+use zu_common::{Result, ZuError, int_key};
 
 use crate::catalog::{Catalog, TableIndex};
 use crate::file::{BlockPtr, Zu1File};
@@ -24,6 +24,7 @@ use crate::segment::{
     CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, chunk_zone, decode_chunk,
     load_chunk_directory_pooled, read_one_cached, write_segment,
 };
+use crate::stats;
 
 const PROPS_VERSION: u16 = 1;
 const MAX_NAME_LEN: usize = 256;
@@ -194,7 +195,21 @@ pub fn store_props(
         index.remove(table_id);
     }
     let mut cols = Vec::with_capacity(columns.len());
+    let mut col_stats = BTreeMap::new();
     for (name, values) in columns {
+        // The values are all in hand here and nowhere else, so this is
+        // where the estimator's statistics get built: a COPY that
+        // brings properties leaves the optimizer able to reason about
+        // them, without anyone remembering to ANALYZE (perf/12 §1).
+        let stat = match values {
+            PropValues::Str(v) => stats::column_stats(v),
+            PropValues::Int(v) => {
+                let keys: Vec<[u8; 8]> = v.iter().map(|&x| int_key(x as i64)).collect();
+                let refs: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
+                stats::column_stats(&refs)
+            }
+        };
+        col_stats.insert((*name).to_string(), stat);
         let (ty, meta) = match values {
             PropValues::Str(v) => (PropType::Str, write_blob_segment(db, v)?),
             PropValues::Int(v) => (PropType::Int, write_segment(db, v)?),
@@ -214,6 +229,12 @@ pub fn store_props(
     crate::graph::free_chain(db, db.db_header().table_index_root)?;
     let index_root = meta::write_chain(db, &index.encode())?;
     db.db_header_mut().table_index_root = index_root;
+
+    let mut all = stats::Stats::load(db)?;
+    all.cols.insert(table_id, col_stats);
+    crate::graph::free_chain(db, db.db_header().stats_root)?;
+    all.store(db)?;
+
     db.checkpoint()?;
     Ok(directory)
 }

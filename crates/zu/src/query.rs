@@ -397,6 +397,29 @@ pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
             })
             .collect(),
     );
+    schema.set_col_stats(
+        stats
+            .cols
+            .iter()
+            .map(|(id, cols)| {
+                let cols = cols
+                    .iter()
+                    .map(|(name, c)| {
+                        (
+                            name.clone(),
+                            binder::ColStats {
+                                rows: c.rows,
+                                ndv: c.ndv,
+                                top: c.top.clone(),
+                                bounds: c.bounds.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                (*id, cols)
+            })
+            .collect(),
+    );
     schema.set_degree_hists(
         stats
             .rels
@@ -1024,6 +1047,58 @@ mod tests {
         crate::zu1::colors::analyze(&mut db).expect("analyze");
         let after = explain_analyze(source, &mut db, &[]).expect("explain after");
         assert!(!after.contains("AspJoin"), "got:\n{after}");
+    }
+
+    #[test]
+    fn column_statistics_tell_the_frequent_value_from_the_rare_one() {
+        use crate::zu1::props::{PropValues, store_props};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("skew.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // One thousand people whose tag column is badly skewed: 700
+        // hubs, then 200, 60 and 40. Uniformity would call every one of
+        // the four 250 rows and be wrong three times.
+        let counts = [(&b"hub"[..], 700usize), (b"a", 200), (b"b", 60), (b"c", 40)];
+        let tags: Vec<&[u8]> = counts
+            .iter()
+            .flat_map(|&(tag, n)| std::iter::repeat_n(tag, n))
+            .collect();
+        graph::bulk_load_as(&mut db, "person", "knows", 1000, &[(0u32, 1u32)]).expect("load");
+        store_props(&mut db, "person", &[("tag", PropValues::Str(&tags))]).expect("props");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let est_of = |source: &str, args: &[(&str, Value)], db: &mut Zu1File| -> String {
+            let text = explain_analyze(source, db, args).expect("explain");
+            text.lines()
+                .find(|l| l.contains("Filter"))
+                .unwrap_or_else(|| panic!("no filter line in:\n{text}"))
+                .to_string()
+        };
+
+        // A literal the top list holds is estimated at its own count,
+        // and the actual comes back beside it, so both halves of the
+        // assertion are the same run.
+        for (tag, n) in counts {
+            let tag = std::str::from_utf8(tag).expect("utf8");
+            let line = est_of(
+                &format!("MATCH (a:person) WHERE a.tag = '{tag}' RETURN count(*) AS c"),
+                &[],
+                &mut db,
+            );
+            assert!(line.contains(&format!("est {n:>9}")), "got: {line}");
+            assert!(line.contains(&format!("flat {n:>9}")), "got: {line}");
+        }
+
+        // A parameter is not known when the plan is built, so the only
+        // honest answer is the average value's share, 1000 over 4.
+        let line = est_of(
+            "MATCH (a:person) WHERE a.tag = $t RETURN count(*) AS c",
+            &[("t", Value::Str("hub".into()))],
+            &mut db,
+        );
+        assert!(line.contains("est       250"), "got: {line}");
     }
 
     #[test]

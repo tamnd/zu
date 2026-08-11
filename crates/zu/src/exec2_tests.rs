@@ -133,6 +133,18 @@ fn covered_shapes_match_the_old_engine() {
          WHERE c.age > 40 RETURN c.id AS c, count(*) AS n",
         "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
          WHERE c.age > 40 RETURN a.id AS a, b.id AS b, c.id AS c",
+        // The closes the intersection cannot take. An undirected close
+        // reads a list per side, so the optimizer leaves it a binary
+        // probe, and the pipeline answers it as a membership test
+        // against the end that is already pinned.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
+         RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
+         RETURN a.id AS a, b.id AS b, c.id AS c",
+        "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+         RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
+         WHERE c.age > 40 RETURN c.id AS c, count(*) AS n",
         // Aggregation, keyed and bare.
         "MATCH (p:person) RETURN p.age AS age, count(p) AS n",
         "MATCH (p:person) RETURN p.name AS name, count(p) AS n",

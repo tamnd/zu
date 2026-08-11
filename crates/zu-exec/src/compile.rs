@@ -77,6 +77,16 @@ pub(crate) enum Op {
         probe_level: usize,
         to: usize,
     },
+    /// The binary close (perf/05 section 6): both ends of the edge are
+    /// already bound, so nothing is built and the newest level only
+    /// loses the rows with no edge back to the pinned end. One list is
+    /// read for the whole vector and every row is galloped into it.
+    Semi {
+        rel: RelId,
+        dirs: Dirs,
+        /// The level holding the end that stays fixed for the vector.
+        probe_level: usize,
+    },
     /// Terminal fusion of trailing expands feeding a bare count: each
     /// active row of the newest level contributes the product of its
     /// per-step degrees, read off the CSR offsets alone. One step is
@@ -359,6 +369,23 @@ impl Compiler<'_> {
                     ops.push(op);
                     ops.extend(held.into_iter().rev());
                 }
+                Some(LogicalPlan::Expand {
+                    rel,
+                    from,
+                    to,
+                    direction,
+                    range: None,
+                    into: true,
+                    wcoj: false,
+                    optional: None,
+                    ..
+                }) => {
+                    let Some(op) = self.close_semi(*rel, *from, *to, *direction) else {
+                        return Ok(None);
+                    };
+                    it.next();
+                    ops.push(op);
+                }
                 _ => break,
             }
         }
@@ -506,6 +533,7 @@ impl Compiler<'_> {
                     }
                     newest = *to;
                 }
+                Op::Semi { probe_level, .. } if *probe_level >= newest => return Ok(None),
                 _ => {}
             }
         }
@@ -615,6 +643,52 @@ impl Compiler<'_> {
             probe,
             probe_level,
             to: built_to,
+        })
+    }
+
+    /// Compiles a closing expand the intersection did not take into a
+    /// semijoin, or None when neither end sits on the newest level.
+    /// Both the storage probe and the accumulated edge set the old
+    /// engine picks between are the same test here, whether an edge
+    /// exists, and the answer is one row either way, so the two plan
+    /// flavors compile to the same operator.
+    fn close_semi(
+        &self,
+        rel: usize,
+        from: usize,
+        to: usize,
+        direction: RelDirection,
+    ) -> Option<Op> {
+        let newest = self.levels.len() - 1;
+        let &from_level = self.slot_level.get(&from)?;
+        let &to_level = self.slot_level.get(&to)?;
+        let &[rel_id] = self.query.variables[rel].rel_tables.as_slice() else {
+            return None;
+        };
+        // The pinned end is the one below the newest level: its list is
+        // read once and the rows of the newest level are probed into it.
+        let (probe_level, probe_dir) = if from_level < newest && to_level == newest {
+            (from_level, direction)
+        } else if to_level < newest && from_level == newest {
+            (to_level, flip(direction))
+        } else {
+            return None;
+        };
+        let dirs = expand_dirs(
+            self.schema,
+            rel_id,
+            self.levels[probe_level].table,
+            probe_dir,
+        )?;
+        // The walk has to land on the table the probed rows come from.
+        let lands = match dirs {
+            Dirs::One(d) => far_table(self.schema, rel_id, d)? == self.levels[newest].table,
+            Dirs::Both => self.levels[probe_level].table == self.levels[newest].table,
+        };
+        lands.then_some(Op::Semi {
+            rel: rel_id,
+            dirs,
+            probe_level,
         })
     }
 
@@ -1049,10 +1123,6 @@ fn flip_cmp(op: BinaryOp) -> Option<BinaryOp> {
     }
 }
 
-/// The traversal sides of one expand step, matching the old engine's
-/// orientation checks: forward applies when the source table is the
-/// rel's from side, backward when it is the to side, and an undirected
-/// step over a self-referencing rel walks both, forward first.
 /// The table on the far side of one CSR walk.
 fn far_table(schema: &Schema, rel: RelId, dir: Dir) -> Option<TableId> {
     let def = schema.rel_by_id(rel)?;
@@ -1071,6 +1141,10 @@ fn flip(direction: RelDirection) -> RelDirection {
     }
 }
 
+/// The traversal sides of one expand step, matching the old engine's
+/// orientation checks: forward applies when the source table is the
+/// rel's from side, backward when it is the to side, and an undirected
+/// step over a self-referencing rel walks both, forward first.
 fn expand_dirs(
     schema: &Schema,
     rel: RelId,

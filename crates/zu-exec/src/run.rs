@@ -292,6 +292,8 @@ struct Worker<'a> {
     neigh: Vec<u64>,
     /// Intersection scratch for the WCOJ close.
     hits: Vec<u64>,
+    /// Survivor scratch for the binary close.
+    keep: Vec<u16>,
     /// Per-row degree and running product scratch for hub counts.
     deg: Vec<u64>,
     prod: Vec<u64>,
@@ -322,6 +324,7 @@ impl<'a> Worker<'a> {
             scratch: Vec::new(),
             neigh: Vec::new(),
             hits: Vec::new(),
+            keep: Vec::new(),
             deg: Vec::new(),
             prod: Vec::new(),
             idx_pool: Vec::new(),
@@ -429,6 +432,11 @@ impl<'a> Worker<'a> {
                 probe_level,
                 to,
             } => self.intersect(*seed, *probe, *probe_level, *to, rest, set),
+            Op::Semi {
+                rel,
+                dirs,
+                probe_level,
+            } => self.semi(*rel, *dirs, *probe_level, rest, set),
             Op::DegreeProduct { steps } => {
                 self.collect_rows(set.chunks.last().expect("a level under the count"));
                 let rows = std::mem::take(&mut self.scratch);
@@ -607,6 +615,70 @@ impl<'a> Worker<'a> {
         self.hits = hits;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
+        result
+    }
+
+    /// The binary close: both ends of the edge are already bound, so
+    /// the newest level keeps the rows with an edge back to the pinned
+    /// end and nothing else changes. The pinned end's neighbor list is
+    /// read once for the whole vector and each row galloped into it,
+    /// the cursor carried across rows because an expand hands its rows
+    /// over in list order.
+    fn semi(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        probe_level: usize,
+        rest: &[Op],
+        set: &mut ChunkSet,
+    ) -> Result<()> {
+        let far = &set.chunks[probe_level];
+        let prow = row_at(far, pinned_pos(far));
+        let mut pins = Vec::with_capacity(2);
+        for dir in sides(dirs) {
+            pins.push(self.pin(rel, dir, prow)?);
+        }
+        let at = (prow % u64::from(GROUP_ROWS)) as usize;
+        let lists: Vec<&[u64]> = pins.iter().map(|p| p.list(at)).collect();
+        if lists.iter().all(|l| l.is_empty()) {
+            return Ok(());
+        }
+        let last = set.chunks.len() - 1;
+        let mut keep = std::mem::take(&mut self.keep);
+        keep.clear();
+        {
+            let chunk = &set.chunks[last];
+            let vals = chunk.vecs[0].values::<u64>();
+            let mut cur = [0usize; 2];
+            let mut prev = 0;
+            let cur = &mut cur[..lists.len()];
+            match &chunk.sel {
+                Some(s) => {
+                    for &i in s.as_slice() {
+                        if member(&lists, cur, &mut prev, vals[i as usize]) {
+                            keep.push(i);
+                        }
+                    }
+                }
+                None => {
+                    for i in 0..chunk.count {
+                        if member(&lists, cur, &mut prev, vals[i as usize]) {
+                            keep.push(i as u16);
+                        }
+                    }
+                }
+            }
+        }
+        let mut result = Ok(());
+        if !keep.is_empty() {
+            let mut sel = SelVector::with_capacity(&mut self.arena, keep.len());
+            for &i in &keep {
+                sel.push(i);
+            }
+            set.chunks[last].sel = Some(sel);
+            result = self.run_ops(rest, set);
+        }
+        self.keep = keep;
         result
     }
 
@@ -848,6 +920,24 @@ fn leapfrog(seed: &[u64], probe: &[u64], out: &mut Vec<u64>) {
             pi += 1;
         }
     }
+}
+
+/// Whether `v` sits in any of the pinned lists, carrying each list's
+/// cursor forward. Rows arrive in list order out of an expand, so the
+/// cursor usually starts within a step or two of the answer; a row that
+/// goes backwards rewinds it, which is what keeps a filtered or scanned
+/// level correct here too.
+fn member(lists: &[&[u64]], cur: &mut [usize], prev: &mut u64, v: u64) -> bool {
+    if v < *prev {
+        cur.fill(0);
+    }
+    *prev = v;
+    let mut hit = false;
+    for (list, c) in lists.iter().zip(cur.iter_mut()) {
+        *c = gallop(list, v, *c);
+        hit |= list.get(*c) == Some(&v);
+    }
+    hit
 }
 
 /// First position at or after `from` whose value is at least `target`,

@@ -35,6 +35,8 @@ const PLAN_CAP: usize = 1024;
 struct CachedPlan {
     query: BoundQuery,
     plan: LogicalPlan,
+    /// What the optimizer wants EXPLAIN to say that the tree does not.
+    notes: Vec<String>,
 }
 
 pub struct Session {
@@ -138,7 +140,8 @@ impl Session {
     /// EXPLAIN ANALYZE through the session: same cache, same options,
     /// profiled execution.
     pub fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {
-        Ok(self.profile(source, params)?.render())
+        let notes = self.plan_for(source)?.notes.clone();
+        Ok(query::noted(notes, self.profile(source, params)?.render()))
     }
 
     /// The same run, handing back the counters instead of the
@@ -163,8 +166,8 @@ impl Session {
         if let Some(cached) = self.plans.get(source) {
             return Ok(cached.clone());
         }
-        let (query, plan) = query::compile(source, &self.schema)?;
-        let cached = Arc::new(CachedPlan { query, plan });
+        let (query, plan, notes) = query::compile(source, &self.schema)?;
+        let cached = Arc::new(CachedPlan { query, plan, notes });
         if self.plans.len() >= PLAN_CAP {
             self.plans.clear();
         }

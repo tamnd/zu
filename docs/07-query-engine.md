@@ -54,7 +54,7 @@ Plans cached by (query text, catalog epoch, param types), LDBC short reads are p
 1. Per-direction degree histograms (log2 buckets) per rel table, and the l1/l2/l3/linf norms of both degree sequences alongside them. A frontier that already holds one row per edge sits on nodes drawn in proportion to their degree, so the mean an expand off it sees is the degree-weighted mean and not the plain one; the mixed norm, the sum over nodes of out-degree times in-degree, is that mean's numerator when the two hops read opposite sides and makes a two hop count over one rel table exact.
 2. Label-pair join selectivities from edge counts.
 3. **Color summaries** (COLOR, PVLDB 2024): quasi-stable coloring, default ≤ 1024 colors, built by `ANALYZE`, stored in stats blocks; estimates multi-hop pattern cardinalities with graceful degradation under updates.
-4. **Pessimistic caps** (AGM/degree-sequence bounds) clamp every estimate; join order falls back to the bound-optimal order when estimate and bound disagree by > 100× (robustness first).
+4. **Pessimistic caps** (AGM/degree-sequence bounds) clamp every estimate; join order falls back to the bound-optimal order when estimate and bound disagree by > 100x (robustness first). `ZU_BOUND_DISAGREEMENT` retunes the factor, and EXPLAIN prints a note naming the ratio whenever the fallback fires.
 
 ## 7. Execution-time adaptivity (small, deterministic)
 

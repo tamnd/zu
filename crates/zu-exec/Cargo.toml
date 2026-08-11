@@ -18,5 +18,9 @@ zu-query.workspace = true
 name = "join"
 harness = false
 
+[[bench]]
+name = "sip"
+harness = false
+
 [lints]
 workspace = true

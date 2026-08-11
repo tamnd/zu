@@ -27,6 +27,7 @@ pub mod join;
 mod pool;
 mod run;
 mod sink;
+pub mod sip;
 
 use zu_common::Result;
 use zu_query::binder::{BoundQuery, Schema};

@@ -137,9 +137,17 @@ pub(crate) fn run(
     }
 }
 
-/// Splits the scan into morsels: chunk-multiple sizes targeting four
+/// Splits the scan into morsels: chunk-multiple sizes targeting eight
 /// morsels per worker, never crossing a storage group boundary so a
 /// morsel's CSR pins and zone reads stay within one group.
+///
+/// Eight rather than four because the tail decides the query: on a
+/// machine with slow and fast cores the slow worker picks up a last
+/// morsel nobody else can finish for it, so the whole query waits on
+/// one morsel's worth of rows. Halving the morsel halves that tail.
+/// Sixteen per worker gave nothing back over eight, so the claim
+/// traffic starts costing what the shorter tail saves somewhere in
+/// between.
 fn make_morsels(rows: u64, workers: usize) -> Vec<(u64, u64)> {
     const CHUNK: u64 = SCAN_ROWS as u64;
     const GROUP: u64 = GROUP_ROWS as u64;
@@ -147,7 +155,7 @@ fn make_morsels(rows: u64, workers: usize) -> Vec<(u64, u64)> {
     if rows == 0 {
         return out;
     }
-    let target = (rows / (workers as u64 * 4)).clamp(CHUNK, GROUP) / CHUNK * CHUNK;
+    let target = (rows / (workers as u64 * 8)).clamp(CHUNK, GROUP) / CHUNK * CHUNK;
     let mut group_lo = 0;
     while group_lo < rows {
         let group_hi = (group_lo + GROUP).min(rows);
@@ -973,7 +981,7 @@ mod tests {
             expect = hi;
         }
         assert_eq!(expect, rows);
-        assert!(morsels.len() >= 16, "four workers get several morsels each");
+        assert!(morsels.len() >= 32, "four workers get several morsels each");
     }
 
     #[test]

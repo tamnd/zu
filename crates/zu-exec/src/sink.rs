@@ -375,32 +375,195 @@ fn key_order(keys: &[(usize, bool)], a: &[Value], b: &[Value]) -> Ordering {
     Ordering::Equal
 }
 
-/// One order-preserving 128 bit key per row, when every sort column is
-/// an integer and there are no more than two of them. An i64 keeps its
-/// order as a u64 once the sign bit is flipped, and a descending column
-/// is that key inverted, so the tuple of them sorts as plain numbers.
-/// Sorting those beats sorting through the rows: the compare reads one
-/// contiguous array instead of chasing a Vec per row, and the pair
-/// carries the row position so equal keys keep their input order. This
-/// is the IS and IC shape, ORDER BY a date or a score with an id to
-/// break the ties.
-fn norm_keys(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<Vec<u128>> {
-    if keys.is_empty() || keys.len() > 2 {
+/// The longest string a normalized key encodes. Every row pays the
+/// longest string in its column, so one long value in a text column
+/// widens the key for the whole set; past this the padding costs more
+/// than the compare it saves and the row comparator is the better deal.
+const NORM_STR_MAX: usize = 24;
+
+/// The widest key that still fits one machine word pair. At or under
+/// this a key sorts as a u128, which moves the key and the row position
+/// together in one 16 byte compare; over it the sort compares bytes in
+/// place and moves only the position.
+const NORM_WORD: usize = 16;
+
+/// The widest key at all. The buffer costs this per row on top of the
+/// rows themselves, and an ORDER BY this long is deciding on its first
+/// few columns anyway, so past here the row comparator is the honest
+/// answer: it reads the columns it needs and stops.
+const NORM_MAX: usize = 64;
+
+/// How a sort column turns into bytes that sort the way its values do.
+#[derive(Clone, Copy, PartialEq)]
+enum NormKind {
+    /// An i64 keeps its order as a u64 once the sign bit is flipped.
+    Int,
+    /// A negative f64 reverses under its own bits, so it inverts whole
+    /// and a positive one only flips its sign bit. That is the order
+    /// total_cmp gives, NaN ends included.
+    Float,
+    Bool,
+    /// The table and then the offset, which is how two nodes compare.
+    Node,
+    /// The text padded out to the longest string the column holds, with
+    /// the length behind it so a string sorts ahead of the one it is a
+    /// prefix of even when the padding is part of that longer string.
+    Str,
+}
+
+/// Where one sort column sits in the key and what it costs. The kind
+/// is spent by the time the layout is built: the encoder reads the
+/// value itself, and the layout is what says every row agrees on it.
+struct NormField {
+    col: usize,
+    asc: bool,
+    at: usize,
+    width: usize,
+}
+
+fn norm_kind(v: &Value) -> Option<NormKind> {
+    match v {
+        Value::Int(_) => Some(NormKind::Int),
+        Value::Float(_) => Some(NormKind::Float),
+        Value::Bool(_) => Some(NormKind::Bool),
+        Value::Node { .. } => Some(NormKind::Node),
+        Value::Str(_) => Some(NormKind::Str),
+        _ => None,
+    }
+}
+
+/// The key layout for these sort columns, or None when the set has no
+/// rows, a column holds a type with no byte form, a column changes type
+/// from row to row, a text column runs past what padding is worth, or
+/// the columns together run past what a key is worth carrying.
+/// The type has to hold for every row because a column of integers and
+/// floats mixed compares through f64, which no fixed byte form gives.
+fn norm_plan(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<Vec<NormField>> {
+    if keys.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut key = 0u128;
-        for (at, &(col, asc)) in keys.iter().enumerate() {
-            let Some(Value::Int(n)) = row.get(col) else {
-                return None;
-            };
-            let part = (*n as u64) ^ (1 << 63);
-            key |= u128::from(if asc { part } else { !part }) << (64 * (1 - at));
+    let first = rows.first()?;
+    let mut fields = Vec::with_capacity(keys.len());
+    let mut at = 0;
+    for &(col, asc) in keys {
+        let kind = norm_kind(first.get(col)?)?;
+        let width = match kind {
+            NormKind::Int | NormKind::Float => 8,
+            NormKind::Bool => 1,
+            NormKind::Node => 12,
+            NormKind::Str => {
+                let mut longest = 0;
+                for row in rows {
+                    let Some(Value::Str(s)) = row.get(col) else {
+                        return None;
+                    };
+                    longest = longest.max(s.len());
+                }
+                if longest > NORM_STR_MAX {
+                    return None;
+                }
+                longest + 1
+            }
+        };
+        if kind != NormKind::Str
+            && rows
+                .iter()
+                .any(|r| r.get(col).and_then(norm_kind) != Some(kind))
+        {
+            return None;
         }
-        out.push(key);
+        fields.push(NormField {
+            col,
+            asc,
+            at,
+            width,
+        });
+        at += width;
+        if at > NORM_MAX {
+            return None;
+        }
     }
-    Some(out)
+    Some(fields)
+}
+
+/// One order-preserving byte string per row, laid out back to back at a
+/// fixed stride. The bytes compare the way the values compare, so the
+/// sort reads one contiguous buffer instead of chasing a Vec per row,
+/// and a descending column is its own field inverted. This is the IS
+/// and IC shape, ORDER BY a date or a score with an id to break the
+/// ties, and it holds up just as well on a name and three columns.
+fn norm_keys(rows: &[Vec<Value>], fields: &[NormField], width: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rows.len() * width];
+    for (row, key) in rows.iter().zip(out.chunks_exact_mut(width)) {
+        for f in fields {
+            let cell = &mut key[f.at..][..f.width];
+            match &row[f.col] {
+                Value::Int(n) => cell.copy_from_slice(&((*n as u64) ^ (1 << 63)).to_be_bytes()),
+                Value::Float(x) => {
+                    let bits = x.to_bits();
+                    let flip = if bits >> 63 == 1 {
+                        !bits
+                    } else {
+                        bits ^ (1 << 63)
+                    };
+                    cell.copy_from_slice(&flip.to_be_bytes());
+                }
+                Value::Bool(b) => cell[0] = u8::from(*b),
+                Value::Node { table, offset } => {
+                    cell[..4].copy_from_slice(&table.to_be_bytes());
+                    cell[4..].copy_from_slice(&offset.to_be_bytes());
+                }
+                Value::Str(s) => {
+                    cell[..s.len()].copy_from_slice(s.as_bytes());
+                    cell[f.width - 1] = s.len() as u8;
+                }
+                other => unreachable!("the layout matched every row, not {other:?}"),
+            }
+            if !f.asc {
+                for b in cell.iter_mut() {
+                    *b = !*b;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The row order a key that fits one word gives. The key and the row
+/// position travel as one pair, so the sort never reads back into the
+/// buffer, and the position breaks ties into input order.
+fn order_by_word(norm: &[u8], width: usize, need: usize) -> Vec<u32> {
+    let word = |key: &[u8]| {
+        let mut buf = [0u8; NORM_WORD];
+        buf[..key.len()].copy_from_slice(key);
+        u128::from_be_bytes(buf)
+    };
+    let mut order: Vec<(u128, u32)> = norm
+        .chunks_exact(width)
+        .zip(0u32..)
+        .map(|(key, at)| (word(key), at))
+        .collect();
+    if need < order.len() {
+        order.select_nth_unstable(need);
+        order.truncate(need);
+    }
+    order.sort_unstable();
+    order.into_iter().map(|(_, at)| at).collect()
+}
+
+/// The row order a key too wide for a word gives. The compare is a
+/// memcmp of two fixed slices, which still beats walking a row of
+/// values, and only the four byte position moves.
+fn order_by_bytes(norm: &[u8], width: usize, need: usize) -> Vec<u32> {
+    let key = |at: &u32| &norm[*at as usize * width..][..width];
+    let by = |x: &u32, y: &u32| key(x).cmp(key(y)).then(x.cmp(y));
+    let mut order: Vec<u32> = (0..(norm.len() / width) as u32).collect();
+    if need < order.len() {
+        order.select_nth_unstable_by(need, by);
+        order.truncate(need);
+    }
+    order.sort_unstable_by(by);
+    order
 }
 
 /// ORDER BY over materialized rows, ordering the whole set only when
@@ -410,15 +573,16 @@ fn norm_keys(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<Vec<u128>> {
 /// ties on the row's position so the answer is the stable sort's, the
 /// order the old engine's sort_by produces.
 fn sort_rows(rows: &mut Vec<Vec<Value>>, keys: &[(usize, bool)], need: usize) {
-    if let Some(norm) = norm_keys(rows, keys) {
-        let mut order: Vec<(u128, u32)> = norm.into_iter().zip(0u32..).collect();
-        if need < order.len() {
-            order.select_nth_unstable(need);
-            order.truncate(need);
-        }
-        order.sort_unstable();
+    if let Some(fields) = norm_plan(rows, keys) {
+        let width = fields.iter().map(|f| f.width).sum();
+        let norm = norm_keys(rows, &fields, width);
+        let order = if width <= NORM_WORD {
+            order_by_word(&norm, width, need)
+        } else {
+            order_by_bytes(&norm, width, need)
+        };
         let mut out = Vec::with_capacity(order.len());
-        for (_, i) in order {
+        for i in order {
             out.push(std::mem::take(&mut rows[i as usize]));
         }
         *rows = out;
@@ -673,6 +837,182 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["e", "b", "f", "d", "g", "c", "a"]);
+    }
+
+    /// The order the row comparator gives. Its sort is stable, so ties
+    /// keep their input order, which is what the normalized key has to
+    /// reproduce whatever shape the key takes.
+    fn by_comparator(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Vec<Vec<Value>> {
+        let mut out = rows.to_vec();
+        out.sort_by(|a, b| {
+            for &(col, asc) in keys {
+                let ord = val_cmp(&a[col], &b[col]);
+                let ord = if asc { ord } else { ord.reverse() };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            Ordering::Equal
+        });
+        out
+    }
+
+    /// The bytes the key takes, or None when the set has no normalized
+    /// form at all.
+    fn key_width(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<usize> {
+        norm_plan(rows, keys).map(|f| f.iter().map(|x| x.width).sum())
+    }
+
+    /// Three integer columns with heavy repeats, so every key has to
+    /// reach the column behind it and the tie break past that.
+    fn wide_rows() -> Vec<Vec<Value>> {
+        (0..500i64)
+            .map(|i| {
+                vec![
+                    Value::Int(i % 5),
+                    Value::Int(-(i % 7)),
+                    Value::Int((i * 31) % 11),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn three_integer_columns_sort_the_way_the_comparator_does() {
+        let rows = wide_rows();
+        let keys = vec![(0usize, true), (1usize, false), (2usize, true)];
+        assert_eq!(key_width(&rows, &keys), Some(24), "past one word");
+        assert_eq!(
+            apply_post(&[PostSpec::Sort(keys.clone())], rows.clone()),
+            by_comparator(&rows, &keys)
+        );
+    }
+
+    #[test]
+    fn a_limited_wide_sort_returns_the_full_sorts_prefix() {
+        let rows = wide_rows();
+        let keys = vec![(2usize, false), (0usize, true), (1usize, true)];
+        let full = by_comparator(&rows, &keys);
+        for need in [1, 17, 499, 500, 501] {
+            let got = apply_post(
+                &[PostSpec::Sort(keys.clone()), PostSpec::Limit(need as u64)],
+                rows.clone(),
+            );
+            assert_eq!(got, full[..need.min(full.len())].to_vec(), "limit {need}");
+        }
+    }
+
+    #[test]
+    fn a_text_key_sorts_ahead_of_the_string_it_prefixes() {
+        let names = ["ab", "", "a", "abc", "b", "a", "ab"];
+        let rows: Vec<Vec<Value>> = names
+            .iter()
+            .zip(0i64..)
+            .map(|(s, i)| vec![Value::Str((*s).into()), Value::Int(i)])
+            .collect();
+        for keys in [
+            vec![(0usize, true), (1usize, true)],
+            vec![(0usize, false), (1usize, true)],
+        ] {
+            assert_eq!(
+                key_width(&rows, &keys),
+                Some(12),
+                "three plus one and an id"
+            );
+            assert_eq!(
+                apply_post(&[PostSpec::Sort(keys.clone())], rows.clone()),
+                by_comparator(&rows, &keys)
+            );
+        }
+    }
+
+    #[test]
+    fn floats_bools_and_nodes_all_have_a_byte_form() {
+        let floats = [f64::NEG_INFINITY, -1.5, -0.0, 0.0, 1.5, f64::INFINITY];
+        let rows: Vec<Vec<Value>> = (0..24i64)
+            .map(|i| {
+                vec![
+                    Value::Float(floats[i as usize % floats.len()]),
+                    Value::Bool(i % 2 == 0),
+                    Value::Node {
+                        table: (i % 3) as u32,
+                        offset: (i % 4) as u64,
+                    },
+                ]
+            })
+            .collect();
+        for keys in [
+            vec![(0usize, true), (2usize, false)],
+            vec![(1usize, false), (0usize, false)],
+            vec![(2usize, true), (1usize, true), (0usize, true)],
+        ] {
+            assert!(key_width(&rows, &keys).is_some(), "keys {keys:?}");
+            assert_eq!(
+                apply_post(&[PostSpec::Sort(keys.clone())], rows.clone()),
+                by_comparator(&rows, &keys),
+                "keys {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shape_with_no_byte_form_falls_back_and_answers_the_same() {
+        let long = "l".repeat(NORM_STR_MAX + 1);
+        let sets = [
+            // A column of integers and floats mixed, which compares
+            // through f64 and has no fixed byte form.
+            vec![
+                vec![Value::Int(2), Value::Int(0)],
+                vec![Value::Float(1.5), Value::Int(1)],
+                vec![Value::Int(1), Value::Int(2)],
+            ],
+            // Text past what padding is worth.
+            vec![
+                vec![Value::Str(long.clone()), Value::Int(0)],
+                vec![Value::Str("a".into()), Value::Int(1)],
+            ],
+            // A type the key has no encoding for at all.
+            vec![
+                vec![Value::Null, Value::Int(0)],
+                vec![Value::Null, Value::Int(1)],
+            ],
+        ];
+        let keys = vec![(0usize, true), (1usize, true)];
+        for rows in sets {
+            assert_eq!(key_width(&rows, &keys), None, "{rows:?}");
+            assert_eq!(
+                apply_post(&[PostSpec::Sort(keys.clone())], rows.clone()),
+                by_comparator(&rows, &keys)
+            );
+        }
+    }
+
+    #[test]
+    fn an_order_by_wider_than_the_key_falls_back_too() {
+        let cols = NORM_MAX / 8 + 1;
+        let rows: Vec<Vec<Value>> = (0..40i64)
+            .map(|i| (0..cols as i64).map(|c| Value::Int((i * c) % 6)).collect())
+            .collect();
+        let fits: Vec<(usize, bool)> = (0..cols - 1).map(|c| (c, c % 2 == 0)).collect();
+        let over: Vec<(usize, bool)> = (0..cols).map(|c| (c, c % 2 == 0)).collect();
+        assert_eq!(
+            key_width(&rows, &fits),
+            Some(NORM_MAX),
+            "the last key that fits"
+        );
+        assert_eq!(key_width(&rows, &over), None, "one column too many");
+        assert_eq!(
+            apply_post(&[PostSpec::Sort(over.clone())], rows.clone()),
+            by_comparator(&rows, &over)
+        );
+    }
+
+    #[test]
+    fn an_empty_set_has_no_key_and_sorts_to_nothing() {
+        let rows: Vec<Vec<Value>> = Vec::new();
+        let keys = vec![(0usize, true)];
+        assert_eq!(key_width(&rows, &keys), None);
+        assert!(apply_post(&[PostSpec::Sort(keys)], rows).is_empty());
     }
 
     /// The workers' side of a bounded run: rows are dealt to `workers`

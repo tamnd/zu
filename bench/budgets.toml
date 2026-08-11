@@ -418,6 +418,27 @@ exec_group_mrows_s_core = 5.0
 # raise it.
 exec_sort_share_pct = 5.0
 
+# The rate a wide ORDER BY orders at, M rows/s (perf/05 section 5). The
+# same bench runs a hundred thousand row fan twice over: once ordered on
+# three integer columns, which is 24 bytes of normalized key and past
+# what one 128 bit word holds, and once ordered on a name with an id
+# behind it, which is not an integer key at all. Each is timed against
+# the same projection with the ORDER BY taken off, so the two timings
+# differ by the sort and nothing else, and the floor is the slower of
+# the two shapes so neither can slip while the other carries it.
+#
+# Measured at dcdcbbe, against the same bench with only sink.rs put back
+# to what main had: gamingpc 13.5 and 28.1 against 9.3 and 8.0, server1
+# 3.3 and 9.4 against 1.3 and 1.4. The three column key gains the least
+# because a 24 byte compare is a memcmp either way; the name key gains
+# the most because before this it was not a normalized key at all and
+# every compare walked a row of values.
+#
+# server1 sets the floor and it swings, 3.9 on one run and 3.3 on the
+# next inside the same hour, so the margin under it is that spread and
+# not slack. Raise this floor, never lower it.
+exec_sort_wide_mrows_s = 3.0
+
 # The unchained join table probed on distinct keys, M rows/s (perf/05
 # section 2): a million build rows, four million probes, every one of
 # them a hit. It floors the probe rather than the build because it is

@@ -186,9 +186,18 @@ ldbc_ic_p50_ms = 10.0
 # its crawl), information like their B4 numbers until those boxes
 # quiet down. The ceiling keeps headroom for server1 to gate again
 # when its service load lifts. Every measured run asserts the count
-# against a reference walked from the raw edge list. Lower this
-# ceiling, never raise it.
-ldbc_triangle_p50_ms = 600.0
+# against a reference walked from the raw edge list.
+#
+# P3 rewrote the closing intersect to run off borrowed pins with a
+# gallop and merge switch, and the ceiling comes down 600 to 150 with
+# it. Measured at 6b34892: gamingpc 8.28 and 8.42 ms, local M series
+# 10.08 to 10.71, server3 33.04, server1 49.05 quiet and 65.31 under
+# a load average of 5.9 on its 4 cores, server2 81.82. The two bare
+# metal hosts are inside the 25 ms perf/05 asks for; the shared vCPU
+# hosts are 4 to 8x behind that and the ceiling has to clear all of
+# them, so it sits at 150 with headroom over server1's worst p50
+# rather than at the target. Lower this ceiling, never raise it.
+ldbc_triangle_p50_ms = 150.0
 
 # Table function kernels on SF1 (docs/07 section 4, docs/12 M4), timed
 # directly against the loaded knows CSR: pagerank is 20 power
@@ -359,3 +368,42 @@ vec_unpack_gvals_s = 0.9
 # Nothing in the fleet is 8 quiet equal cores, so the floor sits under
 # server3's worst run. Raise this floor, never lower it.
 exec_scale_8x = 2.0
+
+# The grouping sink at one worker, M rows/s (perf/05 section 4): ten
+# million people scanned and grouped on an integer key into a hundred
+# thousand groups. It is the whole query, decode and scan and sink and
+# the final sort of the groups, because that is what a user waits for.
+#
+# perf/05 asks for 100 M rows/s/core and the bare metal hosts are
+# there: local M series 97 and 100, gamingpc 91 and 94. The shared
+# vCPU hosts are an order of magnitude behind, server1 9, server2 8,
+# server3 7, and it is not the sink. The same query grouped into
+# twelve groups, where the whole table fits in L1, runs 47 on server1
+# and 37 on server2 against 159 locally, so the gap is already there
+# before the group table is wide enough to miss. These boxes do not
+# have the memory bandwidth to feed one core a scan this size, and no
+# amount of work on the sink moves that. So the floor sits under
+# server3's worst run and the number that answers perf/05 is the bare
+# metal one. The bench crosschecks the group count and the row total
+# against the generator on every run. Raise this floor, never lower
+# it.
+exec_group_mrows_s_core = 5.0
+
+# What the ORDER BY costs on a query that already has one, percent
+# (perf/05 section 5). The bench runs the same ten thousand row fan
+# three ways, unordered, ordered with a LIMIT 10, and fully ordered,
+# and the share is what the ORDER BY and the LIMIT add over the plain
+# projection. perf/05 asks for under 5 percent.
+#
+# Measured at 6b34892: gamingpc 3.5 and 4.1, server2 4.1, local M
+# series 4.4 and 5.0, server3 6.7, server1 1.9 quiet and 9.4 loaded.
+# The spread is the measurement, not the sort. The share is a
+# difference of two timings a few milliseconds apart, so it carries
+# the noise of both, and on the loaded hosts that noise is bigger than
+# what is being measured: server1's fully ordered run came in at 11.29
+# ms against 11.58 for the top ten, which is the strictly larger job
+# finishing first. The ceiling therefore has to sit above the noise
+# rather than at the target, and the answer to perf/05 is the quiet
+# host median of 4 percent. The top ten rows are crosschecked against
+# a reference sort on every run. Lower this ceiling, never raise it.
+exec_sort_share_pct = 15.0

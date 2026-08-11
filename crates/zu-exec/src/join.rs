@@ -68,6 +68,13 @@ const ROWS_PER_BUCKET: usize = 1;
 /// the group table settled on for the same dependent-load problem.
 const PREFETCH: usize = 8;
 
+/// How far past the keys it addresses the first directory has to be
+/// before the table is seated again in one sized for them. Four, so
+/// that a build side with the odd duplicate in it keeps the directory
+/// it already has and only a genuinely duplicate-heavy one pays for a
+/// second seating.
+const FIT_SLACK: usize = 4;
+
 /// Bits of a directory word given to the offset. The rest is the tag.
 const PTR_BITS: u32 = 48;
 const PTR_MASK: u64 = (1 << PTR_BITS) - 1;
@@ -153,7 +160,10 @@ impl JoinTable {
         // Pass two, scatter into bucket order and collect the tags. The
         // cursor walks a copy of the offsets so `dir` keeps the starts.
         let mut cursor: Vec<u64> = dir[..buckets].to_vec();
-        let mut tags = vec![0u64; buckets];
+        // A tag is 16 bits, and this is written at random, so it is held
+        // at its own width: a word apiece would put four times the pages
+        // under the scatter's random writes for no more information.
+        let mut tags = vec![0u16; buckets];
         let mut sorted_keys = vec![0u64; n];
         let mut sorted_payload = vec![0u64; n];
         for i in 0..n {
@@ -163,79 +173,96 @@ impl JoinTable {
             cursor[b] += 1;
             sorted_keys[at] = keys[i];
             sorted_payload[at] = payload[i];
-            tags[b] |= tag_bits(h);
+            tags[b] |= tag_bits(h) as u16;
         }
 
-        // The scatter kept build order inside a bucket, so two distinct
-        // keys that hashed to the same bucket are interleaved there, and
-        // a lookup walking one contiguous run would stop at the first
-        // foreign key and miss the rest of its own. Order each bucket by
-        // key so that a key's rows are one range again. Buckets hold
-        // about a row each and a bucket that is already ordered, which
-        // is nearly all of them and every bucket holding one key however
-        // many times, costs the scan and nothing more.
+        // Pass three, one walk over the buckets that orders each one and
+        // then collapses it, since both halves want the same bucket in
+        // cache at the same moment.
+        //
+        // Ordering first: the scatter kept build order inside a bucket,
+        // so two distinct keys that hashed to the same bucket are
+        // interleaved there, and a lookup walking one contiguous run
+        // would stop at the first foreign key and miss the rest of its
+        // own. Sorting the bucket by key makes a key's rows one range
+        // again. Buckets hold about a row each and a bucket that is
+        // already ordered, which is nearly all of them and every bucket
+        // holding one key however many times, costs the scan and nothing
+        // more.
+        //
+        // Collapsing second: a key's rows are one run of the payload
+        // now, and that run can be described once instead of being spelt
+        // out again beside every row it holds. Keep the key once and
+        // where its run starts, and point the directory at those rather
+        // than at the rows, so that a probe compares one key per distinct
+        // key in the bucket, which is usually one key, and takes the run
+        // bounds off two offsets rather than reading the rows to find
+        // where its own stop. The runs tile the payload in order, so the
+        // next key's offset is this key's end and one sentinel closes the
+        // last of them.
+        //
+        // The keys collapse in place, over the buffer the scatter filled.
+        // The write stays behind the read, because a bucket never keeps
+        // more keys than it holds rows, so the walk cannot reach a slot
+        // it has already overwritten. The tags fold in on the way past,
+        // and the directory sentinel keeps its bare offset because the
+        // last bucket's range has to end somewhere.
         let mut scratch: Vec<(u64, u64)> = Vec::new();
-        for b in 0..buckets {
-            let start = dir[b] as usize;
-            let end = dir[b + 1] as usize;
-            if end - start < 2 || sorted_keys[start..end].is_sorted() {
-                continue;
-            }
-            scratch.clear();
-            scratch.extend(
-                sorted_keys[start..end]
-                    .iter()
-                    .copied()
-                    .zip(sorted_payload[start..end].iter().copied()),
-            );
-            // Stable, so a key's payloads stay in build order.
-            scratch.sort_by_key(|(k, _)| *k);
-            for (i, (k, p)) in scratch.iter().enumerate() {
-                sorted_keys[start + i] = *k;
-                sorted_payload[start + i] = *p;
-            }
-        }
-
-        // Every bucket is ordered by key now, so a key's rows are one
-        // run of the payload, and that run can be described once instead
-        // of being spelt out again beside every row it holds. Keep the
-        // key once and where its run starts, and point the directory at
-        // those rather than at the rows: a probe then compares one key
-        // per distinct key in the bucket, which is usually one key, and
-        // takes the run bounds off the two offsets rather than reading
-        // the rows to find where its own stop. The runs tile the payload
-        // in order, so the next key's offset is this key's end and one
-        // sentinel closes the last of them. The tags fold in on the way
-        // past, and the directory sentinel keeps its bare offset because
-        // the last bucket's range has to end somewhere.
-        let mut keys = Vec::with_capacity(n);
+        let mut keys = sorted_keys;
         let mut at = Vec::with_capacity(n + 1);
-        let mut start = dir[0] as usize;
+        let mut kept = 0usize;
+        let mut start = 0usize;
         for b in 0..buckets {
             let end = dir[b + 1] as usize;
-            dir[b] = keys.len() as u64 | (tags[b] << PTR_BITS);
+            if end - start >= 2 && !keys[start..end].is_sorted() {
+                scratch.clear();
+                scratch.extend(
+                    keys[start..end]
+                        .iter()
+                        .copied()
+                        .zip(sorted_payload[start..end].iter().copied()),
+                );
+                // Stable, so a key's payloads stay in build order.
+                scratch.sort_by_key(|(k, _)| *k);
+                for (i, (k, p)) in scratch.iter().enumerate() {
+                    keys[start + i] = *k;
+                    sorted_payload[start + i] = *p;
+                }
+            }
+            dir[b] = kept as u64 | ((tags[b] as u64) << PTR_BITS);
             let mut row = start;
             while row < end {
-                let key = sorted_keys[row];
-                keys.push(key);
+                let key = keys[row];
+                keys[kept] = key;
                 at.push(row as u32);
+                kept += 1;
                 row += 1;
-                while row < end && sorted_keys[row] == key {
+                while row < end && keys[row] == key {
                     row += 1;
                 }
             }
             start = end;
         }
         debug_assert_eq!(start, n);
+        keys.truncate(kept);
         at.push(n as u32);
         dir[buckets] = keys.len() as u64;
-        if keys.len() * 2 <= n {
-            // A build side of mostly duplicates leaves both of these
-            // holding a multiple of what they need, which a probe would
-            // then carry around as untouched pages.
-            keys.shrink_to_fit();
-            at.shrink_to_fit();
+
+        // This directory was sized for the rows, and every row of a key
+        // beyond the first turned out to share one slot with it, so a
+        // build side of mostly duplicates has left it several times
+        // larger than the keys it addresses. A probe pays that size
+        // twice, once in the cache and TLB misses of a random walk over
+        // a mostly empty array, and once in the memory it holds for the
+        // whole life of the table. Seat the keys again in a directory
+        // sized for them.
+        if kept * FIT_SLACK <= buckets && std::env::var("ZU_JOIN_FIT").as_deref() != Ok("0") {
+            return seat(&keys, &at, &sorted_payload);
         }
+        // Short of that the buffers still hold what the rows asked for
+        // rather than what the keys did.
+        keys.shrink_to_fit();
+        at.shrink_to_fit();
 
         Self {
             dir,
@@ -255,6 +282,16 @@ impl JoinTable {
     /// can walk past in total.
     pub fn distinct(&self) -> usize {
         self.keys.len()
+    }
+
+    /// What the table holds, in bytes. Every probe worker shares the one
+    /// table, so this is paid once, but it is paid for as long as the
+    /// join runs.
+    pub fn bytes(&self) -> usize {
+        size_of_val(self.dir.as_slice())
+            + size_of_val(self.keys.as_slice())
+            + size_of_val(self.at.as_slice())
+            + size_of_val(self.payload.as_slice())
     }
 
     /// The payloads `key` matched, empty when it matched nothing.
@@ -344,6 +381,75 @@ impl JoinTable {
                 emit(i, row);
             }
         }
+    }
+}
+
+/// Seat already collapsed keys in a directory sized for the keys
+/// themselves, moving each key's run of rows with it.
+///
+/// This is the same counting sort the build runs, one bucket per key
+/// rather than one per row, and it needs no per-bucket ordering: the
+/// keys are distinct by the time they arrive here, so a probe that
+/// walks a bucket comparing keys does not care what order they sit in.
+/// The rows follow their key so that the runs still tile the payload in
+/// order, which is what lets a run's end be read off the next key's
+/// offset.
+fn seat(keys: &[u64], at: &[u32], payload: &[u64]) -> JoinTable {
+    let d = keys.len();
+    let buckets = d.next_power_of_two();
+    let mask = buckets as u64 - 1;
+
+    let mut hashes = vec![0u64; d];
+    hash_slice(keys, &mut hashes);
+    let mut dir = vec![0u64; buckets + 1];
+    for &h in &hashes {
+        dir[(h & mask) as usize] += 1;
+    }
+    let mut acc = 0u64;
+    for slot in &mut dir {
+        let count = *slot;
+        *slot = acc;
+        acc += count;
+    }
+    debug_assert_eq!(acc, d as u64);
+
+    // The keys move now, and each one takes a note of where its rows
+    // were, which the copy below turns into where they are.
+    let mut cursor: Vec<u64> = dir[..buckets].to_vec();
+    let mut tags = vec![0u16; buckets];
+    let mut seated = vec![0u64; d];
+    let mut was = vec![0u32; d];
+    let mut runs = vec![0u32; d];
+    for i in 0..d {
+        let h = hashes[i];
+        let b = (h & mask) as usize;
+        let slot = cursor[b] as usize;
+        cursor[b] += 1;
+        seated[slot] = keys[i];
+        was[slot] = at[i];
+        runs[slot] = at[i + 1] - at[i];
+        tags[b] |= tag_bits(h) as u16;
+    }
+    for (b, tag) in tags.into_iter().enumerate() {
+        dir[b] |= (tag as u64) << PTR_BITS;
+    }
+
+    let mut rows = Vec::with_capacity(payload.len());
+    let mut starts = Vec::with_capacity(d + 1);
+    for i in 0..d {
+        starts.push(rows.len() as u32);
+        let from = was[i] as usize;
+        rows.extend_from_slice(&payload[from..from + runs[i] as usize]);
+    }
+    starts.push(rows.len() as u32);
+    debug_assert_eq!(rows.len(), payload.len());
+
+    JoinTable {
+        dir,
+        keys: seated,
+        at: starts,
+        payload: rows,
+        mask,
     }
 }
 

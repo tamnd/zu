@@ -88,6 +88,16 @@ fn main() {
         "join: build {BUILD} rows in {build_ms:.2} ms, {:.0} M rows/s",
         BUILD as f64 / 1e3 / build_ms
     );
+    // The two tables hold the same rows and differ only in how many
+    // distinct keys those rows carry, so the gap between them is what
+    // the table costs for storing a key it has already stored.
+    println!(
+        "join: distinct table {:.1} MB over {} keys, duplicate table {:.1} MB over {} keys",
+        dtable.bytes() as f64 / 1e6,
+        dtable.distinct(),
+        htable.bytes() as f64 / 1e6,
+        htable.distinct()
+    );
 
     // Probe keys. Half of the distinct probe hits, because the build
     // side only covers the first BUILD strides.

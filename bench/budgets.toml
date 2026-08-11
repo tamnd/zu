@@ -434,27 +434,30 @@ exec_join_probe_mrows_s = 6.0
 # pool is 29 operators. Unlike everything else in this file these are
 # not timings: they fall out of the data and the estimator alone, so
 # they read the same on every host and any move in them is a change in
-# the optimizer. gamingpc and server1 both report p50 1.00, p90 16.37,
-# p99 16.37, max 23.76.
+# the optimizer. gamingpc and server1 both report p50 1.00, p90 2.10,
+# p99 2.34, max 23.76.
 #
-# perf/12 section 6 wants 2, 10, and 100. p50 and p99 are there and p90
-# is not, so its ceiling sits at today's number rather than at the
-# target: a ceiling holds ground, and the ground held is the shape of
-# the estimator as it stands. Property predicates used to be a table of
-# constants and that was the whole of the miss; the per column
-# statistics of perf/12 section 1 took p90 from 74.30 and p99 from
-# 114.39 down to where they are, and the degree sequence norms of the
-# same section took p50 from 1.17 and the worst operator from 45.89.
-# What is left is two things and neither is a property. The seeded hop
-# is 16.4 because the seed the corpus picks has 335 knows edges against
-# a mean of 16.8, and the parameter that names it is not known when the
-# plan is built, so the mean is the only honest answer a plan time
-# estimate has. The triangle close is 23.8 because the intersection
-# still treats the closing edge as independent of the two hops that
-# reached its endpoints. Lower these ceilings, never raise them.
+# perf/12 section 6 wants 2, 10, and 100, and all three are met. p90 and
+# p99 sat at 16.37 until the point seeded hop stopped guessing: three of
+# the twelve queries name their seed with a parameter, the seed SF1
+# hands them holds 335 knows edges against a mean of 16.8, and no plan
+# time estimate can know that because the plan is cached across
+# parameter values. The run has the value, so the step off a pinned seed
+# now reads that seed's degree off the offsets and reports it, which
+# took those three operators from 16.4 to 1.0 and p90 from 16.37 to
+# 2.10. Before that, property predicates were the whole of the miss:
+# the per column statistics of perf/12 section 1 took p90 from 74.30 and
+# p99 from 114.39, and the degree sequence norms of the same section
+# took p50 from 1.17 and the worst operator from 45.89.
+#
+# What is left is the triangle close at 23.8, which the intersection
+# still treats as independent of the two hops that reached its
+# endpoints. The ceilings below sit close to the measurements because
+# these numbers do not move with the host: any move at all is the
+# estimator changing. Lower these ceilings, never raise them.
 card_qerror_p50 = 1.2
-card_qerror_p90 = 18.0
-card_qerror_p99 = 18.0
+card_qerror_p90 = 3.0
+card_qerror_p99 = 3.0
 card_qerror_max = 26.0
 
 # Cardinality quality over graphs the bench generates itself (perf/12
@@ -466,19 +469,23 @@ card_qerror_max = 26.0
 # each, 75 operators in the pool. Deterministic like the SF1 numbers
 # above and for the same reason, so these read the same on every host.
 #
-# Measured p50 1.00, p90 1.02, max 611.29 on the Mac, gamingpc and
-# server1 alike. The max is the hub seeded hop: the seed picked has
-# 2372 knows edges against a mean under four, and the parameter naming
-# it is unknown at plan time, so the estimator can only offer the mean.
-# That is the same wall the SF1 seeded hop hits at 16.4, just on a
-# graph built to make it hurt. Second worst is the hub triangle at 447,
-# the independence assumption on the closing edge. Both close with the
-# dual run of perf/12 section 2.4 firing at runtime rather than with a
-# better plan time guess. Lower these ceilings, never raise them.
+# Measured p50 1.00, p90 1.02, max 447.43 on the Mac, gamingpc and
+# server1 alike. The max used to be the hub seeded hop at 611.29: that
+# shape gives node 3 2372 knows edges against a mean under four, and no
+# plan time estimate can know which node a parameter names. Reading the
+# pinned seed's own degree at run time took it to 1.0 and took the hub
+# p90 from 1.68 to 1.02. What is left on top is the hub triangle at
+# 447, the independence assumption on the closing edge, and that one
+# does want a better estimate rather than a better reader.
+#
+# There is no ceiling here anywhere near as tight as the SF1 ones above
+# because these shapes are built to be hostile on purpose, so the number
+# to watch is whether the max moves, not how large it is. Lower these
+# ceilings, never raise them.
 #
 # There is no budget line for bound violations on purpose. A ceiling is
 # a promise the join order DP is built on, so the bench fails on the
 # first one whether the run is gated or not, and no number of wrong
 # ceilings is worth writing down here as acceptable.
 card_gen_qerror_p90 = 1.2
-card_gen_qerror_max = 650.0
+card_gen_qerror_max = 500.0

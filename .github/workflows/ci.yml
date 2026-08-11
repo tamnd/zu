@@ -47,7 +47,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The CLI bin and the C API cdylib are both called zu, so on MSVC
+      # they want the same zu.pdb and the linker fails with LNK1201 when
+      # they get there together. Renaming either one changes what users
+      # type or what they link against, so the debug info goes instead;
+      # nothing on this job reads it.
       - run: cargo test --workspace --all-features
+        env:
+          CARGO_PROFILE_DEV_DEBUG: ${{ matrix.os == 'windows-latest' && '0' || 'true' }}
 
   membudget:
     runs-on: ubuntu-latest

@@ -5,17 +5,37 @@
 //! perform zero heap allocations once the arena owns its blocks. This is
 //! its own integration test binary so the allocator shim cannot distort
 //! any other test.
+//!
+//! The count is per thread, not per process. A global allocator sees
+//! every thread, and the test harness runs the body on a worker while
+//! its own thread is alive; on a loaded machine that thread lands an
+//! allocation inside the measured window and the gate fails on
+//! somebody else's work. Counting only the thread doing the loop
+//! measures the loop.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 struct Counting;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Const-initialized and Copy, so the slot itself neither allocates
+    // on first touch nor registers a destructor. Anything else here
+    // would recurse into the allocator being counted.
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn bump() {
+    let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+}
+
+fn allocs() -> usize {
+    ALLOCS.with(Cell::get)
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        bump();
         unsafe { System.alloc(layout) }
     }
 
@@ -24,7 +44,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        bump();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -49,14 +69,20 @@ fn steady_state_morsel_loop_allocates_nothing() {
         kernels::sum_i64(&v, Some(&sel))
     };
 
+    // The counter has to be able to see a heap allocation on this
+    // thread, or the gate below passes by measuring nothing.
+    let sighted = allocs();
+    drop(std::hint::black_box(vec![0u8; 64]));
+    assert!(allocs() > sighted, "the counter is not counting");
+
     // Warm up: the arena grows its blocks here.
     let expected = run(&mut arena);
 
-    let before = ALLOCS.load(Ordering::Relaxed);
+    let before = allocs();
     for _ in 0..100 {
         assert_eq!(run(&mut arena), expected);
     }
-    let after = ALLOCS.load(Ordering::Relaxed);
+    let after = allocs();
     assert_eq!(
         after - before,
         0,

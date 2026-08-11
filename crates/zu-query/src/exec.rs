@@ -270,8 +270,32 @@ pub struct OpProfile {
     /// Values produced across all pulls. Rows over pulls is the
     /// average vector length, the factorization stat.
     pub rows: u64,
+    /// The rows those values stand for with the factorization
+    /// multiplied out: on a chain it equals `rows`, on a star it is
+    /// the product over every vector still unflat beside this one.
+    pub flat: u64,
+    /// What the optimizer expected this operator to produce, when the
+    /// operator is one that produces rows at all. `None` for the
+    /// source, the flattens, and the optional brackets, which pass
+    /// their input through and have no cardinality of their own.
+    pub est: Option<f64>,
     /// Self time in nanoseconds, child time excluded.
     pub nanos: u64,
+}
+
+impl OpProfile {
+    /// The q-error of this operator's estimate, `max(est/act, act/est)`
+    /// (perf/12 §4). Both sides are floored at one row: a zero actual
+    /// against an estimate of 3 is an error of 3, not of infinity, and
+    /// an operator nobody pulled has no error at all.
+    pub fn qerror(&self) -> Option<f64> {
+        let est = self.est?.max(1.0);
+        if self.pulls == 0 {
+            return None;
+        }
+        let act = (self.flat as f64).max(1.0);
+        Some((est / act).max(act / est))
+    }
 }
 
 /// One stage of a profiled run: the operator pipeline bottom-up plus
@@ -303,9 +327,19 @@ fn fmt_time(nanos: u64) -> String {
 }
 
 impl Profile {
+    /// Every operator's q-error across every stage, unordered. This is
+    /// what `zu bench cardinality` accumulates into percentiles.
+    pub fn qerrors(&self) -> Vec<f64> {
+        self.stages
+            .iter()
+            .flat_map(|s| s.ops.iter().filter_map(OpProfile::qerror))
+            .collect()
+    }
+
     /// Renders one block per stage: the sink with its row count and
     /// wall time, then each operator top-down with pulls, rows, the
-    /// average vector length per pull, and self time.
+    /// estimate and its q-error where there is one, the average vector
+    /// length per pull, and self time.
     pub fn render(&self) -> String {
         let mut out = String::new();
         for (ix, stage) in self.stages.iter().enumerate() {
@@ -323,11 +357,17 @@ impl Profile {
                 } else {
                     op.rows as f64 / op.pulls as f64
                 };
+                let est = match (op.est, op.qerror()) {
+                    (Some(e), Some(q)) => format!("  est {:>9}  q {q:>6.1}", e.round() as i64),
+                    (Some(e), None) => format!("  est {:>9}  q      -", e.round() as i64),
+                    (None, _) => "  est         -  q      -".to_string(),
+                };
                 out.push_str(&format!(
-                    "  {:width$}  pulls {:>6}  rows {:>8}  avg {:>7.1}  self {}\n",
+                    "  {:width$}  pulls {:>6}  rows {:>8}  flat {:>9}{est}  avg {:>7.1}  self {}\n",
                     op.name,
                     op.pulls,
                     op.rows,
+                    op.flat,
                     avg,
                     fmt_time(op.nanos),
                 ));
@@ -820,6 +860,10 @@ struct SinkDef {
 #[derive(Debug, Clone)]
 struct StageDef {
     descs: Vec<OpDesc>,
+    /// The optimizer's row estimate for each operator, `None` where no
+    /// logical operator owns it (the source, the optional brackets,
+    /// the flattens the builder inserts on its own).
+    est: Vec<Option<f64>>,
     /// Slots of each chunk, in column order.
     chunk_slots: Vec<Vec<usize>>,
     slot_loc: BTreeMap<usize, (usize, usize)>,
@@ -830,6 +874,14 @@ struct StageDef {
 
 struct StageBuilder {
     descs: Vec<OpDesc>,
+    /// Estimates in lockstep with `descs`. Every push and every removal
+    /// goes through [`StageBuilder::push`] and
+    /// [`StageBuilder::remove`] so the two vectors cannot drift.
+    est: Vec<Option<f64>>,
+    /// The estimate operators pushed right now inherit: the logical
+    /// operator being compiled owns everything the compiler emits for
+    /// it, flattens included.
+    cur_est: Option<f64>,
     chunk_slots: Vec<Vec<usize>>,
     chunk_flat: Vec<bool>,
     slot_loc: BTreeMap<usize, (usize, usize)>,
@@ -849,6 +901,8 @@ impl StageBuilder {
     fn new(flat: bool, wcoj: Wcoj, shapes: BTreeMap<usize, Vec<usize>>) -> Self {
         StageBuilder {
             descs: Vec::new(),
+            est: Vec::new(),
+            cur_est: None,
             chunk_slots: Vec::new(),
             chunk_flat: Vec::new(),
             slot_loc: BTreeMap::new(),
@@ -857,6 +911,18 @@ impl StageBuilder {
             wcoj,
             shapes,
         }
+    }
+
+    /// Appends an operator, tagging it with the estimate of whichever
+    /// logical operator is being compiled.
+    fn push(&mut self, desc: OpDesc) {
+        self.descs.push(desc);
+        self.est.push(self.cur_est);
+    }
+
+    fn remove(&mut self, ix: usize) {
+        self.descs.remove(ix);
+        self.est.remove(ix);
     }
 
     /// Closes a slot set over path shapes: a path variable this stage
@@ -886,7 +952,7 @@ impl StageBuilder {
 
     fn ensure_flat(&mut self, chunk: usize) {
         if !self.chunk_flat[chunk] {
-            self.descs.push(OpDesc::Flatten { chunk });
+            self.push(OpDesc::Flatten { chunk });
             self.chunk_flat[chunk] = true;
             self.compactable = None;
         }
@@ -1137,9 +1203,9 @@ fn compile_match_op(
             let consumed = fused.is_some();
             let chunk = b.new_chunk(vec![*slot], false);
             if let Some(key) = fused {
-                b.descs.push(OpDesc::IndexLookup { tables, key, chunk });
+                b.push(OpDesc::IndexLookup { tables, key, chunk });
             } else {
-                b.descs.push(OpDesc::Scan { tables, chunk });
+                b.push(OpDesc::Scan { tables, chunk });
             }
             b.produced(chunk);
             Ok(consumed)
@@ -1176,7 +1242,7 @@ fn compile_match_op(
             {
                 let (rel2, probe, probe_dir, probe_step) = fused;
                 let chunk = b.new_chunk(vec![*to, *rel, rel2], false);
-                b.descs.push(OpDesc::MultiwayIntersect {
+                b.push(OpDesc::MultiwayIntersect {
                     seed: *from,
                     seed_dir: *direction,
                     seed_step: rels[0],
@@ -1203,7 +1269,7 @@ fn compile_match_op(
                     )));
                 }
                 let chunk = b.new_chunk(vec![*to, *rel], false);
-                b.descs.push(OpDesc::VarExpand {
+                b.push(OpDesc::VarExpand {
                     from: *from,
                     direction: *direction,
                     rels,
@@ -1227,7 +1293,7 @@ fn compile_match_op(
                 if *asp {
                     // The retain fusion is decided by the stage-level
                     // rewrite once every downstream reference is known.
-                    b.descs.push(OpDesc::AspJoin {
+                    b.push(OpDesc::AspJoin {
                         from: *from,
                         to: *to,
                         direction: *direction,
@@ -1236,7 +1302,7 @@ fn compile_match_op(
                         retain: None,
                     });
                 } else {
-                    b.descs.push(OpDesc::ExpandInto {
+                    b.push(OpDesc::ExpandInto {
                         from: *from,
                         to: *to,
                         direction: *direction,
@@ -1246,7 +1312,7 @@ fn compile_match_op(
                 }
             } else {
                 let chunk = b.new_chunk(vec![*to, *rel], false);
-                b.descs.push(OpDesc::Expand {
+                b.push(OpDesc::Expand {
                     from: *from,
                     direction: *direction,
                     rels,
@@ -1270,7 +1336,7 @@ fn compile_match_op(
                     None
                 }
             };
-            b.descs.push(OpDesc::Filter {
+            b.push(OpDesc::Filter {
                 expr: expr.clone(),
                 compact,
             });
@@ -1290,6 +1356,7 @@ fn compile_optional_group(
     start: usize,
     query: &BoundQuery,
     schema: &Schema,
+    est: &[f64],
 ) -> Result<usize> {
     let group = optional_group(linear[start]);
     let mut end = start + 1;
@@ -1320,7 +1387,10 @@ fn compile_optional_group(
         }
     }
     let begin = b.descs.len();
-    b.descs.push(OpDesc::OptionalBegin);
+    // The brackets belong to no logical operator, so they carry no
+    // estimate and the profile leaves their column blank.
+    b.cur_est = None;
+    b.push(OpDesc::OptionalBegin);
     // Nothing below the boundary may compact through the group, and
     // nothing above may compact through the `OptionalEnd`.
     b.compactable = None;
@@ -1332,12 +1402,19 @@ fn compile_optional_group(
         } else {
             None
         };
+        b.cur_est = est.get(i).copied();
+        let before = b.descs.len();
         if compile_match_op(b, linear[i], lookahead, query, schema)? {
+            let fused = est.get(i + 1).copied();
+            for slot in &mut b.est[before..] {
+                *slot = fused;
+            }
             i += 1;
         }
         i += 1;
     }
-    b.descs.push(OpDesc::OptionalEnd {
+    b.cur_est = None;
+    b.push(OpDesc::OptionalEnd {
         begin,
         chunks: (first_chunk..b.chunk_slots.len()).collect(),
     });
@@ -1514,7 +1591,7 @@ fn rewrite_count_expand(
             if let OpDesc::AspJoin { retain, .. } = &mut b.descs[t] {
                 *retain = Some(f);
             }
-            b.descs.remove(t - 1);
+            b.remove(t - 1);
             b.chunk_flat[f] = false;
             fused = true;
             break;
@@ -1602,7 +1679,7 @@ fn rewrite_count_expand(
         *a = absorb;
     }
     if absorb.is_some() {
-        b.descs.remove(target - 1);
+        b.remove(target - 1);
     }
 }
 
@@ -1643,14 +1720,21 @@ fn build_stages(
             (slot, read)
         })
         .collect();
+    // One estimate per linearized operator, in the same bottom-up
+    // order, so `est[i]` belongs to `linear[i]`. The optimizer is the
+    // only thing that knows these numbers and it does not write them
+    // onto the plan, so ask it again here.
+    let est = crate::optimizer::estimates(plan, query, schema);
+
     let mut stages = Vec::new();
     let mut b = StageBuilder::new(options.flat, options.wcoj, shapes.clone());
-    b.descs.push(OpDesc::Source);
+    b.push(OpDesc::Source);
 
     let mut i = 0;
     while i < linear.len() {
+        b.cur_est = est.get(i).copied();
         if optional_group(linear[i]).is_some() {
-            i = compile_optional_group(&mut b, &linear, i, query, schema)?;
+            i = compile_optional_group(&mut b, &linear, i, query, schema, &est)?;
             continue;
         }
         match linear[i] {
@@ -1658,7 +1742,15 @@ fn build_stages(
             LogicalPlan::ScanNodes { .. }
             | LogicalPlan::Expand { .. }
             | LogicalPlan::Filter { .. } => {
+                let before = b.descs.len();
                 if compile_match_op(&mut b, linear[i], linear.get(i + 1).copied(), query, schema)? {
+                    // The lookahead filter fused into the scan, so the
+                    // one operator left standing produces the filtered
+                    // count, not the scan's.
+                    let fused = est.get(i + 1).copied();
+                    for slot in &mut b.est[before..] {
+                        *slot = fused;
+                    }
                     i += 1;
                 }
             }
@@ -1667,7 +1759,7 @@ fn build_stages(
                     b.ensure_flat(c);
                 }
                 let chunk = b.new_chunk(vec![*slot], false);
-                b.descs.push(OpDesc::Unwind {
+                b.push(OpDesc::Unwind {
                     expr: expr.clone(),
                     chunk,
                 });
@@ -1682,7 +1774,7 @@ fn build_stages(
                 ..
             } => {
                 let chunk = b.new_chunk(slots.clone(), false);
-                b.descs.push(OpDesc::TableFunction {
+                b.push(OpDesc::TableFunction {
                     func: *func,
                     rel: *rel,
                     table: *table,
@@ -1773,6 +1865,7 @@ fn build_stages(
                 };
                 stages.push(StageDef {
                     descs: std::mem::take(&mut b.descs),
+                    est: std::mem::take(&mut b.est),
                     chunk_slots: std::mem::take(&mut b.chunk_slots),
                     slot_loc: std::mem::take(&mut b.slot_loc),
                     unflat,
@@ -1789,7 +1882,7 @@ fn build_stages(
                     }
                     b = StageBuilder::new(options.flat, options.wcoj, shapes.clone());
                     let chunk = b.new_chunk(slots, false);
-                    b.descs.push(OpDesc::RowSource { chunk });
+                    b.push(OpDesc::RowSource { chunk });
                     b.produced(chunk);
                 }
             }
@@ -1849,6 +1942,10 @@ struct OpState {
 struct OpStats {
     pulls: u64,
     rows: u64,
+    /// The rows those values stand for once the factorization is
+    /// multiplied out, from [`flat_rows`]. This is the number an
+    /// estimate is judged against.
+    flat: u64,
     nanos: u64,
 }
 
@@ -1922,6 +2019,10 @@ struct StageCtx<'a> {
     morsel: Option<Morsel>,
     /// One entry per operator when profiling, empty otherwise.
     stats: Vec<OpStats>,
+    /// The chunks still unflat at each operator, from [`live_unflat`].
+    /// Filled only when profiling, and only so the flat row count can
+    /// be accumulated.
+    live: Vec<Vec<usize>>,
 }
 
 fn value_of(ctx: &mut StageCtx, slot: usize) -> Result<Value> {
@@ -2020,6 +2121,92 @@ fn degree_sum(
         }
     }
     Ok(total)
+}
+
+/// The chunks still unflat at each operator, replayed off the final
+/// operator list so no bookkeeping can drift out of sync with the
+/// fusions that rewrite it.
+///
+/// This is what turns a per-pull vector width into a row count.
+/// `rows` counts the values one operator emitted, but under
+/// factorization the rows those values stand for is the product over
+/// every vector still unflat beside them, which is exactly the
+/// cartesian product the sink walks. On a plain chain the set is the
+/// producer's own chunk and the product is the vector width again, so
+/// nothing changes; on a star, where one hop's vector stays unflat
+/// while the next hop runs, it is the difference between counting the
+/// second hop's neighbors and counting the paths.
+fn live_unflat(descs: &[OpDesc]) -> Vec<Vec<usize>> {
+    let mut unflat: BTreeSet<usize> = BTreeSet::new();
+    let mut out = Vec::with_capacity(descs.len());
+    for desc in descs {
+        match desc {
+            // A flatten pins one position, so the chunk stops
+            // multiplying from here up.
+            OpDesc::Flatten { chunk } => {
+                unflat.remove(chunk);
+            }
+            // The retained probe hands its chunk back unflat: the
+            // survivors are a vector again.
+            OpDesc::AspJoin {
+                retain: Some(f), ..
+            } => {
+                unflat.insert(*f);
+            }
+            // An absorbing expand reads the whole source vector in one
+            // pull and puts the sum over all of it in its own chunk, so
+            // the source stops multiplying here even though no flatten
+            // stands in front of it. The fusion removed that flatten.
+            OpDesc::Expand {
+                chunk,
+                absorb: Some(f),
+                ..
+            } => {
+                unflat.remove(f);
+                unflat.insert(*chunk);
+            }
+            OpDesc::RowSource { chunk }
+            | OpDesc::Scan { chunk, .. }
+            | OpDesc::IndexLookup { chunk, .. }
+            | OpDesc::Expand { chunk, .. }
+            | OpDesc::VarExpand { chunk, .. }
+            | OpDesc::ExpandInto { chunk, .. }
+            | OpDesc::AspJoin { chunk, .. }
+            | OpDesc::MultiwayIntersect { chunk, .. }
+            | OpDesc::Unwind { chunk, .. }
+            | OpDesc::TableFunction { chunk, .. } => {
+                unflat.insert(*chunk);
+            }
+            OpDesc::Source | OpDesc::Filter { .. } | OpDesc::OptionalBegin => {}
+            OpDesc::OptionalEnd { .. } => {}
+        }
+        out.push(unflat.iter().copied().collect());
+    }
+    out
+}
+
+/// The rows one successful pull stands for: the product of every
+/// vector still unflat at this operator. An empty set is one row,
+/// which is what a flatten or the source produces.
+fn flat_rows(ctx: &StageCtx, i: usize) -> u64 {
+    ctx.live[i]
+        .iter()
+        .map(|&c| ctx.chunks[c].size as u64)
+        .product()
+}
+
+/// Whether this operator's flat row count is an output cardinality an
+/// estimate can be judged against. The source, the flattens, and the
+/// optional brackets pass rows through without producing any, so
+/// their count belongs to whatever is under them.
+fn counts_rows(desc: &OpDesc) -> bool {
+    !matches!(
+        desc,
+        OpDesc::Source
+            | OpDesc::Flatten { .. }
+            | OpDesc::OptionalBegin
+            | OpDesc::OptionalEnd { .. }
+    )
 }
 
 /// How many values one successful pull produced: chunk producers
@@ -2332,11 +2519,13 @@ fn next(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
     let got = step(descs, ctx, i)?;
     let nanos = start.elapsed().as_nanos() as u64;
     let rows = if got { produced_rows(descs, ctx, i) } else { 0 };
+    let flat = if got { flat_rows(ctx, i) } else { 0 };
     let s = &mut ctx.stats[i];
     s.nanos += nanos;
     if got {
         s.pulls += 1;
         s.rows += rows;
+        s.flat = s.flat.saturating_add(flat);
     }
     Ok(got)
 }
@@ -3946,6 +4135,7 @@ fn drive_worker(
         isect: BTreeMap::new(),
         morsel: None,
         stats: Vec::new(),
+        live: Vec::new(),
     };
     let mut out = Vec::new();
     while let Some((ix, morsel)) = find_task(local, injector, stealers) {
@@ -4046,6 +4236,7 @@ fn run_stage_parallel(
         isect: BTreeMap::new(),
         morsel: None,
         stats: Vec::new(),
+        live: Vec::new(),
     };
     let mut rows = Vec::new();
     if sink.aggregate {
@@ -4097,6 +4288,13 @@ fn stage_profile(
             name: op_name(&stage.descs[i], stage, query, schema),
             pulls: s.pulls,
             rows: s.rows,
+            flat: s.flat,
+            est: stage
+                .est
+                .get(i)
+                .copied()
+                .flatten()
+                .filter(|_| counts_rows(&stage.descs[i])),
             nanos: s.nanos.saturating_sub(child),
         });
     }
@@ -4181,6 +4379,11 @@ fn run_stages(
             morsel: None,
             stats: if profile.is_some() {
                 vec![OpStats::default(); stage.descs.len()]
+            } else {
+                Vec::new()
+            },
+            live: if profile.is_some() {
+                live_unflat(&stage.descs)
             } else {
                 Vec::new()
             },
@@ -5437,6 +5640,7 @@ mod tests {
             isect: BTreeMap::new(),
             morsel: None,
             stats: Vec::new(),
+            live: Vec::new(),
         };
         let rels = [RelStep {
             id: 2,

@@ -40,6 +40,7 @@ zu copy --from follows.parquet --to social.zu1 --table Follows --reorder degree
 zu convert social.db social.zu1    # engine ↔ engine
 zu verify social.zu1               # CRC/structure audit
 zu stat social.zu1                 # sizes, encodings, bits/edge, cache stats
+zu analyze social.zu1              # rebuild the optimizer's COLOR summaries (§07 §6)
 zu bench ldbc --sf 1 --engine zu1  # built-in benchmark harness (§11)
 zu s3 gc s3://bucket/graphs/social # manual GC / checkpoint / inspect manifest
 zu mcp social.zu1                  # MCP server over stdio (2026 table stakes)

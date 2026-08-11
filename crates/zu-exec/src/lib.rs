@@ -23,6 +23,7 @@
 
 mod compile;
 mod group;
+pub mod join;
 mod pool;
 mod run;
 mod sink;

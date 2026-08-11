@@ -14,5 +14,9 @@ zu-common.workspace = true
 zu-vector.workspace = true
 zu-query.workspace = true
 
+[[bench]]
+name = "join"
+harness = false
+
 [lints]
 workspace = true

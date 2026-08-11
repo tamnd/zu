@@ -547,14 +547,20 @@ type CardQuery = (&'static str, &'static str, Vec<(&'static str, Value)>);
 /// selectivities are the part of the estimator that is still a table
 /// of constants and the numbers should say so out loud.
 ///
+/// Every operator that carries a pessimistic ceiling is also held
+/// against it. A ceiling is a promise and not a guess, so real rows
+/// above one is a bug in the bound and perf/12 §6 makes it a hard
+/// fail whatever the percentiles say.
+///
 /// Profiled runs are sequential by construction, so this phase is
 /// about estimate quality and says nothing about speed. Returns the
-/// p50, p90, p99, and worst of the pooled q-errors.
+/// p50, p90, p99, and worst of the pooled q-errors, plus the number of
+/// violated ceilings.
 fn run_cardinality(
     path: &std::path::Path,
     by_row: &[u64],
     profiles: &ProfileRows,
-) -> (f64, f64, f64, f64) {
+) -> (f64, f64, f64, f64, usize) {
     let mut db = Zu1File::open(path).expect("open");
 
     // Literals lifted out of the loaded data so every predicate below
@@ -631,12 +637,22 @@ fn run_cardinality(
     ];
 
     let mut all = Vec::new();
+    let mut violations = 0usize;
     for (name, source, params) in &corpus {
         let borrowed: Vec<(&str, Value)> = params.iter().map(|(k, v)| (*k, v.clone())).collect();
         let profile = zu::query::profile(source, &mut db, &borrowed).expect("profile");
         let mut worst: Option<(f64, String, f64, u64)> = None;
         for stage in &profile.stages {
             for op in &stage.ops {
+                if op.bound_violation() {
+                    violations += 1;
+                    println!(
+                        "sf1 cardinality {name}: BOUND VIOLATION at {}, ceiling {:.0} vs {} actual",
+                        op.name,
+                        op.bnd.unwrap_or_default(),
+                        op.flat
+                    );
+                }
                 let (Some(q), Some(est)) = (op.qerror(), op.est) else {
                     continue;
                 };
@@ -657,11 +673,11 @@ fn run_cardinality(
     let pick = |pct: usize| all[(all.len() - 1) * pct / 100];
     let (p50, p90, p99, max) = (pick(50), pick(90), pick(99), all[all.len() - 1]);
     println!(
-        "sf1 cardinality: {} operators over {} queries, q-error p50 {p50:.2}, p90 {p90:.2}, p99 {p99:.2}, max {max:.2}",
+        "sf1 cardinality: {} operators over {} queries, q-error p50 {p50:.2}, p90 {p90:.2}, p99 {p99:.2}, max {max:.2}, {violations} bound violations",
         all.len(),
         corpus.len(),
     );
-    (p50, p90, p99, max)
+    (p50, p90, p99, max, violations)
 }
 
 /// The M4 table function kernels over the loaded file (docs/07 §4):
@@ -838,7 +854,7 @@ fn main() {
     let triangle_p50 = run_triangle_count(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
-    let (q50, q90, q99, qmax) = run_cardinality(&path, &by_row, &profiles);
+    let (q50, q90, q99, qmax, violations) = run_cardinality(&path, &by_row, &profiles);
     let (pagerank_s, wcc_s, sssp_s, louvain_s) = run_table_functions(&path, &edges, node_count);
 
     let mut failed = false;
@@ -876,6 +892,13 @@ fn main() {
         && ic_p50 > ceiling
     {
         println!("GATE FAIL IC friends-of-friends: p50 {ic_p50:.3} ms > ceiling {ceiling}");
+        failed = true;
+    }
+    // No budget line for this one. A ceiling the data walks straight
+    // through is wrong, and there is no number of wrong ceilings worth
+    // writing down as acceptable.
+    if violations > 0 {
+        println!("GATE FAIL cardinality: {violations} bound violations, ceilings must hold");
         failed = true;
     }
     for (name, got, key) in [

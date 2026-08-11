@@ -82,6 +82,10 @@ pub(crate) enum Op {
         dirs: Dirs,
         from: usize,
         to: usize,
+        /// Whether the descent may carry whole vectors instead of one
+        /// source row's neighbors. Set by `batch_expands` once the
+        /// pipeline is final, false while the plan is still growing.
+        batch: bool,
     },
     /// The WCOJ close (docs/07 section 4, perf/05 section 3): the
     /// expand that would build the closing node and the probe back
@@ -193,6 +197,49 @@ pub(crate) enum SinkSpec {
         items: Vec<ScalarRef>,
         post: Vec<PostSpec>,
     },
+}
+
+/// Whether anything the sink reads sits on `level`.
+fn sink_reads(sink: &SinkSpec, level: usize) -> bool {
+    let named = |r: &ScalarRef| r.level() == level;
+    match sink {
+        SinkSpec::Count => false,
+        SinkSpec::Agg { keys, aggs, .. } => {
+            keys.iter().any(named) || aggs.iter().filter_map(AggSpec::arg).any(|r| named(&r))
+        }
+        SinkSpec::Rows { items, .. } => items.iter().any(named),
+    }
+}
+
+/// Marks the expands that may descend on whole vectors.
+///
+/// An expand pins one source row at a time because the pin is how
+/// everything above the expand knows which row the neighbors below
+/// belong to. When nothing above reads that level, the pin carries no
+/// information and the row by row descent is pure overhead: on an
+/// average social degree the pipeline below runs on a dozen rows at a
+/// time instead of the 2048 it is written for. Those expands
+/// concatenate neighbor lists across source rows instead, which is the
+/// same rows in the same order, just handed down in full vectors.
+///
+/// Only the expand's own level matters. Levels under it stay pinned by
+/// the expands that built them, so a probe or a projection reaching
+/// past this one is none of this decision's business.
+fn batch_expands(ops: &mut [Op], sink: &SinkSpec) {
+    for i in 0..ops.len() {
+        let Op::Expand { from, .. } = ops[i] else {
+            continue;
+        };
+        let probed = ops[i + 1..].iter().any(|op| match op {
+            Op::Intersect { probe_level, .. } | Op::Semi { probe_level, .. } => {
+                *probe_level == from
+            }
+            _ => false,
+        });
+        if let Op::Expand { batch, .. } = &mut ops[i] {
+            *batch = !probed && !sink_reads(sink, from);
+        }
+    }
 }
 
 /// Compiles a plan, `Ok(None)` for any shape not covered yet.
@@ -364,6 +411,7 @@ impl Compiler<'_> {
                         dirs,
                         from: src,
                         to: to_level,
+                        batch: false,
                     });
                 }
                 Some(LogicalPlan::Expand {
@@ -508,6 +556,7 @@ impl Compiler<'_> {
                 dirs,
                 from,
                 to,
+                ..
             }) = ops.last()
             {
                 if !self.levels[*to].cols.is_empty() || step_from.is_some_and(|f| f != *from) {
@@ -561,6 +610,8 @@ impl Compiler<'_> {
                 _ => {}
             }
         }
+
+        batch_expands(&mut ops, &sink);
 
         Ok(Some(ExecPlan {
             table,
@@ -622,6 +673,7 @@ impl Compiler<'_> {
             dirs: Dirs::One(built_dir),
             from: built_from,
             to: built_to,
+            ..
         } = ops.last()?
         else {
             return None;
@@ -1190,5 +1242,102 @@ fn expand_dirs(
         // No side applies: the old engine yields empty configs here;
         // rare enough to leave with the oracle.
         (false, false) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hop(from: usize, to: usize) -> Op {
+        Op::Expand {
+            rel: 0,
+            dirs: Dirs::One(Dir::Fwd),
+            from,
+            to,
+            batch: false,
+        }
+    }
+
+    fn batched(ops: &[Op]) -> Vec<bool> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Expand { batch, .. } => Some(*batch),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_expand_batches_when_nothing_above_reads_its_source() {
+        let mut ops = vec![hop(0, 1), hop(1, 2)];
+        batch_expands(&mut ops, &SinkSpec::Count);
+        assert_eq!(batched(&ops), [true, true], "a bare count reads no level");
+
+        let mut ops = vec![hop(0, 1), hop(1, 2)];
+        batch_expands(
+            &mut ops,
+            &SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 2 }],
+                post: Vec::new(),
+            },
+        );
+        assert_eq!(
+            batched(&ops),
+            [true, true],
+            "the projected level is the one the last expand builds, not the one it walks off"
+        );
+    }
+
+    #[test]
+    fn an_expand_whose_source_is_read_above_it_keeps_its_pin() {
+        let mut ops = vec![hop(0, 1), hop(1, 2)];
+        batch_expands(
+            &mut ops,
+            &SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 1 }],
+                post: Vec::new(),
+            },
+        );
+        assert_eq!(
+            batched(&ops),
+            [true, false],
+            "level 1 is projected, so the expand that walks off it stays row at a time"
+        );
+
+        let mut ops = vec![
+            hop(0, 1),
+            hop(1, 2),
+            Op::Semi {
+                rel: 0,
+                dirs: Dirs::One(Dir::Fwd),
+                probe_level: 1,
+            },
+        ];
+        batch_expands(&mut ops, &SinkSpec::Count);
+        assert_eq!(
+            batched(&ops),
+            [true, false],
+            "the semi join probes level 1 through its pin"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_argument_counts_as_a_read() {
+        let mut ops = vec![hop(0, 1), hop(1, 2)];
+        batch_expands(
+            &mut ops,
+            &SinkSpec::Agg {
+                item_agg: vec![true],
+                keys: Vec::new(),
+                aggs: vec![AggSpec::Sum(ScalarRef::Col {
+                    level: 1,
+                    vec: 1,
+                    ty: ColType::Int,
+                })],
+                post: Vec::new(),
+            },
+        );
+        assert_eq!(batched(&ops), [true, false], "sum reads level 1 per path");
     }
 }

@@ -415,6 +415,8 @@ pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
                     binder::ColorSummary {
                         counts: c.counts.clone(),
                         triples: c.triples.clone(),
+                        epoch: c.epoch,
+                        edges: c.edges,
                     },
                 ))
             })

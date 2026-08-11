@@ -15,7 +15,7 @@ use crate::colors::ColorSummary;
 use crate::file::Zu1File;
 use crate::meta;
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// The most colors one summary may carry (docs/07 §6).
 pub const COLOR_CAP: usize = 1024;
@@ -122,6 +122,8 @@ impl Stats {
                 out.extend_from_slice(&edges.to_le_bytes());
                 out.extend_from_slice(&dmax.to_le_bytes());
             }
+            out.extend_from_slice(&summary.map_or(0, |s| s.epoch).to_le_bytes());
+            out.extend_from_slice(&summary.map_or(0, |s| s.edges).to_le_bytes());
         }
         out.extend_from_slice(&(self.cols.len() as u32).to_le_bytes());
         for (table, cols) in &self.cols {
@@ -236,8 +238,21 @@ impl Stats {
                     }
                     triples.push((f, t, u64_at(payload, &mut at)?, u64_at(payload, &mut at)?));
                 }
+                // Versions 2 to 4 predate the staleness stamp. Zeros
+                // read as unstamped, and an unstamped summary is taken
+                // at face value: there is nothing to compare it to.
+                let (mut epoch, mut edges) = (0, 0);
+                if version >= 5 {
+                    epoch = u64_at(payload, &mut at)?;
+                    edges = u64_at(payload, &mut at)?;
+                }
                 if color_count > 0 {
-                    colors = Some(ColorSummary { counts, triples });
+                    colors = Some(ColorSummary {
+                        counts,
+                        triples,
+                        epoch,
+                        edges,
+                    });
                 }
             }
             rels.insert(
@@ -610,6 +625,8 @@ mod tests {
                 colors: Some(ColorSummary {
                     counts: vec![3, 6],
                     triples: vec![(0, 1, 9, 4), (1, 1, 2, 1)],
+                    epoch: 12,
+                    edges: 11,
                 }),
             },
         );
@@ -778,6 +795,42 @@ mod tests {
         let decoded = Stats::decode(&payload).expect("decode v2");
         assert_eq!(decoded.rels[&4].out_hist, [7]);
         assert!(decoded.cols.is_empty());
+    }
+
+    #[test]
+    fn version_four_summaries_decode_without_a_staleness_stamp() {
+        // A version 4 chain as PR #88 wrote it: norms, then a color
+        // section that stops after the triples. One color and one pair
+        // so the summary is really there and it is only the stamp that
+        // is missing.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        for _ in 0..9 {
+            payload.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&5u64.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        for word in [0u32, 0] {
+            payload.extend_from_slice(&word.to_le_bytes());
+        }
+        for count in [7u64, 3] {
+            payload.extend_from_slice(&count.to_le_bytes());
+        }
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let decoded = Stats::decode(&payload).expect("decode v4");
+        let summary = decoded.rels[&4].colors.as_ref().expect("summary");
+        assert_eq!(summary.triples, [(0, 0, 7, 3)]);
+        assert_eq!(
+            (summary.epoch, summary.edges),
+            (0, 0),
+            "no stamp on a file written before it existed"
+        );
     }
 
     #[test]

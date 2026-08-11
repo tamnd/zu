@@ -279,6 +279,10 @@ pub struct OpProfile {
     /// source, the flattens, and the optional brackets, which pass
     /// their input through and have no cardinality of their own.
     pub est: Option<f64>,
+    /// The most rows the optimizer's ceiling allowed this operator,
+    /// when the statistics were there to set one. `flat` above this is
+    /// a bound violation and perf/12 §6 makes that a hard fail.
+    pub bnd: Option<f64>,
     /// Self time in nanoseconds, child time excluded.
     pub nanos: u64,
 }
@@ -288,6 +292,20 @@ impl OpProfile {
     /// (perf/12 §4). Both sides are floored at one row: a zero actual
     /// against an estimate of 3 is an error of 3, not of infinity, and
     /// an operator nobody pulled has no error at all.
+    /// Whether this operator produced more rows than the optimizer's
+    /// ceiling promised it could. Compared on the flattened count,
+    /// which is what the estimate stands for.
+    ///
+    /// The slack is there because the ceiling comes out of roots and
+    /// fractional powers: a table whose every node holds one edge has
+    /// an exact bound of `sqrt(n) * l2`, and in f64 that lands a
+    /// couple of ULPs under the edge count it is supposed to equal. A
+    /// real violation is a factor out, never a rounding.
+    pub fn bound_violation(&self) -> bool {
+        self.bnd
+            .is_some_and(|b| self.flat as f64 > b * (1.0 + 1e-9))
+    }
+
     pub fn qerror(&self) -> Option<f64> {
         let est = self.est?.max(1.0);
         if self.pulls == 0 {
@@ -362,8 +380,14 @@ impl Profile {
                     (Some(e), None) => format!("  est {:>9}  q      -", e.round() as i64),
                     (None, _) => "  est         -  q      -".to_string(),
                 };
+                // A violated ceiling is the one thing here that is a
+                // bug rather than a number, so it says so in words.
+                let over = match op.bound_violation() {
+                    true => format!("  BOUND {:>9}", op.bnd.unwrap_or_default().round() as i64),
+                    false => String::new(),
+                };
                 out.push_str(&format!(
-                    "  {:width$}  pulls {:>6}  rows {:>8}  flat {:>9}{est}  avg {:>7.1}  self {}\n",
+                    "  {:width$}  pulls {:>6}  rows {:>8}  flat {:>9}{est}  avg {:>7.1}  self {}{over}\n",
                     op.name,
                     op.pulls,
                     op.rows,
@@ -863,7 +887,7 @@ struct StageDef {
     /// The optimizer's row estimate for each operator, `None` where no
     /// logical operator owns it (the source, the optional brackets,
     /// the flattens the builder inserts on its own).
-    est: Vec<Option<f64>>,
+    est: Vec<Option<crate::optimizer::Estimate>>,
     /// Slots of each chunk, in column order.
     chunk_slots: Vec<Vec<usize>>,
     slot_loc: BTreeMap<usize, (usize, usize)>,
@@ -877,11 +901,11 @@ struct StageBuilder {
     /// Estimates in lockstep with `descs`. Every push and every removal
     /// goes through [`StageBuilder::push`] and
     /// [`StageBuilder::remove`] so the two vectors cannot drift.
-    est: Vec<Option<f64>>,
+    est: Vec<Option<crate::optimizer::Estimate>>,
     /// The estimate operators pushed right now inherit: the logical
     /// operator being compiled owns everything the compiler emits for
     /// it, flattens included.
-    cur_est: Option<f64>,
+    cur_est: Option<crate::optimizer::Estimate>,
     chunk_slots: Vec<Vec<usize>>,
     chunk_flat: Vec<bool>,
     slot_loc: BTreeMap<usize, (usize, usize)>,
@@ -1356,7 +1380,7 @@ fn compile_optional_group(
     start: usize,
     query: &BoundQuery,
     schema: &Schema,
-    est: &[f64],
+    est: &[crate::optimizer::Estimate],
 ) -> Result<usize> {
     let group = optional_group(linear[start]);
     let mut end = start + 1;
@@ -4284,17 +4308,19 @@ fn stage_profile(
     let mut ops = Vec::with_capacity(stats.len());
     for (i, s) in stats.iter().enumerate() {
         let child = if i == 0 { 0 } else { stats[i - 1].nanos };
+        let expected = stage
+            .est
+            .get(i)
+            .copied()
+            .flatten()
+            .filter(|_| counts_rows(&stage.descs[i]));
         ops.push(OpProfile {
             name: op_name(&stage.descs[i], stage, query, schema),
             pulls: s.pulls,
             rows: s.rows,
             flat: s.flat,
-            est: stage
-                .est
-                .get(i)
-                .copied()
-                .flatten()
-                .filter(|_| counts_rows(&stage.descs[i])),
+            est: expected.map(|e| e.est),
+            bnd: expected.and_then(|e| e.bnd),
             nanos: s.nanos.saturating_sub(child),
         });
     }
@@ -4457,6 +4483,27 @@ pub fn execute_profiled(
 mod tests {
     use super::*;
     use crate::binder::{NodeDef, RelDef};
+
+    #[test]
+    fn a_ceiling_is_violated_by_a_factor_and_never_by_a_rounding() {
+        let op = |flat, bnd| OpProfile {
+            name: "Expand".into(),
+            pulls: 1,
+            rows: flat,
+            flat,
+            est: Some(1.0),
+            bnd,
+            nanos: 0,
+        };
+        // The Holder terms are roots and fractional powers, so a bound
+        // that is exactly the edge count in real arithmetic comes back
+        // a couple of ULPs under it.
+        assert!(!op(20_000, Some(19_999.999_999_999_993)).bound_violation());
+        assert!(!op(20_000, Some(20_000.0)).bound_violation());
+        assert!(op(20_001, Some(20_000.0)).bound_violation());
+        // No statistics, no promise, so nothing to violate.
+        assert!(!op(u64::MAX, None).bound_violation());
+    }
 
     /// Six people, three places, eight KNOWS edges with exactly one
     /// directed triangle (0, 1, 2), and one place per person.

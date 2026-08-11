@@ -106,6 +106,18 @@ jobs:
       - run: cargo bench -p zu-vector --no-run
       - run: bench/check_asm.sh
 
+  cardinality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The perf/12 section 6 gate. Builds its own graphs, so unlike
+      # the LDBC bench it needs no dataset and runs here. Holds the
+      # q-error percentiles to bench/budgets.toml and fails on the
+      # first ceiling the data walks through.
+      - run: ZU_GATE=1 cargo bench -p zu --bench cardinality
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

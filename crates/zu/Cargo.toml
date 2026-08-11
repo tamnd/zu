@@ -48,6 +48,10 @@ harness = false
 name = "topn"
 harness = false
 
+[[bench]]
+name = "cardinality"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

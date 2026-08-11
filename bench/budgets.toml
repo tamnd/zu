@@ -455,3 +455,29 @@ card_qerror_p50 = 1.2
 card_qerror_p90 = 18.0
 card_qerror_p99 = 18.0
 card_qerror_max = 26.0
+
+# Cardinality quality over graphs the bench generates itself (perf/12
+# sections 4 and 6). SF1 is one graph with one degree distribution and
+# it is not in CI, so this gate varies the data instead of the queries:
+# a uniform graph where every node holds eight out-edges, a hub graph
+# where sixteen nodes hold half the edges, and a funnel where twenty
+# thousand nodes point at two hundred targets. Eleven queries run over
+# each, 75 operators in the pool. Deterministic like the SF1 numbers
+# above and for the same reason, so these read the same on every host.
+#
+# Measured p50 1.00, p90 1.02, max 611.29 on the Mac, gamingpc and
+# server1 alike. The max is the hub seeded hop: the seed picked has
+# 2372 knows edges against a mean under four, and the parameter naming
+# it is unknown at plan time, so the estimator can only offer the mean.
+# That is the same wall the SF1 seeded hop hits at 16.4, just on a
+# graph built to make it hurt. Second worst is the hub triangle at 447,
+# the independence assumption on the closing edge. Both close with the
+# dual run of perf/12 section 2.4 firing at runtime rather than with a
+# better plan time guess. Lower these ceilings, never raise them.
+#
+# There is no budget line for bound violations on purpose. A ceiling is
+# a promise the join order DP is built on, so the bench fails on the
+# first one whether the run is gated or not, and no number of wrong
+# ceilings is worth writing down here as acceptable.
+card_gen_qerror_p90 = 1.2
+card_gen_qerror_max = 650.0

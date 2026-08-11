@@ -183,7 +183,14 @@ pub(crate) fn submit<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) -> Pending {
         let mut jobs = q.jobs.lock().unwrap();
         jobs.push_back(wrapped);
         q.pending.fetch_add(1, Ordering::Relaxed);
-        if q.idle.load(Ordering::Relaxed) == 0 && q.workers.load(Ordering::Relaxed) < cap {
+        // Spawn while queued jobs outnumber the workers free to take
+        // them; comparing against zero here left one parked worker
+        // serving a whole batch alone, because idle only drops when a
+        // worker actually dequeues, long after this loop has pushed
+        // everything.
+        if q.pending.load(Ordering::Relaxed) > q.idle.load(Ordering::Relaxed)
+            && q.workers.load(Ordering::Relaxed) < cap
+        {
             q.workers.fetch_add(1, Ordering::Relaxed);
             std::thread::Builder::new()
                 .name("zu-exec-worker".into())

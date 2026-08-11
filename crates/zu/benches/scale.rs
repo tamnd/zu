@@ -7,12 +7,15 @@
 //! fresh in a tempdir. That width matters: the auto thread heuristic
 //! keeps single-group scans sequential because forking snapshots
 //! costs more than the scan, so the parallel path needs a table that
-//! actually earns it. Two queries run at 1 and 8 threads through the
-//! public zu::query::run path, a scan-filter-count and an
+//! actually earns it. Two queries run at 1, 2, 4, and 8 threads
+//! through the public zu::query::run path, a scan-filter-count and an
 //! expand-filter-count whose per-row gathers give workers real work
-//! beyond memory bandwidth. Every count is crosschecked against a
-//! reference computed from the raw age formula and edge list, and
-//! the 1-thread and 8-thread answers must agree exactly.
+//! beyond memory bandwidth. The intermediate counts separate executor
+//! scaling from the host ceiling: a machine with four fast cores and
+//! a slow scheduler flattens between 4 and 8, and that shows in the
+//! curve instead of hiding in one number. Every count is crosschecked
+//! against a reference computed from the raw age formula and edge
+//! list, and every thread count must return the same answer exactly.
 //!
 //! exec_scale_8x gates the expand query's speedup at 8 workers over
 //! one. The gate only arms on hosts with at least 8 cores; server1
@@ -123,23 +126,26 @@ fn main() {
     let scan_q = "MATCH (p:person) WHERE p.age > 499 RETURN count(p) AS n";
     let expand_q = "MATCH (a:person)-[:knows]->(b) WHERE b.age > 499 RETURN count(b) AS n";
 
-    let (scan_1, c) = measure(&mut db, scan_q, 1, 9);
-    assert_eq!(c, scan_ref, "scan count against the age formula");
-    let (scan_8, c) = measure(&mut db, scan_q, 8, 9);
-    assert_eq!(c, scan_ref, "parallel scan count against the age formula");
-    println!(
-        "scale scan-filter-count: 1 thread {scan_1:.2} ms, 8 threads {scan_8:.2} ms, {:.1}x, crosschecked",
-        scan_1 / scan_8
-    );
+    let curve = |db: &mut Zu1File, source: &str, reference: i64, what: &str| {
+        let mut base = 0.0;
+        let mut last = 0.0;
+        let mut line = format!("scale {what}:");
+        for threads in [1usize, 2, 4, 8] {
+            let (ms, c) = measure(db, source, threads, 9);
+            assert_eq!(c, reference, "{what} count at {threads} threads");
+            line.push_str(&format!(" {threads}t {ms:.2} ms,"));
+            if threads == 1 {
+                base = ms;
+            }
+            last = ms;
+        }
+        let scale = base / last;
+        println!("{line} {scale:.1}x at 8, crosschecked");
+        scale
+    };
 
-    let (exp_1, c) = measure(&mut db, expand_q, 1, 9);
-    assert_eq!(c, expand_ref, "expand count against the edge list");
-    let (exp_8, c) = measure(&mut db, expand_q, 8, 9);
-    assert_eq!(c, expand_ref, "parallel expand count against the edge list");
-    let scale = exp_1 / exp_8;
-    println!(
-        "scale expand-filter-count: 1 thread {exp_1:.2} ms, 8 threads {exp_8:.2} ms, {scale:.1}x, crosschecked"
-    );
+    curve(&mut db, scan_q, scan_ref, "scan-filter-count");
+    let scale = curve(&mut db, expand_q, expand_ref, "expand-filter-count");
 
     let gate = std::env::var("ZU_GATE").as_deref() == Ok("1");
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());

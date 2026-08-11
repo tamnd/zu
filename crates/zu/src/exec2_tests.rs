@@ -18,7 +18,9 @@ const N: u64 = 3000;
 
 /// A person table spanning three scan chunks with int and string
 /// props, and a knows graph dense enough that expands cross chunks in
-/// both directions.
+/// both directions. Person 1 is a hub with half the table as friends,
+/// so a seeded two-hop out of it is over the threshold where the
+/// executor splits the frontier across workers.
 fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
     let mut db = Zu1File::create(path).unwrap();
     let n = N as u32;
@@ -28,6 +30,15 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
         edges.push(((i * 13 + 5) % n, i));
         if i % 3 == 0 {
             edges.push((i, (i / 3) % n));
+        }
+        if i < 256 {
+            // A dense cluster, and person 1 knows all of it: the seed's
+            // two-hop frontier is then big enough that the executor
+            // splits it across workers.
+            for j in 0..32 {
+                edges.push((i, (i * 32 + j) % n));
+            }
+            edges.push((1, i));
         }
     }
     edges.sort_unstable();
@@ -114,9 +125,68 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (p:person) RETURN p.id AS id LIMIT 10",
         "MATCH (p:person) RETURN p.age AS age SKIP 5 LIMIT 7",
         "MATCH (p:person) RETURN DISTINCT p.age AS age",
+        // ORDER BY, on its own and fused with SKIP and LIMIT.
+        "MATCH (p:person) RETURN p.age AS age ORDER BY age",
+        "MATCH (p:person) RETURN p.age AS age ORDER BY age DESC LIMIT 10",
+        "MATCH (p:person) RETURN p.id AS id, p.name AS name ORDER BY name DESC, id",
+        "MATCH (p:person) WHERE p.age > 50 RETURN p.id AS id ORDER BY id DESC SKIP 3 LIMIT 5",
+        "MATCH (p:person) RETURN DISTINCT p.age AS age ORDER BY age DESC",
+        "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY age, name LIMIT 4",
+        // The cyclic close, which fuses into one intersection.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         RETURN a.id AS a, b.id AS b, c.id AS c",
+        // The same close with the scan at the far side: a filter on the
+        // closing node moves the scan there, and the intersection comes
+        // back with the two lists in the other order.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         WHERE c.age > 40 RETURN c.id AS c, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         WHERE c.age > 40 RETURN a.id AS a, b.id AS b, c.id AS c",
+        // The closes the intersection cannot take. An undirected close
+        // reads a list per side, so the optimizer leaves it a binary
+        // probe, and the pipeline answers it as a membership test
+        // against the end that is already pinned.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
+         RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
+         RETURN a.id AS a, b.id AS b, c.id AS c",
+        "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+         RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]-(c) \
+         WHERE c.age > 40 RETURN c.id AS c, count(*) AS n",
+        // The seeded shapes: the key index answers level 0, so these
+        // never scan. A key past the end of the table is no rows, not
+        // an error, and the pipeline still has to hand the sink an
+        // empty batch so the columns come back.
+        "MATCH (p:person {id: 42}) RETURN p.name AS name",
+        "MATCH (p:person) WHERE p.id = 42 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE id(p) = 42 RETURN p.age AS age",
+        "MATCH (p:person {id: 999999}) RETURN p.name AS name",
+        "MATCH (p:person {id: 999999}) RETURN count(p) AS n",
+        "MATCH (p:person {id: 42})-[:knows]->(b) RETURN count(b) AS n",
+        "MATCH (p:person {id: 42})-[:knows]->(b) RETURN b.id AS id ORDER BY id",
+        "MATCH (p:person {id: 42})-[:knows]->(b)-[:knows]->(c) \
+         WHERE c.age > 40 RETURN DISTINCT c.id AS id ORDER BY id LIMIT 20",
+        "MATCH (p:person {id: 42})-[:knows]->(b) RETURN b.age AS age, count(b) AS n",
+        // The hub, whose frontier is split across workers. Row order
+        // has to come back the same as one worker walking the list, so
+        // these run unordered as well as ordered.
+        "MATCH (p:person {id: 1})-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS n",
+        "MATCH (p:person {id: 1})-[:knows]->(b)-[:knows]->(c) RETURN c.id AS id",
+        "MATCH (p:person {id: 1})-[:knows]->(b)-[:knows]->(c) \
+         WHERE c.id <> 1 RETURN DISTINCT c.id AS id, c.name AS name ORDER BY id LIMIT 20",
+        "MATCH (p:person {id: 1})-[:knows]->(b)-[:knows]->(c) RETURN c.id AS id LIMIT 25",
+        "MATCH (p:person {id: 1})-[:knows]->(b)-[:knows]->(c) \
+         RETURN c.age AS age, count(c) AS n ORDER BY n DESC, age",
+        // An id compared against another column is not a seek, it is
+        // an ordinary filter over the scan.
+        "MATCH (p:person) WHERE p.id = p.age RETURN count(p) AS n",
         // Aggregation, keyed and bare.
         "MATCH (p:person) RETURN p.age AS age, count(p) AS n",
         "MATCH (p:person) RETURN p.name AS name, count(p) AS n",
+        "MATCH (p:person) RETURN p.age AS age, count(p) AS n ORDER BY n DESC, age LIMIT 5",
         "MATCH (p:person) WHERE p.age > 90 RETURN sum(p.score) AS s, min(p.age) AS lo, \
          max(p.age) AS hi, avg(p.score) AS m, count(p) AS n",
         "MATCH (p:person) WHERE p.age > 200 RETURN sum(p.score) AS s, min(p.age) AS lo",
@@ -149,7 +219,12 @@ fn unclaimed_shapes_fall_back() {
     let dir = tempfile::tempdir().unwrap();
     let (mut db, catalog, schema) = setup(&dir.path().join("fallback.zu1"));
     let fallback_queries = [
-        "MATCH (p:person) RETURN p.age AS age ORDER BY age",
+        // ORDER BY over something the projection does not return has
+        // no output column to read, so it stays with the old engine.
+        "MATCH (p:person) RETURN p.name AS name ORDER BY p.age",
+        // A sort inside a WITH orders rows the pipeline is not the
+        // last reader of, so the whole chain goes back.
+        "MATCH (p:person) WITH p.age AS age ORDER BY age LIMIT 5 RETURN age AS age",
         "MATCH (p:person) RETURN p.age + 1 AS b",
         "MATCH (p:person) RETURN collect(p.age) AS ages",
         "MATCH (p:person) RETURN count(DISTINCT p.age) AS n",
@@ -157,12 +232,10 @@ fn unclaimed_shapes_fall_back() {
         "MATCH (a:person)-[:knows*1..2]->(b) RETURN count(b) AS n",
         "OPTIONAL MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",
         "UNWIND [1, 2, 3] AS x RETURN x",
-        // An id point predicate is the shape the old engine seeks
-        // instead of scanning; the pipeline has no seek source, so
-        // claiming these would read the table to find one row.
-        "MATCH (p:person {id: 42}) RETURN p.name AS name",
-        "MATCH (p:person) WHERE p.id = 42 RETURN count(p) AS n",
-        "MATCH (p:person {id: 42})-[:knows]->(b) RETURN count(b) AS n",
+        // A seek key that is not an integer constant has no row to
+        // seek, and a scan to find one row costs more than the old
+        // engine's seek, so the shape goes back.
+        "MATCH (p:person {id: 'x'}) RETURN count(p) AS n",
     ];
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);
@@ -183,5 +256,5 @@ fn public_run_uses_the_pipeline_executor_transparently() {
         &[("src", Value::Int(3))],
     )
     .unwrap();
-    assert!(!r.rows.is_empty(), "the fallback path still answers");
+    assert!(!r.rows.is_empty(), "a seeded expand still answers");
 }

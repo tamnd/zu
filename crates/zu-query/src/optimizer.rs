@@ -882,7 +882,19 @@ fn order_component(
         best
     };
     let best = run(false).expect("connected component always has an order");
-    let best = if best.bnd.is_some() && best.bcost > BOUND_DISAGREEMENT * best.cost {
+    // Bound mode is there to catch an order whose estimate came out of
+    // guessed selectivities. A seed pinned by a primary key is not a
+    // guess, it is one row, so the estimate above it stands and the
+    // ceiling does not get to overrule it: the ceiling has to assume
+    // the worst node in the table at every hop, which reads as a
+    // blowup next to a full scan whose own ceiling caps out at the
+    // edge count, and the scan then wins an order of magnitude of
+    // real work.
+    let pinned_seed = match best.steps.first() {
+        Some(Step::Scan(slot)) => filters.iter().any(|f| key_point(f, *slot, query)),
+        _ => false,
+    };
+    let best = if !pinned_seed && best.bnd.is_some() && best.bcost > BOUND_DISAGREEMENT * best.cost {
         run(true).unwrap_or(best)
     } else {
         best

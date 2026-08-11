@@ -407,3 +407,22 @@ exec_group_mrows_s_core = 5.0
 # host median of 4 percent. The top ten rows are crosschecked against
 # a reference sort on every run. Lower this ceiling, never raise it.
 exec_sort_share_pct = 15.0
+
+# The unchained join table probed on distinct keys, M rows/s (perf/05
+# section 2): a million build rows, four million probes, every one of
+# them a hit. It floors the probe rather than the build or the
+# duplicate-heavy join because it is the shape with the least room to
+# hide, one directory word and one short range per row with nothing
+# amortized over a match list.
+#
+# Measured: local M series 78 to 93, gamingpc 77 to 79, server1 10. The
+# same probe on a std HashSet, which is what exec.rs uses today, is 1.1
+# to 2.1x slower on every host, and the miss probe that the folded
+# Bloom tag is actually there for is 2.0 to 3.5x slower. Those are the
+# two shapes this table was chosen for and it wins both. The
+# duplicate-heavy inner join does not win yet and is deliberately not
+# floored here, because a floor holds ground and there is no ground
+# held. Nothing compiles to a join yet either, so this gate guards a
+# primitive and not a query. The bench crosschecks every timed run
+# against a scan of the build side. Raise this floor, never lower it.
+exec_join_probe_mrows_s = 6.0

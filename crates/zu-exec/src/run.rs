@@ -100,11 +100,7 @@ struct Schedule {
 
 /// The driving scan, split into morsels, with the worker count the
 /// table size justifies.
-fn scan_work(
-    plan: &ExecPlan,
-    snap: &mut dyn Snapshot,
-    options: &Options,
-) -> Result<Schedule> {
+fn scan_work(plan: &ExecPlan, snap: &mut dyn Snapshot, options: &Options) -> Result<Schedule> {
     let total_rows = snap.table_rows(plan.table)?;
     let threads = match options.threads {
         // A scan under one storage group is a handful of morsels;
@@ -213,12 +209,7 @@ fn seek_work(
     }
     morsels.push((lo, list.len() as u64));
     Ok(Schedule {
-        work: Work::Frontier {
-            seed,
-            rel,
-            dir,
-            to,
-        },
+        work: Work::Frontier { seed, rel, dir, to },
         morsels,
         threads,
     })
@@ -528,12 +519,9 @@ impl<'a> Worker<'a> {
         match self.work {
             Work::Scan => self.scan_morsel(idx, range)?,
             Work::Seek(seed) => self.seek_morsel(seed)?,
-            Work::Frontier {
-                seed,
-                rel,
-                dir,
-                to,
-            } => self.frontier_morsel(seed, rel, dir, to, range)?,
+            Work::Frontier { seed, rel, dir, to } => {
+                self.frontier_morsel(seed, rel, dir, to, range)?
+            }
         }
         if rows_sink {
             let batch = std::mem::take(&mut self.sink.rows);

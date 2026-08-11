@@ -894,7 +894,8 @@ fn order_component(
         Some(Step::Scan(slot)) => filters.iter().any(|f| key_point(f, *slot, query)),
         _ => false,
     };
-    let best = if !pinned_seed && best.bnd.is_some() && best.bcost > BOUND_DISAGREEMENT * best.cost {
+    let best = if !pinned_seed && best.bnd.is_some() && best.bcost > BOUND_DISAGREEMENT * best.cost
+    {
         run(true).unwrap_or(best)
     } else {
         best

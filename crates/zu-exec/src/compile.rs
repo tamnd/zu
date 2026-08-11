@@ -5,9 +5,9 @@
 //! The supported shape today is the linear read pipeline: a single
 //! non-optional node scan, filters, single-hop expands that walk off
 //! the newest level, and one final Project or Aggregate with its
-//! absorbed Distinct, Skip, and Limit. Everything the old executor
-//! also covers, variable-length expands, optional groups, closing
-//! joins, unwind, table functions, sorts, and rel values, falls back.
+//! absorbed Distinct, Sort, Skip, and Limit. Everything the old
+//! executor also covers, variable-length expands, optional groups,
+//! closing joins, unwind, table functions, and rel values, falls back.
 //! The bar for anything compiled here is exact old-engine output:
 //! same rows, same order, same errors on overflow.
 
@@ -125,6 +125,10 @@ impl AggSpec {
 /// Post steps above the sink, in plan order.
 pub(crate) enum PostSpec {
     Distinct,
+    /// ORDER BY over output columns: the column each key reads and
+    /// whether it ascends. A key that names something the projection
+    /// does not output falls back to the old engine.
+    Sort(Vec<(usize, bool)>),
     Skip(u64),
     Limit(u64),
 }
@@ -330,8 +334,13 @@ impl Compiler<'_> {
                     };
                     post.push(PostSpec::Limit(n));
                 }
-                // ORDER BY and HAVING-style filters land with the
-                // parallel sort sink; fall back for now.
+                LogicalPlan::Sort { keys, .. } => {
+                    let Some(cols) = self.sort_cols(keys) else {
+                        return Ok(None);
+                    };
+                    post.push(PostSpec::Sort(cols));
+                }
+                // HAVING-style filters above the sink still fall back.
                 _ => return Ok(None),
             }
         }
@@ -472,6 +481,43 @@ impl Compiler<'_> {
             return None;
         }
         Some(items.iter().map(|it| it.aggregate).collect())
+    }
+
+    /// Resolves ORDER BY keys to output columns. A key either names a
+    /// projected item, which is how `ORDER BY alias` binds, or repeats
+    /// the item's own expression, which is how `ORDER BY p.name` binds
+    /// when p is still in scope. Anything else, an expression over a
+    /// column the query does not return, needs the key materialized
+    /// next to the row and goes back to the old engine.
+    fn sort_cols(&self, keys: &[(BoundExpr, bool)]) -> Option<Vec<(usize, bool)>> {
+        let BoundClause::Project { items, .. } = self.query.clauses.last()? else {
+            return None;
+        };
+        let mut cols = Vec::with_capacity(keys.len());
+        for (expr, asc) in keys {
+            let at = items.iter().position(|item| {
+                item.expr == *expr
+                    || matches!(expr, BoundExpr::Var(slot) if self.item_slot(item) == Some(*slot))
+            })?;
+            cols.push((at, *asc));
+        }
+        Some(cols)
+    }
+
+    /// The slot a projected item answers to after the projection, the
+    /// same rule the old engine's sink uses: WITH items carry it, RETURN
+    /// items lose theirs in the binder and get it back by name.
+    fn item_slot(&self, item: &BoundItem) -> Option<usize> {
+        if item.slot.is_some() {
+            return item.slot;
+        }
+        if let BoundExpr::Var(slot) = item.expr {
+            return Some(slot);
+        }
+        self.query
+            .variables
+            .iter()
+            .rposition(|v| v.name == item.name)
     }
 
     /// A SKIP or LIMIT count that is a plain non-negative integer.

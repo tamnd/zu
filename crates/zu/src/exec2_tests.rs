@@ -114,9 +114,17 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (p:person) RETURN p.id AS id LIMIT 10",
         "MATCH (p:person) RETURN p.age AS age SKIP 5 LIMIT 7",
         "MATCH (p:person) RETURN DISTINCT p.age AS age",
+        // ORDER BY, on its own and fused with SKIP and LIMIT.
+        "MATCH (p:person) RETURN p.age AS age ORDER BY age",
+        "MATCH (p:person) RETURN p.age AS age ORDER BY age DESC LIMIT 10",
+        "MATCH (p:person) RETURN p.id AS id, p.name AS name ORDER BY name DESC, id",
+        "MATCH (p:person) WHERE p.age > 50 RETURN p.id AS id ORDER BY id DESC SKIP 3 LIMIT 5",
+        "MATCH (p:person) RETURN DISTINCT p.age AS age ORDER BY age DESC",
+        "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY age, name LIMIT 4",
         // Aggregation, keyed and bare.
         "MATCH (p:person) RETURN p.age AS age, count(p) AS n",
         "MATCH (p:person) RETURN p.name AS name, count(p) AS n",
+        "MATCH (p:person) RETURN p.age AS age, count(p) AS n ORDER BY n DESC, age LIMIT 5",
         "MATCH (p:person) WHERE p.age > 90 RETURN sum(p.score) AS s, min(p.age) AS lo, \
          max(p.age) AS hi, avg(p.score) AS m, count(p) AS n",
         "MATCH (p:person) WHERE p.age > 200 RETURN sum(p.score) AS s, min(p.age) AS lo",
@@ -149,7 +157,12 @@ fn unclaimed_shapes_fall_back() {
     let dir = tempfile::tempdir().unwrap();
     let (mut db, catalog, schema) = setup(&dir.path().join("fallback.zu1"));
     let fallback_queries = [
-        "MATCH (p:person) RETURN p.age AS age ORDER BY age",
+        // ORDER BY over something the projection does not return has
+        // no output column to read, so it stays with the old engine.
+        "MATCH (p:person) RETURN p.name AS name ORDER BY p.age",
+        // A sort inside a WITH orders rows the pipeline is not the
+        // last reader of, so the whole chain goes back.
+        "MATCH (p:person) WITH p.age AS age ORDER BY age LIMIT 5 RETURN age AS age",
         "MATCH (p:person) RETURN p.age + 1 AS b",
         "MATCH (p:person) RETURN collect(p.age) AS ages",
         "MATCH (p:person) RETURN count(DISTINCT p.age) AS n",

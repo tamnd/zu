@@ -7,6 +7,7 @@
 //! plan order. Aggregate accumulators mirror the old `Acc` semantics
 //! including the empty-input rows and the sum overflow error.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use zu_common::{Result, ZuError};
@@ -150,9 +151,10 @@ pub(crate) struct SinkState {
 
 /// Post steps over materialized rows, exactly the old apply_post.
 pub(crate) fn apply_post(post: &[PostSpec], mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
-    for op in post {
+    for (at, op) in post.iter().enumerate() {
         match op {
             PostSpec::Distinct => rows = distinct(rows),
+            PostSpec::Sort(keys) => sort_rows(&mut rows, keys, needed_after(&post[at + 1..])),
             PostSpec::Skip(n) => {
                 let n = (*n as usize).min(rows.len());
                 rows.drain(..n);
@@ -163,32 +165,137 @@ pub(crate) fn apply_post(post: &[PostSpec], mut rows: Vec<Vec<Value>>) -> Vec<Ve
     rows
 }
 
-/// Group order: the OrdValue total order over the three types a
-/// grouping key can hold here, taken by reference. Sorting through
-/// OrdValue itself would mean cloning every key of every group, which
-/// on a hundred thousand groups costs more than the sort does.
-fn key_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+/// The OrdValue total order taken by reference. Ordering through
+/// OrdValue itself means cloning both values, which on a hundred
+/// thousand groups or a wide sort costs more than the compare does, so
+/// the types a sink actually produces are matched here and only the
+/// rest, lists and paths, pay the clone.
+fn val_cmp(x: &Value, y: &Value) -> Ordering {
+    match (x, y) {
+        (Value::Int(p), Value::Int(q)) => p.cmp(q),
+        (Value::Str(p), Value::Str(q)) => p.cmp(q),
+        (Value::Float(p), Value::Float(q)) => p.total_cmp(q),
+        (Value::Int(p), Value::Float(q)) => (*p as f64).total_cmp(q),
+        (Value::Float(p), Value::Int(q)) => p.total_cmp(&(*q as f64)),
+        (Value::Bool(p), Value::Bool(q)) => p.cmp(q),
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (
+            Value::Node {
+                table: t1,
+                offset: o1,
+            },
+            Value::Node {
+                table: t2,
+                offset: o2,
+            },
+        ) => (t1, o1).cmp(&(t2, o2)),
+        _ => OrdValue(x.clone()).cmp(&OrdValue(y.clone())),
+    }
+}
+
+/// Group order: the key columns compared left to right.
+fn key_cmp(a: &[Value], b: &[Value]) -> Ordering {
     for (x, y) in a.iter().zip(b) {
-        let ord = match (x, y) {
-            (Value::Int(p), Value::Int(q)) => p.cmp(q),
-            (Value::Str(p), Value::Str(q)) => p.cmp(q),
-            (
-                Value::Node {
-                    table: t1,
-                    offset: o1,
-                },
-                Value::Node {
-                    table: t2,
-                    offset: o2,
-                },
-            ) => (t1, o1).cmp(&(t2, o2)),
-            _ => OrdValue(x.clone()).cmp(&OrdValue(y.clone())),
-        };
-        if ord != std::cmp::Ordering::Equal {
+        let ord = val_cmp(x, y);
+        if ord != Ordering::Equal {
             return ord;
         }
     }
-    std::cmp::Ordering::Equal
+    Ordering::Equal
+}
+
+/// How many of the sorted rows the steps above the sort can still use.
+/// A SKIP of n under a LIMIT of k needs n + k of them and nothing more,
+/// which is what turns an ORDER BY under a LIMIT into a selection.
+fn needed_after(post: &[PostSpec]) -> usize {
+    let mut need = usize::MAX;
+    for op in post.iter().rev() {
+        need = match op {
+            PostSpec::Limit(k) => need.min(*k as usize),
+            PostSpec::Skip(n) => need.saturating_add(*n as usize),
+            _ => usize::MAX,
+        };
+    }
+    need
+}
+
+/// One order-preserving 128 bit key per row, when every sort column is
+/// an integer and there are no more than two of them. An i64 keeps its
+/// order as a u64 once the sign bit is flipped, and a descending column
+/// is that key inverted, so the tuple of them sorts as plain numbers.
+/// Sorting those beats sorting through the rows: the compare reads one
+/// contiguous array instead of chasing a Vec per row, and the pair
+/// carries the row position so equal keys keep their input order. This
+/// is the IS and IC shape, ORDER BY a date or a score with an id to
+/// break the ties.
+fn norm_keys(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<Vec<u128>> {
+    if keys.is_empty() || keys.len() > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut key = 0u128;
+        for (at, &(col, asc)) in keys.iter().enumerate() {
+            let Some(Value::Int(n)) = row.get(col) else {
+                return None;
+            };
+            let part = (*n as u64) ^ (1 << 63);
+            key |= u128::from(if asc { part } else { !part }) << (64 * (1 - at));
+        }
+        out.push(key);
+    }
+    Some(out)
+}
+
+/// ORDER BY over materialized rows, ordering the whole set only when
+/// something above wants the whole set. Under a LIMIT it partitions
+/// once around the k-th row and orders the surviving prefix, which is
+/// O(n) plus O(k log k) instead of O(n log n). The comparator breaks
+/// ties on the row's position so the answer is the stable sort's, the
+/// order the old engine's sort_by produces.
+fn sort_rows(rows: &mut Vec<Vec<Value>>, keys: &[(usize, bool)], need: usize) {
+    if let Some(norm) = norm_keys(rows, keys) {
+        let mut order: Vec<(u128, u32)> = norm.into_iter().zip(0u32..).collect();
+        if need < order.len() {
+            order.select_nth_unstable(need);
+            order.truncate(need);
+        }
+        order.sort_unstable();
+        let mut out = Vec::with_capacity(order.len());
+        for (_, i) in order {
+            out.push(std::mem::take(&mut rows[i as usize]));
+        }
+        *rows = out;
+        return;
+    }
+    let by_keys = |a: &Vec<Value>, b: &Vec<Value>| {
+        for &(col, asc) in keys {
+            let ord = val_cmp(&a[col], &b[col]);
+            let ord = if asc { ord } else { ord.reverse() };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    };
+    if need >= rows.len() {
+        rows.sort_by(by_keys);
+        return;
+    }
+    let mut order: Vec<u32> = (0..rows.len() as u32).collect();
+    {
+        let by = |x: &u32, y: &u32| {
+            by_keys(&rows[*x as usize], &rows[*y as usize]).then(x.cmp(y))
+        };
+        order.select_nth_unstable_by(need, by);
+        order.truncate(need);
+        order.sort_unstable_by(by);
+    }
+    let mut out = Vec::with_capacity(need);
+    for i in order {
+        out.push(std::mem::take(&mut rows[i as usize]));
+    }
+    *rows = out;
 }
 
 /// The key layout of a row set, or None when some column holds a type
@@ -345,5 +452,80 @@ pub(crate) fn finish_rows(
     QueryResult {
         columns,
         rows: apply_post(post, rows),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(vals: &[(i64, &str)]) -> Vec<Vec<Value>> {
+        vals.iter()
+            .map(|&(n, s)| vec![Value::Int(n), Value::Str(s.into())])
+            .collect()
+    }
+
+    const DATA: [(i64, &str); 7] = [
+        (3, "a"),
+        (1, "b"),
+        (3, "c"),
+        (2, "d"),
+        (1, "e"),
+        (2, "f"),
+        (3, "g"),
+    ];
+
+    #[test]
+    fn a_limited_sort_returns_the_full_sorts_prefix() {
+        let full = apply_post(&[PostSpec::Sort(vec![(0, true)])], rows(&DATA));
+        let top = apply_post(
+            &[PostSpec::Sort(vec![(0, true)]), PostSpec::Limit(3)],
+            rows(&DATA),
+        );
+        assert_eq!(top, full[..3].to_vec(), "ties keep their input order");
+    }
+
+    #[test]
+    fn skip_widens_what_the_selection_has_to_order() {
+        let want = apply_post(
+            &[
+                PostSpec::Sort(vec![(0, false)]),
+                PostSpec::Skip(2),
+                PostSpec::Limit(3),
+            ],
+            rows(&DATA),
+        );
+        let mut full = apply_post(&[PostSpec::Sort(vec![(0, false)])], rows(&DATA));
+        full.drain(..2);
+        full.truncate(3);
+        assert_eq!(want, full);
+    }
+
+    #[test]
+    fn later_keys_break_the_first_keys_ties() {
+        let got = apply_post(&[PostSpec::Sort(vec![(0, true), (1, false)])], rows(&DATA));
+        let names: Vec<&str> = got
+            .iter()
+            .map(|r| match &r[1] {
+                Value::Str(s) => s.as_str(),
+                other => panic!("expected a name, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["e", "b", "f", "d", "g", "c", "a"]);
+    }
+
+    #[test]
+    fn nothing_above_the_sort_means_the_whole_set_is_ordered() {
+        assert_eq!(needed_after(&[]), usize::MAX);
+        assert_eq!(needed_after(&[PostSpec::Limit(10)]), 10);
+        assert_eq!(needed_after(&[PostSpec::Skip(5), PostSpec::Limit(10)]), 15);
+        assert_eq!(needed_after(&[PostSpec::Skip(5)]), usize::MAX);
+        // A limit under a dedup still bounds the sort, a dedup under a
+        // limit does not: it can drop rows the limit then asks for.
+        assert_eq!(needed_after(&[PostSpec::Limit(10), PostSpec::Distinct]), 10);
+        assert_eq!(
+            needed_after(&[PostSpec::Distinct, PostSpec::Limit(10)]),
+            usize::MAX
+        );
     }
 }

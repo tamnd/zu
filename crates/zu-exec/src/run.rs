@@ -178,7 +178,9 @@ fn quota_of(post: &[PostSpec]) -> Option<u64> {
     let mut limit = None;
     for p in post {
         match p {
-            PostSpec::Distinct => return None,
+            // Ordered output has no early stop: the last row scanned
+            // can still sort into the answer.
+            PostSpec::Distinct | PostSpec::Sort(_) => return None,
             PostSpec::Skip(n) => skip = *n,
             PostSpec::Limit(n) => limit = Some(*n),
         }

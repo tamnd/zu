@@ -44,6 +44,10 @@ harness = false
 name = "groupby"
 harness = false
 
+[[bench]]
+name = "topn"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

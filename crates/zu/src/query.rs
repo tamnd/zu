@@ -496,10 +496,18 @@ pub(crate) fn env_options() -> exec::Options {
 }
 
 /// Executes one query with per-operator counters and returns the
-/// rendered EXPLAIN ANALYZE listing: pulls, rows, average vector
-/// length, and self time per operator, per stage. The grammar has no
-/// EXPLAIN keyword yet, so this is the API entry point.
+/// rendered EXPLAIN ANALYZE listing: pulls, rows, the estimate and its
+/// q-error, the average vector length, and self time per operator, per
+/// stage. The grammar has no EXPLAIN keyword yet, so this is the API
+/// entry point.
 pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<String> {
+    Ok(profile(source, db, params)?.render())
+}
+
+/// The same profiled run handing back the counters instead of the
+/// rendering. The cardinality phase of the LDBC bench reads q-error
+/// off this (perf/12 §4).
+pub fn profile(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<exec::Profile> {
     let p = prepare(source, db, params)?;
     let mut graph = Zu1Graph::new(db, p.catalog);
     let (_, profile) = exec::execute_profiled(
@@ -510,7 +518,7 @@ pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)])
         &p.args,
         &env_options(),
     )?;
-    Ok(profile.render())
+    Ok(profile)
 }
 
 #[cfg(test)]
@@ -880,6 +888,87 @@ mod tests {
         assert!(
             text.contains("ExpandCount (b)-[:follows]->(c)"),
             "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_profile_carries_the_estimate_beside_the_measured_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("qerror.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = (0..400u32).map(|i| (i % 97, (i * 7 + 3) % 89)).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let text = explain_analyze(
+            "MATCH (a:person)-[:follows]->(b) RETURN a.id, b.id",
+            &mut db,
+            &[],
+        )
+        .expect("explain analyze");
+        // The scan knows the table count exactly, so its estimate is
+        // the row count and its q-error is one. Degree histograms make
+        // the expand nearly exact on this shape too.
+        assert!(
+            text.contains("Scan a: person")
+                && text.contains("flat        97  est        97  q    1.0"),
+            "got:\n{text}"
+        );
+        // The source and the flattens report configurations per pull,
+        // not rows, so they must not claim an error.
+        for line in text
+            .lines()
+            .filter(|l| l.contains("Source") || l.contains("Flatten"))
+        {
+            assert!(line.contains("est         -  q      -"), "got:\n{text}");
+        }
+    }
+
+    #[test]
+    fn the_flat_count_is_the_path_count_not_the_vector_width() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("star.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = (0..400u32).map(|i| (i % 97, (i * 7 + 3) % 89)).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load");
+        drop(db);
+
+        // Two-hop paths through the middle node, in and out degree
+        // multiplied per middle and summed, which is what the plan is
+        // counting.
+        let mut indeg = [0u64; 97];
+        let mut outdeg = [0u64; 97];
+        for &(s, d) in &edges {
+            outdeg[s as usize] += 1;
+            indeg[d as usize] += 1;
+        }
+        let paths: u64 = (0..97).map(|v| indeg[v] * outdeg[v]).sum();
+        assert!(paths > 0);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let text = explain_analyze(
+            "MATCH (a:person)-[:follows]->(b)-[:follows]->(c) RETURN count(c) AS n",
+            &mut db,
+            &[],
+        )
+        .expect("explain analyze two hop");
+        // The optimizer starts at the middle and expands both ways, so
+        // the first hop's vector is still unflat while the second runs.
+        // The second hop's own row count is neighbours summed over the
+        // middles; the paths are that times the first hop's width, and
+        // it is the paths the estimate has to be held against.
+        let last = text
+            .lines()
+            .find(|l| l.contains("(b)-[:follows]->(c)") || l.contains("(b)<-[:follows]-(c)"))
+            .unwrap_or_else(|| panic!("no closing hop:\n{text}"));
+        assert!(
+            last.contains(&format!("flat {paths:>9}")),
+            "want flat {paths}, got:\n{text}"
         );
     }
 

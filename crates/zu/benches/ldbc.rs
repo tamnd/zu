@@ -21,7 +21,14 @@
 //! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
 //! ORDER BY, and LIMIT, p50 in ms. Every phase crosschecks against a
 //! reference computed from the raw files, so a number cannot come from
-//! a broken reader or a wrong plan. With ZU_GATE=1 the process exits
+//! a broken reader or a wrong plan.
+//!
+//! Cardinality is the odd one out: it times nothing. It runs a twelve
+//! query corpus profiled and pools the q-error of every operator whose
+//! estimate the optimizer committed to, which is the perf/12 section 4
+//! measurement. The numbers come out of the data and the estimator
+//! alone, so they are the same on every host and a move in them is a
+//! change in the optimizer, not weather. With ZU_GATE=1 the process exits
 //! nonzero when a ceiling in bench/budgets.toml is missed, and missing
 //! data fails the gate instead of skipping it.
 //!
@@ -528,6 +535,132 @@ fn run_ic_friends_of_friends(
     p50
 }
 
+/// Cardinality quality over the SF1 corpus (perf/12 §4): every query
+/// below runs profiled, and each operator whose measured row count is
+/// a real output cardinality contributes one q-error,
+/// `max(est/act, act/est)`. The corpus is the shapes this file already
+/// gates plus the property-predicate shapes, because the property
+/// selectivities are the part of the estimator that is still a table
+/// of constants and the numbers should say so out loud.
+///
+/// Profiled runs are sequential by construction, so this phase is
+/// about estimate quality and says nothing about speed. Returns the
+/// p50, p90, and p99 of the pooled q-errors.
+fn run_cardinality(
+    path: &std::path::Path,
+    by_row: &[u64],
+    profiles: &ProfileRows,
+) -> (f64, f64, f64) {
+    let mut db = Zu1File::open(path).expect("open");
+
+    // Literals lifted out of the loaded data so every predicate below
+    // matches something. `gender` has two values, `browserUsed` a
+    // handful, `firstName` thousands: three very different true
+    // selectivities against one assumed constant.
+    let seed = Value::Int(by_row[by_row.len() / 3] as i64);
+    let gender = Value::Str(profiles[0][2].clone());
+    let browser = Value::Str(profiles[0][5].clone());
+    let first = Value::Str(profiles[0][0].clone());
+    let birthday = Value::Str(profiles[by_row.len() / 2][3].clone());
+
+    let corpus: Vec<(&str, &str, Vec<(&str, Value)>)> = vec![
+        ("scan", "MATCH (p:person) RETURN count(p) AS n", vec![]),
+        (
+            "hop",
+            "MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",
+            vec![],
+        ),
+        (
+            "two-hop",
+            "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN count(c) AS n",
+            vec![],
+        ),
+        (
+            "triangle",
+            "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+             RETURN count(*) AS n",
+            vec![],
+        ),
+        (
+            "seeded-hop",
+            "MATCH (p:person {id: $id})-[:knows]->(f) RETURN count(f) AS n",
+            vec![("id", seed.clone())],
+        ),
+        (
+            "IC-fof",
+            "MATCH (p:person {id: $id})-[:knows]->(f)-[:knows]->(ff) \
+             WHERE ff.id <> $id \
+             RETURN DISTINCT ff.id AS id ORDER BY id LIMIT 20",
+            vec![("id", seed.clone())],
+        ),
+        (
+            "eq-gender",
+            "MATCH (p:person) WHERE p.gender = $v RETURN count(p) AS n",
+            vec![("v", gender)],
+        ),
+        (
+            "eq-browser",
+            "MATCH (p:person) WHERE p.browserUsed = $v RETURN count(p) AS n",
+            vec![("v", browser)],
+        ),
+        (
+            "eq-firstname",
+            "MATCH (p:person) WHERE p.firstName = $v RETURN count(p) AS n",
+            vec![("v", first.clone())],
+        ),
+        (
+            "range-birthday",
+            "MATCH (p:person) WHERE p.birthday < $v RETURN count(p) AS n",
+            vec![("v", birthday)],
+        ),
+        (
+            "eq-then-hop",
+            "MATCH (p:person)-[:knows]->(f) WHERE p.firstName = $v RETURN count(f) AS n",
+            vec![("v", first)],
+        ),
+        (
+            "seeded-hop-eq",
+            "MATCH (p:person {id: $id})-[:knows]->(f) WHERE f.gender = $v \
+             RETURN count(f) AS n",
+            vec![("id", seed), ("v", Value::Str(profiles[0][2].clone()))],
+        ),
+    ];
+
+    let mut all = Vec::new();
+    for (name, source, params) in &corpus {
+        let borrowed: Vec<(&str, Value)> = params.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let profile = zu::query::profile(source, &mut db, &borrowed).expect("profile");
+        let mut worst: Option<(f64, String, f64, u64)> = None;
+        for stage in &profile.stages {
+            for op in &stage.ops {
+                let (Some(q), Some(est)) = (op.qerror(), op.est) else {
+                    continue;
+                };
+                all.push(q);
+                if worst.as_ref().is_none_or(|(w, ..)| q > *w) {
+                    worst = Some((q, op.name.clone(), est, op.flat));
+                }
+            }
+        }
+        let (q, op, est, act) = worst.expect("every query has at least a scan");
+        println!(
+            "sf1 cardinality {name}: worst q {q:.1} at {op}, est {:.0} vs {act} actual",
+            est
+        );
+    }
+
+    all.sort_by(f64::total_cmp);
+    let pick = |pct: usize| all[(all.len() - 1) * pct / 100];
+    let (p50, p90, p99) = (pick(50), pick(90), pick(99));
+    println!(
+        "sf1 cardinality: {} operators over {} queries, q-error p50 {p50:.2}, p90 {p90:.2}, p99 {p99:.2}, max {:.2}",
+        all.len(),
+        corpus.len(),
+        all[all.len() - 1]
+    );
+    (p50, p90, p99)
+}
+
 /// The M4 table function kernels over the loaded file (docs/07 §4):
 /// pagerank, wcc, sssp, louvain timed as direct kernel calls, each
 /// crosschecked against an independent computation over the raw edge
@@ -702,6 +835,7 @@ fn main() {
     let triangle_p50 = run_triangle_count(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
+    let (q50, q90, q99) = run_cardinality(&path, &by_row, &profiles);
     let (pagerank_s, wcc_s, sssp_s, louvain_s) = run_table_functions(&path, &edges, node_count);
 
     let mut failed = false;
@@ -740,6 +874,18 @@ fn main() {
     {
         println!("GATE FAIL IC friends-of-friends: p50 {ic_p50:.3} ms > ceiling {ceiling}");
         failed = true;
+    }
+    for (name, got, key) in [
+        ("p50", q50, "card_qerror_p50"),
+        ("p90", q90, "card_qerror_p90"),
+        ("p99", q99, "card_qerror_p99"),
+    ] {
+        if let Some(ceiling) = budget(key)
+            && got > ceiling
+        {
+            println!("GATE FAIL cardinality q-error {name}: {got:.2} > ceiling {ceiling}");
+            failed = true;
+        }
     }
     for (name, secs, key) in [
         ("pagerank", pagerank_s, "ldbc_pagerank_s"),

@@ -426,3 +426,29 @@ exec_sort_share_pct = 15.0
 # primitive and not a query. The bench crosschecks every timed run
 # against a scan of the build side. Raise this floor, never lower it.
 exec_join_probe_mrows_s = 6.0
+
+# Cardinality quality over the SF1 corpus, q-error percentiles
+# (perf/12 section 4). Twelve queries run profiled, every operator that
+# carries an estimate contributes one max(est/act, act/est), and the
+# pool is 29 operators. Unlike everything else in this file these are
+# not timings: they fall out of the data and the estimator alone, so
+# they read the same on every host and any move in them is a change in
+# the optimizer. gamingpc, server1, and local M series all report p50
+# 1.17, p90 74.30, p99 114.39, max 117.01.
+#
+# perf/12 section 6 wants 2, 10, and 100. p50 is already there and the
+# p90 and p99 are not, so those two ceilings sit at today's numbers
+# rather than at the target: a ceiling holds ground, and the ground
+# held is the shape of the estimator as it stands. The misses are all
+# one thing. Structure is fine, the scan is exact, the hop is 1.2 and
+# the two hop is 1.8 off the degree histograms. Property predicates are
+# a table of constants, so every equality is assumed to keep a tenth of
+# the rows whatever the column: firstName has thousands of values and
+# the assumption is 114x too generous, while gender has two and it is
+# 4.9x too tight, and the same wrong tenth then feeds the hop below it
+# and comes out as the 117 on eq-then-hop. Nothing here moves without
+# real per property statistics, and when they land these two numbers
+# come down to the target. Lower these ceilings, never raise them.
+card_qerror_p50 = 2.0
+card_qerror_p90 = 80.0
+card_qerror_p99 = 120.0

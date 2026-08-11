@@ -24,21 +24,32 @@
 //! many loads in flight instead of one.
 //!
 //! What the bench actually says, so the next person does not have to
-//! rediscover it. Against the standard library, which is the shape
-//! `exec.rs` uses today, this wins the shapes the tag was put there for
-//! and loses the others. Misses run about 2x a `HashSet` probe, which is
-//! the antijoin and the mark join and is where the folded tag earns its
-//! bits. Distinct-key hits are a wash. The duplicate-heavy inner join,
-//! which is the shape perf/05 quotes the largest speedup on, is well
-//! behind a `HashMap<u64, Vec<u64>>`, because that layout checks a key
-//! once per probe and then reads a compact payload run, while this one
+//! rediscover it. The baseline is the standard library on the same keys,
+//! which is not a strawman: it is the shape `exec.rs` uses today.
+//!
+//! Misses run 2.0 to 3.5x a `HashSet` probe across the fleet. That is
+//! the antijoin and the mark join, and it is where the folded tag earns
+//! its bits, since a miss reads the directory word and stops. Hits on
+//! distinct keys run 1.1 to 2.1x. Both of those hold on every host, and
+//! the margin is widest on the slow ones, which is the right direction.
+//!
+//! Two things are behind. The duplicate-heavy inner join, which is the
+//! shape perf/05 quotes the largest number on, runs at a third of a
+//! `HashMap<u64, Vec<u64>>` everywhere. That layout checks a key once
+//! per probe and then reads a compact payload run, while this one
 //! carries the key beside every build row and re-checks it per row to
-//! find where the run ends. The build is also behind, by about 3x: the
-//! histogram and the scatter are both random access over a directory
-//! the size of the build side, and the write-combining radix pass
-//! perf/05 section 2 calls for is exactly the fix and is not written
-//! yet. None of that is load bearing until this is wired into a plan,
-//! which it is not.
+//! find where the run ends, so it moves twice the memory. Storing a run
+//! length per distinct key rather than repeating the key is the obvious
+//! answer and is not written. The build is behind on the fast hosts,
+//! 0.3x locally and 0.7x on gamingpc, and ahead on the slow ones, 1.8
+//! to 2.6x on server1: the histogram and the scatter are random access
+//! over a directory the size of the build side, so this is bandwidth
+//! against the standard library's slower per-key hash. The
+//! write-combining radix pass perf/05 section 2 calls for is the named
+//! fix for that half and is not written either.
+//!
+//! None of it is load bearing yet. Nothing compiles to a join, so this
+//! table is reachable only from its own tests and its own bench.
 
 use zu_vector::kernels::{hash_slice, hash64};
 

@@ -499,6 +499,11 @@ pub fn bulk_load_keyed(
     rev.sort_unstable();
     let bwd = build_direction(db, node_count, &rev)?;
     let in_hist = crate::stats::degree_histogram(&rev);
+    let norms = crate::stats::DegreeStats {
+        out: crate::stats::degree_norms(edges),
+        inn: crate::stats::degree_norms(&rev),
+        cross: crate::stats::degree_cross(edges, &rev),
+    };
     drop(rev);
     let row_counts = |g: u64| {
         let first_row = g * GROUP_ROWS as u64;
@@ -534,6 +539,7 @@ pub fn bulk_load_keyed(
         crate::stats::RelStats {
             out_hist,
             in_hist,
+            norms,
             colors: None,
         },
     );

@@ -58,7 +58,14 @@ pub fn optimize(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Resul
 /// row because grouped cardinality is unknown until the column catalog
 /// carries statistics, which only understates and keeps ExpandInto.
 fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalPlan, f64) {
-    mark_asp_walk(plan, query, schema, &mut BTreeMap::new(), &mut Vec::new())
+    mark_asp_walk(
+        plan,
+        query,
+        schema,
+        &mut BTreeMap::new(),
+        &mut Ceiling::default(),
+        &mut Vec::new(),
+    )
 }
 
 /// The per-operator row estimate the optimizer settled on, one entry
@@ -72,8 +79,58 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
 /// off `LogicalPlan` keeps plan equality meaning what it means today.
 pub fn estimates(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Vec<f64> {
     let mut out = Vec::new();
-    mark_asp_walk(plan.clone(), query, schema, &mut BTreeMap::new(), &mut out);
+    mark_asp_walk(
+        plan.clone(),
+        query,
+        schema,
+        &mut BTreeMap::new(),
+        &mut Ceiling::default(),
+        &mut out,
+    );
     out
+}
+
+/// The running pessimistic ceiling the marking walk carries, so the
+/// estimate it reports is clamped by the same bounds the DP ordered
+/// with (perf/12 §2.4). The DP clamps inside its own search and the
+/// walk runs afterwards over the plan the search picked, so without
+/// this the two disagree and it is the walk's number EXPLAIN prints.
+#[derive(Debug)]
+struct Ceiling {
+    /// None once any operator has no ceiling to offer, which turns the
+    /// clamp off for everything above it.
+    bnd: Option<f64>,
+    /// The slot whose values are still all different, the seed scan
+    /// and nothing above it.
+    distinct: Option<usize>,
+    /// How the rows on each slot an expand has walked are spread over
+    /// that slot's nodes. Slots not in here are still flat.
+    spread: BTreeMap<usize, Spread>,
+}
+
+impl Ceiling {
+    /// Records what a step over `e` from `src` to `dst` leaves on both
+    /// ends: one row per edge, each end spread by the degree its own
+    /// side of the step read.
+    fn walked(&mut self, e: &ExpandOp, src: usize, dst: usize, query: &BoundQuery) {
+        let rel = lone_rel(e, query);
+        let near = walk_sides(e, src);
+        let far: Vec<usize> = near.iter().map(|d| 1 - d).collect();
+        self.spread.insert(src, Spread::after(rel, near));
+        self.spread.insert(dst, Spread::after(rel, &far));
+    }
+}
+
+impl Default for Ceiling {
+    /// The source is one row and that is a ceiling as much as an
+    /// estimate, so the walk starts with the clamp armed.
+    fn default() -> Self {
+        Ceiling {
+            bnd: Some(1.0),
+            distinct: None,
+            spread: BTreeMap::new(),
+        }
+    }
 }
 
 /// The [`mark_asp`] recursion, threading each slot's color
@@ -86,9 +143,10 @@ fn mark_asp_walk(
     query: &BoundQuery,
     schema: &Schema,
     dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
+    ceil: &mut Ceiling,
     out: &mut Vec<f64>,
 ) -> (LogicalPlan, f64) {
-    let (plan, est) = mark_asp_node(plan, query, schema, dists, out);
+    let (plan, est) = mark_asp_node(plan, query, schema, dists, ceil, out);
     if !matches!(plan, LogicalPlan::Empty) {
         out.push(est);
     }
@@ -100,6 +158,7 @@ fn mark_asp_node(
     query: &BoundQuery,
     schema: &Schema,
     dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
+    ceil: &mut Ceiling,
     out: &mut Vec<f64>,
 ) -> (LogicalPlan, f64) {
     match plan {
@@ -109,8 +168,14 @@ fn mark_asp_node(
             slot,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
-            let est = est * slot_card(slot, query, schema);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let card = slot_card(slot, query, schema);
+            // The seed scan is the one place rows are known to hold
+            // every node once. A scan above anything else is a cross
+            // product and its slot repeats per input row.
+            ceil.distinct = (est == 1.0).then_some(slot);
+            ceil.bnd = ceil.bnd.map(|b| b * card);
+            let est = est * card;
             (
                 LogicalPlan::ScanNodes {
                     input: Box::new(input),
@@ -132,7 +197,7 @@ fn mark_asp_node(
             wcoj: _,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             let e = ExpandOp {
                 rel,
                 from,
@@ -161,15 +226,31 @@ fn mark_asp_node(
                 let wcoj = range.is_none()
                     && !matches!(direction, RelDirection::Undirected)
                     && query.variables[rel].rel_tables.len() == 1;
+                // A close keeps or drops rows, never adds, so the
+                // ceiling under it stands and only the spread moves.
+                ceil.walked(&e, from, to, query);
                 (asp, wcoj, est * into_prob(&e, query, schema))
             } else {
-                let (factor, reached) =
-                    expand_estimate(&e, from, dists.get(&from).cloned().as_ref(), query, schema);
+                let (factor, reached) = expand_estimate(
+                    &e,
+                    from,
+                    ceil.spread.get(&from).copied().unwrap_or_default(),
+                    dists.get(&from).cloned().as_ref(),
+                    query,
+                    schema,
+                );
                 if let Some(d) = reached {
                     dists.insert(to, d);
                 }
+                let distinct = ceil.distinct == Some(from);
+                ceil.walked(&e, from, to, query);
+                ceil.bnd = ceil
+                    .bnd
+                    .and_then(|b| step_bound(&e, from, b, distinct, query, schema));
+                ceil.distinct = None;
                 (false, false, est * factor)
             };
+            let est = ceil.bnd.map_or(est, |b| est.min(b));
             (
                 LogicalPlan::Expand {
                     input: Box::new(input),
@@ -191,8 +272,11 @@ fn mark_asp_node(
             expr,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             let est = (est * selectivity(&expr, query, schema)).max(1e-6);
+            // A filter only removes rows, so the ceiling under it still
+            // holds over its output.
+            let est = ceil.bnd.map_or(est, |b| est.min(b));
             (
                 LogicalPlan::Filter {
                     input: Box::new(input),
@@ -203,7 +287,9 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Unwind { input, expr, slot } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            // Nothing bounds how wide a list is.
+            ceil.bnd = None;
             (
                 LogicalPlan::Unwind {
                     input: Box::new(input),
@@ -221,12 +307,14 @@ fn mark_asp_node(
             args,
             slots,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             // One row per node of the rel's domain, exactly.
             let rows = schema
                 .node_by_id(table)
                 .map(|n| n.node_count as f64)
                 .unwrap_or(1.0);
+            ceil.bnd = ceil.bnd.map(|b| b * rows);
+            ceil.distinct = None;
             (
                 LogicalPlan::TableFunction {
                     input: Box::new(input),
@@ -240,7 +328,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Project { input, items } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             (
                 LogicalPlan::Project {
                     input: Box::new(input),
@@ -250,10 +338,14 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
-            let (input, _) = mark_asp_walk(*input, query, schema, dists, out);
-            // Grouping changes what a slot's rows are, so tracked
-            // distributions reset with the estimate.
+            let (input, _) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            // Grouping changes what a slot's rows are, so the tracked
+            // distributions go with the estimate. Nothing here says how
+            // many groups there will be, so the ceiling goes too rather
+            // than capping everything above at the one row this claims.
             dists.clear();
+            ceil.bnd = None;
+            ceil.distinct = None;
             (
                 LogicalPlan::Aggregate {
                     input: Box::new(input),
@@ -264,7 +356,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Distinct { input } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             (
                 LogicalPlan::Distinct {
                     input: Box::new(input),
@@ -273,7 +365,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Sort { input, keys } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             (
                 LogicalPlan::Sort {
                     input: Box::new(input),
@@ -283,7 +375,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Skip { input, expr } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             (
                 LogicalPlan::Skip {
                     input: Box::new(input),
@@ -293,7 +385,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Limit { input, expr } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
             (
                 LogicalPlan::Limit {
                     input: Box::new(input),
@@ -715,12 +807,20 @@ fn order_component(
         card: f64,
         /// Pessimistic ceiling on `card`, None once any step lacks one.
         bnd: Option<f64>,
+        /// The slot whose values are still known to be all different,
+        /// which is the seed slot straight off its scan and nothing
+        /// after that: an expand repeats its source once per neighbor
+        /// and lands several sources on the same neighbor.
+        distinct: Option<usize>,
         /// Running sum of the ceilings, the bound analog of `cost`.
         bcost: f64,
         /// Color distribution per slot a colored expand reached, tagged
         /// with the rel table whose color space it lives in; the state
         /// the next hop's estimate conditions on.
         dists: BTreeMap<usize, (u32, Vec<f64>)>,
+        /// How the rows on each slot the order has walked are spread
+        /// over that slot's nodes. Slots not in here are still flat.
+        spread: BTreeMap<usize, Spread>,
         steps: Vec<Step>,
     }
     let filter_slots: Vec<HashSet<usize>> = filters
@@ -792,8 +892,10 @@ fn order_component(
                     cost: 0.0,
                     card: 1.0,
                     bnd: Some(1.0),
+                    distinct: None,
                     bcost: 0.0,
                     dists: BTreeMap::new(),
+                    spread: BTreeMap::new(),
                     steps: Vec::new(),
                 },
                 Some(slot) => {
@@ -817,7 +919,9 @@ fn order_component(
                         cost: card,
                         card,
                         bnd: Some(bnd),
+                        distinct: Some(*slot),
                         bcost: bnd,
+                        spread: BTreeMap::new(),
                         dists: BTreeMap::new(),
                         steps: vec![Step::Scan(*slot)],
                     }
@@ -838,7 +942,30 @@ fn order_component(
                     if !from_bound && !to_bound {
                         continue;
                     }
-                    let (step, factor, bfactor, reached) = if from_bound && to_bound {
+                    // Absolute ceiling on the rows the step leaves,
+                    // not a multiplier: the lp bound on a distinct
+                    // source is not a per-row number.
+                    let bound_after = |src: usize| {
+                        entry.bnd.and_then(|b| {
+                            let distinct = entry.distinct == Some(src);
+                            step_bound(e, src, b, distinct, query, schema)
+                        })
+                    };
+                    let spread_of =
+                        |src: usize| entry.spread.get(&src).copied().unwrap_or_default();
+                    // Both ends of a taken step hold one row per edge
+                    // afterwards, each spread by the degree its own end
+                    // of the step read.
+                    let walked = |src: usize, dst: usize| {
+                        let rel = lone_rel(e, query);
+                        let near = walk_sides(e, src);
+                        let far: Vec<usize> = near.iter().map(|d| 1 - d).collect();
+                        let mut next = entry.spread.clone();
+                        next.insert(src, Spread::after(rel, near));
+                        next.insert(dst, Spread::after(rel, &far));
+                        next
+                    };
+                    let (step, factor, bnd, reached, spread) = if from_bound && to_bound {
                         (
                             Step::Expand {
                                 ix: *rel,
@@ -848,12 +975,19 @@ fn order_component(
                             },
                             into_prob(e, query, schema),
                             // A close keeps or drops rows, never adds.
-                            Some(1.0),
+                            entry.bnd,
                             None,
+                            walked(e.from, e.to),
                         )
                     } else if from_bound {
-                        let (factor, dist) =
-                            expand_estimate(e, e.from, entry.dists.get(&e.from), query, schema);
+                        let (factor, dist) = expand_estimate(
+                            e,
+                            e.from,
+                            spread_of(e.from),
+                            entry.dists.get(&e.from),
+                            query,
+                            schema,
+                        );
                         (
                             Step::Expand {
                                 ix: *rel,
@@ -862,12 +996,19 @@ fn order_component(
                                 into: false,
                             },
                             factor,
-                            step_bound(e, e.from, query, schema),
+                            bound_after(e.from),
                             dist.map(|d| (e.to, d)),
+                            walked(e.from, e.to),
                         )
                     } else {
-                        let (factor, dist) =
-                            expand_estimate(e, e.to, entry.dists.get(&e.to), query, schema);
+                        let (factor, dist) = expand_estimate(
+                            e,
+                            e.to,
+                            spread_of(e.to),
+                            entry.dists.get(&e.to),
+                            query,
+                            schema,
+                        );
                         (
                             Step::Expand {
                                 ix: *rel,
@@ -876,13 +1017,14 @@ fn order_component(
                                 into: false,
                             },
                             factor,
-                            step_bound(e, e.to, query, schema),
+                            bound_after(e.to),
                             dist.map(|d| (e.from, d)),
+                            walked(e.to, e.from),
                         )
                     };
                     let next = mask | (1 << i);
                     let grown = base_bound(next);
-                    let bnd = entry.bnd.zip(bfactor).map(|(b, f)| (b * f).max(1e-6));
+                    let bnd = bnd.map(|b| b.max(1e-6));
                     let card = (entry.card * factor * newly(&bound, &grown)).max(1e-6);
                     let card = bnd.map_or(card, |b| card.min(b));
                     let mut dists = entry.dists.clone();
@@ -893,8 +1035,10 @@ fn order_component(
                         cost: entry.cost + card,
                         card,
                         bnd,
+                        distinct: None,
                         bcost: entry.bcost + bnd.unwrap_or(0.0),
                         dists,
+                        spread,
                         steps: Vec::new(),
                     };
                     let slot = &mut dp[next as usize];
@@ -1089,49 +1233,114 @@ fn hist_fanout(edges: f64, hist: &[u64]) -> Option<f64> {
 /// engine's degree histograms when it carries them (docs/07 §6) and
 /// the count ratios otherwise. Var-length steps raise the degree to
 /// their minimum hop count as a heuristic.
-fn degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f64 {
+fn degree(e: &ExpandOp, source: usize, spread: Spread, query: &BoundQuery, schema: &Schema) -> f64 {
     let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8)) as i32;
-    hop_degree(e, source, query, schema).max(1e-6).powi(hops)
+    hop_degree(e, source, spread, query, schema)
+        .max(1e-6)
+        .powi(hops)
+}
+
+/// The degree sides an expand from `source` reads: out-degree is 0,
+/// in-degree is 1, and an undirected step reads both.
+fn walk_sides(e: &ExpandOp, source: usize) -> &'static [usize] {
+    let reversed = source == e.to && source != e.from;
+    match (e.direction, reversed) {
+        (RelDirection::Out, false) | (RelDirection::In, true) => &[0],
+        (RelDirection::Out, true) | (RelDirection::In, false) => &[1],
+        (RelDirection::Undirected, _) => &[0, 1],
+    }
+}
+
+/// How the rows on a slot are spread over that slot's nodes, which is
+/// what decides whether an expand off it sees the plain mean degree or
+/// the degree-weighted one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+enum Spread {
+    /// One row per node, what a scan leaves behind.
+    #[default]
+    Flat,
+    /// One row per edge, so the node a row sits on is drawn in
+    /// proportion to a degree: `rel` names the table whose edges they
+    /// are and `side` which of its two degrees, both `None` when the
+    /// step that spread them read more than one table or both sides.
+    Edges {
+        rel: Option<u32>,
+        side: Option<usize>,
+    },
+}
+
+impl Spread {
+    /// The rows a slot holds after a step over `rel` read its `side`
+    /// degree: one per edge of that table, spread by that same side.
+    fn after(rel: Option<u32>, side: &[usize]) -> Spread {
+        Spread::Edges {
+            rel,
+            side: match side {
+                [d] => Some(*d),
+                _ => None,
+            },
+        }
+    }
+
+    /// The degree side the rows are spread by, as seen by a step about
+    /// to read `side` of `rel`. `None` says one row per node, and a
+    /// spread the step cannot name reads as its own side, which is the
+    /// plain degree-weighted mean.
+    fn seen_by(self, rel: u32, side: usize) -> Option<usize> {
+        match self {
+            Spread::Flat => None,
+            Spread::Edges { rel: r, side: s } => Some(match s {
+                Some(s) if r == Some(rel) => s,
+                _ => side,
+            }),
+        }
+    }
 }
 
 /// [`degree`] for a single hop, the per-step mean the color walk feeds
 /// its first hop.
-fn hop_degree(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> f64 {
-    let reversed = source == e.to && source != e.from;
+///
+/// A source slot holding one row per edge has its rows sitting on nodes
+/// drawn in proportion to a degree, so the mean the step sees is the
+/// degree-weighted mean and not the plain one. That is what makes a two
+/// hop count come out right: a chain through a hub is counted once per
+/// edge into the hub, not once per hub, and the plain mean is far too
+/// small. [`binder::DegreeStats::weighted`] has the arithmetic.
+fn hop_degree(
+    e: &ExpandOp,
+    source: usize,
+    spread: Spread,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> f64 {
     let mut deg = 0.0;
     for rid in &query.variables[e.rel].rel_tables {
         let Some(rd) = schema.rel_by_id(*rid) else {
             continue;
         };
         let edges = rd.edge_count as f64;
-        let from_cnt = node_count(schema, rd.from);
-        let to_cnt = node_count(schema, rd.to);
         let hists = schema.degree_hist(*rid);
-        let fwd = hists
-            .and_then(|[out, _]| hist_fanout(edges, out))
-            .unwrap_or(edges / from_cnt);
-        let bwd = hists
-            .and_then(|[_, inn]| hist_fanout(edges, inn))
-            .unwrap_or(edges / to_cnt);
-        deg += match e.direction {
-            RelDirection::Out => {
-                if reversed {
-                    bwd
-                } else {
-                    fwd
-                }
-            }
-            RelDirection::In => {
-                if reversed {
-                    fwd
-                } else {
-                    bwd
-                }
-            }
-            RelDirection::Undirected => fwd + bwd,
-        };
+        let norms = schema.degree_norm(*rid);
+        let flat = [rd.from, rd.to].map(|t| edges / node_count(schema, t));
+        for d in walk_sides(e, source) {
+            deg += match (norms, spread.seen_by(*rid, *d)) {
+                (Some(n), Some(by)) => n.weighted(by, *d),
+                _ => hists
+                    .and_then(|h| hist_fanout(edges, &h[*d]))
+                    .unwrap_or(flat[*d]),
+            };
+        }
     }
     deg
+}
+
+/// The single rel table an expand walks, when the pattern named a type
+/// that resolves to exactly one.
+fn lone_rel(e: &ExpandOp, query: &BoundQuery) -> Option<u32> {
+    match query.variables[e.rel].rel_tables[..] {
+        [rid] => Some(rid),
+        _ => None,
+    }
 }
 
 /// The single rel table an expand's colors can track: exactly one
@@ -1217,11 +1426,12 @@ fn color_seed(sum: &ColorSummary, reversed: bool) -> Option<Vec<f64>> {
 fn expand_estimate(
     e: &ExpandOp,
     source: usize,
+    spread: Spread,
     dist: Option<&(u32, Vec<f64>)>,
     query: &BoundQuery,
     schema: &Schema,
 ) -> (f64, Option<(u32, Vec<f64>)>) {
-    let plain = degree(e, source, query, schema);
+    let plain = degree(e, source, spread, query, schema);
     let Some(rid) = colored_rel(e, query, schema) else {
         return (plain, None);
     };
@@ -1236,7 +1446,7 @@ fn expand_estimate(
     let (mut fan, mut d) = match dist {
         Some((from_rel, d)) if *from_rel == rid => color_hop(sum, d, reversed),
         _ => match color_seed(sum, reversed) {
-            Some(seed) => (hop_degree(e, source, query, schema).max(1e-6), seed),
+            Some(seed) => (hop_degree(e, source, spread, query, schema).max(1e-6), seed),
             None => return (plain, None),
         },
     };
@@ -1402,40 +1612,56 @@ fn hist_dmax(hist: &[u64]) -> f64 {
         .map_or(0.0, |top| 2f64.powi(top as i32 + 1) - 1.0)
 }
 
-/// Worst-case fan-out of one expand step from `source`: the largest
-/// degree any single row can multiply by, summed over the candidate
-/// rel tables. None disables the caps for the order: a table without
-/// histograms has no usable ceiling and an unbounded var-length step
-/// has none at all.
-fn step_bound(e: &ExpandOp, source: usize, query: &BoundQuery, schema: &Schema) -> Option<f64> {
+/// Ceiling on the rows one expand step from `source` produces, given
+/// `rows` arriving and whether their values in the source slot are
+/// known to be all different (perf/12 §2.3). None disables the caps for
+/// the whole order: a table with no statistics has no usable ceiling
+/// and an unbounded var-length step has none at all.
+///
+/// `rows` rows over distinct keys can only reach the `rows`
+/// highest-degree nodes once each, which is what the lp norms bound
+/// and why a full scan expanded over every edge is capped at the edge
+/// count exactly. Once the keys can repeat, the only thing left to say
+/// is that every row takes the worst node in the table.
+fn step_bound(
+    e: &ExpandOp,
+    source: usize,
+    rows: f64,
+    distinct: bool,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> Option<f64> {
     let hops = match e.range {
         None => 1,
         Some(v) => v.max?.clamp(1, 8) as i32,
     };
-    let reversed = source == e.to && source != e.from;
-    let mut worst = 0.0;
+    // Per rel table and direction, the ceiling on one hop's output and
+    // the per-row worst case the hops after it multiply by.
+    let mut first = 0.0f64;
+    let mut per_row = 0.0f64;
     for rid in &query.variables[e.rel].rel_tables {
-        let [out, inn] = schema.degree_hist(*rid)?;
-        let (fwd, bwd) = (hist_dmax(out), hist_dmax(inn));
-        worst += match e.direction {
-            RelDirection::Out => {
-                if reversed {
-                    bwd
-                } else {
-                    fwd
+        let hists = schema.degree_hist(*rid);
+        let norms = schema.degree_norm(*rid);
+        if hists.is_none() && norms.is_none() {
+            return None;
+        }
+        for d in walk_sides(e, source) {
+            let (top, worst) = match norms.map(|n| n.side(*d)) {
+                Some(n) => (n.top_sum(rows), n.linf),
+                // Histograms only: the top bucket's ceiling per row,
+                // and no way to tell the distinct case apart.
+                None => {
+                    let dmax = hist_dmax(&hists.expect("checked above")[*d]);
+                    (rows * dmax, dmax)
                 }
-            }
-            RelDirection::In => {
-                if reversed {
-                    fwd
-                } else {
-                    bwd
-                }
-            }
-            RelDirection::Undirected => fwd + bwd,
-        };
+            };
+            first += if distinct { top } else { rows * worst };
+            per_row += worst;
+        }
     }
-    Some(worst.powi(hops))
+    // Only the first hop starts from keys that may be distinct; a
+    // longer walk revisits nodes and every hop after it is worst case.
+    Some(first * per_row.powi(hops - 1))
 }
 
 #[cfg(test)]
@@ -1763,10 +1989,10 @@ mod tests {
         };
         assert_eq!(query.variables[e.rel].rel_tables, [2], "slot 1 is r");
         let hub = (2u32, vec![1.0, 0.0]);
-        let (fan, _) = expand_estimate(&e, 0, Some(&hub), &query, &schema);
+        let (fan, _) = expand_estimate(&e, 0, Spread::Flat, Some(&hub), &query, &schema);
         assert_eq!(fan, 1800.0);
         let foreign = (3u32, vec![1.0, 0.0]);
-        let (fan, _) = expand_estimate(&e, 0, Some(&foreign), &query, &schema);
+        let (fan, _) = expand_estimate(&e, 0, Spread::Flat, Some(&foreign), &query, &schema);
         assert_eq!(fan, 20.0, "foreign space falls back to the mean");
     }
 

@@ -7,39 +7,25 @@
 //! plan order. Aggregate accumulators mirror the old `Acc` semantics
 //! including the empty-input rows and the sum overflow error.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use zu_common::{Result, ZuError};
 use zu_query::exec::{OrdValue, QueryResult, Value};
 
 use crate::compile::{AggSpec, PostSpec};
+use crate::group::{GroupTable, KeyBatch, PartKind};
+
+/// Rows per DISTINCT probe vector, the pipeline's vector width.
+const VECTOR: usize = 2048;
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
 }
 
-/// One grouping key part. Hashable, unlike Value, and cheap to order
-/// through OrdValue at merge time.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) enum KeyVal {
-    Int(i64),
-    Str(String),
-    Node(u32, u64),
-}
-
-impl KeyVal {
-    fn value(self) -> Value {
-        match self {
-            KeyVal::Int(n) => Value::Int(n),
-            KeyVal::Str(s) => Value::Str(s),
-            KeyVal::Node(table, offset) => Value::Node { table, offset },
-        }
-    }
-}
-
 /// One aggregate accumulator, the integer subset of the old engine's
 /// Acc with identical finalize semantics: sum of nothing is 0, avg of
 /// nothing is null, min and max of nothing are null.
+#[derive(Clone, Copy)]
 pub(crate) enum Acc {
     Count(i64),
     Sum(Option<i64>),
@@ -99,8 +85,8 @@ impl Acc {
         Ok(())
     }
 
-    fn merge(&mut self, other: Acc) -> Result<()> {
-        match (self, other) {
+    pub(crate) fn merge(&mut self, other: &Acc) -> Result<()> {
+        match (self, *other) {
             (Acc::Count(n), Acc::Count(m)) => *n += m,
             (Acc::Sum(a), Acc::Sum(b)) => {
                 *a = match (*a, b) {
@@ -151,8 +137,11 @@ impl Acc {
 pub(crate) struct SinkState {
     /// The bare count sink, also fed directly by DegreeCount.
     pub count: i64,
-    /// Keyed aggregation partials.
-    pub groups: HashMap<Vec<KeyVal>, Vec<Acc>>,
+    /// Keyed aggregation partials, built on the worker's first keyed
+    /// row so a plan that never groups never pays for the table.
+    pub groups: Option<GroupTable>,
+    /// States of the single group a bare aggregate has.
+    pub bare: Vec<Acc>,
     /// Rows of the morsel in flight.
     pub rows: Vec<Vec<Value>>,
     /// Finished morsels: (morsel index, its rows).
@@ -163,12 +152,7 @@ pub(crate) struct SinkState {
 pub(crate) fn apply_post(post: &[PostSpec], mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     for op in post {
         match op {
-            PostSpec::Distinct => {
-                let mut seen = BTreeSet::new();
-                rows.retain(|row| {
-                    seen.insert(row.iter().cloned().map(OrdValue).collect::<Vec<_>>())
-                });
-            }
+            PostSpec::Distinct => rows = distinct(rows),
             PostSpec::Skip(n) => {
                 let n = (*n as usize).min(rows.len());
                 rows.drain(..n);
@@ -179,10 +163,115 @@ pub(crate) fn apply_post(post: &[PostSpec], mut rows: Vec<Vec<Value>>) -> Vec<Ve
     rows
 }
 
+/// Group order: the OrdValue total order over the three types a
+/// grouping key can hold here, taken by reference. Sorting through
+/// OrdValue itself would mean cloning every key of every group, which
+/// on a hundred thousand groups costs more than the sort does.
+fn key_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b) {
+        let ord = match (x, y) {
+            (Value::Int(p), Value::Int(q)) => p.cmp(q),
+            (Value::Str(p), Value::Str(q)) => p.cmp(q),
+            (
+                Value::Node {
+                    table: t1,
+                    offset: o1,
+                },
+                Value::Node {
+                    table: t2,
+                    offset: o2,
+                },
+            ) => (t1, o1).cmp(&(t2, o2)),
+            _ => OrdValue(x.clone()).cmp(&OrdValue(y.clone())),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// The key layout of a row set, or None when some column holds a type
+/// the group table has no part for or the columns are not the same type
+/// on every row. Rows out of one sink always are, the check is cheap,
+/// and it keeps the hashed path from misreading a key.
+fn row_parts(rows: &[Vec<Value>]) -> Option<Vec<PartKind>> {
+    let parts: Vec<PartKind> = rows.first()?.iter().map(part_of).collect::<Option<_>>()?;
+    let same = rows.iter().all(|row| {
+        row.len() == parts.len()
+            && row
+                .iter()
+                .zip(&parts)
+                .all(|(v, &p)| part_of(v) == Some(p))
+    });
+    same.then_some(parts)
+}
+
+fn part_of(v: &Value) -> Option<PartKind> {
+    match v {
+        Value::Int(_) => Some(PartKind::Int),
+        Value::Str(_) => Some(PartKind::Str),
+        Value::Node { .. } => Some(PartKind::Node),
+        _ => None,
+    }
+}
+
+/// DISTINCT over materialized rows, keeping the first occurrence. Rows
+/// of integers, strings, and nodes go through the group table a vector
+/// at a time, one hash and no allocation each. Anything else, a float or
+/// a null or a mixed column, falls back to the ordered set, which clones
+/// a row's worth of values per row but handles every type there is.
+fn distinct(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    let Some(parts) = row_parts(&rows) else {
+        let mut seen = BTreeSet::new();
+        rows.retain(|row| seen.insert(row.iter().cloned().map(OrdValue).collect::<Vec<_>>()));
+        return rows;
+    };
+    let mut table = GroupTable::new(parts, 0);
+    let stride = table.stride();
+    let mut batch = KeyBatch::default();
+    let mut gids = Vec::new();
+    // A row is the first sight of its key exactly when the table hands
+    // it the next index it had not handed out yet.
+    let mut next = 0;
+    let mut keep = Vec::with_capacity(rows.len());
+    for block in rows.chunks(VECTOR) {
+        batch.reset(stride, block.len());
+        for (row, values) in block.iter().enumerate() {
+            let mut off = 0;
+            for v in values {
+                match v {
+                    Value::Int(n) => {
+                        let (words, stride) = batch.words_mut();
+                        words[row * stride + off] = *n as u64;
+                    }
+                    Value::Node { table, offset } => {
+                        let (words, stride) = batch.words_mut();
+                        words[row * stride + off] = u64::from(*table);
+                        words[row * stride + off + 1] = *offset;
+                    }
+                    Value::Str(s) => batch.set_str(row, off, s.as_bytes()),
+                    _ => unreachable!("row_parts admitted the row"),
+                }
+                off += part_of(v).expect("row_parts admitted the row").words();
+            }
+        }
+        table.probe(&batch, &[], &mut gids);
+        keep.extend(gids.iter().map(|&g| {
+            let new = g as usize == next;
+            next += usize::from(new);
+            new
+        }));
+    }
+    let mut it = keep.into_iter();
+    rows.retain(|_| it.next().expect("one flag per row"));
+    rows
+}
+
 /// Merges keyed aggregation partials into the final result: fold the
-/// maps, add the empty-input group for a bare aggregate, order groups
-/// by key ascending like the old BTreeMap sink, and interleave keys
-/// and aggregates back into clause order.
+/// group tables, produce the empty-input row for a bare aggregate,
+/// order groups by key ascending like the old BTreeMap sink, and
+/// interleave keys and aggregates back into clause order.
 pub(crate) fn finish_agg(
     columns: Vec<String>,
     item_agg: &[bool],
@@ -191,35 +280,37 @@ pub(crate) fn finish_agg(
     partials: Vec<SinkState>,
     keys_empty: bool,
 ) -> Result<QueryResult> {
-    let mut merged: HashMap<Vec<KeyVal>, Vec<Acc>> = HashMap::new();
-    for p in partials {
-        for (k, states) in p.groups {
-            match merged.entry(k) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(states);
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    for (a, b) in e.get_mut().iter_mut().zip(states) {
-                        a.merge(b)?;
-                    }
-                }
+    // A bare aggregate has one group whichever way the input went, so
+    // it never needs the table: fold the per-worker state vectors and
+    // emit the row even when no worker saw a row at all.
+    if keys_empty {
+        let mut states: Vec<Acc> = specs.iter().map(Acc::new).collect();
+        for p in &partials {
+            for (a, b) in states.iter_mut().zip(&p.bare) {
+                a.merge(b)?;
             }
         }
+        let row = states.into_iter().map(Acc::finalize).collect();
+        return Ok(QueryResult {
+            columns,
+            rows: apply_post(post, vec![row]),
+        });
     }
-    if merged.is_empty() && keys_empty {
-        merged.insert(Vec::new(), specs.iter().map(Acc::new).collect());
+    // Fold every other worker into the first non-empty table rather
+    // than into a fresh one, so the biggest partial is usually the one
+    // nobody has to rehash.
+    let mut merged: Option<GroupTable> = None;
+    for p in partials {
+        let Some(t) = p.groups else { continue };
+        match &mut merged {
+            None => merged = Some(t),
+            Some(m) => m.merge_from(&t)?,
+        }
     }
-    let mut groups: Vec<(Vec<OrdValue>, Vec<Value>, Vec<Acc>)> = merged
-        .into_iter()
-        .map(|(k, states)| {
-            let vals: Vec<Value> = k.into_iter().map(KeyVal::value).collect();
-            let ord: Vec<OrdValue> = vals.iter().cloned().map(OrdValue).collect();
-            (ord, vals, states)
-        })
-        .collect();
-    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut groups = merged.map(GroupTable::drain).unwrap_or_default();
+    groups.sort_by(|a, b| key_cmp(&a.0, &b.0));
     let mut rows = Vec::with_capacity(groups.len());
-    for (_, keyvals, states) in groups {
+    for (keyvals, states) in groups {
         let mut kit = keyvals.into_iter();
         let mut sit = states.into_iter();
         let mut row = Vec::with_capacity(item_agg.len());

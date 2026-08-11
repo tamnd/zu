@@ -24,9 +24,10 @@ use zu_query::exec::{Options, QueryResult, Value};
 use zu_query::snapshot::{ColId, CsrPin, Dir, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector};
 
-use crate::compile::{Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec};
+use crate::compile::{AggSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec};
+use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::pool;
-use crate::sink::{self, Acc, KeyVal, SinkState};
+use crate::sink::{self, Acc, SinkState};
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
@@ -285,6 +286,12 @@ struct Worker<'a> {
     /// recursion depth in steady state.
     idx_pool: Vec<Vec<u32>>,
     row_pool: Vec<Vec<u64>>,
+    /// Grouping scratch, all reused down the whole run so a GROUP BY
+    /// vector never allocates: the packed keys, the group index the
+    /// table gave each row, and one aggregate's arguments.
+    batch: KeyBatch,
+    gids: Vec<u32>,
+    args: Vec<i64>,
     sink: SinkState,
     stop: &'a StopState,
     /// Rows emitted in the morsel in flight, for the quota check.
@@ -305,6 +312,9 @@ impl<'a> Worker<'a> {
             prod: Vec::new(),
             idx_pool: Vec::new(),
             row_pool: Vec::new(),
+            batch: KeyBatch::default(),
+            gids: Vec::new(),
+            args: Vec::new(),
             sink: SinkState::default(),
             stop,
             local_rows: 0,
@@ -585,6 +595,59 @@ impl<'a> Worker<'a> {
         Ok(self.prod.iter().sum())
     }
 
+    /// Keyed aggregation for one chunk set, a column at a time: pack the
+    /// key vector, probe the whole vector in one call, then walk the
+    /// group indices once per aggregate. Nothing in here dispatches on
+    /// the plan per row, which is the point; the per-row work left is a
+    /// hash, a probe, and an accumulator update.
+    fn group_vector(&mut self, set: &ChunkSet, keys: &[ScalarRef], aggs: &[AggSpec]) -> Result<()> {
+        let last = set.chunks.len() - 1;
+        let live = &set.chunks[last];
+        debug_assert!(live.cur.is_none(), "sink level is never pinned");
+        // An unfiltered vector reads straight down its columns; only a
+        // selection sends the reads through the survivor list.
+        let sel = live.sel.as_ref().map(|s| s.as_slice());
+        let rows = sel.map_or(live.count as usize, |s| s.len());
+        if rows == 0 {
+            return Ok(());
+        }
+        let table = self
+            .sink
+            .groups
+            .get_or_insert_with(|| GroupTable::new(key_parts(keys), aggs.len()));
+        self.batch.reset(table.stride(), rows);
+        let mut off = 0;
+        for &r in keys {
+            fill_key_col(self.plan, set, r, sel, rows, off, &mut self.batch)?;
+            off += part_kind(r).words();
+        }
+        table.probe(&self.batch, aggs, &mut self.gids);
+        let n = aggs.len();
+        for (j, spec) in aggs.iter().enumerate() {
+            // Dense columns and required nodes are never null, so
+            // count(x) counts rows exactly like count(*).
+            let counting = spec.arg().is_none() || matches!(spec, AggSpec::CountRef(_));
+            if counting {
+                let accs = table.accs_mut();
+                // Warming the states the way the probe warms slots
+                // measured slower here, so the loop stays plain: the
+                // group indices repeat far more than slots do, and the
+                // states are already in cache most of the time.
+                for &g in &self.gids {
+                    accs[g as usize * n + j].add_star(1);
+                }
+                continue;
+            }
+            let r = spec.arg().expect("a non counting aggregate has an argument");
+            gather_ints(set, r, sel, rows, &mut self.args);
+            let accs = table.accs_mut();
+            for (&g, &v) in self.gids.iter().zip(&self.args) {
+                accs[g as usize * n + j].add_int(v, 1)?;
+            }
+        }
+        Ok(())
+    }
+
     fn push_sink(&mut self, set: &mut ChunkSet) -> Result<()> {
         match &self.plan.sink {
             SinkSpec::Count => {
@@ -610,12 +673,10 @@ impl<'a> Worker<'a> {
                     return Ok(());
                 }
                 if keys.is_empty() {
-                    let states = self
-                        .sink
-                        .groups
-                        .entry(Vec::new())
-                        .or_insert_with(|| aggs.iter().map(Acc::new).collect());
-                    for (spec, acc) in aggs.iter().zip(states) {
+                    if self.sink.bare.is_empty() {
+                        self.sink.bare = aggs.iter().map(Acc::new).collect();
+                    }
+                    for (spec, acc) in aggs.iter().zip(&mut self.sink.bare) {
                         match spec.arg() {
                             None => acc.add_star(mult),
                             Some(r) if matches!(spec, crate::compile::AggSpec::CountRef(_)) => {
@@ -637,34 +698,7 @@ impl<'a> Worker<'a> {
                     }
                     Ok(())
                 } else {
-                    for pos in active_positions(&set.chunks[last]) {
-                        let mut key = Vec::with_capacity(keys.len());
-                        for &r in keys {
-                            key.push(key_val(self.plan, set, r, pos)?);
-                        }
-                        let states = self
-                            .sink
-                            .groups
-                            .entry(key)
-                            .or_insert_with(|| aggs.iter().map(Acc::new).collect());
-                        for (spec, acc) in aggs.iter().zip(states) {
-                            match spec.arg() {
-                                None => acc.add_star(1),
-                                Some(_) if matches!(spec, crate::compile::AggSpec::CountRef(_)) => {
-                                    acc.add_star(1);
-                                }
-                                Some(r) => {
-                                    let p = if r.level() == last {
-                                        pos
-                                    } else {
-                                        pinned_pos(&set.chunks[r.level()])
-                                    };
-                                    acc.add_int(int_scalar(set, r, p), 1)?;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
+                    self.group_vector(set, keys, aggs)
                 }
             }
         }
@@ -747,23 +781,170 @@ fn int_scalar(set: &ChunkSet, r: ScalarRef, pos: usize) -> i64 {
     }
 }
 
-fn key_val(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<KeyVal> {
-    Ok(match scalar(plan, set, r, pos)? {
-        Value::Int(n) => KeyVal::Int(n),
-        Value::Str(s) => KeyVal::Str(s),
-        Value::Node { table, offset } => KeyVal::Node(table, offset),
-        other => return Err(invalid(format!("unexpected grouping key {other:?}"))),
-    })
+/// What one key ref packs into: a node takes two words, a string a byte
+/// range, everything else one word.
+fn part_kind(r: ScalarRef) -> PartKind {
+    match r {
+        ScalarRef::Node { .. } => PartKind::Node,
+        ScalarRef::RowId { .. } => PartKind::Int,
+        ScalarRef::Col { ty, .. } => match ty {
+            zu_query::snapshot::ColType::Int => PartKind::Int,
+            zu_query::snapshot::ColType::Str => PartKind::Str,
+        },
+    }
 }
 
-fn str_at(v: &ValueVector, idx: usize) -> Result<String> {
+fn key_parts(keys: &[ScalarRef]) -> Vec<PartKind> {
+    keys.iter().copied().map(part_kind).collect()
+}
+
+/// Packs one key column of the whole vector. A ref on the newest level
+/// reads one value per active position; a ref on a pinned level is the
+/// same value for every row of the vector, and the fill says so.
+fn fill_key_col(
+    plan: &ExecPlan,
+    set: &ChunkSet,
+    r: ScalarRef,
+    sel: Option<&[u16]>,
+    rows: usize,
+    off: usize,
+    batch: &mut KeyBatch,
+) -> Result<()> {
+    let level = r.level();
+    let chunk = &set.chunks[level];
+    let live = level + 1 == set.chunks.len();
+    match r {
+        ScalarRef::Node { .. } | ScalarRef::RowId { .. } => {
+            // The node's table is the level's table, one word for the
+            // whole vector; the row id is the varying half.
+            let at = match r {
+                ScalarRef::Node { .. } => {
+                    batch.fill_word(off, u64::from(plan.levels[level].table));
+                    off + 1
+                }
+                _ => off,
+            };
+            if live {
+                fill_col(batch, at, chunk.vecs[0].values::<u64>(), sel, rows, |v| v);
+            } else {
+                batch.fill_word(at, row_at(chunk, pinned_pos(chunk)));
+            }
+        }
+        ScalarRef::Col { vec, ty, .. } => match ty {
+            zu_query::snapshot::ColType::Int => {
+                if live {
+                    fill_col(batch, off, chunk.vecs[vec].values::<i64>(), sel, rows, |v| {
+                        v as u64
+                    });
+                } else {
+                    let v = chunk.vecs[vec].values::<i64>()[pinned_pos(chunk)];
+                    batch.fill_word(off, v as u64);
+                }
+            }
+            zu_query::snapshot::ColType::Str => {
+                // The view array and the string buffers are the same
+                // for every row of the vector, so they are read once
+                // here rather than per row through with_str_bytes.
+                let v = &chunk.vecs[vec];
+                let views = v.values::<StrView>();
+                let bufs = v.str_buffers();
+                for row in 0..rows {
+                    let idx = match (live, sel) {
+                        (false, _) => pinned_pos(chunk),
+                        (true, None) => row,
+                        (true, Some(pos)) => pos[row] as usize,
+                    };
+                    let view = views[idx];
+                    let bytes = match bufs {
+                        Some(b) => view.bytes(b),
+                        None => view.inline_bytes(),
+                    };
+                    if std::str::from_utf8(bytes).is_err() {
+                        return Err(invalid("string property is not UTF-8".to_string()));
+                    }
+                    batch.set_str(row, off, bytes);
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Writes one column of the key vector out of a column's values, either
+/// straight down or through the selection.
+fn fill_col<T: Copy>(
+    batch: &mut KeyBatch,
+    off: usize,
+    vals: &[T],
+    sel: Option<&[u16]>,
+    rows: usize,
+    word: impl Fn(T) -> u64,
+) {
+    let (words, stride) = batch.words_mut();
+    let dst = words.iter_mut().skip(off).step_by(stride);
+    match sel {
+        None => {
+            for (w, &v) in dst.zip(&vals[..rows]) {
+                *w = word(v);
+            }
+        }
+        Some(pos) => {
+            for (w, &p) in dst.zip(pos) {
+                *w = word(vals[p as usize]);
+            }
+        }
+    }
+}
+
+/// Gathers an aggregate's integer argument for the whole vector, the
+/// pinned case being one value repeated.
+fn gather_ints(set: &ChunkSet, r: ScalarRef, sel: Option<&[u16]>, rows: usize, out: &mut Vec<i64>) {
+    out.clear();
+    let level = r.level();
+    let chunk = &set.chunks[level];
+    if level + 1 != set.chunks.len() {
+        out.resize(rows, int_scalar(set, r, pinned_pos(chunk)));
+        return;
+    }
+    match r {
+        ScalarRef::Col { vec, .. } => {
+            let vals = chunk.vecs[vec].values::<i64>();
+            match sel {
+                None => out.extend_from_slice(&vals[..rows]),
+                Some(pos) => out.extend(pos.iter().map(|&p| vals[p as usize])),
+            }
+        }
+        ScalarRef::RowId { .. } => {
+            let ids = chunk.vecs[0].values::<u64>();
+            match sel {
+                None => out.extend(ids[..rows].iter().map(|&v| v as i64)),
+                Some(pos) => out.extend(pos.iter().map(|&p| ids[p as usize] as i64)),
+            }
+        }
+        ScalarRef::Node { .. } => unreachable!("nodes are not integer arguments"),
+    }
+}
+
+/// Hands the bytes of a string cell to `f`, checked for UTF-8 first so
+/// the group table can turn them back into a String without checking
+/// again and so a bad property errors on the query the old engine errors
+/// on. A short string lives inside the view, which is a value on the
+/// stack here, so the bytes cannot outlive the call and every reader
+/// takes a closure rather than a slice.
+fn with_str_bytes<T>(v: &ValueVector, idx: usize, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
     let view = v.values::<StrView>()[idx];
     let bytes = match v.str_buffers() {
         Some(bufs) => view.bytes(bufs),
         None => view.inline_bytes(),
     };
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| invalid("string property is not UTF-8".to_string()))
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Ok(f(bytes)),
+        Err(_) => Err(invalid("string property is not UTF-8".to_string())),
+    }
+}
+
+fn str_at(v: &ValueVector, idx: usize) -> Result<String> {
+    with_str_bytes(v, idx, |b| String::from_utf8_lossy(b).into_owned())
 }
 
 #[cfg(test)]

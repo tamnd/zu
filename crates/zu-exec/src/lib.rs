@@ -22,6 +22,7 @@
 //! [`Snapshot`]: zu_query::snapshot::Snapshot
 
 mod compile;
+mod group;
 mod pool;
 mod run;
 mod sink;

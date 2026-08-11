@@ -520,6 +520,29 @@ exec_join_build_mrows_s = 8.0
 # floor, never lower it.
 exec_sip_select_mrows_s = 50.0
 
+# The summed arithmetic projection at one worker, M rows/s (perf/05
+# section 5): two million people and `sum(p.score * 2 + p.bucket)`,
+# which returns one row, so nothing is built and the number is the
+# scan and the expression and nothing else.
+#
+# The bench prints three shapes and each one twice, once through the
+# pipeline and once with ZU_EXEC2=0, which is where all three ran
+# before an arithmetic projection had a compiled shape. Measured at
+# f3f7d2f, one worker, in ms for the pipeline against the old engine:
+# the sum 13.8 against 185.3 on the local M series, 12.2 against 221.4
+# on gamingpc, 45.6 against 655.1 on server1; the hundredth-of-a-table
+# read 8.9 against 93.7, 8.9 against 120.4 and 29.5 against 316.0; and
+# the same expression returned for every row 48.5 against 331.8, 66.8
+# against 314.4 and 286.2 against 1028.4. So 13.5x, 18.2x and 14.4x on
+# the shape with no rows to build, and 6.8x, 4.7x and 3.6x once two
+# million rows have to be handed back, where the row build is most of
+# what is left.
+#
+# The floor is set off server1, the slowest host and the one that
+# gates with no free page cache, at about two thirds of what it
+# measured there. Raise this floor, never lower it.
+exec_project_mrows_s_core = 25.0
+
 # Cardinality quality over the SF1 corpus, q-error percentiles
 # (perf/12 section 4). Twelve queries run profiled, every operator that
 # carries an estimate contributes one max(est/act, act/est), and the

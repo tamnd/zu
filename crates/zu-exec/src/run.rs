@@ -24,7 +24,9 @@ use zu_query::exec::{Options, QueryResult, Value};
 use zu_query::snapshot::{ColId, CsrPin, Dir, GroupId, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector};
 
-use crate::compile::{AggSpec, Close, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source};
+use crate::compile::{
+    AggSpec, Close, ColSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source,
+};
 use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::pool;
 use crate::sink::{self, Acc, SinkState};
@@ -510,7 +512,14 @@ impl<'a> Worker<'a> {
             snap,
             arena: MorselArena::new(),
             pins: HashMap::new(),
-            scan_cols: plan.levels[0].cols.iter().map(|&(id, _)| id).collect(),
+            scan_cols: plan.levels[0]
+                .cols
+                .iter()
+                .filter_map(|c| match *c {
+                    ColSpec::Stored(id, _) => Some(id),
+                    ColSpec::Computed(_) => None,
+                })
+                .collect(),
             scratch: Vec::new(),
             neigh: Vec::new(),
             hits: Vec::new(),
@@ -647,13 +656,26 @@ impl<'a> Worker<'a> {
                 *slot = sc.row_base + i as u64;
             }
             vecs.push(ids);
-            vecs.extend(sc.columns);
-            let level0 = DataChunk {
+            let mut level0 = DataChunk {
                 vecs,
                 sel: sc.sel,
                 count: sc.rows,
                 cur: None,
             };
+            let mut stored = sc.columns.into_iter();
+            for spec in &plan.levels[0].cols {
+                let v = match spec {
+                    // The scan handed these back in registration order,
+                    // one per stored entry, so taking them in turn keeps
+                    // every column at the position it was given.
+                    ColSpec::Stored(..) => match stored.next() {
+                        Some(v) => v,
+                        None => break,
+                    },
+                    ColSpec::Computed(prog) => prog.eval(&level0, &mut self.arena)?,
+                };
+                level0.vecs.push(v);
+            }
             if level0.active_count() == 0 {
                 continue;
             }
@@ -1056,7 +1078,10 @@ impl<'a> Worker<'a> {
     }
 
     /// Builds one level chunk from a neighbor slice: row ids plus every
-    /// property column the pipeline reads on this level.
+    /// column the pipeline reads on this level, gathered if it is stored
+    /// and computed over the vector if it is an expression. The list is
+    /// in registration order and a program only loads columns registered
+    /// ahead of it, so one pass fills the chunk.
     fn make_level(&mut self, level: usize, part: &[u64]) -> Result<DataChunk> {
         let info = &self.plan.levels[level];
         let mut vecs = Vec::with_capacity(1 + info.cols.len());
@@ -1065,14 +1090,19 @@ impl<'a> Worker<'a> {
             PhysType::Int64,
             part,
         ));
-        for &(col, _) in &info.cols {
-            vecs.push(
-                self.snap
-                    .get()
-                    .gather(info.table, col, part, &mut self.arena)?,
-            );
+        let mut chunk = DataChunk::new(vecs, part.len() as u32);
+        for spec in &info.cols {
+            let v = match spec {
+                ColSpec::Stored(col, _) => {
+                    self.snap
+                        .get()
+                        .gather(info.table, *col, part, &mut self.arena)?
+                }
+                ColSpec::Computed(prog) => prog.eval(&chunk, &mut self.arena)?,
+            };
+            chunk.vecs.push(v);
         }
-        Ok(DataChunk::new(vecs, part.len() as u32))
+        Ok(chunk)
     }
 
     /// Copies a chunk's active row ids into the scratch buffer.
@@ -1617,7 +1647,7 @@ mod tests {
     use zu_vector::{ExprOp, OwnedValue};
 
     use super::*;
-    use crate::compile::{AggSpec, Level, PostSpec};
+    use crate::compile::{AggSpec, ColSpec, Level, PostSpec};
     use zu_vector::{CmpOp, Program};
 
     /// One node table, integer column 0, one rel with in-memory CSRs.
@@ -1776,7 +1806,7 @@ mod tests {
     fn age_level() -> Level {
         Level {
             table: 0,
-            cols: vec![(0, zu_query::snapshot::ColType::Int)],
+            cols: vec![ColSpec::Stored(0, zu_query::snapshot::ColType::Int)],
         }
     }
 

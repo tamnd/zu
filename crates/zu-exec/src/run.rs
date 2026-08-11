@@ -21,10 +21,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
-use zu_query::snapshot::{ColId, CsrPin, Dir, RelId, SCAN_ROWS, Snapshot};
+use zu_query::snapshot::{ColId, CsrPin, Dir, GroupId, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector};
 
-use crate::compile::{AggSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec};
+use crate::compile::{AggSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source};
 use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::pool;
 use crate::sink::{self, Acc, SinkState};
@@ -39,6 +39,72 @@ pub(crate) fn run(
     snap: &mut dyn Snapshot,
     options: &Options,
 ) -> Result<QueryResult> {
+    let sched = match plan.source {
+        Source::Seek(key) => seek_work(plan, snap, options, key)?,
+        Source::Scan(_) => scan_work(plan, snap, options)?,
+    };
+    let partials = drive(plan, snap, &sched)?;
+
+    match &plan.sink {
+        SinkSpec::Count => {
+            let total: i64 = partials.iter().map(|p| p.count).sum();
+            Ok(QueryResult {
+                columns: plan.columns.clone(),
+                rows: vec![vec![Value::Int(total)]],
+            })
+        }
+        SinkSpec::Agg {
+            item_agg,
+            keys,
+            aggs,
+            post,
+        } => sink::finish_agg(
+            plan.columns.clone(),
+            item_agg,
+            aggs,
+            post,
+            partials,
+            keys.is_empty(),
+        ),
+        SinkSpec::Rows { post, .. } => Ok(sink::finish_rows(plan.columns.clone(), post, partials)),
+    }
+}
+
+/// What a worker does with a morsel. Both kinds split the same way,
+/// contiguous ranges claimed in order and stitched back by index, so
+/// the parallel answer is the sequential one either way.
+#[derive(Clone, Copy)]
+enum Work {
+    /// Rows of the driving scan.
+    Scan,
+    /// The whole seeded plan on one morsel; `None` is a key that hit
+    /// no row, which still owes the sink its empty batch.
+    Seek(Option<u64>),
+    /// One slice of a seeded plan's first frontier: the seed row is
+    /// fixed and the morsel owns a range of its neighbor list.
+    Frontier {
+        seed: u64,
+        rel: RelId,
+        dir: Dir,
+        to: usize,
+    },
+}
+
+/// One query's morsels: what a morsel means, the ranges themselves,
+/// and how many workers to put on them.
+struct Schedule {
+    work: Work,
+    morsels: Vec<(u64, u64)>,
+    threads: usize,
+}
+
+/// The driving scan, split into morsels, with the worker count the
+/// table size justifies.
+fn scan_work(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    options: &Options,
+) -> Result<Schedule> {
     let total_rows = snap.table_rows(plan.table)?;
     let threads = match options.threads {
         // A scan under one storage group is a handful of morsels;
@@ -52,13 +118,138 @@ pub(crate) fn run(
         0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
         n => n,
     };
-    let morsels = make_morsels(total_rows, threads.max(1));
+    Ok(Schedule {
+        work: Work::Scan,
+        morsels: make_morsels(total_rows, threads.max(1)),
+        threads,
+    })
+}
+
+/// A morsel is worth handing to another core once it is this many rows
+/// of work: below it the fork and the handoff cost more than the split
+/// saves. Measured on the LDBC friends-of-friends read, where the split
+/// starts paying at a few tens of thousands of paths.
+const SPLIT_ROWS: u64 = 2 * 1024;
+
+/// The seeded plan's morsels. A seek touches one row, so there is
+/// normally nothing to split and the whole pipeline runs on the calling
+/// thread. The exception is the celebrity seed (perf/13 section 2): a
+/// person with a huge two-hop frontier is one query's worth of work
+/// behind one row, and left alone it sets the p99 of the whole class.
+/// The frontier splits into morsels weighted by each neighbor's own
+/// degree, so the workers get equal work rather than equal neighbors.
+fn seek_work(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    options: &Options,
+    key: u64,
+) -> Result<Schedule> {
+    let one = |work| {
+        Ok(Schedule {
+            work,
+            morsels: vec![(0, 0)],
+            threads: 1,
+        })
+    };
+    let Some(seed) = snap.seek_key(plan.table, key)? else {
+        return one(Work::Seek(None));
+    };
+    if options.threads == 1 {
+        return one(Work::Seek(Some(seed)));
+    }
+    let Some(&Op::Expand {
+        rel,
+        dirs: Dirs::One(dir),
+        from: 0,
+        to,
+    }) = plan.ops.first()
+    else {
+        return one(Work::Seek(Some(seed)));
+    };
+    // Weigh the frontier by the next hop when there is one, so a
+    // neighbor with a thousand edges counts for a thousand.
+    let list = snap.csr(rel, group_of(seed), dir)?;
+    let list = list.list((seed % u64::from(GROUP_ROWS)) as usize).to_vec();
+    let mut weight = vec![1u64; list.len()];
+    if let Some(&Op::Expand {
+        rel: next,
+        dirs: Dirs::One(next_dir),
+        from: 1,
+        ..
+    }) = plan.ops.get(1)
+    {
+        snap.degrees(next, &list, next_dir, &mut weight)?;
+        for w in &mut weight {
+            // `degrees` adds onto the slot, so the seed of 1 above is
+            // still in there; that floor is what keeps a zero-degree
+            // neighbor from disappearing out of the weighting.
+            *w = (*w).max(1);
+        }
+    }
+    let total: u64 = weight.iter().sum();
+    if total < SPLIT_ROWS {
+        return one(Work::Seek(Some(seed)));
+    }
+    let threads = match options.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+        n => n,
+    };
+    if threads < 2 {
+        return one(Work::Seek(Some(seed)));
+    }
+    // Four morsels a worker, the same oversubscription the scan uses:
+    // the weights are estimates, and a short tail morsel is what lets
+    // a worker that drew a heavy one be overtaken.
+    let target = (total / (threads as u64 * 4)).max(1);
+    let mut morsels = Vec::new();
+    let (mut lo, mut acc) = (0u64, 0u64);
+    for (i, w) in weight.iter().enumerate() {
+        acc += w;
+        if acc >= target && i as u64 + 1 < list.len() as u64 {
+            morsels.push((lo, i as u64 + 1));
+            lo = i as u64 + 1;
+            acc = 0;
+        }
+    }
+    morsels.push((lo, list.len() as u64));
+    Ok(Schedule {
+        work: Work::Frontier {
+            seed,
+            rel,
+            dir,
+            to,
+        },
+        morsels,
+        threads,
+    })
+}
+
+fn group_of(row: u64) -> GroupId {
+    (row / u64::from(GROUP_ROWS)) as GroupId
+}
+
+/// Runs the morsels across workers and returns each worker's partial
+/// sink.
+fn drive(plan: &ExecPlan, snap: &mut dyn Snapshot, sched: &Schedule) -> Result<Vec<SinkState>> {
+    let Schedule {
+        work,
+        morsels,
+        threads,
+    } = sched;
+    let (work, threads) = (*work, *threads);
     let quota = match &plan.sink {
         SinkSpec::Rows { post, .. } => quota_of(post),
         _ => None,
     };
     let stop = StopState::new(quota, morsels.len());
     let claim = AtomicUsize::new(0);
+
+    // A single worker needs none of the handoff machinery, and a point
+    // read is short enough that setting it up shows in the latency.
+    if threads <= 1 || morsels.len() <= 1 {
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
+        return w.work(morsels, &claim).map(|()| vec![w.sink]);
+    }
 
     // Fork one handle per extra worker; a backend that cannot fork
     // runs the query on this thread alone.
@@ -85,17 +276,17 @@ pub(crate) fn run(
             .into_iter()
             .zip(&slots)
             .map(|(f, slot)| {
-                let (stop, claim, morsels) = (&stop, &claim, morsels.as_slice());
+                let (stop, claim) = (&stop, &claim);
                 Box::new(move || {
-                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop);
+                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop, work);
                     let res = w.work(morsels, claim).map(|()| w.sink);
                     *slot.lock().unwrap() = Some(res);
                 }) as Box<dyn FnOnce() + Send + '_>
             })
             .collect();
         let pending = pool::submit(jobs);
-        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop);
-        let main = w.work(&morsels, &claim).map(|()| w.sink);
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
+        let main = w.work(morsels, &claim).map(|()| w.sink);
         pending.wait();
         main
     };
@@ -111,33 +302,9 @@ pub(crate) fn run(
             Err(e) => first_err = first_err.or(Some(e)),
         }
     }
-    let partials = match first_err {
-        Some(e) => return Err(e),
-        None => out,
-    };
-
-    match &plan.sink {
-        SinkSpec::Count => {
-            let total: i64 = partials.iter().map(|p| p.count).sum();
-            Ok(QueryResult {
-                columns: plan.columns.clone(),
-                rows: vec![vec![Value::Int(total)]],
-            })
-        }
-        SinkSpec::Agg {
-            item_agg,
-            keys,
-            aggs,
-            post,
-        } => sink::finish_agg(
-            plan.columns.clone(),
-            item_agg,
-            aggs,
-            post,
-            partials,
-            keys.is_empty(),
-        ),
-        SinkSpec::Rows { post, .. } => Ok(sink::finish_rows(plan.columns.clone(), post, partials)),
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(out),
     }
 }
 
@@ -309,12 +476,14 @@ struct Worker<'a> {
     args: Vec<i64>,
     sink: SinkState,
     stop: &'a StopState,
+    /// What this worker's morsels mean.
+    work: Work,
     /// Rows emitted in the morsel in flight, for the quota check.
     local_rows: u64,
 }
 
 impl<'a> Worker<'a> {
-    fn new(plan: &'a ExecPlan, snap: SnapHandle<'a>, stop: &'a StopState) -> Self {
+    fn new(plan: &'a ExecPlan, snap: SnapHandle<'a>, stop: &'a StopState, work: Work) -> Self {
         Worker {
             plan,
             snap,
@@ -334,6 +503,7 @@ impl<'a> Worker<'a> {
             args: Vec::new(),
             sink: SinkState::default(),
             stop,
+            work,
             local_rows: 0,
         }
     }
@@ -351,9 +521,84 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn run_morsel(&mut self, idx: usize, (lo, hi): (u64, u64)) -> Result<()> {
+    fn run_morsel(&mut self, idx: usize, range: (u64, u64)) -> Result<()> {
         self.arena.reset();
         self.local_rows = 0;
+        let rows_sink = matches!(self.plan.sink, SinkSpec::Rows { .. });
+        match self.work {
+            Work::Scan => self.scan_morsel(idx, range)?,
+            Work::Seek(seed) => self.seek_morsel(seed)?,
+            Work::Frontier {
+                seed,
+                rel,
+                dir,
+                to,
+            } => self.frontier_morsel(seed, rel, dir, to, range)?,
+        }
+        if rows_sink {
+            let batch = std::mem::take(&mut self.sink.rows);
+            self.sink.batches.push((idx, batch));
+        }
+        self.stop.morsel_done(idx, self.local_rows);
+        Ok(())
+    }
+
+    /// The seeded plan on one worker: the key index already found the
+    /// row, so level 0 is that row and everything above it is the
+    /// pipeline a scan runs. A key that hit nothing runs no ops and
+    /// still leaves the sink an empty batch.
+    fn seek_morsel(&mut self, seed: Option<u64>) -> Result<()> {
+        let Some(seed) = seed else { return Ok(()) };
+        let plan = self.plan;
+        let level0 = self.make_level(0, &[seed])?;
+        let mut set = ChunkSet::new(vec![level0]);
+        self.run_ops(&plan.ops, &mut set)
+    }
+
+    /// One slice of a celebrity seed's frontier. The seed's level 0 is
+    /// rebuilt per morsel, which is one row's gather, and the first
+    /// expand is unrolled here so the morsel can own a range of the
+    /// neighbor list instead of the whole of it. Slices are contiguous
+    /// and claimed in order, so the batches stitch back into exactly
+    /// the order one worker walking the list would have emitted.
+    fn frontier_morsel(
+        &mut self,
+        seed: u64,
+        rel: RelId,
+        dir: Dir,
+        to: usize,
+        (lo, hi): (u64, u64),
+    ) -> Result<()> {
+        let plan = self.plan;
+        let mut level0 = self.make_level(0, &[seed])?;
+        level0.cur = Some(0);
+        let mut set = ChunkSet::new(vec![level0]);
+        let pin = self.pin(rel, dir, seed)?;
+        let list = pin.list((seed % u64::from(GROUP_ROWS)) as usize);
+        let mut result = Ok(());
+        for part in list[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
+            let chunk = match self.make_level(to, part) {
+                Ok(c) => c,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            set.chunks.push(chunk);
+            let res = self.run_ops(&plan.ops[1..], &mut set);
+            set.chunks.pop();
+            if let Err(e) = res {
+                result = Err(e);
+                break;
+            }
+            if self.stop.stopped() {
+                break;
+            }
+        }
+        result
+    }
+
+    fn scan_morsel(&mut self, idx: usize, (lo, hi): (u64, u64)) -> Result<()> {
         let plan = self.plan;
         let rows_sink = matches!(plan.sink, SinkSpec::Rows { .. });
         for chunk in lo / SCAN_ROWS as u64..hi.div_ceil(SCAN_ROWS as u64) {
@@ -364,7 +609,7 @@ impl<'a> Worker<'a> {
                 plan.table,
                 chunk,
                 &self.scan_cols,
-                plan.pred.as_ref(),
+                plan.zone(),
                 &mut self.arena,
             )?
             else {
@@ -394,11 +639,6 @@ impl<'a> Worker<'a> {
                 break;
             }
         }
-        if rows_sink {
-            let batch = std::mem::take(&mut self.sink.rows);
-            self.sink.batches.push((idx, batch));
-        }
-        self.stop.morsel_done(idx, self.local_rows);
         Ok(())
     }
 
@@ -1358,8 +1598,8 @@ mod tests {
             Ok(ValueVector::flat_from(arena, PhysType::Int64, &vals))
         }
 
-        fn lookup_pk(&mut self, _rel: RelId, _key: u64) -> Result<Option<u64>> {
-            Ok(None)
+        fn seek_key(&mut self, _table: TableId, key: u64) -> Result<Option<u64>> {
+            Ok((key < self.rows).then_some(key))
         }
 
         fn degree_batch(&mut self, _rel: RelId, nodes: &[u64], dir: Dir) -> Result<u64> {
@@ -1379,7 +1619,7 @@ mod tests {
     fn plan(levels: Vec<Level>, ops: Vec<Op>, sink: SinkSpec, columns: &[&str]) -> ExecPlan {
         ExecPlan {
             table: 0,
-            pred: None,
+            source: Source::Scan(None),
             ops,
             sink,
             levels,
@@ -1497,11 +1737,11 @@ mod tests {
     fn zone_pred_skips_chunks() {
         let mut snap = Mock::new(10, |i| i as i64, false);
         let mut p = plan(vec![age_level()], Vec::new(), SinkSpec::Count, &["n"]);
-        p.pred = Some(ZonePred {
+        p.source = Source::Scan(Some(ZonePred {
             col: 0,
             lo: 1000,
             hi: u64::MAX,
-        });
+        }));
         let r = run(&p, &mut snap, &seq()).unwrap();
         assert_eq!(r.rows, vec![vec![Value::Int(0)]], "every chunk zoned out");
     }

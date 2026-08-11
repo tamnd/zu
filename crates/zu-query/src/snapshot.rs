@@ -143,9 +143,11 @@ pub trait Snapshot {
         arena: &mut MorselArena,
     ) -> Result<ValueVector>;
 
-    /// The dense row a primary key maps to in `rel`'s node domain,
-    /// `None` when absent.
-    fn lookup_pk(&mut self, rel: RelId, key: u64) -> Result<Option<u64>>;
+    /// The dense row a primary key maps to in `table`, `None` when the
+    /// key is absent or lands past the table. A table loaded without a
+    /// key index keeps the dense contract, where the key is the row,
+    /// which is the same rule property reads follow for `.id`.
+    fn seek_key(&mut self, table: TableId, key: u64) -> Result<Option<u64>>;
 
     /// Sum of degrees over `nodes` in `dir`, offsets only; neighbor
     /// values never decode for a count.

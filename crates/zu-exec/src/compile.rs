@@ -24,12 +24,32 @@ use zu_vector::{BinOp, CmpOp, ExprOp, OwnedValue, PhysType, Program, Reg};
 /// One compiled pipeline over one driving scan.
 pub(crate) struct ExecPlan {
     pub table: TableId,
-    /// Zone pushdown for the scan, extracted from a level 0 filter.
-    pub pred: Option<ZonePred>,
+    pub source: Source,
     pub ops: Vec<Op>,
     pub sink: SinkSpec,
     pub levels: Vec<Level>,
     pub columns: Vec<String>,
+}
+
+/// Where level 0 comes from.
+pub(crate) enum Source {
+    /// The driving scan, carrying any zone pushdown a level 0 filter
+    /// gave up.
+    Scan(Option<ZonePred>),
+    /// The primary-key seek an `{id: k}` predicate folds into: one row
+    /// or none, and no scan at all.
+    Seek(u64),
+}
+
+impl ExecPlan {
+    /// The zone pushdown the scan runs with; a seek has no chunks to
+    /// skip.
+    pub fn zone(&self) -> Option<&ZonePred> {
+        match &self.source {
+            Source::Scan(pred) => pred.as_ref(),
+            Source::Seek(_) => None,
+        }
+    }
 }
 
 /// One factorization level: the scan at index 0, one per expand after.
@@ -261,20 +281,24 @@ impl Compiler<'_> {
             _ => return Ok(None),
         };
         // A point predicate on the driving slot's id is the one shape
-        // the old engine does not scan at all: it folds the filter into
-        // the scan and seeks the primary-key index, so it touches one
-        // row. The pipeline has no seek source, so compiling this here
-        // reads the whole table to find that row, which measured 20 us
-        // against the old engine's 1.5 on a ten thousand node table.
-        // Hand the shape back until a seek operator exists.
+        // that never scans: the key index answers it with one row, so
+        // the filter turns into the source instead of running over
+        // every chunk. A key that is not a constant here, or one that
+        // does not fit a row id, goes back to the old engine rather
+        // than reading the whole table to find one row.
+        let mut seek = None;
         if let Some(LogicalPlan::Filter {
             expr,
             optional: None,
             ..
         }) = it.peek()
-            && id_point(expr, scan_slot)
+            && let Some(key) = id_point(expr, scan_slot)
         {
-            return Ok(None);
+            let Some(k) = self.const_int(key).and_then(|k| u64::try_from(k).ok()) else {
+                return Ok(None);
+            };
+            it.next();
+            seek = Some(k);
         }
         self.levels.push(LevelBuild {
             table,
@@ -297,7 +321,7 @@ impl Compiler<'_> {
                     let Some(prog) = self.build_prog(expr, level)? else {
                         return Ok(None);
                     };
-                    if level == 0 && ops.is_empty() && pred.is_none() {
+                    if level == 0 && ops.is_empty() && pred.is_none() && seek.is_none() {
                         pred = self.zone_pred(expr)?;
                     }
                     ops.push(Op::Filter { prog });
@@ -540,7 +564,10 @@ impl Compiler<'_> {
 
         Ok(Some(ExecPlan {
             table,
-            pred,
+            source: match seek {
+                Some(key) => Source::Seek(key),
+                None => Source::Scan(pred),
+            },
             ops,
             sink,
             levels: self
@@ -1076,19 +1103,19 @@ fn bin_op(op: BinaryOp) -> Option<BinOp> {
     }
 }
 
-/// Whether a filter is the `{id: k}` point predicate the old engine
-/// fuses into a seek: `slot.id = k` or `id(slot) = k` in either operand
+/// The key side of an `{id: k}` point predicate, the shape both engines
+/// answer with a seek: `slot.id = k` or `id(slot) = k` in either operand
 /// order against a constant. The old engine accepts any key expression
 /// that names no slot; a literal or a parameter is what people write,
 /// and a wider key only costs the seek, never an answer.
-fn id_point(expr: &BoundExpr, slot: usize) -> bool {
+fn id_point(expr: &BoundExpr, slot: usize) -> Option<&BoundExpr> {
     let BoundExpr::Binary {
         op: BinaryOp::Eq,
         lhs,
         rhs,
     } = expr
     else {
-        return false;
+        return None;
     };
     for (side, key) in [(lhs, rhs), (rhs, lhs)] {
         let on_id = match side.as_ref() {
@@ -1104,10 +1131,10 @@ fn id_point(expr: &BoundExpr, slot: usize) -> bool {
             _ => false,
         };
         if on_id && matches!(key.as_ref(), BoundExpr::Literal(_) | BoundExpr::Param(_)) {
-            return true;
+            return Some(key);
         }
     }
-    false
+    None
 }
 
 /// `c op x` rewritten as `x op' c`.

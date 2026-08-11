@@ -284,9 +284,7 @@ fn sort_rows(rows: &mut Vec<Vec<Value>>, keys: &[(usize, bool)], need: usize) {
     }
     let mut order: Vec<u32> = (0..rows.len() as u32).collect();
     {
-        let by = |x: &u32, y: &u32| {
-            by_keys(&rows[*x as usize], &rows[*y as usize]).then(x.cmp(y))
-        };
+        let by = |x: &u32, y: &u32| by_keys(&rows[*x as usize], &rows[*y as usize]).then(x.cmp(y));
         order.select_nth_unstable_by(need, by);
         order.truncate(need);
         order.sort_unstable_by(by);
@@ -305,11 +303,7 @@ fn sort_rows(rows: &mut Vec<Vec<Value>>, keys: &[(usize, bool)], need: usize) {
 fn row_parts(rows: &[Vec<Value>]) -> Option<Vec<PartKind>> {
     let parts: Vec<PartKind> = rows.first()?.iter().map(part_of).collect::<Option<_>>()?;
     let same = rows.iter().all(|row| {
-        row.len() == parts.len()
-            && row
-                .iter()
-                .zip(&parts)
-                .all(|(v, &p)| part_of(v) == Some(p))
+        row.len() == parts.len() && row.iter().zip(&parts).all(|(v, &p)| part_of(v) == Some(p))
     });
     same.then_some(parts)
 }

@@ -221,10 +221,10 @@ impl GroupTable {
             // one round per word, and stride is one for the common
             // single column key.
             hashes.extend(batch.words.chunks_exact(self.stride.max(1)).map(|words| {
-                    let mut h = SEED;
-                    for &w in words {
-                        h = hash64(h ^ w);
-                    }
+                let mut h = SEED;
+                for &w in words {
+                    h = hash64(h ^ w);
+                }
                 h
             }));
         }
@@ -551,7 +551,13 @@ mod tests {
     fn string_keys_compare_by_bytes() {
         let mut t = GroupTable::new(vec![PartKind::Str], 1);
         let specs = [AggSpec::CountStar];
-        let strs = ["a", "bb", "a", "a longer string past the inline limit", "bb"];
+        let strs = [
+            "a",
+            "bb",
+            "a",
+            "a longer string past the inline limit",
+            "bb",
+        ];
         let mut batch = KeyBatch::default();
         batch.reset(t.stride(), strs.len());
         for (row, s) in strs.iter().enumerate() {

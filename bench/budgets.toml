@@ -200,6 +200,19 @@ ldbc_ic_p50_ms = 6.0
 # rather than at the target. Lower this ceiling, never raise it.
 ldbc_triangle_p50_ms = 150.0
 
+# The same SF1 triangle walked undirected, 1.77 M closed paths. An
+# undirected end has two sorted lists, so the optimizer keeps this one
+# on the binary probe and the close compiles to the semijoin the
+# pipeline folds into the expand above it. It is the phase that moves
+# when that fusion changes, and it is a fifth of the graph's paths, so
+# it also stands in for the 2-hop shapes nothing else times. Measured
+# at f6f2386 with main and the branch interleaved: gamingpc 296 to 300
+# ms before the fold and 267 to 270 after, local M series 336 to 340
+# against 324 to 328, server1 909 to 974 against 863 to 965 with its
+# usual vCPU spread. The ceiling clears server1's worst p50 with room
+# for the load it gates under. Lower this ceiling, never raise it.
+ldbc_close_p50_ms = 1200.0
+
 # Table function kernels on SF1 (docs/07 section 4, docs/12 M4), timed
 # directly against the loaded knows CSR: pagerank is 20 power
 # iterations at damping 0.85, wcc is union-find by minimum with path

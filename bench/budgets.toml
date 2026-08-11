@@ -426,7 +426,7 @@ exec_sort_share_pct = 5.0
 #
 # Measured: local M series 78 to 93, gamingpc 73 to 82, server1 7 to 10.
 # The same probe on a std HashSet, which is what exec.rs uses today, is
-# 1.1 to 2.6x slower on every host, and the miss probe that the folded
+# 1.0 to 2.6x slower on every host, and the miss probe that the folded
 # Bloom tag is actually there for is 2.0 to 4.9x slower. Those are the
 # two shapes this table was chosen for and it wins both. Nothing
 # compiles to a join yet, so this gate guards a primitive and not a

@@ -37,10 +37,10 @@
 //! rediscover it. The baseline is the standard library on the same keys,
 //! which is not a strawman: it is the shape `exec.rs` uses today.
 //!
-//! Misses run 2.0 to 3.5x a `HashSet` probe across the fleet. That is
+//! Misses run 2.0 to 4.9x a `HashSet` probe across the fleet. That is
 //! the antijoin and the mark join, and it is where the folded tag earns
 //! its bits, since a miss reads the directory word and stops. Hits on
-//! distinct keys run 1.1 to 2.1x. Both of those hold on every host, and
+//! distinct keys run 1.0 to 2.6x. Both of those hold on every host, and
 //! the margin is widest on the slow ones, which is the right direction.
 //!
 //! The duplicate-heavy inner join, forty rows to a key, is the shape
@@ -48,8 +48,8 @@
 //! of a `HashMap<u64, Vec<u64>>` everywhere, because it read the key
 //! beside every row it returned and then read the rows again to find
 //! where its own run stopped. Storing the key once put it level with
-//! that map and 3.6 to 6.3x its own old self: 292.56 to 46.60 ms on the
-//! local M series, 240 to 66.58 on gamingpc, 2740 to 747 on server1.
+//! that map and 3.5 to 5.3x its own old self: 249.03 to 47.02 ms on the
+//! local M series, 240.45 to 66.58 on gamingpc, 2861 to 824 on server1.
 //! Part of that is the second seating rather than the collapse alone.
 //! Left in the directory the rows asked for, the same probe reads 90.34
 //! on gamingpc against 66.58 seated and 1166 on server1 against 747,

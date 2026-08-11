@@ -111,8 +111,99 @@ fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalP
         schema,
         &mut BTreeMap::new(),
         &mut Ceiling::default(),
+        &mut Seeds::default(),
         &mut Vec::new(),
     )
+}
+
+/// What the reader running the query can tell the estimator and the
+/// catalog cannot: which row a point lookup names, and how many
+/// neighbors that one row holds.
+///
+/// The statistics only carry means, and a mean is the wrong number for
+/// a point seed. SF1 hands `{id: $id}` a person with 335 friends while
+/// the mean degree over the table is 20, so the first step off the seed
+/// is out by the whole skew of the graph no matter how good the
+/// histogram is. Reading the seed's own degree costs one offsets probe
+/// and is exact, so that is what the estimate uses when a reader is
+/// there to ask. Planning never gets one: the plan is cached across
+/// parameter values and this answer is not the same for two of them.
+pub trait Probe {
+    /// The row `key` names in `table`, None when no row carries it or
+    /// the key is not a constant this run can resolve.
+    fn seed(&mut self, table: u32, key: &BoundExpr) -> Option<u64>;
+
+    /// Neighbors `node` holds in `rel`, out-edges when `reversed` is
+    /// false and in-edges when true. None when the reader cannot say.
+    fn degree(&mut self, rel: u32, node: u64, reversed: bool) -> Option<u64>;
+}
+
+/// The slots a point lookup has pinned to one row, and the reader that
+/// resolved them. Default is the planning case, no reader and nothing
+/// pinned, which estimates exactly as it did before this existed.
+#[derive(Default)]
+struct Seeds<'a> {
+    probe: Option<&'a mut dyn Probe>,
+    /// Slot to the row its point lookup named.
+    at: BTreeMap<usize, u64>,
+}
+
+impl Seeds<'_> {
+    /// Records the row `filter` pins `slot` to, when the filter is a
+    /// point lookup on a slot that still holds one row per node and a
+    /// reader can resolve the key.
+    fn pin(&mut self, filter: &BoundExpr, slot: usize, query: &BoundQuery) {
+        let Some(probe) = self.probe.as_deref_mut() else {
+            return;
+        };
+        let Some(key) = key_expr(filter, slot, query) else {
+            return;
+        };
+        // A slot bound to two labels resolves in both, and the step off
+        // it reads both rows, so there is no single degree to read.
+        let [table] = query.variables[slot].node_tables[..] else {
+            return;
+        };
+        if let Some(row) = probe.seed(table, key) {
+            self.at.insert(slot, row);
+        }
+    }
+
+    /// Rows one step of `e` off `source` produces, exactly, when
+    /// `source` is pinned to a row whose degrees the reader can read.
+    /// A var-length step only knows its first hop this way, so it keeps
+    /// the statistics.
+    fn fanout(
+        &mut self,
+        e: &ExpandOp,
+        source: usize,
+        query: &BoundQuery,
+        schema: &Schema,
+    ) -> Option<f64> {
+        if e.range.is_some() {
+            return None;
+        }
+        let probe = self.probe.as_deref_mut()?;
+        let row = *self.at.get(&source)?;
+        let table = match query.variables[source].node_tables[..] {
+            [t] => t,
+            _ => return None,
+        };
+        let mut rows = 0.0;
+        for rid in &query.variables[e.rel].rel_tables {
+            let rd = schema.rel_by_id(*rid)?;
+            for d in walk_sides(e, source) {
+                // The row is an offset in its own table's space, so a
+                // step reading the far side of the rel is reading a
+                // different table's rows and this one says nothing.
+                if [rd.from, rd.to][*d] != table {
+                    return None;
+                }
+                rows += probe.degree(*rid, row, *d == 1)? as f64;
+            }
+        }
+        Some(rows)
+    }
 }
 
 /// What the optimizer expects of one operator: the estimate it
@@ -137,6 +228,20 @@ pub struct Estimate {
 /// a tree that has already survived the DP, and keeping the estimate
 /// off `LogicalPlan` keeps plan equality meaning what it means today.
 pub fn estimates(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Vec<Estimate> {
+    probed_estimates(plan, query, schema, None)
+}
+
+/// [`estimates`] with a reader behind it, which is what an execution
+/// has and planning does not. Everything the catalog can answer is
+/// answered the same way; the probe only speaks where a point lookup
+/// pinned a slot to one row, and there it replaces a mean degree with
+/// the degree that row holds.
+pub fn probed_estimates(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    probe: Option<&mut dyn Probe>,
+) -> Vec<Estimate> {
     let mut out = Vec::new();
     mark_asp_walk(
         plan.clone(),
@@ -144,6 +249,10 @@ pub fn estimates(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Vec
         schema,
         &mut BTreeMap::new(),
         &mut Ceiling::default(),
+        &mut Seeds {
+            probe,
+            at: BTreeMap::new(),
+        },
         &mut out,
     );
     out
@@ -203,9 +312,10 @@ fn mark_asp_walk(
     schema: &Schema,
     dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
     ceil: &mut Ceiling,
+    seeds: &mut Seeds<'_>,
     out: &mut Vec<Estimate>,
 ) -> (LogicalPlan, f64) {
-    let (plan, est) = mark_asp_node(plan, query, schema, dists, ceil, out);
+    let (plan, est) = mark_asp_node(plan, query, schema, dists, ceil, seeds, out);
     if !matches!(plan, LogicalPlan::Empty) {
         out.push(Estimate { est, bnd: ceil.bnd });
     }
@@ -218,6 +328,7 @@ fn mark_asp_node(
     schema: &Schema,
     dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
     ceil: &mut Ceiling,
+    seeds: &mut Seeds<'_>,
     out: &mut Vec<Estimate>,
 ) -> (LogicalPlan, f64) {
     match plan {
@@ -227,7 +338,7 @@ fn mark_asp_node(
             slot,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             let card = slot_card(slot, query, schema);
             // The seed scan is the one place rows are known to hold
             // every node once. A scan above anything else is a cross
@@ -256,7 +367,7 @@ fn mark_asp_node(
             wcoj: _,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             let e = ExpandOp {
                 rel,
                 from,
@@ -298,6 +409,12 @@ fn mark_asp_node(
                     query,
                     schema,
                 );
+                // A step off a pinned row reads that row's list and
+                // nothing else, so the reader's answer is the count and
+                // not an estimate of it. The colors have nothing to add
+                // over an exact number, but they still describe where
+                // the step lands, so the distribution stays.
+                let factor = seeds.fanout(&e, from, query, schema).unwrap_or(factor);
                 if let Some(d) = reached {
                     dists.insert(to, d);
                 }
@@ -331,7 +448,13 @@ fn mark_asp_node(
             expr,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
+            // `distinct` is the seed scan and nothing above it, which is
+            // where a point lookup lands and the only place a filter
+            // leaves a slot holding one known row.
+            if let Some(slot) = ceil.distinct {
+                seeds.pin(&expr, slot, query);
+            }
             let est = (est * selectivity(&expr, query, schema)).max(1e-6);
             // A filter only removes rows, so the ceiling under it still
             // holds over its output.
@@ -346,7 +469,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Unwind { input, expr, slot } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // Nothing bounds how wide a list is.
             ceil.bnd = None;
             (
@@ -366,7 +489,7 @@ fn mark_asp_node(
             args,
             slots,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // One row per node of the rel's domain, exactly.
             let rows = schema
                 .node_by_id(table)
@@ -387,7 +510,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Project { input, items } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             (
                 LogicalPlan::Project {
                     input: Box::new(input),
@@ -397,12 +520,13 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
-            let (input, _) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, _) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // Grouping changes what a slot's rows are, so the tracked
             // distributions go with the estimate. Nothing here says how
             // many groups there will be, so the ceiling goes too rather
             // than capping everything above at the one row this claims.
             dists.clear();
+            seeds.at.clear();
             ceil.bnd = None;
             ceil.distinct = None;
             (
@@ -415,7 +539,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Distinct { input } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             (
                 LogicalPlan::Distinct {
                     input: Box::new(input),
@@ -424,7 +548,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Sort { input, keys } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             (
                 LogicalPlan::Sort {
                     input: Box::new(input),
@@ -434,7 +558,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Skip { input, expr } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             (
                 LogicalPlan::Skip {
                     input: Box::new(input),
@@ -444,7 +568,7 @@ fn mark_asp_node(
             )
         }
         LogicalPlan::Limit { input, expr } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, out);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             (
                 LogicalPlan::Limit {
                     input: Box::new(input),
@@ -1680,21 +1804,30 @@ fn selectivity(filter: &BoundExpr, query: &BoundQuery, schema: &Schema) -> f64 {
 /// Whether `filter` pins `slot` to one key: equality between the
 /// slot's `id` property and a literal or parameter.
 fn key_point(filter: &BoundExpr, slot: usize, query: &BoundQuery) -> bool {
+    key_expr(filter, slot, query).is_some()
+}
+
+/// The side of a point lookup that carries the key, so a reader can
+/// resolve it to a row.
+fn key_expr<'a>(filter: &'a BoundExpr, slot: usize, query: &BoundQuery) -> Option<&'a BoundExpr> {
     let BoundExpr::Binary {
         op: BinaryOp::Eq,
         lhs,
         rhs,
     } = filter
     else {
-        return false;
+        return None;
     };
-    [(lhs, rhs), (rhs, lhs)].into_iter().any(|(side, other)| {
-        matches!(side.as_ref(), BoundExpr::Property { base, key }
+    [(lhs, rhs), (rhs, lhs)]
+        .into_iter()
+        .find_map(|(side, other)| {
+            let names_id = matches!(side.as_ref(), BoundExpr::Property { base, key }
             if key == "id"
                 && !query.variables[slot].node_tables.is_empty()
-                && matches!(base.as_ref(), BoundExpr::Var(s) if *s == slot))
-            && matches!(other.as_ref(), BoundExpr::Param(_) | BoundExpr::Literal(_))
-    })
+                && matches!(base.as_ref(), BoundExpr::Var(s) if *s == slot));
+            let constant = matches!(other.as_ref(), BoundExpr::Param(_) | BoundExpr::Literal(_));
+            (names_id && constant).then(|| other.as_ref())
+        })
 }
 
 /// Ceiling on the largest degree the histogram admits: bucket `i`
@@ -1808,6 +1941,92 @@ mod tests {
 
     fn lines(text: &str) -> Vec<&str> {
         text.lines().map(str::trim_start).collect()
+    }
+
+    /// A reader that resolves every key to one row and gives that row
+    /// one degree on every side, which is all the estimator asks of it.
+    /// `found` off is a key that names nothing.
+    struct FakeProbe {
+        found: bool,
+        row: u64,
+        degree: u64,
+    }
+
+    impl Probe for FakeProbe {
+        fn seed(&mut self, _table: u32, _key: &BoundExpr) -> Option<u64> {
+            self.found.then_some(self.row)
+        }
+
+        fn degree(&mut self, _rel: u32, node: u64, _reversed: bool) -> Option<u64> {
+            (node == self.row).then_some(self.degree)
+        }
+    }
+
+    /// Every operator's estimate, bottom-up, for a plan the optimizer
+    /// has already ordered.
+    fn ests(source: &str, probe: Option<&mut dyn Probe>) -> Vec<f64> {
+        let schema = schema();
+        let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+        let built = plan::build(&query).expect("build");
+        let opt = optimize(built, &query, &schema).expect("optimize");
+        probed_estimates(&opt, &query, &schema, probe)
+            .iter()
+            .map(|e| e.est)
+            .collect()
+    }
+
+    #[test]
+    fn a_point_seeded_hop_reads_the_seed_own_degree() {
+        // Mean degree over the table is 20, the seed holds 335, and the
+        // statistics have no way to tell the two apart. Scan, filter,
+        // expand, project.
+        let q = "MATCH (p:Person {id: $x})-[:KNOWS]->(f) RETURN f.id AS id";
+        assert_eq!(ests(q, None), vec![9000.0, 1.0, 20.0, 20.0]);
+        let mut probe = FakeProbe {
+            found: true,
+            row: 4,
+            degree: 335,
+        };
+        assert_eq!(ests(q, Some(&mut probe)), vec![9000.0, 1.0, 335.0, 335.0]);
+    }
+
+    #[test]
+    fn a_key_that_names_no_row_keeps_the_statistics() {
+        let mut probe = FakeProbe {
+            found: false,
+            row: 4,
+            degree: 335,
+        };
+        let q = "MATCH (p:Person {id: $x})-[:KNOWS]->(f) RETURN f.id AS id";
+        assert_eq!(ests(q, Some(&mut probe)), vec![9000.0, 1.0, 20.0, 20.0]);
+    }
+
+    #[test]
+    fn a_hop_off_a_scan_never_asks_the_reader() {
+        let mut probe = FakeProbe {
+            found: true,
+            row: 4,
+            degree: 335,
+        };
+        let q = "MATCH (p:Person)-[:KNOWS]->(f) RETURN f.id AS id";
+        assert_eq!(ests(q, None), ests(q, Some(&mut probe)));
+    }
+
+    #[test]
+    fn only_the_step_off_the_seed_is_exact() {
+        // The second hop starts from 335 rows spread over nodes nobody
+        // named, so it is back on the degree-weighted mean and the only
+        // thing the reader changed is what it multiplies.
+        let q = "MATCH (p:Person {id: $x})-[:KNOWS]->(f)-[:KNOWS]->(g) RETURN g.id AS id";
+        let plain = ests(q, None);
+        let mut probe = FakeProbe {
+            found: true,
+            row: 4,
+            degree: 335,
+        };
+        let seeded = ests(q, Some(&mut probe));
+        assert_eq!(seeded[2] / plain[2], 335.0 / 20.0);
+        assert_eq!(seeded[3] / plain[3], 335.0 / 20.0);
     }
 
     #[test]

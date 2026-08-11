@@ -58,17 +58,49 @@ pub fn optimize(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> Resul
 /// row because grouped cardinality is unknown until the column catalog
 /// carries statistics, which only understates and keeps ExpandInto.
 fn mark_asp(plan: LogicalPlan, query: &BoundQuery, schema: &Schema) -> (LogicalPlan, f64) {
-    mark_asp_walk(plan, query, schema, &mut BTreeMap::new())
+    mark_asp_walk(plan, query, schema, &mut BTreeMap::new(), &mut Vec::new())
+}
+
+/// The per-operator row estimate the optimizer settled on, one entry
+/// per operator, bottom-up, in the same order `exec` linearizes the
+/// plan into its operator pipeline. This is what EXPLAIN ANALYZE holds
+/// against the measured row counts to report q-error (perf/12 §4).
+///
+/// It reruns the marking walk on a clone rather than caching the
+/// numbers on the plan. The walk is a few dozen float operations over
+/// a tree that has already survived the DP, and keeping the estimate
+/// off `LogicalPlan` keeps plan equality meaning what it means today.
+pub fn estimates(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Vec<f64> {
+    let mut out = Vec::new();
+    mark_asp_walk(plan.clone(), query, schema, &mut BTreeMap::new(), &mut out);
+    out
 }
 
 /// The [`mark_asp`] recursion, threading each slot's color
 /// distribution so a colored close sees the frontier its probe side
-/// actually carries.
+/// actually carries, and recording every operator's estimate into
+/// `out` on the way back up. `Empty` records nothing because the
+/// linearization `exec` builds does not carry it either.
 fn mark_asp_walk(
     plan: LogicalPlan,
     query: &BoundQuery,
     schema: &Schema,
     dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
+    out: &mut Vec<f64>,
+) -> (LogicalPlan, f64) {
+    let (plan, est) = mark_asp_node(plan, query, schema, dists, out);
+    if !matches!(plan, LogicalPlan::Empty) {
+        out.push(est);
+    }
+    (plan, est)
+}
+
+fn mark_asp_node(
+    plan: LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    dists: &mut BTreeMap<usize, (u32, Vec<f64>)>,
+    out: &mut Vec<f64>,
 ) -> (LogicalPlan, f64) {
     match plan {
         LogicalPlan::Empty => (LogicalPlan::Empty, 1.0),
@@ -77,7 +109,7 @@ fn mark_asp_walk(
             slot,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             let est = est * slot_card(slot, query, schema);
             (
                 LogicalPlan::ScanNodes {
@@ -100,7 +132,7 @@ fn mark_asp_walk(
             wcoj: _,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             let e = ExpandOp {
                 rel,
                 from,
@@ -159,7 +191,7 @@ fn mark_asp_walk(
             expr,
             optional,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             let est = (est * selectivity(&expr, query, schema)).max(1e-6);
             (
                 LogicalPlan::Filter {
@@ -171,7 +203,7 @@ fn mark_asp_walk(
             )
         }
         LogicalPlan::Unwind { input, expr, slot } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             (
                 LogicalPlan::Unwind {
                     input: Box::new(input),
@@ -189,7 +221,7 @@ fn mark_asp_walk(
             args,
             slots,
         } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             // One row per node of the rel's domain, exactly.
             let rows = schema
                 .node_by_id(table)
@@ -208,7 +240,7 @@ fn mark_asp_walk(
             )
         }
         LogicalPlan::Project { input, items } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             (
                 LogicalPlan::Project {
                     input: Box::new(input),
@@ -218,7 +250,7 @@ fn mark_asp_walk(
             )
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
-            let (input, _) = mark_asp_walk(*input, query, schema, dists);
+            let (input, _) = mark_asp_walk(*input, query, schema, dists, out);
             // Grouping changes what a slot's rows are, so tracked
             // distributions reset with the estimate.
             dists.clear();
@@ -232,7 +264,7 @@ fn mark_asp_walk(
             )
         }
         LogicalPlan::Distinct { input } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             (
                 LogicalPlan::Distinct {
                     input: Box::new(input),
@@ -241,7 +273,7 @@ fn mark_asp_walk(
             )
         }
         LogicalPlan::Sort { input, keys } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             (
                 LogicalPlan::Sort {
                     input: Box::new(input),
@@ -251,7 +283,7 @@ fn mark_asp_walk(
             )
         }
         LogicalPlan::Skip { input, expr } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             (
                 LogicalPlan::Skip {
                     input: Box::new(input),
@@ -261,7 +293,7 @@ fn mark_asp_walk(
             )
         }
         LogicalPlan::Limit { input, expr } => {
-            let (input, est) = mark_asp_walk(*input, query, schema, dists);
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, out);
             (
                 LogicalPlan::Limit {
                     input: Box::new(input),

@@ -138,6 +138,13 @@ impl Session {
     /// EXPLAIN ANALYZE through the session: same cache, same options,
     /// profiled execution.
     pub fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {
+        Ok(self.profile(source, params)?.render())
+    }
+
+    /// The same run, handing back the counters instead of the
+    /// rendering, for callers that want the numbers. `zu bench
+    /// cardinality` reads q-error off this.
+    pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<exec::Profile> {
         self.refresh()?;
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
@@ -149,7 +156,7 @@ impl Session {
             &args,
             &query::env_options(),
         )?;
-        Ok(profile.render())
+        Ok(profile)
     }
 
     fn plan_for(&mut self, source: &str) -> Result<Arc<CachedPlan>> {

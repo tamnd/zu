@@ -708,16 +708,28 @@ impl<'a> Worker<'a> {
             }
         }
         let mut result = Ok(());
+        // One pin covers a whole storage group and the rows arrive in
+        // row order, so the pin is held across rows the way the WCOJ
+        // close holds its seed. Without this the loop pays a hash of
+        // the pin key and two atomic refcount bumps per row per
+        // direction, around a body whose real work is one slice of the
+        // group's neighbor array. One slot per side, since an
+        // undirected expand reads two pins that move together.
+        let mut held: [Option<(u32, CsrPin)>; 2] = [None, None];
         'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
             set.chunks[src].cur = Some(phys);
-            for dir in sides(dirs) {
-                let pin = match self.pin(rel, dir, row) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        result = Err(e);
-                        break 'srcs;
+            let group = (row / u64::from(GROUP_ROWS)) as u32;
+            for (slot, dir) in sides(dirs).enumerate() {
+                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
+                    match self.pin(rel, dir, row) {
+                        Ok(p) => held[slot] = Some((group, p)),
+                        Err(e) => {
+                            result = Err(e);
+                            break 'srcs;
+                        }
                     }
-                };
+                }
+                let pin = &held[slot].as_ref().expect("just pinned").1;
                 let list = pin.list((row % u64::from(GROUP_ROWS)) as usize);
                 for part in list.chunks(zu_vector::VECTOR_SIZE) {
                     let chunk = match self.make_level(to, part) {

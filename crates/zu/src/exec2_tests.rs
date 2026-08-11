@@ -73,7 +73,7 @@ fn run_both(
     source: &str,
     threads: usize,
 ) -> (Option<exec::QueryResult>, exec::QueryResult) {
-    let (query, plan) = query::compile(source, schema).unwrap();
+    let (query, plan, _) = query::compile(source, schema).unwrap();
     assert!(query.params.is_empty(), "parity queries take no params");
     let options = Options {
         threads,

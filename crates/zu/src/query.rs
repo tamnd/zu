@@ -43,7 +43,17 @@ pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
             edge_count: r.edge_count,
         })
         .collect();
-    Schema::new(nodes, rels)
+    let mut schema = Schema::new(nodes, rels)?;
+    // perf/12 §2.4 wants the dual run threshold tunable. Default is
+    // 100x; lower it to reach for the robust join order sooner on data
+    // whose estimates cannot be trusted.
+    if let Some(factor) = std::env::var("ZU_BOUND_DISAGREEMENT")
+        .ok()
+        .and_then(|f| f.parse().ok())
+    {
+        schema.set_bound_disagreement(factor);
+    }
+    Ok(schema)
 }
 
 /// Parses and binds one query against a zu1 catalog.
@@ -59,8 +69,19 @@ pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
     let parsed = parser::parse(source)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
-    let optimized = optimizer::optimize(built, &query, &schema)?;
-    Ok(plan::explain(&optimized, &query, &schema))
+    let (optimized, notes) = optimizer::optimize_noted(built, &query, &schema)?;
+    Ok(noted(notes, plan::explain(&optimized, &query, &schema)))
+}
+
+/// Puts the optimizer's notes above a listing, one per line. They go
+/// on top because they are about the whole plan and not about any one
+/// operator in it.
+pub(crate) fn noted(notes: Vec<String>, listing: String) -> String {
+    notes
+        .into_iter()
+        .map(|n| format!("note: {n}\n"))
+        .chain([listing])
+        .collect()
 }
 
 /// The file handle behind a [`Zu1Graph`]: the caller's borrowed handle
@@ -366,6 +387,8 @@ struct Prepared {
     query: BoundQuery,
     plan: plan::LogicalPlan,
     args: Vec<Value>,
+    /// What the optimizer wants EXPLAIN to say that the tree does not.
+    notes: Vec<String>,
 }
 
 /// Loads the catalog and stats chains from disk and builds the binder
@@ -453,12 +476,15 @@ pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
 /// Parses, binds, plans, and optimizes one query against a schema.
 /// Everything here depends only on the query text and the schema, so
 /// the result is what a plan cache stores.
-pub(crate) fn compile(source: &str, schema: &Schema) -> Result<(BoundQuery, plan::LogicalPlan)> {
+pub(crate) fn compile(
+    source: &str,
+    schema: &Schema,
+) -> Result<(BoundQuery, plan::LogicalPlan, Vec<String>)> {
     let parsed = parser::parse(source)?;
     let query = binder::bind(&parsed, schema)?;
     let built = plan::build(&query)?;
-    let plan = optimizer::optimize(built, &query, schema)?;
-    Ok((query, plan))
+    let (plan, notes) = optimizer::optimize_noted(built, &query, schema)?;
+    Ok((query, plan, notes))
 }
 
 /// Resolves caller parameters against the binder's parameter order.
@@ -479,7 +505,7 @@ pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Ve
 
 fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
     let (catalog, schema) = load_schema(db)?;
-    let (query, plan) = compile(source, &schema)?;
+    let (query, plan, notes) = compile(source, &schema)?;
     let args = bind_args(&query.params, params)?;
     Ok(Prepared {
         catalog,
@@ -487,6 +513,7 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
         query,
         plan,
         args,
+        notes,
     })
 }
 
@@ -544,13 +571,24 @@ pub(crate) fn env_options() -> exec::Options {
 /// stage. The grammar has no EXPLAIN keyword yet, so this is the API
 /// entry point.
 pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<String> {
-    Ok(profile(source, db, params)?.render())
+    let (profile, notes) = profile_noted(source, db, params)?;
+    Ok(noted(notes, profile.render()))
 }
 
 /// The same profiled run handing back the counters instead of the
 /// rendering. The cardinality phase of the LDBC bench reads q-error
 /// off this (perf/12 §4).
 pub fn profile(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<exec::Profile> {
+    Ok(profile_noted(source, db, params)?.0)
+}
+
+/// The profiled run plus the optimizer's notes, which the rendering
+/// wants and the bench does not.
+fn profile_noted(
+    source: &str,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+) -> Result<(exec::Profile, Vec<String>)> {
     let p = prepare(source, db, params)?;
     let mut graph = Zu1Graph::new(db, p.catalog);
     let (_, profile) = exec::execute_profiled(
@@ -561,7 +599,7 @@ pub fn profile(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Resu
         &p.args,
         &env_options(),
     )?;
-    Ok(profile)
+    Ok((profile, p.notes))
 }
 
 #[cfg(test)]

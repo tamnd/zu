@@ -58,6 +58,10 @@ pub(crate) fn run(
                 rows: vec![vec![Value::Int(total)]],
             })
         }
+        SinkSpec::CountDistinct { .. } => Ok(QueryResult {
+            columns: plan.columns.clone(),
+            rows: vec![vec![Value::Int(sink::finish_distinct(partials)?)]],
+        }),
         SinkSpec::Agg {
             item_agg,
             keys,
@@ -1274,6 +1278,10 @@ impl<'a> Worker<'a> {
                 self.sink.count += set.multiplicity() as i64;
                 Ok(())
             }
+            // The distinct tuple is the group key and nothing
+            // accumulates against it, so the table is built for its
+            // group count alone.
+            SinkSpec::CountDistinct { keys } => self.group_vector(set, keys, &[]),
             SinkSpec::Rows { items, .. } => {
                 let plan = self.plan;
                 let last = set.chunks.len() - 1;

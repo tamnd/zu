@@ -191,8 +191,8 @@ impl GroupTable {
         self.stride
     }
 
-    #[cfg(test)]
-    fn groups(&self) -> usize {
+    /// How many distinct keys the table holds.
+    pub(crate) fn groups(&self) -> usize {
         self.groups
     }
 

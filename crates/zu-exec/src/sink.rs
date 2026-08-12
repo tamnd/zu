@@ -750,6 +750,24 @@ pub(crate) fn finish_agg(
     })
 }
 
+/// Folds the workers' tables and answers with how many groups they
+/// hold together, which is the whole of `count(DISTINCT ...)`: the
+/// tuple went in as a group key and the group count is the number of
+/// tuples that were different. Nothing accumulated per group, so the
+/// merge only has to find the keys one table holds that another one
+/// does not.
+pub(crate) fn finish_distinct(partials: Vec<SinkState>) -> Result<i64> {
+    let mut merged: Option<GroupTable> = None;
+    for p in partials {
+        let Some(t) = p.groups else { continue };
+        match &mut merged {
+            None => merged = Some(t),
+            Some(m) => m.merge_from(&t)?,
+        }
+    }
+    Ok(merged.map_or(0, |m| m.groups() as i64))
+}
+
 /// Stitches row batches back into scan order and applies the posts.
 pub(crate) fn finish_rows(
     columns: Vec<String>,

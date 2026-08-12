@@ -1004,14 +1004,31 @@ impl Compiler<'_> {
             }
         }
 
-        // Fuse trailing expands feeding a bare count into one degree
-        // product when nothing reads the expanded levels' rows or
-        // columns. The steps must fan out of one source level: a
-        // single popped expand is the plain expand-then-count fusion,
-        // several are a hub, the shape the optimizer picks for an
-        // unseeded two-hop, where the count per source row is the
+        // Fuse trailing expands feeding a count or a grouped aggregate
+        // into one degree product when nothing reads the expanded
+        // levels' rows or columns. The steps must fan out of one source
+        // level: a single popped expand is the plain expand-then-count
+        // fusion, several are a hub, the shape the optimizer picks for
+        // an unseeded two-hop, where the count per source row is the
         // product of its per-step degrees.
-        if matches!(sink, SinkSpec::Count) {
+        //
+        // An aggregate takes the product as a weight. What the walk
+        // would have built is one row per neighbor carrying the same
+        // key and the same argument as the source row it came off, so
+        // the group only ever needed to know how many of them there
+        // were, and a degree read is offsets alone: the neighbor array
+        // is never touched. A source row the steps found nothing for
+        // weighs nothing and drops out, which is what keeps a group
+        // from opening on a row that has no answer.
+        let fusable = match &sink {
+            SinkSpec::Count => true,
+            // A bracket's level binds one invalid row on a miss, and a
+            // degree read off it would be row zero's degree rather than
+            // nothing, so an optional keeps its walk.
+            SinkSpec::Agg { .. } => self.optional_level.is_none(),
+            SinkSpec::CountDistinct { .. } | SinkSpec::Rows { .. } => false,
+        };
+        if fusable {
             let mut steps = Vec::new();
             let mut step_from = None;
             while let Some(Op::Expand {
@@ -1022,7 +1039,10 @@ impl Compiler<'_> {
                 ..
             }) = ops.last()
             {
-                if !self.levels[*to].cols.is_empty() || step_from.is_some_and(|f| f != *from) {
+                if !self.levels[*to].cols.is_empty()
+                    || sink_reads(&sink, *to)
+                    || step_from.is_some_and(|f| f != *from)
+                {
                     break;
                 }
                 step_from = Some(*from);

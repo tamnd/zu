@@ -290,6 +290,22 @@ impl GroupTable {
         }
     }
 
+    /// The same where each key stands for `w[row]` rows, which is what
+    /// a fused degree product hands over: the neighbors a source row
+    /// would have produced all share its key, so they arrive as one
+    /// increment instead of one row each.
+    pub(crate) fn count_ints_weighted(&mut self, words: &[u64], w: &[i64]) {
+        debug_assert!(self.counting, "counting mode holds the count in the slot");
+        debug_assert_eq!(words.len(), w.len(), "one weight per key");
+        for (row, (&word, &n)) in words.iter().zip(w).enumerate() {
+            if let Some(&next) = words.get(row + AHEAD) {
+                let i = hash64(SEED ^ next) as usize & self.mask;
+                warm(self.slots[i]);
+            }
+            self.bump(word, n as u64);
+        }
+    }
+
     /// Adds `n` rows to key `w`'s count, creating its group on first
     /// sight. The key sits in the slot whole, so a slot that is taken
     /// and does not match is the only case that walks on.

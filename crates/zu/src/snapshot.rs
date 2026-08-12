@@ -88,16 +88,55 @@ pub struct Zu1Snapshot<'a> {
     str_ends: Vec<u64>,
 }
 
+/// What a snapshot learns while it reads, kept in a value of its own
+/// so a caller that opens a snapshot per query can carry it over.
+///
+/// A snapshot is a view of one epoch and is built and dropped around a
+/// single execution, but the table readers behind it are not per query
+/// at all: loading one reads its directory out of the file, and on a
+/// small graph that load costs more than the query it was opened for.
+/// The buffers are here for the same reason, so a scan does not start
+/// by growing a fresh vector every time.
+///
+/// Everything in here is valid for as long as the epoch it was read at
+/// is, which is the caller's business: hand it back to
+/// [`Zu1Snapshot::with_cache`] while the epoch holds and drop it when
+/// the epoch moves.
+#[derive(Default)]
+pub struct SnapshotCache {
+    pub(crate) readers: HashMap<u32, GraphReader>,
+    pub(crate) props: HashMap<u32, Option<PropsReader>>,
+    scratch: Vec<u64>,
+    str_bytes: Vec<u8>,
+    str_ends: Vec<u64>,
+}
+
 impl<'a> Zu1Snapshot<'a> {
     pub fn new(db: &'a mut Zu1File, catalog: Catalog) -> Self {
+        Self::with_cache(db, catalog, SnapshotCache::default())
+    }
+
+    /// A snapshot that starts from what an earlier one already read.
+    pub fn with_cache(db: &'a mut Zu1File, catalog: Catalog, cache: SnapshotCache) -> Self {
         Zu1Snapshot {
             db: Db::Borrowed(db),
             catalog,
-            readers: HashMap::new(),
-            props: HashMap::new(),
-            scratch: Vec::new(),
-            str_bytes: Vec::new(),
-            str_ends: Vec::new(),
+            readers: cache.readers,
+            props: cache.props,
+            scratch: cache.scratch,
+            str_bytes: cache.str_bytes,
+            str_ends: cache.str_ends,
+        }
+    }
+
+    /// Takes back what this snapshot read, to hand to the next one.
+    pub fn into_cache(self) -> SnapshotCache {
+        SnapshotCache {
+            readers: self.readers,
+            props: self.props,
+            scratch: self.scratch,
+            str_bytes: self.str_bytes,
+            str_ends: self.str_ends,
         }
     }
 

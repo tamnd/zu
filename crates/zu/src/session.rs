@@ -43,6 +43,11 @@ pub struct Session {
     graph: Zu1Graph<'static>,
     schema: zu_query::binder::Schema,
     epoch: u64,
+    /// What the pipeline executor's snapshot read last time. A
+    /// snapshot lives for one execution, so without this every query
+    /// reopens the table readers it needs, which on a small graph is
+    /// most of what the query costs.
+    snap: crate::snapshot::SnapshotCache,
     plans: HashMap<String, Arc<CachedPlan>>,
     stmts: HashMap<u64, String>,
     next_stmt: u64,
@@ -57,6 +62,7 @@ impl Session {
             graph: Zu1Graph::owned(db, catalog),
             schema,
             epoch,
+            snap: crate::snapshot::SnapshotCache::default(),
             plans: HashMap::new(),
             stmts: HashMap::new(),
             next_stmt: 1,
@@ -72,15 +78,19 @@ impl Session {
         let options = query::env_options();
         if query::exec2_enabled() {
             let catalog = self.graph.catalog().clone();
-            let mut snap = crate::snapshot::Zu1Snapshot::new(self.graph.file_mut(), catalog);
-            if let Some(r) = zu_exec::try_execute(
+            let warm = std::mem::take(&mut self.snap);
+            let mut snap =
+                crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
+            let out = zu_exec::try_execute(
                 &cached.plan,
                 &cached.query,
                 &self.schema,
                 &mut snap,
                 &args,
                 &options,
-            )? {
+            );
+            self.snap = snap.into_cache();
+            if let Some(r) = out? {
                 return Ok(r);
             }
         }
@@ -184,6 +194,9 @@ impl Session {
         self.graph.set_catalog(catalog);
         self.schema = schema;
         self.plans.clear();
+        // The readers the last epoch's snapshots loaded describe a
+        // layout that has moved, so they go with the plans.
+        self.snap = crate::snapshot::SnapshotCache::default();
         self.epoch = epoch;
         Ok(())
     }
@@ -273,6 +286,39 @@ mod tests {
             )
             .expect_err("missing param");
         assert!(err.to_string().contains("missing parameter $src"));
+    }
+
+    #[test]
+    fn table_readers_outlive_a_query_but_not_an_epoch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("readers.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        assert!(session.snap.readers.is_empty(), "nothing read yet");
+        let source = "MATCH (a:person {id: $src})-[:follows]->(b) RETURN count(b) AS n";
+        session
+            .run(source, &[("src", Value::Int(3))])
+            .expect("warm");
+        // The follows reader the seek and the hop needed is still
+        // here, so the next query starts on it instead of reading its
+        // directory back out of the file.
+        assert_eq!(session.snap.readers.len(), 1);
+        session
+            .run(source, &[("src", Value::Int(10))])
+            .expect("second");
+        assert_eq!(session.snap.readers.len(), 1);
+
+        // A moved epoch describes a layout those readers were built
+        // for and no longer describes, so they go with the plans.
+        session.graph.file_mut().db_header_mut().epoch += 1;
+        session.refresh().expect("refresh");
+        assert!(session.snap.readers.is_empty(), "stale readers dropped");
+        assert!(session.snap.props.is_empty(), "stale props dropped");
+        session
+            .run(source, &[("src", Value::Int(3))])
+            .expect("after epoch move");
+        assert_eq!(session.snap.readers.len(), 1);
     }
 
     #[test]

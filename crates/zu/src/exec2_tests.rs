@@ -231,6 +231,56 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN sum(a.score) AS s",
         "MATCH (a:person)-[:knows]->(b) RETURN a.age AS age, count(*) AS n \
          ORDER BY n DESC, age LIMIT 5",
+        // Second pattern branches: a hop off a level the pipeline has
+        // already walked past, which is a cross product per source row
+        // rather than a chain. Both far ends read so the weight fusion
+        // cannot take it, the same under a filter on the branch, the
+        // branch grouped by the shared variable, a branch off the head
+        // of a two hop chain so the pinned level is two below the
+        // newest, a predicate spanning the two branches, and the rows
+        // themselves sorted and cut so the pairing order is checked.
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN b.age AS x, c.age AS y ORDER BY x, y LIMIT 20",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) WHERE c.age > 50 \
+         RETURN b.age AS x, c.age AS y ORDER BY x, y LIMIT 20",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN a.age AS k, count(b) AS n ORDER BY k LIMIT 10",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) MATCH (a)-[:knows]->(d) \
+         WHERE d.age > 50 RETURN a.age AS k, count(*) AS n ORDER BY k LIMIT 10",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) WHERE b.age > c.age \
+         RETURN count(*) AS n",
+        "MATCH (a:person {id: 1})-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN b.id AS b, c.id AS c ORDER BY b, c LIMIT 20",
+        // Hubs whose first pattern nothing reads: the hop comes out of
+        // the middle of the pipeline and its degree weighs the rows the
+        // other pattern kept, so the answers below are the ones that
+        // catch a weight applied to the wrong rows or dropped. Grouped
+        // by the far end, grouped by both ends, counted bare, summed off
+        // the shared variable, minned so the weight has to be ignored,
+        // one where the unread hop runs backwards so the direction has
+        // to reach the degree read, and one where a filter on the
+        // shared variable runs before any of it.
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN c.age AS k, count(*) AS n ORDER BY k LIMIT 10",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN c.age AS k, a.age AS j, count(*) AS n ORDER BY k, j LIMIT 10",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN sum(a.age) AS s, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN min(c.age) AS lo, max(c.age) AS hi, avg(c.age) AS mid",
+        "MATCH (a:person)<-[:knows]-(b) MATCH (a)-[:knows]->(c) \
+         RETURN c.age AS k, count(*) AS n ORDER BY k LIMIT 10",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) WHERE a.age > 50 \
+         RETURN c.age AS k, count(*) AS n ORDER BY k LIMIT 10",
+        // The unread hop last rather than first, with the pipeline
+        // ending two levels above the one it hangs off, so the weight is
+        // read off a pin and every row of the walk that is still there
+        // carries the same one.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) MATCH (a)-[:knows]->(d) \
+         RETURN c.age AS k, count(*) AS n ORDER BY k LIMIT 10",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN b.age AS k, count(*) AS n ORDER BY k LIMIT 10",
         // Undirected closes, the shape that keeps the binary probe and
         // so runs the semijoin folded into the expand above it. Once
         // over a scan, once under a key seek, and once with the closed

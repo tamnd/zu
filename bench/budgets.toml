@@ -644,6 +644,45 @@ exec_project_mrows_s_core = 25.0
 # this floor, never lower it.
 exec_optional_mrows_s_core = 8.0
 
+# The batch point read at one worker, M keys/s (docs/07): a leading
+# UNWIND over fifty thousand ids strided across a two million row table
+# so no two lookups land near each other, which is the serving shape of
+# a client holding a page of ids. The bare read is what the floor sits
+# on, since it is the key index and the gather and nothing else.
+#
+# The bench prints five shapes and each one twice, once through the
+# pipeline over the whole batch and once with ZU_EXEC2=0 over eight
+# keys, because the old engine has no plan for this at all: its index
+# lookup only fires on a key that names no variable, so a key out of an
+# UNWIND leaves it scanning the table once per element. Both sides are
+# reported per key for that reason. Measured at 659927b, one worker, in
+# us per key for the pipeline against the old engine: the read 0.11
+# against 92924 on gamingpc and 0.39 against 281828 on server1; the hop
+# 0.42 against 92698 and 1.54 against 269806; the counted hop 1.45
+# against 92963 and 3.55 against 281854; the count per key 0.51 against
+# 92758 and 2.35 against 286573; the two hop count 1.76 against 92085
+# and 4.45 against 292312.
+#
+# The reference that says what this is worth is the last line the bench
+# prints: the same page of ids read the way a client reads one today,
+# one prepared point query per key, both sides on the pipeline. That is
+# 44.79 us per key on gamingpc against the batch's 0.11 and 136.43 on
+# server1 against 0.39, so 407x and 350x on the same work with the per
+# query cost paid once instead of fifty thousand times.
+#
+# The floor is set off server1, the slowest host and the one that gates
+# with no free page cache. This shape is the one that feels that box
+# being shared: fifty thousand lookups landing all over the table are
+# page cache reads, so when the neighbors take the memory the whole
+# bench goes with it. Five runs there read 2.6, 2.5, 2.3, 1.8 and 0.3 M
+# keys/s, the last one with a load average of 49 and 165 MB free, while
+# gamingpc reads 8.7 twice in a row. The floor sits under the worst of
+# those so it fails on the shape and not on a neighbor: a fallback to
+# the old engine is 0.0000035 here and the group thrash this change
+# fixed was 20x, both of which it still catches. Raise this floor,
+# never lower it.
+exec_batch_mkeys_s_core = 0.25
+
 # Cardinality quality over the SF1 corpus, q-error percentiles
 # (perf/12 section 4). Twelve queries run profiled, every operator that
 # carries an estimate contributes one max(est/act, act/est), and the

@@ -39,6 +39,11 @@ pub(crate) enum Source {
     /// The primary-key seek an `{id: k}` predicate folds into: one row
     /// or none, and no scan at all.
     Seek(u64),
+    /// The batch of seeks a leading UNWIND folds into (docs/07): the
+    /// list is known before the query runs, so the keys are resolved a
+    /// vector at a time and level 0 is built out of the rows they hit,
+    /// in list order, with a key that hits nothing dropping its row.
+    Seeks(Vec<u64>),
 }
 
 impl ExecPlan {
@@ -47,7 +52,7 @@ impl ExecPlan {
     pub fn zone(&self) -> Option<&ZonePred> {
         match &self.source {
             Source::Scan(pred) => pred.as_ref(),
-            Source::Seek(_) => None,
+            Source::Seek(_) | Source::Seeks(_) => None,
         }
     }
 }
@@ -83,6 +88,11 @@ pub(crate) enum ColSpec {
         from: usize,
         vec: usize,
     },
+    /// The key that found each row of a batch of seeks, standing for
+    /// the UNWIND variable the batch came from. The seek already knows
+    /// it, so the variable is answered out of the column the source
+    /// fills rather than gathered back off the row it found.
+    Key,
 }
 
 /// Traversal sides of one expand: `Both` is an undirected step over a
@@ -398,6 +408,7 @@ pub(crate) fn compile(
         levels: Vec::new(),
         slot_level: HashMap::new(),
         optional_level: None,
+        unwind_slot: None,
     };
     c.compile(plan)
 }
@@ -429,6 +440,10 @@ struct Compiler<'a> {
     /// to what it can answer with a null there, and nothing else
     /// compiles after the group closes.
     optional_level: Option<usize>,
+    /// The variable a leading UNWIND bound, once its list has become
+    /// the batch of seeks that drives the plan. Reading it is reading
+    /// the key that found the row, which is level 0's key column.
+    unwind_slot: Option<usize>,
 }
 
 impl Compiler<'_> {
@@ -458,6 +473,22 @@ impl Compiler<'_> {
             return Ok(None);
         }
 
+        // A leading UNWIND over a list that is already known, which is
+        // the batch point read: a client hands a page of ids and wants
+        // the rows behind them. The list is held here and only becomes
+        // the source once the filter under the scan says the values are
+        // keys of the scanned table; an UNWIND of anything else, or one
+        // whose variable is not what the scan seeks on, goes back to
+        // the old engine whole.
+        let mut unwound = None;
+        if let Some(LogicalPlan::Unwind { expr, slot, .. }) = it.peek() {
+            let Some(keys) = self.const_keys(expr) else {
+                return Ok(None);
+            };
+            it.next();
+            unwound = Some((*slot, keys));
+        }
+
         // The driving scan: one required node slot over one table.
         let (table, scan_slot) = match it.next() {
             Some(LogicalPlan::ScanNodes {
@@ -481,7 +512,31 @@ impl Compiler<'_> {
         // does not fit a row id, goes back to the old engine rather
         // than reading the whole table to find one row.
         let mut seek = None;
-        if let Some(LogicalPlan::Filter {
+        let mut seeks = None;
+        if let Some((slot, keys)) = unwound {
+            // The list is the driving source only if the scan seeks on
+            // the variable it bound. Anything else that an UNWIND could
+            // be doing over a scan is a join the pipeline has no shape
+            // for, so the query goes back rather than scanning the
+            // table once per element.
+            let Some(LogicalPlan::Filter {
+                expr,
+                optional: None,
+                ..
+            }) = it.peek()
+            else {
+                return Ok(None);
+            };
+            let Some(&BoundExpr::Var(key)) = id_point(expr, scan_slot) else {
+                return Ok(None);
+            };
+            if key != slot {
+                return Ok(None);
+            }
+            it.next();
+            self.unwind_slot = Some(slot);
+            seeks = Some(keys);
+        } else if let Some(LogicalPlan::Filter {
             expr,
             optional: None,
             ..
@@ -524,7 +579,12 @@ impl Compiler<'_> {
                     let Some(prog) = self.build_prog(expr, level)? else {
                         return Ok(None);
                     };
-                    if level == 0 && ops.is_empty() && pred.is_none() && seek.is_none() {
+                    if level == 0
+                        && ops.is_empty()
+                        && pred.is_none()
+                        && seek.is_none()
+                        && seeks.is_none()
+                    {
                         pred = self.zone_pred(expr)?;
                     }
                     ops.push(Op::Filter { prog });
@@ -916,9 +976,10 @@ impl Compiler<'_> {
 
         Ok(Some(ExecPlan {
             table,
-            source: match seek {
-                Some(key) => Source::Seek(key),
-                None => Source::Scan(pred),
+            source: match (seek, seeks) {
+                (Some(key), _) => Source::Seek(key),
+                (None, Some(keys)) => Source::Seeks(keys),
+                (None, None) => Source::Scan(pred),
             },
             ops,
             sink,
@@ -1114,6 +1175,38 @@ impl Compiler<'_> {
             .rposition(|v| v.name == item.name)
     }
 
+    /// The keys a leading UNWIND yields, when the list is written out
+    /// or arrives whole as a parameter and every element is a key a
+    /// seek could use.
+    ///
+    /// One element that is not a non-negative integer sends the whole
+    /// query back. The old engine skips such an element, since no row
+    /// answers to it, so declining costs nothing but the fallback and
+    /// keeps the rule here to one line.
+    fn const_keys(&self, expr: &BoundExpr) -> Option<Vec<u64>> {
+        let ints: Vec<i64> = match expr {
+            BoundExpr::List(items) => items
+                .iter()
+                .map(|item| match item {
+                    BoundExpr::Literal(Literal::Int(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?,
+            BoundExpr::Param(ix) => match self.params.get(*ix)? {
+                Value::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Int(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()?,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        ints.into_iter().map(|n| u64::try_from(n).ok()).collect()
+    }
+
     /// A SKIP or LIMIT count that is a plain non-negative integer.
     fn const_count(&self, expr: &BoundExpr) -> Option<u64> {
         let v = match expr {
@@ -1143,6 +1236,27 @@ impl Compiler<'_> {
             .cols
             .push((key.to_string(), ColSpec::Stored(id, ty)));
         Ok(Some((self.levels[level].cols.len(), ty)))
+    }
+
+    /// Registers level 0's key column, or finds the one already there,
+    /// and returns the scalar that reads it back.
+    fn key_col(&mut self) -> ScalarRef {
+        let at = match self.levels[0]
+            .cols
+            .iter()
+            .position(|(_, c)| matches!(c, ColSpec::Key))
+        {
+            Some(ix) => ix + 1,
+            None => {
+                self.levels[0].cols.push((String::new(), ColSpec::Key));
+                self.levels[0].cols.len()
+            }
+        };
+        ScalarRef::Col {
+            level: 0,
+            vec: at,
+            ty: ColType::Int,
+        }
     }
 
     /// Registers a lower level's pinned value as a constant column on
@@ -1255,6 +1369,15 @@ impl Compiler<'_> {
     /// sink can read: a node slot, a property column, the dense id, or
     /// a value computed from one level's columns.
     fn item_ref(&mut self, expr: &BoundExpr) -> Result<Option<ScalarRef>> {
+        // The UNWIND variable a batch of seeks drives on. A row exists
+        // because a key found it, so the key is a column of level 0 and
+        // not something to gather back off the row: a table whose keys
+        // are not its row ids would give a different answer that way.
+        if let BoundExpr::Var(slot) = expr
+            && self.unwind_slot == Some(*slot)
+        {
+            return Ok(Some(self.key_col()));
+        }
         match expr {
             BoundExpr::Var(slot) => Ok(self
                 .slot_level
@@ -1663,6 +1786,11 @@ fn bin_op(op: BinaryOp) -> Option<BinOp> {
 /// order against a constant. The old engine accepts any key expression
 /// that names no slot; a literal or a parameter is what people write,
 /// and a wider key only costs the seek, never an answer.
+///
+/// A variable comes back too, since that is what a leading UNWIND
+/// leaves behind, and the caller decides whether it is the one the
+/// batch of seeks binds. Every other variable fails that check and the
+/// query goes back to the old engine.
 fn id_point(expr: &BoundExpr, slot: usize) -> Option<&BoundExpr> {
     let BoundExpr::Binary {
         op: BinaryOp::Eq,
@@ -1685,7 +1813,12 @@ fn id_point(expr: &BoundExpr, slot: usize) -> Option<&BoundExpr> {
             } => matches!(args.as_slice(), [BoundExpr::Var(s)] if *s == slot),
             _ => false,
         };
-        if on_id && matches!(key.as_ref(), BoundExpr::Literal(_) | BoundExpr::Param(_)) {
+        if on_id
+            && matches!(
+                key.as_ref(),
+                BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Var(_)
+            )
+        {
             return Some(key);
         }
     }

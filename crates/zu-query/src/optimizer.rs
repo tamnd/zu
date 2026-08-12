@@ -1260,7 +1260,7 @@ fn order_component(
                     let pinned = filter_slots.iter().zip(filters).any(|(slots, f)| {
                         slots.is_subset(&grown)
                             && !slots.is_subset(b0)
-                            && key_point(f, *slot, query)
+                            && key_point(f, *slot, query, b0)
                     });
                     let bnd = if pinned {
                         query.variables[*slot].node_tables.len() as f64
@@ -1419,7 +1419,7 @@ fn order_component(
     // edge count, and the scan then wins an order of magnitude of
     // real work.
     let pinned_seed = match best.steps.first() {
-        Some(Step::Scan(slot)) => filters.iter().any(|f| key_point(f, *slot, query)),
+        Some(Step::Scan(slot)) => filters.iter().any(|f| key_point(f, *slot, query, b0)),
         _ => false,
     };
     // A zero cost order is free by the estimates and any ceiling above
@@ -1898,14 +1898,26 @@ fn selectivity(filter: &BoundExpr, query: &BoundQuery, schema: &Schema) -> f64 {
                     let BoundExpr::Var(slot) = base.as_ref() else {
                         continue;
                     };
+                    // A key the query spells out and a key it holds in a
+                    // variable are both one row out of the index, so an
+                    // id equality reads the same either way. The key
+                    // side being a variable is what a batch of point
+                    // reads looks like, an UNWIND binding the ids and
+                    // the scan seeking on them one at a time.
+                    if key == "id"
+                        && !query.variables[*slot].node_tables.is_empty()
+                        && matches!(
+                            other.as_ref(),
+                            BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Var(_)
+                        )
+                    {
+                        return 1.0 / slot_card(*slot, query, schema);
+                    }
                     let known = match other.as_ref() {
                         BoundExpr::Literal(v) => literal_key(v),
                         BoundExpr::Param(_) => None,
                         _ => continue,
                     };
-                    if key == "id" && !query.variables[*slot].node_tables.is_empty() {
-                        return 1.0 / slot_card(*slot, query, schema);
-                    }
                     let got = match &known {
                         Some(k) => {
                             col_selectivity(*slot, key, query, schema, |s| s.eq_selectivity(k))
@@ -1954,14 +1966,30 @@ fn selectivity(filter: &BoundExpr, query: &BoundQuery, schema: &Schema) -> f64 {
 }
 
 /// Whether `filter` pins `slot` to one key: equality between the
-/// slot's `id` property and a literal or parameter.
-fn key_point(filter: &BoundExpr, slot: usize, query: &BoundQuery) -> bool {
-    key_expr(filter, slot, query).is_some()
+/// slot's `id` property and a key that is one value by the time the
+/// scan runs. A literal and a parameter are, and so is a variable
+/// something below the run has already bound, which is how a leading
+/// UNWIND hands a scan the ids of a batch: the scan seeks once per
+/// element and each seek is a row.
+fn key_point(filter: &BoundExpr, slot: usize, query: &BoundQuery, bound: &HashSet<usize>) -> bool {
+    match key_side(filter, slot, query) {
+        Some(BoundExpr::Var(s)) => bound.contains(s),
+        Some(_) => true,
+        None => false,
+    }
 }
 
 /// The side of a point lookup that carries the key, so a reader can
-/// resolve it to a row.
+/// resolve it to a row. A key held in a variable has no value until
+/// the query runs and never comes back from here.
 fn key_expr<'a>(filter: &'a BoundExpr, slot: usize, query: &BoundQuery) -> Option<&'a BoundExpr> {
+    key_side(filter, slot, query)
+        .filter(|k| matches!(k, BoundExpr::Param(_) | BoundExpr::Literal(_)))
+}
+
+/// The key side of an equality on `slot`'s id, whatever it is written
+/// as.
+fn key_side<'a>(filter: &'a BoundExpr, slot: usize, query: &BoundQuery) -> Option<&'a BoundExpr> {
     let BoundExpr::Binary {
         op: BinaryOp::Eq,
         lhs,
@@ -1977,8 +2005,11 @@ fn key_expr<'a>(filter: &'a BoundExpr, slot: usize, query: &BoundQuery) -> Optio
             if key == "id"
                 && !query.variables[slot].node_tables.is_empty()
                 && matches!(base.as_ref(), BoundExpr::Var(s) if *s == slot));
-            let constant = matches!(other.as_ref(), BoundExpr::Param(_) | BoundExpr::Literal(_));
-            (names_id && constant).then(|| other.as_ref())
+            let key = matches!(
+                other.as_ref(),
+                BoundExpr::Param(_) | BoundExpr::Literal(_) | BoundExpr::Var(_)
+            );
+            (names_id && key).then(|| other.as_ref())
         })
 }
 

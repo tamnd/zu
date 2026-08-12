@@ -200,18 +200,39 @@ ldbc_ic_p50_ms = 6.0
 # rather than at the target. Lower this ceiling, never raise it.
 ldbc_triangle_p50_ms = 150.0
 
-# The same SF1 triangle walked undirected, 1.77 M closed paths. An
-# undirected end has two sorted lists, so the optimizer keeps this one
-# on the binary probe and the close compiles to the semijoin the
-# pipeline folds into the expand above it. It is the phase that moves
-# when that fusion changes, and it is a fifth of the graph's paths, so
-# it also stands in for the 2-hop shapes nothing else times. Measured
-# at f6f2386 with main and the branch interleaved: gamingpc 296 to 300
-# ms before the fold and 267 to 270 after, local M series 336 to 340
-# against 324 to 328, server1 909 to 974 against 863 to 965 with its
-# usual vCPU spread. The ceiling clears server1's worst p50 with room
-# for the load it gates under. Lower this ceiling, never raise it.
-ldbc_close_p50_ms = 1200.0
+# The same SF1 triangle walked undirected, 1.77 M closed paths. It is a
+# fifth of the graph's paths and it stands in for the 2-hop shapes
+# nothing else times. An undirected end has two stored lists, and until
+# P3 that was reason enough to leave the close on the binary probe: the
+# optimizer would not mark it, so the close compiled to the semijoin the
+# pipeline folds into the expand above it and every 2-path was walked.
+# The mark now allows an undirected end when both sides live in one rel
+# table, the intersection walks each stored list in turn against the
+# unioned probe side, and the phase stops enumerating what it is about
+# to throw away. Measured at c2638a7 with main and the branch
+# interleaved on the same host in the same session: gamingpc 272 and
+# 277 ms against 39 twice, local M series 418 and 466 against 49,
+# server1 761 against 147 with its usual vCPU spread. That is 7x on
+# gamingpc, 9x locally and 5x on server1, so the ceiling comes down
+# 1200 to 400. server1 read 147 on one pass and 182 with a 218 max on
+# the next, so the room over it is that spread and not slack, and the
+# old plan measured 761 on the same box. Lower this ceiling, never
+# raise it.
+ldbc_close_p50_ms = 400.0
+
+# The directed triangle again with `a.id < b.id < c.id` on it, the same
+# 295 K triangles reached the way a user writes the query when they
+# want each triangle once. The predicate binds at the second hop, so
+# filter placement leaves it sitting between that hop and the close,
+# where the close cannot fuse into the expand below it and goes back to
+# a storage probe per candidate row. Lifting the predicate above the
+# close is what this phase times, and its ceiling is set the same way
+# as the close above it. Measured before and after the lift: local M
+# series 452.948 to 34.195 ms, gamingpc 373.309 to 30.307, server1
+# 1312.932 to 131.796. server1 then read 114 on the gate pass with a
+# 255 max, which is the spread that sets the ceiling rather than the
+# p50. Lower this ceiling, never raise it.
+ldbc_ordered_triangle_p50_ms = 400.0
 
 # Table function kernels on SF1 (docs/07 section 4, docs/12 M4), timed
 # directly against the loaded knows CSR: pagerank is 20 power

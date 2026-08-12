@@ -1172,7 +1172,17 @@ impl Compiler<'_> {
             let Some(r) = self.item_ref(part)? else {
                 return Ok(None);
             };
-            keys.push(r);
+            // A node key carries its table beside its row, and a level
+            // has one table, so the table word is the same for every
+            // row the query will ever hash. Counting rows counts the
+            // same nodes, and it halves the key: one word decides a
+            // slot on its own, where two send every probe back to the
+            // stored key to compare it. Nothing reads these keys back,
+            // so the node itself is never wanted.
+            keys.push(match r {
+                ScalarRef::Node { level } => ScalarRef::RowId { level },
+                other => other,
+            });
         }
         Ok(Some(keys))
     }

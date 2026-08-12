@@ -208,6 +208,29 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person)-[:knows]->(b) WHERE b.age < 10 RETURN a.id AS a, b.id AS b",
         "MATCH (a:person)-[:knows]->(b) RETURN b.age AS age, count(b) AS n",
         "MATCH (a:person)-[:knows]->(b) WHERE a.score = 300 RETURN sum(b.score) AS s",
+        // Aggregates that read nothing off the expanded level, so the
+        // hop is a weight rather than a walk. The counted key, the same
+        // one backward where a person nobody knows has to stay out of
+        // the answer, a string key so the weight goes through the probe
+        // instead of the counting slots, the sum and the average that
+        // scale with the weight beside the min and the max that do not,
+        // a filtered source so the weights line up with the survivors,
+        // a hub whose weight is a degree product, a chained hop with
+        // the key pinned two levels down, and the same grouped answer
+        // sorted and cut.
+        "MATCH (a:person)-[:knows]->(b) RETURN a.age AS age, count(b) AS n",
+        "MATCH (a:person)<-[:knows]-(b) RETURN a.age AS age, count(*) AS n",
+        "MATCH (a:person)-[:knows]-(b) RETURN a.age AS age, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) RETURN a.name AS name, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) RETURN a.age AS age, sum(a.score) AS s, \
+         min(a.score) AS lo, max(a.score) AS hi, avg(a.score) AS m, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) RETURN sum(a.score) AS s, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age > 50 RETURN a.age AS age, count(*) AS n",
+        "MATCH (b:person)<-[:knows]-(a) MATCH (b)-[:knows]->(c) RETURN b.age AS age, count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN a.age AS age, count(c) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN sum(a.score) AS s",
+        "MATCH (a:person)-[:knows]->(b) RETURN a.age AS age, count(*) AS n \
+         ORDER BY n DESC, age LIMIT 5",
         // Undirected closes, the shape that keeps the binary probe and
         // so runs the semijoin folded into the expand above it. Once
         // over a scan, once under a key seek, and once with the closed

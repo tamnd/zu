@@ -21,7 +21,7 @@ use crate::file::{BlockPtr, Zu1File};
 use crate::fullzip::{read_blob_range, write_blob_segment};
 use crate::meta;
 use crate::segment::{
-    CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, chunk_zone, decode_chunk,
+    CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, cached_chunk, chunk_zone, decode_chunk,
     load_chunk_directory_pooled, read_one_cached, write_segment,
 };
 use crate::stats;
@@ -269,10 +269,7 @@ pub struct PropsReader {
     directory: PropsDirectory,
     int_state: BTreeMap<usize, (Arc<ChunkDirectory>, ChunkCache)>,
     str_state: BTreeMap<usize, StrChunk>,
-    /// Reused by [`Self::gather_int`] so a warm gather decodes into the
-    /// same buffer every call.
-    gather_scratch: Vec<u64>,
-    /// Row order scratch for the gathers, reused the same way.
+    /// Row order scratch for the gathers, reused across calls.
     order_scratch: Vec<u32>,
 }
 
@@ -282,7 +279,6 @@ impl PropsReader {
             directory,
             int_state: BTreeMap::new(),
             str_state: BTreeMap::new(),
-            gather_scratch: Vec::new(),
             order_scratch: Vec::new(),
         }
     }
@@ -392,9 +388,19 @@ impl PropsReader {
 
     /// Gathers `col` for arbitrary `rows`, writing `out[i]` for
     /// `rows[i]`, the batched read of perf/04 section 5: rows sort by
-    /// position, runs sharing a chunk decode it once into a reused
-    /// scratch, and values scatter back to the caller's order. However
-    /// many rows land in one chunk, it decodes once per call.
+    /// position, runs sharing a chunk decode it once, and values
+    /// scatter back to the caller's order.
+    ///
+    /// The decode goes through the same chunk cache the point read
+    /// keeps, which is what makes a small gather cheap. An expand hands
+    /// this a handful of rows per call and calls it once per source
+    /// row, so a per-call decode meant decoding a whole chunk to read
+    /// one value out of it, and a pipeline reading a property off an
+    /// expanded level ran slower than the row at a time engine it
+    /// replaces. Warm, a gather is a binary search and a slice copy.
+    /// The cache holds every chunk it touches, the same bound the point
+    /// read carries, and eviction stays the buffer manager's job
+    /// (docs/09, M3).
     pub fn gather_int(
         &mut self,
         db: &mut Zu1File,
@@ -409,15 +415,18 @@ impl PropsReader {
                 self.directory.columns[col].name
             )));
         }
-        let pools = db.pools();
-        let dir = load_chunk_directory_pooled(db, &pools.fences, meta)?;
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.int_state.entry(col) {
+            let pools = db.pools();
+            let dir = load_chunk_directory_pooled(db, &pools.fences, meta)?;
+            slot.insert((dir, ChunkCache::default()));
+        }
+        let (dir, cache) = self.int_state.get_mut(&col).expect("just inserted");
         let order = &mut self.order_scratch;
         order.clear();
         order.extend(0..rows.len() as u32);
         order.sort_unstable_by_key(|&i| rows[i as usize]);
         out.clear();
         out.resize(rows.len(), 0);
-        let scratch = &mut self.gather_scratch;
         let mut i = 0;
         while i < order.len() {
             let row = rows[order[i] as usize];
@@ -428,13 +437,13 @@ impl PropsReader {
                 )));
             }
             let chunk = (row / CHUNK_ROWS as u64) as usize;
-            decode_chunk(db, meta, &dir, chunk, scratch)?;
+            let values = cached_chunk(db, meta, dir, cache, chunk)?;
             while i < order.len() {
                 let r = rows[order[i] as usize];
                 if r / CHUNK_ROWS as u64 != chunk as u64 {
                     break;
                 }
-                out[order[i] as usize] = scratch[(r % CHUNK_ROWS as u64) as usize];
+                out[order[i] as usize] = values[(r % CHUNK_ROWS as u64) as usize];
                 i += 1;
             }
         }

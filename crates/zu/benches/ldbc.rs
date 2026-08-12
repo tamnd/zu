@@ -16,9 +16,13 @@
 //! factorized count over the whole graph through the query engine, p50
 //! in ms. Triangle is the unseeded directed triangle count over the
 //! whole graph, the shape the optimizer closes with AspJoin, p50 in
-//! ms. Close is the same triangle walked undirected, the shape that
-//! keeps the binary probe and so runs the semijoin folded into the
-//! expand, p50 in ms. IS is the IS1-shaped profile read by original
+//! ms. Ordered is the same cycle with the id ordering written on it,
+//! the shape every triangle benchmark asks for, where the predicate
+//! lands between the expand and the close and the close has to keep
+//! its fusion anyway, p50 in ms. Close is the same triangle walked
+//! undirected, the shape that keeps the binary probe and so runs the
+//! semijoin folded into the expand, p50 in ms. IS is the IS1-shaped
+//! profile read by original
 //! id, all eight properties through zu::query::run, gated at the G2 1
 //! ms warm p50.
 //! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
@@ -409,6 +413,67 @@ fn run_triangle_count(path: &std::path::Path, edges: &[(u32, u32)], node_count: 
         "sf1 triangle count (binary): p50 {:.3} ms, max {:.3} ms over {runs} runs",
         blat[runs / 2].as_secs_f64() * 1e3,
         blat[runs - 1].as_secs_f64() * 1e3
+    );
+    p50
+}
+
+/// Ordered triangle: the same directed cycle with the id ordering
+/// written on it, which is how every benchmark asks for triangles when
+/// it wants each one counted once instead of once per rotation.
+///
+/// The ordering is what makes the shape interesting. Filter placement
+/// puts `b.id < c.id` where c binds, straight between the expand and
+/// the close, and the physical compiler only fuses a close into the
+/// expand under it when the two are adjacent, so the predicate used to
+/// cost the whole intersection and the plan went back to one storage
+/// probe per candidate row. The reference walks the same order over the
+/// raw pairs, so a plan that counts a triple twice or drops one fails
+/// here rather than showing up as a fast wrong number.
+fn run_ordered_triangle(
+    path: &std::path::Path,
+    edges: &[(u32, u32)],
+    by_row: &[u64],
+    node_count: u64,
+) -> f64 {
+    let mut adj = vec![Vec::new(); node_count as usize];
+    for &(s, d) in edges {
+        adj[s as usize].push(d);
+    }
+    let key = |row: u32| by_row[row as usize];
+    let mut expected = 0i64;
+    for &(a, b) in edges {
+        if key(a) >= key(b) {
+            continue;
+        }
+        for &c in &adj[b as usize] {
+            if key(b) < key(c) && edges.binary_search(&(a, c)).is_ok() {
+                expected += 1;
+            }
+        }
+    }
+    let mut db = Zu1File::open(path).expect("open");
+    let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+                  WHERE a.id < b.id AND b.id < c.id RETURN count(*) AS triangles";
+    let runs = 15usize;
+    for _ in 0..3 {
+        zu::query::run(source, &mut db, &[]).expect("warmup run");
+    }
+    let mut lat = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t = Instant::now();
+        let r = zu::query::run(source, &mut db, &[]).expect("ordered triangle");
+        lat.push(t.elapsed());
+        assert_eq!(
+            r.rows,
+            [[Value::Int(expected)]],
+            "ordered triangle disagrees with the edge list reference"
+        );
+    }
+    lat.sort_unstable();
+    let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    println!(
+        "sf1 ordered triangle: {expected} triangles, p50 {p50:.3} ms, max {:.3} ms over {runs} runs",
+        lat[runs - 1].as_secs_f64() * 1e3
     );
     p50
 }
@@ -910,6 +975,7 @@ fn main() {
     let key_p50 = run_key_lookups(&path, &by_row);
     let two_hop_p50 = run_two_hop(&path, &edges, node_count);
     let triangle_p50 = run_triangle_count(&path, &edges, node_count);
+    let ordered_p50 = run_ordered_triangle(&path, &edges, &by_row, node_count);
     let close_p50 = run_undirected_close(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
@@ -939,6 +1005,12 @@ fn main() {
         && triangle_p50 > ceiling
     {
         println!("GATE FAIL triangle count: p50 {triangle_p50:.3} ms > ceiling {ceiling}");
+        failed = true;
+    }
+    if let Some(ceiling) = budget("ldbc_ordered_triangle_p50_ms")
+        && ordered_p50 > ceiling
+    {
+        println!("GATE FAIL ordered triangle: p50 {ordered_p50:.3} ms > ceiling {ceiling}");
         failed = true;
     }
     if let Some(ceiling) = budget("ldbc_close_p50_ms")

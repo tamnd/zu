@@ -56,7 +56,151 @@ pub fn optimize_noted(
     let mut notes = Vec::new();
     staleness_notes(query, schema, &mut notes);
     let plan = rewrite(plan, query, schema, &mut notes)?;
-    Ok((mark_asp(plan, query, schema).0, notes))
+    let plan = mark_asp(plan, query, schema).0;
+    Ok((lift_close_filters(plan), notes))
+}
+
+/// Moves a predicate out from between an expand and the marked close
+/// that probes the endpoint it just bound.
+///
+/// Filter placement puts every predicate at the first point its slots
+/// are bound, which is the right default and is also what stops the
+/// WCOJ fusion here: the physical compiler folds a close into the
+/// expand below it only when the two are adjacent, so one predicate in
+/// between costs the whole intersection and the plan goes back to a
+/// storage probe per candidate row. On the ordered triangle that is
+/// tens of thousands of probes against a close that keeps a few
+/// hundred rows, so the close is by far the cheaper of the two filters
+/// and the predicate belongs above it.
+///
+/// Only a marked close moves anything. An unmarked one runs the binary
+/// probe either way, and there the predicate first is the better order.
+/// A lifted predicate cannot name the rel the close binds, since it was
+/// placed before that rel was bound, and it keeps its own optional
+/// group, so this is a reorder of two row filters and nothing else.
+fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Empty => LogicalPlan::Empty,
+        LogicalPlan::ScanNodes {
+            input,
+            slot,
+            optional,
+        } => LogicalPlan::ScanNodes {
+            input: Box::new(lift_close_filters(*input)),
+            slot,
+            optional,
+        },
+        LogicalPlan::Expand {
+            input,
+            rel,
+            from,
+            to,
+            direction,
+            range,
+            into,
+            asp,
+            wcoj,
+            optional,
+        } => {
+            let mut below = lift_close_filters(*input);
+            let mut lifted = Vec::new();
+            while into && wcoj {
+                let LogicalPlan::Filter {
+                    input: inner,
+                    expr,
+                    optional: fopt,
+                } = below
+                else {
+                    break;
+                };
+                let mut slots = HashSet::new();
+                expr_slots(&expr, &mut slots);
+                if fopt != optional || slots.contains(&rel) {
+                    below = LogicalPlan::Filter {
+                        input: inner,
+                        expr,
+                        optional: fopt,
+                    };
+                    break;
+                }
+                below = *inner;
+                lifted.push((expr, fopt));
+            }
+            let mut plan = LogicalPlan::Expand {
+                input: Box::new(below),
+                rel,
+                from,
+                to,
+                direction,
+                range,
+                into,
+                asp,
+                wcoj,
+                optional,
+            };
+            for (expr, optional) in lifted.into_iter().rev() {
+                plan = LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    expr,
+                    optional,
+                };
+            }
+            plan
+        }
+        LogicalPlan::Filter {
+            input,
+            expr,
+            optional,
+        } => LogicalPlan::Filter {
+            input: Box::new(lift_close_filters(*input)),
+            expr,
+            optional,
+        },
+        LogicalPlan::Unwind { input, expr, slot } => LogicalPlan::Unwind {
+            input: Box::new(lift_close_filters(*input)),
+            expr,
+            slot,
+        },
+        LogicalPlan::TableFunction {
+            input,
+            func,
+            rel,
+            table,
+            args,
+            slots,
+        } => LogicalPlan::TableFunction {
+            input: Box::new(lift_close_filters(*input)),
+            func,
+            rel,
+            table,
+            args,
+            slots,
+        },
+        LogicalPlan::Project { input, items } => LogicalPlan::Project {
+            input: Box::new(lift_close_filters(*input)),
+            items,
+        },
+        LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
+            input: Box::new(lift_close_filters(*input)),
+            keys,
+            aggs,
+        },
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(lift_close_filters(*input)),
+        },
+        LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
+            input: Box::new(lift_close_filters(*input)),
+            keys,
+        },
+        LogicalPlan::Skip { input, expr } => LogicalPlan::Skip {
+            input: Box::new(lift_close_filters(*input)),
+            expr,
+        },
+        LogicalPlan::Limit { input, expr } => LogicalPlan::Limit {
+            input: Box::new(lift_close_filters(*input)),
+            expr,
+        },
+    }
 }
 
 /// One note per rel table in the query whose COLOR summary the writes
@@ -2523,6 +2667,52 @@ mod tests {
              RETURN a.id AS id",
         );
         assert_eq!(marks, [(false, false), (false, false), (true, true)]);
+    }
+
+    #[test]
+    fn a_predicate_between_an_expand_and_a_marked_close_rides_above_it() {
+        // The ordered triangle: filter placement wants b.id < c.id right
+        // where c binds, and the close right after it is the marked one,
+        // so the predicate moves above the close and the two expands end
+        // up adjacent for the fusion to take.
+        let text = optimized(
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+             WHERE a.id < b.id AND b.id < c.id RETURN count(*) AS n",
+        );
+        let lines = lines(&text);
+        let close = lines
+            .iter()
+            .position(|l| l.starts_with("ExpandInto") || l.starts_with("AspJoin"))
+            .unwrap_or_else(|| panic!("no close, got:\n{text}"));
+        let filter = lines
+            .iter()
+            .position(|l| l.contains("b.id < c.id"))
+            .unwrap_or_else(|| panic!("no b.id < c.id filter, got:\n{text}"));
+        assert!(filter < close, "explain reads top down, got:\n{text}");
+        assert!(
+            lines[close + 1].starts_with("Expand "),
+            "the close should sit straight on the expand, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_predicate_under_an_unmarked_close_stays_where_it_was_placed() {
+        // Undirected closes carry no mark, the binary probe runs either
+        // way, and there the cheaper order is the predicate first.
+        let text = optimized(
+            "MATCH (a:Person)-[:KNOWS]-(b)-[:KNOWS]-(c), (a)-[:KNOWS]-(c) \
+             WHERE b.id < c.id RETURN count(*) AS n",
+        );
+        let lines = lines(&text);
+        let close = lines
+            .iter()
+            .position(|l| l.starts_with("ExpandInto") || l.starts_with("AspJoin"))
+            .unwrap_or_else(|| panic!("no close, got:\n{text}"));
+        let filter = lines
+            .iter()
+            .position(|l| l.contains("b.id < c.id"))
+            .unwrap_or_else(|| panic!("no b.id < c.id filter, got:\n{text}"));
+        assert!(close < filter, "explain reads top down, got:\n{text}");
     }
 
     #[test]

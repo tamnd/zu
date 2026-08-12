@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
-use zu_query::snapshot::{ColId, CsrPin, Dir, GroupId, RelId, SCAN_ROWS, Snapshot};
+use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, GroupId, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{
     Bitmap, ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector,
     VecEncoding,
@@ -560,7 +560,9 @@ impl<'a> Worker<'a> {
                 .iter()
                 .filter_map(|c| match *c {
                     ColSpec::Stored(id, _) => Some(id),
-                    ColSpec::Computed(_) | ColSpec::Outer { .. } | ColSpec::Key => None,
+                    ColSpec::Computed(_) | ColSpec::Outer { .. } | ColSpec::Key | ColSpec::Func => {
+                        None
+                    }
                 })
                 .collect(),
             scratch: Vec::new(),
@@ -768,6 +770,12 @@ impl<'a> Worker<'a> {
                     // to answer with; the compiler only registers one
                     // under the seeks source.
                     ColSpec::Key => unreachable!("the scan level has no seek keys"),
+                    // The kernel answered per node in row order, so
+                    // the chunk's slice of it is the column.
+                    ColSpec::Func => {
+                        let col = plan.func.as_ref().expect("a call under a func column");
+                        func_vec(col, sc.row_base, sc.rows as usize, &mut self.arena)
+                    }
                 };
                 level0.vecs.push(v);
             }
@@ -1317,6 +1325,10 @@ impl<'a> Worker<'a> {
                     debug_assert_eq!(keys.len(), part.len(), "one key per row it found");
                     ValueVector::flat_from(&mut self.arena, PhysType::Int64, keys)
                 }
+                // Only level 0 carries a kernel's answer, and a level 0
+                // built out of rows rather than scanned is a seek,
+                // which the compiler never puts under a call.
+                ColSpec::Func => unreachable!("a func column is scanned, not gathered"),
             };
             chunk.vecs.push(v);
         }
@@ -1697,6 +1709,26 @@ fn pinned_pos(chunk: &DataChunk) -> usize {
 
 fn row_at(chunk: &DataChunk, pos: usize) -> u64 {
     chunk.vecs[0].values::<u64>()[pos]
+}
+
+/// One chunk's slice of a table function's answer, as a column. The
+/// kernel yielded a value per node in row order, so a scan chunk takes
+/// its own range of it; the rows the kernel reached nothing for come
+/// out invalid, which is the null a projection reads and the false a
+/// comparison against it gives.
+fn func_vec(col: &FuncCol, base: u64, rows: usize, arena: &mut MorselArena) -> ValueVector {
+    let lo = base as usize;
+    let mut v = ValueVector::flat_from(arena, PhysType::Int64, &col.values[lo..lo + rows]);
+    if col.nullable() {
+        let mut valid = Bitmap::new_in(arena, rows, true);
+        for (i, &null) in col.null[lo..lo + rows].iter().enumerate() {
+            if null {
+                valid.clear(i);
+            }
+        }
+        v.validity = Some(valid);
+    }
+    v
 }
 
 /// One row of a pinned level's vector, standing for every row of the
@@ -2116,6 +2148,7 @@ mod tests {
             sink,
             levels,
             columns: columns.iter().map(|s| s.to_string()).collect(),
+            func: None,
         }
     }
 

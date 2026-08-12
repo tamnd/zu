@@ -1233,15 +1233,33 @@ impl<'a> Worker<'a> {
         if rows == 0 {
             return Ok(());
         }
-        let table = self
-            .sink
-            .groups
-            .get_or_insert_with(|| GroupTable::new(key_parts(keys), aggs.len()));
+        // Dense columns and required nodes are never null, so count(x)
+        // counts rows exactly like count(*). One fixed-width key with
+        // nothing but counters over it is the shape the table can hold
+        // whole in its slots, which is most of what a GROUP BY is.
+        let parts = key_parts(keys);
+        let counting = parts.len() == 1
+            && parts[0] == PartKind::Int
+            && aggs
+                .iter()
+                .all(|s| s.arg().is_none() || matches!(s, AggSpec::CountRef(_)));
+        let table = self.sink.groups.get_or_insert_with(|| {
+            if counting {
+                GroupTable::counting(parts, aggs.len())
+            } else {
+                GroupTable::new(parts, aggs.len())
+            }
+        });
         self.batch.reset(table.stride(), rows);
         let mut off = 0;
         for &r in keys {
             fill_key_col(self.plan, set, r, sel, rows, off, &mut self.batch)?;
             off += part_kind(r).words();
+        }
+        if counting {
+            let (words, _) = self.batch.words_mut();
+            table.count_ints(words);
+            return Ok(());
         }
         table.probe(&self.batch, aggs, &mut self.gids);
         let n = aggs.len();

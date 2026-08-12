@@ -134,9 +134,20 @@ pub(crate) struct GroupTable {
     simple: bool,
     /// Probe slots. `[0]` is 0 when empty, else `tag:16 | index+1:48`;
     /// `[1]` is the key's first word, or its hash for a varlen key.
+    ///
+    /// Counting mode reads them differently: `[0]` is the key and `[1]`
+    /// is that key's row count, so a slot is the whole group and an
+    /// empty slot is a zero count.
     slots: Vec<[u64; 2]>,
     mask: usize,
     groups: usize,
+    /// Counting mode: the slot each group sits in, in the order the
+    /// groups were first seen, since the slot no longer carries an
+    /// index of its own.
+    order: Vec<u32>,
+    /// Whether the slot holds the count instead of an index into the
+    /// key and state buffers.
+    counting: bool,
     /// One hash per row of the batch in flight.
     hashes: Vec<u64>,
 }
@@ -183,8 +194,26 @@ impl GroupTable {
             slots: vec![[0; 2]; INIT_SLOTS],
             mask: INIT_SLOTS - 1,
             groups: 0,
+            order: Vec::new(),
+            counting: false,
             hashes: Vec::new(),
         }
+    }
+
+    /// A table for one fixed-width key with nothing but counters over
+    /// it, which is what most of the GROUP BY queries in the wild are.
+    ///
+    /// The general table charges a row two random lines, the slot it
+    /// probes and the group's states, and at a hundred thousand groups
+    /// neither is in cache. Here the count lives in the slot beside the
+    /// key, so a row touches one line and the states buffer is never
+    /// built. A count of zero is what an empty slot means, and a group
+    /// is created with one, so nothing else marks a slot as taken.
+    pub(crate) fn counting(parts: Vec<PartKind>, n_aggs: usize) -> GroupTable {
+        let mut t = GroupTable::new(parts, n_aggs);
+        debug_assert!(t.simple, "counting mode holds the key in the slot");
+        t.counting = true;
+        t
     }
 
     pub(crate) fn stride(&self) -> usize {
@@ -238,6 +267,51 @@ impl GroupTable {
             out[row] = self.find_or_insert(hashes[row], batch, row, specs) as u32;
         }
         self.hashes = hashes;
+    }
+
+    /// One column of integer keys straight into the slots, the whole
+    /// per-row path of a counting GROUP BY in one loop.
+    ///
+    /// The general path writes the hash of every row down, then the
+    /// group index of every row, then walks the indices again to
+    /// accumulate into a states buffer somewhere else. All of that is
+    /// memory the caller never reads, and the last of it is a second
+    /// random line per row. Here a row is a hash, one slot, and an
+    /// increment inside it. The lookahead stays, since the slot is
+    /// still the line the loop waits on.
+    pub(crate) fn count_ints(&mut self, words: &[u64]) {
+        debug_assert!(self.counting, "counting mode holds the count in the slot");
+        for (row, &w) in words.iter().enumerate() {
+            if let Some(&next) = words.get(row + AHEAD) {
+                let i = hash64(SEED ^ next) as usize & self.mask;
+                warm(self.slots[i]);
+            }
+            self.bump(w, 1);
+        }
+    }
+
+    /// Adds `n` rows to key `w`'s count, creating its group on first
+    /// sight. The key sits in the slot whole, so a slot that is taken
+    /// and does not match is the only case that walks on.
+    fn bump(&mut self, w: u64, n: u64) {
+        let mut i = hash64(SEED ^ w) as usize & self.mask;
+        loop {
+            let slot = &mut self.slots[i];
+            if slot[1] == 0 {
+                *slot = [w, n];
+                self.order.push(i as u32);
+                self.groups += 1;
+                if self.groups * 4 > self.slots.len() * 3 {
+                    self.grow();
+                }
+                return;
+            }
+            if slot[0] == w {
+                slot[1] += n;
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
     }
 
     fn find_or_insert(&mut self, h: u64, batch: &KeyBatch, row: usize, specs: &[AggSpec]) -> usize {
@@ -386,6 +460,23 @@ impl GroupTable {
 
     fn grow(&mut self) {
         let n = self.slots.len() * 2;
+        if self.counting {
+            // The slots are the groups here, so they move rather than
+            // being rebuilt from a key buffer, and the order list is
+            // rewritten with where each one landed.
+            let old = std::mem::replace(&mut self.slots, vec![[0; 2]; n]);
+            self.mask = n - 1;
+            for at in &mut self.order {
+                let slot = old[*at as usize];
+                let mut i = hash64(SEED ^ slot[0]) as usize & self.mask;
+                while self.slots[i][1] != 0 {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = slot;
+                *at = i as u32;
+            }
+            return;
+        }
         self.slots.clear();
         self.slots.resize(n, [0; 2]);
         self.mask = n - 1;
@@ -406,6 +497,14 @@ impl GroupTable {
     pub(crate) fn merge_from(&mut self, other: &GroupTable) -> zu_common::Result<()> {
         debug_assert_eq!(self.parts.len(), other.parts.len());
         debug_assert_eq!(self.n_aggs, other.n_aggs);
+        debug_assert_eq!(self.counting, other.counting);
+        if self.counting {
+            for &at in &other.order {
+                let slot = other.slots[at as usize];
+                self.bump(slot[0], slot[1]);
+            }
+            return Ok(());
+        }
         let mut batch = KeyBatch::default();
         batch.reset(self.stride, 1);
         for g in 0..other.groups {
@@ -452,6 +551,21 @@ impl GroupTable {
     /// Every group as its key values and its states, insertion ordered.
     pub(crate) fn drain(self) -> Vec<(Vec<Value>, Vec<Acc>)> {
         let mut out = Vec::with_capacity(self.groups);
+        if self.counting {
+            // Every counter over the same group counted the same rows,
+            // so the one count in the slot answers all of them.
+            for &at in &self.order {
+                let slot = self.slots[at as usize];
+                let key = match self.parts[0] {
+                    PartKind::Int => Value::Int(slot[0] as i64),
+                    PartKind::Node | PartKind::Str => {
+                        unreachable!("counting mode is one fixed-width word")
+                    }
+                };
+                out.push((vec![key], vec![Acc::Count(slot[1] as i64); self.n_aggs]));
+            }
+            return out;
+        }
         let mut accs = self.accs.into_iter();
         for g in 0..self.groups {
             let base = g * self.stride;
@@ -664,5 +778,61 @@ mod tests {
             .collect();
         assert_eq!(first, [true, false, true, false]);
         assert_eq!(t.groups(), 2);
+    }
+
+    #[test]
+    fn counting_mode_agrees_with_the_general_table() {
+        let vals: Vec<u64> = (0..50_000).map(|i: u64| (i * 7919) % 3000).collect();
+        let mut c = GroupTable::counting(vec![PartKind::Int], 1);
+        c.count_ints(&vals);
+        let mut g = GroupTable::new(vec![PartKind::Int], 1);
+        count_ints(&mut g, &vals.iter().map(|&v| v as i64).collect::<Vec<_>>());
+        let mut counted = c.drain();
+        let mut general = g.drain();
+        assert_eq!(counted.len(), 3000, "the table grew past its first slots");
+        for rows in [&mut counted, &mut general] {
+            rows.sort_by_key(|(v, _)| match v[0] {
+                Value::Int(n) => n,
+                _ => panic!("int key"),
+            });
+        }
+        let key_of = |r: &(Vec<Value>, Vec<Acc>)| r.0[0].clone();
+        assert_eq!(
+            counted.iter().map(key_of).collect::<Vec<_>>(),
+            general.iter().map(key_of).collect::<Vec<_>>(),
+        );
+        let count_at = |r: &(Vec<Value>, Vec<Acc>)| count_of(&r.1[0]);
+        assert_eq!(
+            counted.iter().map(count_at).collect::<Vec<_>>(),
+            general.iter().map(count_at).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn counting_mode_merges_a_second_partial() {
+        let mut a = GroupTable::counting(vec![PartKind::Int], 2);
+        let mut b = GroupTable::counting(vec![PartKind::Int], 2);
+        a.count_ints(&(0..100).map(|i: u64| i % 10).collect::<Vec<_>>());
+        b.count_ints(&(0..100).map(|i: u64| i % 15).collect::<Vec<_>>());
+        a.merge_from(&b).unwrap();
+        let rows = a.drain();
+        assert_eq!(rows.len(), 15, "keys 10 to 14 came from the second partial");
+        assert_eq!(rows.iter().map(|(_, s)| count_of(&s[0])).sum::<i64>(), 200);
+        for (_, accs) in &rows {
+            assert_eq!(accs.len(), 2, "one count per aggregate over the group");
+            assert_eq!(count_of(&accs[0]), count_of(&accs[1]));
+        }
+    }
+
+    #[test]
+    fn counting_mode_keeps_the_zero_key() {
+        // Zero is a real key and an empty slot is a zero count, so the
+        // two only stay apart because a group starts at one.
+        let mut t = GroupTable::counting(vec![PartKind::Int], 1);
+        t.count_ints(&[0, 0, 5]);
+        let rows = t.drain();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0[0], Value::Int(0));
+        assert_eq!(count_of(&rows[0].1[0]), 2);
     }
 }

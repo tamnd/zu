@@ -458,20 +458,21 @@ exec_scale_8x = 2.0
 # thousand groups. It is the whole query, decode and scan and sink and
 # the final sort of the groups, because that is what a user waits for.
 #
-# perf/05 asks for 100 M rows/s/core and the bare metal hosts are
-# there: local M series 97 and 100, gamingpc 91 and 94. The shared
-# vCPU hosts are an order of magnitude behind, server1 9, server2 8,
-# server3 7, and it is not the sink. The same query grouped into
-# twelve groups, where the whole table fits in L1, runs 47 on server1
-# and 37 on server2 against 159 locally, so the gap is already there
-# before the group table is wide enough to miss. These boxes do not
-# have the memory bandwidth to feed one core a scan this size, and no
-# amount of work on the sink moves that. So the floor sits under
-# server3's worst run and the number that answers perf/05 is the bare
-# metal one. The bench crosschecks the group count and the row total
-# against the generator on every run. Raise this floor, never lower
-# it.
-exec_group_mrows_s_core = 5.0
+# perf/05 asks for 100 M rows/s/core and the bare metal hosts clear
+# it now that a counting group by keeps the count in the probe slot:
+# gamingpc 115 and 113 against 91 and 94 before. The shared vCPU
+# hosts moved with it, server1 9 to 13 and server3 7 to 10, and they
+# are still an order of magnitude behind, which is not the sink. The
+# same query grouped into twelve groups, where the whole table fits
+# in L1, runs 72 to 79 on server1 and 63 to 65 on server3 against 205
+# on gamingpc, so the gap is already there before the group table is
+# wide enough to miss. These boxes do not have the memory bandwidth
+# to feed one core a scan this size, and no amount of work on the
+# sink moves that. So the floor sits under server3's worst run and
+# the number that answers perf/05 is the bare metal one. The bench
+# crosschecks the group count and the row total against the generator
+# on every run. Raise this floor, never lower it.
+exec_group_mrows_s_core = 8.0
 
 # What the ORDER BY costs on a query that already has one, percent
 # (perf/05 section 5). The bench runs the same ten thousand row fan

@@ -159,6 +159,18 @@ pub(crate) enum Op {
         /// The level holding the end that stays fixed for the vector.
         probe_level: usize,
     },
+    /// Top of an OPTIONAL MATCH bracket (docs/07): the `len` ops above
+    /// this one are the group, the last of them being `OptionalHit`,
+    /// and everything past that is the pipeline the group feeds. The
+    /// group runs once per row of the level below it, with that row
+    /// pinned, which is what makes a miss a per-row fact. A row the
+    /// group matched nothing for still goes on, with `level` bound to
+    /// one null row.
+    Optional { len: usize, level: usize },
+    /// Bottom of the bracket, reached only when the group produced a
+    /// row. Setting the flag is all it does; the pipeline below runs
+    /// off it either way.
+    OptionalHit,
     /// Terminal fusion of trailing expands feeding a bare count: each
     /// active row of the newest level contributes the product of its
     /// per-step degrees, read off the CSR offsets alone. One step is
@@ -385,6 +397,7 @@ pub(crate) fn compile(
         wcoj: options.wcoj,
         levels: Vec::new(),
         slot_level: HashMap::new(),
+        optional_level: None,
     };
     c.compile(plan)
 }
@@ -411,6 +424,11 @@ struct Compiler<'a> {
     wcoj: Wcoj,
     levels: Vec<LevelBuild>,
     slot_level: HashMap<usize, usize>,
+    /// The level an OPTIONAL MATCH group introduced, once one is open.
+    /// It is the level that binds null on a miss, so the sink is held
+    /// to what it can answer with a null there, and nothing else
+    /// compiles after the group closes.
+    optional_level: Option<usize>,
 }
 
 impl Compiler<'_> {
@@ -486,6 +504,15 @@ impl Compiler<'_> {
         let mut ops = Vec::new();
         let mut pred = None;
         loop {
+            // An open bracket ends the pipeline: the group's level is
+            // the newest one and it may be null, so nothing walks off
+            // it or filters on it here. Whatever is left goes to the
+            // sink match below, which takes a projection or an
+            // aggregate and sends anything else back to the old
+            // engine.
+            if self.optional_level.is_some() {
+                break;
+            }
             match it.peek() {
                 Some(LogicalPlan::Filter {
                     expr,
@@ -543,6 +570,83 @@ impl Compiler<'_> {
                         batch: false,
                         close: None,
                     });
+                }
+                // OPTIONAL MATCH, in the one shape the bracket covers:
+                // a single hop introducing the far node, with the
+                // group's own filters over it. That is what an
+                // OPTIONAL MATCH is in nearly every query that has
+                // one, and it is where the whole query used to go
+                // back to the old executor.
+                Some(LogicalPlan::Expand {
+                    rel,
+                    from,
+                    to,
+                    direction,
+                    range: None,
+                    into: false,
+                    optional: Some(group),
+                    ..
+                }) => {
+                    it.next();
+                    let Some(&src) = self.slot_level.get(from) else {
+                        return Ok(None);
+                    };
+                    let &[rel_id] = self.query.variables[*rel].rel_tables.as_slice() else {
+                        return Ok(None);
+                    };
+                    let &[to_table] = self.query.variables[*to].node_tables.as_slice() else {
+                        return Ok(None);
+                    };
+                    let Some(dirs) =
+                        expand_dirs(self.schema, rel_id, self.levels[src].table, *direction)
+                    else {
+                        return Ok(None);
+                    };
+                    let to_level = self.levels.len();
+                    self.levels.push(LevelBuild {
+                        table: to_table,
+                        cols: Vec::new(),
+                    });
+                    self.slot_level.insert(*to, to_level);
+                    let head = ops.len();
+                    ops.push(Op::Optional {
+                        len: 0,
+                        level: to_level,
+                    });
+                    ops.push(Op::Expand {
+                        rel: rel_id,
+                        dirs,
+                        from: src,
+                        to: to_level,
+                        batch: false,
+                        close: None,
+                    });
+                    // The clause's inline props and its WHERE gate the
+                    // match inside the group: a row they reject is a
+                    // miss, not a dropped row, which is why they have
+                    // to sit above the expand and below the bracket.
+                    while let Some(LogicalPlan::Filter {
+                        expr,
+                        optional: Some(g),
+                        ..
+                    }) = it.peek()
+                    {
+                        if g != group {
+                            break;
+                        }
+                        it.next();
+                        let Some(prog) = self.build_prog(expr, to_level)? else {
+                            return Ok(None);
+                        };
+                        ops.push(Op::Filter { prog });
+                    }
+                    ops.push(Op::OptionalHit);
+                    let len = ops.len() - head - 1;
+                    let Op::Optional { len: slot, .. } = &mut ops[head] else {
+                        unreachable!("just pushed the bracket");
+                    };
+                    *slot = len;
+                    self.optional_level = Some(to_level);
                 }
                 Some(LogicalPlan::Expand {
                     rel,
@@ -696,6 +800,35 @@ impl Compiler<'_> {
             _ => return Ok(None),
         };
 
+        // The bracket's level binds null on a miss, and only some
+        // sinks answer with a null in them. A projection carries one
+        // out as a value, and a count over a miss counts the outer row
+        // once because a null level still has one row. Deduplicating
+        // and ordering on a null, and aggregating over one, follow
+        // rules the sink does not implement yet, so those go back to
+        // the old engine.
+        if let Some(opt) = self.optional_level {
+            let ok = match &sink {
+                SinkSpec::Count => true,
+                SinkSpec::Rows { items, post } => post.iter().all(|p| match p {
+                    PostSpec::Distinct => false,
+                    PostSpec::Sort(cols) => cols.iter().all(|&(at, _)| items[at].level() != opt),
+                    PostSpec::Skip(_) | PostSpec::Limit(_) => true,
+                }),
+                SinkSpec::CountDistinct { keys } => keys.iter().all(|k| k.level() != opt),
+                SinkSpec::Agg { keys, aggs, .. } => {
+                    keys.iter().all(|k| k.level() != opt)
+                        && aggs
+                            .iter()
+                            .filter_map(AggSpec::arg)
+                            .all(|r| r.level() != opt)
+                }
+            };
+            if !ok {
+                return Ok(None);
+            }
+        }
+
         // Fuse trailing expands feeding a bare count into one degree
         // product when nothing reads the expanded levels' rows or
         // columns. The steps must fan out of one source level: a
@@ -768,6 +901,18 @@ impl Compiler<'_> {
 
         fuse_closes(&mut ops);
         batch_expands(&mut ops, &sink, &self.levels);
+        // The bracket runs its group one outer row at a time, because
+        // whether the group matched is a fact about that row. A
+        // batched descent drops the pin and concatenates neighbors
+        // across source rows, which loses exactly that, so nothing
+        // inside the bracket batches.
+        if let Some(head) = ops.iter().position(|op| matches!(op, Op::Optional { .. })) {
+            for op in &mut ops[head..] {
+                if let Op::Expand { batch, .. } = op {
+                    *batch = false;
+                }
+            }
+        }
 
         Ok(Some(ExecPlan {
             table,
@@ -1211,6 +1356,14 @@ impl Compiler<'_> {
         let Some(r) = self.item_ref(arg)? else {
             return Ok(None);
         };
+        // An argument off an OPTIONAL MATCH group is null on a miss,
+        // and every aggregate here skips nulls: count(x) is zero over
+        // one, not one, and the counting spec below would count it
+        // like a star. That is the rule the old engine has and the
+        // accumulators do not, so the shape goes back there.
+        if self.optional_level == Some(r.level()) {
+            return Ok(None);
+        }
         let is_int = matches!(r, ScalarRef::RowId { .. })
             || matches!(
                 r,

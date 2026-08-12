@@ -231,8 +231,20 @@ ldbc_close_p50_ms = 400.0
 # series 452.948 to 34.195 ms, gamingpc 373.309 to 30.307, server1
 # 1312.932 to 131.796. server1 then read 114 on the gate pass with a
 # 255 max, which is the spread that sets the ceiling rather than the
-# p50. Lower this ceiling, never raise it.
-ldbc_ordered_triangle_p50_ms = 400.0
+# p50.
+#
+# The predicate itself then went to the pipeline. It names two levels,
+# which the compiler used to decline, so the whole query fell back to
+# the row at a time engine even though the plan above it was already
+# right. Compiling it as a broadcast of the pinned lower end takes the
+# query off that fallback, and the gather it needs is what turned the
+# chunk cache on for batched property reads. Measured with main and
+# the branch on the same host in the same session: gamingpc 29.645 to
+# 11.838 ms, server1 94.902 to 42.352, local M series 33.249 to
+# 22.288. server1 is the floor host and read 53.141 on the pass right
+# after its build with a 65 max, so the ceiling comes down 400 to 150
+# on that spread. Lower this ceiling, never raise it.
+ldbc_ordered_triangle_p50_ms = 150.0
 
 # Table function kernels on SF1 (docs/07 section 4, docs/12 M4), timed
 # directly against the loaded knows CSR: pagerank is 20 power

@@ -266,6 +266,39 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person)-[:knows]->(b) RETURN count(DISTINCT [a.id, b.id]) AS n",
         "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
          WHERE a.id < b.id AND b.id < c.id RETURN count(DISTINCT [a.id, b.id, c.id]) AS n",
+        // OPTIONAL MATCH: the group runs per outer row and a row it
+        // matched nothing for still comes out, with the group's slots
+        // bound null. The setup graph has isolated people, so every
+        // one of these has real misses in it. Once bare, once with
+        // the far node itself projected, once with a string off it,
+        // once under a filter that leaves one outer row, once with
+        // the group's own WHERE deciding what counts as a match, once
+        // with an inline property doing the same, once where the
+        // group matches nothing at all, once off an expanded level
+        // rather than the scan, once under a key seek, and once
+        // counted, where a miss still counts as one row.
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a.id AS a, b AS node",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) \
+         RETURN a.name AS a, b.name AS b, b.age AS age",
+        "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) WHERE b.age > 90 \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b {age: 7}) \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) WHERE b.age > 500 \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 OPTIONAL MATCH (b)-[:knows]->(c) \
+         RETURN a.id AS a, b.id AS b, c.id AS c",
+        "MATCH (a:person {id: 42}) OPTIONAL MATCH (a)-[:knows]->(b) \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN count(*) AS n",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) WHERE b.age > 500 \
+         RETURN count(*) AS n",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a.age AS age, count(*) AS n",
+        "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
+         RETURN a.id AS a, b.id AS b LIMIT 4",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -304,7 +337,26 @@ fn unclaimed_shapes_fall_back() {
         "MATCH (p:person) RETURN count(DISTINCT p.age) AS a, count(DISTINCT p.score) AS b",
         "MATCH (a:person)-[r:knows]->(b) RETURN count(r) AS n",
         "MATCH (a:person)-[:knows*1..2]->(b) RETURN count(b) AS n",
+        // An OPTIONAL MATCH with no required match under it has no
+        // driving scan the bracket can hang off.
         "OPTIONAL MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",
+        // The bracket ends the pipeline, so a second one, or anything
+        // required above the first, goes back whole.
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) OPTIONAL MATCH (a)-[:knows]->(c) \
+         RETURN a.id AS a, b.id AS b, c.id AS c",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) MATCH (b)-[:knows]->(c) \
+         RETURN count(*) AS n",
+        // Reading the group's level in a way a null has an answer for
+        // that the sink does not implement: count(x) is zero over a
+        // miss rather than one, and sorting and deduplicating have to
+        // decide where a null sorts and whether two of them are one
+        // row.
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN count(b) AS n",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN sum(b.score) AS s",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN b.age AS age, count(*) AS n",
+        "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN DISTINCT b.age AS age",
+        "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
+         RETURN a.id AS a, b.id AS b ORDER BY b",
         "UNWIND [1, 2, 3] AS x RETURN x",
         // A seek key that is not an integer constant has no row to
         // seek, and a scan to find one row costs more than the old

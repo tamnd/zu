@@ -614,6 +614,36 @@ exec_sip_select_mrows_s = 50.0
 # measured there. Raise this floor, never lower it.
 exec_project_mrows_s_core = 25.0
 
+# The OPTIONAL MATCH bracket at one worker, M outer rows/s (docs/07):
+# two million people of whom every fourth is isolated, so a quarter of
+# the outer rows take the miss path and the number is not the matching
+# case with a branch in it. The rest know two people each. The counted
+# shape is what the floor sits on, since it has nothing built above the
+# bracket and so is the walk and the miss handling and nothing else.
+#
+# The bench prints four shapes and each one twice, once through the
+# pipeline and once with ZU_EXEC2=0, which is where the first three ran
+# before an OPTIONAL MATCH had a compiled shape at all. Measured at
+# c7c02f0, one worker, in ms for the pipeline against the old engine:
+# the count 51.6 against 156.1 on gamingpc and 158.2 against 574.4 on
+# server1; the rows shape 145.4 against 591.9 and 529.0 against 2220.8;
+# the filtered shape, whose WHERE sits inside the bracket and turns
+# most hits into misses, 296.5 against 697.4 and 1283.1 against 3299.9.
+# So 3.0x and 3.6x on the count, 4.1x and 4.2x on the rows, 2.4x and
+# 2.6x on the filtered one, which is dominated by the filter running
+# over a vector of two rather than by the bracket.
+#
+# The fourth shape is the same walk and the same projection with the
+# bracket taken off: 131.1 ms on gamingpc against the rows shape's
+# 145.4, and 411.5 against 529.0 on server1. That gap is what the
+# bracket costs, and it is the miss path and the null level, not a tax
+# on the rows that matched.
+#
+# The floor is set off server1, the slowest host and the one that gates
+# with no free page cache, at about two thirds of its worse run. Raise
+# this floor, never lower it.
+exec_optional_mrows_s_core = 8.0
+
 # Cardinality quality over the SF1 corpus, q-error percentiles
 # (perf/12 section 4). Twelve queries run profiled, every operator that
 # carries an estimate contributes one max(est/act, act/est), and the

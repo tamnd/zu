@@ -727,22 +727,13 @@ impl GraphReader {
         Ok(&self.cached_offsets[idx].as_ref().unwrap().1)
     }
 
-    /// Sum of degrees over `nodes` in `dir`, one pooled offset pin per
-    /// group run. This is the counting expand's bulk read: it touches
-    /// the 8% offsets pool and never the 20% adjacency pool, so a
-    /// count over a hub's neighborhood costs offset diffs, not decoded
-    /// neighbor megabytes.
+    /// Sum of degrees over `nodes` in `dir`. This is the counting
+    /// expand's bulk read: it touches the 8% offsets pool and never the
+    /// 20% adjacency pool, so a count over a hub's neighborhood costs
+    /// offset diffs, not decoded neighbor megabytes.
     pub fn degree_batch(&mut self, db: &mut Zu1File, nodes: &[u64], dir: Direction) -> Result<u64> {
         let mut total = 0u64;
-        let mut cur: Option<(usize, Arc<Vec<u64>>)> = None;
-        for &node in nodes {
-            let (g, row) = self.locate(node)?;
-            if cur.as_ref().map(|(i, _)| *i) != Some(g) {
-                cur = Some((g, Arc::clone(self.offsets(db, g, dir)?)));
-            }
-            let offs = &cur.as_ref().unwrap().1;
-            total += offs[row + 1] - offs[row];
-        }
+        self.degrees_run(db, nodes, dir, |_, d| total += d)?;
         Ok(total)
     }
 
@@ -758,14 +749,55 @@ impl GraphReader {
         out: &mut [u64],
     ) -> Result<()> {
         debug_assert_eq!(nodes.len(), out.len());
-        let mut cur: Option<(usize, Arc<Vec<u64>>)> = None;
-        for (slot, &node) in out.iter_mut().zip(nodes) {
-            let (g, row) = self.locate(node)?;
-            if cur.as_ref().map(|(i, _)| *i) != Some(g) {
-                cur = Some((g, Arc::clone(self.offsets(db, g, dir)?)));
+        self.degrees_run(db, nodes, dir, |at, d| out[at] += d)
+    }
+
+    /// Every node's degree in `dir`, handed to `sink` with the position
+    /// it arrived in. Nodes of the same group that arrive together are
+    /// one run, and the run picks how it reads: the whole group's
+    /// offsets once it is long enough to pay for decoding them, and the
+    /// two offsets a row needs when it is not. A scan hands over a
+    /// group's rows in order and takes the first path, which is what
+    /// the reader-local slot is there for. A batch of point reads hands
+    /// over rows from all over the table and takes the second, which is
+    /// the difference between reading a chunk per row and decoding a
+    /// group per row.
+    fn degrees_run(
+        &mut self,
+        db: &mut Zu1File,
+        nodes: &[u64],
+        dir: Direction,
+        mut sink: impl FnMut(usize, u64),
+    ) -> Result<()> {
+        let mut at = 0;
+        while at < nodes.len() {
+            let (group, _) = self.locate(nodes[at])?;
+            let mut end = at + 1;
+            while end < nodes.len() && self.locate(nodes[end])?.0 == group {
+                end += 1;
             }
-            let offs = &cur.as_ref().unwrap().1;
-            *slot += offs[row + 1] - offs[row];
+            let chunks = self.directory.groups[group]
+                .dir(dir)
+                .offsets
+                .chunk_count()
+                .max(1);
+            if end - at >= chunks {
+                let offs = Arc::clone(self.offsets(db, group, dir)?);
+                for (i, &node) in (at..end).zip(&nodes[at..end]) {
+                    let (_, row) = self.locate(node)?;
+                    sink(i, offs[row + 1] - offs[row]);
+                }
+            } else {
+                let meta = &self.directory.groups[group].dir(dir).offsets;
+                let mut pair = Vec::with_capacity(2);
+                for (i, &node) in (at..end).zip(&nodes[at..end]) {
+                    let (_, row) = self.locate(node)?;
+                    pair.clear();
+                    read_range(db, meta, row as u64, row as u64 + 2, &mut pair)?;
+                    sink(i, pair[1] - pair[0]);
+                }
+            }
+            at = end;
         }
         Ok(())
     }

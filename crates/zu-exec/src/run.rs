@@ -44,8 +44,9 @@ pub(crate) fn run(
     snap: &mut dyn Snapshot,
     options: &Options,
 ) -> Result<QueryResult> {
-    let sched = match plan.source {
-        Source::Seek(key) => seek_work(plan, snap, options, key)?,
+    let sched = match &plan.source {
+        Source::Seek(key) => seek_work(plan, snap, options, *key)?,
+        Source::Seeks(keys) => seeks_work(keys, options),
         Source::Scan(_) => scan_work(plan, snap, options)?,
     };
     let partials = drive(plan, snap, &sched)?;
@@ -89,6 +90,9 @@ enum Work {
     /// The whole seeded plan on one morsel; `None` is a key that hit
     /// no row, which still owes the sink its empty batch.
     Seek(Option<u64>),
+    /// A range of a batch of seeks: the morsel owns those keys, in
+    /// order, and builds its own level 0 out of the rows they find.
+    Seeks,
     /// One slice of a seeded plan's first frontier: the seed row is
     /// fixed and the morsel owns a range of its neighbor list.
     Frontier {
@@ -234,6 +238,26 @@ fn seek_work(
         morsels,
         threads,
     })
+}
+
+/// A batch of seeks, split into morsels of the key list. The keys are
+/// the work here, not the rows behind them, so the split is by position
+/// in the list and a morsel keeps its keys in the order they were
+/// written: batches stitch back into the order one worker walking the
+/// list would have emitted.
+fn seeks_work(keys: &[u64], options: &Options) -> Schedule {
+    let threads = match options.threads {
+        // A page of ids is a handful of lookups, and forking snapshots
+        // costs more than the lookups do.
+        0 if keys.len() as u64 <= SPLIT_ROWS => 1,
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+        n => n,
+    };
+    Schedule {
+        work: Work::Seeks,
+        morsels: make_morsels(keys.len() as u64, threads.max(1)),
+        threads,
+    }
 }
 
 fn group_of(row: u64) -> GroupId {
@@ -536,7 +560,7 @@ impl<'a> Worker<'a> {
                 .iter()
                 .filter_map(|c| match *c {
                     ColSpec::Stored(id, _) => Some(id),
-                    ColSpec::Computed(_) | ColSpec::Outer { .. } => None,
+                    ColSpec::Computed(_) | ColSpec::Outer { .. } | ColSpec::Key => None,
                 })
                 .collect(),
             scratch: Vec::new(),
@@ -587,6 +611,7 @@ impl<'a> Worker<'a> {
         match self.work {
             Work::Scan => self.scan_morsel(idx, range)?,
             Work::Seek(seed) => self.seek_morsel(seed)?,
+            Work::Seeks => self.seeks_morsel(idx, range)?,
             Work::Frontier { seed, rel, dir, to } => {
                 self.frontier_morsel(seed, rel, dir, to, range)?
             }
@@ -606,9 +631,47 @@ impl<'a> Worker<'a> {
     fn seek_morsel(&mut self, seed: Option<u64>) -> Result<()> {
         let Some(seed) = seed else { return Ok(()) };
         let plan = self.plan;
-        let level0 = self.make_level(0, &[seed], &[])?;
+        let level0 = self.make_level(0, &[seed], &[], &[])?;
         let mut set = ChunkSet::new(vec![level0]);
         self.run_ops(&plan.ops, &mut set)
+    }
+
+    /// One morsel's slice of a batch of seeks. The keys resolve a
+    /// vector at a time and level 0 is built out of the rows they hit,
+    /// so the gather and everything above it run over a full vector
+    /// rather than once per key, which is what a batch of point reads
+    /// used to cost. A key that finds nothing takes its place out of
+    /// the vector and no row comes of it.
+    fn seeks_morsel(&mut self, idx: usize, (lo, hi): (u64, u64)) -> Result<()> {
+        let plan = self.plan;
+        let Source::Seeks(keys) = &plan.source else {
+            unreachable!("the seeks morsel runs under a batch of seeks");
+        };
+        let rows_sink = matches!(plan.sink, SinkSpec::Rows { .. });
+        let (mut found, mut hit) = (Vec::new(), Vec::new());
+        for part in keys[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
+            if self.stop.stopped() {
+                break;
+            }
+            found.clear();
+            hit.clear();
+            for &key in part {
+                if let Some(row) = self.snap.get().seek_key(plan.table, key)? {
+                    found.push(row);
+                    hit.push(key);
+                }
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let level0 = self.make_level(0, &found, &[], &hit)?;
+            let mut set = ChunkSet::new(vec![level0]);
+            self.run_ops(&plan.ops, &mut set)?;
+            if rows_sink && self.stop.quota_met(idx, self.local_rows) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// One slice of a celebrity seed's frontier. The seed's level 0 is
@@ -626,14 +689,14 @@ impl<'a> Worker<'a> {
         (lo, hi): (u64, u64),
     ) -> Result<()> {
         let plan = self.plan;
-        let mut level0 = self.make_level(0, &[seed], &[])?;
+        let mut level0 = self.make_level(0, &[seed], &[], &[])?;
         level0.cur = Some(0);
         let mut set = ChunkSet::new(vec![level0]);
         let pin = self.pin(rel, dir, seed)?;
         let list = pin.list((seed % u64::from(GROUP_ROWS)) as usize);
         let mut result = Ok(());
         for part in list[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
-            let chunk = match self.make_level(to, part, &set.chunks) {
+            let chunk = match self.make_level(to, part, &set.chunks, &[]) {
                 Ok(c) => c,
                 Err(e) => {
                     result = Err(e);
@@ -700,6 +763,11 @@ impl<'a> Worker<'a> {
                     // and the compiler only ever registers a broadcast
                     // off a level below the one it lands on.
                     ColSpec::Outer { .. } => unreachable!("the scan level reads no outer value"),
+                    // A key column stands for the UNWIND variable a
+                    // batch of seeks drives on, and a scan has no keys
+                    // to answer with; the compiler only registers one
+                    // under the seeks source.
+                    ColSpec::Key => unreachable!("the scan level has no seek keys"),
                 };
                 level0.vecs.push(v);
             }
@@ -796,8 +864,8 @@ impl<'a> Worker<'a> {
             }
             Op::DegreeProduct { steps } => {
                 self.collect_rows(set.chunks.last().expect("a level under the count"));
-                let rows = std::mem::take(&mut self.scratch);
-                let sum = self.product_sum(steps, &rows);
+                let mut rows = std::mem::take(&mut self.scratch);
+                let sum = self.product_sum(steps, &mut rows);
                 self.scratch = rows;
                 self.sink.count += sum? as i64;
                 Ok(())
@@ -1005,7 +1073,7 @@ impl<'a> Worker<'a> {
     /// Pushes one vector of expanded rows through the rest of the
     /// pipeline as the newest level.
     fn descend(&mut self, to: usize, part: &[u64], rest: &[Op], set: &mut ChunkSet) -> Result<()> {
-        let chunk = self.make_level(to, part, &set.chunks)?;
+        let chunk = self.make_level(to, part, &set.chunks, &[])?;
         set.chunks.push(chunk);
         let res = self.run_ops(rest, set);
         set.chunks.pop();
@@ -1107,7 +1175,7 @@ impl<'a> Worker<'a> {
                 leapfrog(spin.list(at), plist, &mut hits);
             }
             for part in hits.chunks(zu_vector::VECTOR_SIZE) {
-                let chunk = match self.make_level(to, part, &set.chunks) {
+                let chunk = match self.make_level(to, part, &set.chunks, &[]) {
                     Ok(c) => c,
                     Err(e) => {
                         result = Err(e);
@@ -1214,7 +1282,13 @@ impl<'a> Worker<'a> {
     /// and computed over the vector if it is an expression. The list is
     /// in registration order and a program only loads columns registered
     /// ahead of it, so one pass fills the chunk.
-    fn make_level(&mut self, level: usize, part: &[u64], below: &[DataChunk]) -> Result<DataChunk> {
+    fn make_level(
+        &mut self,
+        level: usize,
+        part: &[u64],
+        below: &[DataChunk],
+        keys: &[u64],
+    ) -> Result<DataChunk> {
         let info = &self.plan.levels[level];
         let mut vecs = Vec::with_capacity(1 + info.cols.len());
         vecs.push(ValueVector::flat_from(
@@ -1235,6 +1309,13 @@ impl<'a> Worker<'a> {
                     let src = &below[*from];
                     let at = pinned_pos(src);
                     broadcast(&src.vecs[*vec], at, part.len(), &mut self.arena)
+                }
+                // The keys arrive alongside the rows they found, so the
+                // column is the batch as it was handed over. Only the
+                // seeks source registers one, and only on level 0.
+                ColSpec::Key => {
+                    debug_assert_eq!(keys.len(), part.len(), "one key per row it found");
+                    ValueVector::flat_from(&mut self.arena, PhysType::Int64, keys)
                 }
             };
             chunk.vecs.push(v);
@@ -1260,8 +1341,7 @@ impl<'a> Worker<'a> {
     /// the fused degree product never builds levels at all. The whole
     /// chunk's neighbor lists concatenate into one buffer and the
     /// product runs over that, so the per-source cost is a slice copy
-    /// instead of a pipeline descent. A morsel never crosses a group,
-    /// so one pin per direction covers every source row in the chunk.
+    /// instead of a pipeline descent.
     fn expand_degree(
         &mut self,
         rel: RelId,
@@ -1270,21 +1350,46 @@ impl<'a> Worker<'a> {
         set: &ChunkSet,
     ) -> Result<()> {
         self.collect_rows(set.chunks.last().expect("a level under the expand"));
-        let Some(&first) = self.scratch.first() else {
+        if self.scratch.is_empty() {
             return Ok(());
-        };
-        self.neigh.clear();
-        for dir in sides(dirs) {
-            let pin = self.pin(rel, dir, first)?;
-            for &row in &self.scratch {
-                self.neigh
-                    .extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
-            }
         }
-        let neigh = std::mem::take(&mut self.neigh);
-        let sum = self.product_sum(steps, &neigh);
+        let mut rows = std::mem::take(&mut self.scratch);
+        rows.sort_unstable();
+        let mut neigh = std::mem::take(&mut self.neigh);
+        neigh.clear();
+        let sum = self
+            .concat_lists(rel, dirs, &rows, &mut neigh)
+            .and_then(|()| self.product_sum(steps, &mut neigh));
+        self.scratch = rows;
         self.neigh = neigh;
         self.sink.count += sum? as i64;
+        Ok(())
+    }
+
+    /// Appends every row's neighbor list, one pin per group run. A scan
+    /// morsel stays inside one group and pins once, but a batch of
+    /// seeks lands anywhere in the table, so the pin follows the group
+    /// the row is in rather than the group the first row happened to be
+    /// in. `rows` ascending is what keeps that one pin per group; what
+    /// comes back is summed, so the caller is free to sort.
+    fn concat_lists(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        rows: &[u64],
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        for dir in sides(dirs) {
+            let mut held: Option<(u64, CsrPin)> = None;
+            for &row in rows {
+                let group = row / u64::from(GROUP_ROWS);
+                if held.as_ref().is_none_or(|&(g, _)| g != group) {
+                    held = Some((group, self.pin(rel, dir, row)?));
+                }
+                let pin = &held.as_ref().expect("just pinned").1;
+                out.extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
+            }
+        }
         Ok(())
     }
 
@@ -1293,7 +1398,14 @@ impl<'a> Worker<'a> {
     /// here, so each row counts exactly once. One step is a plain
     /// degree sum and stays on the bulk `degree_batch` read; several
     /// steps read per-row degrees and multiply.
-    fn product_sum(&mut self, steps: &[(RelId, Dirs)], rows: &[u64]) -> Result<u64> {
+    ///
+    /// Both reads hold one group's offsets at a time, so a row list
+    /// that jumps between groups reads a segment per row, which is what
+    /// a batch of seeks hands over. The answer is a sum over the whole
+    /// list and nothing above reads the list again, so the list is
+    /// sorted in place first and every group is read once.
+    fn product_sum(&mut self, steps: &[(RelId, Dirs)], rows: &mut [u64]) -> Result<u64> {
+        rows.sort_unstable();
         if let [(rel, dirs)] = steps {
             let mut sum = 0;
             for dir in sides(*dirs) {

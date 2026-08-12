@@ -125,9 +125,14 @@ pub(crate) enum Op {
     /// seed list hangs off the newest level, the probe list off a
     /// level pinned above it, so a wedge closes in one leapfrog walk
     /// instead of a storage probe per candidate.
+    ///
+    /// An undirected end over a self-referencing rel reads both stored
+    /// lists. On the probe side the two are unioned once for the
+    /// vector; on the seed side each is walked in turn, which is the
+    /// old engine's rule and keeps a two way edge counted twice.
     Intersect {
-        seed: (RelId, Dir),
-        probe: (RelId, Dir),
+        seed: (RelId, Dirs),
+        probe: (RelId, Dirs),
         /// The level holding the wedge's far end, always pinned when
         /// the op runs.
         probe_level: usize,
@@ -527,13 +532,26 @@ impl Compiler<'_> {
                     while matches!(ops.last(), Some(Op::Filter { .. })) {
                         held.push(ops.pop().expect("just matched"));
                     }
-                    let Some(op) = self.fuse_close(&ops, *rel, *from, *to, *direction) else {
-                        return Ok(None);
-                    };
                     it.next();
-                    ops.pop();
-                    ops.push(op);
-                    ops.extend(held.into_iter().rev());
+                    match self.fuse_close(&ops, *rel, *from, *to, *direction) {
+                        Some(op) => {
+                            ops.pop();
+                            ops.push(op);
+                            ops.extend(held.into_iter().rev());
+                        }
+                        // The mark says the pair is worth intersecting,
+                        // not that this executor can. The plain probe
+                        // is still correct, and taking it here beats
+                        // sending the whole query back to the old
+                        // engine over one operator.
+                        None => {
+                            ops.extend(held.into_iter().rev());
+                            let Some(op) = self.close_semi(*rel, *from, *to, *direction) else {
+                                return Ok(None);
+                            };
+                            ops.push(op);
+                        }
+                    }
                 }
                 Some(LogicalPlan::Expand {
                     rel,
@@ -744,10 +762,10 @@ impl Compiler<'_> {
 
     /// Fuses a closing expand into the expand that built the node it
     /// closes on, or None when the pair is not a shape the intersection
-    /// covers: both sides one direction over one rel table, one of the
-    /// two lists hanging off the newest level so it is walked row by
-    /// row, and the other hanging off a level below it so it is pinned
-    /// and read once for the whole vector.
+    /// covers: both sides over one rel table, one of the two lists
+    /// hanging off the newest level so it is walked row by row, and the
+    /// other hanging off a level below it so it is pinned and read once
+    /// for the whole vector.
     ///
     /// Which of the two is which depends on where the optimizer put the
     /// scan. Starting at the wedge tip leaves the built expand walking
@@ -765,7 +783,7 @@ impl Compiler<'_> {
     ) -> Option<Op> {
         let &Op::Expand {
             rel: built_rel,
-            dirs: Dirs::One(built_dir),
+            dirs: built_dirs,
             from: built_from,
             to: built_to,
             ..
@@ -790,25 +808,30 @@ impl Compiler<'_> {
         let &[close_rel] = self.query.variables[rel].rel_tables.as_slice() else {
             return None;
         };
-        let Dirs::One(close_dir) = expand_dirs(
+        let close_dirs = expand_dirs(
             self.schema,
             close_rel,
             self.levels[far_level].table,
             far_dir,
-        )?
-        else {
-            return None;
+        )?;
+        // The close has to land on the table the built expand's level
+        // holds, otherwise the two lists name different things and
+        // there is nothing to intersect. A both-sides walk stays on one
+        // table by construction, so its far side is the near side.
+        let lands = match close_dirs {
+            Dirs::One(d) => far_table(self.schema, close_rel, d)? == self.levels[built_to].table,
+            Dirs::Both => self.levels[far_level].table == self.levels[built_to].table,
         };
-        if far_table(self.schema, close_rel, close_dir)? != self.levels[built_to].table {
+        if !lands {
             return None;
         }
         // The newest level is the one the pipeline ends on before this
         // pair, and the other list has to sit strictly below it.
         let newest = built_to - 1;
         let (seed, probe, probe_level) = if built_from == newest && far_level < newest {
-            ((built_rel, built_dir), (close_rel, close_dir), far_level)
+            ((built_rel, built_dirs), (close_rel, close_dirs), far_level)
         } else if far_level == newest && built_from < newest {
-            ((close_rel, close_dir), (built_rel, built_dir), built_from)
+            ((close_rel, close_dirs), (built_rel, built_dirs), built_from)
         } else {
             return None;
         };

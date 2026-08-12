@@ -104,27 +104,26 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
         } => {
             let mut below = lift_close_filters(*input);
             let mut lifted = Vec::new();
-            while into && wcoj {
-                let LogicalPlan::Filter {
+            if into && wcoj {
+                while let LogicalPlan::Filter {
                     input: inner,
                     expr,
                     optional: fopt,
                 } = below
-                else {
-                    break;
-                };
-                let mut slots = HashSet::new();
-                expr_slots(&expr, &mut slots);
-                if fopt != optional || slots.contains(&rel) {
-                    below = LogicalPlan::Filter {
-                        input: inner,
-                        expr,
-                        optional: fopt,
-                    };
-                    break;
+                {
+                    let mut slots = HashSet::new();
+                    expr_slots(&expr, &mut slots);
+                    if fopt != optional || slots.contains(&rel) {
+                        below = LogicalPlan::Filter {
+                            input: inner,
+                            expr,
+                            optional: fopt,
+                        };
+                        break;
+                    }
+                    below = *inner;
+                    lifted.push((expr, fopt));
                 }
-                below = *inner;
-                lifted.push((expr, fopt));
             }
             let mut plan = LogicalPlan::Expand {
                 input: Box::new(below),
@@ -531,16 +530,24 @@ fn mark_asp_node(
                 let asp = optional.is_none() && range.is_none() && est > edges.max(1.0);
                 // A closing expand completes a cycle in the join graph
                 // by construction, so docs/07 §4 injects the multiway
-                // intersection here. The fusion reads one sorted list
-                // per side, so undirected closes and multi-table rels
-                // keep the binary probe; the 16x intermediate-to-output
-                // ratio for acyclic marks arrives with the §6
-                // histograms. Optional closes are marked too: the
-                // compiler only fuses within one group, which keeps
-                // left-outer semantics exact.
+                // intersection here. Multi-table rels keep the binary
+                // probe; the 16x intermediate-to-output ratio for
+                // acyclic marks arrives with the §6 histograms. An
+                // undirected end reads two stored lists rather than
+                // one, which the intersection walks in turn on the
+                // seed side and unions on the probe side, so it marks
+                // too as long as the rel is self referencing and both
+                // its lists hold the same node table. Optional closes
+                // are marked as well: the compiler only fuses within
+                // one group, which keeps left-outer semantics exact.
+                let self_ref = query.variables[rel]
+                    .rel_tables
+                    .first()
+                    .and_then(|id| schema.rel_by_id(*id))
+                    .is_some_and(|rd| rd.from == rd.to);
                 let wcoj = range.is_none()
-                    && !matches!(direction, RelDirection::Undirected)
-                    && query.variables[rel].rel_tables.len() == 1;
+                    && query.variables[rel].rel_tables.len() == 1
+                    && (self_ref || !matches!(direction, RelDirection::Undirected));
                 // A close keeps or drops rows, never adds, so the
                 // ceiling under it stands and only the spread moves.
                 ceil.walked(&e, from, to, query);
@@ -2696,9 +2703,11 @@ mod tests {
     }
 
     #[test]
-    fn a_predicate_under_an_unmarked_close_stays_where_it_was_placed() {
-        // Undirected closes carry no mark, the binary probe runs either
-        // way, and there the cheaper order is the predicate first.
+    fn a_predicate_an_expand_below_the_close_stays_where_it_was_placed() {
+        // The DP starts this one at b and expands both ways out of it,
+        // so the predicate lands under the second expand rather than
+        // straight under the close. Nothing is blocking a fusion there
+        // and the cheaper order is the predicate first, where it was.
         let text = optimized(
             "MATCH (a:Person)-[:KNOWS]-(b)-[:KNOWS]-(c), (a)-[:KNOWS]-(c) \
              WHERE b.id < c.id RETURN count(*) AS n",
@@ -2716,15 +2725,33 @@ mod tests {
     }
 
     #[test]
-    fn undirected_closes_stay_unmarked() {
-        // Every edge undirected, so whichever edge the DP picks as the
-        // close has no single sorted list to gallop and stays unmarked.
+    fn undirected_closes_over_one_table_carry_the_mark() {
+        // Every edge undirected, and KNOWS runs Person to Person, so
+        // both ends of the close have their two stored lists on the one
+        // table: the intersection walks them in turn on the seed side
+        // and unions them on the probe side, and the mark says so.
         let marks = expand_marks(
             "MATCH (a:Person)-[:KNOWS]-(b)-[:KNOWS]-(c), (a)-[:KNOWS]-(c) \
              RETURN a.id AS id",
         );
-        assert!(marks.iter().any(|(into, _)| *into), "got: {marks:?}");
-        assert!(marks.iter().all(|(_, wcoj)| !wcoj), "got: {marks:?}");
+        assert!(
+            marks.iter().any(|&(into, wcoj)| into && wcoj),
+            "got: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn undirected_closes_across_two_tables_stay_unmarked() {
+        // A four cycle over IS_LOCATED_IN, which runs Person to Place,
+        // so whichever edge the DP closes on is undirected between two
+        // different tables. Which side an end reads then depends on the
+        // row, not on the plan, and the close stays unmarked.
+        let marks = expand_marks(
+            "MATCH (a:Person)-[:IS_LOCATED_IN]-(p)-[:IS_LOCATED_IN]-(b)-[:IS_LOCATED_IN]-(q), \
+             (a)-[:IS_LOCATED_IN]-(q) RETURN a.id AS id",
+        );
+        assert!(marks.iter().any(|&(into, _)| into), "got: {marks:?}");
+        assert!(marks.iter().all(|&(_, wcoj)| !wcoj), "got: {marks:?}");
     }
 
     #[test]

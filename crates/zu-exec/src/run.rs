@@ -1243,6 +1243,18 @@ impl<'a> Worker<'a> {
             fill_key_col(self.plan, set, r, sel, rows, off, &mut self.batch)?;
             off += part_kind(r).words();
         }
+        // Dense columns and required nodes are never null, so count(x)
+        // counts rows exactly like count(*), and a key of one word with
+        // nothing but counters over it is the shape the table takes
+        // from the key straight to the states.
+        let counting_only = aggs
+            .iter()
+            .all(|s| s.arg().is_none() || matches!(s, AggSpec::CountRef(_)));
+        if table.simple() && counting_only {
+            let (words, _) = self.batch.words_mut();
+            table.count_ints(words, aggs);
+            return Ok(());
+        }
         table.probe(&self.batch, aggs, &mut self.gids);
         let n = aggs.len();
         for (j, spec) in aggs.iter().enumerate() {

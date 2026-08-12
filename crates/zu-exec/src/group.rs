@@ -240,6 +240,67 @@ impl GroupTable {
         self.hashes = hashes;
     }
 
+    /// Whether a key is one fixed-width word, the shape the fused
+    /// counting path takes.
+    pub(crate) fn simple(&self) -> bool {
+        self.simple
+    }
+
+    /// One column of integer keys straight to the accumulators, for the
+    /// shape most GROUP BY queries are: a single fixed-width key and
+    /// aggregates that only count.
+    ///
+    /// The general path writes the hash of every row down, then the
+    /// group index of every row, then walks the indices again to
+    /// accumulate. All three are vector-sized passes over memory the
+    /// caller does not need afterwards, and at this size the query is
+    /// paying for them: a row's whole cost here is a hash, one slot,
+    /// and the states of the group it landed in, so the passes around
+    /// it are a fair share of the work. Fusing them keeps the slot
+    /// lookahead, which is the part that matters, and drops the rest.
+    pub(crate) fn count_ints(&mut self, words: &[u64], specs: &[AggSpec]) {
+        debug_assert!(self.simple, "one fixed-width key word");
+        debug_assert_eq!(self.n_aggs, specs.len());
+        let n = self.n_aggs;
+        for (row, &w) in words.iter().enumerate() {
+            if let Some(&next) = words.get(row + AHEAD) {
+                let i = hash64(SEED ^ next) as usize & self.mask;
+                warm(self.slots[i]);
+            }
+            let g = self.find_or_insert_simple(hash64(SEED ^ w), w, specs);
+            for a in &mut self.accs[g * n..g * n + n] {
+                a.add_star(1);
+            }
+        }
+    }
+
+    /// [`find_or_insert`] for a key the slot holds whole, so a tag hit
+    /// is a key hit and nothing reads the key pages.
+    ///
+    /// [`find_or_insert`]: GroupTable::find_or_insert
+    fn find_or_insert_simple(&mut self, h: u64, w: u64, specs: &[AggSpec]) -> usize {
+        let tag = (h >> 48).max(1);
+        let mut i = h as usize & self.mask;
+        loop {
+            let slot = self.slots[i];
+            if slot[0] == 0 {
+                let g = self.groups;
+                self.keys.push(w);
+                self.accs.extend(specs.iter().map(Acc::new));
+                self.slots[i] = [(tag << 48) | (g as u64 + 1), w];
+                self.groups += 1;
+                if self.groups * 4 > self.slots.len() * 3 {
+                    self.grow();
+                }
+                return g;
+            }
+            if slot[0] >> 48 == tag && slot[1] == w {
+                return ((slot[0] & IDX_MASK) - 1) as usize;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
     fn find_or_insert(&mut self, h: u64, batch: &KeyBatch, row: usize, specs: &[AggSpec]) -> usize {
         let tag = (h >> 48).max(1);
         let inline = self.inline_word(h, batch.row_words(row));

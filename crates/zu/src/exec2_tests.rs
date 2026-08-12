@@ -218,6 +218,27 @@ fn covered_shapes_match_the_old_engine() {
          RETURN count(c) AS n",
         "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
          RETURN b.id AS b, c.id AS c ORDER BY b, c LIMIT 20",
+        // Correlated filters, the predicate that names a level and one
+        // below it. The lower end is pinned while the filter runs, so
+        // it joins the chunk as a constant column and the compare is
+        // the ordinary two-vector kernel. Once over a plain hop, once
+        // on a property instead of the row id, once reaching two levels
+        // down, and once as the pair of predicates that turns the
+        // triangle into one triangle per orientation.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < b.id RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < b.id RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age < b.age RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE b.age > a.age AND b.score > 100 \
+         RETURN a.id AS a, b.id AS b ORDER BY a, b LIMIT 20",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) WHERE a.id <> c.id RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         WHERE a.id < b.id AND b.id < c.id RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c), (a)-[:knows]->(c) \
+         WHERE a.id < b.id AND b.id < c.id RETURN a.id AS a, b.id AS b, c.id AS c",
+        "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+         WHERE a.id < b.id AND b.id < c.id RETURN count(*) AS n",
+        "MATCH (a:person {id: 1})-[:knows]->(b)-[:knows]->(c) WHERE b.id < c.id \
+         RETURN c.id AS id ORDER BY id LIMIT 20",
         // Computed projections, which run as a column of the level
         // their properties come from instead of a per-row evaluation
         // over the sink. Once bare, once sorted on the computed value,
@@ -252,6 +273,14 @@ fn unclaimed_shapes_fall_back() {
         // the shape stays where the error is, divisor constant or not.
         "MATCH (p:person) RETURN p.score / 3 AS b",
         "MATCH (p:person) RETURN p.age % 10 AS b, p.id AS id",
+        // A correlated end inside arithmetic. The compare kernel ands
+        // the broadcast column's validity into its answer, so a null
+        // end compares false there, but the arith kernels do not carry
+        // validity yet and would turn a null into a number.
+        "MATCH (a:person)-[:knows]->(b) WHERE b.age > a.age + 1 RETURN count(*) AS n",
+        // A correlated string end would have to carry its buffers into
+        // the broadcast.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.name < b.name RETURN count(*) AS n",
         "MATCH (p:person) RETURN collect(p.age) AS ages",
         "MATCH (p:person) RETURN count(DISTINCT p.age) AS n",
         "MATCH (a:person)-[r:knows]->(b) RETURN count(r) AS n",

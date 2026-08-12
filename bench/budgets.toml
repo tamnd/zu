@@ -744,3 +744,24 @@ card_qerror_max = 26.0
 # ceilings is worth writing down here as acceptable.
 card_gen_qerror_p90 = 1.2
 card_gen_qerror_max = 500.0
+
+# The table function port (perf/07 section 5, zu#76). A leading CALL
+# yields one row per node and the pipeline now runs that whole shape
+# instead of handing it to the old engine. The bench builds a million
+# people in a thousand blocks, two friends each inside the block, so wcc
+# labels a thousand components and a group by on the yielded label has a
+# thousand real groups. Five shapes run: count the yield, sum it, group
+# by it, hop off every yielded node, and hop with the yielded value in
+# the WHERE. Every run is crosschecked against a union-find over the
+# same edge list, so a pipeline that loses rows fails before it prints.
+#
+# FLEET_NUMBERS
+#
+# The floor is the count case end to end in millions of rows a second,
+# so it carries the kernel both engines run. That is on purpose: the
+# whole query finishes in less time than a standalone wcc reads, so a
+# floor on the pipeline's own share would be a floor on timing noise.
+# The kernel does not hide a regression either, because a fallback to
+# the old engine is FALLBACK_RATIO here. Raise this floor, never lower
+# it.
+exec_call_mrows_s_core = 0.0

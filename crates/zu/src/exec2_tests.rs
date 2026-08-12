@@ -324,6 +324,30 @@ fn covered_shapes_match_the_old_engine() {
          RETURN id AS i, f.age AS age",
         "UNWIND [1, 7, 11] AS id MATCH (p:person {id: id})-[:knows]->(f) \
          RETURN f.id AS f ORDER BY f LIMIT 5",
+        // A leading CALL: the kernel runs once and level 0 is the node
+        // domain it answered over, with the yielded value beside the
+        // row. Once counted, once summed, once as rows in id order,
+        // once deduplicated, once grouped by the value, once with a hop
+        // off every yielded node, once with the value filtering above
+        // that hop, and once yielding a value that is null wherever the
+        // kernel reached nothing.
+        "CALL wcc('knows') YIELD node, component RETURN count(node) AS n",
+        "CALL wcc('knows') YIELD node, component RETURN count(node) AS n, sum(component) AS total",
+        "CALL wcc('knows') YIELD node, component RETURN node.id AS id, component ORDER BY id \
+         LIMIT 10",
+        "CALL wcc('knows') YIELD node, component RETURN DISTINCT component AS c",
+        "CALL wcc('knows') YIELD node, component RETURN component AS c, count(node) AS n \
+         ORDER BY n DESC, c LIMIT 5",
+        "CALL louvain('knows') YIELD node, community RETURN count(node) AS n",
+        "CALL wcc('knows') YIELD node, component MATCH (node)-[:knows]->(f) RETURN count(f) AS n",
+        "CALL wcc('knows') YIELD node, component MATCH (node)-[:knows]->(f) WHERE component > 0 \
+         RETURN count(f) AS n",
+        "CALL wcc('knows') YIELD node, component MATCH (node)-[:knows]->(f) \
+         RETURN component AS c, f.id AS f ORDER BY f LIMIT 8",
+        "CALL sssp('knows', 1) YIELD node, distance RETURN node.id AS id, distance ORDER BY id \
+         LIMIT 20",
+        "CALL sssp('knows', 1) YIELD node, distance MATCH (node)-[:knows]->(f) \
+         WHERE distance = 1 RETURN count(f) AS n",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -400,6 +424,20 @@ fn unclaimed_shapes_fall_back() {
         // seek, and a scan to find one row costs more than the old
         // engine's seek, so the shape goes back.
         "MATCH (p:person {id: 'x'}) RETURN count(p) AS n",
+        // pagerank yields a float and a compiled column carries an
+        // integer or a string, so the call stays with the old engine.
+        "CALL pagerank('knows') YIELD node, rank RETURN count(node) AS n",
+        // A yielded value that is null where the kernel reached
+        // nothing. It reads fine as a row and as a predicate, but
+        // grouping on one, ordering by one and aggregating over one
+        // follow rules the packed key and the accumulators do not
+        // implement.
+        "CALL sssp('knows', 1) YIELD node, distance RETURN distance AS d, count(node) AS n",
+        "CALL sssp('knows', 1) YIELD node, distance RETURN sum(distance) AS s",
+        "CALL sssp('knows', 1) YIELD node, distance RETURN count(distance) AS n",
+        "CALL sssp('knows', 1) YIELD node, distance RETURN DISTINCT distance AS d",
+        "CALL sssp('knows', 1) YIELD node, distance RETURN node.id AS id, distance \
+         ORDER BY distance LIMIT 5",
     ];
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);
@@ -421,4 +459,22 @@ fn public_run_uses_the_pipeline_executor_transparently() {
     )
     .unwrap();
     assert!(!r.rows.is_empty(), "a seeded expand still answers");
+    // A CALL routes the same way, and a source key with no row behind
+    // it falls back rather than being answered here: what a walk with
+    // no start does is the old engine's contract, and it still counts
+    // every node the kernel ran over.
+    let r = query::run(
+        "CALL wcc('knows') YIELD node, component RETURN count(node) AS n",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Int(N as i64)]]);
+    let r = query::run(
+        "CALL sssp('knows', 999999) YIELD node, distance RETURN count(node) AS n",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Int(N as i64)]]);
 }

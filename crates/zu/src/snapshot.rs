@@ -17,9 +17,11 @@ use zu_common::{Result, ZuError};
 use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
 
 pub use zu_query::snapshot::{
-    ColId, ColType, CsrPin, Dir, GroupId, RelId, SCAN_ROWS, ScanChunk, Snapshot, TableId, ZonePred,
+    ColId, ColType, CsrPin, Dir, FuncCol, GroupId, RelId, SCAN_ROWS, ScanChunk, Snapshot, TableId,
+    ZonePred,
 };
 
+use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
@@ -419,6 +421,37 @@ impl Snapshot for Zu1Snapshot<'_> {
             .get_mut(&rel)
             .expect("just loaded")
             .degrees_into(db, nodes, direction(dir), out)
+    }
+
+    fn table_function(&mut self, name: &str, rel: RelId, args: &[i64]) -> Result<Option<FuncCol>> {
+        // pagerank is missing on purpose: its rank is a float and a
+        // compiled column carries an integer or a string, so that call
+        // stays with the old engine until the column does floats.
+        if !matches!(name, "wcc" | "louvain" | "sssp") {
+            return Ok(None);
+        }
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        let reader = readers.get_mut(&rel).expect("just loaded");
+        let (values, null) = match name {
+            "wcc" => (algo::wcc(db, reader)?, Vec::new()),
+            "louvain" => (algo::louvain(db, reader)?, Vec::new()),
+            _ => {
+                let Some(&source) = args.first() else {
+                    return Ok(None);
+                };
+                let dist = algo::sssp(db, reader, source as u64)?;
+                let null = dist.iter().map(|&d| d == u64::MAX).collect();
+                (dist, null)
+            }
+        };
+        Ok(Some(FuncCol {
+            // A label and a distance are row ids and hop counts, both
+            // small; the cast only ever matters for the unreached
+            // sentinel, which is the null beside it.
+            values: values.into_iter().map(|v| v as i64).collect(),
+            null,
+        }))
     }
 
     fn fork(&self) -> Option<Box<dyn Snapshot + Send>> {

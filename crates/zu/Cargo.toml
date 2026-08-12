@@ -64,6 +64,10 @@ harness = false
 name = "batch"
 harness = false
 
+[[bench]]
+name = "call"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

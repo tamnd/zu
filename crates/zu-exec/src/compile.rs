@@ -15,10 +15,10 @@ use std::collections::HashMap;
 
 use zu_common::Result;
 use zu_query::ast::{BinaryOp, Literal, RelDirection};
-use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema};
+use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 use zu_query::exec::{Options, Value, Wcoj};
 use zu_query::plan::LogicalPlan;
-use zu_query::snapshot::{ColId, ColType, Dir, RelId, Snapshot, TableId, ZonePred};
+use zu_query::snapshot::{ColId, ColType, Dir, FuncCol, RelId, Snapshot, TableId, ZonePred};
 use zu_vector::{BinOp, CmpOp, ExprOp, OwnedValue, PhysType, Program, Reg};
 
 /// One compiled pipeline over one driving scan.
@@ -29,6 +29,10 @@ pub(crate) struct ExecPlan {
     pub sink: SinkSpec,
     pub levels: Vec<Level>,
     pub columns: Vec<String>,
+    /// What a leading CALL yielded, one value per node of the domain.
+    /// The kernel ran once while this plan was compiled, so every
+    /// worker reads the same answer and none of them runs it again.
+    pub func: Option<FuncCol>,
 }
 
 /// Where level 0 comes from.
@@ -93,6 +97,11 @@ pub(crate) enum ColSpec {
     /// it, so the variable is answered out of the column the source
     /// fills rather than gathered back off the row it found.
     Key,
+    /// The value a table function yielded, read out of the plan's
+    /// answer by row id. The kernel already holds one value per node
+    /// of the domain, so this is a copy where a stored column would
+    /// have been a decode.
+    Func,
 }
 
 /// Traversal sides of one expand: `Both` is an undirected step over a
@@ -409,6 +418,8 @@ pub(crate) fn compile(
         slot_level: HashMap::new(),
         optional_level: None,
         unwind_slot: None,
+        func_slot: None,
+        func: None,
     };
     c.compile(plan)
 }
@@ -444,6 +455,11 @@ struct Compiler<'a> {
     /// the batch of seeks that drives the plan. Reading it is reading
     /// the key that found the row, which is level 0's key column.
     unwind_slot: Option<usize>,
+    /// The value variable a leading CALL yielded. Reading it is reading
+    /// level 0's func column, the kernel's answer for that row.
+    func_slot: Option<usize>,
+    /// That kernel's answer, held until it goes on the plan.
+    func: Option<FuncCol>,
 }
 
 impl Compiler<'_> {
@@ -487,6 +503,63 @@ impl Compiler<'_> {
             };
             it.next();
             unwound = Some((*slot, keys));
+        }
+
+        // A leading CALL is the other thing that drives a pipeline: the
+        // kernel runs over the whole rel and yields one row per node of
+        // its domain, so level 0 is that node table read in row order
+        // and the yielded value is a column of it. The rest of the
+        // query, the hops off the yielded node and everything that
+        // aggregates over them, then compiles like any other pipeline
+        // instead of going back a row at a time.
+        if let Some(LogicalPlan::TableFunction {
+            func,
+            rel,
+            table,
+            args,
+            slots,
+            ..
+        }) = it.peek()
+        {
+            // A batch of seeks and a kernel are two different sources
+            // and the plan only has room for one.
+            if unwound.is_some() {
+                return Ok(None);
+            }
+            let &[node_slot, value_slot] = slots.as_slice() else {
+                return Ok(None);
+            };
+            let mut vals = Vec::with_capacity(args.len());
+            for arg in args {
+                let Some(v) = self.const_int(arg) else {
+                    return Ok(None);
+                };
+                vals.push(v);
+            }
+            // sssp is given a node id and walks from the row behind it,
+            // the resolution the old engine does before it calls the
+            // kernel. A key that names no node is an error that engine
+            // owns, so an unresolved one falls back rather than being
+            // answered here.
+            if matches!(func, TableFunc::Sssp) {
+                let Some(row) = self.seek_arg(*table, vals.first().copied())? else {
+                    return Ok(None);
+                };
+                vals[0] = row;
+            }
+            let Some(col) = self.snap.table_function(func.name(), *rel, &vals)? else {
+                return Ok(None);
+            };
+            it.next();
+            self.slot_level.insert(node_slot, 0);
+            self.slot_level.insert(value_slot, 0);
+            self.func_slot = Some(value_slot);
+            self.func = Some(col);
+            self.levels.push(LevelBuild {
+                table: *table,
+                cols: Vec::new(),
+            });
+            return self.rest(it, *table, None, None);
         }
 
         // The driving scan: one required node slot over one table.
@@ -553,7 +626,21 @@ impl Compiler<'_> {
             table,
             cols: Vec::new(),
         });
+        self.rest(it, table, seek, seeks)
+    }
 
+    /// Everything above the source: the filters and expands in written
+    /// order, then the sink with its absorbed post steps. Level 0 is
+    /// already registered when this runs, so what drives the plan, a
+    /// scan, a seek, a batch of them or a kernel, only shows up in the
+    /// source it ends up carrying.
+    fn rest<'p, I: Iterator<Item = &'p LogicalPlan>>(
+        &mut self,
+        mut it: std::iter::Peekable<I>,
+        table: TableId,
+        seek: Option<u64>,
+        seeks: Option<Vec<u64>>,
+    ) -> Result<Option<ExecPlan>> {
         // Filters and expands, in written order, always off the newest
         // level.
         let mut ops = Vec::new();
@@ -889,6 +976,34 @@ impl Compiler<'_> {
             }
         }
 
+        // A kernel that answers null for some rows, which sssp does for
+        // every node it did not reach, is read the way any other
+        // nullable value is: a projection carries the null out and a
+        // comparison against it is false, both of which match the old
+        // engine. Grouping on one, ordering by one, deduplicating on
+        // one and aggregating over one follow rules the packed key and
+        // the accumulators do not implement, so those go back.
+        if let Some(null) = self.null_func_vec() {
+            let reads =
+                |r: &ScalarRef| matches!(*r, ScalarRef::Col { level: 0, vec, .. } if vec == null);
+            let ok = match &sink {
+                SinkSpec::Count => true,
+                SinkSpec::Rows { items, post } => post.iter().all(|p| match p {
+                    PostSpec::Distinct => !items.iter().any(reads),
+                    PostSpec::Sort(cols) => !cols.iter().any(|&(at, _)| reads(&items[at])),
+                    PostSpec::Skip(_) | PostSpec::Limit(_) => true,
+                }),
+                SinkSpec::CountDistinct { keys } => !keys.iter().any(reads),
+                SinkSpec::Agg { keys, aggs, .. } => {
+                    !keys.iter().any(reads)
+                        && !aggs.iter().filter_map(AggSpec::arg).any(|r| reads(&r))
+                }
+            };
+            if !ok {
+                return Ok(None);
+            }
+        }
+
         // Fuse trailing expands feeding a bare count into one degree
         // product when nothing reads the expanded levels' rows or
         // columns. The steps must fan out of one source level: a
@@ -992,6 +1107,7 @@ impl Compiler<'_> {
                 })
                 .collect(),
             columns: self.query.columns.clone(),
+            func: self.func.take(),
         }))
     }
 
@@ -1259,6 +1375,52 @@ impl Compiler<'_> {
         }
     }
 
+    /// Registers level 0's func column, or finds the one already there,
+    /// and returns the scalar that reads it back. A yielded value is
+    /// the kernel's answer for the row, so it enters the chunk beside
+    /// the row id rather than being looked up anywhere.
+    fn func_col(&mut self) -> ScalarRef {
+        let at = match self.levels[0]
+            .cols
+            .iter()
+            .position(|(_, c)| matches!(c, ColSpec::Func))
+        {
+            Some(ix) => ix + 1,
+            None => {
+                self.levels[0].cols.push((String::new(), ColSpec::Func));
+                self.levels[0].cols.len()
+            }
+        };
+        ScalarRef::Col {
+            level: 0,
+            vec: at,
+            ty: ColType::Int,
+        }
+    }
+
+    /// Level 0's func column position when the kernel's answer has
+    /// nulls in it, `None` when every row has a value or when nothing
+    /// read the column at all.
+    fn null_func_vec(&self) -> Option<usize> {
+        if !self.func.as_ref().is_some_and(FuncCol::nullable) {
+            return None;
+        }
+        self.levels[0]
+            .cols
+            .iter()
+            .position(|(_, c)| matches!(c, ColSpec::Func))
+            .map(|ix| ix + 1)
+    }
+
+    /// The dense row a table function's node id argument names, `None`
+    /// when there is no argument or the key names no node.
+    fn seek_arg(&mut self, table: TableId, key: Option<i64>) -> Result<Option<i64>> {
+        let Some(key) = key.and_then(|k| u64::try_from(k).ok()) else {
+            return Ok(None);
+        };
+        Ok(self.snap.seek_key(table, key)?.map(|row| row as i64))
+    }
+
     /// Registers a lower level's pinned value as a constant column on
     /// `level`, returning its chunk vector position. Two predicates
     /// reading the same end share the column, the way two readers of a
@@ -1378,6 +1540,13 @@ impl Compiler<'_> {
         {
             return Ok(Some(self.key_col()));
         }
+        // The value a CALL yielded, which is the same story: the kernel
+        // answered for the row, so it is a column of level 0.
+        if let BoundExpr::Var(slot) = expr
+            && self.func_slot == Some(*slot)
+        {
+            return Ok(Some(self.func_col()));
+        }
         match expr {
             BoundExpr::Var(slot) => Ok(self
                 .slot_level
@@ -1485,6 +1654,14 @@ impl Compiler<'_> {
         // like a star. That is the rule the old engine has and the
         // accumulators do not, so the shape goes back there.
         if self.optional_level == Some(r.level()) {
+            return Ok(None);
+        }
+        // Same rule for a kernel that answered null for some rows: a
+        // count over one is not a count of rows, and the sums and
+        // extremes have nothing to skip a null with. The sink gate
+        // below cannot see this one, since a bare count collapses to
+        // the sink that carries no argument at all.
+        if matches!(r, ScalarRef::Col { level: 0, vec, .. } if Some(vec) == self.null_func_vec()) {
             return Ok(None);
         }
         let is_int = matches!(r, ScalarRef::RowId { .. })
@@ -1598,7 +1775,11 @@ impl Compiler<'_> {
                 Some(Value::Str(s)) => b.push_const(OwnedValue::Str(s.as_bytes().into())).map(Some),
                 _ => Ok(None),
             },
-            BoundExpr::Property { .. } => {
+            // A property, or a variable that stands for a column: the
+            // value a CALL yielded and the key a batch of seeks found
+            // are both columns of level 0, and a variable naming a node
+            // is not a value at all, which the node arm below declines.
+            BoundExpr::Property { .. } | BoundExpr::Var(_) => {
                 let Some(r) = self.item_ref(expr)? else {
                     return Ok(None);
                 };

@@ -101,6 +101,26 @@ pub struct ScanChunk {
     pub columns: Vec<ValueVector>,
 }
 
+/// One yielded column of a table function: a value for every node of
+/// the domain, in row order, which is how the graph kernels already
+/// hand their answers back. `null` marks the rows the kernel answered
+/// nothing for, the unreached nodes `sssp` yields null at, and is
+/// empty when every row has a value.
+pub struct FuncCol {
+    pub values: Vec<i64>,
+    pub null: Vec<bool>,
+}
+
+impl FuncCol {
+    /// Whether any row of this column is null, which decides where the
+    /// value is allowed to be read: a null answers a projection and
+    /// fails a comparison, but grouping and ordering on one follow
+    /// rules the compiled sinks do not implement.
+    pub fn nullable(&self) -> bool {
+        !self.null.is_empty()
+    }
+}
+
 /// One consistent view of stored graph data, read in batches. A
 /// snapshot pins one commit epoch: two readers at the same epoch see
 /// the same bytes, and nothing a snapshot lends out changes under it.
@@ -170,6 +190,17 @@ pub trait Snapshot {
             *slot += pin.degree((node % u64::from(zu_common::GROUP_ROWS)) as usize);
         }
         Ok(())
+    }
+
+    /// Runs a table function kernel over `rel` and hands back the one
+    /// column it yields, dense over the node domain. `None` means this
+    /// backend has no vectorized answer for the call, either because it
+    /// knows no kernel under that name or because the kernel yields
+    /// something the compiled column cannot carry, and the query goes
+    /// back to the row-at-a-time engine, errors included.
+    fn table_function(&mut self, name: &str, rel: RelId, args: &[i64]) -> Result<Option<FuncCol>> {
+        let _ = (name, rel, args);
+        Ok(None)
     }
 
     /// A second handle on the same epoch for a parallel worker. Forks

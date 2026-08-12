@@ -170,6 +170,27 @@ ldbc_two_hop_p50_ms = 8.0
 ldbc_is_p50_ms = 1.0
 ldbc_ic_p50_ms = 6.0
 
+# The seeded two hop asked as a number rather than as rows, how many
+# different people a person reaches in two steps. It is the shape every
+# k-hop benchmark counts with, and unlike IC above it there is nothing
+# between the walk and the answer but the distinct set, so what the set
+# costs is what moves this line. Like IS and IC it goes through the one
+# shot zu::query::run, so a fair part of the number is parse and plan.
+#
+# The count now compiles: a distinct count is a group by its own
+# argument whose answer is how many groups there are, so it goes to the
+# pipeline's group table instead of sending the query back to the row
+# at a time engine and its BTreeSet per run. Measured p50 against the
+# old engine on the same files: gamingpc 0.177 against 0.213, server1
+# 0.466 against 0.595, local M series 0.218 against 0.266, with the p99
+# 0.523 against 1.143 locally.
+#
+# server1 is the floor host and reads 0.466 and 0.469 across two
+# passes, but it also read a 7.764 ms p99 on hub seeds in one of them,
+# so the ceiling carries the room that spread asks for rather than
+# sitting near the p50. Lower this ceiling, never raise it.
+ldbc_distinct_two_hop_p50_ms = 2.0
+
 # The unseeded directed triangle count on SF1, the AspJoin shape from
 # docs/07: the optimizer marks the closing expand because probing 7.6 M
 # 2-paths against storage would cost far more than the 173 K edges the

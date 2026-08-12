@@ -26,7 +26,11 @@
 //! id, all eight properties through zu::query::run, gated at the G2 1
 //! ms warm p50.
 //! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
-//! ORDER BY, and LIMIT, p50 in ms. Every phase crosschecks against a
+//! ORDER BY, and LIMIT, p50 in ms. Distinct two-hop is the same
+//! seeded walk asked as a number rather than as rows, how many
+//! different people a person reaches in two steps, which is the shape
+//! every k-hop benchmark counts with and the one place the cost of the
+//! distinct set shows up on its own, p50 in ms. Every phase crosschecks against a
 //! reference computed from the raw files, so a number cannot come from
 //! a broken reader or a wrong plan.
 //!
@@ -587,6 +591,61 @@ fn run_is_reads(path: &std::path::Path, by_row: &[u64], profiles: &ProfileRows) 
     p50
 }
 
+/// The seeded 2-hop asked as a number rather than as rows: how many
+/// different people a person reaches in two steps. It is the shape
+/// every k-hop benchmark counts with, and the only thing between the
+/// expand and the answer is the distinct set, so this phase is where
+/// the cost of that set shows up unmixed with a projection or a sort.
+/// The reference is the same walk over the raw edge list.
+fn run_distinct_two_hop(path: &std::path::Path, edges: &[(u32, u32)], by_row: &[u64]) -> f64 {
+    let n = by_row.len();
+    let mut adj = vec![Vec::new(); n];
+    for &(s, d) in edges {
+        adj[s as usize].push(d as usize);
+    }
+    let seeds: Vec<usize> = (0..n).filter(|&r| !adj[r].is_empty()).collect();
+    let reference = |seed: usize| -> i64 {
+        let mut hits: Vec<usize> = adj[seed]
+            .iter()
+            .flat_map(|&f| adj[f].iter().copied())
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        hits.len() as i64
+    };
+    let mut db = Zu1File::open(path).expect("open");
+    let source = "MATCH (p:person {id: $id})-[:knows]->(f)-[:knows]->(ff) \
+                  RETURN count(DISTINCT ff) AS n";
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..50 {
+        let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
+        let id = Value::Int(by_row[seed] as i64);
+        zu::query::run(source, &mut db, &[("id", id)]).expect("warmup distinct two-hop");
+    }
+    let runs = 500usize;
+    let mut lat = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let seed = seeds[(xorshift(&mut rng) as usize) % seeds.len()];
+        let id = Value::Int(by_row[seed] as i64);
+        let t = Instant::now();
+        let r = zu::query::run(source, &mut db, &[("id", id)]).expect("distinct two-hop");
+        lat.push(t.elapsed());
+        assert_eq!(
+            r.rows,
+            [[Value::Int(reference(seed))]],
+            "distinct two-hop out of person {} disagrees with the reference",
+            by_row[seed]
+        );
+    }
+    lat.sort_unstable();
+    let p50 = lat[runs / 2].as_secs_f64() * 1e3;
+    println!(
+        "sf1 distinct two-hop: p50 {p50:.3} ms, p99 {:.3} ms over {runs} runs, all counts crosschecked",
+        lat[runs * 99 / 100].as_secs_f64() * 1e3
+    );
+    p50
+}
+
 /// IC: an IC-shaped friends-of-friends read, 2 hops out of one person
 /// with DISTINCT, a property projection, ORDER BY, and LIMIT, parse to
 /// result. The reference recomputes each seed's answer from the raw
@@ -979,6 +1038,7 @@ fn main() {
     let close_p50 = run_undirected_close(&path, &edges, node_count);
     let is_p50 = run_is_reads(&path, &by_row, &profiles);
     let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
+    let distinct_p50 = run_distinct_two_hop(&path, &edges, &by_row);
     let (q50, q90, q99, qmax, violations) = run_cardinality(&path, &by_row, &profiles);
     let (pagerank_s, wcc_s, sssp_s, louvain_s) = run_table_functions(&path, &edges, node_count);
 
@@ -1029,6 +1089,12 @@ fn main() {
         && ic_p50 > ceiling
     {
         println!("GATE FAIL IC friends-of-friends: p50 {ic_p50:.3} ms > ceiling {ceiling}");
+        failed = true;
+    }
+    if let Some(ceiling) = budget("ldbc_distinct_two_hop_p50_ms")
+        && distinct_p50 > ceiling
+    {
+        println!("GATE FAIL distinct two-hop: p50 {distinct_p50:.3} ms > ceiling {ceiling}");
         failed = true;
     }
     // No budget line for this one. A ceiling the data walks straight

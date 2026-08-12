@@ -72,6 +72,17 @@ pub(crate) struct Level {
 pub(crate) enum ColSpec {
     Stored(ColId, ColType),
     Computed(Program),
+    /// A value read off a level below, standing for every row of this
+    /// one. A correlated predicate like `a.id < b.id` compares a column
+    /// of the level it runs on against a level the pipeline pinned on
+    /// the way here, and that pinned end is one value for the whole
+    /// vector, so it enters the chunk as a constant column and the
+    /// program loads it like any other. `from` is the level below,
+    /// `vec` the chunk vector position to read there.
+    Outer {
+        from: usize,
+        vec: usize,
+    },
 }
 
 /// Traversal sides of one expand: `Both` is an undirected step over a
@@ -262,7 +273,7 @@ fn sink_reads(sink: &SinkSpec, level: usize) -> bool {
 /// Only the expand's own level matters. Levels under it stay pinned by
 /// the expands that built them, so a probe or a projection reaching
 /// past this one is none of this decision's business.
-fn batch_expands(ops: &mut [Op], sink: &SinkSpec) {
+fn batch_expands(ops: &mut [Op], sink: &SinkSpec, levels: &[LevelBuild]) {
     for i in 0..ops.len() {
         let Op::Expand { from, close, .. } = ops[i] else {
             continue;
@@ -278,9 +289,21 @@ fn batch_expands(ops: &mut [Op], sink: &SinkSpec) {
         // level through that level's pin like a standalone semi does.
         let probed = close.is_some_and(|c| c.probe_level == from) || ops[i + 1..].iter().any(reads);
         if let Op::Expand { batch, .. } = &mut ops[i] {
-            *batch = !probed && !sink_reads(sink, from);
+            *batch = !probed && !sink_reads(sink, from) && !outer_reads(levels, from);
         }
     }
+}
+
+/// Whether any level broadcasts a value off `level`. The broadcast is
+/// read at that level's pin, and a batched expand leaves the pin on the
+/// first row of the vector it hands down, so an expand walking off a
+/// level a correlated predicate reads stays row at a time.
+fn outer_reads(levels: &[LevelBuild], level: usize) -> bool {
+    levels.iter().any(|l| {
+        l.cols
+            .iter()
+            .any(|(_, c)| matches!(c, ColSpec::Outer { from, .. } if *from == level))
+    })
 }
 
 /// Folds a semijoin into the expand that produced the rows it judges.
@@ -724,7 +747,7 @@ impl Compiler<'_> {
         }
 
         fuse_closes(&mut ops);
-        batch_expands(&mut ops, &sink);
+        batch_expands(&mut ops, &sink, &self.levels);
 
         Ok(Some(ExecPlan {
             table,
@@ -957,6 +980,21 @@ impl Compiler<'_> {
         Ok(Some((self.levels[level].cols.len(), ty)))
     }
 
+    /// Registers a lower level's pinned value as a constant column on
+    /// `level`, returning its chunk vector position. Two predicates
+    /// reading the same end share the column, the way two readers of a
+    /// property share its gather.
+    fn register_outer(&mut self, level: usize, from: usize, vec: usize) -> usize {
+        let same = |c: &ColSpec| matches!(c, ColSpec::Outer { from: f, vec: v } if *f == from && *v == vec);
+        if let Some(ix) = self.levels[level].cols.iter().position(|(_, c)| same(c)) {
+            return ix + 1;
+        }
+        self.levels[level]
+            .cols
+            .push((String::new(), ColSpec::Outer { from, vec }));
+        self.levels[level].cols.len()
+    }
+
     /// Compiles an arithmetic projection into a computed column on the
     /// level its properties come from, returning the scalar the sink
     /// reads it back through. The program is registered after every
@@ -986,7 +1024,7 @@ impl Compiler<'_> {
             ops: Vec::new(),
             types: Vec::new(),
         };
-        let Some(root) = self.value_reg(&mut b, expr, level)? else {
+        let Some(root) = self.value_reg(&mut b, expr, level, false)? else {
             return Ok(None);
         };
         if b.types[root as usize] != PhysType::Int64 {
@@ -1147,10 +1185,10 @@ impl Compiler<'_> {
             return Ok(None);
         };
         if let Some(cmp) = cmp_op(*op) {
-            let Some(l) = self.value_reg(b, lhs, level)? else {
+            let Some(l) = self.value_reg(b, lhs, level, true)? else {
                 return Ok(None);
             };
-            let Some(r) = self.value_reg(b, rhs, level)? else {
+            let Some(r) = self.value_reg(b, rhs, level, true)? else {
                 return Ok(None);
             };
             // The kernels compare within one physical type; mixed
@@ -1184,11 +1222,21 @@ impl Compiler<'_> {
         }
     }
 
+    /// One operand of a predicate, compiled into a register.
+    ///
+    /// `outer` says whether a property of a level below `level` may be
+    /// read here. It holds directly under a comparison, where the value
+    /// enters the kernel as a constant vector and a null end clears the
+    /// whole column's validity, which is the answer the old engine
+    /// gives. It does not hold inside arithmetic: the arith kernels do
+    /// not propagate validity yet, so `a.x + 1` over a null end would
+    /// come out as a number instead of null.
     fn value_reg(
         &mut self,
         b: &mut ProgBuilder,
         expr: &BoundExpr,
         level: usize,
+        outer: bool,
     ) -> Result<Option<Reg>> {
         match expr {
             BoundExpr::Literal(Literal::Int(n)) => b.push_const(OwnedValue::Int(*n)).map(Some),
@@ -1206,12 +1254,10 @@ impl Compiler<'_> {
                 let Some(r) = self.item_ref(expr)? else {
                     return Ok(None);
                 };
-                if r.level() != level {
-                    return Ok(None);
-                }
-                let (col, ty) = match r {
-                    ScalarRef::RowId { .. } => (0, PhysType::Int64),
-                    ScalarRef::Col { vec, ty, .. } => (
+                let (from, mut col, ty) = match r {
+                    ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
+                    ScalarRef::Col { level, vec, ty } => (
+                        level,
                         vec,
                         match ty {
                             ColType::Int => PhysType::Int64,
@@ -1220,21 +1266,30 @@ impl Compiler<'_> {
                     ),
                     ScalarRef::Node { .. } => return Ok(None),
                 };
+                if from != level {
+                    // A level above this one is not built yet, and a
+                    // string end would have to carry its buffers into
+                    // the broadcast, so both go back to the old engine.
+                    if !outer || from > level || ty != PhysType::Int64 {
+                        return Ok(None);
+                    }
+                    col = self.register_outer(level, from, col);
+                }
+                let Ok(col) = u8::try_from(col) else {
+                    return Ok(None);
+                };
                 let dst = b.push_type(ty)?;
-                b.ops.push(ExprOp::LoadCol {
-                    col: col as u8,
-                    dst,
-                });
+                b.ops.push(ExprOp::LoadCol { col, dst });
                 Ok(Some(dst))
             }
             BoundExpr::Binary { op, lhs, rhs } => {
                 let Some(bin) = bin_op(*op) else {
                     return Ok(None);
                 };
-                let Some(l) = self.value_reg(b, lhs, level)? else {
+                let Some(l) = self.value_reg(b, lhs, level, false)? else {
                     return Ok(None);
                 };
-                let Some(r) = self.value_reg(b, rhs, level)? else {
+                let Some(r) = self.value_reg(b, rhs, level, false)? else {
                     return Ok(None);
                 };
                 let ty = b.types[l as usize];
@@ -1500,6 +1555,13 @@ mod tests {
         }
     }
 
+    fn level(cols: Vec<ColSpec>) -> LevelBuild {
+        LevelBuild {
+            table: 0,
+            cols: cols.into_iter().map(|c| (String::new(), c)).collect(),
+        }
+    }
+
     fn closes(ops: &[Op]) -> Vec<Option<usize>> {
         ops.iter()
             .filter_map(|op| match op {
@@ -1543,7 +1605,7 @@ mod tests {
     fn a_folded_close_keeps_the_probe_levels_pin() {
         let mut ops = vec![hop(0, 1), hop(1, 2), semi(1)];
         fuse_closes(&mut ops);
-        batch_expands(&mut ops, &SinkSpec::Count);
+        batch_expands(&mut ops, &SinkSpec::Count, &[]);
         assert_eq!(
             batched(&ops),
             [true, false],
@@ -1554,7 +1616,7 @@ mod tests {
     #[test]
     fn an_expand_batches_when_nothing_above_reads_its_source() {
         let mut ops = vec![hop(0, 1), hop(1, 2)];
-        batch_expands(&mut ops, &SinkSpec::Count);
+        batch_expands(&mut ops, &SinkSpec::Count, &[]);
         assert_eq!(batched(&ops), [true, true], "a bare count reads no level");
 
         let mut ops = vec![hop(0, 1), hop(1, 2)];
@@ -1564,6 +1626,7 @@ mod tests {
                 items: vec![ScalarRef::RowId { level: 2 }],
                 post: Vec::new(),
             },
+            &[],
         );
         assert_eq!(
             batched(&ops),
@@ -1581,6 +1644,7 @@ mod tests {
                 items: vec![ScalarRef::RowId { level: 1 }],
                 post: Vec::new(),
             },
+            &[],
         );
         assert_eq!(
             batched(&ops),
@@ -1597,11 +1661,40 @@ mod tests {
                 probe_level: 1,
             },
         ];
-        batch_expands(&mut ops, &SinkSpec::Count);
+        batch_expands(&mut ops, &SinkSpec::Count, &[]);
         assert_eq!(
             batched(&ops),
             [true, false],
             "the semi join probes level 1 through its pin"
+        );
+    }
+
+    #[test]
+    fn a_broadcast_counts_as_a_read_of_the_level_it_comes_from() {
+        let mut ops = vec![hop(0, 1), hop(1, 2)];
+        let levels = [
+            level(Vec::new()),
+            level(Vec::new()),
+            level(vec![ColSpec::Outer { from: 1, vec: 0 }]),
+        ];
+        batch_expands(&mut ops, &SinkSpec::Count, &levels);
+        assert_eq!(
+            batched(&ops),
+            [true, false],
+            "level 2 reads level 1 at its pin, so that expand stays row at a time"
+        );
+
+        let mut ops = vec![hop(0, 1), hop(1, 2)];
+        let levels = [
+            level(Vec::new()),
+            level(Vec::new()),
+            level(vec![ColSpec::Outer { from: 0, vec: 0 }]),
+        ];
+        batch_expands(&mut ops, &SinkSpec::Count, &levels);
+        assert_eq!(
+            batched(&ops),
+            [false, true],
+            "reaching past a level is the business of the expand that walks off the one it names"
         );
     }
 
@@ -1620,6 +1713,7 @@ mod tests {
                 })],
                 post: Vec::new(),
             },
+            &[],
         );
         assert_eq!(batched(&ops), [true, false], "sum reads level 1 per path");
     }

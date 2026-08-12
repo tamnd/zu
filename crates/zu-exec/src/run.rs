@@ -22,7 +22,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use zu_common::{GROUP_ROWS, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
 use zu_query::snapshot::{ColId, CsrPin, Dir, GroupId, RelId, SCAN_ROWS, Snapshot};
-use zu_vector::{ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector};
+use zu_vector::{
+    Bitmap, ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector,
+    VecEncoding,
+};
 
 use crate::compile::{
     AggSpec, Close, ColSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source,
@@ -517,7 +520,7 @@ impl<'a> Worker<'a> {
                 .iter()
                 .filter_map(|c| match *c {
                     ColSpec::Stored(id, _) => Some(id),
-                    ColSpec::Computed(_) => None,
+                    ColSpec::Computed(_) | ColSpec::Outer { .. } => None,
                 })
                 .collect(),
             scratch: Vec::new(),
@@ -583,7 +586,7 @@ impl<'a> Worker<'a> {
     fn seek_morsel(&mut self, seed: Option<u64>) -> Result<()> {
         let Some(seed) = seed else { return Ok(()) };
         let plan = self.plan;
-        let level0 = self.make_level(0, &[seed])?;
+        let level0 = self.make_level(0, &[seed], &[])?;
         let mut set = ChunkSet::new(vec![level0]);
         self.run_ops(&plan.ops, &mut set)
     }
@@ -603,14 +606,14 @@ impl<'a> Worker<'a> {
         (lo, hi): (u64, u64),
     ) -> Result<()> {
         let plan = self.plan;
-        let mut level0 = self.make_level(0, &[seed])?;
+        let mut level0 = self.make_level(0, &[seed], &[])?;
         level0.cur = Some(0);
         let mut set = ChunkSet::new(vec![level0]);
         let pin = self.pin(rel, dir, seed)?;
         let list = pin.list((seed % u64::from(GROUP_ROWS)) as usize);
         let mut result = Ok(());
         for part in list[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
-            let chunk = match self.make_level(to, part) {
+            let chunk = match self.make_level(to, part, &set.chunks) {
                 Ok(c) => c,
                 Err(e) => {
                     result = Err(e);
@@ -673,6 +676,10 @@ impl<'a> Worker<'a> {
                         None => break,
                     },
                     ColSpec::Computed(prog) => prog.eval(&level0, &mut self.arena)?,
+                    // Level 0 has nothing below it to broadcast from,
+                    // and the compiler only ever registers a broadcast
+                    // off a level below the one it lands on.
+                    ColSpec::Outer { .. } => unreachable!("the scan level reads no outer value"),
                 };
                 level0.vecs.push(v);
             }
@@ -895,7 +902,7 @@ impl<'a> Worker<'a> {
     /// Pushes one vector of expanded rows through the rest of the
     /// pipeline as the newest level.
     fn descend(&mut self, to: usize, part: &[u64], rest: &[Op], set: &mut ChunkSet) -> Result<()> {
-        let chunk = self.make_level(to, part)?;
+        let chunk = self.make_level(to, part, &set.chunks)?;
         set.chunks.push(chunk);
         let res = self.run_ops(rest, set);
         set.chunks.pop();
@@ -997,7 +1004,7 @@ impl<'a> Worker<'a> {
                 leapfrog(spin.list(at), plist, &mut hits);
             }
             for part in hits.chunks(zu_vector::VECTOR_SIZE) {
-                let chunk = match self.make_level(to, part) {
+                let chunk = match self.make_level(to, part, &set.chunks) {
                     Ok(c) => c,
                     Err(e) => {
                         result = Err(e);
@@ -1104,7 +1111,7 @@ impl<'a> Worker<'a> {
     /// and computed over the vector if it is an expression. The list is
     /// in registration order and a program only loads columns registered
     /// ahead of it, so one pass fills the chunk.
-    fn make_level(&mut self, level: usize, part: &[u64]) -> Result<DataChunk> {
+    fn make_level(&mut self, level: usize, part: &[u64], below: &[DataChunk]) -> Result<DataChunk> {
         let info = &self.plan.levels[level];
         let mut vecs = Vec::with_capacity(1 + info.cols.len());
         vecs.push(ValueVector::flat_from(
@@ -1121,6 +1128,11 @@ impl<'a> Worker<'a> {
                         .gather(info.table, *col, part, &mut self.arena)?
                 }
                 ColSpec::Computed(prog) => prog.eval(&chunk, &mut self.arena)?,
+                ColSpec::Outer { from, vec } => {
+                    let src = &below[*from];
+                    let at = pinned_pos(src);
+                    broadcast(&src.vecs[*vec], at, part.len(), &mut self.arena)
+                }
             };
             chunk.vecs.push(v);
         }
@@ -1448,6 +1460,24 @@ fn pinned_pos(chunk: &DataChunk) -> usize {
 
 fn row_at(chunk: &DataChunk, pos: usize) -> u64 {
     chunk.vecs[0].values::<u64>()[pos]
+}
+
+/// One row of a pinned level's vector, standing for every row of the
+/// level being built. Integers only, which is what the compiler
+/// registers a broadcast for. A null end keeps the constant's value and
+/// clears its validity: the compare kernel ands validity into its
+/// result, so every row of the vector fails the predicate, which is
+/// what a comparison against a missing property answers.
+fn broadcast(src: &ValueVector, at: usize, len: usize, arena: &mut MorselArena) -> ValueVector {
+    let value = match src.encoding {
+        VecEncoding::Constant => src.constant_value::<i64>(),
+        _ => src.values::<i64>()[at],
+    };
+    let mut v = ValueVector::constant(arena, src.phys, value, len);
+    if !src.is_valid(at) {
+        v.validity = Some(Bitmap::new_in(arena, len, false));
+    }
+    v
 }
 
 /// Reads one scalar for the sink: refs on the newest level read at

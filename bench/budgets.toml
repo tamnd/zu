@@ -755,13 +755,24 @@ card_gen_qerror_max = 500.0
 # the WHERE. Every run is crosschecked against a union-find over the
 # same edge list, so a pipeline that loses rows fails before it prints.
 #
-# FLEET_NUMBERS
+# One worker, so these are per core. gamingpc reads the count at 169.6
+# M rows/s against the old engine's 73.3 ms, the sum at 109.0 against
+# 89.4, the group by at 93.0 against 156.1, the hop at 140.8 against
+# 58.7 and the filtered hop at 140.6 against 89.4, which is 12.4x, 9.7x,
+# 14.5x, 8.3x and 12.6x. server1 reads 51.9, 33.0, 26.2, 35.1 and 36.2
+# M rows/s for 12.8x, 11.6x, 13.4x, 7.8x and 10.3x on the same shapes.
+# The wcc kernel itself is 5.6 ms on gamingpc and 17.2 on server1, and
+# both engines pay it, so the ratios above are what the rows cost with
+# the algorithm left in.
 #
 # The floor is the count case end to end in millions of rows a second,
 # so it carries the kernel both engines run. That is on purpose: the
-# whole query finishes in less time than a standalone wcc reads, so a
-# floor on the pipeline's own share would be a floor on timing noise.
-# The kernel does not hide a regression either, because a fallback to
-# the old engine is FALLBACK_RATIO here. Raise this floor, never lower
-# it.
-exec_call_mrows_s_core = 0.0
+# whole query finishes in less time than a standalone wcc reads, 5.9 ms
+# against 5.6 on gamingpc, so a floor on the pipeline's own share would
+# be a floor on timing noise. The kernel does not hide a regression
+# either, because a fallback to the old engine reads 4.1 M rows/s on
+# server1 and the floor sits three times above that. It also sits under
+# the worst the shared box has printed, 41.0 M rows/s at a load average
+# of 16, so it fails on the shape and not on a neighbor. Raise this
+# floor, never lower it.
+exec_call_mrows_s_core = 12.0

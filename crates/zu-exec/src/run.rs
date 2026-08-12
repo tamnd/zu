@@ -911,8 +911,8 @@ impl<'a> Worker<'a> {
     /// candidate.
     fn intersect(
         &mut self,
-        seed: (RelId, Dir),
-        probe: (RelId, Dir),
+        seed: (RelId, Dirs),
+        probe: (RelId, Dirs),
         probe_level: usize,
         to: usize,
         rest: &[Op],
@@ -921,9 +921,27 @@ impl<'a> Worker<'a> {
         let src = set.chunks.len() - 1;
         let far = &set.chunks[probe_level];
         let prow = row_at(far, pinned_pos(far));
-        let ppin = self.pin(probe.0, probe.1, prow)?;
-        let plist = ppin.list((prow % u64::from(GROUP_ROWS)) as usize);
+        let pat = (prow % u64::from(GROUP_ROWS)) as usize;
+        let mut ppins = Vec::new();
+        for dir in sides(probe.1) {
+            ppins.push(self.pin(probe.0, dir, prow)?);
+        }
+        // An undirected probe end asks whether an edge exists either
+        // way, so the two stored lists become one sorted set here and
+        // the walk below stays a single leapfrog. The union is built
+        // once for the whole vector, the same as the single list case.
+        let mut union = self.row_pool.pop().unwrap_or_default();
+        union.clear();
+        let plist: &[u64] = match ppins.as_slice() {
+            [one] => one.list(pat),
+            [a, b] => {
+                merge_sorted(a.list(pat), b.list(pat), &mut union);
+                &union
+            }
+            _ => unreachable!("an expand walks one side or two"),
+        };
         if plist.is_empty() {
+            self.row_pool.push(union);
             return Ok(());
         }
         // Copy the active rows out first: pinning mutates the chunk the
@@ -954,27 +972,30 @@ impl<'a> Worker<'a> {
         // list rarely leaves the group it started in, so the pin is
         // held across rows rather than looked up per row: the lookup
         // is a hash of the pin key and this loop runs once per edge
-        // under the scan.
-        let mut held: Option<(u32, CsrPin)> = None;
+        // under the scan. One slot per side, since an undirected seed
+        // reads two pins that move together.
+        let mut held: [Option<(u32, CsrPin)>; 2] = [None, None];
         'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
             set.chunks[src].cur = Some(phys);
             let group = (row / u64::from(GROUP_ROWS)) as u32;
-            if held.as_ref().is_none_or(|&(g, _)| g != group) {
-                match self.pin(seed.0, seed.1, row) {
-                    Ok(p) => held = Some((group, p)),
-                    Err(e) => {
-                        result = Err(e);
-                        break 'srcs;
+            let at = (row % u64::from(GROUP_ROWS)) as usize;
+            hits.clear();
+            // Each stored side is walked on its own. A node reachable
+            // both ways is two edges and closes the wedge twice, which
+            // is what the row by row expand this replaces would count.
+            for (slot, dir) in sides(seed.1).enumerate() {
+                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
+                    match self.pin(seed.0, dir, row) {
+                        Ok(p) => held[slot] = Some((group, p)),
+                        Err(e) => {
+                            result = Err(e);
+                            break 'srcs;
+                        }
                     }
                 }
+                let spin = &held[slot].as_ref().expect("just pinned").1;
+                leapfrog(spin.list(at), plist, &mut hits);
             }
-            let spin = &held.as_ref().expect("just pinned").1;
-            hits.clear();
-            leapfrog(
-                spin.list((row % u64::from(GROUP_ROWS)) as usize),
-                plist,
-                &mut hits,
-            );
             for part in hits.chunks(zu_vector::VECTOR_SIZE) {
                 let chunk = match self.make_level(to, part) {
                     Ok(c) => c,
@@ -999,6 +1020,7 @@ impl<'a> Worker<'a> {
         self.hits = hits;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
+        self.row_pool.push(union);
         result
     }
 
@@ -1327,6 +1349,28 @@ fn leapfrog(seed: &[u64], probe: &[u64], out: &mut Vec<u64>) {
                 si += 1;
             }
             pi += 1;
+        }
+    }
+}
+
+/// Unions two sorted neighbor lists into `out`, ascending and without
+/// repeats. The probe side of an intersection only answers whether an
+/// edge exists, so a node the two sides share is one entry here.
+fn merge_sorted(a: &[u64], b: &[u64], out: &mut Vec<u64>) {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let v = a[i].min(b[j]);
+        out.push(v);
+        while i < a.len() && a[i] == v {
+            i += 1;
+        }
+        while j < b.len() && b[j] == v {
+            j += 1;
+        }
+    }
+    for &v in a[i..].iter().chain(&b[j..]) {
+        if out.last() != Some(&v) {
+            out.push(v);
         }
     }
 }

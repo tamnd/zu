@@ -1162,10 +1162,14 @@ fn wcoj_fusion(
     else {
         return Ok(None);
     };
-    if *opt2 != optional
-        || !(*wcoj || b.wcoj == Wcoj::Force)
-        || matches!(direction, RelDirection::Undirected)
-    {
+    if *opt2 != optional || !(*wcoj || b.wcoj == Wcoj::Force) {
+        return Ok(None);
+    }
+    let steps = rel_steps(*rel, query, schema)?;
+    let [step] = steps[..] else {
+        return Ok(None);
+    };
+    if !usable_side(&step, *direction) {
         return Ok(None);
     }
     // The close either points into the expand's endpoint from a bound
@@ -1179,14 +1183,10 @@ fn wcoj_fusion(
         let flipped = match direction {
             RelDirection::Out => RelDirection::In,
             RelDirection::In => RelDirection::Out,
-            RelDirection::Undirected => return Ok(None),
+            RelDirection::Undirected => RelDirection::Undirected,
         };
         (*to2, flipped)
     } else {
-        return Ok(None);
-    };
-    let steps = rel_steps(*rel, query, schema)?;
-    let [step] = steps[..] else {
         return Ok(None);
     };
     let probe_chunk = b.slot_loc[&probe].0;
@@ -1261,7 +1261,7 @@ fn compile_match_op(
                 && range.is_none()
                 && !*into
                 && rels.len() == 1
-                && !matches!(direction, RelDirection::Undirected)
+                && usable_side(&rels[0], *direction)
                 && let Some(fused) = wcoj_fusion(b, lookahead, *to, *optional, query, schema)?
             {
                 let (rel2, probe, probe_dir, probe_step) = fused;
@@ -2073,7 +2073,7 @@ struct StageCtx<'a> {
     /// makes the probe side one storage read per node instead of one
     /// per pair. Outside `states` for the same rearm reason as the
     /// edge sets.
-    isect: BTreeMap<usize, ((u32, u64), Vec<u64>)>,
+    isect: BTreeMap<usize, ProbeSide>,
     /// The row range a parallel worker's driving scan is bounded to,
     /// `None` on sequential runs. Only the scan at operator index 1
     /// consults it; any later scan in the pipeline still iterates its
@@ -2520,16 +2520,86 @@ fn asp_hit(
     None
 }
 
-/// Whether `table` is the near side of `step` under `direction`:
-/// the adjacency read that yields the far node, as the reversed flag
-/// for [`Graph::neighbors`] plus the far node's table. `None` when the
-/// table sits on neither matching side, which makes the intersection
-/// empty for that configuration.
-fn near_side(step: &RelStep, direction: RelDirection, table: u32) -> Option<(bool, u32)> {
+/// Whether one end of the intersection has stored lists to gallop for
+/// this direction. A fixed direction reads one list and always does; an
+/// undirected end reads both, which only lines up when the rel is self
+/// referencing and the two lists hold the same node table.
+fn usable_side(step: &RelStep, direction: RelDirection) -> bool {
+    !matches!(direction, RelDirection::Undirected) || step.from_table == step.to_table
+}
+
+/// The stored lists one end of the intersection reads, and the table
+/// its far end lands in. A fixed direction is one list; an undirected
+/// end is both, forward first, which is the order the plain undirected
+/// expand emits in. Undirected only answers for a self-referencing rel,
+/// where both stored lists hold the same node table.
+fn near_sides(
+    step: &RelStep,
+    direction: RelDirection,
+    table: u32,
+) -> Option<(&'static [bool], u32)> {
     match direction {
-        RelDirection::Out if table == step.from_table => Some((false, step.to_table)),
-        RelDirection::In if table == step.to_table => Some((true, step.from_table)),
+        RelDirection::Out if table == step.from_table => Some((&[false], step.to_table)),
+        RelDirection::In if table == step.to_table => Some((&[true], step.from_table)),
+        RelDirection::Undirected
+            if step.from_table == step.to_table && table == step.from_table =>
+        {
+            Some((&[false, true], step.to_table))
+        }
         _ => None,
+    }
+}
+
+/// The probe side of one intersection, cached per probe node.
+///
+/// `all` is what the leapfrog walks: the stored list for a fixed
+/// direction, the union of both for an undirected end. `out` is the
+/// forward list on its own, kept only in the undirected case so an
+/// emitted rel can be oriented the way the binary probe would have
+/// oriented it.
+struct ProbeSide {
+    key: (u32, u64),
+    all: Vec<u64>,
+    out: Vec<u64>,
+}
+
+impl ProbeSide {
+    /// A cache no probe node can match, so the first pull reads.
+    fn empty() -> Self {
+        ProbeSide {
+            key: (u32::MAX, u64::MAX),
+            all: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+}
+
+/// Union of two ascending lists into `out`, ascending and deduplicated.
+/// The intersection's probe side is an existence check, so a value both
+/// stored lists hold is one entry here and one hit there.
+fn merge_sorted(a: &[u64], b: &[u64], out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let v = a[i].min(b[j]);
+        while i < a.len() && a[i] == v {
+            i += 1;
+        }
+        while j < b.len() && b[j] == v {
+            j += 1;
+        }
+        out.push(v);
+    }
+    for &v in &a[i..] {
+        if out.last() != Some(&v) {
+            out.push(v);
+        }
+    }
+    for &v in &b[j..] {
+        if out.last() != Some(&v) {
+            out.push(v);
+        }
     }
 }
 
@@ -3154,9 +3224,9 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             }
             let (st, so) = node_value(sv, "multiway intersect")?;
             let (pt, po) = node_value(pv, "multiway intersect")?;
-            let (Some((srev, sfar)), Some((prev, pfar))) = (
-                near_side(seed_step, *seed_dir, st),
-                near_side(probe_step, *probe_dir, pt),
+            let (Some((sdirs, sfar)), Some((pdirs, pfar))) = (
+                near_sides(seed_step, *seed_dir, st),
+                near_sides(probe_step, *probe_dir, pt),
             ) else {
                 continue;
             };
@@ -3173,34 +3243,58 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     isect,
                     ..
                 } = ctx;
-                graph.neighbors(seed_step.id, so, srev, scratch)?;
-                let (key, list) = isect
-                    .entry(i)
-                    .or_insert_with(|| ((u32::MAX, u64::MAX), Vec::new()));
-                if *key != (pt, po) {
-                    graph.neighbors(probe_step.id, po, prev, list)?;
-                    *key = (pt, po);
-                }
-                leapfrog(scratch, list, |v| {
-                    far.push(Value::Node {
-                        table: sfar,
-                        offset: v,
-                    });
-                    if *emit_rels {
-                        let (ss, sd) = if srev { (v, so) } else { (so, v) };
-                        seed_rels.push(Value::Rel {
-                            table: seed_step.id,
-                            src: ss,
-                            dst: sd,
-                        });
-                        let (ps, pd) = if prev { (v, po) } else { (po, v) };
-                        probe_rels.push(Value::Rel {
-                            table: probe_step.id,
-                            src: ps,
-                            dst: pd,
-                        });
+                let cache = isect.entry(i).or_insert_with(ProbeSide::empty);
+                if cache.key != (pt, po) {
+                    match pdirs {
+                        [prev] => {
+                            graph.neighbors(probe_step.id, po, *prev, &mut cache.all)?;
+                            cache.out.clear();
+                        }
+                        _ => {
+                            graph.neighbors(probe_step.id, po, false, &mut cache.out)?;
+                            graph.neighbors(probe_step.id, po, true, scratch)?;
+                            merge_sorted(&cache.out, scratch, &mut cache.all);
+                        }
                     }
-                });
+                    cache.key = (pt, po);
+                }
+                let cache = &*cache;
+                // An undirected end reads both stored lists. Walking
+                // them one after the other, forward first, is the same
+                // rows in the same order the expand this replaces
+                // emitted them in, so nothing above the close sees the
+                // fusion in its input.
+                for &srev in sdirs {
+                    graph.neighbors(seed_step.id, so, srev, scratch)?;
+                    leapfrog(scratch, &cache.all, |v| {
+                        far.push(Value::Node {
+                            table: sfar,
+                            offset: v,
+                        });
+                        if *emit_rels {
+                            let (ss, sd) = if srev { (v, so) } else { (so, v) };
+                            seed_rels.push(Value::Rel {
+                                table: seed_step.id,
+                                src: ss,
+                                dst: sd,
+                            });
+                            // The binary probe an undirected close
+                            // replaces reports the forward edge when
+                            // there is one, so the merged list asks
+                            // which side the hit came from.
+                            let forward = match pdirs {
+                                [prev] => !prev,
+                                _ => cache.out.binary_search(&v).is_ok(),
+                            };
+                            let (ps, pd) = if forward { (po, v) } else { (v, po) };
+                            probe_rels.push(Value::Rel {
+                                table: probe_step.id,
+                                src: ps,
+                                dst: pd,
+                            });
+                        }
+                    });
+                }
             }
             if far.is_empty() {
                 continue;
@@ -5145,16 +5239,35 @@ mod tests {
     }
 
     #[test]
-    fn multiway_intersect_leaves_the_undirected_close_alone() {
-        // An undirected closing edge has no single sorted list to
-        // gallop, so the fusion declines and the binary pair runs.
+    fn multiway_intersect_takes_the_undirected_close() {
+        // KNOWS runs Person to Person, so an undirected end is the two
+        // stored lists of the one table: the seed side walks them in
+        // turn and the probe side answers out of their union. The
+        // fusion takes it and the count matches the binary pair.
         let source = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]-(c) \
                       RETURN count(*) AS triangles";
         let (r, p) = profiled_opts(source, &[], wcoj());
         assert_eq!(r, run_opts(source, &[], no_wcoj()));
         let names = op_names(&p);
         assert!(
-            !names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn the_undirected_intersect_orients_the_rels_it_emits() {
+        // Both ends undirected and every rel returned, so the fusion
+        // has to say which way each edge it kept was stored. The probe
+        // side is the one that can go either way and the emitted rels
+        // have to come out the same as the pair the fusion replaced.
+        let source = "MATCH (a:Person)-[r1:KNOWS]-(b)-[r2:KNOWS]-(c), (a)-[r3:KNOWS]-(c) \
+                      RETURN r1, r2, r3";
+        let (r, p) = profiled_opts(source, &[], wcoj());
+        assert_eq!(r, run_opts(source, &[], no_wcoj()));
+        let names = op_names(&p);
+        assert!(
+            names.iter().any(|n| n.starts_with("MultiwayIntersect")),
             "got: {names:?}"
         );
     }

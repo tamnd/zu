@@ -1107,10 +1107,13 @@ mod tests {
             .flat_map(|h| (0..10u32).map(move |t| (h, 10 + (h / 10) * 10 + t)))
             .collect();
         graph::bulk_load_as(&mut db, "person", "knows", 2010, &knows).expect("load knows");
-        // The undirected close keeps the WCOJ fusion out, so the asp
+        // A second empty rel table so the close can name two of them.
+        // The intersection reads one sorted list per end, so a close
+        // spanning two rel tables keeps the WCOJ fusion out and the asp
         // mark alone decides between the probe and the hash join.
+        graph::bulk_load_as(&mut db, "person", "likes", 2010, &[]).expect("load likes");
         let source = "MATCH (a:person)-[:knows]->(b)-[:knows]->(c)-[:knows]->(d), \
-                      (a)-[:knows]-(d) RETURN count(*) AS n";
+                      (a)-[:knows|likes]-(d) RETURN count(*) AS n";
         let before = explain_analyze(source, &mut db, &[]).expect("explain before");
         assert!(before.contains("AspJoin"), "got:\n{before}");
         crate::zu1::colors::analyze(&mut db).expect("analyze");

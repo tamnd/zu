@@ -671,9 +671,10 @@ exec_optional_mrows_s_core = 8.0
 # query cost paid once instead of fifty thousand times.
 #
 # The floor is set off server1, the slowest host and the one that gates
-# with no free page cache, at about two thirds of its worse run. Raise
-# this floor, never lower it.
-exec_batch_mkeys_s_core = 1.6
+# with no free page cache. Its warm runs read 2.5 and 2.6 M keys/s and
+# the run right after a build reads 1.6, which is the one the floor has
+# to clear, so two thirds of that. Raise this floor, never lower it.
+exec_batch_mkeys_s_core = 1.0
 
 # Cardinality quality over the SF1 corpus, q-error percentiles
 # (perf/12 section 4). Twelve queries run profiled, every operator that

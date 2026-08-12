@@ -525,6 +525,12 @@ struct Worker<'a> {
     /// while the weights stay where their rows are.
     order: Vec<u32>,
     sorted: Vec<u64>,
+    /// The hub weight of every row of a batched descent, in the
+    /// positions of the vector it hands down. Empty unless a batched
+    /// expand is carrying one, which is the flag the degree product
+    /// under it reads: one weight per row there, one for the whole
+    /// vector off the pin otherwise.
+    bwts: Vec<i64>,
     /// Index and row scratch pools for expand iteration, one pair per
     /// recursion depth in steady state.
     idx_pool: Vec<Vec<u32>>,
@@ -589,6 +595,7 @@ impl<'a> Worker<'a> {
             ends: Vec::new(),
             order: Vec::new(),
             sorted: Vec::new(),
+            bwts: Vec::new(),
             idx_pool: Vec::new(),
             row_pool: Vec::new(),
             batch: KeyBatch::default(),
@@ -835,7 +842,13 @@ impl<'a> Worker<'a> {
                 close,
                 ..
             } => {
-                if let ([Op::DegreeProduct { steps }], None) = (rest, close) {
+                // Only the product over the level this expand builds
+                // fuses into it. One off a level below is a weight the
+                // pin already holds, and the rows this expand emits are
+                // what the sink reads, so that one runs where it sits.
+                if let ([Op::DegreeProduct { steps, from }], None) = (rest, close)
+                    && *from == *to
+                {
                     // The concatenating path answers with one sum over
                     // the whole vector, which is the whole answer only
                     // where the answer is one number. A weighted sink
@@ -856,6 +869,12 @@ impl<'a> Worker<'a> {
                 };
                 self.expand(hop, rest, set, None)
             }
+            Op::Branch {
+                rel,
+                dirs,
+                from,
+                to,
+            } => self.branch(*rel, *dirs, *from, *to, rest, set),
             Op::Intersect {
                 seed,
                 probe,
@@ -897,7 +916,10 @@ impl<'a> Worker<'a> {
                 self.opt_hit = true;
                 self.run_ops(rest, set)
             }
-            Op::DegreeProduct { steps } => {
+            Op::DegreeProduct { steps, from } => {
+                if *from != set.chunks.len() - 1 {
+                    return self.pinned_weight(steps, *from, set);
+                }
                 if !matches!(self.plan.sink, SinkSpec::Count) {
                     return self.weighted_sink(steps, set);
                 }
@@ -986,6 +1008,28 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        // The hub weight: the pipeline under this expand is filters and
+        // then a degree product off this expand's own source level, so
+        // every row it emits stands for as many rows of the hop that was
+        // fused away as its source row has neighbors. That count is one
+        // degree read per source row, taken here for the whole vector,
+        // and it rides the descent in the positions the rows land in.
+        // A source row with no neighbors on the fused side is not
+        // walked at all: the walk that is gone would have paired it
+        // with nothing.
+        let hub = match rest.last() {
+            Some(Op::DegreeProduct { steps, from }) if batch && *from == src => {
+                self.degree_products(steps, &rows)?;
+                Some(std::mem::take(&mut self.prod))
+            }
+            _ => None,
+        };
+        let mut fillw = if hub.is_some() {
+            std::mem::take(&mut self.bwts)
+        } else {
+            Vec::new()
+        };
+        fillw.clear();
         let mut result = Ok(());
         // One pin covers a whole storage group and the rows arrive in
         // row order, so the pin is held across rows the way the WCOJ
@@ -1007,7 +1051,12 @@ impl<'a> Worker<'a> {
         if batch {
             set.chunks[src].cur = idxs.first().copied();
         }
-        'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
+        'srcs: for (at, (&phys, &row)) in idxs.iter().zip(&rows).enumerate() {
+            let weight = match &hub {
+                Some(w) if w[at] == 0 => continue,
+                Some(w) => w[at] as i64,
+                None => 0,
+            };
             if !batch {
                 set.chunks[src].cur = Some(phys);
             }
@@ -1048,10 +1097,16 @@ impl<'a> Worker<'a> {
                     while !tail.is_empty() {
                         let take = (zu_vector::VECTOR_SIZE - fill.len()).min(tail.len());
                         fill.extend_from_slice(&tail[..take]);
+                        if hub.is_some() {
+                            fillw.resize(fill.len(), weight);
+                        }
                         tail = &tail[take..];
                         if fill.len() == zu_vector::VECTOR_SIZE {
+                            self.bwts = std::mem::take(&mut fillw);
                             let res = self.descend(to, &fill, rest, set);
+                            fillw = std::mem::take(&mut self.bwts);
                             fill.clear();
+                            fillw.clear();
                             if let Err(e) = res {
                                 result = Err(e);
                                 break 'srcs;
@@ -1098,13 +1153,78 @@ impl<'a> Worker<'a> {
             }
         }
         if result.is_ok() && !fill.is_empty() {
+            self.bwts = std::mem::take(&mut fillw);
             result = self.descend(to, &fill, rest, set);
+            fillw = std::mem::take(&mut self.bwts);
+        }
+        if let Some(w) = hub {
+            self.prod = w;
+            fillw.clear();
+            self.bwts = fillw;
         }
         set.chunks[src].cur = None;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
         self.row_pool.push(fill);
         self.row_pool.push(masked);
+        result
+    }
+
+    /// The second pattern branch: a hop off a level below the newest
+    /// one, which is what two patterns sharing a variable compile to
+    /// when the far end of both is read.
+    ///
+    /// The source is pinned for the whole op, so its neighbor list is
+    /// read once and every row of the newest level pairs with the whole
+    /// of it. That pairing is the reason the newest level is pinned a
+    /// row at a time here: everything below the branch reads the levels
+    /// under it at their pins, so a vector of them cannot ride along.
+    fn branch(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        from: usize,
+        to: usize,
+        rest: &[Op],
+        set: &mut ChunkSet,
+    ) -> Result<()> {
+        let far = &set.chunks[from];
+        let prow = row_at(far, pinned_pos(far));
+        let mut pins = Vec::with_capacity(2);
+        for dir in sides(dirs) {
+            pins.push(self.pin(rel, dir, prow)?);
+        }
+        let at = (prow % u64::from(GROUP_ROWS)) as usize;
+        if pins.iter().all(|p| p.list(at).is_empty()) {
+            return Ok(());
+        }
+        let src = set.chunks.len() - 1;
+        let mut idxs = self.idx_pool.pop().unwrap_or_default();
+        idxs.clear();
+        {
+            let chunk = &set.chunks[src];
+            match &chunk.sel {
+                Some(s) => idxs.extend(s.as_slice().iter().map(|&i| u32::from(i))),
+                None => idxs.extend(0..chunk.count),
+            }
+        }
+        let mut result = Ok(());
+        'srcs: for &phys in &idxs {
+            set.chunks[src].cur = Some(phys);
+            for pin in &pins {
+                for part in pin.list(at).chunks(zu_vector::VECTOR_SIZE) {
+                    if let Err(e) = self.descend(to, part, rest, set) {
+                        result = Err(e);
+                        break 'srcs;
+                    }
+                }
+            }
+            if self.stop.stopped() {
+                break;
+            }
+        }
+        set.chunks[src].cur = None;
+        self.idx_pool.push(idxs);
         result
     }
 
@@ -1636,6 +1756,83 @@ impl<'a> Worker<'a> {
         self.wts = wts;
         self.wsel = wsel;
         res
+    }
+
+    /// The weight a fused hop off a level the pipeline has walked past
+    /// contributes. That level is pinned while this runs, so the product
+    /// of its degrees is one number for the whole vector and every row
+    /// the sink sees stands for that many rows of the walk that is no
+    /// longer there.
+    ///
+    /// A pinned row the steps found nothing for weighs nothing, and the
+    /// walk they replaced would have paired the rows below with nothing
+    /// at all, so the vector drops here.
+    fn pinned_weight(
+        &mut self,
+        steps: &[(RelId, Dirs)],
+        from: usize,
+        set: &ChunkSet,
+    ) -> Result<()> {
+        if !self.bwts.is_empty() {
+            return self.batched_weight(set);
+        }
+        let src = &set.chunks[from];
+        let mut rows = std::mem::take(&mut self.scratch);
+        rows.clear();
+        rows.push(row_at(src, pinned_pos(src)));
+        let w = self.product_sum(steps, &mut rows);
+        self.scratch = rows;
+        let w = w?;
+        if w == 0 {
+            return Ok(());
+        }
+        let last = set.chunks.len() - 1;
+        if matches!(self.plan.sink, SinkSpec::Count) {
+            let n = active_positions(&set.chunks[last]).count() as u64;
+            self.sink.count += (w * n) as i64;
+            return Ok(());
+        }
+        let mut wts = std::mem::take(&mut self.wts);
+        let mut wsel = std::mem::take(&mut self.wsel);
+        wts.clear();
+        wsel.clear();
+        for pos in active_positions(&set.chunks[last]) {
+            wts.push(w as i64);
+            wsel.push(pos as u16);
+        }
+        let res = self.weighted_rows(set, &wsel, &wts);
+        self.wts = wts;
+        self.wsel = wsel;
+        res
+    }
+
+    /// The same weight when the expand above carried it down per row.
+    /// The vector's rows come off many source rows there, so each of
+    /// them stands for a different number, read at the position the row
+    /// sits in rather than off a pin.
+    fn batched_weight(&mut self, set: &ChunkSet) -> Result<()> {
+        let last = set.chunks.len() - 1;
+        let held = std::mem::take(&mut self.bwts);
+        let out = if matches!(self.plan.sink, SinkSpec::Count) {
+            let total: i64 = active_positions(&set.chunks[last]).map(|p| held[p]).sum();
+            self.sink.count += total;
+            Ok(())
+        } else {
+            let mut wts = std::mem::take(&mut self.wts);
+            let mut wsel = std::mem::take(&mut self.wsel);
+            wts.clear();
+            wsel.clear();
+            for pos in active_positions(&set.chunks[last]) {
+                wts.push(held[pos]);
+                wsel.push(pos as u16);
+            }
+            let res = self.weighted_rows(set, &wsel, &wts);
+            self.wts = wts;
+            self.wsel = wsel;
+            res
+        };
+        self.bwts = held;
+        out
     }
 
     /// The weighted rows into whichever sink the fusion allowed.
@@ -2548,6 +2745,7 @@ mod tests {
             vec![bare_level(), bare_level()],
             vec![Op::DegreeProduct {
                 steps: vec![(0, Dirs::One(Dir::Fwd))],
+                from: 0,
             }],
             SinkSpec::Count,
             &["n"],
@@ -2574,6 +2772,7 @@ mod tests {
                 },
                 Op::DegreeProduct {
                     steps: vec![(0, Dirs::One(Dir::Fwd))],
+                    from: 1,
                 },
             ],
             SinkSpec::Count,
@@ -2594,6 +2793,7 @@ mod tests {
             vec![bare_level(), bare_level(), bare_level()],
             vec![Op::DegreeProduct {
                 steps: vec![(0, Dirs::One(Dir::Bwd)), (0, Dirs::One(Dir::Fwd))],
+                from: 0,
             }],
             SinkSpec::Count,
             &["n"],

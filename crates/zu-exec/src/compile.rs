@@ -4,8 +4,11 @@
 //!
 //! The supported shape today is the linear read pipeline: a single
 //! non-optional node scan, filters, single-hop expands that walk off
-//! the newest level, and one final Project or Aggregate with its
-//! absorbed Distinct, Sort, Skip, and Limit. Everything the old
+//! the newest level or off a level below it, and one final Project or
+//! Aggregate with its absorbed Distinct, Sort, Skip, and Limit. A hop
+//! off a lower level is the second pattern branch, the shape two
+//! patterns sharing a variable compile to, and it pairs every row of
+//! the newest level with the whole of the pinned one. Everything the old
 //! executor also covers, variable-length expands, optional groups,
 //! closing joins, unwind, table functions, and rel values, falls back.
 //! The bar for anything compiled here is exact old-engine output:
@@ -149,6 +152,21 @@ pub(crate) enum Op {
         /// `fuse_closes`, None while the plan is still growing.
         close: Option<Close>,
     },
+    /// A second pattern branch: a hop off a level the pipeline has
+    /// already walked past, which is what a query writes when two
+    /// patterns share a variable and read the far end of both.
+    ///
+    /// The source level sits below the newest one, so it is pinned for
+    /// the whole op and its list is read once. What the newest level
+    /// contributes is multiplicity: every one of its rows pairs with
+    /// every neighbor of the pinned row, so the newest level is pinned
+    /// a row at a time and the same list descends under each.
+    Branch {
+        rel: RelId,
+        dirs: Dirs,
+        from: usize,
+        to: usize,
+    },
     /// The WCOJ close (docs/07 section 4, perf/05 section 3): the
     /// expand that would build the closing node and the probe back
     /// into it are one intersection of two sorted neighbor lists. The
@@ -190,13 +208,21 @@ pub(crate) enum Op {
     /// row. Setting the flag is all it does; the pipeline below runs
     /// off it either way.
     OptionalHit,
-    /// Terminal fusion of trailing expands feeding a bare count: each
-    /// active row of the newest level contributes the product of its
-    /// per-step degrees, read off the CSR offsets alone. One step is
-    /// the plain expand-then-count fusion; several steps are a hub
-    /// plan, expands fanning out of one level with nothing reading
-    /// the far ends.
-    DegreeProduct { steps: Vec<(RelId, Dirs)> },
+    /// Terminal fusion of expands feeding a bare count: each active row
+    /// of level `from` contributes the product of its per-step degrees,
+    /// read off the CSR offsets alone. One step is the plain
+    /// expand-then-count fusion; several steps are a hub plan, expands
+    /// fanning out of one level with nothing reading the far ends.
+    ///
+    /// `from` is the newest level when the fused expands were the last
+    /// thing in the pipeline, and a level below it when they were not,
+    /// which is the hop off a hub whose other pattern is still walked.
+    /// A level below the newest one is pinned while this runs, so its
+    /// product is one number and every row the sink sees carries it.
+    DegreeProduct {
+        steps: Vec<(RelId, Dirs)>,
+        from: usize,
+    },
 }
 
 /// A per-row scalar a sink reads out of the chunk set.
@@ -237,6 +263,19 @@ pub(crate) enum AggSpec {
 }
 
 impl AggSpec {
+    /// The argument in place, for the renumbering a dropped level
+    /// forces on everything that names one.
+    pub(crate) fn arg_mut(&mut self) -> Option<&mut ScalarRef> {
+        match self {
+            AggSpec::CountStar => None,
+            AggSpec::CountRef(r)
+            | AggSpec::Sum(r)
+            | AggSpec::Min(r)
+            | AggSpec::Max(r)
+            | AggSpec::Avg(r) => Some(r),
+        }
+    }
+
     pub(crate) fn arg(&self) -> Option<ScalarRef> {
         match *self {
             AggSpec::CountStar => None,
@@ -298,6 +337,43 @@ fn sink_reads(sink: &SinkSpec, level: usize) -> bool {
     }
 }
 
+/// Whether an op names `level` at all, as the end it walks off, the end
+/// it builds, the end it probes back into, or the level a bracket
+/// binds. An op that names a level is an op that stops it being fused
+/// away.
+fn names_level(op: &Op, level: usize) -> bool {
+    match op {
+        Op::Expand {
+            from, to, close, ..
+        } => *from == level || *to == level || close.is_some_and(|c| c.probe_level == level),
+        Op::Branch { from, to, .. } => *from == level || *to == level,
+        Op::Intersect {
+            probe_level, to, ..
+        } => *probe_level == level || *to == level,
+        Op::Semi { probe_level, .. } => *probe_level == level,
+        Op::Optional { level: opt, .. } => *opt == level,
+        Op::DegreeProduct { from, .. } => *from == level,
+        Op::Filter { .. } | Op::OptionalHit => false,
+    }
+}
+
+/// Whether the ops right above an expand read the level it built
+/// without naming it. A filter refines whatever level is newest where
+/// it sits, a semi judges it, and an intersection seeds off it, and
+/// right above an expand that level is the one the expand made. The
+/// walk cannot go away under any of them. Anything that builds a level
+/// of its own moves the newest on, so the scan stops there.
+fn reads_newest(above: &[Op]) -> bool {
+    for op in above {
+        match op {
+            Op::Filter { .. } | Op::Semi { .. } | Op::Intersect { .. } => return true,
+            Op::Expand { .. } | Op::Branch { .. } => return false,
+            Op::Optional { .. } | Op::OptionalHit | Op::DegreeProduct { .. } => {}
+        }
+    }
+    false
+}
+
 /// Marks the expands that may descend on whole vectors.
 ///
 /// An expand pins one source row at a time because the pin is how
@@ -317,11 +393,28 @@ fn batch_expands(ops: &mut [Op], sink: &SinkSpec, levels: &[LevelBuild]) {
         let Op::Expand { from, close, .. } = ops[i] else {
             continue;
         };
+        // The hub weight is the one thing that reads a source level
+        // without needing its pin: when everything above this expand is
+        // a filter and then the degree product off this expand's own
+        // source, the runner takes one degree per source row before it
+        // descends and carries the weights down with the rows.
+        let hub = matches!(ops.last(), Some(Op::DegreeProduct { from: f, .. }) if *f == from)
+            && ops[i + 1..]
+                .iter()
+                .all(|op| matches!(op, Op::Filter { .. } | Op::DegreeProduct { .. }));
         let reads = |op: &Op| match op {
             Op::Intersect { probe_level, .. } | Op::Semi { probe_level, .. } => {
                 *probe_level == from
             }
             Op::Expand { close: Some(c), .. } => c.probe_level == from,
+            // A branch walks off the pin too, and its source level is
+            // one the pipeline has already left behind, so it is read
+            // at whatever row the pin holds.
+            Op::Branch { from: src, .. } => *src == from,
+            // So does a degree product whose source the pipeline has
+            // walked past, unless this expand is the one carrying it:
+            // otherwise its weight is that one pinned row's.
+            Op::DegreeProduct { from: src, .. } => *src == from && !hub,
             _ => false,
         };
         // The expand's own fused close counts: it reads the probe
@@ -885,7 +978,7 @@ impl Compiler<'_> {
             }
         }
 
-        let sink = match sink_node {
+        let mut sink = match sink_node {
             Some(LogicalPlan::Project { items, .. }) => {
                 let mut refs = Vec::with_capacity(items.len());
                 for item in items {
@@ -1030,6 +1123,7 @@ impl Compiler<'_> {
         };
         if fusable {
             let mut steps = Vec::new();
+            let mut taken = Vec::new();
             let mut step_from = None;
             while let Some(Op::Expand {
                 rel,
@@ -1047,7 +1141,49 @@ impl Compiler<'_> {
                 }
                 step_from = Some(*from);
                 steps.push((*rel, *dirs));
-                ops.pop();
+                taken.push(ops.pop().expect("just matched"));
+            }
+            // The same fusion for a hop sitting in the middle of the
+            // pipeline. Two patterns off one variable put the read end
+            // last as often as first, and the unread one is a weight
+            // wherever it sits: the pipeline below it never looked at
+            // its rows, so the only thing they contributed was how many
+            // there were. Taking it out is what keeps the walk below
+            // from running once per neighbor of a level nobody reads.
+            //
+            // Its level goes away with it, so everything above it moves
+            // down one and the level indices the plan is written in are
+            // renumbered before the plan is handed over.
+            let mut dropped = Vec::new();
+            if self.optional_level.is_none() {
+                for i in (0..ops.len()).rev() {
+                    let Op::Expand {
+                        rel,
+                        dirs,
+                        from,
+                        to,
+                        ..
+                    } = ops[i]
+                    else {
+                        continue;
+                    };
+                    if !self.levels[to].cols.is_empty()
+                        || sink_reads(&sink, to)
+                        || outer_reads(&self.levels, to)
+                        || step_from.is_some_and(|f| f != from)
+                        || ops
+                            .iter()
+                            .enumerate()
+                            .any(|(j, op)| j != i && names_level(op, to))
+                        || reads_newest(&ops[i + 1..])
+                    {
+                        continue;
+                    }
+                    step_from = Some(from);
+                    steps.push((rel, dirs));
+                    ops.remove(i);
+                    dropped.push(to);
+                }
             }
             if let Some(from) = step_from {
                 let newest_after = ops
@@ -1058,27 +1194,60 @@ impl Compiler<'_> {
                     })
                     .next_back()
                     .unwrap_or(0);
-                if from != newest_after {
-                    // The steps hang off a level the surviving
-                    // pipeline does not end on; validation below
-                    // rejects the unfused shape too.
-                    return Ok(None);
+                // Steps off a level the surviving pipeline does not end
+                // on are read at that level's pin instead of over a
+                // vector of rows, which the runner does and a bracket
+                // does not: its level binds an invalid row on a miss and
+                // a degree read off that would answer row zero's. So an
+                // optional puts the expands back and walks them.
+                if from != newest_after && self.optional_level.is_some() {
+                    steps.clear();
+                    while let Some(op) = taken.pop() {
+                        ops.push(op);
+                    }
                 }
-                ops.push(Op::DegreeProduct { steps });
+            }
+            if !dropped.is_empty() {
+                let map = self.renumber(&dropped, &mut ops, &mut sink);
+                step_from = step_from.map(|from| map[from]);
+            }
+            if !steps.is_empty() {
+                let from = step_from.expect("every step came off a level");
+                ops.push(Op::DegreeProduct { steps, from });
             }
         }
 
-        // After fusion every surviving expand must walk off the newest
-        // level, the invariant the runner's pin-and-descend loop is
-        // built on. The hub shapes fusion could not absorb fall back
-        // to the old engine here.
+        // After fusion every surviving expand either walks off the
+        // newest level, the invariant the runner's pin-and-descend loop
+        // is built on, or off a level below it, which is a branch and
+        // runs as one. The bracket is the exception: a branch under it
+        // would walk off a level whose pin the miss path rewrites, so
+        // an optional keeps the old rule and falls back.
+        let bracketed = self.optional_level.is_some();
         let mut newest = 0;
-        for op in &ops {
+        for op in &mut ops {
             match op {
-                Op::Expand { from, to, .. } => {
+                Op::Expand {
+                    rel,
+                    dirs,
+                    from,
+                    to,
+                    ..
+                } => {
                     if *from != newest {
-                        return Ok(None);
+                        if bracketed || *from > newest {
+                            return Ok(None);
+                        }
+                        *op = Op::Branch {
+                            rel: *rel,
+                            dirs: *dirs,
+                            from: *from,
+                            to: *to,
+                        };
                     }
+                    let (Op::Expand { to, .. } | Op::Branch { to, .. }) = op else {
+                        unreachable!("just matched one of the two");
+                    };
                     newest = *to;
                 }
                 Op::Intersect {
@@ -1129,6 +1298,85 @@ impl Compiler<'_> {
             columns: self.query.columns.clone(),
             func: self.func.take(),
         }))
+    }
+
+    /// Drops the levels a fused hop took away and moves everything
+    /// above them down one, in the levels themselves, in the ops, and
+    /// in the sink. A level is its position in the runner's chunk
+    /// stack, so a plan that keeps a hole in the numbering reads the
+    /// wrong chunk. Answers the old level to new level map, which the
+    /// fusion still needs for the source it kept.
+    fn renumber(&mut self, dropped: &[usize], ops: &mut [Op], sink: &mut SinkSpec) -> Vec<usize> {
+        let mut map = vec![usize::MAX; self.levels.len()];
+        let mut next = 0;
+        for (old, slot) in map.iter_mut().enumerate() {
+            if dropped.contains(&old) {
+                continue;
+            }
+            *slot = next;
+            next += 1;
+        }
+        let kept: Vec<_> = self
+            .levels
+            .drain(..)
+            .enumerate()
+            .filter(|(old, _)| map[*old] != usize::MAX)
+            .map(|(_, mut level)| {
+                for (_, col) in &mut level.cols {
+                    if let ColSpec::Outer { from, .. } = col {
+                        *from = map[*from];
+                    }
+                }
+                level
+            })
+            .collect();
+        self.levels = kept;
+        for op in ops {
+            match op {
+                Op::Expand {
+                    from, to, close, ..
+                } => {
+                    *from = map[*from];
+                    *to = map[*to];
+                    if let Some(c) = close {
+                        c.probe_level = map[c.probe_level];
+                    }
+                }
+                Op::Branch { from, to, .. } => {
+                    *from = map[*from];
+                    *to = map[*to];
+                }
+                Op::Intersect {
+                    probe_level, to, ..
+                } => {
+                    *probe_level = map[*probe_level];
+                    *to = map[*to];
+                }
+                Op::Semi { probe_level, .. } => *probe_level = map[*probe_level],
+                Op::Optional { level, .. } => *level = map[*level],
+                Op::DegreeProduct { from, .. } => *from = map[*from],
+                Op::Filter { .. } | Op::OptionalHit => {}
+            }
+        }
+        let fix = |r: &mut ScalarRef| match r {
+            ScalarRef::Node { level }
+            | ScalarRef::RowId { level }
+            | ScalarRef::Col { level, .. } => {
+                *level = map[*level];
+            }
+        };
+        match sink {
+            SinkSpec::Count => {}
+            SinkSpec::CountDistinct { keys } => keys.iter_mut().for_each(fix),
+            SinkSpec::Rows { items, .. } => items.iter_mut().for_each(fix),
+            SinkSpec::Agg { keys, aggs, .. } => {
+                keys.iter_mut().for_each(fix);
+                for arg in aggs.iter_mut().filter_map(AggSpec::arg_mut) {
+                    fix(arg);
+                }
+            }
+        }
+        map
     }
 
     /// Reconstructs the output item order of the final projection: one

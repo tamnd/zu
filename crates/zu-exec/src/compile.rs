@@ -233,6 +233,13 @@ pub(crate) enum SinkSpec {
     /// The bare global count(*): one accumulator, fed by multiplicity
     /// or by a fused DegreeProduct.
     Count,
+    /// The global `count(DISTINCT ...)`. A distinct count is a group by
+    /// its own argument whose answer is how many groups there are, so
+    /// the argument compiles to the group keys and the sink counts the
+    /// table instead of reading an accumulator out of it. A list
+    /// argument is the tuple written out, which is how a query asks to
+    /// count each unordered triple once.
+    CountDistinct { keys: Vec<ScalarRef> },
     Agg {
         /// One flag per output item in clause order: true takes the
         /// next aggregate, false the next key.
@@ -252,6 +259,7 @@ fn sink_reads(sink: &SinkSpec, level: usize) -> bool {
     let named = |r: &ScalarRef| r.level() == level;
     match sink {
         SinkSpec::Count => false,
+        SinkSpec::CountDistinct { keys } => keys.iter().any(named),
         SinkSpec::Agg { keys, aggs, .. } => {
             keys.iter().any(named) || aggs.iter().filter_map(AggSpec::arg).any(|r| named(&r))
         }
@@ -651,25 +659,37 @@ impl Compiler<'_> {
                     };
                     key_refs.push(r);
                 }
-                let mut agg_specs = Vec::with_capacity(aggs.len());
-                for item in aggs {
-                    let Some(spec) = self.agg_spec(&item.expr)? else {
-                        return Ok(None);
-                    };
-                    agg_specs.push(spec);
+                // A distinct count brings its own grouping and answers
+                // out of the table rather than out of an accumulator,
+                // so it is decided before the ordinary aggregate specs.
+                let mut tuple = None;
+                if key_refs.is_empty() && post.is_empty() && aggs.len() == 1 {
+                    tuple = self.distinct_count_keys(&aggs[0].expr)?;
                 }
-                if key_refs.is_empty()
-                    && agg_specs.len() == 1
-                    && matches!(agg_specs[0], AggSpec::CountStar | AggSpec::CountRef(_))
-                    && post.is_empty()
-                {
-                    SinkSpec::Count
-                } else {
-                    SinkSpec::Agg {
-                        item_agg,
-                        keys: key_refs,
-                        aggs: agg_specs,
-                        post,
+                match tuple {
+                    Some(keys) => SinkSpec::CountDistinct { keys },
+                    None => {
+                        let mut agg_specs = Vec::with_capacity(aggs.len());
+                        for item in aggs {
+                            let Some(spec) = self.agg_spec(&item.expr)? else {
+                                return Ok(None);
+                            };
+                            agg_specs.push(spec);
+                        }
+                        if key_refs.is_empty()
+                            && agg_specs.len() == 1
+                            && matches!(agg_specs[0], AggSpec::CountStar | AggSpec::CountRef(_))
+                            && post.is_empty()
+                        {
+                            SinkSpec::Count
+                        } else {
+                            SinkSpec::Agg {
+                                item_agg,
+                                keys: key_refs,
+                                aggs: agg_specs,
+                                post,
+                            }
+                        }
                     }
                 }
             }
@@ -1113,6 +1133,58 @@ impl Compiler<'_> {
             }
             _ => self.register_expr(expr),
         }
+    }
+
+    /// The group keys of a global `count(DISTINCT ...)`, `None` when
+    /// the item is not that call.
+    ///
+    /// A list argument is the tuple spelled out and each element
+    /// becomes a key part, which is how a query counts each unordered
+    /// triple once. Anything else is the one part case, `count(DISTINCT
+    /// c)` over a node or a column.
+    ///
+    /// The old engine skips a null argument before it reaches the set,
+    /// and nothing that compiles to a key part here can be null: node
+    /// and row id refs never are, and a stored column is dense, which
+    /// is the same assumption `CountRef` already counts on.
+    fn distinct_count_keys(&mut self, expr: &BoundExpr) -> Result<Option<Vec<ScalarRef>>> {
+        let BoundExpr::Call {
+            func: Func::Count,
+            distinct: true,
+            star: false,
+            args,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        let [arg] = args.as_slice() else {
+            return Ok(None);
+        };
+        let parts = match arg {
+            BoundExpr::List(items) => items.as_slice(),
+            other => std::slice::from_ref(other),
+        };
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        let mut keys = Vec::with_capacity(parts.len());
+        for part in parts {
+            let Some(r) = self.item_ref(part)? else {
+                return Ok(None);
+            };
+            // A node key carries its table beside its row, and a level
+            // has one table, so the table word is the same for every
+            // row the query will ever hash. Counting rows counts the
+            // same nodes, and it halves the key: one word decides a
+            // slot on its own, where two send every probe back to the
+            // stored key to compare it. Nothing reads these keys back,
+            // so the node itself is never wanted.
+            keys.push(match r {
+                ScalarRef::Node { level } => ScalarRef::RowId { level },
+                other => other,
+            });
+        }
+        Ok(Some(keys))
     }
 
     /// Maps one aggregate item to its spec. Restricted to integer

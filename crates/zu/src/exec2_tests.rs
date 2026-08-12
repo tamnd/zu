@@ -251,6 +251,21 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (p:person) RETURN DISTINCT p.age + p.age AS b ORDER BY b",
         "MATCH (a:person {id: 1})-[:knows]->(b) RETURN b.age + 1 AS b ORDER BY b",
         "MATCH (a:person)-[:knows]->(b) RETURN sum(b.score + 1) AS s",
+        // count(DISTINCT ...), which groups on its own argument and
+        // answers with how many groups came out. Once on a column,
+        // once on a node, once on a computed value, once on a string,
+        // once over an expand where the argument sits on the level the
+        // expand walks off, and once on the tuple that counts each
+        // unordered triple exactly once.
+        "MATCH (p:person) RETURN count(DISTINCT p.age) AS n",
+        "MATCH (p:person) RETURN count(DISTINCT p) AS n",
+        "MATCH (p:person) RETURN count(DISTINCT p.age + 1) AS n",
+        "MATCH (p:person) RETURN count(DISTINCT p.name) AS n",
+        "MATCH (p:person) WHERE p.age > 500 RETURN count(DISTINCT p.age) AS n",
+        "MATCH (a:person)-[:knows]->(b) RETURN count(DISTINCT a.id) AS n",
+        "MATCH (a:person)-[:knows]->(b) RETURN count(DISTINCT [a.id, b.id]) AS n",
+        "MATCH (a:person)-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
+         WHERE a.id < b.id AND b.id < c.id RETURN count(DISTINCT [a.id, b.id, c.id]) AS n",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -282,7 +297,11 @@ fn unclaimed_shapes_fall_back() {
         // the broadcast.
         "MATCH (a:person)-[:knows]->(b) WHERE a.name < b.name RETURN count(*) AS n",
         "MATCH (p:person) RETURN collect(p.age) AS ages",
-        "MATCH (p:person) RETURN count(DISTINCT p.age) AS n",
+        // A distinct count beside a grouping key needs a set per group
+        // rather than one table over the whole input.
+        "MATCH (p:person) RETURN p.age AS age, count(DISTINCT p.score) AS n",
+        // Two of them would need two tables, and the sink holds one.
+        "MATCH (p:person) RETURN count(DISTINCT p.age) AS a, count(DISTINCT p.score) AS b",
         "MATCH (a:person)-[r:knows]->(b) RETURN count(r) AS n",
         "MATCH (a:person)-[:knows*1..2]->(b) RETURN count(b) AS n",
         "OPTIONAL MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",

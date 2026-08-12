@@ -776,3 +776,35 @@ card_gen_qerror_max = 500.0
 # of 16, so it fails on the shape and not on a neighbor. Raise this
 # floor, never lower it.
 exec_call_mrows_s_core = 12.0
+
+# Factorized aggregation over a hop (perf/13 section 1, zu#76). An
+# aggregate that reads nothing off the expanded level does not need the
+# expanded rows, only how many of them there were, so the hop becomes a
+# weight: a degree read over offsets alone, the neighbor array never
+# touched, one group probe per source row instead of one per neighbor.
+# The bench is a million people over a thousand cities with out degrees
+# zero to seven, 3.5M edges and 17.5M two hop rows, and every case is
+# crosschecked against the edge list per group and in total, so a weight
+# that lands on the wrong key fails before it prints.
+#
+# One worker, so these are per core, and the rate counts the hop rows
+# the walk would have produced. gamingpc reads the counted key at 502.5
+# M hop rows/s against the old engine's 152.0 ms, the summed key at
+# 341.0 against 195.8, the bare sum at 602.1 against 110.5 and the two
+# hop at 240.3 against 2318.2, which is 21.8x, 19.1x, 19.0x and 31.8x.
+# server1 at a load average of 14 reads 147.2, 70.0, 205.7 and 48.8 M
+# hop rows/s for 30.8x, 12.4x, 20.8x and 23.6x.
+#
+# The two hop is the case the sorted degree read is for. Its neighbors
+# arrive in the order their source rows did, and a degree read that
+# walks into a new storage group every row reads two offsets out of the
+# file for each of them, which was 4.8s of the 4.9s the case took before
+# the order went in.
+#
+# The floor is the counted key, the shape whose whole per row cost is a
+# hash and an increment. It sits three times under the worst the shared
+# box has printed and eight times over what the same query reads when it
+# falls back to the old engine, 4.8 M hop rows/s on server1, so it fails
+# on the fusion going away rather than on a noisy neighbor. Raise this
+# floor, never lower it.
+exec_factor_mrows_s_core = 40.0

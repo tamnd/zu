@@ -512,6 +512,19 @@ struct Worker<'a> {
     /// Per-row degree and running product scratch for hub counts.
     deg: Vec<u64>,
     prod: Vec<u64>,
+    /// What a fused degree product hands the sink: the weight of every
+    /// row that kept one, and the positions those rows sit at, which is
+    /// the selection the keys and the arguments are read through.
+    wts: Vec<i64>,
+    wsel: Vec<u16>,
+    /// Where each source row's neighbors end in the concatenated list,
+    /// for a weighted hop that still has to read the lists.
+    ends: Vec<u32>,
+    /// An ascending order over a weighted hop's rows and those rows in
+    /// it, so the degree read stays inside a storage group at a time
+    /// while the weights stay where their rows are.
+    order: Vec<u32>,
+    sorted: Vec<u64>,
     /// Index and row scratch pools for expand iteration, one pair per
     /// recursion depth in steady state.
     idx_pool: Vec<Vec<u32>>,
@@ -571,6 +584,11 @@ impl<'a> Worker<'a> {
             keep: Vec::new(),
             deg: Vec::new(),
             prod: Vec::new(),
+            wts: Vec::new(),
+            wsel: Vec::new(),
+            ends: Vec::new(),
+            order: Vec::new(),
+            sorted: Vec::new(),
             idx_pool: Vec::new(),
             row_pool: Vec::new(),
             batch: KeyBatch::default(),
@@ -818,7 +836,16 @@ impl<'a> Worker<'a> {
                 ..
             } => {
                 if let ([Op::DegreeProduct { steps }], None) = (rest, close) {
-                    return self.expand_degree(*rel, *dirs, steps, set);
+                    // The concatenating path answers with one sum over
+                    // the whole vector, which is the whole answer only
+                    // where the answer is one number. A weighted sink
+                    // reads keys off the row each weight belongs to, so
+                    // it keeps the lists apart by source row instead.
+                    return if matches!(self.plan.sink, SinkSpec::Count) {
+                        self.expand_degree(*rel, *dirs, steps, set)
+                    } else {
+                        self.expand_weights(*rel, *dirs, steps, set)
+                    };
                 }
                 let hop = Hop {
                     rel: *rel,
@@ -871,6 +898,9 @@ impl<'a> Worker<'a> {
                 self.run_ops(rest, set)
             }
             Op::DegreeProduct { steps } => {
+                if !matches!(self.plan.sink, SinkSpec::Count) {
+                    return self.weighted_sink(steps, set);
+                }
                 self.collect_rows(set.chunks.last().expect("a level under the count"));
                 let mut rows = std::mem::take(&mut self.scratch);
                 let sum = self.product_sum(steps, &mut rows);
@@ -1440,6 +1470,211 @@ impl<'a> Worker<'a> {
         Ok(self.prod.iter().sum())
     }
 
+    /// Each row's product of per-step degrees, left where the row is.
+    ///
+    /// [`Worker::product_sum`] sorts the list itself, because its answer
+    /// is one number over the whole of it. Here every weight has to stay
+    /// next to the row it belongs to, since the sink reads that row's
+    /// keys, so what gets sorted is an order over the list and the
+    /// degrees are scattered back through it.
+    ///
+    /// The sort is the whole cost of this path when the rows are a hop's
+    /// neighbors. A degree read that walks into a new storage group
+    /// every row reads two offsets out of the file for each of them,
+    /// where the same rows in order read the group once and answer the
+    /// rest off it, so a few thousand ids sorted buys back a chunk
+    /// decode per id.
+    fn degree_products(&mut self, steps: &[(RelId, Dirs)], rows: &[u64]) -> Result<()> {
+        self.prod.clear();
+        self.prod.resize(rows.len(), 1);
+        // A level's own rows arrive ascending off the scan and have
+        // nothing to gain here, so only a hop's neighbors, which arrive
+        // in the order their source rows did, pay for the order.
+        let ascending = rows.is_sorted();
+        if !ascending {
+            self.order.clear();
+            self.order.extend(0..rows.len() as u32);
+            self.order.sort_unstable_by_key(|&i| rows[i as usize]);
+            self.sorted.clear();
+            self.sorted
+                .extend(self.order.iter().map(|&i| rows[i as usize]));
+        }
+        for &(rel, dirs) in steps {
+            self.deg.clear();
+            self.deg.resize(rows.len(), 0);
+            let read = if ascending { rows } else { &self.sorted };
+            for dir in sides(dirs) {
+                self.snap.get().degrees(rel, read, dir, &mut self.deg)?;
+            }
+            if ascending {
+                for (p, &d) in self.prod.iter_mut().zip(&self.deg) {
+                    *p *= d;
+                }
+            } else {
+                for (&i, &d) in self.order.iter().zip(&self.deg) {
+                    self.prod[i as usize] *= d;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The weighted answer for a hop that still walks: what a source
+    /// row weighs is the sum over its neighbors of what each of those
+    /// weighs, so the walk reads its lists here and the levels above it
+    /// are never built.
+    ///
+    /// This is the shape a group by two hops out takes, the key sitting
+    /// on the level the walk starts from. Running it as an ordinary
+    /// descent instead costs a level, a key vector and a group probe
+    /// per source row, over vectors as short as one node's neighbor
+    /// list, which is most of the query on a graph with a small mean
+    /// degree.
+    fn expand_weights(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        steps: &[(RelId, Dirs)],
+        set: &ChunkSet,
+    ) -> Result<()> {
+        let last = set.chunks.len() - 1;
+        self.collect_rows(&set.chunks[last]);
+        if self.scratch.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::take(&mut self.scratch);
+        let mut neigh = std::mem::take(&mut self.neigh);
+        let mut ends = std::mem::take(&mut self.ends);
+        neigh.clear();
+        ends.clear();
+        let res = self
+            .lists_by_row(rel, dirs, &rows, &mut neigh, &mut ends)
+            .and_then(|()| self.degree_products(steps, &neigh));
+        self.scratch = rows;
+        self.neigh = neigh;
+        let mut wts = std::mem::take(&mut self.wts);
+        let mut wsel = std::mem::take(&mut self.wsel);
+        wts.clear();
+        wsel.clear();
+        if res.is_ok() {
+            let mut at = 0;
+            for (pos, &end) in active_positions(&set.chunks[last]).zip(&ends) {
+                let w: u64 = self.prod[at..end as usize].iter().sum();
+                at = end as usize;
+                if w != 0 {
+                    wts.push(w as i64);
+                    wsel.push(pos as u16);
+                }
+            }
+        }
+        self.ends = ends;
+        let out = res.and_then(|()| self.weighted_rows(set, &wsel, &wts));
+        self.wts = wts;
+        self.wsel = wsel;
+        out
+    }
+
+    /// Every row's neighbor list, one after another, with the end of
+    /// each row's stretch. [`Worker::concat_lists`] walks a direction at
+    /// a time because its answer is one sum; here the lists have to stay
+    /// with the row they came off, so the row is the outer loop and one
+    /// pin per side follows the group.
+    fn lists_by_row(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        rows: &[u64],
+        out: &mut Vec<u64>,
+        ends: &mut Vec<u32>,
+    ) -> Result<()> {
+        let mut held: [Option<(u64, CsrPin)>; 2] = [None, None];
+        for &row in rows {
+            let group = row / u64::from(GROUP_ROWS);
+            for (slot, dir) in sides(dirs).enumerate() {
+                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
+                    held[slot] = Some((group, self.pin(rel, dir, row)?));
+                }
+                let pin = &held[slot].as_ref().expect("just pinned").1;
+                out.extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
+            }
+            ends.push(out.len() as u32);
+        }
+        Ok(())
+    }
+
+    /// Feeds the sink the rows a fused expand would have built, as
+    /// weights rather than rows. Every neighbor of a source row carries
+    /// that row's keys and that row's arguments, so the group only
+    /// needs to know how many neighbors there were, and that is a
+    /// degree: offsets alone, with the neighbor array never read.
+    ///
+    /// A row the steps found nothing for weighs nothing and is dropped
+    /// here, which is the difference between a group by over a hop and
+    /// one over the source table: a key whose rows have no edge at all
+    /// is not a group of the answer.
+    fn weighted_sink(&mut self, steps: &[(RelId, Dirs)], set: &ChunkSet) -> Result<()> {
+        let last = set.chunks.len() - 1;
+        self.collect_rows(&set.chunks[last]);
+        if self.scratch.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::take(&mut self.scratch);
+        let res = self.degree_products(steps, &rows);
+        self.scratch = rows;
+        res?;
+        let mut wts = std::mem::take(&mut self.wts);
+        let mut wsel = std::mem::take(&mut self.wsel);
+        wts.clear();
+        wsel.clear();
+        for (pos, &w) in active_positions(&set.chunks[last]).zip(&self.prod) {
+            if w != 0 {
+                wts.push(w as i64);
+                wsel.push(pos as u16);
+            }
+        }
+        let res = self.weighted_rows(set, &wsel, &wts);
+        self.wts = wts;
+        self.wsel = wsel;
+        res
+    }
+
+    /// The weighted rows into whichever sink the fusion allowed.
+    fn weighted_rows(&mut self, set: &ChunkSet, wsel: &[u16], wts: &[i64]) -> Result<()> {
+        if wts.is_empty() {
+            return Ok(());
+        }
+        let plan = self.plan;
+        let SinkSpec::Agg { keys, aggs, .. } = &plan.sink else {
+            unreachable!("only a count or an aggregate fuses a degree product");
+        };
+        if !keys.is_empty() {
+            return self.group_rows(set, keys, aggs, Some(wsel), wts.len(), Some(wts));
+        }
+        let last = set.chunks.len() - 1;
+        let total: i64 = wts.iter().sum();
+        if self.sink.bare.is_empty() {
+            self.sink.bare = aggs.iter().map(Acc::new).collect();
+        }
+        for (spec, acc) in aggs.iter().zip(&mut self.sink.bare) {
+            match spec.arg() {
+                // Dense columns and required nodes are never null, so
+                // count(x) counts rows exactly like star does.
+                None => acc.add_star(total),
+                Some(_) if matches!(spec, AggSpec::CountRef(_)) => acc.add_star(total),
+                Some(r) if r.level() == last => {
+                    for (&w, &pos) in wts.iter().zip(wsel) {
+                        acc.add_int(int_scalar(set, r, pos as usize), w)?;
+                    }
+                }
+                Some(r) => {
+                    let pos = pinned_pos(&set.chunks[r.level()]);
+                    acc.add_int(int_scalar(set, r, pos), total)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Keyed aggregation for one chunk set, a column at a time: pack the
     /// key vector, probe the whole vector in one call, then walk the
     /// group indices once per aggregate. Nothing in here dispatches on
@@ -1453,6 +1688,24 @@ impl<'a> Worker<'a> {
         // selection sends the reads through the survivor list.
         let sel = live.sel.as_ref().map(|s| s.as_slice());
         let rows = sel.map_or(live.count as usize, |s| s.len());
+        self.group_rows(set, keys, aggs, sel, rows, None)
+    }
+
+    /// The same over a chosen set of rows, each standing for `w` of
+    /// them when a fused degree product handed its weights over. A
+    /// weight multiplies a count and a sum and leaves a min or a max
+    /// alone, which is what the accumulator already does with the
+    /// multiplicity a pinned level carries.
+    fn group_rows(
+        &mut self,
+        set: &ChunkSet,
+        keys: &[ScalarRef],
+        aggs: &[AggSpec],
+        sel: Option<&[u16]>,
+        rows: usize,
+        w: Option<&[i64]>,
+    ) -> Result<()> {
+        debug_assert!(w.is_none_or(|w| w.len() == rows), "one weight per row");
         if rows == 0 {
             return Ok(());
         }
@@ -1481,11 +1734,15 @@ impl<'a> Worker<'a> {
         }
         if counting {
             let (words, _) = self.batch.words_mut();
-            table.count_ints(words);
+            match w {
+                Some(w) => table.count_ints_weighted(words, w),
+                None => table.count_ints(words),
+            }
             return Ok(());
         }
         table.probe(&self.batch, aggs, &mut self.gids);
         let n = aggs.len();
+        let weight = |i: usize| w.map_or(1, |w| w[i]);
         for (j, spec) in aggs.iter().enumerate() {
             // Dense columns and required nodes are never null, so
             // count(x) counts rows exactly like count(*).
@@ -1496,8 +1753,8 @@ impl<'a> Worker<'a> {
                 // measured slower here, so the loop stays plain: the
                 // group indices repeat far more than slots do, and the
                 // states are already in cache most of the time.
-                for &g in &self.gids {
-                    accs[g as usize * n + j].add_star(1);
+                for (i, &g) in self.gids.iter().enumerate() {
+                    accs[g as usize * n + j].add_star(weight(i));
                 }
                 continue;
             }
@@ -1506,8 +1763,8 @@ impl<'a> Worker<'a> {
                 .expect("a non counting aggregate has an argument");
             gather_ints(set, r, sel, rows, &mut self.args);
             let accs = table.accs_mut();
-            for (&g, &v) in self.gids.iter().zip(&self.args) {
-                accs[g as usize * n + j].add_int(v, 1)?;
+            for (i, (&g, &v)) in self.gids.iter().zip(&self.args).enumerate() {
+                accs[g as usize * n + j].add_int(v, weight(i))?;
             }
         }
         Ok(())

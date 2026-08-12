@@ -68,6 +68,10 @@ harness = false
 name = "call"
 harness = false
 
+[[bench]]
+name = "factor"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

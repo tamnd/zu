@@ -510,6 +510,18 @@ struct Worker<'a> {
     /// Sort key scratch for the bounded sink, refilled per row so a
     /// row the buffer rejects costs no allocation at all.
     keybuf: Vec<Value>,
+    /// Whether the OPTIONAL MATCH group in flight produced a row for
+    /// the outer row it is running on. Cleared before the group and
+    /// set by `Op::OptionalHit`, which is the only thing under the
+    /// group that can say so.
+    opt_hit: bool,
+    /// The null level a missed OPTIONAL MATCH binds, kept across the
+    /// misses of one morsel. It is the same one row every time, so
+    /// building it per miss would be a handful of arena bytes per
+    /// outer row that matched nothing, which on a selective group is
+    /// most of them. Dropped whenever the arena resets, since that is
+    /// where its buffers live.
+    null: Option<DataChunk>,
 }
 
 impl<'a> Worker<'a> {
@@ -547,6 +559,8 @@ impl<'a> Worker<'a> {
             local_rows: 0,
             morsel: 0,
             keybuf: Vec::new(),
+            opt_hit: false,
+            null: None,
         }
     }
 
@@ -565,6 +579,8 @@ impl<'a> Worker<'a> {
 
     fn run_morsel(&mut self, idx: usize, range: (u64, u64)) -> Result<()> {
         self.arena.reset();
+        // Its buffers came out of the arena that just went away.
+        self.null = None;
         self.local_rows = 0;
         self.morsel = idx;
         let rows_sink = matches!(self.plan.sink, SinkSpec::Rows { .. }) && self.sink.top.is_none();
@@ -735,7 +751,7 @@ impl<'a> Worker<'a> {
                     batch: *batch,
                     close: *close,
                 };
-                self.expand(hop, rest, set)
+                self.expand(hop, rest, set, None)
             }
             Op::Intersect {
                 seed,
@@ -748,6 +764,36 @@ impl<'a> Worker<'a> {
                 dirs,
                 probe_level,
             } => self.semi(*rel, *dirs, *probe_level, rest, set),
+            // The bracket is the expand under it, told what to do with
+            // a source row it found nothing for. Keeping the two one
+            // operator is what lets the group hold its CSR pins and
+            // its scratch across outer rows, the same as any other
+            // expand; a bracket that drove the group itself paid for
+            // all of that once per outer row.
+            Op::Optional { len, level } => {
+                let &Op::Expand {
+                    rel,
+                    dirs,
+                    to,
+                    close,
+                    ..
+                } = &rest[0]
+                else {
+                    unreachable!("the bracket compiles with its expand under it");
+                };
+                let hop = Hop {
+                    rel,
+                    dirs,
+                    to,
+                    batch: false,
+                    close,
+                };
+                self.expand(hop, &rest[1..], set, Some((*level, &rest[*len..])))
+            }
+            Op::OptionalHit => {
+                self.opt_hit = true;
+                self.run_ops(rest, set)
+            }
             Op::DegreeProduct { steps } => {
                 self.collect_rows(set.chunks.last().expect("a level under the count"));
                 let rows = std::mem::take(&mut self.scratch);
@@ -759,7 +805,33 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn expand(&mut self, hop: Hop, rest: &[Op], set: &mut ChunkSet) -> Result<()> {
+    /// The single row an OPTIONAL MATCH binds on a miss: every vector
+    /// the level has, present and invalid, so a read off any of them
+    /// answers null and the level still counts once. Built out of the
+    /// morsel arena per miss, which is where it has to come from since
+    /// the arena resets between morsels.
+    fn null_level(&mut self, level: usize) -> DataChunk {
+        let n = 1 + self.plan.levels[level].cols.len();
+        let mut vecs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut v = ValueVector::constant(&mut self.arena, PhysType::Int64, 0i64, 1);
+            v.validity = Some(Bitmap::new_in(&mut self.arena, 1, false));
+            vecs.push(v);
+        }
+        DataChunk::new(vecs, 1)
+    }
+
+    /// Walks one hop. `opt` turns the walk into an OPTIONAL MATCH
+    /// bracket: the level the group introduces and the pipeline to run
+    /// for a source row the group found nothing for, which gets one
+    /// null row of that level instead of dropping out.
+    fn expand(
+        &mut self,
+        hop: Hop,
+        rest: &[Op],
+        set: &mut ChunkSet,
+        opt: Option<(usize, &[Op])>,
+    ) -> Result<()> {
         let Hop {
             rel,
             dirs,
@@ -833,6 +905,7 @@ impl<'a> Worker<'a> {
             if !batch {
                 set.chunks[src].cur = Some(phys);
             }
+            self.opt_hit = false;
             let group = (row / u64::from(GROUP_ROWS)) as u32;
             for (slot, dir) in sides(dirs).enumerate() {
                 if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
@@ -886,6 +959,32 @@ impl<'a> Worker<'a> {
                         result = Err(e);
                         break 'srcs;
                     }
+                }
+            }
+            // Both sides of the hop are walked by here, so nothing
+            // else can turn this row into a match. `opt_hit` is what
+            // the group's own filters have to say about it too: they
+            // sit between the descent and the flag, so a row whose
+            // only neighbors they rejected is a miss.
+            if let Some((level, cont)) = opt
+                && !self.opt_hit
+            {
+                let chunk = match self.null.take() {
+                    Some(c) => c,
+                    None => self.null_level(level),
+                };
+                set.chunks.push(chunk);
+                let res = self.run_ops(cont, set);
+                // Back into the worker for the next miss, with
+                // anything the pipeline below did to its selection
+                // undone, since the next miss is a fresh row.
+                let mut chunk = set.chunks.pop().expect("just pushed the null level");
+                chunk.sel = None;
+                chunk.cur = None;
+                self.null = Some(chunk);
+                if let Err(e) = res {
+                    result = Err(e);
+                    break 'srcs;
                 }
             }
             if self.stop.stopped() {
@@ -1516,6 +1615,18 @@ fn scalar(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<V
     } else {
         pinned_pos(chunk)
     };
+    // The level an OPTIONAL MATCH bound on a miss has every vector
+    // invalid, and a computed column clears validity on the rows it
+    // divided by zero. Either way the answer is null, whatever the
+    // ref names, and on a vector with no validity at all this is one
+    // predictable branch per read.
+    let at = match r {
+        ScalarRef::Col { vec, .. } => vec,
+        ScalarRef::Node { .. } | ScalarRef::RowId { .. } => 0,
+    };
+    if !chunk.vecs[at].is_valid(idx) {
+        return Ok(Value::Null);
+    }
     Ok(match r {
         ScalarRef::Node { .. } => Value::Node {
             table: plan.levels[level].table,

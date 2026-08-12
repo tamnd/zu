@@ -56,6 +56,10 @@ harness = false
 name = "project"
 harness = false
 
+[[bench]]
+name = "optional"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

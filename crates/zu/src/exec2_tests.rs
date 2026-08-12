@@ -299,6 +299,31 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a.age AS age, count(*) AS n",
         "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
          RETURN a.id AS a, b.id AS b LIMIT 4",
+        // A leading UNWIND whose values are what the scan seeks on:
+        // the list is the batch of point reads and the keys drive the
+        // plan. Once bare, once with the key itself returned beside
+        // the row it found, once with a key that finds nothing in the
+        // middle of the list, once with a key written twice, once
+        // spelled id(p), once with a hop off every row, once counted
+        // per key, once counted two hops out where the count fuses into
+        // degrees, once with the group's WHERE above the hop, and once
+        // ordered under a limit.
+        "UNWIND [7, 11, 13] AS id MATCH (p:person {id: id}) RETURN p.age AS age",
+        "UNWIND [7, 11, 13] AS id MATCH (p:person {id: id}) RETURN id AS i, p.name AS name",
+        "UNWIND [7, 999999, 13] AS id MATCH (p:person {id: id}) RETURN id AS i, p.age AS age",
+        "UNWIND [7, 7, 13] AS id MATCH (p:person {id: id}) RETURN id AS i, p.age AS age",
+        "UNWIND [7, 11] AS id MATCH (p:person) WHERE id(p) = id RETURN id AS i, p.age AS age",
+        "UNWIND [1, 7, 11] AS id MATCH (p:person {id: id})-[:knows]->(f) \
+         RETURN id AS i, f.id AS f",
+        "UNWIND [1, 7, 11] AS id MATCH (p:person {id: id})-[:knows]->(f) RETURN count(f) AS n",
+        "UNWIND [1, 7, 11] AS id MATCH (p:person {id: id})-[:knows]->(f) \
+         RETURN id AS i, count(f) AS n",
+        "UNWIND [1, 7, 11] AS id MATCH (p:person {id: id})-[:knows]->(f)-[:knows]->(g) \
+         RETURN count(g) AS n",
+        "UNWIND [1, 7, 11] AS id MATCH (p:person {id: id})-[:knows]->(f) WHERE f.age > 50 \
+         RETURN id AS i, f.age AS age",
+        "UNWIND [1, 7, 11] AS id MATCH (p:person {id: id})-[:knows]->(f) \
+         RETURN f.id AS f ORDER BY f LIMIT 5",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -358,6 +383,19 @@ fn unclaimed_shapes_fall_back() {
         "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
          RETURN a.id AS a, b.id AS b ORDER BY b",
         "UNWIND [1, 2, 3] AS x RETURN x",
+        // An UNWIND the scan does not seek on. The list would have to
+        // join against the table some other way, and the pipeline has
+        // no shape for that, so the query goes back rather than
+        // scanning once per element.
+        "UNWIND [1, 2] AS x MATCH (p:person) WHERE p.age = x RETURN count(p) AS n",
+        "UNWIND [1, 2] AS x MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",
+        // An UNWIND above the scan is not a source at all.
+        "MATCH (p:person) UNWIND [1, 2] AS x RETURN count(p) AS n",
+        // A list the compiler cannot read off as keys before the query
+        // runs: a negative element names no row, and one element is
+        // enough to send the whole list back.
+        "UNWIND [-1, 7] AS id MATCH (p:person {id: id}) RETURN p.age AS age",
+        "UNWIND [1, 2] AS id MATCH (p:person {id: id + 0}) RETURN p.age AS age",
         // A seek key that is not an integer constant has no row to
         // seek, and a scan to find one row costs more than the old
         // engine's seek, so the shape goes back.

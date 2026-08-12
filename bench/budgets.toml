@@ -290,13 +290,29 @@ open_p99_ms = 10.0
 # text: epoch check plus cache lookup, the work between receiving a
 # known query and starting execution. point is the full warm point
 # read through the session: plan hit, bind, key lookup, one-hop count.
-# Measured on the local M series: plan hit 0.04 us, point read 2.0 us
-# (the one-shot open+plan+run path on the same file is 133 us, 65x).
-# Ceilings are the perf/07 targets and leave room for the EPYC vCPU
-# hosts and their documented steal. Lower these ceilings, never raise
-# them.
+# When P0 landed the point read measured 2.0 us on the local M series
+# and the one-shot open+plan+run path on the same file was 133 us, 65x
+# it. Ceilings are the perf/07 targets and leave room for the EPYC vCPU
+# hosts and their documented steal.
+#
+# The point read then went to 14 us and nobody noticed, because 20 was
+# loose enough to hold it. Turning the pipeline executor on by default
+# moved the read onto a snapshot the session built and threw away per
+# query, so every point read reopened the table reader it needed and
+# read its directory back out of the file, and on this graph that load
+# was most of the query. server1 is the floor host and it was over the
+# ceiling outright at 28.26 and 28.69 on two passes, a gate failing on
+# main. Holding the readers for as long as the epoch they were read at
+# is: local M series 14.50 to 2.67, gamingpc 13.98 to 3.50, server1
+# 28.26 to 4.82.
+#
+# The ceiling comes down 20 to 10 on server1's spread, which read 4.64
+# and 4.82 across two passes. It is deliberately not set near the
+# measurement: the number this gate exists to catch is a read that
+# stopped being warm, and that lands well past 10 on every host in the
+# fleet. Lower these ceilings, never raise them.
 session_plan_hit_us = 5.0
-session_point_us = 20.0
+session_point_us = 10.0
 
 # P1 vector kernel gates (Spec/2064g/perf/02 and perf/11, zu#74),
 # benches/kernels.rs, single core, all inputs cache resident. The spec

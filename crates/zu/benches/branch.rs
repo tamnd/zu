@@ -44,6 +44,10 @@
 //! reads a column off each end, so nothing can fold it away later and
 //! the floor keeps measuring the branch itself.
 //!
+//! exec_hub_mpairs_s_core floors the grouped branch, the case where one
+//! end is read by nobody and turns into a weight. That is the one that
+//! notices a fallback, since the walk it skips is most of the work.
+//!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench branch
 
 use std::time::Instant;
@@ -257,7 +261,7 @@ fn main() {
         ),
     ];
 
-    let mut paired = 0.0;
+    let (mut paired, mut hub) = (0.0, 0.0);
     for (what, source, want, rows) in cases {
         let new = measure(&mut db, source, &want, 5);
         // SAFETY: same as the worker count above.
@@ -272,18 +276,28 @@ fn main() {
              crosschecked",
             old / new
         );
-        if what == "paired predicate" {
-            paired = mpairs;
+        match what {
+            "paired predicate" => paired = mpairs,
+            "grouped branch" => hub = mpairs,
+            _ => {}
         }
     }
 
-    if std::env::var("ZU_GATE").as_deref() == Ok("1")
-        && let Some(floor) = budget("exec_branch_mpairs_s_core")
-    {
+    if std::env::var("ZU_GATE").as_deref() != Ok("1") {
+        return;
+    }
+    if let Some(floor) = budget("exec_branch_mpairs_s_core") {
         assert!(
             paired >= floor,
             "the paired predicate reads {paired:.1} M pairs/s, under the {floor} M floor"
         );
         println!("gate: branch floor met");
+    }
+    if let Some(floor) = budget("exec_hub_mpairs_s_core") {
+        assert!(
+            hub >= floor,
+            "the grouped branch reads {hub:.1} M pairs/s, under the {floor} M floor"
+        );
+        println!("gate: hub floor met");
     }
 }

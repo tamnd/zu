@@ -4,8 +4,11 @@
 //!
 //! The supported shape today is the linear read pipeline: a single
 //! non-optional node scan, filters, single-hop expands that walk off
-//! the newest level, and one final Project or Aggregate with its
-//! absorbed Distinct, Sort, Skip, and Limit. Everything the old
+//! the newest level or off a level below it, and one final Project or
+//! Aggregate with its absorbed Distinct, Sort, Skip, and Limit. A hop
+//! off a lower level is the second pattern branch, the shape two
+//! patterns sharing a variable compile to, and it pairs every row of
+//! the newest level with the whole of the pinned one. Everything the old
 //! executor also covers, variable-length expands, optional groups,
 //! closing joins, unwind, table functions, and rel values, falls back.
 //! The bar for anything compiled here is exact old-engine output:

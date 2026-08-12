@@ -808,3 +808,37 @@ exec_call_mrows_s_core = 12.0
 # on the fusion going away rather than on a noisy neighbor. Raise this
 # floor, never lower it.
 exec_factor_mrows_s_core = 40.0
+
+# The second pattern branch and the hub weight (perf/05 section 2,
+# zu#76). Two patterns off one variable with both far ends read is a
+# cross product per source row: the shared end is pinned, its list is
+# read once, and every row of the newest level pairs with the whole of
+# it. When one of the two ends is read by nothing the walk on that side
+# is not a walk at all, it is a degree, and the rows the other side
+# keeps carry it as a weight.
+#
+# Same graph as the factor bench, a million people over a thousand
+# cities with out degrees zero to seven, and the same crosscheck: every
+# case is checked against the edge list on every run, rows and total, so
+# a pairing that drops or repeats fails before it prints. The rate
+# counts the pairs the cross product has to walk.
+#
+# One worker, so these are per core. gamingpc reads the grouped branch
+# at 179.8 M pairs/s against the old engine's 579.8 ms, both ends
+# grouped at 25.1 against 3018.6, the paired predicate at 30.7 against
+# 1760.6 and the two hop branch at 26.5 against 11785.7, which is 6.0x,
+# 4.3x, 3.1x and 173.3x. server1 at a load average of 40 reads 20.5,
+# 6.3, 8.1 and 7.6 M pairs/s for 5.8x, 4.9x, 2.8x and 401.0x. The shared
+# box was between 24 and 80 loaded across those runs and printed 5.4 M
+# pairs/s for the paired predicate on the run before, which is what the
+# floors are set under.
+#
+# Two floors, because the two halves fail differently. The hub weight
+# floor is the one that catches a fallback: the same grouped query reads
+# 3.5 M pairs/s when it goes back to the old engine on server1, and the
+# floor sits three times over that. The branch floor catches a collapse
+# rather than a fallback, since the old engine is only 2.4x behind it on
+# the shared box, and it sits under the worst that box has printed.
+# Raise these floors, never lower them.
+exec_branch_mpairs_s_core = 3.0
+exec_hub_mpairs_s_core = 10.0

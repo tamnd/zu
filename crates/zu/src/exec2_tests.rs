@@ -273,6 +273,14 @@ fn covered_shapes_match_the_old_engine() {
          RETURN c.age AS k, count(*) AS n ORDER BY k LIMIT 10",
         "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) WHERE a.age > 50 \
          RETURN c.age AS k, count(*) AS n ORDER BY k LIMIT 10",
+        // The unread hop last rather than first, with the pipeline
+        // ending two levels above the one it hangs off, so the weight is
+        // read off a pin and every row of the walk that is still there
+        // carries the same one.
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) MATCH (a)-[:knows]->(d) \
+         RETURN c.age AS k, count(*) AS n ORDER BY k LIMIT 10",
+        "MATCH (a:person)-[:knows]->(b) MATCH (a)-[:knows]->(c) \
+         RETURN b.age AS k, count(*) AS n ORDER BY k LIMIT 10",
         // Undirected closes, the shape that keeps the binary probe and
         // so runs the semijoin folded into the expand above it. Once
         // over a scan, once under a key seek, and once with the closed

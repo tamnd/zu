@@ -48,13 +48,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The CLI bin and the C API cdylib are both called zu, so on MSVC
-      # they want the same zu.pdb and the linker fails with LNK1201 when
-      # they get there together. Renaming either one changes what users
-      # type or what they link against, so the debug info goes instead;
-      # nothing on this job reads it.
-      - run: cargo test --workspace --all-features
-        env:
-          CARGO_PROFILE_DEV_DEBUG: ${{ matrix.os == 'windows-latest' && '0' || 'true' }}
+      # they want the same zu.pdb and whichever link gets there second
+      # dies with LNK1201. Renaming either one changes what users type or
+      # what they link against. Turning the debug info off by env was the
+      # first try and it did not hold, the job kept failing with /DEBUG
+      # still on the link line, so the two now build in separate passes
+      # and never reach that file at the same time.
+      - if: matrix.os == 'windows-latest'
+        run: |
+          cargo test --workspace --exclude zu-capi --all-features
+          cargo test -p zu-capi --all-features
+      - if: matrix.os != 'windows-latest'
+        run: cargo test --workspace --all-features
 
   membudget:
     runs-on: ubuntu-latest

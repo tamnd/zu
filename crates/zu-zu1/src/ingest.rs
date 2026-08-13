@@ -29,7 +29,7 @@ use crate::catalog::Catalog;
 use crate::file::{BlockPtr, Zu1File};
 use crate::fullzip::{read_blob_segment, write_blob_segment};
 use crate::meta;
-use crate::props::{PropType, PropValues, load_props};
+use crate::props::{PropValues, load_props};
 use crate::segment::{SegmentMeta, read_segment, write_segment};
 use crate::txn::{IngestPayload, Mvcc};
 use crate::wal::{Wal, WalColumn, WalRecord, WalValues};
@@ -45,10 +45,21 @@ fn corrupt(detail: String) -> ZuError {
     }
 }
 
+/// Which of the two storage shapes a sealed segment holds. The
+/// manifest does not need the column's logical type: the props
+/// directory already carries that, and what replay has to know is how
+/// to read the bytes back, which is the lane or the blob and nothing
+/// finer. A float column and a date column seal identically here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealKind {
+    Lane,
+    Blob,
+}
+
 /// One sealed column or edge endpoint as the manifest stores it.
 struct ManifestSegment {
     col: u32,
-    ty: PropType,
+    ty: SealKind,
     meta: SegmentMeta,
 }
 
@@ -70,8 +81,8 @@ fn encode_manifest(table: u32, kind: u8, rows: u64, segments: &[ManifestSegment]
     for seg in segments {
         out.extend_from_slice(&seg.col.to_le_bytes());
         out.push(match seg.ty {
-            PropType::Int => 0,
-            PropType::Str => 1,
+            SealKind::Lane => 0,
+            SealKind::Blob => 1,
         });
         seg.meta.encode(&mut out);
     }
@@ -104,8 +115,8 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
             .ok_or_else(|| corrupt("truncated segment entry".into()))?;
         let col = u32::from_le_bytes(fixed[..4].try_into().unwrap());
         let ty = match fixed[4] {
-            0 => PropType::Int,
-            1 => PropType::Str,
+            0 => SealKind::Lane,
+            1 => SealKind::Blob,
             other => return Err(corrupt(format!("unknown column type {other}"))),
         };
         let (meta, next) = SegmentMeta::decode(bytes, pos + 5)?;
@@ -217,14 +228,11 @@ pub fn ingest_nodes(
         let stored = dir.columns.get(col as usize).ok_or_else(|| {
             ZuError::InvalidArgument(format!("ingest names no stored column at position {col}"))
         })?;
-        let ty = match values {
-            PropValues::Int(_) => PropType::Int,
-            PropValues::Str(_) => PropType::Str,
-        };
+        let ty = values.ty();
         if stored.ty != ty {
             return Err(ZuError::InvalidArgument(format!(
-                "ingest column '{}' does not match its stored type",
-                stored.name
+                "ingest column '{}' holds {ty}, the stored column holds {}",
+                stored.name, stored.ty
             )));
         }
         if std::mem::replace(&mut covered[col as usize], true) {
@@ -246,17 +254,21 @@ pub fn ingest_nodes(
             let mut segments = Vec::with_capacity(cols.len());
             let mut wal_cols = Vec::with_capacity(cols.len());
             for &(col, ref values) in cols {
-                let (ty, meta, wal_values) = match values {
-                    PropValues::Int(v) => (
-                        PropType::Int,
-                        write_segment(db, v)?,
-                        WalValues::Int(v.to_vec()),
+                // The overlay carries lane columns as words, whatever
+                // the words mean, and the stored column's type is what
+                // reads them back. So the seal only splits two ways.
+                let (ty, meta, wal_values) = match (values.lane(), values) {
+                    (Some(words), _) => (
+                        SealKind::Lane,
+                        write_segment(db, &words)?,
+                        WalValues::Int(words.into_owned()),
                     ),
-                    PropValues::Str(v) => (
-                        PropType::Str,
+                    (None, PropValues::Str(v) | PropValues::Bytes(v)) => (
+                        SealKind::Blob,
                         write_blob_segment(db, v)?,
                         WalValues::Str(v.iter().map(|s| s.to_vec()).collect()),
                     ),
+                    (None, _) => unreachable!("every variable width column is a blob"),
                 };
                 segments.push(ManifestSegment { col, ty, meta });
                 wal_cols.push(WalColumn {
@@ -318,12 +330,12 @@ pub fn ingest_edges(
             let segments = vec![
                 ManifestSegment {
                     col: 0,
-                    ty: PropType::Int,
+                    ty: SealKind::Lane,
                     meta: write_segment(db, src)?,
                 },
                 ManifestSegment {
                     col: 1,
-                    ty: PropType::Int,
+                    ty: SealKind::Lane,
                     meta: write_segment(db, dst)?,
                 },
             ];
@@ -372,12 +384,12 @@ pub(crate) fn resolve(
     }
     let read_values = |db: &mut Zu1File, seg: &ManifestSegment| -> Result<WalValues> {
         Ok(match seg.ty {
-            PropType::Int => {
+            SealKind::Lane => {
                 let mut values = Vec::with_capacity(manifest.rows as usize);
                 read_segment(db, &seg.meta, &mut values)?;
                 WalValues::Int(values)
             }
-            PropType::Str => {
+            SealKind::Blob => {
                 let (mut bytes, mut ends) = (Vec::new(), Vec::new());
                 read_blob_segment(db, &seg.meta, &mut bytes, &mut ends)?;
                 let mut values = Vec::with_capacity(ends.len());
@@ -852,7 +864,7 @@ mod tests {
             2,
             &[ManifestSegment {
                 col: 0,
-                ty: PropType::Int,
+                ty: SealKind::Lane,
                 meta,
             }],
         );

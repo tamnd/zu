@@ -1,20 +1,29 @@
-//! Node property columns, the slice of the column catalog the M2 LDBC
-//! subset needs. A node table's entry in the table index points at a
-//! props directory chain: string columns stored as FullZip blob
-//! segments, integer columns as cascade-encoded u64 segments, every
-//! column row-aligned with the table's row domain. The full typed
-//! column catalog is milestone 3 (docs/04 section 5, docs/12); the
-//! encoding here is version-prefixed so that catalog replaces this
-//! with a version bump, not a migration.
+//! Node property columns. A node table's entry in the table index
+//! points at a props directory chain: variable width columns stored as
+//! FullZip blob segments, fixed width columns as cascade-encoded u64
+//! segments, every column row-aligned with the table's row domain.
+//!
+//! A column carries a [`LogicalType`] from the lattice of gql/plan/02,
+//! which is what tells a reader whether the word it pulls out of a
+//! fixed width lane is a count, a truth value, a float, a day or a
+//! nanosecond. The lane itself does not care: the cascade encodes 64
+//! bit words, so a boolean, a float and a date all ride the encoding
+//! the integer columns already had, and only the type at the top says
+//! what a word means. This is the whole reason properties can widen
+//! past strings and integers without a second storage path.
 //!
 //! Directory layout: `version: u16`, `node_count: u64`,
 //! `column_count: u32`, then per column `name_len: u16` + UTF-8 bytes,
-//! `type: u8` (0 string, 1 integer), and the column's `SegmentMeta`.
+//! `type: u8` (a code from [`TYPE_CODES`]), and the column's
+//! `SegmentMeta`.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use zu_common::{Result, ZuError, int_key};
+use zu_common::{
+    DurationKind, FloatBits, IntBits, LogicalType, PhysicalType, Result, ZuError, int_key,
+};
 
 use crate::catalog::{Catalog, TableIndex};
 use crate::file::{BlockPtr, Zu1File};
@@ -26,20 +35,180 @@ use crate::segment::{
 };
 use crate::stats;
 
-const PROPS_VERSION: u16 = 1;
+/// Version 1 held a one byte type that could say string or integer and
+/// nothing else. Version 2 holds a code from [`TYPE_CODES`], which is
+/// the storable part of the logical lattice. Version 1 directories are
+/// still read, because a file written before this is not wrong, it is
+/// just narrow.
+const PROPS_VERSION: u16 = 2;
 const MAX_NAME_LEN: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PropType {
-    Str,
-    Int,
+/// The property types a column can be declared as, and the byte that
+/// stands for each one on disk.
+///
+/// This is deliberately a table of whole types rather than a codec over
+/// [`LogicalType`]. A property column is one of these or it is not
+/// storable, and a reader that meets a code it does not know should say
+/// so rather than reconstruct a type out of flags. Codes 0 and 1 keep
+/// the meaning they had in version 1 so the two versions read the same.
+static TYPE_CODES: [(u8, LogicalType); 18] = [
+    (
+        0,
+        LogicalType::Str {
+            min: None,
+            max: None,
+            fixed: false,
+        },
+    ),
+    (
+        1,
+        LogicalType::Int {
+            signed: true,
+            bits: IntBits::B64,
+            precision: None,
+        },
+    ),
+    (2, LogicalType::Bool),
+    (
+        3,
+        LogicalType::Float {
+            bits: FloatBits::B64,
+            precision: None,
+        },
+    ),
+    (4, LogicalType::Date),
+    (5, LogicalType::LocalTime),
+    (6, LogicalType::LocalDatetime),
+    (7, LogicalType::Duration(DurationKind::DayTime)),
+    (8, LogicalType::Duration(DurationKind::YearMonth)),
+    (
+        9,
+        LogicalType::Float {
+            bits: FloatBits::B32,
+            precision: None,
+        },
+    ),
+    (
+        10,
+        LogicalType::Int {
+            signed: true,
+            bits: IntBits::B8,
+            precision: None,
+        },
+    ),
+    (
+        11,
+        LogicalType::Int {
+            signed: true,
+            bits: IntBits::B16,
+            precision: None,
+        },
+    ),
+    (
+        12,
+        LogicalType::Int {
+            signed: true,
+            bits: IntBits::B32,
+            precision: None,
+        },
+    ),
+    (
+        13,
+        LogicalType::Int {
+            signed: false,
+            bits: IntBits::B8,
+            precision: None,
+        },
+    ),
+    (
+        14,
+        LogicalType::Int {
+            signed: false,
+            bits: IntBits::B16,
+            precision: None,
+        },
+    ),
+    (
+        15,
+        LogicalType::Int {
+            signed: false,
+            bits: IntBits::B32,
+            precision: None,
+        },
+    ),
+    (
+        16,
+        LogicalType::Int {
+            signed: false,
+            bits: IntBits::B64,
+            precision: None,
+        },
+    ),
+    (
+        17,
+        LogicalType::Bytes {
+            min: None,
+            max: None,
+            fixed: false,
+        },
+    ),
+];
+
+/// The code a column of this type is written under, `None` when the
+/// type is not storable as a property column yet.
+fn type_code(ty: &LogicalType) -> Option<u8> {
+    TYPE_CODES.iter().find(|(_, t)| t == ty).map(|(c, _)| *c)
+}
+
+fn code_type(code: u8) -> Option<LogicalType> {
+    TYPE_CODES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, t)| t.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropColumn {
     pub name: String,
-    pub ty: PropType,
+    pub ty: LogicalType,
     pub meta: SegmentMeta,
+}
+
+impl PropColumn {
+    /// Whether this column stores in the fixed width lane, which is one
+    /// 64 bit word per row through the integer cascade, as against the
+    /// blob segments a string or a byte string uses.
+    ///
+    /// Every fixed stride type of eight bytes or less rides the lane:
+    /// the cascade encodes words and does not care what the bits mean,
+    /// and the column's type is what says whether a word is a count, a
+    /// truth value, a float, a day or a nanosecond.
+    pub fn is_lane(&self) -> bool {
+        lane_type(&self.ty)
+    }
+}
+
+/// Whether values of this type ride the fixed width lane.
+fn lane_type(ty: &LogicalType) -> bool {
+    matches!(
+        ty.physical(),
+        Some(
+            PhysicalType::Bool
+                | PhysicalType::I8
+                | PhysicalType::I16
+                | PhysicalType::I32
+                | PhysicalType::I64
+                | PhysicalType::U8
+                | PhysicalType::U16
+                | PhysicalType::U32
+                | PhysicalType::U64
+                | PhysicalType::F32
+                | PhysicalType::F64
+                | PhysicalType::Days32
+                | PhysicalType::Nanos64
+                | PhysicalType::Months32
+        )
+    )
 }
 
 /// The property columns of one node table.
@@ -50,23 +219,121 @@ pub struct PropsDirectory {
 }
 
 /// Row-ordered values for one column at store time.
+///
+/// The fixed width arms all end up as 64 bit words in the same lane;
+/// they are kept apart here so a caller states what it is storing once,
+/// at the point where it still knows, rather than handing over a bag of
+/// words and a type that has to agree with them.
 #[derive(Debug, Clone, Copy)]
 pub enum PropValues<'a> {
     Str(&'a [&'a [u8]]),
+    Bytes(&'a [&'a [u8]]),
     Int(&'a [u64]),
+    Bool(&'a [bool]),
+    Float(&'a [f64]),
+    /// Days since the epoch.
+    Date(&'a [i32]),
+    /// Nanoseconds since midnight.
+    LocalTime(&'a [i64]),
+    /// Nanoseconds since the epoch.
+    LocalDatetime(&'a [i64]),
+    /// Months for a year-month duration, nanoseconds for a day-time one.
+    Duration(DurationKind, &'a [i64]),
 }
 
 impl PropValues<'_> {
     /// Rows this column carries.
     pub fn len(&self) -> usize {
         match self {
-            PropValues::Str(v) => v.len(),
+            PropValues::Str(v) | PropValues::Bytes(v) => v.len(),
             PropValues::Int(v) => v.len(),
+            PropValues::Bool(v) => v.len(),
+            PropValues::Float(v) => v.len(),
+            PropValues::Date(v) => v.len(),
+            PropValues::LocalTime(v) | PropValues::LocalDatetime(v) => v.len(),
+            PropValues::Duration(_, v) => v.len(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The type a column holding these values is declared as.
+    pub fn ty(&self) -> LogicalType {
+        match self {
+            PropValues::Str(_) => LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false,
+            },
+            PropValues::Bytes(_) => LogicalType::Bytes {
+                min: None,
+                max: None,
+                fixed: false,
+            },
+            PropValues::Int(_) => LogicalType::Int {
+                signed: true,
+                bits: IntBits::B64,
+                precision: None,
+            },
+            PropValues::Bool(_) => LogicalType::Bool,
+            PropValues::Float(_) => LogicalType::Float {
+                bits: FloatBits::B64,
+                precision: None,
+            },
+            PropValues::Date(_) => LogicalType::Date,
+            PropValues::LocalTime(_) => LogicalType::LocalTime,
+            PropValues::LocalDatetime(_) => LogicalType::LocalDatetime,
+            PropValues::Duration(kind, _) => LogicalType::Duration(*kind),
+        }
+    }
+
+    /// The lane words for a fixed width column, `None` for the blob
+    /// arms. Signed values sit in the lane two's complement, floats sit
+    /// there as their IEEE bits; the column's type is what says which.
+    ///
+    /// Integer columns borrow rather than copy, which is not a detail:
+    /// they are the column a bulk load is mostly made of, and the load
+    /// is measured in nodes per second, so a widening that made every
+    /// integer column a fresh allocation would be a real cost paid by
+    /// every load for the sake of the arms that need one.
+    pub(crate) fn lane(&self) -> Option<Cow<'_, [u64]>> {
+        Some(match self {
+            PropValues::Str(_) | PropValues::Bytes(_) => return None,
+            PropValues::Int(v) => Cow::Borrowed(*v),
+            PropValues::Bool(v) => v.iter().map(|&b| u64::from(b)).collect(),
+            PropValues::Float(v) => v.iter().map(|&f| f.to_bits()).collect(),
+            PropValues::Date(v) => v.iter().map(|&d| i64::from(d) as u64).collect(),
+            PropValues::LocalTime(v) | PropValues::LocalDatetime(v) => {
+                v.iter().map(|&n| n as u64).collect()
+            }
+            PropValues::Duration(_, v) => v.iter().map(|&n| n as u64).collect(),
+        })
+    }
+
+    /// The sort key of every value, what the estimator's histogram is
+    /// built over. Floats go through the IEEE total order so a range
+    /// estimate over a float column reads the same order a comparison
+    /// does, rather than the order of the raw bit pattern.
+    fn keys(&self) -> Option<Vec<[u8; 8]>> {
+        let words = self.lane()?;
+        Some(match self {
+            PropValues::Float(_) => words.iter().map(|&w| int_key(float_key(w))).collect(),
+            _ => words.iter().map(|&w| int_key(w as i64)).collect(),
+        })
+    }
+}
+
+/// The IEEE 754 total order of a float, as a signed integer: negatives
+/// invert so they sort under positives, positives get their sign bit
+/// flipped on so they sort over them.
+fn float_key(bits: u64) -> i64 {
+    let signed = bits as i64;
+    if signed < 0 {
+        !signed
+    } else {
+        signed ^ i64::MIN
     }
 }
 
@@ -75,6 +342,22 @@ fn corrupt(detail: String) -> ZuError {
         what: "props directory",
         detail,
     }
+}
+
+/// A fixed width read asked of a column that is stored as blobs.
+fn not_lane(column: &PropColumn) -> ZuError {
+    ZuError::InvalidArgument(format!(
+        "column '{}' holds {} and is not a fixed width column",
+        column.name, column.ty
+    ))
+}
+
+/// A blob read asked of a column that is stored in the lane.
+fn not_blob(column: &PropColumn) -> ZuError {
+    ZuError::InvalidArgument(format!(
+        "column '{}' holds {} and is not a variable width column",
+        column.name, column.ty
+    ))
 }
 
 impl PropsDirectory {
@@ -86,10 +369,9 @@ impl PropsDirectory {
         for col in &self.columns {
             out.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
             out.extend_from_slice(col.name.as_bytes());
-            out.push(match col.ty {
-                PropType::Str => 0,
-                PropType::Int => 1,
-            });
+            // Unstorable types are refused at store time, so a column
+            // that reached the directory has a code.
+            out.push(type_code(&col.ty).expect("column type is storable"));
             col.meta.encode(&mut out);
         }
         out
@@ -100,7 +382,11 @@ impl PropsDirectory {
             .get(..14)
             .ok_or_else(|| corrupt("truncated header".into()))?;
         let version = u16::from_le_bytes(head[..2].try_into().unwrap());
-        if version != PROPS_VERSION {
+        // Version 1 is still read. It only ever wrote codes 0 and 1,
+        // and those two codes mean in version 2 what they meant then,
+        // so the difference between the versions is which codes may
+        // appear rather than how any of them decodes.
+        if version != PROPS_VERSION && version != 1 {
             return Err(ZuError::Unsupported {
                 what: "props directory version",
                 id: u32::from(version),
@@ -134,9 +420,14 @@ impl PropsDirectory {
                 String::from_utf8(raw.to_vec()).map_err(|_| corrupt("name is not UTF-8".into()))?;
             pos += len;
             let ty = match bytes.get(pos) {
-                Some(0) => PropType::Str,
-                Some(1) => PropType::Int,
-                Some(t) => return Err(corrupt(format!("unknown column type {t}"))),
+                Some(&code) if version >= PROPS_VERSION || code <= 1 => {
+                    code_type(code).ok_or_else(|| corrupt(format!("unknown column type {code}")))?
+                }
+                Some(code) => {
+                    return Err(corrupt(format!(
+                        "column type {code} in a version {version} directory"
+                    )));
+                }
                 None => return Err(corrupt("truncated column type".into())),
             };
             pos += 1;
@@ -201,18 +492,27 @@ pub fn store_props(
         // where the estimator's statistics get built: a COPY that
         // brings properties leaves the optimizer able to reason about
         // them, without anyone remembering to ANALYZE (perf/12 §1).
-        let stat = match values {
-            PropValues::Str(v) => stats::column_stats(v),
-            PropValues::Int(v) => {
-                let keys: Vec<[u8; 8]> = v.iter().map(|&x| int_key(x as i64)).collect();
+        let ty = values.ty();
+        if type_code(&ty).is_none() {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{name}' has type {ty}, which is not storable as a property"
+            )));
+        }
+        let stat = match values.keys() {
+            Some(keys) => {
                 let refs: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
                 stats::column_stats(&refs)
             }
+            None => match values {
+                PropValues::Str(v) | PropValues::Bytes(v) => stats::column_stats(v),
+                _ => unreachable!("every fixed width column has lane keys"),
+            },
         };
         col_stats.insert((*name).to_string(), stat);
-        let (ty, meta) = match values {
-            PropValues::Str(v) => (PropType::Str, write_blob_segment(db, v)?),
-            PropValues::Int(v) => (PropType::Int, write_segment(db, v)?),
+        let meta = match (values.lane(), values) {
+            (Some(words), _) => write_segment(db, &words)?,
+            (None, PropValues::Str(v) | PropValues::Bytes(v)) => write_blob_segment(db, v)?,
+            (None, _) => unreachable!("every variable width column is a blob"),
         };
         cols.push(PropColumn {
             name: (*name).to_string(),
@@ -340,11 +640,8 @@ impl PropsReader {
         out: &mut Vec<u64>,
     ) -> Result<()> {
         let column = &self.directory.columns[col];
-        if column.ty != PropType::Int {
-            return Err(ZuError::InvalidArgument(format!(
-                "column '{}' is not an integer column",
-                column.name
-            )));
+        if !column.is_lane() {
+            return Err(not_lane(column));
         }
         let dir = self.int_dir(db, col)?;
         let meta = &self.directory.columns[col].meta;
@@ -364,11 +661,8 @@ impl PropsReader {
         ends: &mut Vec<u64>,
     ) -> Result<()> {
         let column = &self.directory.columns[col];
-        if column.ty != PropType::Str {
-            return Err(ZuError::InvalidArgument(format!(
-                "column '{}' is not a string column",
-                column.name
-            )));
+        if column.is_lane() {
+            return Err(not_blob(column));
         }
         bytes.clear();
         ends.clear();
@@ -409,11 +703,8 @@ impl PropsReader {
         out: &mut Vec<u64>,
     ) -> Result<()> {
         let meta = &self.directory.columns[col].meta;
-        if self.directory.columns[col].ty != PropType::Int {
-            return Err(ZuError::InvalidArgument(format!(
-                "column '{}' is not an integer column",
-                self.directory.columns[col].name
-            )));
+        if !self.directory.columns[col].is_lane() {
+            return Err(not_lane(&self.directory.columns[col]));
         }
         if let std::collections::btree_map::Entry::Vacant(slot) = self.int_state.entry(col) {
             let pools = db.pools();
@@ -465,11 +756,8 @@ impl PropsReader {
         out_ends: &mut Vec<u64>,
     ) -> Result<()> {
         let meta = &self.directory.columns[col].meta;
-        if self.directory.columns[col].ty != PropType::Str {
-            return Err(ZuError::InvalidArgument(format!(
-                "column '{}' is not a string column",
-                self.directory.columns[col].name
-            )));
+        if self.directory.columns[col].is_lane() {
+            return Err(not_blob(&self.directory.columns[col]));
         }
         let order = &mut self.order_scratch;
         order.clear();
@@ -754,6 +1042,156 @@ mod tests {
         let four: Vec<&[u8]> = vec![b"a"; 4];
         let err = store_props(&mut db, "nobody", &[("x", PropValues::Str(&four))]).unwrap_err();
         assert!(err.to_string().contains("no node table"), "{err}");
+    }
+
+    #[test]
+    fn every_lane_type_round_trips_through_the_same_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let flags = [true, false, false, true];
+        let scores = [1.5f64, -0.25, f64::MAX, 0.0];
+        let days = [0i32, -1, 19_000, i32::MIN];
+        let nanos = [0i64, 86_399_999_999_999, -5, i64::MAX];
+        let months = [0i64, 13, -13, 240];
+        let raw: Vec<&[u8]> = vec![b"\x00\xff", b"", b"\x01", b"\xfe\xed"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("flag", PropValues::Bool(&flags)),
+                ("score", PropValues::Float(&scores)),
+                ("born", PropValues::Date(&days)),
+                ("at", PropValues::LocalTime(&nanos)),
+                (
+                    "age",
+                    PropValues::Duration(DurationKind::YearMonth, &months),
+                ),
+                ("blob", PropValues::Bytes(&raw)),
+            ],
+        )
+        .unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let loaded = load_props(&mut db, table).unwrap().unwrap();
+        // The type survives the directory, which is the whole point: a
+        // word out of the lane means nothing without it.
+        assert_eq!(loaded.columns[0].ty, LogicalType::Bool);
+        assert_eq!(
+            loaded.columns[1].ty,
+            LogicalType::Float {
+                bits: FloatBits::B64,
+                precision: None
+            }
+        );
+        assert_eq!(loaded.columns[2].ty, LogicalType::Date);
+        assert_eq!(loaded.columns[3].ty, LogicalType::LocalTime);
+        assert_eq!(
+            loaded.columns[4].ty,
+            LogicalType::Duration(DurationKind::YearMonth)
+        );
+        assert!(loaded.columns[..5].iter().all(PropColumn::is_lane));
+        assert!(!loaded.columns[5].is_lane());
+        let mut reader = PropsReader::new(loaded);
+        for row in 0..4u64 {
+            let mut word = |reader: &mut PropsReader, name: &str| {
+                let col = reader.col(name).unwrap();
+                reader.read_int(&mut db, col, row).unwrap()
+            };
+            assert_eq!(word(&mut reader, "flag") != 0, flags[row as usize]);
+            assert_eq!(
+                f64::from_bits(word(&mut reader, "score")),
+                scores[row as usize]
+            );
+            assert_eq!(
+                word(&mut reader, "born") as i64,
+                i64::from(days[row as usize])
+            );
+            assert_eq!(word(&mut reader, "at") as i64, nanos[row as usize]);
+            assert_eq!(word(&mut reader, "age") as i64, months[row as usize]);
+            let col = reader.col("blob").unwrap();
+            let mut out = Vec::new();
+            reader.read_str(&mut db, col, row, &mut out).unwrap();
+            assert_eq!(out, raw[row as usize]);
+        }
+        // The two shapes refuse each other's reads, and the message
+        // names the type rather than saying "not an integer column".
+        let blob = reader.col("blob").unwrap();
+        let err = reader
+            .gather_int(&mut db, blob, &[0], &mut Vec::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("BYTES"), "{err}");
+        let score = reader.col("score").unwrap();
+        let err = reader
+            .scan_str_range(&mut db, score, 0, 1, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("FLOAT"), "{err}");
+    }
+
+    #[test]
+    fn a_version_1_directory_still_reads() {
+        // Written by hand in the old layout: one string column and one
+        // integer column, type codes 0 and 1, which is every type
+        // version 1 could hold.
+        let meta = SegmentMeta {
+            value_count: 2,
+            payload_len: 16,
+            uncompressed_bytes: 16,
+            min: 1,
+            max: 2,
+            crc: 0,
+            structural: crate::segment::Structural::MiniBlock,
+            sorted: false,
+            blocks: vec![7],
+        };
+        let mut old = Vec::new();
+        old.extend_from_slice(&1u16.to_le_bytes());
+        old.extend_from_slice(&2u64.to_le_bytes());
+        old.extend_from_slice(&2u32.to_le_bytes());
+        for (name, code) in [("s", 0u8), ("i", 1u8)] {
+            old.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            old.extend_from_slice(name.as_bytes());
+            old.push(code);
+            meta.encode(&mut old);
+        }
+        let dir = PropsDirectory::decode(&old).unwrap();
+        assert_eq!(
+            dir.columns[0].ty,
+            LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false
+            }
+        );
+        assert_eq!(
+            dir.columns[1].ty,
+            LogicalType::Int {
+                signed: true,
+                bits: IntBits::B64,
+                precision: None
+            }
+        );
+        // A version 2 code in a version 1 directory is a file that
+        // cannot have been written by either version.
+        let mut forged = old.clone();
+        let at = forged.len() - meta_len(&meta) - 1;
+        forged[at] = 3;
+        assert!(PropsDirectory::decode(&forged).is_err());
+        // Re-encoding lifts it to the current version without moving
+        // any bytes of the two columns' meaning.
+        let again = PropsDirectory::decode(&dir.encode()).unwrap();
+        assert_eq!(again, dir);
+        assert_eq!(u16::from_le_bytes(dir.encode()[..2].try_into().unwrap()), 2);
+    }
+
+    /// Encoded length of a segment meta, so the version 1 test can find
+    /// the last column's type byte without hardcoding a size.
+    fn meta_len(meta: &SegmentMeta) -> usize {
+        let mut out = Vec::new();
+        meta.encode(&mut out);
+        out.len()
     }
 
     #[test]

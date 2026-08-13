@@ -57,6 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use zu_common::gqlstatus::DiagnosticRecord;
 use zu_common::{Result, ZuError};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
@@ -155,11 +156,47 @@ fn chain_has_node(link: &PathLink, table: u32, offset: u64) -> bool {
     false
 }
 
-/// The rows a query returns, one column name per RETURN item.
-#[derive(Debug, Clone, PartialEq)]
+/// The rows a query returns, one column name per RETURN item, plus any
+/// conditions raised along the way that did not stop it.
+///
+/// `notices` is the other half of the GQLSTATUS envelope
+/// (Spec/2064g/gql/plan/07). An exception replaces the result and comes
+/// back as `Err`; a warning or a completion condition rides with the
+/// answer and lands here, because a statement that dropped a null out of
+/// an aggregate still has rows to give you and the standard still wants
+/// you told. Almost every query leaves this empty, so it costs one empty
+/// `Vec` and no allocation on the path that raises nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+    pub notices: Vec<DiagnosticRecord>,
+}
+
+impl QueryResult {
+    /// A result with no conditions attached, which is the common case.
+    pub fn new(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
+        QueryResult {
+            columns,
+            rows,
+            notices: Vec::new(),
+        }
+    }
+
+    /// Attaches a condition to a result that is still an answer. Nothing
+    /// here may be an exception: an exception is not something a
+    /// statement returns alongside rows, it is what it returns instead.
+    pub fn notice(&mut self, record: DiagnosticRecord) {
+        debug_assert!(
+            record.severity().is_success(),
+            "an exception belongs in Err, not in notices: {record}"
+        );
+        // Aggregate warnings fire per group; the caller wants to know it
+        // happened, not how many times.
+        if !self.notices.iter().any(|n| n.status == record.status) {
+            self.notices.push(record);
+        }
+    }
 }
 
 /// What the executor needs from a storage engine. Methods take
@@ -4559,10 +4596,7 @@ fn run_stages(
             ));
         }
     }
-    Ok(QueryResult {
-        columns: query.columns.clone(),
-        rows,
-    })
+    Ok(QueryResult::new(query.columns.clone(), rows))
 }
 
 /// available_parallelism, resolved once for the process. On Linux the

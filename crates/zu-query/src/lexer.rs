@@ -8,6 +8,7 @@
 //! deliberately not tokens: `a < -1` must lex as less-than then minus,
 //! so the parser assembles pattern arrows from the single characters.
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 
 /// One lexed token with its byte span in the source.
@@ -113,8 +114,13 @@ pub fn position(source: &str, offset: usize) -> String {
     format!("line {line}, column {col}")
 }
 
+/// Every failure the lexer can produce is a `42001 invalid syntax`:
+/// the text is not GQL. Anything richer than that is the parser's job.
 fn err(source: &str, offset: usize, detail: &str) -> ZuError {
-    ZuError::InvalidArgument(format!("{}: {detail}", position(source, offset)))
+    ZuError::gql(
+        codes::C42001,
+        format!("{}: {detail}", position(source, offset)),
+    )
 }
 
 /// Lexes the whole source into tokens.

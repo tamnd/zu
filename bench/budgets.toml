@@ -609,11 +609,12 @@ exec_sip_select_mrows_s = 50.0
 # host spends its time. The range saves a decode, so it wins where
 # decoding is the cost. The mask saves one probe, one random read of
 # the join's directory, so it wins where a random read is the cost and
-# is a wash where the whole table sits in cache. Measured at 7124380,
-# both passes on each host: the range 1.4x on the local M series, 1.3
-# on gamingpc, 1.3 to 1.4 on server1; the mask 1.0x locally, 1.1 on
-# gamingpc, 1.2 to 1.6 on server1. The two are complements, and on
-# every host one of them is a clear win while the other sits near one.
+# is a wash where the whole table sits in cache. Measured at 4407926,
+# both passes on each host: the range 1.3 to 1.4x on the local M
+# series, 1.3 on gamingpc, 1.4 to 1.6 on server1; the mask 1.0x
+# locally, 1.1 on gamingpc, 1.2 to 1.4 on server1. The two are
+# complements, and on every host one of them is a clear win while the
+# other sits near one.
 #
 # So the two per shape floors are no regression gates, set under the
 # lowest either has come back, and exec_sip_best_x is the one that says

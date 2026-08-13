@@ -91,31 +91,36 @@
 //! directory, so a test that costs a random read of its own and is
 //! sometimes wrong about the row has nothing left to win. On the join
 //! bench, against the same plan with ZU_SIP=0, the mask runs 1.0x on
-//! the local M series, 1.1x on gamingpc and 1.2 to 1.6x on server1,
+//! the local M series, 1.1x on gamingpc and 1.2 to 1.4x on server1,
 //! and the bloom ran 0.8 to 0.9x locally before it was taken back out.
 //! A scan that took the filter instead of an operator over rows it has
 //! already decoded is what would give the inexact one something real to
 //! save, and that is not written yet.
 //!
-//! The range is published either way and runs 1.4x locally, 1.3x on
-//! gamingpc and 1.3 to 1.4x on server1. Read the two sets together
-//! rather than one at a time. They are complements: the range saves a
-//! decode and the mask saves a random read, so each wins on the host
-//! where the thing it removes is what that host is short of, and sits
-//! near one on the host where it is not. On the local M series the
-//! join's directory is in cache and the probe the mask skips was never
-//! expensive, so there the mask is the wash and the range is the win;
-//! on server1 it is the other way round. On every host one of the two
-//! is a clear win, which is what the bench gates. Both sets are timed
-//! on and off alternately, because timing them as two blocks of runs
-//! lets a box that drifts over those few seconds put the drift in the
-//! ratio, and that alone was most of the spread these numbers used to
-//! have. Neither shape is the pass at its best. The optimizer
-//! drives the side it estimated cheaper and builds the dearer one, so
-//! the filter is published from the big side onto the small one, which
-//! is the direction with the least to gain, and the build of the big
-//! side is in the number either way. The join side choice is what
-//! changes that, and it is not this file.
+//! The range is published either way and runs 1.3 to 1.4x locally,
+//! 1.3x on gamingpc and 1.4 to 1.6x on server1. Read the two sets
+//! together rather than one at a time. They are complements: the range
+//! saves a decode and the mask saves a random read, so each is worth
+//! most on the host that is short of the thing it removes. On the
+//! local M series the join's directory sits in cache and the probe the
+//! mask skips was never expensive, so there the mask is a wash and the
+//! range is the whole win. On server1, which has neither the cache nor
+//! the memory headroom, both halves pay. On every host at least one of
+//! the two is a clear win, which is what the bench gates.
+//!
+//! Both sets are timed on and off alternately, and with a few rounds
+//! of each before the clock starts. Timing them as two blocks lets a
+//! box that drifts over those few seconds put the drift in the ratio,
+//! and warming only one round leaves the pass straight after a build
+//! reading about a fifth low. Those two between them were most of the
+//! spread these numbers used to have.
+//!
+//! Neither shape is the pass at its best. The optimizer drives the
+//! side it estimated cheaper and builds the dearer one, so the filter
+//! is published from the big side onto the small one, which is the
+//! direction with the least to gain, and the build of the big side is
+//! in the number either way. The join side choice is what changes
+//! that, and it is not this file.
 //!
 //! A filter that turns out to reject nothing is worse than no filter,
 //! so the operator watches its own rejection rate over the first few

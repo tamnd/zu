@@ -26,6 +26,16 @@ fn invalid(detail: String) -> ZuError {
 /// One aggregate accumulator, the integer subset of the old engine's
 /// Acc with identical finalize semantics: sum of nothing is 0, avg of
 /// nothing is null, min and max of nothing are null.
+///
+/// There is deliberately no counterpart here to the old engine's
+/// `01G11 null value eliminated in set function`. This accumulator
+/// never sees a null: `Compiler::agg_spec` declines an argument off an
+/// optional level or off a kernel column that answers null, and dense
+/// stored columns have a value on every row. So a statement that could
+/// raise the warning is one this executor refused to compile, and the
+/// old engine raises it there. If that gate ever loosens, the warning
+/// has to arrive here at the same time, or the two executors will
+/// answer the same query with two different envelopes.
 #[derive(Clone, Copy)]
 pub(crate) enum Acc {
     Count(i64),

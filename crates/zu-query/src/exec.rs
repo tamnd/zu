@@ -2144,6 +2144,10 @@ struct StageCtx<'a> {
     /// Filled only when profiling, and only so the flat row count can
     /// be accumulated.
     live: Vec<Vec<usize>>,
+    /// Conditions raised while running this stage that did not stop it.
+    /// Drained into the result by whoever owns the stage. Empty on
+    /// every query that raises nothing, which is nearly all of them.
+    notices: Vec<DiagnosticRecord>,
 }
 
 fn value_of(ctx: &mut StageCtx, slot: usize) -> Result<Value> {
@@ -3884,6 +3888,12 @@ struct AggState {
     /// DISTINCT arguments collect into a set first; multiplicities do
     /// not apply under set semantics.
     distinct: Option<BTreeSet<OrdValue>>,
+    /// Whether a null was dropped on the way in. Set functions ignore
+    /// nulls, and the standard wants the caller told that they did:
+    /// `01G11 null value eliminated in set function`. A flag rather
+    /// than a count, because the warning is raised once and the number
+    /// of nulls is not part of it.
+    nulls_eliminated: bool,
 }
 
 impl AggState {
@@ -3898,7 +3908,11 @@ impl AggState {
             Func::Id | Func::Size => unreachable!("scalar function as an aggregate"),
         };
         let distinct = (spec.distinct && !spec.star).then(BTreeSet::new);
-        AggState { acc, distinct }
+        AggState {
+            acc,
+            distinct,
+            nulls_eliminated: false,
+        }
     }
 
     fn add_star(&mut self, mult: i64) {
@@ -3909,6 +3923,9 @@ impl AggState {
 
     fn add(&mut self, v: Value, mult: i64) -> Result<()> {
         if matches!(v, Value::Null) {
+            // count(*) never lands here: it has no argument, so it has
+            // no null to eliminate. Every other set function does.
+            self.nulls_eliminated = true;
             return Ok(());
         }
         if let Some(set) = &mut self.distinct {
@@ -3989,6 +4006,7 @@ impl AggState {
     /// the sequential run; both states come from the same spec, so the
     /// variants always line up.
     fn merge(&mut self, other: AggState) -> Result<()> {
+        self.nulls_eliminated |= other.nulls_eliminated;
         if let (Some(mine), Some(theirs)) = (&mut self.distinct, other.distinct) {
             mine.extend(theirs);
             return Ok(());
@@ -4163,9 +4181,18 @@ fn finalize_group(
     let mut values = Vec::with_capacity(sink.items.len());
     for item in &sink.items {
         let v = if item.aggregate {
-            sit.next()
-                .expect("one state per aggregate item")
-                .finalize()?
+            let state = sit.next().expect("one state per aggregate item");
+            // Read the flag before finalize consumes the state. The
+            // warning is per statement, not per group: notice() dedupes
+            // by status, so a thousand groups that each dropped a null
+            // report it once.
+            if state.nulls_eliminated {
+                ctx.notices.push(DiagnosticRecord::new(
+                    codes::C01G11,
+                    "a set function ignored one or more null arguments",
+                ));
+            }
+            state.finalize()?
         } else {
             kit.next().expect("one key value per key item").0
         };
@@ -4260,6 +4287,8 @@ fn apply_post(sink: &SinkDef, ctx: &mut StageCtx, mut rows: Vec<Row>) -> Result<
     Ok(rows)
 }
 
+/// Drives one stage to completion. Conditions the stage raised without
+/// stopping are left in `ctx.notices` for the caller to drain.
 fn run_stage(stage: &StageDef, query: &BoundQuery, ctx: &mut StageCtx) -> Result<Vec<Vec<Value>>> {
     let top = stage.descs.len() - 1;
     let sink = &stage.sink;
@@ -4388,6 +4417,7 @@ fn drive_worker(
         morsel: None,
         stats: Vec::new(),
         live: Vec::new(),
+        notices: Vec::new(),
     };
     let mut out = Vec::new();
     while let Some((ix, morsel)) = find_task(local, injector, stealers) {
@@ -4428,11 +4458,15 @@ fn drive_worker(
 /// graph as worker zero, and each fork carries one spawned worker.
 /// Partials merge in morsel order and the sink's finalize and post
 /// operators run once on the merged result.
+/// The morsel-parallel counterpart of [`run_stage`]. Workers only
+/// accumulate partials, so every condition is raised on the main thread
+/// while merging and finalizing, and comes back in `notices`.
 fn run_stage_parallel(
     job: &StageJob,
     graph: &mut dyn Graph,
     forks: &mut [Box<dyn Graph + Send>],
     morsels: Vec<Morsel>,
+    notices: &mut Vec<DiagnosticRecord>,
 ) -> Result<Vec<Vec<Value>>> {
     let total = morsels.len();
     let injector = crossbeam_deque::Injector::new();
@@ -4489,6 +4523,7 @@ fn run_stage_parallel(
         morsel: None,
         stats: Vec::new(),
         live: Vec::new(),
+        notices: Vec::new(),
     };
     let mut rows = Vec::new();
     if sink.aggregate {
@@ -4522,6 +4557,7 @@ fn run_stage_parallel(
         }
     }
     let rows = apply_post(sink, &mut ctx, rows)?;
+    notices.append(&mut ctx.notices);
     Ok(rows.into_iter().map(|r| r.values).collect())
 }
 
@@ -4588,6 +4624,7 @@ fn run_stages(
     // the fully sequential baseline.
     let mut forks: Option<Vec<Box<dyn Graph + Send>>> = None;
     let mut rows = Vec::new();
+    let mut notices = Vec::new();
     for stage in &stages {
         if threads > 1
             && profile.is_none()
@@ -4606,7 +4643,7 @@ fn run_stages(
                     counts: &counts,
                     params,
                 };
-                rows = run_stage_parallel(&job, graph, forks, morsels)?;
+                rows = run_stage_parallel(&job, graph, forks, morsels, &mut notices)?;
                 continue;
             }
         }
@@ -4641,9 +4678,11 @@ fn run_stages(
             } else {
                 Vec::new()
             },
+            notices: Vec::new(),
         };
         let started = Instant::now();
         rows = run_stage(stage, query, &mut ctx)?;
+        notices.append(&mut ctx.notices);
         if let Some(p) = profile.as_deref_mut() {
             p.stages.push(stage_profile(
                 stage,
@@ -4655,7 +4694,11 @@ fn run_stages(
             ));
         }
     }
-    Ok(QueryResult::new(query.columns.clone(), rows))
+    let mut result = QueryResult::new(query.columns.clone(), rows);
+    for record in notices {
+        result.notice(record);
+    }
+    Ok(result)
 }
 
 /// available_parallelism, resolved once for the process. On Linux the
@@ -5693,6 +5736,61 @@ mod tests {
     }
 
     #[test]
+    fn an_aggregate_that_skips_a_null_warns_with_01g11() {
+        // The optional group misses for most people, so avg() has a
+        // null argument on those rows and ignores it. The answer is
+        // still an answer, so it comes back with a warning beside it
+        // rather than an error instead of it.
+        let r = run(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 \
+             RETURN avg(b.id) AS avg_friend",
+            &[],
+        );
+        assert_eq!(r.notices.len(), 1);
+        assert_eq!(r.notices[0].status.code(), "01G11");
+        assert!(r.notices[0].severity().is_success());
+        // A warning is not an exception: the rows survived.
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn the_warning_is_raised_once_however_many_groups_dropped_a_null() {
+        let r = run(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 \
+             RETURN a.id AS id, avg(b.id) AS avg_friend ORDER BY id",
+            &[],
+        );
+        assert!(r.rows.len() > 1, "several groups, so several chances");
+        assert_eq!(
+            r.notices.len(),
+            1,
+            "one warning per statement, not per group"
+        );
+        assert_eq!(r.notices[0].status.code(), "01G11");
+    }
+
+    #[test]
+    fn an_aggregate_with_nothing_to_skip_says_nothing() {
+        let r = run("MATCH (a:Person) RETURN avg(a.id) AS avg_id", &[]);
+        assert!(r.notices.is_empty());
+        // count(*) has no argument, so it has no null to eliminate.
+        let star = run("MATCH (a:Person) RETURN count(*) AS n", &[]);
+        assert!(star.notices.is_empty());
+    }
+
+    #[test]
+    fn the_parallel_path_reports_the_same_warning_as_the_sequential_one() {
+        let source = "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 \
+                      RETURN avg(b.id) AS avg_friend";
+        let seq = run(source, &[]);
+        let par = run_par(source, &[]);
+        // Workers only accumulate partials, so the flag has to survive
+        // the merge for these two to agree.
+        assert_eq!(seq.notices, par.notices);
+        assert_eq!(seq.rows, par.rows);
+    }
+
+    #[test]
     fn a_result_with_no_columns_completes_with_00001() {
         // No statement zu parses reaches this yet: the grammar requires
         // a projection, so `columns` is never empty from a real query.
@@ -6043,6 +6141,7 @@ mod tests {
             morsel: None,
             stats: Vec::new(),
             live: Vec::new(),
+            notices: Vec::new(),
         };
         let rels = [RelStep {
             id: 2,

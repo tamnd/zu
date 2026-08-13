@@ -39,21 +39,33 @@ fn one_process_serves_statements_frames_and_errors() {
 
     // A bare statement, folded onto one line the way a client sends it.
     let r = ask(r"MATCH (a:person {id: 3})-[:follows]->(b)\nRETURN count(b) AS n");
-    assert!(r.starts_with("{\"columns\":[\"n\"],\"rows\":[["), "got {r}");
+    assert!(
+        r.starts_with("{\"gqlstatus\":\"00000\",\"columns\":[\"n\"],\"rows\":[["),
+        "got {r}"
+    );
 
     // A frame with parameters; same session, same process.
     let r = ask(
         r#"{"op":"query","q":"MATCH (a:person {id: $src})-[:follows]->(b) RETURN count(b) AS n","params":{"src":3}}"#,
     );
-    assert!(r.starts_with("{\"columns\":[\"n\"],\"rows\":[["), "got {r}");
+    assert!(
+        r.starts_with("{\"gqlstatus\":\"00000\",\"columns\":[\"n\"],\"rows\":[["),
+        "got {r}"
+    );
 
     // Prepare once, execute with different bindings, close.
     let r = ask(r#"{"op":"prepare","q":"MATCH (a:person {id: $src}) RETURN a.id AS id"}"#);
     assert_eq!(r, "{\"stmt\":1,\"params\":[\"src\"]}");
     let r = ask(r#"{"op":"execute","stmt":1,"params":{"src":5}}"#);
-    assert_eq!(r, "{\"columns\":[\"id\"],\"rows\":[[5]]}");
+    assert_eq!(
+        r,
+        "{\"gqlstatus\":\"00000\",\"columns\":[\"id\"],\"rows\":[[5]]}"
+    );
     let r = ask(r#"{"op":"execute","stmt":1,"params":{"src":9}}"#);
-    assert_eq!(r, "{\"columns\":[\"id\"],\"rows\":[[9]]}");
+    assert_eq!(
+        r,
+        "{\"gqlstatus\":\"00000\",\"columns\":[\"id\"],\"rows\":[[9]]}"
+    );
 
     // A missing binding is an error line, and the loop survives it.
     let r = ask(r#"{"op":"execute","stmt":1}"#);
@@ -68,7 +80,10 @@ fn one_process_serves_statements_frames_and_errors() {
     let r = ask(r#"{"op":"query","q":"#);
     assert!(r.contains("bad frame"), "got {r}");
     let r = ask("MATCH (a:person) RETURN count(a) AS n");
-    assert_eq!(r, "{\"columns\":[\"n\"],\"rows\":[[97]]}");
+    assert_eq!(
+        r,
+        "{\"gqlstatus\":\"00000\",\"columns\":[\"n\"],\"rows\":[[97]]}"
+    );
 
     let r = ask(r#"{"op":"quit"}"#);
     assert_eq!(r, "{\"bye\":true}");

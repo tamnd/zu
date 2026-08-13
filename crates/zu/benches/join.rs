@@ -198,6 +198,43 @@ fn measure(db: &mut Zu1File, source: &str, want: &Want, runs: usize) -> f64 {
     times[times.len() / 2]
 }
 
+/// Median ms of `source` with the sideways filter on and with it held
+/// back, timed alternately rather than as two blocks. The two medians
+/// are divided into each other and a machine that drifts between the
+/// first block and the second turns that drift into the answer. Cold
+/// caches, another tenant waking up and this box's own build finishing
+/// all drift in one direction over a few seconds, which is exactly the
+/// span two blocks of five runs cover. Alternating puts the same drift
+/// in both halves.
+fn measure_sip(db: &mut Zu1File, source: &str, want: &Want, runs: usize) -> (f64, f64) {
+    let mut on = Vec::with_capacity(runs);
+    let mut off = Vec::with_capacity(runs);
+    let time = |db: &mut Zu1File| {
+        let t = Instant::now();
+        let r = query::run(source, db, &[]).expect("timed run");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        check(&r, want, source);
+        ms
+    };
+    // One of each before the clock matters, so neither side pays for
+    // the other's first touch of a page.
+    time(db);
+    // SAFETY: same as the worker count above.
+    unsafe { std::env::set_var("ZU_SIP", "0") };
+    time(db);
+    unsafe { std::env::remove_var("ZU_SIP") };
+    for _ in 0..runs {
+        on.push(time(db));
+        // SAFETY: same as the worker count above.
+        unsafe { std::env::set_var("ZU_SIP", "0") };
+        off.push(time(db));
+        unsafe { std::env::remove_var("ZU_SIP") };
+    }
+    on.sort_by(f64::total_cmp);
+    off.sort_by(f64::total_cmp);
+    (on[on.len() / 2], off[off.len() / 2])
+}
+
 /// One case: the query the pipeline runs, the cut down one the old
 /// engine runs, and what each has to answer.
 struct Case {
@@ -498,17 +535,15 @@ fn main() {
     let mut worst_mask = f64::MAX;
     let mut worst_range = f64::MAX;
     for case in cases {
-        let new = measure(&mut db, &case.new, &case.want, 5);
-        // The same plan with the join's filter withheld, which is the
-        // baseline the sideways pass is worth measuring against: same
-        // rows, same order, one less thing known.
-        let off = (case.sip != Sip::No).then(|| {
-            // SAFETY: same as the worker count above.
-            unsafe { std::env::set_var("ZU_SIP", "0") };
-            let ms = measure(&mut db, &case.new, &case.want, 5);
-            unsafe { std::env::remove_var("ZU_SIP") };
-            ms
-        });
+        // The sideways shapes are timed against the same plan with the
+        // join's filter withheld, which is the only baseline worth
+        // comparing to: same rows, same order, one less thing known.
+        let (new, off) = if case.sip == Sip::No {
+            (measure(&mut db, &case.new, &case.want, 5), None)
+        } else {
+            let (on, off) = measure_sip(&mut db, &case.new, &case.want, 5);
+            (on, Some(off))
+        };
         // SAFETY: same as the worker count above.
         unsafe { std::env::set_var("ZU_EXEC2", "0") };
         let old = measure(&mut db, &case.old, &case.old_want, 1);

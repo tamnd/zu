@@ -636,16 +636,25 @@ fn query(
     }
 }
 
-/// Renders a result as one JSON object: `{"columns":[...],"rows":[[...]]}`,
-/// with a `"notices"` array when the statement raised a condition it
-/// survived. Hand-rolled because the CLI carries no JSON crate; G7 caps
-/// the binary at 15 MiB and this is the only place that needs one.
+/// Renders a result as one JSON object:
+/// `{"gqlstatus":"00000","columns":[...],"rows":[[...]]}`, with a
+/// `"notices"` array when the statement raised a condition it survived.
+/// Hand-rolled because the CLI carries no JSON crate; G7 caps the binary
+/// at 15 MiB and this is the only place that needs one.
+///
+/// `gqlstatus` is always present, because a statement that succeeded
+/// raised a condition too and a reader should not have to infer which one
+/// from the shape of the reply. It is the field a conformance harness
+/// grades, and leaving it out would mean the harness derives the code
+/// from the row count, which grades the harness rather than the engine.
 ///
 /// `notices` is omitted rather than empty on the common path. A reader
 /// that wants it can ask for the key; a reader that does not pays no
 /// bytes for it, and almost every statement raises nothing.
 fn render_json(r: &QueryResult) -> String {
-    let mut out = String::from("{\"columns\":[");
+    let mut out = String::from("{\"gqlstatus\":");
+    write_json_str(&mut out, r.status().code());
+    out.push_str(",\"columns\":[");
     for (i, c) in r.columns.iter().enumerate() {
         if i > 0 {
             out.push(',');
@@ -1019,17 +1028,30 @@ mod tests {
         };
         assert_eq!(
             render_json(&r),
-            "{\"columns\":[\"n\",\"name\"],\"rows\":[[3,\"Ada\"],[null,true]]}\n"
+            "{\"gqlstatus\":\"00000\",\"columns\":[\"n\",\"name\"],\
+             \"rows\":[[3,\"Ada\"],[null,true]]}\n"
         );
 
         // Empty is still a well-formed object, so a caller parsing
-        // stdout never has to special-case "no rows".
+        // stdout never has to special-case "no rows". It also still
+        // completes with 00000: a query whose binding table came back
+        // empty succeeded, it did not raise `02000 no data`.
         let empty = QueryResult {
             columns: vec!["d".into()],
             rows: vec![],
             notices: Vec::new(),
         };
-        assert_eq!(render_json(&empty), "{\"columns\":[\"d\"],\"rows\":[]}\n");
+        assert_eq!(
+            render_json(&empty),
+            "{\"gqlstatus\":\"00000\",\"columns\":[\"d\"],\"rows\":[]}\n"
+        );
+
+        // No projection is the one case that reports something else.
+        let omitted = QueryResult::new(Vec::new(), Vec::new());
+        assert_eq!(
+            render_json(&omitted),
+            "{\"gqlstatus\":\"00001\",\"columns\":[],\"rows\":[]}\n"
+        );
     }
 
     #[test]
@@ -1043,7 +1065,8 @@ mod tests {
         ));
         assert_eq!(
             render_json(&r),
-            "{\"columns\":[\"c\"],\"rows\":[[2]],\"notices\":[{\"gqlstatus\":\"01G11\",\
+            "{\"gqlstatus\":\"00000\",\"columns\":[\"c\"],\"rows\":[[2]],\
+             \"notices\":[{\"gqlstatus\":\"01G11\",\
              \"condition\":\"warning, null value eliminated in set function\",\
              \"severity\":\"warning\",\"message\":\"avg(n.age) skipped 3 nulls\"}]}\n"
         );
@@ -1076,7 +1099,8 @@ mod tests {
         };
         assert_eq!(
             render_json(&r),
-            "{\"columns\":[\"s\"],\"rows\":[[\"say \\\"hi\\\"\\n\\tpath\\\\to\"],\
+            "{\"gqlstatus\":\"00000\",\"columns\":[\"s\"],\
+             \"rows\":[[\"say \\\"hi\\\"\\n\\tpath\\\\to\"],\
              [\"bell\\u0007\"],[null],[null]]}\n"
         );
     }
@@ -1101,7 +1125,8 @@ mod tests {
         };
         assert_eq!(
             render_json(&r),
-            "{\"columns\":[\"a\",\"e\",\"p\"],\"rows\":[[{\"table\":0,\"offset\":7},\
+            "{\"gqlstatus\":\"00000\",\"columns\":[\"a\",\"e\",\"p\"],\
+             \"rows\":[[{\"table\":0,\"offset\":7},\
              {\"table\":1,\"src\":7,\"dst\":9},[1,[2]]]]}\n"
         );
     }

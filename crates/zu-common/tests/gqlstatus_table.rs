@@ -15,6 +15,13 @@
 //! bug and it silently reassigns four codes to the wrong classes, so the
 //! scanner handles the two spellings apart and a test pins the four codes
 //! that would move.
+//!
+//! One thing the artifact does not spell out: a `<class>` element is
+//! itself a GQLSTATUS value, its two-character code followed by `000`.
+//! The artifact only writes those out for the four classes that have no
+//! subclasses, because for the rest the class element is a container. So
+//! every class here emits a `{code}000` row whether or not it is
+//! self-closing, which is where `00000 successful completion` comes from.
 
 use std::path::PathBuf;
 
@@ -109,19 +116,22 @@ fn parse_artifact(xml: &str) -> Vec<Row> {
                 let code = attr(&inside, "code").expect("class code");
                 let class_name = attr(&inside, "name").expect("class name");
                 assert_eq!(code.len(), 2, "class code {code:?} is not two characters");
-                if self_closing {
-                    // A class with no subclasses still has a GQLSTATUS
-                    // value: its code followed by `000`.
-                    rows.push(Row {
-                        code: format!("{code}000"),
-                        severity: severity_for(&category),
-                        class: class_name,
-                        subclass: None,
-                    });
-                    open = None;
+                // The class itself is a GQLSTATUS value, its code
+                // followed by `000`, whether or not the artifact spells
+                // it out with subclasses underneath.
+                rows.push(Row {
+                    code: format!("{code}000"),
+                    severity: severity_for(&category),
+                    class: class_name.clone(),
+                    subclass: None,
+                });
+                // A self-closing class must not stay open, or the next
+                // class's subclasses get attributed to it.
+                open = if self_closing {
+                    None
                 } else {
-                    open = Some((category, code, class_name));
-                }
+                    Some((category, code, class_name))
+                };
             }
             "subclass" => {
                 let (category, class_code, class_name) =
@@ -259,31 +269,44 @@ fn the_artifact_has_the_shape_the_denominator_assumes() {
     let xml = std::fs::read_to_string(manifest_dir().join("artifacts/gql-conditions.xml"))
         .expect("conditions artifact");
     let rows = parse_artifact(&xml);
-    assert_eq!(rows.len(), 72, "72 GQLSTATUS values");
+    assert_eq!(rows.len(), 80, "12 class rows plus 68 subclass rows");
     assert_eq!(
         rows.iter().filter(|r| r.subclass.is_some()).count(),
         68,
         "68 subclass rows, the conformance denominator"
     );
-    // 63 of the 68 subclass rows are exceptions; 2D and G2 are the two
-    // class-only exception codes. 02 and 03 are class-only but are no
-    // data and informational, which is why 72 minus 4 is not 68 minus 4.
-    let by_severity = |s: &str| rows.iter().filter(|r| r.severity.ends_with(s)).count();
     assert_eq!(
-        by_severity("Exception"),
-        65,
-        "63 subclass plus 2 class-only"
+        rows.iter().filter(|r| r.subclass.is_none()).count(),
+        12,
+        "one class row per class"
     );
-    assert_eq!(by_severity("Warning"), 4);
-    assert_eq!(by_severity("Success"), 1);
-    assert_eq!(by_severity("NoData"), 1);
-    assert_eq!(by_severity("Informational"), 1);
+    // The 68 subclass rows split 63 exception, 4 warning, 1 success. The
+    // 12 class rows add 8 exceptions (08, 22, 25, 2D, 40, 42, G1, G2) and
+    // one each of success, warning, no data and informational.
+    let by_severity = |s: &str| rows.iter().filter(|r| r.severity.ends_with(s)).count();
+    assert_eq!(by_severity("Exception"), 71, "63 subclass plus 8 class");
+    assert_eq!(by_severity("Warning"), 5, "4 subclass plus 01000");
+    assert_eq!(by_severity("Success"), 2, "00001 plus 00000");
+    assert_eq!(by_severity("NoData"), 1, "02000");
+    assert_eq!(by_severity("Informational"), 1, "03000");
     assert_eq!(
         rows.iter()
             .filter(|r| r.subclass.is_some() && r.severity.ends_with("Exception"))
             .count(),
         63,
         "63 exception subclass rows"
+    );
+
+    // The two codes the rest of the engine leans on hardest, spelled out
+    // so a parser change that drops the class rows fails here loudly.
+    let find = |code: &str| rows.iter().find(|r| r.code == code);
+    let ok = find("00000").expect("00000 is a GQLSTATUS value");
+    assert_eq!(ok.class, "successful completion");
+    assert_eq!(ok.subclass, None);
+    assert_eq!(ok.severity, "Severity::Success");
+    assert_eq!(
+        find("00001").expect("00001").subclass.as_deref(),
+        Some("omitted result")
     );
 }
 

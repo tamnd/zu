@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use zu_common::gqlstatus::{DiagnosticRecord, codes};
+use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
 use zu_common::{Result, ZuError};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
@@ -168,12 +168,12 @@ fn chain_has_node(link: &PathLink, table: u32, offset: u64) -> bool {
 /// The rows a query returns, one column name per RETURN item, plus any
 /// conditions raised along the way that did not stop it.
 ///
-/// `notices` is the other half of the GQLSTATUS envelope
-/// (Spec/2064g/gql/plan/07). An exception replaces the result and comes
-/// back as `Err`; a warning or a completion condition rides with the
-/// answer and lands here, because a statement that dropped a null out of
-/// an aggregate still has rows to give you and the standard still wants
-/// you told. Almost every query leaves this empty, so it costs one empty
+/// This and [`QueryResult::status`] are the other half of the GQLSTATUS
+/// envelope (Spec/2064g/gql/plan/07). An exception replaces the result
+/// and comes back as `Err`; a warning rides with the answer and lands in
+/// `notices`, because a statement that dropped a null out of an
+/// aggregate still has rows to give you and the standard still wants you
+/// told. Almost every query leaves `notices` empty, so it costs one empty
 /// `Vec` and no allocation on the path that raises nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryResult {
@@ -184,25 +184,34 @@ pub struct QueryResult {
 
 impl QueryResult {
     /// The result of a statement that ran to completion.
-    ///
-    /// A statement with no projection has no binding table to give back,
-    /// and the standard has a completion condition for exactly that:
-    /// `00001 successful completion, omitted result`. It is attached here
-    /// rather than at each call site so no executor can forget it, and
-    /// because "did this statement produce columns" is the whole test.
     pub fn new(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
-        let mut result = QueryResult {
+        QueryResult {
             columns,
             rows,
             notices: Vec::new(),
-        };
-        if result.columns.is_empty() {
-            result.notice(DiagnosticRecord::new(
-                codes::C00001,
-                "no result was returned",
-            ));
         }
-        result
+    }
+
+    /// The completion condition for the statement, which is the single
+    /// GQLSTATUS value a caller gets back when nothing went wrong.
+    ///
+    /// `00000 successful completion` unless the statement had no
+    /// projection to give back, in which case the standard has a
+    /// condition for exactly that: `00001 successful completion, omitted
+    /// result`. It is derived here rather than stored at each call site
+    /// so no executor can forget it, and because "did this statement
+    /// produce columns" is the whole test.
+    ///
+    /// This is deliberately not a notice. A statement reports one
+    /// outcome and any number of warnings alongside it, and folding the
+    /// outcome into the warning list makes the two indistinguishable to
+    /// anything reading the envelope.
+    pub fn status(&self) -> GqlStatus {
+        if self.columns.is_empty() {
+            codes::C00001
+        } else {
+            codes::C00000
+        }
     }
 
     /// Attaches a condition to a result that is still an answer. Nothing
@@ -5794,15 +5803,30 @@ mod tests {
     fn a_result_with_no_columns_completes_with_00001() {
         // No statement zu parses reaches this yet: the grammar requires
         // a projection, so `columns` is never empty from a real query.
-        // The rule lives in the constructor anyway, so the first write
+        // The rule lives on the result anyway, so the first write
         // statement in G3 gets it without anyone remembering to.
         let omitted = QueryResult::new(Vec::new(), Vec::new());
-        assert_eq!(omitted.notices.len(), 1);
-        assert_eq!(omitted.notices[0].status.code(), "00001");
-        assert!(omitted.notices[0].severity().is_success());
-        // A statement that does project keeps a clean envelope.
+        assert_eq!(omitted.status().code(), "00001");
+        assert!(omitted.status().severity().is_success());
+        assert!(omitted.notices.is_empty(), "the outcome is not a notice");
+    }
+
+    #[test]
+    fn a_statement_that_projects_completes_with_00000() {
         let ok = run("MATCH (a:Person) RETURN a.id AS id", &[]);
+        assert_eq!(ok.status().code(), "00000");
         assert!(ok.notices.is_empty());
+        // Zero rows is still a successful completion. `02000 no data` is
+        // for a positioned operation that found nothing to act on, not
+        // for a query whose binding table came back empty, and reporting
+        // it here would be inventing a condition the standard does not
+        // raise.
+        let empty = run(
+            "MATCH (a:Person) WHERE a.id > 100000 RETURN a.id AS id",
+            &[],
+        );
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.status().code(), "00000");
     }
 
     #[test]

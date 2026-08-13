@@ -15,6 +15,7 @@
 //! same rows, same order, same errors on overflow.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zu_common::Result;
 use zu_query::ast::{BinaryOp, Literal, RelDirection};
@@ -22,7 +23,9 @@ use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Sche
 use zu_query::exec::{Options, Value, Wcoj};
 use zu_query::plan::LogicalPlan;
 use zu_query::snapshot::{ColId, ColType, Dir, FuncCol, RelId, Snapshot, TableId, ZonePred};
-use zu_vector::{BinOp, CmpOp, ExprOp, OwnedValue, PhysType, Program, Reg};
+use zu_vector::{BinOp, CmpOp, ExprOp, MorselArena, OwnedValue, PhysType, Program, Reg};
+
+use crate::join::JoinTable;
 
 /// One compiled pipeline over one driving scan.
 pub(crate) struct ExecPlan {
@@ -223,6 +226,24 @@ pub(crate) enum Op {
         steps: Vec<(RelId, Dirs)>,
         from: usize,
     },
+    /// The value join (perf/05 section 2): a second pattern that shares
+    /// no variable with the first and is tied to it by an equality
+    /// instead, which is what a query writes when the edge between two
+    /// node kinds is a property rather than a rel.
+    ///
+    /// The pattern's table is the build side. It is read once while the
+    /// plan is compiled, into a hash table every worker then shares, so
+    /// the rows a key matched are a slice of one buffer and a probe
+    /// that matches nothing costs one directory word. The probe is one
+    /// lookup per row of whatever level `key` reads, and the rows it
+    /// matched become level `to` exactly the way an expand's neighbors
+    /// do, in build order, which is the row order the old engine's
+    /// nested loop over the same two patterns produces.
+    Join {
+        table: Arc<JoinTable>,
+        key: ScalarRef,
+        to: usize,
+    },
 }
 
 /// A per-row scalar a sink reads out of the chunk set.
@@ -353,6 +374,7 @@ fn names_level(op: &Op, level: usize) -> bool {
         Op::Semi { probe_level, .. } => *probe_level == level,
         Op::Optional { level: opt, .. } => *opt == level,
         Op::DegreeProduct { from, .. } => *from == level,
+        Op::Join { key, to, .. } => key.level() == level || *to == level,
         Op::Filter { .. } | Op::OptionalHit => false,
     }
 }
@@ -367,7 +389,7 @@ fn reads_newest(above: &[Op]) -> bool {
     for op in above {
         match op {
             Op::Filter { .. } | Op::Semi { .. } | Op::Intersect { .. } => return true,
-            Op::Expand { .. } | Op::Branch { .. } => return false,
+            Op::Expand { .. } | Op::Branch { .. } | Op::Join { .. } => return false,
             Op::Optional { .. } | Op::OptionalHit | Op::DegreeProduct { .. } => {}
         }
     }
@@ -415,6 +437,10 @@ fn batch_expands(ops: &mut [Op], sink: &SinkSpec, levels: &[LevelBuild]) {
             // walked past, unless this expand is the one carrying it:
             // otherwise its weight is that one pinned row's.
             Op::DegreeProduct { from: src, .. } => *src == from && !hub,
+            // A join reads its key off a pinned row whenever the key
+            // sits below the newest level, and this expand's source is
+            // below the newest level from the moment it runs.
+            Op::Join { key, .. } => key.level() == from,
             _ => false,
         };
         // The expand's own fused close counts: it reads the probe
@@ -516,6 +542,12 @@ pub(crate) fn compile(
     };
     c.compile(plan)
 }
+
+/// Rows a value join will read into a build table. Sixteen bytes a row
+/// go into the table itself, so this is a few hundred megabytes at the
+/// ceiling, and a side larger than it falls back rather than building
+/// something that size before the query has answered anything.
+const BUILD_ROWS_MAX: u64 = 50_000_000;
 
 /// A level under construction: the registry assigns chunk vector
 /// positions as columns are demanded, so programs built mid-walk hold
@@ -738,6 +770,15 @@ impl Compiler<'_> {
         // level.
         let mut ops = Vec::new();
         let mut pred = None;
+        // The patterns that share no variable with the first one, each
+        // held until a predicate says what ties it to the pipeline. A
+        // held pattern is a cross product until then, and the equality
+        // that turns it into a join is written in the WHERE, which the
+        // plan puts above every scan. Predicates that name a held
+        // pattern wait with it, since the level they read does not
+        // exist until its join builds it.
+        let mut pending: Vec<(usize, TableId)> = Vec::new();
+        let mut waiting: Vec<&BoundExpr> = Vec::new();
         loop {
             // An open bracket ends the pipeline: the group's level is
             // the newest one and it may be null, so nothing walks off
@@ -755,6 +796,18 @@ impl Compiler<'_> {
                     ..
                 }) => {
                     it.next();
+                    // A predicate that names a held pattern waits: it
+                    // either ties that pattern to the pipeline, which
+                    // is the join, or reads a level the join has not
+                    // built yet. Settling decides which, and one join
+                    // can be what lets the next predicate become one.
+                    if pending.iter().any(|&(slot, _)| self.names_slot(expr, slot)) {
+                        waiting.push(expr);
+                        if self.settle(&mut ops, &mut pending, &mut waiting)?.is_none() {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
                     let level = self.levels.len() - 1;
                     let Some(prog) = self.build_prog(expr, level)? else {
                         return Ok(None);
@@ -768,6 +821,22 @@ impl Compiler<'_> {
                         pred = self.zone_pred(expr)?;
                     }
                     ops.push(Op::Filter { prog });
+                }
+                // A second driving scan, which is a second pattern with
+                // no variable in common with the first. Nothing is
+                // emitted here: the scan is held until the equality
+                // that joins it turns up, and a plan where none does is
+                // a cross product this pipeline has no shape for.
+                Some(LogicalPlan::ScanNodes {
+                    slot,
+                    optional: None,
+                    ..
+                }) => {
+                    it.next();
+                    let &[build] = self.query.variables[*slot].node_tables.as_slice() else {
+                        return Ok(None);
+                    };
+                    pending.push((*slot, build));
                 }
                 Some(LogicalPlan::Expand {
                     rel,
@@ -947,6 +1016,16 @@ impl Compiler<'_> {
                 }
                 _ => break,
             }
+        }
+
+        // A held pattern nothing ever tied to the pipeline is a cross
+        // product, and one of those belongs on the old engine: it has a
+        // nested loop for it and this pipeline would have to build a
+        // table of the whole side to answer the same thing. A predicate
+        // still waiting names one of those patterns, so it goes back
+        // for the same reason.
+        if !pending.is_empty() || !waiting.is_empty() {
+            return Ok(None);
         }
 
         // The sink and its absorbed post steps.
@@ -1259,6 +1338,16 @@ impl Compiler<'_> {
                     newest = *to;
                 }
                 Op::Semi { probe_level, .. } if *probe_level >= newest => return Ok(None),
+                // A join's key is read off a level the pipeline has
+                // already built, at its pin when it is not the newest
+                // one, so a key naming a level above is a plan the
+                // runner has no row for.
+                Op::Join { key, to, .. } => {
+                    if key.level() > newest {
+                        return Ok(None);
+                    }
+                    newest = *to;
+                }
                 _ => {}
             }
         }
@@ -1355,6 +1444,14 @@ impl Compiler<'_> {
                 Op::Semi { probe_level, .. } => *probe_level = map[*probe_level],
                 Op::Optional { level, .. } => *level = map[*level],
                 Op::DegreeProduct { from, .. } => *from = map[*from],
+                Op::Join { key, to, .. } => {
+                    match key {
+                        ScalarRef::Node { level }
+                        | ScalarRef::RowId { level }
+                        | ScalarRef::Col { level, .. } => *level = map[*level],
+                    }
+                    *to = map[*to];
+                }
                 Op::Filter { .. } | Op::OptionalHit => {}
             }
         }
@@ -1793,6 +1890,197 @@ impl Compiler<'_> {
             }
             _ => {}
         }
+    }
+
+    /// Whether an expression reads a variable at all.
+    fn names_slot(&self, expr: &BoundExpr, slot: usize) -> bool {
+        let mut found = false;
+        self.walk_slots(expr, &mut |s| found |= s == slot);
+        found
+    }
+
+    /// The equality that ties a held pattern to the pipeline, as the
+    /// build table it produces and the probe scalar it reads, `None`
+    /// when this predicate is not that equality.
+    ///
+    /// One side has to read a property of the held pattern and nothing
+    /// else, and the other has to read only levels the pipeline has
+    /// already built. That second side is the probe key, one value per
+    /// row wherever it sits, and the first is the build key, read off
+    /// the held table once here.
+    ///
+    /// Integer columns on both sides. A string key would have to carry
+    /// its bytes into the table and hash them there, and comparing a
+    /// property against a node is not an equality either engine
+    /// answers, so both go back.
+    fn join_tie(
+        &mut self,
+        expr: &BoundExpr,
+        slot: usize,
+        build: TableId,
+    ) -> Result<Option<(Arc<JoinTable>, ScalarRef)>> {
+        let BoundExpr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        // Whichever side reads the held pattern is the build key, and
+        // it has to read only that.
+        let (mine, theirs) = match (self.names_slot(lhs, slot), self.names_slot(rhs, slot)) {
+            (true, false) => (lhs.as_ref(), rhs.as_ref()),
+            (false, true) => (rhs.as_ref(), lhs.as_ref()),
+            _ => return Ok(None),
+        };
+        let BoundExpr::Property { base, key } = mine else {
+            return Ok(None);
+        };
+        if !matches!(base.as_ref(), BoundExpr::Var(s) if *s == slot) {
+            return Ok(None);
+        }
+        // The probe side has to be readable where the join runs, which
+        // means every variable in it is already a level. A side that
+        // names nothing at all is a constant, and that is a predicate
+        // on the held pattern rather than a join.
+        let mut probes = 0;
+        let mut ready = true;
+        self.walk_slots(theirs, &mut |s| {
+            probes += 1;
+            ready &= self.slot_level.contains_key(&s);
+        });
+        if probes == 0 || !ready {
+            return Ok(None);
+        }
+        let Some((col, ColType::Int)) = self.snap.resolve_col(build, key)? else {
+            return Ok(None);
+        };
+        let Some(probe) = self.item_ref(theirs)? else {
+            return Ok(None);
+        };
+        // Everything cheap says yes before the build reads a table, so
+        // a predicate that comes back here after another join bound the
+        // level it probes does not pay for the read twice.
+        match probe {
+            ScalarRef::Col {
+                ty: ColType::Int, ..
+            }
+            | ScalarRef::RowId { .. } => {}
+            _ => return Ok(None),
+        }
+        let Some(table) = self.build_join(build, col)? else {
+            return Ok(None);
+        };
+        Ok(Some((table, probe)))
+    }
+
+    /// Places every join the predicates seen so far allow, and compiles
+    /// the ones that are not joins as filters once nothing they read is
+    /// still held.
+    ///
+    /// One join can be what lets the next predicate become one, since
+    /// its probe side may read a level an earlier join built, so this
+    /// runs to a fixpoint rather than once per predicate. What is left
+    /// over stays where it is: the caller has more plan to walk, and
+    /// the equality that settles it may not have turned up yet.
+    ///
+    /// `None` is a shape this pipeline has no plan for, same as
+    /// everywhere else.
+    fn settle(
+        &mut self,
+        ops: &mut Vec<Op>,
+        pending: &mut Vec<(usize, TableId)>,
+        waiting: &mut Vec<&BoundExpr>,
+    ) -> Result<Option<()>> {
+        loop {
+            let mut moved = false;
+            let mut i = 0;
+            while i < waiting.len() {
+                let expr = waiting[i];
+                let held: Vec<usize> = (0..pending.len())
+                    .filter(|&p| self.names_slot(expr, pending[p].0))
+                    .collect();
+                // Nothing it reads is held any more, so every level it
+                // wants exists and it is a filter over the newest one.
+                if held.is_empty() {
+                    waiting.remove(i);
+                    let level = self.levels.len() - 1;
+                    let Some(prog) = self.build_prog(expr, level)? else {
+                        return Ok(None);
+                    };
+                    ops.push(Op::Filter { prog });
+                    moved = true;
+                    continue;
+                }
+                let mut tied = false;
+                for p in held {
+                    let (slot, build) = pending[p];
+                    let Some((table, key)) = self.join_tie(expr, slot, build)? else {
+                        continue;
+                    };
+                    let to = self.levels.len();
+                    self.levels.push(LevelBuild {
+                        table: build,
+                        cols: Vec::new(),
+                    });
+                    self.slot_level.insert(slot, to);
+                    ops.push(Op::Join { table, key, to });
+                    pending.remove(p);
+                    waiting.remove(i);
+                    tied = true;
+                    moved = true;
+                    break;
+                }
+                if !tied {
+                    i += 1;
+                }
+            }
+            if !moved {
+                return Ok(Some(()));
+            }
+        }
+    }
+
+    /// Reads one integer column of a table into a hash table keyed by
+    /// its values, carrying the row each value came from.
+    ///
+    /// This runs once, here, rather than per worker: the old engine's
+    /// join has every worker sweep the whole side to fill its own
+    /// membership set, and the whole point of the shared table is that
+    /// the build happens a single time and the probe side is what
+    /// scales out.
+    ///
+    /// A null in the column is not a key. An equality against null is
+    /// null, which drops the row on both engines, so those rows are
+    /// left out of the table instead of being probed and rejected.
+    fn build_join(&mut self, table: TableId, col: ColId) -> Result<Option<Arc<JoinTable>>> {
+        let rows = self.snap.table_rows(table)?;
+        // The table is two words a row and it is built before the query
+        // has returned anything, so a build side past this is not a
+        // plan to run quietly: it goes back to the old engine, whose
+        // nested loop is slow but bounded.
+        if rows > BUILD_ROWS_MAX {
+            return Ok(None);
+        }
+        let mut keys = Vec::with_capacity(rows as usize);
+        let mut payload = Vec::with_capacity(rows as usize);
+        let mut arena = MorselArena::new();
+        let mut chunk = 0;
+        while let Some(sc) = self.snap.scan(table, chunk, &[col], None, &mut arena)? {
+            let vec = &sc.columns[0];
+            let vals = vec.values::<i64>();
+            for (i, &v) in vals.iter().enumerate().take(sc.rows as usize) {
+                if !vec.is_valid(i) {
+                    continue;
+                }
+                keys.push(v as u64);
+                payload.push(sc.row_base + i as u64);
+            }
+            chunk += 1;
+            arena.reset();
+        }
+        Ok(Some(Arc::new(JoinTable::build(&keys, &payload))))
     }
 
     /// Maps a projection, key, or argument expression to a scalar the

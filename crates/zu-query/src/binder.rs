@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 
 use crate::ast::{
@@ -23,6 +24,21 @@ use crate::ast::{
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
+}
+
+/// `42002 syntax error or access rule violation, invalid reference`: a
+/// name in the statement does not resolve, or resolves to something
+/// already taken. The statement parses, so this is not 42001; it just
+/// mentions something that is not there.
+fn bad_reference(detail: String) -> ZuError {
+    ZuError::gql(codes::C42002, detail)
+}
+
+/// `22G03 data exception, invalid value type`: the expression is well
+/// formed and every name in it resolves, but its type is not one this
+/// position accepts.
+fn bad_type(detail: String) -> ZuError {
+    ZuError::gql(codes::C22G03, detail)
 }
 
 /// One node table: a label naming the row domain `0..node_count`.
@@ -768,7 +784,9 @@ impl Binder<'_> {
 
     fn declare(&mut self, name: &str, ty: Type) -> Result<usize> {
         if self.scope.contains_key(name) {
-            return Err(invalid(format!("variable '{name}' is already defined")));
+            return Err(bad_reference(format!(
+                "variable '{name}' is already defined"
+            )));
         }
         let slot = self.new_slot(name.to_string(), ty);
         self.scope.insert(name.to_string(), slot);
@@ -843,7 +861,7 @@ impl Binder<'_> {
         let rel = self
             .schema
             .rel_by_name(rel_name)
-            .ok_or_else(|| invalid(format!("unknown rel table '{rel_name}'")))?;
+            .ok_or_else(|| bad_reference(format!("unknown rel table '{rel_name}'")))?;
         if rel.from != rel.to {
             return Err(invalid(format!(
                 "{} needs a rel table over one node table, '{}' connects two",
@@ -980,7 +998,10 @@ impl Binder<'_> {
         let mut new_scope: HashMap<String, usize> = HashMap::new();
         for item in &mut items {
             if !is_return && new_scope.contains_key(&item.name) {
-                return Err(invalid(format!("duplicate name '{}' in WITH", item.name)));
+                return Err(bad_reference(format!(
+                    "duplicate name '{}' in WITH",
+                    item.name
+                )));
             }
             // Projecting a plain variable keeps its slot; anything else
             // gets a fresh one carrying the item's type.
@@ -1035,7 +1056,7 @@ impl Binder<'_> {
         let mut ctx = ExprCtx::new(false);
         let (bound, ty) = self.bind_expr(expr, &mut ctx)?;
         if !matches!(ty, Type::Int | Type::Any) {
-            return Err(invalid(format!("{what} needs an integer, got {ty}")));
+            return Err(bad_type(format!("{what} needs an integer, got {ty}")));
         }
         Ok(Some(bound))
     }
@@ -1094,7 +1115,7 @@ impl Binder<'_> {
                 let node = self
                     .schema
                     .node_by_name(label)
-                    .ok_or_else(|| invalid(format!("unknown label '{label}'")))?;
+                    .ok_or_else(|| bad_reference(format!("unknown label '{label}'")))?;
                 vec![node.id]
             }
             _ => {
@@ -1160,7 +1181,7 @@ impl Binder<'_> {
                 let rel = self
                     .schema
                     .rel_by_name(ty)
-                    .ok_or_else(|| invalid(format!("unknown relationship type '{ty}'")))?;
+                    .ok_or_else(|| bad_reference(format!("unknown relationship type '{ty}'")))?;
                 candidates.push(rel.id);
             }
         }
@@ -1338,11 +1359,10 @@ impl Binder<'_> {
                 Ok((BoundExpr::Param(index), Type::Any))
             }
             Expr::Variable(name) => {
-                let slot = self
-                    .scope
-                    .get(name)
-                    .copied()
-                    .ok_or_else(|| invalid(format!("variable '{name}' is not defined")))?;
+                let slot =
+                    self.scope.get(name).copied().ok_or_else(|| {
+                        bad_reference(format!("variable '{name}' is not defined"))
+                    })?;
                 Ok((BoundExpr::Var(slot), self.variables[slot].ty.clone()))
             }
             Expr::Property { base, key } => {
@@ -1447,8 +1467,8 @@ impl Binder<'_> {
         args: &[Expr],
         ctx: &mut ExprCtx,
     ) -> Result<(BoundExpr, Type)> {
-        let func =
-            Func::resolve(name).ok_or_else(|| invalid(format!("unknown function '{name}'")))?;
+        let func = Func::resolve(name)
+            .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
         if func.is_aggregate() {
             if !ctx.allow_aggregates {
                 return Err(invalid(format!(

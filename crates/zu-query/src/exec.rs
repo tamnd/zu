@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use zu_common::gqlstatus::DiagnosticRecord;
+use zu_common::gqlstatus::{DiagnosticRecord, codes};
 use zu_common::{Result, ZuError};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
@@ -67,8 +67,17 @@ use crate::plan::{LogicalPlan, expr_text};
 /// Vector width of one chunk fill.
 pub const VECTOR_SIZE: usize = 2048;
 
+/// An engine-internal failure: a slot that is not bound, a multiplicity
+/// that overflowed, a shape the planner should never have produced.
+/// These are bugs in zu, not conditions the standard has a code for, so
+/// they stay uncoded rather than borrowing one that nearly fits.
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
+}
+
+/// A GQL condition raised while evaluating.
+fn gql(status: zu_common::GqlStatus, detail: String) -> ZuError {
+    ZuError::gql(status, detail)
 }
 
 /// One runtime value. Nodes and rels carry their table so multi-table
@@ -174,13 +183,26 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    /// A result with no conditions attached, which is the common case.
+    /// The result of a statement that ran to completion.
+    ///
+    /// A statement with no projection has no binding table to give back,
+    /// and the standard has a completion condition for exactly that:
+    /// `00001 successful completion, omitted result`. It is attached here
+    /// rather than at each call site so no executor can forget it, and
+    /// because "did this statement produce columns" is the whole test.
     pub fn new(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
-        QueryResult {
+        let mut result = QueryResult {
             columns,
             rows,
             notices: Vec::new(),
+        };
+        if result.columns.is_empty() {
+            result.notice(DiagnosticRecord::new(
+                codes::C00001,
+                "no result was returned",
+            ));
         }
+        result
     }
 
     /// Attaches a condition to a result that is still an answer. Nothing
@@ -3601,13 +3623,13 @@ fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
                 Mul => x.checked_mul(y).ok_or_else(overflow)?,
                 Div => {
                     if y == 0 {
-                        return Err(invalid("division by zero".into()));
+                        return Err(divide_by_zero(op));
                     }
                     x.checked_div(y).ok_or_else(overflow)?
                 }
                 Mod => {
                     if y == 0 {
-                        return Err(invalid("division by zero".into()));
+                        return Err(divide_by_zero(op));
                     }
                     x.checked_rem(y).ok_or_else(overflow)?
                 }
@@ -3621,15 +3643,39 @@ fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
                     Add => x + y,
                     Sub => x - y,
                     Mul => x * y,
+                    // Approximate numerics divide by zero too. IEEE
+                    // would answer infinity here, but GQL asks for
+                    // 22012 whatever the numeric type is, and an engine
+                    // that quietly answers inf has given a wrong answer
+                    // rather than raised a condition.
+                    Div | Mod if y == 0.0 => return Err(divide_by_zero(op)),
                     Div => x / y,
                     Mod => x % y,
                     _ => unreachable!("arith only sees arithmetic operators"),
                 };
                 Ok(Value::Float(r))
             }
-            _ => Err(invalid(format!("cannot apply {op:?} to {a:?} and {b:?}"))),
+            // Neither side is a number, so this is not arithmetic at
+            // all. `22G03 invalid value type` is the condition for an
+            // operand whose type the operator does not accept.
+            _ => Err(gql(
+                codes::C22G03,
+                format!("cannot apply {op:?} to {a:?} and {b:?}"),
+            )),
         },
     }
+}
+
+/// `22012 data exception, division by zero`, for both `/` and `%`. The
+/// standard's name says division, and the modulus of a zero divisor is
+/// undefined for exactly the same reason.
+fn divide_by_zero(op: BinaryOp) -> ZuError {
+    let what = if matches!(op, BinaryOp::Mod) {
+        "modulus"
+    } else {
+        "division"
+    };
+    gql(codes::C22012, format!("{what} by zero"))
 }
 
 fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
@@ -4144,13 +4190,26 @@ fn finalize_group(
     })
 }
 
+/// Evaluates a `SKIP` or `LIMIT` count.
+///
+/// Two conditions live here and they are not the same mistake. A
+/// negative integer is a well typed value the clause cannot use, which
+/// is `22G02 negative limit value`; the standard has one code for it and
+/// uses it for the offset as well as the limit, so both spellings raise
+/// it. Anything that is not an integer at all never gets that far and is
+/// `22G03 invalid value type`.
 fn count_expr(ctx: &mut StageCtx, expr: &BoundExpr, what: &str) -> Result<usize> {
     ctx.overlay.clear();
     match eval(ctx, expr)? {
         Value::Int(n) if n >= 0 => Ok(n as usize),
-        other => Err(invalid(format!(
-            "{what} needs a non-negative integer, got {other:?}"
-        ))),
+        Value::Int(n) => Err(gql(
+            codes::C22G02,
+            format!("{what} needs a non-negative integer, got {n}"),
+        )),
+        other => Err(gql(
+            codes::C22G03,
+            format!("{what} needs an integer, got {other:?}"),
+        )),
     }
 }
 
@@ -4832,6 +4891,45 @@ mod tests {
 
     fn run(source: &str, params: &[(&str, Value)]) -> QueryResult {
         run_with(source, params, false)
+    }
+
+    /// The GQLSTATUS a statement that cannot run comes back with. Panics
+    /// when it succeeds, or when it fails without a code, since an
+    /// uncoded failure on a well formed statement is the bug this is
+    /// here to catch.
+    fn status_of(source: &str) -> &'static str {
+        let schema = schema();
+        let parsed = match crate::parser::parse(source) {
+            Ok(p) => p,
+            Err(e) => return coded(&e),
+        };
+        let query = match crate::binder::bind(&parsed, &schema) {
+            Ok(q) => q,
+            Err(e) => return coded(&e),
+        };
+        let built = crate::plan::build(&query).expect("plan");
+        let optimized = crate::optimizer::optimize(built, &query, &schema).expect("optimize");
+        let mut graph = mock();
+        match execute(
+            &optimized,
+            &query,
+            &schema,
+            &mut graph,
+            &[],
+            &Options {
+                threads: 1,
+                ..Options::default()
+            },
+        ) {
+            Ok(_) => panic!("{source:?} was expected to fail"),
+            Err(e) => coded(&e),
+        }
+    }
+
+    fn coded(e: &ZuError) -> &'static str {
+        e.gqlstatus()
+            .unwrap_or_else(|| panic!("failure with no GQLSTATUS: {e}"))
+            .code()
     }
 
     /// Runs morsel-parallel with 2-row morsels over four workers, so
@@ -5535,6 +5633,78 @@ mod tests {
             &[],
         );
         assert!(r.rows.is_empty(), "got {:?}", r.rows);
+    }
+
+    #[test]
+    fn dividing_by_zero_is_22012_whatever_the_numeric_type() {
+        assert_eq!(status_of("MATCH (a:Person) RETURN 1 / 0 AS x"), "22012");
+        assert_eq!(status_of("MATCH (a:Person) RETURN 1 % 0 AS x"), "22012");
+        // IEEE would answer infinity for the approximate case. The
+        // standard asks for the condition, so we raise it.
+        assert_eq!(status_of("MATCH (a:Person) RETURN 1.0 / 0.0 AS x"), "22012");
+        assert_eq!(status_of("MATCH (a:Person) RETURN 1 / 0.0 AS x"), "22012");
+    }
+
+    #[test]
+    fn a_negative_count_is_22g02_and_a_non_integer_one_is_22g03() {
+        // The standard names 22G02 for the limit and uses the same code
+        // for the offset, so both spellings answer with it.
+        assert_eq!(
+            status_of("MATCH (a:Person) RETURN a.id AS id LIMIT 0 - 1"),
+            "22G02"
+        );
+        assert_eq!(
+            status_of("MATCH (a:Person) RETURN a.id AS id SKIP 0 - 1"),
+            "22G02"
+        );
+        // Not an integer at all, so it never gets as far as being
+        // negative. A different mistake and a different code.
+        assert_eq!(
+            status_of("MATCH (a:Person) RETURN a.id AS id LIMIT 'two'"),
+            "22G03"
+        );
+    }
+
+    #[test]
+    fn a_name_that_does_not_resolve_is_42002_not_42001() {
+        // The statement parses. Nothing is wrong with its syntax; it
+        // just mentions something that is not there, which is the
+        // distinction between 42001 and 42002.
+        assert_eq!(status_of("MATCH (a:Person) RETURN nope AS x"), "42002");
+        assert_eq!(status_of("MATCH (a:Nonexistent) RETURN a.id AS x"), "42002");
+        assert_eq!(
+            status_of("MATCH (a:Person)-[:NOPE]->(b) RETURN a.id AS x"),
+            "42002"
+        );
+        assert_eq!(
+            status_of("MATCH (a:Person) RETURN nosuchfunc(a) AS x"),
+            "42002"
+        );
+        assert_eq!(
+            status_of("MATCH (a:Person) WITH a.id AS x, a.id AS x RETURN x"),
+            "42002"
+        );
+        // Contrast: this one really is malformed.
+        assert_eq!(status_of("MATCH (a:Person) RETURN"), "42001");
+        // Not a contrast to make by accident: naming a bound variable
+        // again is a join, not a redefinition, and stays legal.
+        let r = run("MATCH (a:Person) MATCH (a:Person) RETURN a.id AS x", &[]);
+        assert_eq!(r.rows.len(), 6);
+    }
+
+    #[test]
+    fn a_result_with_no_columns_completes_with_00001() {
+        // No statement zu parses reaches this yet: the grammar requires
+        // a projection, so `columns` is never empty from a real query.
+        // The rule lives in the constructor anyway, so the first write
+        // statement in G3 gets it without anyone remembering to.
+        let omitted = QueryResult::new(Vec::new(), Vec::new());
+        assert_eq!(omitted.notices.len(), 1);
+        assert_eq!(omitted.notices[0].status.code(), "00001");
+        assert!(omitted.notices[0].severity().is_success());
+        // A statement that does project keeps a clean envelope.
+        let ok = run("MATCH (a:Person) RETURN a.id AS id", &[]);
+        assert!(ok.notices.is_empty());
     }
 
     #[test]

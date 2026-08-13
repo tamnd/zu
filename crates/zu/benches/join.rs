@@ -216,13 +216,19 @@ fn measure_sip(db: &mut Zu1File, source: &str, want: &Want, runs: usize) -> (f64
         check(&r, want, source);
         ms
     };
-    // One of each before the clock matters, so neither side pays for
-    // the other's first touch of a page.
-    time(db);
-    // SAFETY: same as the worker count above.
-    unsafe { std::env::set_var("ZU_SIP", "0") };
-    time(db);
-    unsafe { std::env::remove_var("ZU_SIP") };
+    // A few of each before the clock matters, so neither side pays for
+    // the other's first touch of a page. One round each is not enough
+    // straight off a build: the run right after one comes in around a
+    // fifth slower on the filtered side, which is the house rule about
+    // never recording the first pass, and CI only ever gets a first
+    // pass. So the warmup is what makes the number the same on both.
+    for _ in 0..3 {
+        time(db);
+        // SAFETY: same as the worker count above.
+        unsafe { std::env::set_var("ZU_SIP", "0") };
+        time(db);
+        unsafe { std::env::remove_var("ZU_SIP") };
+    }
     for _ in 0..runs {
         on.push(time(db));
         // SAFETY: same as the worker count above.

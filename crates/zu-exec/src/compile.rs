@@ -838,6 +838,94 @@ impl Compiler<'_> {
                     };
                     pending.push((*slot, build));
                 }
+                // An OPTIONAL MATCH over a pattern that shares no
+                // variable with the pipeline, tied by an equality. That
+                // is a left join: probe the held side and, where the
+                // probe finds nothing, bind the level to one null row
+                // instead of dropping the outer one.
+                //
+                // The bracket is the same one a hop uses. What sits
+                // under it is a join rather than an expand, and the
+                // group's other predicates sit between the two, so a
+                // row whose only matches they reject is a miss and not
+                // a dropped row.
+                Some(LogicalPlan::ScanNodes {
+                    slot,
+                    optional: Some(group),
+                    ..
+                }) => {
+                    let group = *group;
+                    let slot = *slot;
+                    it.next();
+                    let &[build] = self.query.variables[slot].node_tables.as_slice() else {
+                        return Ok(None);
+                    };
+                    // The clause's inline props and its WHERE arrive as
+                    // one conjunction, and the tie is one term of it, so
+                    // the ands are split before anything looks for it.
+                    let mut group_filters: Vec<&BoundExpr> = Vec::new();
+                    while let Some(LogicalPlan::Filter {
+                        expr,
+                        optional: Some(g),
+                        ..
+                    }) = it.peek()
+                    {
+                        if *g != group {
+                            break;
+                        }
+                        conjuncts(expr, &mut group_filters);
+                        it.next();
+                    }
+                    // One of the group's predicates has to be the tie.
+                    // Without one the optional pattern is a cross
+                    // product that keeps every outer row, and the old
+                    // engine's nested loop is where that belongs.
+                    let Some(at) = ({
+                        let mut found = None;
+                        for (i, expr) in group_filters.iter().enumerate() {
+                            if self.join_tie(expr, slot, build)?.is_some() {
+                                found = Some(i);
+                                break;
+                            }
+                        }
+                        found
+                    }) else {
+                        return Ok(None);
+                    };
+                    let tie = group_filters.remove(at);
+                    let Some((table, key)) = self.join_tie(tie, slot, build)? else {
+                        unreachable!("the tie was just resolved");
+                    };
+                    let to_level = self.levels.len();
+                    self.levels.push(LevelBuild {
+                        table: build,
+                        cols: Vec::new(),
+                    });
+                    self.slot_level.insert(slot, to_level);
+                    let head = ops.len();
+                    ops.push(Op::Optional {
+                        len: 0,
+                        level: to_level,
+                    });
+                    ops.push(Op::Join {
+                        table,
+                        key,
+                        to: to_level,
+                    });
+                    for expr in group_filters {
+                        let Some(prog) = self.build_prog(expr, to_level)? else {
+                            return Ok(None);
+                        };
+                        ops.push(Op::Filter { prog });
+                    }
+                    ops.push(Op::OptionalHit);
+                    let len = ops.len() - head - 1;
+                    let Op::Optional { len: slot, .. } = &mut ops[head] else {
+                        unreachable!("just pushed the bracket");
+                    };
+                    *slot = len;
+                    self.optional_level = Some(to_level);
+                }
                 Some(LogicalPlan::Expand {
                     rel,
                     from,
@@ -2597,6 +2685,23 @@ fn flip(direction: RelDirection) -> RelDirection {
 /// orientation checks: forward applies when the source table is the
 /// rel's from side, backward when it is the to side, and an undirected
 /// step over a self-referencing rel walks both, forward first.
+/// The terms of a conjunction, flattened. A predicate the binder built
+/// out of several is one `And` tree here, and the join tie is one leaf
+/// of it rather than the whole thing.
+fn conjuncts<'e>(expr: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
+    if let BoundExpr::Binary {
+        op: BinaryOp::And,
+        lhs,
+        rhs,
+    } = expr
+    {
+        conjuncts(lhs, out);
+        conjuncts(rhs, out);
+        return;
+    }
+    out.push(expr);
+}
+
 fn expand_dirs(
     schema: &Schema,
     rel: RelId,

@@ -20,12 +20,13 @@ use std::sync::Arc;
 use zu_common::Result;
 use zu_query::ast::{BinaryOp, Literal, RelDirection};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
-use zu_query::exec::{Options, Value, Wcoj};
+use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::LogicalPlan;
 use zu_query::snapshot::{ColId, ColType, Dir, FuncCol, RelId, Snapshot, TableId, ZonePred};
 use zu_vector::{BinOp, CmpOp, ExprOp, MorselArena, OwnedValue, PhysType, Program, Reg};
 
 use crate::join::JoinTable;
+use crate::sip::SipFilter;
 
 /// One compiled pipeline over one driving scan.
 pub(crate) struct ExecPlan {
@@ -244,6 +245,22 @@ pub(crate) enum Op {
         key: ScalarRef,
         to: usize,
     },
+    /// The sideways pass (perf/13 section 1): what a join's build side
+    /// knows about its keys, applied to the level its probe reads, at
+    /// the position that level is made. Everything between here and the
+    /// join then runs on the rows that can still match, which today is
+    /// the predicates over the level and the probe itself, and is a
+    /// walk off it as soon as the planner puts one there.
+    ///
+    /// `slot` is this operator's place in the plan's filters, which is
+    /// where the runner keeps the count of what it has rejected so far.
+    /// A filter that rejects nothing is a pass over the probe side that
+    /// buys nothing, and the runner is what notices.
+    Sip {
+        filter: Arc<SipFilter>,
+        key: ScalarRef,
+        slot: usize,
+    },
 }
 
 /// A per-row scalar a sink reads out of the chunk set.
@@ -375,6 +392,7 @@ fn names_level(op: &Op, level: usize) -> bool {
         Op::Optional { level: opt, .. } => *opt == level,
         Op::DegreeProduct { from, .. } => *from == level,
         Op::Join { key, to, .. } => key.level() == level || *to == level,
+        Op::Sip { key, .. } => key.level() == level,
         Op::Filter { .. } | Op::OptionalHit => false,
     }
 }
@@ -388,7 +406,11 @@ fn names_level(op: &Op, level: usize) -> bool {
 fn reads_newest(above: &[Op]) -> bool {
     for op in above {
         match op {
-            Op::Filter { .. } | Op::Semi { .. } | Op::Intersect { .. } => return true,
+            // A filter refines the newest level and so does the
+            // sideways one, which is the same read of the same rows.
+            Op::Filter { .. } | Op::Sip { .. } | Op::Semi { .. } | Op::Intersect { .. } => {
+                return true;
+            }
             Op::Expand { .. } | Op::Branch { .. } | Op::Join { .. } => return false,
             Op::Optional { .. } | Op::OptionalHit | Op::DegreeProduct { .. } => {}
         }
@@ -533,8 +555,11 @@ pub(crate) fn compile(
         snap,
         params,
         wcoj: options.wcoj,
+        sip: options.sip,
         levels: Vec::new(),
         slot_level: HashMap::new(),
+        sips: Vec::new(),
+        sip_at: HashMap::new(),
         optional_level: None,
         unwind_slot: None,
         func_slot: None,
@@ -569,8 +594,30 @@ struct Compiler<'a> {
     /// is measured against, so the whole plan goes back to the old
     /// engine rather than closing the cycle here.
     wcoj: Wcoj,
+    /// `Sip::Off` pins the plain probe, so a run with it measures the
+    /// same plan without the filter a join would have published.
+    sip: Sip,
     levels: Vec<LevelBuild>,
     slot_level: HashMap<usize, usize>,
+    /// The joins that placed, each with the scalar its probe reads.
+    /// The filter comes off the table at the end, once the plan is
+    /// known to be one this pipeline runs at all.
+    sips: Vec<(Arc<JoinTable>, ScalarRef)>,
+    /// Where a level's filter goes: the op position right after the
+    /// operator that made the level, which is the first place its rows
+    /// exist and the last place they are all still there.
+    ///
+    /// Two kinds of level are in here, and they are the two a probe key
+    /// can read today. The driving one, which the source makes, so its
+    /// position is the front of the pipeline. And a level a join built,
+    /// which a second join can probe off once the first one has placed
+    /// it. A key on a level a walk made is a shape the compiler does
+    /// not reach: the plan puts that walk under the tie, hanging off a
+    /// pattern still held, and the pipeline declines before any of this
+    /// runs. Levels made inside an optional bracket are left out on
+    /// purpose, since dropping a row of one of those is dropping a
+    /// match the bracket has to keep as a miss.
+    sip_at: HashMap<usize, usize>,
     /// The level an OPTIONAL MATCH group introduced, once one is open.
     /// It is the level that binds null on a miss, so the sink is held
     /// to what it can answer with a null there, and nothing else
@@ -770,6 +817,9 @@ impl Compiler<'_> {
         // level.
         let mut ops = Vec::new();
         let mut pred = None;
+        // The driving level is made by the source, so the front of the
+        // pipeline is where a filter over it goes.
+        self.sip_at.insert(0, 0);
         // The patterns that share no variable with the first one, each
         // held until a predicate says what ties it to the pipeline. A
         // held pattern is a cross product until then, and the equality
@@ -1264,6 +1314,56 @@ impl Compiler<'_> {
             }
         }
 
+        // The sideways pass (perf/13 section 1). A join knows which keys
+        // its build side holds, and the level it probes from was made
+        // somewhere below it, with a walk, a gather and a predicate or
+        // two in between. Putting the filter where that level is made
+        // is what lets all of that run on the rows that can still
+        // match, rather than on every row the scan produced.
+        //
+        // The range goes further down than the operator does, into the
+        // scan's zone pushdown, where a chunk whose values all sit
+        // outside the build side's range is skipped without being
+        // decoded at all.
+        let mut inserts: Vec<(usize, Op)> = Vec::new();
+        for (table, key) in std::mem::take(&mut self.sips) {
+            let Some(&at) = self.sip_at.get(&key.level()) else {
+                continue;
+            };
+            let filter = table.sip();
+            if let ScalarRef::Col { level: 0, vec, .. } = key
+                && pred.is_none()
+                && seek.is_none()
+                && seeks.is_none()
+                && let ColSpec::Stored(col, _) = self.levels[0].cols[vec - 1].1
+            {
+                pred = filter.zone(col);
+            }
+            // A filter with no gaps in it rejects what the range
+            // rejects and nothing else, so testing every probe row
+            // against it is a pass that cannot drop one. The range it
+            // published above is the whole of what that build side had
+            // to say.
+            if filter.gapless() {
+                continue;
+            }
+            let slot = inserts.len();
+            inserts.push((
+                at,
+                Op::Sip {
+                    filter: Arc::new(filter),
+                    key,
+                    slot,
+                },
+            ));
+        }
+        // Back to front, so an insertion never moves a position that
+        // has not been used yet.
+        inserts.sort_by_key(|&(at, _)| std::cmp::Reverse(at));
+        for (at, op) in inserts {
+            ops.insert(at, op);
+        }
+
         // Fuse trailing expands feeding a count or a grouped aggregate
         // into one degree product when nothing reads the expanded
         // levels' rows or columns. The steps must fan out of one source
@@ -1455,6 +1555,29 @@ impl Compiler<'_> {
             }
         }
 
+        if std::env::var("ZU_PLAN2").is_ok() {
+            let names: Vec<String> = ops
+                .iter()
+                .map(|op| match op {
+                    Op::Filter { .. } => "Filter".to_string(),
+                    Op::Expand { from, to, .. } => format!("Expand{from}->{to}"),
+                    Op::Branch { .. } => "Branch".to_string(),
+                    Op::Intersect { .. } => "Intersect".to_string(),
+                    Op::Semi { .. } => "Semi".to_string(),
+                    Op::Optional { .. } => "Optional".to_string(),
+                    Op::OptionalHit { .. } => "OptionalHit".to_string(),
+                    Op::DegreeProduct { .. } => "DegreeProduct".to_string(),
+                    Op::Join { key, to, .. } => format!("Join{}->{to}", key.level()),
+                    Op::Sip { key, filter, .. } => {
+                        format!("Sip{}:{}", key.level(), filter.kind())
+                    }
+                })
+                .collect();
+            eprintln!(
+                "plan2 zone={:?} ops={names:?}",
+                pred.as_ref().map(|p| (p.col, p.lo, p.hi))
+            );
+        }
         Ok(Some(ExecPlan {
             table,
             source: match (seek, seeks) {
@@ -1540,6 +1663,11 @@ impl Compiler<'_> {
                     }
                     *to = map[*to];
                 }
+                Op::Sip { key, .. } => match key {
+                    ScalarRef::Node { level }
+                    | ScalarRef::RowId { level }
+                    | ScalarRef::Col { level, .. } => *level = map[*level],
+                },
                 Op::Filter { .. } | Op::OptionalHit => {}
             }
         }
@@ -2113,7 +2241,11 @@ impl Compiler<'_> {
                         cols: Vec::new(),
                     });
                     self.slot_level.insert(slot, to);
+                    if self.sip == Sip::On {
+                        self.sips.push((table.clone(), key));
+                    }
                     ops.push(Op::Join { table, key, to });
+                    self.sip_at.insert(to, ops.len());
                     pending.remove(p);
                     waiting.remove(i);
                     tied = true;

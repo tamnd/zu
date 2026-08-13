@@ -33,6 +33,7 @@ use crate::compile::{
 use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::join::JoinTable;
 use crate::pool;
+use crate::sip::SipFilter;
 use crate::sink::{self, Acc, SinkState};
 
 fn invalid(detail: String) -> ZuError {
@@ -144,6 +145,34 @@ fn scan_work(plan: &ExecPlan, snap: &mut dyn Snapshot, options: &Options) -> Res
         morsels: make_morsels(total_rows, threads.max(1)),
         threads,
     })
+}
+
+/// Probe rows a sideways filter is judged over before the runner will
+/// switch it off. Four vectors: enough that the rejection rate is the
+/// key distribution rather than one chunk's, and few enough that a
+/// filter which rejects nothing has cost almost nothing by the time it
+/// goes quiet.
+const SIP_TRIAL: u64 = 4 * zu_vector::VECTOR_SIZE as u64;
+
+/// What one `Op::Sip` has done so far in this worker. Every worker
+/// decides for itself: they see different morsels, and a filter that
+/// pays on one part of a table and not another is a filter each of
+/// them should be free to drop.
+#[derive(Clone, Copy)]
+struct SipState {
+    probes: u64,
+    kept: u64,
+    on: bool,
+}
+
+impl Default for SipState {
+    fn default() -> Self {
+        Self {
+            probes: 0,
+            kept: 0,
+            on: true,
+        }
+    }
 }
 
 /// A morsel is worth handing to another core once it is this many rows
@@ -554,6 +583,16 @@ struct Worker<'a> {
     /// Sort key scratch for the bounded sink, refilled per row so a
     /// row the buffer rejects costs no allocation at all.
     keybuf: Vec<Value>,
+    /// One entry per `Op::Sip` in the plan: what that filter has been
+    /// asked and what it let through, which is how the operator knows
+    /// whether it is earning the pass it costs.
+    sips: Vec<SipState>,
+    /// One vector's keys and the positions they came off, and the
+    /// survivors the filter picked out of them. Reused down the run,
+    /// so a filter that runs on every chunk allocates once.
+    sip_keys: Vec<u64>,
+    sip_rows: Vec<u16>,
+    sip_out: Vec<u32>,
     /// Whether the OPTIONAL MATCH group in flight produced a row for
     /// the outer row it is running on. Cleared before the group and
     /// set by `Op::OptionalHit`, which is the only thing under the
@@ -611,6 +650,13 @@ impl<'a> Worker<'a> {
             local_rows: 0,
             morsel: 0,
             keybuf: Vec::new(),
+            sips: vec![
+                SipState::default();
+                plan.ops.iter().filter(|op| matches!(op, Op::Sip { .. })).count()
+            ],
+            sip_keys: Vec::new(),
+            sip_rows: Vec::new(),
+            sip_out: Vec::new(),
             opt_hit: false,
             null: None,
         }
@@ -877,6 +923,12 @@ impl<'a> Worker<'a> {
                 to,
             } => self.branch(*rel, *dirs, *from, *to, rest, set),
             Op::Join { table, key, to } => self.join(table, *key, *to, rest, set, None),
+            Op::Sip { filter, key, slot } => {
+                if !self.sip(filter, *key, *slot, set) {
+                    return Ok(());
+                }
+                self.run_ops(rest, set)
+            }
             Op::Intersect {
                 seed,
                 probe,
@@ -1242,6 +1294,78 @@ impl<'a> Worker<'a> {
         set.chunks[src].cur = None;
         self.idx_pool.push(idxs);
         result
+    }
+
+    /// The sideways pass: drop the rows of the newest level whose key
+    /// no build side under this one holds. Answers whether anything is
+    /// left to run the rest of the pipeline on.
+    ///
+    /// The keys are gathered into one buffer first and tested out of
+    /// it, because the test is a random read into the filter and the
+    /// gather is a sequential one into a column: keeping them apart is
+    /// what lets the filter's prefetch run several tests deep while the
+    /// gather stays a straight walk. A row whose key is null is dropped
+    /// here, which is what the probe would have done with it anyway,
+    /// since an equality against null matches nothing.
+    ///
+    /// A filter earns its pass by rejecting rows. One that is not gets
+    /// switched off after the first few vectors and the rest of the run
+    /// pays nothing for it: the rows were going to reach the join
+    /// either way, and the join tests them itself.
+    fn sip(&mut self, filter: &SipFilter, key: ScalarRef, slot: usize, set: &mut ChunkSet) -> bool {
+        if !self.sips[slot].on {
+            return true;
+        }
+        let last = set.chunks.last().expect("a level under every filter");
+        debug_assert_eq!(
+            key.level() + 1,
+            set.chunks.len(),
+            "a filter sits where its level is the newest one"
+        );
+        let mut keys = std::mem::take(&mut self.sip_keys);
+        let mut rows = std::mem::take(&mut self.sip_rows);
+        let mut out = std::mem::take(&mut self.sip_out);
+        keys.clear();
+        rows.clear();
+        for pos in active_positions(last) {
+            let k = match key {
+                ScalarRef::Col { vec, .. } => {
+                    if !last.vecs[vec].is_valid(pos) {
+                        continue;
+                    }
+                    last.vecs[vec].values::<i64>()[pos] as u64
+                }
+                ScalarRef::RowId { .. } => row_at(last, pos),
+                ScalarRef::Node { .. } => unreachable!("a node is not a join key"),
+            };
+            keys.push(k);
+            rows.push(pos as u16);
+        }
+        out.resize(keys.len(), 0);
+        let n = filter.select(&keys, &mut out);
+        let state = &mut self.sips[slot];
+        state.probes += keys.len() as u64;
+        state.kept += n as u64;
+        // Rejecting under a tenth of what it sees, over enough vectors
+        // for that to be the filter and not the first chunk's luck.
+        if state.probes >= SIP_TRIAL && state.kept * 10 > state.probes * 9 {
+            state.on = false;
+        }
+        let all = n == rows.len();
+        if n > 0 && !all {
+            let mut sel = SelVector::with_capacity(&mut self.arena, n);
+            for &i in &out[..n] {
+                sel.push(rows[i as usize]);
+            }
+            set.chunks
+                .last_mut()
+                .expect("a level under every filter")
+                .sel = Some(sel);
+        }
+        self.sip_keys = keys;
+        self.sip_rows = rows;
+        self.sip_out = out;
+        n > 0
     }
 
     /// The value join's probe side: one lookup per row of the level the
@@ -2839,6 +2963,105 @@ mod tests {
         }));
         let r = run(&p, &mut snap, &seq()).unwrap();
         assert_eq!(r.rows, vec![vec![Value::Int(0)]], "every chunk zoned out");
+    }
+
+    /// A sideways filter over the age column of the driving level.
+    fn sip_op(keys: &[u64], slot: usize) -> Op {
+        Op::Sip {
+            filter: Arc::new(SipFilter::over(keys)),
+            key: ScalarRef::Col {
+                level: 0,
+                vec: 1,
+                ty: zu_query::snapshot::ColType::Int,
+            },
+            slot,
+        }
+    }
+
+    #[test]
+    fn a_sideways_filter_drops_the_rows_that_cannot_match() {
+        let mut snap = Mock::new(2000, |i| i as i64, false);
+        let keys: Vec<u64> = (0..2000).step_by(4).collect();
+        let p = plan(
+            vec![age_level()],
+            vec![sip_op(&keys, 0)],
+            SinkSpec::Count,
+            &["n"],
+        );
+        let r = run(&p, &mut snap, &seq()).unwrap();
+        assert_eq!(r.rows, vec![vec![Value::Int(500)]], "one row in four");
+    }
+
+    #[test]
+    fn a_sideways_filter_that_keeps_nothing_ends_the_vector() {
+        let mut snap = Mock::new(10, |i| i as i64, false);
+        let p = plan(
+            vec![age_level()],
+            vec![sip_op(&[100, 200], 0)],
+            SinkSpec::Count,
+            &["n"],
+        );
+        let r = run(&p, &mut snap, &seq()).unwrap();
+        assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
+    }
+
+    #[test]
+    fn a_sideways_filter_stops_testing_once_it_stops_rejecting() {
+        // Keys covering the first eight chunks and nothing after, so
+        // the trial window sees every row it tests survive and the
+        // operator switches itself off. What comes through after that
+        // is rows the filter would have rejected, which is sound
+        // because the join behind it still has to match them.
+        let rows = 20_000;
+        let mut snap = Mock::new(rows, |i| i as i64, false);
+        let keys: Vec<u64> = (0..SIP_TRIAL).collect();
+        let p = plan(
+            vec![age_level()],
+            vec![sip_op(&keys, 0)],
+            SinkSpec::Count,
+            &["n"],
+        );
+        let r = run(&p, &mut snap, &seq()).unwrap();
+        assert_eq!(
+            r.rows,
+            vec![vec![Value::Int(rows as i64)]],
+            "still filtering after the trial window"
+        );
+    }
+
+    #[test]
+    fn a_sideways_filter_that_earns_its_keep_stays_on() {
+        // The same length of run as the test above, but rejecting
+        // enough that the trial leaves it alone.
+        let rows = 20_000;
+        let mut snap = Mock::new(rows, |i| i as i64, false);
+        let keys: Vec<u64> = (0..rows).step_by(2).collect();
+        let p = plan(
+            vec![age_level()],
+            vec![sip_op(&keys, 0)],
+            SinkSpec::Count,
+            &["n"],
+        );
+        let r = run(&p, &mut snap, &seq()).unwrap();
+        assert_eq!(r.rows, vec![vec![Value::Int(rows as i64 / 2)]]);
+    }
+
+    #[test]
+    fn a_sideways_filter_composes_with_a_filter_over_the_same_level() {
+        // The selection the operator writes is the one the next filter
+        // reads, so the two have to compose rather than each start from
+        // the whole vector.
+        let mut snap = Mock::new(2000, |i| i as i64, false);
+        let keys: Vec<u64> = (0..2000).step_by(4).collect();
+        let p = plan(
+            vec![age_level()],
+            vec![sip_op(&keys, 0), Op::Filter { prog: gt_prog(999) }],
+            SinkSpec::Count,
+            &["n"],
+        );
+        let r = run(&p, &mut snap, &seq()).unwrap();
+        // Multiples of four above 999: 1000, 1004, ... 1996.
+        assert_eq!(r.rows, vec![vec![Value::Int(250)]]);
     }
 
     #[test]

@@ -591,6 +591,28 @@ exec_join_build_mrows_s = 8.0
 # floor, never lower it.
 exec_sip_select_mrows_s = 50.0
 
+# What a query is left at when the join publishes that filter to the
+# level it probes, against the same plan with ZU_SIP=0 holding it back
+# (perf/13 section 1). The join bench times two shapes both ways and
+# this floors the weaker of the two, so it is a no regression gate:
+# a filter that costs more than it saves fails here.
+#
+# The two shapes are the two halves of the pass. One has build keys
+# sixty four apart, so the membership test rejects all but one probe
+# row in sixty four; the other has a build side whose keys are city
+# numbers against a probe key that climbs with the row, so the range
+# alone skips every chunk but the first before it is decoded.
+#
+# The range one is worth having and the membership one is a wash today
+# LOCALFLEET
+#
+# Neither is the pass at its best, and the reason is the join side
+# choice rather than the filter: the optimizer drives the cheaper
+# estimated side and builds the dearer one, so the filter is published
+# from the big side onto the small one and the big side's build is
+# still in both numbers. Raise this floor once that turns around.
+exec_sip_worst_x = 0.85
+
 # The summed arithmetic projection at one worker, M rows/s (perf/05
 # section 5): two million people and `sum(p.score * 2 + p.bucket)`,
 # which returns one row, so nothing is built and the number is the

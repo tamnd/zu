@@ -564,6 +564,13 @@ pub(crate) fn env_options() -> exec::Options {
         Ok("0") => exec::Wcoj::Off,
         _ => exec::Wcoj::Auto,
     };
+    // A join publishes a filter over its build keys unless ZU_SIP=0
+    // says otherwise, which is how a run is measured against the same
+    // plan without one.
+    options.sip = match std::env::var("ZU_SIP").as_deref() {
+        Ok("0") => exec::Sip::Off,
+        _ => exec::Sip::On,
+    };
     options
 }
 

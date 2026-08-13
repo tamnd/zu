@@ -242,6 +242,10 @@ pub struct Options {
     /// How closing-edge probes reach the `MultiwayIntersect`, the
     /// WCOJ closing step of docs/07 §4.
     pub wcoj: Wcoj,
+    /// Whether a join hands what it knows about its keys to the
+    /// operators producing its probe side, the sideways pass of
+    /// perf/13 §1.
+    pub sip: Sip,
 }
 
 /// The WCOJ fusion switch. The optimizer marks cyclic closes on the
@@ -254,6 +258,18 @@ pub enum Wcoj {
     #[default]
     Auto,
     Force,
+    Off,
+}
+
+/// The sideways information passing switch. `On` lets a join publish a
+/// filter over its build keys to the level its probe key is read from,
+/// which is the default. `Off` pins the plain probe, so a run with it
+/// is the baseline the filter is measured against and the rows either
+/// way have to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sip {
+    #[default]
+    On,
     Off,
 }
 

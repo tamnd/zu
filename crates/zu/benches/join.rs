@@ -21,17 +21,35 @@
 //! table order, and that is what makes the answer match the old engine
 //! row for row rather than just as a set.
 //!
-//! Seven shapes. A unique build key, where every probe finds exactly
+//! Nine shapes. A unique build key, where every probe finds exactly
 //! one row and the table is at its widest. A key with a thousand rows
 //! under it, where the probe side is small and the cost is streaming
 //! payload. A probe that misses everything, which is the tag doing its
 //! job and the payload never being touched. A group by a column of the
 //! joined side, which reads the level the join built. A hop off that
-//! level, which is the join feeding a walk. And two left joins, an
+//! level, which is the join feeding a walk. Two left joins, an
 //! OPTIONAL MATCH tied by an equality, one where every probe hits and
 //! one where every other probe misses and the outer row goes on with a
 //! null bound to it. The miss case is the one that would halve its own
 //! answer if a miss were dropped instead of kept.
+//!
+//! The last two are the sideways pass of perf/13 section 1, and each
+//! is timed twice, once with the join publishing what it knows about
+//! its keys to the level it probes and once with ZU_SIP=0 holding it
+//! back. One of them is the membership test earning its keep: the
+//! build keys are sixty four apart, so the filter rejects all but one
+//! probe row in sixty four before the probe. The other is the range
+//! going down into the scan: the build side's keys are city numbers
+//! and the probe's climb with the row, so every chunk but the first
+//! sits outside the range and is skipped without being decoded.
+//!
+//! What those two ratios do not show yet is the pass at its best. The
+//! join builds the side the optimizer estimated dearer and drives the
+//! cheaper one, so the filter is published from the big side onto the
+//! small one, which is the direction with the least to gain, and the
+//! build of the big side is what is left in the number either way.
+//! Turning that around is the join side choice, not this, and it is
+//! the next thing on zu#76.
 //!
 //! Every case is crosschecked against the generators, so a join that
 //! loses rows, repeats them or lands them on the wrong key fails here.
@@ -43,7 +61,10 @@
 //! Everything runs at one worker, so the rate is per core.
 //!
 //! exec_join_mprobes_s_core floors the unique key case in millions of
-//! probe rows a second, build included.
+//! probe rows a second, build included. exec_sip_worst_x floors the
+//! weakest of the two sideways cases against its own filter off run,
+//! which is a no regression gate: a filter that costs more than it
+//! saves fails here.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench join
 
@@ -82,6 +103,19 @@ fn pair(i: u64) -> u64 {
 
 fn city(i: u64) -> u64 {
     (i * 31) % CITIES
+}
+
+/// How far apart the sparse build keys sit, and how many of the probe
+/// side's rows therefore land on one. Sixty four is past the point a
+/// mask stops being the cheaper filter, so this build side publishes a
+/// bloom and the probe rows that survive it are one in sixty four.
+const SPREAD: u64 = 64;
+
+/// A key sparse enough that a filter over it rejects nearly every probe
+/// row, and unique, so a survivor matches exactly one build row and the
+/// work after the filter is the answer rather than the payload.
+fn sparse(i: u64) -> u64 {
+    i * SPREAD
 }
 
 /// A key no row carries, so every probe of it is a miss.
@@ -168,6 +202,11 @@ struct Case {
     old_want: Want,
     probes: u64,
     out: u64,
+    /// Whether to run this one a second time with the sideways filter
+    /// off and report what it was worth. Only the shapes it can do
+    /// something for carry this; on the rest the two runs are the same
+    /// plan and the line would say nothing.
+    sip: bool,
 }
 
 fn main() {
@@ -181,6 +220,7 @@ fn main() {
     let cities: Vec<u64> = (0..NODES).map(city).collect();
     let misses: Vec<u64> = (0..NODES).map(miss).collect();
     let halves: Vec<u64> = (0..NODES).map(half).collect();
+    let sparses: Vec<u64> = (0..NODES).map(sparse).collect();
     store_props(
         &mut db,
         "person",
@@ -189,6 +229,7 @@ fn main() {
             ("city", PropValues::Int(&cities)),
             ("far", PropValues::Int(&misses)),
             ("half", PropValues::Int(&halves)),
+            ("sparse", PropValues::Int(&sparses)),
         ],
     )
     .expect("props");
@@ -226,6 +267,22 @@ fn main() {
     let old_hop_out: u64 = (0..OLD_PROBES)
         .map(|i| out_degree[inv[i as usize] as usize])
         .sum();
+    // The sparse key is one build row per key, sixty four apart, so a
+    // probe row survives exactly when its pair is a multiple of the
+    // spread.
+    let sparse_hit = |i: u64| pair(i).is_multiple_of(SPREAD);
+    let sparse_out = (0..NODES).filter(|&i| sparse_hit(i)).count() as u64;
+    let old_sparse_out = (0..OLD_PROBES).filter(|&i| sparse_hit(i)).count() as u64;
+    // The sparse key against the city key: a probe row matches when its
+    // own key is a city, and the keys climb sixty four at a time, so
+    // the only rows low enough are the first few of the table. Each of
+    // them matches every row carrying that city. Both engines answer
+    // the same number, since the old engine's cut down driving side
+    // already holds all the rows that match.
+    let zone_out: u64 = (0..NODES)
+        .filter(|&i| sparse(i) < CITIES)
+        .map(|i| per_city[sparse(i) as usize])
+        .sum();
     let old_towns = (0..OLD_PROBES)
         .map(|i| city(inv[i as usize]))
         .collect::<std::collections::BTreeSet<_>>()
@@ -255,6 +312,7 @@ fn main() {
             },
             probes: NODES,
             out: unique_out,
+            sip: false,
         },
         Case {
             what: "thousand a key",
@@ -276,6 +334,7 @@ fn main() {
             },
             probes: city_probes,
             out: city_out,
+            sip: false,
         },
         Case {
             what: "every probe misses",
@@ -288,6 +347,7 @@ fn main() {
             old_want: Want { rows: 1, total: 0 },
             probes: NODES,
             out: 0,
+            sip: false,
         },
         Case {
             what: "grouped by the joined side",
@@ -308,6 +368,7 @@ fn main() {
             },
             probes: NODES,
             out: unique_out,
+            sip: false,
         },
         Case {
             what: "hop off the joined side",
@@ -328,6 +389,7 @@ fn main() {
             },
             probes: NODES,
             out: hop_out,
+            sip: false,
         },
         Case {
             what: "left join, every probe hits",
@@ -348,6 +410,7 @@ fn main() {
             },
             probes: NODES,
             out: NODES,
+            sip: false,
         },
         Case {
             what: "left join, every other probe misses",
@@ -370,12 +433,64 @@ fn main() {
             },
             probes: NODES,
             out: NODES,
+            sip: false,
+        },
+        Case {
+            what: "one probe row in sixty four survives",
+            new: "MATCH (a:person), (b:person) WHERE a.pair = b.sparse RETURN count(*) AS n"
+                .into(),
+            old: format!(
+                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.pair = b.sparse \
+                 RETURN count(*) AS n"
+            ),
+            want: Want {
+                rows: 1,
+                total: sparse_out as i64,
+            },
+            old_want: Want {
+                rows: 1,
+                total: old_sparse_out as i64,
+            },
+            probes: NODES,
+            out: sparse_out,
+            sip: true,
+        },
+        Case {
+            what: "the build side's keys fit in one chunk of the probe",
+            new: "MATCH (a:person), (b:person) WHERE a.sparse = b.city RETURN count(*) AS n"
+                .into(),
+            old: format!(
+                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.sparse = b.city \
+                 RETURN count(*) AS n"
+            ),
+            want: Want {
+                rows: 1,
+                total: zone_out as i64,
+            },
+            old_want: Want {
+                rows: 1,
+                total: zone_out as i64,
+            },
+            probes: NODES,
+            out: zone_out,
+            sip: true,
         },
     ];
 
     let mut unique = 0.0;
+    let mut worst_sip = f64::MAX;
     for case in cases {
         let new = measure(&mut db, &case.new, &case.want, 5);
+        // The same plan with the join's filter withheld, which is the
+        // baseline the sideways pass is worth measuring against: same
+        // rows, same order, one less thing known.
+        let off = case.sip.then(|| {
+            // SAFETY: same as the worker count above.
+            unsafe { std::env::set_var("ZU_SIP", "0") };
+            let ms = measure(&mut db, &case.new, &case.want, 5);
+            unsafe { std::env::remove_var("ZU_SIP") };
+            ms
+        });
         // SAFETY: same as the worker count above.
         unsafe { std::env::set_var("ZU_EXEC2", "0") };
         let old = measure(&mut db, &case.old, &case.old_want, 1);
@@ -383,9 +498,16 @@ fn main() {
         let mprobes = case.probes as f64 / 1e3 / new;
         let new_us = new * 1e3 / case.probes as f64;
         let old_us = old * 1e3 / OLD_PROBES as f64;
+        let sip = match off {
+            Some(off) => {
+                worst_sip = worst_sip.min(off / new);
+                format!(", filter off {off:.1} ms {:.1}x", off / new)
+            }
+            None => String::new(),
+        };
         println!(
             "join {}: {new:.1} ms {mprobes:.2} M probes/s {:.1} M rows out, {new_us:.3} us/probe, \
-             old engine {old_us:.1} us/probe over {OLD_PROBES} probes, {:.0}x per probe, \
+             old engine {old_us:.1} us/probe over {OLD_PROBES} probes, {:.0}x per probe{sip}, \
              crosschecked",
             case.what,
             case.out as f64 / 1e6,
@@ -405,5 +527,13 @@ fn main() {
             "the unique key join probes {unique:.2} M rows/s, under the {floor} M floor"
         );
         println!("gate: join floor met");
+    }
+    if let Some(floor) = budget("exec_sip_worst_x") {
+        assert!(
+            worst_sip >= floor,
+            "the sideways filter leaves the query {worst_sip:.2}x at its weakest, \
+             under the {floor}x floor"
+        );
+        println!("gate: sip floor met");
     }
 }

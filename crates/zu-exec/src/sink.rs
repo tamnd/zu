@@ -26,6 +26,16 @@ fn invalid(detail: String) -> ZuError {
 /// One aggregate accumulator, the integer subset of the old engine's
 /// Acc with identical finalize semantics: sum of nothing is 0, avg of
 /// nothing is null, min and max of nothing are null.
+///
+/// There is deliberately no counterpart here to the old engine's
+/// `01G11 null value eliminated in set function`. This accumulator
+/// never sees a null: `Compiler::agg_spec` declines an argument off an
+/// optional level or off a kernel column that answers null, and dense
+/// stored columns have a value on every row. So a statement that could
+/// raise the warning is one this executor refused to compile, and the
+/// old engine raises it there. If that gate ever loosens, the warning
+/// has to arrive here at the same time, or the two executors will
+/// answer the same query with two different envelopes.
 #[derive(Clone, Copy)]
 pub(crate) enum Acc {
     Count(i64),
@@ -712,10 +722,7 @@ pub(crate) fn finish_agg(
             }
         }
         let row = states.into_iter().map(Acc::finalize).collect();
-        return Ok(QueryResult {
-            columns,
-            rows: apply_post(post, vec![row]),
-        });
+        return Ok(QueryResult::new(columns, apply_post(post, vec![row])));
     }
     // Fold every other worker into the first non-empty table rather
     // than into a fresh one, so the biggest partial is usually the one
@@ -744,10 +751,7 @@ pub(crate) fn finish_agg(
         }
         rows.push(row);
     }
-    Ok(QueryResult {
-        columns,
-        rows: apply_post(post, rows),
-    })
+    Ok(QueryResult::new(columns, apply_post(post, rows)))
 }
 
 /// Folds the workers' tables and answers with how many groups they
@@ -780,10 +784,10 @@ pub(crate) fn finish_rows(
         && partials.iter().all(|p| p.top.is_some())
     {
         let tops = partials.iter_mut().filter_map(|p| p.top.take()).collect();
-        return QueryResult {
+        return QueryResult::new(
             columns,
-            rows: apply_post(&post[1..], merge_topn(keys, need, tops)),
-        };
+            apply_post(&post[1..], merge_topn(keys, need, tops)),
+        );
     }
     let mut batches: Vec<(usize, Vec<Vec<Value>>)> =
         partials.into_iter().flat_map(|p| p.batches).collect();
@@ -792,10 +796,7 @@ pub(crate) fn finish_rows(
     for (_, mut b) in batches {
         rows.append(&mut b);
     }
-    QueryResult {
-        columns,
-        rows: apply_post(post, rows),
-    }
+    QueryResult::new(columns, apply_post(post, rows))
 }
 
 #[cfg(test)]

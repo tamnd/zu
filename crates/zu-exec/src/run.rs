@@ -56,15 +56,15 @@ pub(crate) fn run(
     match &plan.sink {
         SinkSpec::Count => {
             let total: i64 = partials.iter().map(|p| p.count).sum();
-            Ok(QueryResult {
-                columns: plan.columns.clone(),
-                rows: vec![vec![Value::Int(total)]],
-            })
+            Ok(QueryResult::new(
+                plan.columns.clone(),
+                vec![vec![Value::Int(total)]],
+            ))
         }
-        SinkSpec::CountDistinct { .. } => Ok(QueryResult {
-            columns: plan.columns.clone(),
-            rows: vec![vec![Value::Int(sink::finish_distinct(partials)?)]],
-        }),
+        SinkSpec::CountDistinct { .. } => Ok(QueryResult::new(
+            plan.columns.clone(),
+            vec![vec![Value::Int(sink::finish_distinct(partials)?)]],
+        )),
         SinkSpec::Agg {
             item_agg,
             keys,

@@ -9,6 +9,7 @@
 //! overflow the stack: every recursion into a subexpression passes
 //! through one depth guard.
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 
 use crate::ast::{
@@ -60,7 +61,7 @@ impl Parser<'_> {
             ),
             None => format!("unexpected end of query, expected {expected}"),
         };
-        ZuError::InvalidArgument(detail)
+        ZuError::gql(codes::C42001, detail)
     }
 
     /// True when the next token is the given keyword, case-insensitive.
@@ -181,20 +182,26 @@ impl Parser<'_> {
                 clauses.push(Clause::Return { projection });
                 self.eat(&TokenKind::Semicolon);
                 if let Some(token) = self.peek() {
-                    return Err(ZuError::InvalidArgument(format!(
-                        "{}: nothing may follow RETURN, found {}",
-                        position(self.source, token.start),
-                        token.kind.describe()
-                    )));
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        format!(
+                            "{}: nothing may follow RETURN, found {}",
+                            position(self.source, token.start),
+                            token.kind.describe()
+                        ),
+                    ));
                 }
                 return Ok(Query { clauses });
             } else if let Some(kw) = UNIMPLEMENTED.iter().find(|kw| self.at_kw(kw)) {
-                return Err(ZuError::InvalidArgument(format!(
-                    "{}: {kw} is not implemented yet, the v0 core is MATCH, WHERE, CALL, UNWIND, WITH, RETURN",
-                    position(self.source, self.peek().expect("peeked").start)
-                )));
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    format!(
+                        "{}: {kw} is not implemented yet, the v0 core is MATCH, WHERE, CALL, UNWIND, WITH, RETURN",
+                        position(self.source, self.peek().expect("peeked").start)
+                    ),
+                ));
             } else if clauses.is_empty() && self.peek().is_none() {
-                return Err(ZuError::InvalidArgument("empty query".into()));
+                return Err(ZuError::gql(codes::C42001, "empty query"));
             } else {
                 return Err(self.error("MATCH, OPTIONAL MATCH, CALL, UNWIND, WITH, or RETURN"));
             }
@@ -292,8 +299,9 @@ impl Parser<'_> {
             self.expect_kw("SHORTEST")?;
             Some(Selector::AllShortest)
         } else if self.at_kw("SHORTEST") {
-            return Err(ZuError::InvalidArgument(
-                "SHORTEST needs a quantity: write ANY SHORTEST or ALL SHORTEST".into(),
+            return Err(ZuError::gql(
+                codes::C42001,
+                "SHORTEST needs a quantity: write ANY SHORTEST or ALL SHORTEST",
             ));
         } else {
             None
@@ -305,8 +313,9 @@ impl Parser<'_> {
         } else if self.eat_kw("ACYCLIC") {
             PathMode::Acyclic
         } else if self.at_kw("SIMPLE") {
-            return Err(ZuError::InvalidArgument(
-                "the SIMPLE path mode is not supported yet; use ACYCLIC".into(),
+            return Err(ZuError::gql(
+                codes::C42001,
+                "the SIMPLE path mode is not supported yet; use ACYCLIC",
             ));
         } else {
             PathMode::default()
@@ -387,10 +396,13 @@ impl Parser<'_> {
         let outbound = self.eat(&TokenKind::Gt);
         let direction = match (inbound, outbound) {
             (true, true) => {
-                return Err(ZuError::InvalidArgument(format!(
-                    "{}: a relationship cannot point both ways",
-                    position(self.source, self.tokens[self.pos - 1].start)
-                )));
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    format!(
+                        "{}: a relationship cannot point both ways",
+                        position(self.source, self.tokens[self.pos - 1].start)
+                    ),
+                ));
             }
             (true, false) => RelDirection::In,
             (false, true) => RelDirection::Out,
@@ -453,9 +465,10 @@ impl Parser<'_> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
-            return Err(ZuError::InvalidArgument(format!(
-                "expression nesting deeper than {MAX_DEPTH}"
-            )));
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!("expression nesting deeper than {MAX_DEPTH}"),
+            ));
         }
         let result = self.parse_or();
         self.depth -= 1;
@@ -646,11 +659,17 @@ impl Parser<'_> {
         match token.kind {
             TokenKind::Int(v) => {
                 self.pos += 1;
+                // Not a syntax error: the text is a well-formed integer
+                // literal, it just names a value no exact numeric type
+                // here can hold, which is what 22003 is for.
                 let v = i64::try_from(v).map_err(|_| {
-                    ZuError::InvalidArgument(format!(
-                        "{}: integer literal out of range",
-                        position(self.source, token.start)
-                    ))
+                    ZuError::gql(
+                        codes::C22003,
+                        format!(
+                            "{}: integer literal out of range",
+                            position(self.source, token.start)
+                        ),
+                    )
                 })?;
                 Ok(Expr::Literal(Literal::Int(v)))
             }

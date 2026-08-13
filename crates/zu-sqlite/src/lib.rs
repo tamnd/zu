@@ -24,12 +24,21 @@ pub const SCHEMA_VERSION: i32 = 2;
 
 /// SQLite column affinity for a property column.
 /// The zu type mapping is specified in `docs/05-storage-sqlite.md` §2.
+///
+/// `Boolean` is the odd one. SQLite has four storage classes and a
+/// truth value is not among them: a boolean is stored as the integers
+/// 0 and 1, and the only place the distinction can live is the column's
+/// declared type. So `Boolean` declares BOOLEAN, holds integers, and
+/// exists so a reader can tell a truth value from a count that happens
+/// to be 0 or 1. Everything else here is a storage class under its own
+/// name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColumnType {
     Integer,
     Real,
     Text,
     Blob,
+    Boolean,
 }
 
 impl ColumnType {
@@ -39,7 +48,21 @@ impl ColumnType {
             Self::Real => "REAL",
             Self::Text => "TEXT",
             Self::Blob => "BLOB",
+            Self::Boolean => "BOOLEAN",
         }
+    }
+
+    /// The type a declared type names, `None` when the declaration is
+    /// not one this crate writes.
+    fn from_sql(declared: &str) -> Option<Self> {
+        Some(match declared {
+            "INTEGER" => Self::Integer,
+            "REAL" => Self::Real,
+            "TEXT" => Self::Text,
+            "BLOB" => Self::Blob,
+            "BOOLEAN" => Self::Boolean,
+            _ => return None,
+        })
     }
 }
 
@@ -508,6 +531,42 @@ impl SqliteStore {
             .into_iter()
             .filter_map(|c| c.strip_prefix("p_").map(str::to_owned))
             .collect())
+    }
+
+    /// The property columns of node table `n_<table>` with the type
+    /// each was declared as, in declared order.
+    ///
+    /// [`read_node_prop`](Self::read_node_prop) answers with the storage
+    /// class a value happens to sit in, which is the truth about the
+    /// bytes and not the whole truth about the column: a boolean and a
+    /// count are both integers there. The declaration is where the rest
+    /// of it lives, so a caller that has to reconstruct a column's type
+    /// reads it here and checks the values against it.
+    pub fn node_column_types(&self, table: &str) -> Result<Vec<(String, ColumnType)>> {
+        let sql = format!("PRAGMA table_info(n_{})", ident(table)?);
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .map_err(sql_err)?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .map_err(sql_err)?;
+        rows.into_iter()
+            .filter_map(|(name, declared)| {
+                let name = name.strip_prefix("p_")?.to_owned();
+                Some(match ColumnType::from_sql(&declared) {
+                    Some(ty) => Ok((name, ty)),
+                    None => Err(ZuError::Corrupt {
+                        what: "sqlite schema",
+                        detail: format!(
+                            "column '{name}' of node table '{table}' is declared \
+                             '{declared}', which this store does not write"
+                        ),
+                    }),
+                })
+            })
+            .collect()
     }
 
     /// One property of one node row, dynamically typed the way SQLite

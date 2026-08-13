@@ -885,8 +885,14 @@ fn write_json_value(out: &mut String, v: &Value) {
         // JSON has no NaN and no infinity, and a reader that has to
         // guess what a bare `NaN` token meant is worse off than one
         // that reads null.
+        //
+        // The debug formatting is deliberate: it keeps the point on a
+        // whole number, so 3.0 goes out as `3.0` and not `3`. JSON has
+        // one number type and readers recover the distinction from the
+        // token, so a float written as `3` arrives as an integer and a
+        // caller comparing types sees the wrong one.
         Value::Float(f) if f.is_finite() => {
-            let _ = write!(out, "{f}");
+            let _ = write!(out, "{f:?}");
         }
         Value::Float(_) => out.push_str("null"),
         Value::Str(s) => write_json_str(out, s),
@@ -1266,6 +1272,29 @@ mod tests {
             "{\"gqlstatus\":\"00000\",\"columns\":[\"s\"],\
              \"rows\":[[\"say \\\"hi\\\"\\n\\tpath\\\\to\"],\
              [\"bell\\u0007\"],[null],[null]]}\n"
+        );
+    }
+
+    /// JSON has one number type, so a reader tells a float from an
+    /// integer by whether the token has a point or an exponent in it.
+    /// A whole float written without one arrives as an integer, and a
+    /// caller that checks types sees the wrong one.
+    #[test]
+    fn a_whole_float_keeps_its_point() {
+        let r = QueryResult {
+            columns: vec!["f".into()],
+            rows: vec![
+                vec![Value::Float(3.0)],
+                vec![Value::Float(-0.25)],
+                vec![Value::Float(0.0)],
+                vec![Value::Int(3)],
+            ],
+            notices: Vec::new(),
+        };
+        assert_eq!(
+            render_json(&r),
+            "{\"gqlstatus\":\"00000\",\"columns\":[\"f\"],\
+             \"rows\":[[3.0],[-0.25],[0.0],[3]]}\n"
         );
     }
 

@@ -440,8 +440,7 @@ fn main() {
         },
         Case {
             what: "one probe row in eight survives",
-            new: "MATCH (a:person), (b:person) WHERE a.pair = b.sparse RETURN count(*) AS n"
-                .into(),
+            new: "MATCH (a:person), (b:person) WHERE a.pair = b.sparse RETURN count(*) AS n".into(),
             old: format!(
                 "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.pair = b.sparse \
                  RETURN count(*) AS n"
@@ -460,8 +459,7 @@ fn main() {
         },
         Case {
             what: "the build side's keys fit in one chunk of the probe",
-            new: "MATCH (a:person), (b:person) WHERE a.sparse = b.city RETURN count(*) AS n"
-                .into(),
+            new: "MATCH (a:person), (b:person) WHERE a.sparse = b.city RETURN count(*) AS n".into(),
             old: format!(
                 "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.sparse = b.city \
                  RETURN count(*) AS n"

@@ -33,8 +33,8 @@ use crate::compile::{
 use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::join::JoinTable;
 use crate::pool;
-use crate::sip::SipFilter;
 use crate::sink::{self, Acc, SinkState};
+use crate::sip::SipFilter;
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
@@ -652,7 +652,10 @@ impl<'a> Worker<'a> {
             keybuf: Vec::new(),
             sips: vec![
                 SipState::default();
-                plan.ops.iter().filter(|op| matches!(op, Op::Sip { .. })).count()
+                plan.ops
+                    .iter()
+                    .filter(|op| matches!(op, Op::Sip { .. }))
+                    .count()
             ],
             sip_keys: Vec::new(),
             sip_rows: Vec::new(),

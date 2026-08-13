@@ -1573,29 +1573,6 @@ impl Compiler<'_> {
             }
         }
 
-        if std::env::var("ZU_PLAN2").is_ok() {
-            let names: Vec<String> = ops
-                .iter()
-                .map(|op| match op {
-                    Op::Filter { .. } => "Filter".to_string(),
-                    Op::Expand { from, to, .. } => format!("Expand{from}->{to}"),
-                    Op::Branch { .. } => "Branch".to_string(),
-                    Op::Intersect { .. } => "Intersect".to_string(),
-                    Op::Semi { .. } => "Semi".to_string(),
-                    Op::Optional { .. } => "Optional".to_string(),
-                    Op::OptionalHit { .. } => "OptionalHit".to_string(),
-                    Op::DegreeProduct { .. } => "DegreeProduct".to_string(),
-                    Op::Join { key, to, .. } => format!("Join{}->{to}", key.level()),
-                    Op::Sip { key, filter, .. } => {
-                        format!("Sip{}:{}", key.level(), filter.kind())
-                    }
-                })
-                .collect();
-            eprintln!(
-                "plan2 zone={:?} ops={names:?}",
-                pred.as_ref().map(|p| (p.col, p.lo, p.hi))
-            );
-        }
         Ok(Some(ExecPlan {
             table,
             source: match (seek, seeks) {

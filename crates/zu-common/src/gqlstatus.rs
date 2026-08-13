@@ -15,9 +15,12 @@
 //! made up has not raised a condition, it has printed a string.
 //!
 //! The conformance denominator is the 68 subclass rows. The table also
-//! carries the four class-only codes (`02000`, `03000`, `2D000`,
-//! `G2000`), which are real GQLSTATUS values but are not separately
-//! counted, so the totals here are 72 and 68 rather than one number.
+//! carries one row per class, the class code followed by `000`, because
+//! that is a GQLSTATUS value too and it is the one a statement reports
+//! when nothing in particular happened: `00000 successful completion`.
+//! The artifact only writes those rows out for the four classes that
+//! have no subclasses, so the generator synthesises the other eight. That
+//! is why the totals here are 80 and 68 rather than one number.
 
 mod generated;
 
@@ -59,7 +62,7 @@ pub struct Condition {
     /// The class name, for example `data exception`.
     pub class: &'static str,
     /// The subclass name, for example `division by zero`. `None` on the
-    /// four class-only rows.
+    /// twelve class rows, whose code ends in `000`.
     pub subclass: Option<&'static str>,
 }
 
@@ -169,11 +172,26 @@ mod tests {
 
     #[test]
     fn the_table_is_the_standard_table() {
-        assert_eq!(CONDITIONS.len(), 72, "72 GQLSTATUS values in the artifact");
+        assert_eq!(CONDITIONS.len(), 80, "12 class rows plus 68 subclass rows");
         assert_eq!(
             subclass_rows().count(),
             68,
             "68 subclass rows, the conformance denominator"
+        );
+    }
+
+    #[test]
+    fn a_statement_that_did_nothing_notable_has_a_code_for_that() {
+        // The artifact spells `00` as a container with `001` inside it,
+        // so a generator that only emits class rows for the self-closing
+        // classes has no way to say "this worked". Everything the shell
+        // reports on a successful statement hangs off this.
+        assert_eq!(codes::C00000.code(), "00000");
+        assert_eq!(codes::C00000.standard_text(), "successful completion");
+        assert_eq!(codes::C00000.severity(), Severity::Success);
+        assert_eq!(
+            codes::C00001.standard_text(),
+            "successful completion, omitted result"
         );
     }
 

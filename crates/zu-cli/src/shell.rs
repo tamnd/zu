@@ -9,18 +9,20 @@
 //! plus `prepare`, `execute`, `close_stmt`, `explain_analyze`, and
 //! `quit`. Any other non-empty line is a bare statement run with no
 //! parameters, with `\n`, `\t`, and `\\` unfolded so a multi-line
-//! statement can travel on one line. Responses are `{"columns":...,
-//! "rows":...}` for results and `{"error":"..."}` for failures, and an
-//! error never kills the loop: the session and its caches survive a
-//! bad statement.
+//! statement can travel on one line. Responses are `{"gqlstatus":...,
+//! "columns":...,"rows":...}` for results and `{"error":"..."}` for
+//! failures, and an error never kills the loop: the session and its
+//! caches survive a bad statement.
 //!
 //! Both response shapes carry GQLSTATUS when there is one
-//! (Spec/2064g/gql/plan/07). A result that raised a condition it
-//! survived grows a `"notices"` array; a failure the engine raised grows
-//! a `"failure"` object with the code, the standard's text and the
-//! severity. A failure the *protocol* raised, a malformed frame or an
-//! unknown op, has no code and does not pretend to: those are not
-//! conditions the standard defines.
+//! (Spec/2064g/gql/plan/07). A successful result leads with the
+//! completion condition, `00000` or `00001` when the statement had no
+//! projection, and grows a `"notices"` array if it raised something it
+//! survived. A failure the engine raised grows a `"failure"` object with
+//! the code, the standard's text and the severity. A failure the
+//! *protocol* raised, a malformed frame or an unknown op, has no code and
+//! does not pretend to: those are not conditions the standard defines,
+//! and a reader can tell the two apart by whether `"failure"` is there.
 
 use std::io::{BufRead, Write};
 use std::process::ExitCode;

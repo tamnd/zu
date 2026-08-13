@@ -9,10 +9,22 @@ use super::{Condition, GqlStatus, Severity};
 /// Every GQLSTATUS value the standard defines, in code order.
 pub(super) static CONDITIONS: &[Condition] = &[
     Condition {
+        code: "00000",
+        severity: Severity::Success,
+        class: "successful completion",
+        subclass: None,
+    },
+    Condition {
         code: "00001",
         severity: Severity::Success,
         class: "successful completion",
         subclass: Some("omitted result"),
+    },
+    Condition {
+        code: "01000",
+        severity: Severity::Warning,
+        class: "warning",
+        subclass: None,
     },
     Condition {
         code: "01004",
@@ -51,10 +63,22 @@ pub(super) static CONDITIONS: &[Condition] = &[
         subclass: None,
     },
     Condition {
+        code: "08000",
+        severity: Severity::Exception,
+        class: "connection exception",
+        subclass: None,
+    },
+    Condition {
         code: "08007",
         severity: Severity::Exception,
         class: "connection exception",
         subclass: Some("transaction resolution unknown"),
+    },
+    Condition {
+        code: "22000",
+        severity: Severity::Exception,
+        class: "data exception",
+        subclass: None,
     },
     Condition {
         code: "22001",
@@ -303,6 +327,12 @@ pub(super) static CONDITIONS: &[Condition] = &[
         subclass: Some("incompatible temporal instant unit groups"),
     },
     Condition {
+        code: "25000",
+        severity: Severity::Exception,
+        class: "invalid transaction state",
+        subclass: None,
+    },
+    Condition {
         code: "25G01",
         severity: Severity::Exception,
         class: "invalid transaction state",
@@ -333,10 +363,22 @@ pub(super) static CONDITIONS: &[Condition] = &[
         subclass: None,
     },
     Condition {
+        code: "40000",
+        severity: Severity::Exception,
+        class: "transaction rollback",
+        subclass: None,
+    },
+    Condition {
         code: "40003",
         severity: Severity::Exception,
         class: "transaction rollback",
         subclass: Some("statement completion unknown"),
+    },
+    Condition {
+        code: "42000",
+        severity: Severity::Exception,
+        class: "syntax error or access rule violation",
+        subclass: None,
     },
     Condition {
         code: "42001",
@@ -417,6 +459,12 @@ pub(super) static CONDITIONS: &[Condition] = &[
         subclass: Some("number of edge type key labels exceeds supported maximum"),
     },
     Condition {
+        code: "G1000",
+        severity: Severity::Exception,
+        class: "dependent object error",
+        subclass: None,
+    },
+    Condition {
         code: "G1001",
         severity: Severity::Exception,
         class: "dependent object error",
@@ -447,148 +495,164 @@ pub(super) static CONDITIONS: &[Condition] = &[
 pub mod codes {
     use super::GqlStatus;
 
+    /// `00000` successful completion
+    pub const C00000: GqlStatus = GqlStatus(0);
     /// `00001` successful completion, omitted result
-    pub const C00001: GqlStatus = GqlStatus(0);
+    pub const C00001: GqlStatus = GqlStatus(1);
+    /// `01000` warning
+    pub const C01000: GqlStatus = GqlStatus(2);
     /// `01004` warning, string data, right truncation
-    pub const C01004: GqlStatus = GqlStatus(1);
+    pub const C01004: GqlStatus = GqlStatus(3);
     /// `01G03` warning, graph does not exist
-    pub const C01G03: GqlStatus = GqlStatus(2);
+    pub const C01G03: GqlStatus = GqlStatus(4);
     /// `01G04` warning, graph type does not exist
-    pub const C01G04: GqlStatus = GqlStatus(3);
+    pub const C01G04: GqlStatus = GqlStatus(5);
     /// `01G11` warning, null value eliminated in set function
-    pub const C01G11: GqlStatus = GqlStatus(4);
+    pub const C01G11: GqlStatus = GqlStatus(6);
     /// `02000` no data
-    pub const C02000: GqlStatus = GqlStatus(5);
+    pub const C02000: GqlStatus = GqlStatus(7);
     /// `03000` informational
-    pub const C03000: GqlStatus = GqlStatus(6);
+    pub const C03000: GqlStatus = GqlStatus(8);
+    /// `08000` connection exception
+    pub const C08000: GqlStatus = GqlStatus(9);
     /// `08007` connection exception, transaction resolution unknown
-    pub const C08007: GqlStatus = GqlStatus(7);
+    pub const C08007: GqlStatus = GqlStatus(10);
+    /// `22000` data exception
+    pub const C22000: GqlStatus = GqlStatus(11);
     /// `22001` data exception, string data, right truncation
-    pub const C22001: GqlStatus = GqlStatus(8);
+    pub const C22001: GqlStatus = GqlStatus(12);
     /// `22003` data exception, numeric value out of range
-    pub const C22003: GqlStatus = GqlStatus(9);
+    pub const C22003: GqlStatus = GqlStatus(13);
     /// `22004` data exception, null value not allowed
-    pub const C22004: GqlStatus = GqlStatus(10);
+    pub const C22004: GqlStatus = GqlStatus(14);
     /// `22007` data exception, invalid date, time, or, datetime format
-    pub const C22007: GqlStatus = GqlStatus(11);
+    pub const C22007: GqlStatus = GqlStatus(15);
     /// `22008` data exception, datetime field overflow
-    pub const C22008: GqlStatus = GqlStatus(12);
+    pub const C22008: GqlStatus = GqlStatus(16);
     /// `22011` data exception, substring error
-    pub const C22011: GqlStatus = GqlStatus(13);
+    pub const C22011: GqlStatus = GqlStatus(17);
     /// `22012` data exception, division by zero
-    pub const C22012: GqlStatus = GqlStatus(14);
+    pub const C22012: GqlStatus = GqlStatus(18);
     /// `22015` data exception, interval field overflow
-    pub const C22015: GqlStatus = GqlStatus(15);
+    pub const C22015: GqlStatus = GqlStatus(19);
     /// `22018` data exception, invalid character value for cast
-    pub const C22018: GqlStatus = GqlStatus(16);
+    pub const C22018: GqlStatus = GqlStatus(20);
     /// `2201E` data exception, invalid argument for natural logarithm
-    pub const C2201E: GqlStatus = GqlStatus(17);
+    pub const C2201E: GqlStatus = GqlStatus(21);
     /// `2201F` data exception, invalid argument for power function
-    pub const C2201F: GqlStatus = GqlStatus(18);
+    pub const C2201F: GqlStatus = GqlStatus(22);
     /// `22027` data exception, trim error
-    pub const C22027: GqlStatus = GqlStatus(19);
+    pub const C22027: GqlStatus = GqlStatus(23);
     /// `2202F` data exception, array data, right truncation
-    pub const C2202F: GqlStatus = GqlStatus(20);
+    pub const C2202F: GqlStatus = GqlStatus(24);
     /// `22G02` data exception, negative limit value
-    pub const C22G02: GqlStatus = GqlStatus(21);
+    pub const C22G02: GqlStatus = GqlStatus(25);
     /// `22G03` data exception, invalid value type
-    pub const C22G03: GqlStatus = GqlStatus(22);
+    pub const C22G03: GqlStatus = GqlStatus(26);
     /// `22G04` data exception, values not comparable
-    pub const C22G04: GqlStatus = GqlStatus(23);
+    pub const C22G04: GqlStatus = GqlStatus(27);
     /// `22G05` data exception, invalid date, time, or datetime function field name
-    pub const C22G05: GqlStatus = GqlStatus(24);
+    pub const C22G05: GqlStatus = GqlStatus(28);
     /// `22G06` data exception, invalid datetime function value
-    pub const C22G06: GqlStatus = GqlStatus(25);
+    pub const C22G06: GqlStatus = GqlStatus(29);
     /// `22G07` data exception, invalid duration function field name
-    pub const C22G07: GqlStatus = GqlStatus(26);
+    pub const C22G07: GqlStatus = GqlStatus(30);
     /// `22G0B` data exception, list data, right truncation
-    pub const C22G0B: GqlStatus = GqlStatus(27);
+    pub const C22G0B: GqlStatus = GqlStatus(31);
     /// `22G0C` data exception, list element error
-    pub const C22G0C: GqlStatus = GqlStatus(28);
+    pub const C22G0C: GqlStatus = GqlStatus(32);
     /// `22G0F` data exception, invalid number of paths or groups
-    pub const C22G0F: GqlStatus = GqlStatus(29);
+    pub const C22G0F: GqlStatus = GqlStatus(33);
     /// `22G0H` data exception, invalid duration format
-    pub const C22G0H: GqlStatus = GqlStatus(30);
+    pub const C22G0H: GqlStatus = GqlStatus(34);
     /// `22G0M` data exception, multiple assignments to a graph element property
-    pub const C22G0M: GqlStatus = GqlStatus(31);
+    pub const C22G0M: GqlStatus = GqlStatus(35);
     /// `22G0N` data exception, number of node labels below supported minimum
-    pub const C22G0N: GqlStatus = GqlStatus(32);
+    pub const C22G0N: GqlStatus = GqlStatus(36);
     /// `22G0P` data exception, number of node labels exceeds supported maximum
-    pub const C22G0P: GqlStatus = GqlStatus(33);
+    pub const C22G0P: GqlStatus = GqlStatus(37);
     /// `22G0Q` data exception, number of edge labels below supported minimum
-    pub const C22G0Q: GqlStatus = GqlStatus(34);
+    pub const C22G0Q: GqlStatus = GqlStatus(38);
     /// `22G0R` data exception, number of edge labels exceeds supported maximum
-    pub const C22G0R: GqlStatus = GqlStatus(35);
+    pub const C22G0R: GqlStatus = GqlStatus(39);
     /// `22G0S` data exception, number of node properties exceeds supported maximum
-    pub const C22G0S: GqlStatus = GqlStatus(36);
+    pub const C22G0S: GqlStatus = GqlStatus(40);
     /// `22G0T` data exception, number of edge properties exceeds supported maximum
-    pub const C22G0T: GqlStatus = GqlStatus(37);
+    pub const C22G0T: GqlStatus = GqlStatus(41);
     /// `22G0U` data exception, record fields do not match
-    pub const C22G0U: GqlStatus = GqlStatus(38);
+    pub const C22G0U: GqlStatus = GqlStatus(42);
     /// `22G0V` data exception, reference value, invalid base type
-    pub const C22G0V: GqlStatus = GqlStatus(39);
+    pub const C22G0V: GqlStatus = GqlStatus(43);
     /// `22G0W` data exception, reference value, invalid constrained type
-    pub const C22G0W: GqlStatus = GqlStatus(40);
+    pub const C22G0W: GqlStatus = GqlStatus(44);
     /// `22G0X` data exception, record data, field unassignable
-    pub const C22G0X: GqlStatus = GqlStatus(41);
+    pub const C22G0X: GqlStatus = GqlStatus(45);
     /// `22G0Y` data exception, record data, field missing
-    pub const C22G0Y: GqlStatus = GqlStatus(42);
+    pub const C22G0Y: GqlStatus = GqlStatus(46);
     /// `22G0Z` data exception, malformed path
-    pub const C22G0Z: GqlStatus = GqlStatus(43);
+    pub const C22G0Z: GqlStatus = GqlStatus(47);
     /// `22G10` data exception, path data, right truncation
-    pub const C22G10: GqlStatus = GqlStatus(44);
+    pub const C22G10: GqlStatus = GqlStatus(48);
     /// `22G11` data exception, reference value, referent deleted
-    pub const C22G11: GqlStatus = GqlStatus(45);
+    pub const C22G11: GqlStatus = GqlStatus(49);
     /// `22G12` data exception, invalid value type
-    pub const C22G12: GqlStatus = GqlStatus(46);
+    pub const C22G12: GqlStatus = GqlStatus(50);
     /// `22G13` data exception, invalid group variable value
-    pub const C22G13: GqlStatus = GqlStatus(47);
+    pub const C22G13: GqlStatus = GqlStatus(51);
     /// `22G14` data exception, incompatible temporal instant unit groups
-    pub const C22G14: GqlStatus = GqlStatus(48);
+    pub const C22G14: GqlStatus = GqlStatus(52);
+    /// `25000` invalid transaction state
+    pub const C25000: GqlStatus = GqlStatus(53);
     /// `25G01` invalid transaction state, active GQL-transaction
-    pub const C25G01: GqlStatus = GqlStatus(49);
+    pub const C25G01: GqlStatus = GqlStatus(54);
     /// `25G02` invalid transaction state, catalog and data statement mixing not supported
-    pub const C25G02: GqlStatus = GqlStatus(50);
+    pub const C25G02: GqlStatus = GqlStatus(55);
     /// `25G03` invalid transaction state, read-only GQL-transaction
-    pub const C25G03: GqlStatus = GqlStatus(51);
+    pub const C25G03: GqlStatus = GqlStatus(56);
     /// `25G04` invalid transaction state, accessing multiple graphs not supported
-    pub const C25G04: GqlStatus = GqlStatus(52);
+    pub const C25G04: GqlStatus = GqlStatus(57);
     /// `2D000` invalid transaction termination
-    pub const C2D000: GqlStatus = GqlStatus(53);
+    pub const C2D000: GqlStatus = GqlStatus(58);
+    /// `40000` transaction rollback
+    pub const C40000: GqlStatus = GqlStatus(59);
     /// `40003` transaction rollback, statement completion unknown
-    pub const C40003: GqlStatus = GqlStatus(54);
+    pub const C40003: GqlStatus = GqlStatus(60);
+    /// `42000` syntax error or access rule violation
+    pub const C42000: GqlStatus = GqlStatus(61);
     /// `42001` syntax error or access rule violation, invalid syntax
-    pub const C42001: GqlStatus = GqlStatus(55);
+    pub const C42001: GqlStatus = GqlStatus(62);
     /// `42002` syntax error or access rule violation, invalid reference
-    pub const C42002: GqlStatus = GqlStatus(56);
+    pub const C42002: GqlStatus = GqlStatus(63);
     /// `42004` syntax error or access rule violation, use of visually confusable identifiers
-    pub const C42004: GqlStatus = GqlStatus(57);
+    pub const C42004: GqlStatus = GqlStatus(64);
     /// `42006` syntax error or access rule violation, number of edge labels below supported minimum
-    pub const C42006: GqlStatus = GqlStatus(58);
+    pub const C42006: GqlStatus = GqlStatus(65);
     /// `42007` syntax error or access rule violation, number of edge labels exceeds supported maximum
-    pub const C42007: GqlStatus = GqlStatus(59);
+    pub const C42007: GqlStatus = GqlStatus(66);
     /// `42008` syntax error or access rule violation, number of edge properties exceeds supported maximum
-    pub const C42008: GqlStatus = GqlStatus(60);
+    pub const C42008: GqlStatus = GqlStatus(67);
     /// `42009` syntax error or access rule violation, number of node labels below supported minimum
-    pub const C42009: GqlStatus = GqlStatus(61);
+    pub const C42009: GqlStatus = GqlStatus(68);
     /// `42010` syntax error or access rule violation, number of node labels exceeds supported maximum
-    pub const C42010: GqlStatus = GqlStatus(62);
+    pub const C42010: GqlStatus = GqlStatus(69);
     /// `42011` syntax error or access rule violation, number of node properties exceeds supported maximum
-    pub const C42011: GqlStatus = GqlStatus(63);
+    pub const C42011: GqlStatus = GqlStatus(70);
     /// `42012` syntax error or access rule violation, number of node type key labels below supported minimum
-    pub const C42012: GqlStatus = GqlStatus(64);
+    pub const C42012: GqlStatus = GqlStatus(71);
     /// `42013` syntax error or access rule violation, number of node type key labels exceeds supported maximum
-    pub const C42013: GqlStatus = GqlStatus(65);
+    pub const C42013: GqlStatus = GqlStatus(72);
     /// `42014` syntax error or access rule violation, number of edge type key labels below supported minimum
-    pub const C42014: GqlStatus = GqlStatus(66);
+    pub const C42014: GqlStatus = GqlStatus(73);
     /// `42015` syntax error or access rule violation, number of edge type key labels exceeds supported maximum
-    pub const C42015: GqlStatus = GqlStatus(67);
+    pub const C42015: GqlStatus = GqlStatus(74);
+    /// `G1000` dependent object error
+    pub const CG1000: GqlStatus = GqlStatus(75);
     /// `G1001` dependent object error, edges still exist
-    pub const CG1001: GqlStatus = GqlStatus(68);
+    pub const CG1001: GqlStatus = GqlStatus(76);
     /// `G1002` dependent object error, endpoint node is deleted
-    pub const CG1002: GqlStatus = GqlStatus(69);
+    pub const CG1002: GqlStatus = GqlStatus(77);
     /// `G1003` dependent object error, endpoint node not in current working graph
-    pub const CG1003: GqlStatus = GqlStatus(70);
+    pub const CG1003: GqlStatus = GqlStatus(78);
     /// `G2000` graph type violation
-    pub const CG2000: GqlStatus = GqlStatus(71);
+    pub const CG2000: GqlStatus = GqlStatus(79);
 }

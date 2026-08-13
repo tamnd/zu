@@ -9,15 +9,15 @@ Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) c
 | | ladybug | zu |
 |---|---|---|
 | version | Lbug 0.19.1 | zu 0.0.1 |
-| measured | 2026-08-13 | 2026-08-13 |
+| measured | 2026-08-13 | 2026-08-14 |
 | on | darwin arm64, Apple M4 | darwin arm64, Apple M4 |
 | harness | gql-compat devel | gql-compat devel |
 | corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
 | cases | 377 | 377 |
-| judged (pass + fail) | 253 | 217 |
-| **passed** | **72** (28.5%) | **63** (29.0%) |
-| failed | 181 | 154 |
-| skipped, cannot hold the fixture | 72 | 143 |
+| judged (pass + fail) | 253 | 221 |
+| **passed** | **72** (28.5%) | **64** (29.0%) |
+| failed | 181 | 157 |
+| skipped, cannot hold the fixture | 72 | 139 |
 | never reached a verdict | 52 | 17 |
 | ISO features with a passing case | 22 of 189 | 10 of 189 |
 | distinct GQLSTATUS values produced | 0 | 4 |
@@ -29,9 +29,9 @@ Pass over judged, then the two exclusions. Read the exclusions first. An engine 
 | kind | engine | cases | pass | fail | skip | error | pass of judged |
 |---|---|---|---|---|---|---|---|
 | mandatory | ladybug | 70 | 30 | 14 | 5 | 21 | 68.2% |
-| mandatory | zu | 70 | 16 | 10 | 44 | 0 | 61.5% |
+| mandatory | zu | 70 | 17 | 10 | 43 | 0 | 63.0% |
 | optional | ladybug | 201 | 22 | 153 | 5 | 21 | 12.6% |
-| optional | zu | 201 | 11 | 116 | 58 | 16 | 8.7% |
+| optional | zu | 201 | 11 | 119 | 55 | 16 | 8.5% |
 | condition | ladybug | 66 | 0 | 4 | 62 | 0 | 0.0% |
 | condition | zu | 66 | 5 | 19 | 41 | 1 | 20.8% |
 | grammar | ladybug | 17 | 11 | 4 | 0 | 2 | 73.3% |

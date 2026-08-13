@@ -31,13 +31,19 @@ use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
 /// is lossy on the way out by construction: a date and a count both
 /// land in INTEGER. The round trip test reads back through zu1, where
 /// the type still says which.
+///
+/// A boolean is the exception, and only because sqlite lets a column
+/// be declared BOOLEAN even though the values are the integers 0 and 1.
+/// That declaration is enough to bring the column back as a boolean,
+/// which matters for the fixture loaders that stage a sqlite file and
+/// convert it.
 fn sqlite_type(ty: &LogicalType, name: &str) -> Result<ColumnType> {
     Ok(match ty {
         LogicalType::Str { .. } => ColumnType::Text,
         LogicalType::Bytes { .. } => ColumnType::Blob,
         LogicalType::Float { .. } => ColumnType::Real,
-        LogicalType::Bool
-        | LogicalType::Int { .. }
+        LogicalType::Bool => ColumnType::Boolean,
+        LogicalType::Int { .. }
         | LogicalType::Date
         | LogicalType::LocalTime
         | LogicalType::LocalDatetime
@@ -146,6 +152,7 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
 /// One node property column read whole, uniformly typed.
 enum ColumnData {
     Int(Vec<u64>),
+    Bool(Vec<bool>),
     Float(Vec<f64>),
     Str(Vec<Vec<u8>>),
     Bytes(Vec<Vec<u8>>),
@@ -199,10 +206,11 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
     }
 
     for node in &nodes {
-        let cols = sq.node_columns(&node.name)?;
-        if cols.is_empty() {
+        let declared = sq.node_column_types(&node.name)?;
+        if declared.is_empty() {
             continue;
         }
+        let cols: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
         let count = sq.node_count(&node.name)?;
         let mut data = Vec::with_capacity(cols.len());
         for col in &cols {
@@ -232,6 +240,35 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             }
             data.push(column.unwrap_or(ColumnData::Int(Vec::new())));
         }
+
+        // A boolean arrives as integers, because that is all sqlite has
+        // to store one in, and the declaration is what says the column
+        // was meant as truth values. Anything outside 0 and 1 under that
+        // declaration is a store written by something that did not mean
+        // it, and is refused rather than folded to true.
+        for ((name, ty), column) in declared.iter().zip(&mut data) {
+            if *ty != ColumnType::Boolean {
+                continue;
+            }
+            let ColumnData::Int(vals) = column else {
+                return Err(ZuError::InvalidArgument(format!(
+                    "'{}' column '{name}' is declared BOOLEAN and does not hold integers",
+                    node.name
+                )));
+            };
+            let bits = vals
+                .iter()
+                .map(|&v| match v {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    other => Err(ZuError::InvalidArgument(format!(
+                        "'{}' column '{name}' is declared BOOLEAN and holds {}",
+                        node.name, other as i64
+                    ))),
+                })
+                .collect::<Result<Vec<bool>>>()?;
+            *column = ColumnData::Bool(bits);
+        }
         let str_refs: Vec<Vec<&[u8]>> = data
             .iter()
             .map(|c| match c {
@@ -248,6 +285,7 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             .map(|((name, c), refs)| {
                 let values = match c {
                     ColumnData::Int(vals) => PropValues::Int(vals),
+                    ColumnData::Bool(vals) => PropValues::Bool(vals),
                     ColumnData::Float(vals) => PropValues::Float(vals),
                     ColumnData::Str(_) => PropValues::Str(refs),
                     ColumnData::Bytes(_) => PropValues::Bytes(refs),

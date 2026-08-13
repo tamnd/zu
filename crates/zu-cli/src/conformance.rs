@@ -93,13 +93,13 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "float-values",
-        supported: false,
-        why: "the loader refuses a double at convert time, by name",
+        supported: true,
+        why: "float columns ride the fixed width lane as their IEEE bits",
     },
     Declared {
         key: "boolean-values",
-        supported: false,
-        why: "the loader refuses a boolean at convert time, by name",
+        supported: true,
+        why: "boolean columns ride the lane, declared BOOLEAN across the sqlite staging hop",
     },
     Declared {
         key: "undirected-edges",
@@ -526,11 +526,13 @@ mod tests {
         assert!(toml.contains("name = \"zu\""));
         assert!(toml.contains("gqlstatus = true"));
         assert!(toml.contains("transactions = false"));
-        assert!(toml.contains("float-values = false"));
+        assert!(toml.contains("float-values = true"));
         assert!(toml.contains("self-loops = true"));
         // The reason rides along on the same line as the value, so a
         // reader of the file never has to go looking for it.
-        assert!(toml.contains("float-values = false  # the loader refuses a double"));
+        assert!(toml.contains(
+            "float-values = true  # float columns ride the fixed width lane as their IEEE bits"
+        ));
     }
 
     #[test]

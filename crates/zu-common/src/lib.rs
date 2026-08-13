@@ -3,10 +3,12 @@
 //! The id layout is format-stable and documented in `docs/03-data-model.md`.
 
 mod error;
+pub mod gqlstatus;
 mod id;
 mod order;
 
 pub use error::ZuError;
+pub use gqlstatus::{DiagnosticRecord, GqlStatus, Severity};
 pub use id::{Epoch, GROUP_ROWS, NodeGroupId, NodeId, NodeOffset, RelId, TableId};
 pub use order::int_key;
 

@@ -13,6 +13,14 @@
 //! "rows":...}` for results and `{"error":"..."}` for failures, and an
 //! error never kills the loop: the session and its caches survive a
 //! bad statement.
+//!
+//! Both response shapes carry GQLSTATUS when there is one
+//! (Spec/2064g/gql/plan/07). A result that raised a condition it
+//! survived grows a `"notices"` array; a failure the engine raised grows
+//! a `"failure"` object with the code, the standard's text and the
+//! severity. A failure the *protocol* raised, a malformed frame or an
+//! unknown op, has no code and does not pretend to: those are not
+//! conditions the standard defines.
 
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
@@ -84,7 +92,7 @@ fn respond(session: &mut Session, line: &str) -> (String, bool) {
     if !line.starts_with('{') {
         let reply = match session.run(&unfold(line), &[]) {
             Ok(r) => crate::render_json(&r),
-            Err(e) => error_line(&e.to_string()),
+            Err(e) => failure_line(&e),
         };
         return (reply, false);
     }
@@ -111,7 +119,7 @@ fn respond(session: &mut Session, line: &str) -> (String, bool) {
                     s.push_str("]}\n");
                     s
                 }
-                Err(e) => error_line(&e.to_string()),
+                Err(e) => failure_line(&e),
             };
             (reply, false)
         }
@@ -129,7 +137,7 @@ fn respond(session: &mut Session, line: &str) -> (String, bool) {
                 .collect();
             let reply = match session.execute(id, &borrowed) {
                 Ok(r) => crate::render_json(&r),
-                Err(e) => error_line(&e.to_string()),
+                Err(e) => failure_line(&e),
             };
             (reply, false)
         }
@@ -168,12 +176,12 @@ fn run_frame(session: &mut Session, frame: &Json, explain: bool) -> String {
                 s.push_str("}\n");
                 s
             }
-            Err(e) => error_line(&e.to_string()),
+            Err(e) => failure_line(&e),
         };
     }
     match session.run(q, &borrowed) {
         Ok(r) => crate::render_json(&r),
-        Err(e) => error_line(&e.to_string()),
+        Err(e) => failure_line(&e),
     }
 }
 
@@ -204,9 +212,28 @@ fn frame_params(frame: &Json) -> Result<Vec<(String, Value)>, String> {
         .collect()
 }
 
+/// A failure with no GQLSTATUS: a malformed frame, an unknown op, a
+/// parameter the wire cannot type. These are protocol faults, not GQL
+/// conditions, and giving them a made-up code would be worse than
+/// leaving the field off.
 fn error_line(message: &str) -> String {
     let mut s = String::from("{\"error\":");
     crate::write_json_str(&mut s, message);
+    s.push_str("}\n");
+    s
+}
+
+/// A failure the engine raised. When it carries a condition the frame
+/// gets the code, the standard's text and the severity in fields of
+/// their own, next to the same `error` string an older reader expects.
+fn failure_line(err: &zu::ZuError) -> String {
+    let Some(record) = err.diagnostic() else {
+        return error_line(&err.to_string());
+    };
+    let mut s = String::from("{\"error\":");
+    crate::write_json_str(&mut s, &record.detail);
+    s.push_str(",\"failure\":");
+    crate::write_json_diagnostic(&mut s, record);
     s.push_str("}\n");
     s
 }

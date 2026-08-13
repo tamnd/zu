@@ -604,6 +604,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 .collect();
             format!("{{{}}}", rendered.join(", "))
         }
+        BoundExpr::Cast { expr, ty } => format!("CAST({} AS {ty})", expr_text(expr, query)),
     }
 }
 

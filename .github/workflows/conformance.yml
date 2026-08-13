@@ -145,11 +145,28 @@ jobs:
       # job compares and uploads and does not commit.
       - name: Nothing regressed against the checked-in tally
         run: ./target/release/zu conformance --regressed "$RUNNER_TEMP/report/zu.json" docs/conformance/zu.json
+      # The other direction of the same question, and the reason it is
+      # nightly rather than per PR: challenging the declaration is a
+      # second run of the whole corpus, and most of it fails on purpose
+      # because every case in it is one zu said it could not take. What
+      # it looks for is the claim of absence that nothing went wrong
+      # with. Declaring a capability zu in fact has costs nothing at the
+      # time, turns real passes into skips, and reads in the report
+      # exactly like a limitation.
+      - name: Nothing zu declares absent is in fact present
+        run: |
+          "$RUNNER_TEMP/gql-compat" run \
+            -adapter zu -binary ./target/release/zu \
+            -challenge -quiet -out "$RUNNER_TEMP/challenge" \
+            || echo "harness exit $? recorded; --verify decides"
+      - name: The challenging run agrees with conformance.toml
+        run: ./target/release/zu conformance --verify "$RUNNER_TEMP/challenge/zu.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: conformance-full
           path: |
             ${{ runner.temp }}/report
+            ${{ runner.temp }}/challenge
             ${{ runner.temp }}/zu.json
           if-no-files-found: warn

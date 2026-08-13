@@ -257,6 +257,46 @@ fn verify_report(report: &Json) -> Vec<String> {
     }
 
     problems.extend(verify_claims_are_not_empty(report));
+    problems.extend(verify_nothing_was_contradicted(report));
+    problems
+}
+
+/// Checks a challenging run for a claim of absence the engine did not keep.
+///
+/// `gql-compat run -challenge` ignores the declaration, runs the cases it
+/// would have excluded, and writes one entry per claim into
+/// `declarations`. An entry marked `contradicted` is one where every
+/// excluded case passed, which is the one outcome an engine that lacks the
+/// thing cannot produce. An ordinary run writes no such array and this
+/// check has nothing to say.
+///
+/// This is the half of `--verify` that could not be written before. The
+/// comparison above catches a declaration the adapter reports differently,
+/// which is drift between two files. This catches a declaration that is
+/// simply wrong, and the only evidence for it is cases that ran.
+fn verify_nothing_was_contradicted(report: &Json) -> Vec<String> {
+    let mut problems = Vec::new();
+    let Some(Json::Arr(declarations)) = report.get("declarations") else {
+        return problems;
+    };
+    for d in declarations {
+        if d.get("contradicted") != Some(&Json::Bool(true)) {
+            continue;
+        }
+        let claim = d.get("claim").and_then(Json::as_str).unwrap_or("(unnamed)");
+        let cases = d.get("cases").and_then(Json::as_u64).unwrap_or(0);
+        let ids = match d.get("passing") {
+            Some(Json::Arr(items)) => items
+                .iter()
+                .filter_map(Json::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        };
+        problems.push(format!(
+            "zu declares {claim} absent, and all {cases} case(s) it excluded passed: {ids}"
+        ));
+    }
     problems
 }
 
@@ -491,5 +531,43 @@ mod tests {
         // The reason rides along on the same line as the value, so a
         // reader of the file never has to go looking for it.
         assert!(toml.contains("float-values = false  # the loader refuses a double"));
+    }
+
+    #[test]
+    fn a_claim_the_harness_contradicted_fails_verification() {
+        let report = json::parse(
+            r#"{"declarations":[
+                 {"claim":"float-values","skip_reason":"fixture-capability",
+                  "cases":3,"pass":3,"contradicted":true,
+                  "passing":["mandatory/return/float","optional/gv01/double"]}]}"#,
+        )
+        .expect("test report parses");
+        let problems = verify_nothing_was_contradicted(&report);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("float-values"), "{}", problems[0]);
+        // The case ids travel with the complaint. A contradiction nobody
+        // can reproduce is a line in a log and not a bug report.
+        assert!(
+            problems[0].contains("mandatory/return/float"),
+            "{}",
+            problems[0]
+        );
+    }
+
+    #[test]
+    fn a_claim_the_harness_confirmed_passes_verification() {
+        // Both shapes have to be quiet: a run that challenged the
+        // declaration and found it honest, and an ordinary run, which
+        // writes no declarations at all and is the common case.
+        let challenged = json::parse(
+            r#"{"declarations":[
+                 {"claim":"GQ13","skip_reason":"required-feature",
+                  "cases":2,"pass":0,"fail":2,"contradicted":false}]}"#,
+        )
+        .expect("test report parses");
+        assert!(verify_nothing_was_contradicted(&challenged).is_empty());
+
+        let ordinary = json::parse(r#"{"cases":[]}"#).expect("test report parses");
+        assert!(verify_nothing_was_contradicted(&ordinary).is_empty());
     }
 }

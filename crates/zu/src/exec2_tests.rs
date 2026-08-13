@@ -5,7 +5,7 @@
 //! oracle here on purpose, that is the migration contract.
 
 use zu_query::binder::Schema;
-use zu_query::exec::{self, Options, Value};
+use zu_query::exec::{self, Options, Sip, Value};
 
 use crate::query::{self, Zu1Graph};
 use crate::snapshot::Zu1Snapshot;
@@ -72,11 +72,13 @@ fn run_both(
     schema: &Schema,
     source: &str,
     threads: usize,
+    sip: Sip,
 ) -> (Option<exec::QueryResult>, exec::QueryResult) {
     let (query, plan, _) = query::compile(source, schema).unwrap();
     assert!(query.params.is_empty(), "parity queries take no params");
     let options = Options {
         threads,
+        sip,
         ..Options::default()
     };
     let new = {
@@ -91,19 +93,24 @@ fn run_both(
 }
 
 /// The shape must compile on the new executor and match the old one
-/// exactly, sequential and parallel.
+/// exactly, sequential and parallel, and with the sideways filter off
+/// as well as on: a filter that changes an answer is a filter that
+/// dropped a row the join would have matched.
 fn covered(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) {
-    for threads in [1, 0] {
-        let (new, old) = run_both(db, catalog, schema, source, threads);
+    for (threads, sip) in [(1, Sip::On), (0, Sip::On), (1, Sip::Off), (0, Sip::Off)] {
+        let (new, old) = run_both(db, catalog, schema, source, threads, sip);
         let new = new.unwrap_or_else(|| panic!("exec2 should cover: {source}"));
         assert_eq!(new.columns, old.columns, "columns for {source}");
-        assert_eq!(new.rows, old.rows, "rows for {source} at threads={threads}");
+        assert_eq!(
+            new.rows, old.rows,
+            "rows for {source} at threads={threads} sip={sip:?}"
+        );
     }
 }
 
 /// The shape must decline so the caller falls back to the old engine.
 fn falls_back(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) {
-    let (new, _) = run_both(db, catalog, schema, source, 1);
+    let (new, _) = run_both(db, catalog, schema, source, 1, Sip::On);
     assert!(new.is_none(), "exec2 should fall back on: {source}");
 }
 
@@ -474,6 +481,34 @@ fn covered_shapes_match_the_old_engine() {
          RETURN a.id AS a, b.id AS b",
         "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.score = a.age \
          RETURN a.id AS a, b.id AS b ORDER BY a DESC LIMIT 8",
+        // The sideways filter, which is a join publishing its keys to
+        // the level its probe reads. Every one of these runs twice with
+        // it and twice without, so the answer is the same either way by
+        // construction; what the shapes are here for is the paths it
+        // takes. The scores are three apart, so their filter is a mask
+        // with gaps in it and the operator goes in; the ages cover
+        // nought to ninety nine solid, so theirs is a range the scan
+        // takes as a pushdown and no operator at all. Then a probe on
+        // the dense id, a walk between the filter and the join that
+        // runs on what the filter left, a filter over a level a walk
+        // made rather than the scan, one that rejects every row, and
+        // one it rejects nothing for, which is the operator switching
+        // itself off mid run.
+        "MATCH (a:person), (b:person) WHERE a.score = b.score RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.age = b.age RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.id = b.score RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(c), (b:person) WHERE a.score = b.score \
+         RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.score = b.score AND b.age > 200 \
+         RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.age = b.age RETURN a.id AS a, b.id AS b LIMIT 5",
+        "MATCH (a:person), (b:person) WHERE a.score = b.score \
+         RETURN b.age AS age, count(*) AS n ORDER BY age LIMIT 3",
+        // A filter over the level a join built rather than over the
+        // scan, which is the second join in a chain publishing to the
+        // first one's rows.
+        "MATCH (a:person), (b:person), (c:person) WHERE a.id < 5 AND a.age = b.score \
+         AND b.age = c.score RETURN count(*) AS n",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -629,4 +664,19 @@ fn public_run_uses_the_pipeline_executor_transparently() {
     )
     .unwrap();
     assert_eq!(r.rows, [[Value::Int(N as i64)]]);
+}
+
+#[test]
+#[ignore = "scratch"]
+fn dump_plans() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, catalog, schema) = setup(&dir.path().join("dump.zu1"));
+    for q in [
+        "MATCH (a:person), (b:person) WHERE b.id < 100 AND a.score = b.score RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.score = b.age RETURN count(*) AS n",
+        "MATCH (b:person), (a:person) WHERE b.id < 100 AND a.score = b.score RETURN count(*) AS n",
+    ] {
+        eprintln!("--- {q}");
+        let _ = run_both(&mut db, &catalog, &schema, q, 1, Sip::On);
+    }
 }

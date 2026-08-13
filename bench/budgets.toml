@@ -591,6 +591,45 @@ exec_join_build_mrows_s = 8.0
 # floor, never lower it.
 exec_sip_select_mrows_s = 50.0
 
+# What a query is left at when the join publishes that filter to the
+# level it probes, against the same plan with ZU_SIP=0 holding it back
+# (perf/13 section 1). The join bench times two shapes both ways, and
+# times the two ways alternately rather than as two blocks, so a box
+# that drifts over the few seconds a block takes puts the same drift in
+# both halves instead of in the ratio.
+#
+# The two shapes are the two halves of the pass. One has build keys
+# eight apart, close enough together that the filter is the exact mask,
+# so seven probe rows in eight are dropped before the probe reads them.
+# The other has a build side whose keys are city numbers against a probe
+# key that climbs with the row, so the range alone skips every chunk but
+# the first before anything decodes it.
+#
+# Neither half wins on every host, and which one wins says where that
+# host spends its time. The range saves a decode, so it wins where
+# decoding is the cost. The mask saves one probe, one random read of
+# the join's directory, so it wins where a random read is the cost and
+# is a wash where the whole table sits in cache. Measured at 4407926,
+# both passes on each host: the range 1.3 to 1.4x on the local M
+# series, 1.3 on gamingpc, 1.4 to 1.6 on server1; the mask 1.0x
+# locally, 1.1 on gamingpc, 1.2 to 1.4 on server1. The two are
+# complements, and on every host one of them is a clear win while the
+# other sits near one.
+#
+# So the two per shape floors are no regression gates, set under the
+# lowest either has come back, and exec_sip_best_x is the one that says
+# the pass is worth having: the better of the two on the host in front
+# of it, which is 1.3 or better everywhere.
+#
+# Neither shape is the pass at its best, and the reason is the join
+# side choice rather than the filter: the optimizer drives the cheaper
+# estimated side and builds the dearer one, so the filter is published
+# from the big side onto the small one and the big side's build is
+# still in both numbers. Raise these floors once that turns around.
+exec_sip_range_x = 1.10
+exec_sip_mask_x = 0.85
+exec_sip_best_x = 1.15
+
 # The summed arithmetic projection at one worker, M rows/s (perf/05
 # section 5): two million people and `sum(p.score * 2 + p.bucket)`,
 # which returns one row, so nothing is built and the number is the

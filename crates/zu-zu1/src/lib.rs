@@ -200,6 +200,103 @@ pub fn verify(path: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// How a store's blocks divide between what the schema costs and what
+/// the graph in it costs.
+///
+/// This exists because a store's size on its own does not divide by a
+/// graph. Every engine writes something before it holds anything, and
+/// zu writes rather a lot of it: the header block, the catalog, the
+/// table index and the statistics are four blocks of 256 KiB before a
+/// single node exists. A tool dividing 1 MiB by three edges gets a
+/// number in the millions of bits per edge and publishes it as an
+/// encoding, which happened, repeatedly, to a benchmark harness that
+/// had no way to ask this question.
+///
+/// The split is drawn where it can be drawn honestly. The four schema
+/// structures are fixed by the shape of the database and do not know
+/// how many rows are under them. Everything else, node groups, column
+/// segments, adjacency, key indexes and the per-table directories that
+/// name them, grows with the graph and is data. The free list is
+/// neither: it is space this file owns and is not currently using, so
+/// it is counted apart from both rather than charged to the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// Bytes per block. Every count below is in blocks; this is what
+    /// turns one into bytes.
+    pub block_size: u64,
+    /// Every block the file spans, the header block included.
+    pub blocks: u64,
+    /// The header block plus the catalog, table index and statistics
+    /// chains: what this database would weigh holding nothing.
+    pub schema_blocks: u64,
+    /// Blocks the free list names, plus the blocks the free list is
+    /// itself written in.
+    pub free_blocks: u64,
+    /// What is left, which is the graph.
+    pub data_blocks: u64,
+}
+
+impl Layout {
+    /// Total size, as the block count implies it.
+    pub fn bytes(&self) -> u64 {
+        self.blocks * self.block_size
+    }
+
+    /// What the schema costs, which is the figure to subtract before
+    /// dividing a store by the graph in it.
+    pub fn schema_bytes(&self) -> u64 {
+        self.schema_blocks * self.block_size
+    }
+
+    /// What the free list is holding on to.
+    pub fn free_bytes(&self) -> u64 {
+        self.free_blocks * self.block_size
+    }
+
+    /// What the graph costs.
+    pub fn data_bytes(&self) -> u64 {
+        self.data_blocks * self.block_size
+    }
+}
+
+/// Reads a file's [`Layout`].
+///
+/// It follows four chains and decodes the free list, which is a handful
+/// of block reads and no scan of the graph, so it is cheap enough to
+/// run after every load. It validates every crc it touches on the way,
+/// because [`meta::chain_blocks`] does, but it is not [`verify`]: a
+/// file whose segments are corrupt still reports a layout.
+pub fn layout(path: &Path) -> Result<Layout> {
+    let mut db = Zu1File::open(path)?;
+    let block_size = u64::from(db.file_header().block_size);
+    let block_count = db.db_header().block_count;
+    // Block 0 holds the file header and both database header slots, and
+    // the pointers the roots use start at 1.
+    let mut schema_blocks = 1;
+    for root in [
+        db.db_header().catalog_root,
+        db.db_header().table_index_root,
+        db.db_header().stats_root,
+    ] {
+        schema_blocks += meta::chain_blocks(&mut db, root)?.len() as u64;
+    }
+    let free_root = db.db_header().free_list_root;
+    let free_chain = meta::chain_blocks(&mut db, free_root)?.len() as u64;
+    let listed = file::decode_free_list(&meta::read_chain(&mut db, free_root)?, block_count)?.len();
+    let free_blocks = free_chain + listed as u64;
+    let blocks = block_count + 1;
+    Ok(Layout {
+        block_size,
+        blocks,
+        schema_blocks,
+        free_blocks,
+        // Saturating rather than asserting: a file with blocks reachable
+        // from no root leaks them, which VACUUM cleans up and which is
+        // not this function's business to refuse a number over.
+        data_blocks: blocks.saturating_sub(schema_blocks + free_blocks),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +311,53 @@ mod tests {
     fn block_size_is_power_of_two() {
         assert!(BLOCK_SIZE.is_power_of_two());
         assert_eq!(BLOCK_SIZE, 256 * 1024);
+    }
+
+    /// A store of `edges` edges over `nodes` nodes, laid out the
+    /// ordinary way.
+    fn loaded(path: &Path, nodes: u32, edges: u32) -> Layout {
+        let mut db = Zu1File::create(path).expect("create");
+        let mut list: Vec<(u32, u32)> = (0..edges)
+            .map(|i| (i % nodes, (i.wrapping_mul(2_654_435_761)) % nodes))
+            .collect();
+        list.sort_unstable();
+        list.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", nodes.into(), &list).expect("load");
+        drop(db);
+        layout(path).expect("layout")
+    }
+
+    #[test]
+    fn the_three_parts_of_a_store_add_up_to_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = loaded(&dir.path().join("small.zu1"), 97, 400);
+        assert_eq!(
+            small.schema_blocks + small.free_blocks + small.data_blocks,
+            small.blocks
+        );
+        assert_eq!(small.bytes(), small.blocks * u64::from(BLOCK_SIZE));
+        // The schema is a real cost and not the whole file, which is
+        // the only reason subtracting it is worth doing.
+        assert!(small.schema_bytes() > 0, "{small:?}");
+        assert!(small.schema_bytes() < small.bytes(), "{small:?}");
+    }
+
+    #[test]
+    fn a_bigger_graph_costs_data_blocks_and_not_schema_blocks() {
+        // This is the property the figure is for. Two stores of the same
+        // shape holding different numbers of edges pay the same schema,
+        // so a harness that subtracts it is left with something that
+        // divides by the graph.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = loaded(&dir.path().join("small.zu1"), 97, 400);
+        let large = loaded(&dir.path().join("large.zu1"), 60_000, 400_000);
+        assert_eq!(
+            small.schema_blocks, large.schema_blocks,
+            "the schema moved with the row count: {small:?} against {large:?}"
+        );
+        assert!(
+            large.data_blocks > small.data_blocks,
+            "a hundred times the edges cost no more data: {small:?} against {large:?}"
+        );
     }
 }

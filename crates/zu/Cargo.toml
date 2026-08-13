@@ -76,6 +76,10 @@ harness = false
 name = "branch"
 harness = false
 
+[[bench]]
+name = "join"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

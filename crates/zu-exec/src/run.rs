@@ -31,6 +31,7 @@ use crate::compile::{
     AggSpec, Close, ColSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source,
 };
 use crate::group::{GroupTable, KeyBatch, PartKind};
+use crate::join::JoinTable;
 use crate::pool;
 use crate::sink::{self, Acc, SinkState};
 
@@ -875,6 +876,7 @@ impl<'a> Worker<'a> {
                 from,
                 to,
             } => self.branch(*rel, *dirs, *from, *to, rest, set),
+            Op::Join { table, key, to } => self.join(table, *key, *to, rest, set),
             Op::Intersect {
                 seed,
                 probe,
@@ -1217,6 +1219,58 @@ impl<'a> Worker<'a> {
                         result = Err(e);
                         break 'srcs;
                     }
+                }
+            }
+            if self.stop.stopped() {
+                break;
+            }
+        }
+        set.chunks[src].cur = None;
+        self.idx_pool.push(idxs);
+        result
+    }
+
+    /// The value join's probe side: one lookup per row of the level the
+    /// key reads, and the rows it matched become the newest level.
+    ///
+    /// The build table was filled once while the plan was compiled and
+    /// every worker shares it, so this reads and never writes. A key
+    /// that matched nothing costs one directory word, which is what
+    /// makes an unmatched probe side cheap enough to leave the join
+    /// where the query wrote it.
+    ///
+    /// A key on a level the pipeline has already left is pinned, so it
+    /// is one value for the whole vector; the loop still walks the rows
+    /// of the newest level, because each of them is a row of the answer
+    /// and pairs with the whole of what the key matched.
+    fn join(
+        &mut self,
+        table: &JoinTable,
+        key: ScalarRef,
+        to: usize,
+        rest: &[Op],
+        set: &mut ChunkSet,
+    ) -> Result<()> {
+        let src = set.chunks.len() - 1;
+        let mut idxs = self.idx_pool.pop().unwrap_or_default();
+        idxs.clear();
+        {
+            let chunk = &set.chunks[src];
+            match &chunk.sel {
+                Some(s) => idxs.extend(s.as_slice().iter().map(|&i| u32::from(i))),
+                None => idxs.extend(0..chunk.count),
+            }
+        }
+        let mut result = Ok(());
+        'srcs: for &phys in &idxs {
+            set.chunks[src].cur = Some(phys);
+            let Some(k) = int_key(set, key, phys as usize) else {
+                continue;
+            };
+            for part in table.lookup(k).chunks(zu_vector::VECTOR_SIZE) {
+                if let Err(e) = self.descend(to, part, rest, set) {
+                    result = Err(e);
+                    break 'srcs;
                 }
             }
             if self.stop.stopped() {
@@ -2236,6 +2290,30 @@ fn scalar(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<V
             zu_query::snapshot::ColType::Str => Value::Str(str_at(&chunk.vecs[vec], idx)?),
         },
     })
+}
+
+/// The join key one row probes with, `None` where the row has no key
+/// at all. A null never equals anything, so a row whose key column is
+/// null matches nothing and the old engine's filter drops it too.
+///
+/// A key on the newest level is read at `pos`; one on a level below is
+/// read at that level's pin, the same rule every other scalar read
+/// follows.
+fn int_key(set: &ChunkSet, r: ScalarRef, pos: usize) -> Option<u64> {
+    let level = r.level();
+    let chunk = &set.chunks[level];
+    let idx = if level + 1 == set.chunks.len() {
+        pos
+    } else {
+        pinned_pos(chunk)
+    };
+    match r {
+        ScalarRef::Col { vec, .. } => chunk.vecs[vec]
+            .is_valid(idx)
+            .then(|| chunk.vecs[vec].values::<i64>()[idx] as u64),
+        ScalarRef::RowId { .. } => Some(row_at(chunk, idx)),
+        ScalarRef::Node { .. } => unreachable!("a node is not a join key"),
+    }
 }
 
 /// Integer read for aggregate arguments; the compiler admits only

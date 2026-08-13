@@ -842,3 +842,41 @@ exec_factor_mrows_s_core = 40.0
 # Raise these floors, never lower them.
 exec_branch_mpairs_s_core = 3.0
 exec_hub_mpairs_s_core = 10.0
+
+# The value join (perf/05 section 3, zu#76). Two patterns that share no
+# variable, tied by an equality on a property. The old engine picks one
+# to drive and scans the whole of the other for every row of it, so the
+# shape is rows times rows. The pipeline reads one integer column of the
+# held side into a hash table once and probes it a row at a time, which
+# is a pass over each side plus the rows that match.
+#
+# The build is paid on every execution, since nothing caches a compiled
+# plan yet, so it is inside every number here. That is what a caller
+# pays today and the floor is set over it rather than over a warm table
+# nobody has.
+#
+# A million people over a thousand cities, four shapes plus a miss case,
+# every one crosschecked against the generators on every run, rows and
+# total, so a join that drops rows, repeats them or lands them on the
+# wrong key fails before it prints. The rate counts probe rows, the rows
+# of the driving side.
+#
+# One worker, so these are per core. gamingpc reads the unique key at
+# 9.85 M probes/s, a key with a thousand rows under it at 15.6 us a
+# probe, an all miss probe at 30.7 M/s, the grouped join at 4.93 M/s and
+# a hop off the joined level at 1.41 M/s. server1 at a load average of
+# 35 reads 1.19, 45.8 us, 7.85, 0.71 and 0.31.
+#
+# There is no ratio against the old engine at this size because it does
+# not finish: it is 72 ms a probe row on gamingpc and 207 ms on server1,
+# which is twenty hours and two and a half days for the million the
+# pipeline does in a tenth of a second. So the bench times the old
+# engine over two hundred probe rows and reports per probe, and the
+# unique key case comes out 714371x ahead per probe on gamingpc and
+# 246985x on server1.
+#
+# One floor, on the unique key case, since that is the one where the
+# table is at its widest and the build is the largest share of the time.
+# It sits under the worst the shared box has printed. Raise it, never
+# lower it.
+exec_join_mprobes_s_core = 0.8

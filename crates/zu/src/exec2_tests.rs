@@ -421,6 +421,39 @@ fn covered_shapes_match_the_old_engine() {
          LIMIT 20",
         "CALL sssp('knows', 1) YIELD node, distance MATCH (node)-[:knows]->(f) \
          WHERE distance = 1 RETURN count(f) AS n",
+        // Two patterns sharing no variable, tied by an equality on a
+        // property. The held one is read into a table once and the
+        // pipeline probes it a row at a time, which is the same answer
+        // the old engine's nested loop gives and in the same order,
+        // since the table hands its rows back in build order. Counted,
+        // aggregated, deduplicated, projected off both ends, with the
+        // equality written each way round, and with a filter on the
+        // held pattern that has to wait for the join to place it.
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND b.score = a.age RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score \
+         RETURN sum(b.age) AS s, min(b.score) AS lo, max(b.score) AS hi",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score \
+         RETURN DISTINCT b.age AS age ORDER BY age LIMIT 4",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score \
+         RETURN a.id AS a, b.id AS b ORDER BY a, b LIMIT 6",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score \
+         RETURN b.name AS name ORDER BY name LIMIT 4",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score AND a.score > 10 \
+         RETURN count(*) AS n",
+        // The dense id as the probe key, and a hop off the level the
+        // join built.
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND b.score = a.id RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(c), (b:person) WHERE a.id < 50 AND c.age > 10 \
+         AND a.age = b.score RETURN count(*) AS n",
+        "MATCH (a:person), (b:person)-[:knows]->(c) WHERE a.id < 50 AND a.age = b.score \
+         RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score \
+         RETURN b.age AS age, count(*) AS n ORDER BY age LIMIT 3",
+        // Two held patterns, both tied to the same probe. The second
+        // join goes in once the first one has placed its level.
+        "MATCH (a:person), (b:person), (c:person) WHERE a.id < 5 AND a.age = b.score \
+         AND a.age = c.score RETURN count(*) AS n",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -511,6 +544,24 @@ fn unclaimed_shapes_fall_back() {
         "CALL sssp('knows', 1) YIELD node, distance RETURN DISTINCT distance AS d",
         "CALL sssp('knows', 1) YIELD node, distance RETURN node.id AS id, distance \
          ORDER BY distance LIMIT 5",
+        // Two patterns nothing ties together is a cross product, and
+        // this pipeline would have to read a whole table into a join
+        // to answer what the old engine's nested loop already does.
+        "MATCH (a:person), (b:person) WHERE a.id < 50 RETURN count(*) AS n",
+        // A tie the join table has no key for. Strings would have to
+        // carry their bytes into the table and hash them there, and a
+        // build key that is computed rather than stored is not a column
+        // to read, so both go back.
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.name = b.name RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age = b.score + 1 \
+         RETURN count(*) AS n",
+        // An inequality is not a join this table answers: it hands back
+        // the rows for one key, not a range of them.
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND a.age > b.score RETURN count(*) AS n",
+        // A predicate over the held pattern alone, with nothing tying it
+        // to the pipeline. It is still a cross product, just a smaller
+        // one.
+        "MATCH (a:person), (b:person) WHERE a.id < 50 AND b.age = 13 RETURN count(*) AS n",
     ];
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);

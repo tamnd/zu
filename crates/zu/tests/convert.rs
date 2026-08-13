@@ -321,3 +321,70 @@ fn float_and_byte_columns_survive_both_hops() {
         );
     }
 }
+
+/// A boolean has no storage class of its own in sqlite, so the only
+/// thing that can carry it across the hop is the declared type. This
+/// checks it does, and that the query layer answers with truth values
+/// rather than the integers they are stored as.
+#[test]
+fn a_boolean_column_survives_the_sqlite_hop_on_its_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    let active = [true, false, false, true, true, false];
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table("person", &[("active", ColumnType::Boolean)])
+        .unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
+    sq.begin().unwrap();
+    for (row, &on) in active.iter().enumerate() {
+        sq.insert_node_at("person", row as i64, &[SqlValue::Int(i64::from(on))])
+            .unwrap();
+    }
+    for &(src, dst) in &EDGES {
+        sq.insert_rel("knows", i64::from(src), i64::from(dst), &[])
+            .unwrap();
+    }
+    sq.commit().unwrap();
+    drop(sq);
+
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut zu = Zu1File::open(&b).unwrap();
+    let person = Catalog::load(&mut zu)
+        .unwrap()
+        .node_by_name("person")
+        .unwrap()
+        .id;
+    let props = load_props(&mut zu, person).unwrap().unwrap();
+    assert_eq!(props.columns[0].ty, zu_common::LogicalType::Bool);
+
+    let got = run_zu1("MATCH (p:person) RETURN p.active AS a", &mut zu, &[]).unwrap();
+    let read: Vec<bool> = got
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            zu::query::Value::Bool(v) => v,
+            ref other => panic!("expected a boolean, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(read, active);
+
+    // Back through sqlite the declaration has to survive too, or the
+    // next conversion reads the column as a count of nothing.
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    assert_eq!(
+        back.node_column_types("person").unwrap(),
+        vec![("active".to_string(), ColumnType::Boolean)]
+    );
+    for row in 0..6i64 {
+        assert_eq!(
+            back.read_node_prop("person", row, "active").unwrap(),
+            SqlValue::Int(i64::from(active[row as usize]))
+        );
+    }
+}

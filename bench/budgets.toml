@@ -621,11 +621,21 @@ exec_sip_select_mrows_s = 50.0
 # the pass is worth having: the better of the two on the host in front
 # of it, which is 1.3 or better everywhere.
 #
-# Neither shape is the pass at its best, and the reason is the join
-# side choice rather than the filter: the optimizer drives the cheaper
-# estimated side and builds the dearer one, so the filter is published
-# from the big side onto the small one and the big side's build is
-# still in both numbers. Raise these floors once that turns around.
+# Neither shape is the pass at its best, because the optimizer drives
+# the cheaper estimated side and builds the dearer one, so the filter
+# is published from the big side onto the small one and the big side's
+# build is in both numbers either way. Building the small side instead
+# was the obvious fix and it was tried: order the two sides of a join
+# dearest first so the small one is held and built. It loses. On the
+# same host, thousand a key went 19.6 to 545.8 ms and grouped by the
+# joined side 355.4 to 429.8, against unique key 174.1 to 155.0, which
+# is the only shape that gained and the only one where the two sides
+# are the same size anyway. Driving the small side is worth more than
+# pointing a selective filter at the big one, because the output rows
+# come off the build side's payload list nearly free while every driven
+# row is a scan and a gather. So the ceiling on these numbers is not the
+# side choice, and raising these floors wants a filter the scan applies
+# rather than an operator over rows already decoded.
 exec_sip_range_x = 1.10
 exec_sip_mask_x = 0.85
 exec_sip_best_x = 1.15

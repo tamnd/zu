@@ -119,8 +119,19 @@
 //! side it estimated cheaper and builds the dearer one, so the filter
 //! is published from the big side onto the small one, which is the
 //! direction with the least to gain, and the build of the big side is
-//! in the number either way. The join side choice is what changes
-//! that, and it is not this file.
+//! in the number either way.
+//!
+//! Building the small side instead is the obvious fix and it does not
+//! work. Ordering the two sides of a join dearest first, so the small
+//! one is held and built, took the join bench's thousand a key shape
+//! from 19.6 to 545.8 ms and its grouped shape from 355.4 to 429.8,
+//! against 174.1 to 155.0 on the one shape whose two sides are the
+//! same size. Driving the small side is worth more than pointing a
+//! selective filter at the big one: the output rows come off the build
+//! side's payload list nearly free, while every driven row is a scan
+//! and a gather. What would lift these numbers is the scan applying
+//! the filter itself, over rows it has not decoded yet, rather than an
+//! operator judging rows that are already in hand.
 //!
 //! A filter that turns out to reject nothing is worse than no filter,
 //! so the operator watches its own rejection rate over the first few

@@ -182,12 +182,21 @@ impl DatabaseHeader {
             return None;
         }
         let word = |i: usize| u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+        let block_count = word(4);
+        // Every block pointer is checked against this count and then
+        // multiplied by the block size to get a byte offset, so a count
+        // whose last block does not have a byte offset is not a count.
+        // The crc only says the bytes are the bytes someone wrote, and a
+        // file the reader did not write gets no benefit of the doubt.
+        if block_count > u64::MAX / u64::from(BLOCK_SIZE) {
+            return None;
+        }
         Some(Self {
             epoch: word(0),
             catalog_root: word(1),
             table_index_root: word(2),
             free_list_root: word(3),
-            block_count: word(4),
+            block_count,
             wal_seq: word(5),
             stats_root: word(6),
         })
@@ -759,6 +768,31 @@ mod tests {
         bytes[FILE_HEADER_SIZE + 3] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
         assert!(matches!(Zu1File::open(&path), Err(ZuError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn a_block_count_too_big_to_address_is_not_a_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        Zu1File::create(&path).unwrap();
+
+        // Slot B gets a header that is correct in every way the reader
+        // used to check: the crc is over the bytes that are there and
+        // the epoch beats anything a real writer will reach. Only the
+        // block count is impossible, and a block at the top of it has
+        // no byte offset to read from. Found by the zu1_file fuzzer.
+        let doctored = DatabaseHeader {
+            epoch: u64::MAX,
+            block_count: u64::MAX / 2,
+            ..Default::default()
+        };
+        let at = FILE_HEADER_SIZE + DB_HEADER_SIZE;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[at..at + DB_HEADER_SIZE].copy_from_slice(&doctored.encode());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let opened = Zu1File::open(&path).unwrap();
+        assert_eq!(opened.db_header().epoch, 1, "slot A should win");
     }
 
     #[test]

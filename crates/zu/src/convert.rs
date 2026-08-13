@@ -18,13 +18,37 @@
 
 use std::path::Path;
 
-use zu_common::{Result, ZuError};
+use zu_common::{FloatBits, LogicalType, Result, ZuError};
 use zu_sqlite::{ColumnType, SqliteStore, TableDef, Value};
 use zu_storage::Direction;
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{Direction as Zu1Direction, GraphReader, bulk_load_as};
-use zu_zu1::props::{PropType, PropValues, PropsReader, load_props, store_props};
+use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
+
+/// The sqlite storage class a zu1 property column converts to. sqlite
+/// has four and zu1 columns are typed finer than that, so the mapping
+/// is lossy on the way out by construction: a date and a count both
+/// land in INTEGER. The round trip test reads back through zu1, where
+/// the type still says which.
+fn sqlite_type(ty: &LogicalType, name: &str) -> Result<ColumnType> {
+    Ok(match ty {
+        LogicalType::Str { .. } => ColumnType::Text,
+        LogicalType::Bytes { .. } => ColumnType::Blob,
+        LogicalType::Float { .. } => ColumnType::Real,
+        LogicalType::Bool
+        | LogicalType::Int { .. }
+        | LogicalType::Date
+        | LogicalType::LocalTime
+        | LogicalType::LocalDatetime
+        | LogicalType::Duration(_) => ColumnType::Integer,
+        other => {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{name}' holds {other}, which has no sqlite storage class"
+            )));
+        }
+    })
+}
 
 /// Converts a zu1 file into a fresh sqlite store at `db_path`.
 pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
@@ -34,21 +58,15 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
 
     for node in catalog.node_tables().to_vec() {
         let props = load_props(&mut zu, node.id)?;
-        let cols: Vec<(String, PropType)> = props
+        let cols: Vec<(String, LogicalType)> = props
             .iter()
             .flat_map(|p| p.columns.iter())
-            .map(|c| (c.name.clone(), c.ty))
+            .map(|c| (c.name.clone(), c.ty.clone()))
             .collect();
         let col_refs: Vec<(&str, ColumnType)> = cols
             .iter()
-            .map(|(n, t)| {
-                let ty = match t {
-                    PropType::Int => ColumnType::Integer,
-                    PropType::Str => ColumnType::Text,
-                };
-                (n.as_str(), ty)
-            })
-            .collect();
+            .map(|(n, t)| Ok((n.as_str(), sqlite_type(t, n)?)))
+            .collect::<Result<_>>()?;
         sq.create_node_table(&node.name, &col_refs)?;
 
         let mut reader = props.map(PropsReader::new);
@@ -59,8 +77,7 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
             if let Some(reader) = reader.as_mut() {
                 for (ci, (name, ty)) in cols.iter().enumerate() {
                     values.push(match ty {
-                        PropType::Int => Value::Int(reader.read_int(&mut zu, ci, row)? as i64),
-                        PropType::Str => {
+                        LogicalType::Str { .. } => {
                             buf.clear();
                             reader.read_str(&mut zu, ci, row, &mut buf)?;
                             Value::Text(String::from_utf8(buf.clone()).map_err(|_| {
@@ -71,6 +88,25 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
                                 ))
                             })?)
                         }
+                        LogicalType::Bytes { .. } => {
+                            buf.clear();
+                            reader.read_str(&mut zu, ci, row, &mut buf)?;
+                            Value::Blob(buf.clone())
+                        }
+                        LogicalType::Bool => {
+                            Value::Int(i64::from(reader.read_int(&mut zu, ci, row)? != 0))
+                        }
+                        LogicalType::Float { bits, .. } => {
+                            let word = reader.read_int(&mut zu, ci, row)?;
+                            Value::Real(match bits {
+                                FloatBits::B32 => f64::from(f32::from_bits(word as u32)),
+                                _ => f64::from_bits(word),
+                            })
+                        }
+                        // Everything else the lane holds is a count of
+                        // something: an integer, a day, a nanosecond or
+                        // a month, and sqlite stores all four the same.
+                        _ => Value::Int(reader.read_int(&mut zu, ci, row)? as i64),
                     });
                 }
             }
@@ -110,7 +146,9 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
 /// One node property column read whole, uniformly typed.
 enum ColumnData {
     Int(Vec<u64>),
+    Float(Vec<f64>),
     Str(Vec<Vec<u8>>),
+    Bytes(Vec<Vec<u8>>),
 }
 
 /// Converts a sqlite store into a fresh zu1 file at `zu1_path`.
@@ -173,22 +211,23 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                 let bad = |what: &str| {
                     ZuError::InvalidArgument(format!(
                         "'{}' column '{col}' row {row} {what}; zu1 property columns \
-                         are dense and uniformly int or string",
+                         are dense and uniformly typed",
                         node.name
                     ))
                 };
                 match (sq.read_node_prop(&node.name, row, col)?, &mut column) {
                     (Value::Int(v), None) => column = Some(ColumnData::Int(vec![v as u64])),
                     (Value::Int(v), Some(ColumnData::Int(vals))) => vals.push(v as u64),
+                    (Value::Real(v), None) => column = Some(ColumnData::Float(vec![v])),
+                    (Value::Real(v), Some(ColumnData::Float(vals))) => vals.push(v),
                     (Value::Text(v), None) => {
                         column = Some(ColumnData::Str(vec![v.into_bytes()]));
                     }
                     (Value::Text(v), Some(ColumnData::Str(vals))) => vals.push(v.into_bytes()),
+                    (Value::Blob(v), None) => column = Some(ColumnData::Bytes(vec![v])),
+                    (Value::Blob(v), Some(ColumnData::Bytes(vals))) => vals.push(v),
                     (Value::Null, _) => return Err(bad("is null")),
-                    (Value::Int(_) | Value::Text(_), Some(_)) => {
-                        return Err(bad("changes type"));
-                    }
-                    (_, _) => return Err(bad("is neither int nor text")),
+                    (_, Some(_)) => return Err(bad("changes type")),
                 }
             }
             data.push(column.unwrap_or(ColumnData::Int(Vec::new())));
@@ -196,8 +235,10 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
         let str_refs: Vec<Vec<&[u8]>> = data
             .iter()
             .map(|c| match c {
-                ColumnData::Str(vals) => vals.iter().map(|v| v.as_slice()).collect(),
-                ColumnData::Int(_) => Vec::new(),
+                ColumnData::Str(vals) | ColumnData::Bytes(vals) => {
+                    vals.iter().map(|v| v.as_slice()).collect()
+                }
+                _ => Vec::new(),
             })
             .collect();
         let columns: Vec<(&str, PropValues)> = cols
@@ -207,7 +248,9 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             .map(|((name, c), refs)| {
                 let values = match c {
                     ColumnData::Int(vals) => PropValues::Int(vals),
+                    ColumnData::Float(vals) => PropValues::Float(vals),
                     ColumnData::Str(_) => PropValues::Str(refs),
+                    ColumnData::Bytes(_) => PropValues::Bytes(refs),
                 };
                 (name.as_str(), values)
             })

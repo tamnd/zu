@@ -128,15 +128,12 @@ pub fn verify(path: &Path) -> Result<u64> {
                         ),
                     ));
                 }
-                match col.ty {
-                    props::PropType::Str => {
-                        let (mut blob, mut ends) = (Vec::new(), Vec::new());
-                        fullzip::read_blob_segment(&mut db, &col.meta, &mut blob, &mut ends)?;
-                    }
-                    props::PropType::Int => {
-                        values.clear();
-                        segment::read_segment(&mut db, &col.meta, &mut values)?;
-                    }
+                if col.is_lane() {
+                    values.clear();
+                    segment::read_segment(&mut db, &col.meta, &mut values)?;
+                } else {
+                    let (mut blob, mut ends) = (Vec::new(), Vec::new());
+                    fullzip::read_blob_segment(&mut db, &col.meta, &mut blob, &mut ends)?;
                 }
                 bytes += col.meta.payload_len;
                 live.extend(col.meta.blocks.iter().copied());

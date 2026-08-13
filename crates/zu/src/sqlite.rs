@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, Graph, QueryResult, Value};
@@ -213,9 +214,13 @@ pub fn run(source: &str, store: &SqliteStore, params: &[(&str, Value)]) -> Resul
         match params.iter().find(|(n, _)| n == name) {
             Some((_, v)) => args.push(v.clone()),
             None => {
-                return Err(ZuError::InvalidArgument(format!(
-                    "missing parameter ${name}"
-                )));
+                // Same condition the zu1 facade raises, for the same
+                // reason: a parameter with no value is a reference in
+                // the statement that resolves to nothing.
+                return Err(ZuError::gql(
+                    codes::C42002,
+                    format!("missing parameter ${name}"),
+                ));
             }
         }
     }

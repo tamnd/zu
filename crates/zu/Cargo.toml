@@ -80,6 +80,10 @@ harness = false
 name = "join"
 harness = false
 
+[[bench]]
+name = "refuse"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

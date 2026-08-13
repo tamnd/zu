@@ -775,7 +775,7 @@ impl Parser<'_> {
     /// null rather than an error, or every optional property that ever
     /// meets a cast becomes one.
     fn parse_value_type(&mut self) -> Result<LogicalType> {
-        let name = match self.peek() {
+        let mut name = match self.peek() {
             Some(Token {
                 kind: TokenKind::Ident(s),
                 ..
@@ -783,37 +783,56 @@ impl Parser<'_> {
             _ => return Err(self.error("a value type")),
         };
         self.pos += 1;
-        let ty = if self.eat(&TokenKind::LParen) {
-            let precision = match self.peek() {
-                Some(Token {
-                    kind: TokenKind::Int(v),
-                    ..
-                }) => u16::try_from(*v).map_err(|_| self.error("a precision in digits"))?,
-                _ => return Err(self.error("a precision in digits")),
-            };
+        // GV23 spells one type in two words. Nothing else does, so the
+        // second word is taken only after the first, and only when the
+        // pair is a name; a bare DOUBLE stays a bare DOUBLE.
+        if name.eq_ignore_ascii_case("DOUBLE") && self.at_kw("PRECISION") {
             self.pos += 1;
-            self.expect(&TokenKind::RParen)?;
-            // Two messages, because the two mistakes are different: a
-            // name nobody knows and a name that knows no precision.
-            if value_type::by_name(&name).is_none() {
-                return Err(unknown_type(&name));
+            name = format!("{name} PRECISION");
+        }
+        if !value_type::is_type_name(&name) {
+            return Err(unknown_type(&name));
+        }
+        let mut args = Vec::new();
+        if self.eat(&TokenKind::LParen) {
+            loop {
+                args.push(self.parse_type_argument()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
-            value_type::by_name_with_precision(&name, precision).ok_or_else(|| {
-                ZuError::gql(
-                    codes::C42001,
-                    format!(
-                        "'{name}' does not take a precision, or {precision} is too many digits"
-                    ),
-                )
-            })?
-        } else {
-            value_type::by_name(&name).ok_or_else(|| unknown_type(&name))?
-        };
+            self.expect(&TokenKind::RParen)?;
+        }
+        let ty = value_type::spelled(&name, &args).ok_or_else(|| {
+            let written: Vec<String> = args.iter().map(u32::to_string).collect();
+            ZuError::gql(
+                codes::C42001,
+                format!(
+                    "'{name}' does not take ({}), or the numbers in it are out of range",
+                    written.join(", ")
+                ),
+            )
+        })?;
         if self.eat_kw("NOT") {
             self.expect_kw("NULL")?;
             return Ok(ty);
         }
         Ok(LogicalType::Nullable(Box::new(ty)))
+    }
+
+    /// One number inside a type's parentheses: a digit count, a scale
+    /// or a length, all of which are counts and none of which is an
+    /// expression.
+    fn parse_type_argument(&mut self) -> Result<u32> {
+        let value = match self.peek() {
+            Some(Token {
+                kind: TokenKind::Int(v),
+                ..
+            }) => *v,
+            _ => return Err(self.error("a count")),
+        };
+        self.pos += 1;
+        u32::try_from(value).map_err(|_| self.error("a count that fits in 32 bits"))
     }
 
     fn parse_call(&mut self, name: String) -> Result<Expr> {

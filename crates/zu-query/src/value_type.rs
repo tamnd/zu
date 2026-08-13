@@ -7,6 +7,11 @@
 //! only the mapping from a name to a [`LogicalType`], kept as a table
 //! rather than a chain of parser branches.
 //!
+//! A name is a family and an arity, not a type on its own. `STRING`,
+//! `STRING(10)` and `STRING(2, 10)` are three features and one row,
+//! and the row says what each count of arguments means, so adding a
+//! spelling is adding a row and never a branch.
+//!
 //! Nullability is the one part that is not a name. A cast target is
 //! nullable unless it says `NOT NULL`, which is why the parser wraps
 //! what this module returns rather than this module doing it: the
@@ -14,13 +19,39 @@
 
 use zu_common::{FloatBits, IntBits, LogicalType};
 
-/// The types a name on its own can spell, without a parenthesised
-/// argument.
+/// What a name means once its arguments are known.
 ///
-/// The unsigned tower has no `SIGNED`/`UNSIGNED` prefixed spellings
-/// here because ISO writes those as a separate production and nothing
-/// in the corpus reaches for them yet; adding them is another row.
-static NAMES: [(&str, LogicalType); 30] = [
+/// The families differ in what an argument counts. An integer's
+/// argument is decimal digits, a string's is characters and a byte
+/// string's is octets, and a decimal takes two arguments that count
+/// different things, so the arity rules cannot be shared.
+enum Family {
+    /// A name that takes no arguments at all.
+    Simple(LogicalType),
+    /// `INT`, `UINT8` and the rest of the tower. One argument is the
+    /// declared decimal digit count of GV09.
+    Int { signed: bool, bits: IntBits },
+    /// `FLOAT` and the widths. One argument is GV22's precision.
+    Float(FloatBits),
+    /// `DECIMAL`, GV17. One argument is the precision, two are the
+    /// precision and the scale.
+    Decimal,
+    /// A character string type, GV30 to GV32. `fixed` is `CHAR`, whose
+    /// one argument is both bounds at once.
+    Chars { fixed: bool },
+    /// A byte string type, GV35 to GV38, counted in octets.
+    Octets { fixed: bool },
+}
+
+/// The default precision of a bare `DECIMAL`.
+///
+/// ISO leaves it implementation defined. 38 digits is the widest a
+/// 128 bit unscaled integer holds in full, which is the widest carrier
+/// the lattice has for one, so it is the largest promise zu can keep.
+const DECIMAL_DIGITS: u16 = 38;
+
+/// Every spelling, in the order the features are numbered.
+static NAMES: &[(&str, Family)] = &[
     ("INT8", int(true, IntBits::B8)),
     ("INT16", int(true, IntBits::B16)),
     ("INT32", int(true, IntBits::B32)),
@@ -42,87 +73,160 @@ static NAMES: [(&str, LogicalType); 30] = [
     ("UINT", int(false, IntBits::B32)),
     ("BIGINT", int(true, IntBits::B64)),
     ("UBIGINT", int(false, IntBits::B64)),
-    ("FLOAT16", float(FloatBits::B16)),
-    ("FLOAT32", float(FloatBits::B32)),
-    ("FLOAT64", float(FloatBits::B64)),
-    ("FLOAT128", float(FloatBits::B128)),
-    ("FLOAT256", float(FloatBits::B256)),
-    ("REAL", float(FloatBits::B32)),
-    ("DOUBLE", float(FloatBits::B64)),
-    ("FLOAT", float(FloatBits::B64)),
-    ("BOOL", LogicalType::Bool),
-    ("BOOLEAN", LogicalType::Bool),
-    (
-        "STRING",
-        LogicalType::Str {
-            min: None,
-            max: None,
-            fixed: false,
-        },
-    ),
+    ("DECIMAL", Family::Decimal),
+    ("DEC", Family::Decimal),
+    ("NUMERIC", Family::Decimal),
+    ("FLOAT16", Family::Float(FloatBits::B16)),
+    ("FLOAT32", Family::Float(FloatBits::B32)),
+    ("FLOAT64", Family::Float(FloatBits::B64)),
+    ("FLOAT128", Family::Float(FloatBits::B128)),
+    ("FLOAT256", Family::Float(FloatBits::B256)),
+    ("REAL", Family::Float(FloatBits::B32)),
+    ("DOUBLE", Family::Float(FloatBits::B64)),
+    // GV23 writes this one as two words. The parser joins them with a
+    // single space before it looks the name up.
+    ("DOUBLE PRECISION", Family::Float(FloatBits::B64)),
+    ("FLOAT", Family::Float(FloatBits::B64)),
+    ("BOOL", Family::Simple(LogicalType::Bool)),
+    ("BOOLEAN", Family::Simple(LogicalType::Bool)),
+    ("STRING", Family::Chars { fixed: false }),
+    ("VARCHAR", Family::Chars { fixed: false }),
+    ("CHAR", Family::Chars { fixed: true }),
+    ("BYTES", Family::Octets { fixed: false }),
+    ("VARBINARY", Family::Octets { fixed: false }),
+    ("BINARY", Family::Octets { fixed: true }),
 ];
 
-const fn int(signed: bool, bits: IntBits) -> LogicalType {
-    LogicalType::Int {
-        signed,
-        bits,
-        precision: None,
-    }
+const fn int(signed: bool, bits: IntBits) -> Family {
+    Family::Int { signed, bits }
 }
 
-const fn float(bits: FloatBits) -> LogicalType {
-    LogicalType::Float {
-        bits,
-        precision: None,
-    }
-}
-
-/// The type a bare name spells, `None` when it spells nothing.
-pub fn by_name(name: &str) -> Option<LogicalType> {
-    NAMES
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, t)| t.clone())
-}
-
-/// The type `name(precision)` spells, for the parenthesised forms.
+/// The type `name` spells with `args` written after it, `None` when it
+/// spells nothing or takes a different number of arguments.
 ///
-/// `INT(p)` is GV09 and `p` counts decimal digits, so it picks the
-/// narrowest width that holds `p` digits and keeps `p` itself, because
-/// the digit count is a check the engine owes the user rather than a
-/// layout: `INT(3)` is sixteen bits wide and still refuses 999 + 1.
-pub fn by_name_with_precision(name: &str, precision: u16) -> Option<LogicalType> {
-    match by_name(name)? {
-        LogicalType::Int { signed, .. } => Some(LogicalType::Int {
-            signed,
-            bits: IntBits::for_digits(precision)?,
-            precision: Some(precision),
-        }),
-        LogicalType::Float { .. } => Some(LogicalType::Float {
-            bits: FloatBits::for_digits(precision)?,
-            precision: Some(precision),
-        }),
-        LogicalType::Str { fixed, .. } => Some(LogicalType::Str {
-            min: None,
-            max: Some(u32::from(precision)),
-            fixed,
-        }),
-        _ => None,
-    }
+/// The argument list is what the parser read between the parentheses,
+/// so an empty slice is the bare name and not a name written `()`.
+pub fn spelled(name: &str, args: &[u32]) -> Option<LogicalType> {
+    let family = &NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))?.1;
+    let digits = |ix: usize| u16::try_from(args[ix]).ok();
+    Some(match (family, args.len()) {
+        (Family::Simple(t), 0) => t.clone(),
+
+        (Family::Int { signed, bits }, 0) => LogicalType::Int {
+            signed: *signed,
+            bits: *bits,
+            precision: None,
+        },
+        // `INT(p)` counts decimal digits, so it picks the narrowest
+        // width that holds `p` of them and keeps `p` itself, because
+        // the digit count is a check the engine owes the user rather
+        // than a layout: `INT(3)` is sixteen bits and still refuses
+        // 999 + 1.
+        (Family::Int { signed, .. }, 1) => {
+            let precision = digits(0)?;
+            LogicalType::Int {
+                signed: *signed,
+                bits: IntBits::for_digits(precision)?,
+                precision: Some(precision),
+            }
+        }
+
+        (Family::Float(bits), 0) => LogicalType::Float {
+            bits: *bits,
+            precision: None,
+        },
+        (Family::Float(_), 1) => {
+            let precision = digits(0)?;
+            LogicalType::Float {
+                bits: FloatBits::for_digits(precision)?,
+                precision: Some(precision),
+            }
+        }
+
+        (Family::Decimal, 0) => LogicalType::Decimal {
+            precision: DECIMAL_DIGITS,
+            scale: 0,
+        },
+        (Family::Decimal, 1) => LogicalType::Decimal {
+            precision: digits(0)?,
+            scale: 0,
+        },
+        (Family::Decimal, 2) => {
+            let (precision, scale) = (digits(0)?, digits(1)?);
+            // A scale past the precision would name digits after the
+            // point that the number has no room for.
+            if scale > precision || precision > DECIMAL_DIGITS {
+                return None;
+            }
+            LogicalType::Decimal { precision, scale }
+        }
+
+        // A fixed length is both bounds at once, which is the whole of
+        // GV32: nothing downstream has to ask whether a type is fixed,
+        // because a minimum equal to the maximum already says it.
+        (Family::Chars { fixed: true }, n @ (0 | 1)) => {
+            let len = if n == 0 { 1 } else { args[0] };
+            LogicalType::Str {
+                min: Some(len),
+                max: Some(len),
+                fixed: true,
+            }
+        }
+        (Family::Chars { fixed: false }, n @ (0..=2)) => LogicalType::Str {
+            min: if n == 2 { Some(args[0]) } else { None },
+            max: match n {
+                0 => None,
+                1 => Some(args[0]),
+                _ => Some(args[1]),
+            },
+            fixed: false,
+        },
+
+        (Family::Octets { fixed: true }, n @ (0 | 1)) => {
+            let len = if n == 0 { 1 } else { args[0] };
+            LogicalType::Bytes {
+                min: Some(len),
+                max: Some(len),
+                fixed: true,
+            }
+        }
+        (Family::Octets { fixed: false }, n @ (0..=2)) => LogicalType::Bytes {
+            min: if n == 2 { Some(args[0]) } else { None },
+            max: match n {
+                0 => None,
+                1 => Some(args[0]),
+                _ => Some(args[1]),
+            },
+            fixed: false,
+        },
+
+        _ => return None,
+    })
+}
+
+/// Whether a name is one this module knows at all, which is how the
+/// parser tells an unknown type from a known one written wrong.
+pub fn is_type_name(name: &str) -> bool {
+    NAMES.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn t(name: &str) -> Option<LogicalType> {
+        spelled(name, &[])
+    }
+
     #[test]
     fn the_word_spellings_are_the_widths_they_alias() {
-        assert_eq!(by_name("smallint"), by_name("INT16"));
-        assert_eq!(by_name("BIGINT"), by_name("int64"));
-        assert_eq!(by_name("UBIGINT"), by_name("UINT64"));
-        assert_eq!(by_name("integer"), by_name("INT"));
-        assert_eq!(by_name("double"), by_name("FLOAT64"));
-        assert_eq!(by_name("nosuchtype"), None);
+        assert_eq!(t("smallint"), t("INT16"));
+        assert_eq!(t("BIGINT"), t("int64"));
+        assert_eq!(t("UBIGINT"), t("UINT64"));
+        assert_eq!(t("integer"), t("INT"));
+        assert_eq!(t("double"), t("FLOAT64"));
+        assert_eq!(t("double precision"), t("FLOAT64"));
+        assert_eq!(t("nosuchtype"), None);
     }
 
     /// The declared digit count is not the width. Nine digits fit in 32
@@ -132,7 +236,7 @@ mod tests {
     #[test]
     fn a_declared_precision_narrows_the_check_not_only_the_width() {
         assert_eq!(
-            by_name_with_precision("INT", 9),
+            spelled("INT", &[9]),
             Some(LogicalType::Int {
                 signed: true,
                 bits: IntBits::B32,
@@ -140,13 +244,67 @@ mod tests {
             })
         );
         assert_eq!(
-            by_name_with_precision("INT", 3),
+            spelled("INT", &[3]),
             Some(LogicalType::Int {
                 signed: true,
                 bits: IntBits::B16,
                 precision: Some(3),
             })
         );
-        assert_eq!(by_name_with_precision("BOOL", 3), None);
+        assert_eq!(spelled("BOOL", &[3]), None);
+        assert_eq!(spelled("INT", &[3, 3]), None);
+    }
+
+    #[test]
+    fn a_length_is_a_pair_of_bounds_and_a_fixed_length_sets_both() {
+        assert_eq!(
+            spelled("STRING", &[10]),
+            Some(LogicalType::Str {
+                min: None,
+                max: Some(10),
+                fixed: false,
+            })
+        );
+        assert_eq!(
+            spelled("STRING", &[2, 10]),
+            Some(LogicalType::Str {
+                min: Some(2),
+                max: Some(10),
+                fixed: false,
+            })
+        );
+        assert_eq!(
+            spelled("CHAR", &[3]),
+            Some(LogicalType::Str {
+                min: Some(3),
+                max: Some(3),
+                fixed: true,
+            })
+        );
+        assert_eq!(
+            spelled("BINARY", &[4]),
+            Some(LogicalType::Bytes {
+                min: Some(4),
+                max: Some(4),
+                fixed: true,
+            })
+        );
+        assert_eq!(spelled("CHAR", &[2, 10]), None);
+    }
+
+    #[test]
+    fn a_decimal_takes_a_precision_and_a_scale_in_that_order() {
+        assert_eq!(
+            spelled("DECIMAL", &[5, 2]),
+            Some(LogicalType::Decimal {
+                precision: 5,
+                scale: 2,
+            })
+        );
+        assert_eq!(spelled("NUMERIC", &[5]), spelled("DEC", &[5, 0]));
+        // A scale past the precision names digits the number cannot
+        // hold, and 39 digits is past what the carrier holds at all.
+        assert_eq!(spelled("DECIMAL", &[2, 5]), None);
+        assert_eq!(spelled("DECIMAL", &[39, 0]), None);
     }
 }

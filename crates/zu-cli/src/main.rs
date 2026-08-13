@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use zu::query::{QueryResult, Value};
 use zu::{DiagnosticRecord, Severity};
 
+mod conformance;
 mod json;
 mod shell;
 
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         },
         Some("query") => query_command(&args[1..]),
         Some("shell") => shell::shell_command(&args[1..]),
+        Some("conformance") => conformance::conformance_command(&args[1..]),
         Some("verify") => match args.get(1) {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
@@ -926,12 +928,13 @@ fn print_usage() {
     println!("usage: zu <command> [args]");
     println!();
     println!(
-        "commands: shell, query, copy, convert, verify, stat, analyze, neighbors [--in] [--key], edge [--in], lookup, bench"
+        "commands: shell, query, copy, convert, verify, stat, analyze, neighbors [--in] [--key], edge [--in], lookup, conformance, bench"
     );
     println!("(implemented milestone by milestone, see the repo issues)");
     println!();
     println!("{QUERY_USAGE}");
     println!("zu shell <file.zu1> [--format jsonl]");
+    println!("zu conformance --declare [--format toml|json] | --verify <report.json>");
 }
 
 #[cfg(test)]

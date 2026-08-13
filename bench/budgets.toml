@@ -153,7 +153,7 @@ ldbc_two_hop_p50_ms = 8.0
 # The LDBC IS and IC subset on SF1 (docs/12 M2 exit), parse to result
 # through zu::query::run against the person props columns the loader
 # stores next to the CSR. IS is the IS1-shaped profile read, all eight
-# person properties by original id, gated at the G2 1 ms warm p50 from
+# person properties by original id, gated at the T2 1 ms warm p50 from
 # docs/02. IC is the IC-shaped friends-of-friends read, 2 hops with
 # DISTINCT, string projections, ORDER BY, and LIMIT; its cost is the
 # 2-hop multiset's property reads, held down by the per-column decoded

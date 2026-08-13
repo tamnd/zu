@@ -134,7 +134,7 @@ const ENGINE: &[Declared] = &[
     Declared {
         key: "transactions",
         supported: false,
-        why: "no START TRANSACTION, COMMIT or ROLLBACK yet; G6",
+        why: "no START TRANSACTION, COMMIT or ROLLBACK yet; milestone G6",
     },
     Declared {
         key: "multiple-statements",
@@ -162,7 +162,7 @@ const NOTES: &[&str] = &[
 
 /// Renders the declaration as TOML.
 ///
-/// Hand-rolled, like the JSON in `main.rs` and for the same reason: G7
+/// Hand-rolled, like the JSON in `main.rs` and for the same reason: T7
 /// caps the binary at 15 MiB and this is the only place that needs it.
 /// Nothing here contains a quote or a backslash, and a test asserts that,
 /// so there is no escaping to get wrong.
@@ -342,7 +342,9 @@ fn render_json() -> String {
     out
 }
 
-const USAGE: &str = "zu conformance --declare [--format toml|json] | --verify <report.json>";
+const USAGE: &str = "zu conformance --declare [--format toml|json] | --verify <report.json> \
+                     | --tally <report.json> | --scoreboard <tally.json>... \
+                     | --regressed <report.json> <baseline.json>";
 
 pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
@@ -367,6 +369,17 @@ pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
         Some("--verify") => match args.get(1) {
             Some(path) => verify(path),
             None => crate::usage_error(USAGE),
+        },
+        Some("--tally") => match args.get(1) {
+            Some(path) => crate::scoreboard::tally_command(path),
+            None => crate::usage_error(USAGE),
+        },
+        Some("--scoreboard") if args.len() > 1 => crate::scoreboard::scoreboard_command(&args[1..]),
+        Some("--regressed") => match (args.get(1), args.get(2)) {
+            (Some(report), Some(baseline)) => {
+                crate::scoreboard::regressed_command(report, baseline)
+            }
+            _ => crate::usage_error(USAGE),
         },
         _ => crate::usage_error(USAGE),
     }

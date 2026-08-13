@@ -1,0 +1,155 @@
+# Conformance against the ISO GQL corpus, measured by tamnd/gql-compat.
+#
+# Kept out of ci.yml because these jobs need a Go toolchain and a
+# checkout of another repository, and because the nightly one wants a
+# schedule that the rest of CI has no use for.
+#
+# The corpus is not a suite zu passes. It is 377 cases of which zu
+# currently answers 63, and it will stay that way for most of G0 to G10.
+# So none of these jobs asks "is it green". They ask "is it worse than
+# the number this repository has written down", which is a question with
+# a useful answer on day one.
+name: Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 03:00 UTC. Nothing depends on the hour beyond it being quiet.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  GO_VERSION: "1.26.5"
+
+jobs:
+  # Every PR. Mandatory and condition cases only: 136 of 377, about a
+  # minute, and between them they cover the two things a change to the
+  # engine is most likely to break. Optional cases are the slow half and
+  # the half where a fall is least likely to be an accident, so they wait
+  # for the nightly.
+  conformance-quick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/checkout@v7
+        with:
+          repository: tamnd/gql-compat
+          path: gql-compat
+      - run: cargo build --release -p zu-cli
+      - name: Build the harness
+        run: go build -o "$RUNNER_TEMP/gql-compat" ./cmd/gql-compat
+        working-directory: gql-compat
+      # The harness exits nonzero whenever any case failed to be
+      # measured, and zu has 17 of those today, so its status cannot be
+      # the gate yet. It is printed rather than swallowed, and the gate
+      # below owns the verdict, including refusing a rise in that count.
+      - name: Run the mandatory and condition cases
+        run: |
+          "$RUNNER_TEMP/gql-compat" run \
+            -adapter zu -binary ./target/release/zu \
+            -kind mandatory -kind condition \
+            -fail-on none -format json -out "$RUNNER_TEMP/report" \
+            || echo "harness exit $? recorded; the gate below decides"
+      - name: Nothing regressed against the checked-in tally
+        run: ./target/release/zu conformance --regressed "$RUNNER_TEMP/report/zu.json" docs/conformance/zu.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-quick-report
+          path: ${{ runner.temp }}/report
+          if-no-files-found: warn
+
+  # Every PR, and cheap. Reads the report the quick job would produce and
+  # fails when what the adapter recorded contradicts conformance.toml.
+  # Separate from the gate above because it answers a different question:
+  # not "did zu get worse" but "is zu still describing itself correctly".
+  # A capability that drifts turns cases into skips, and skips do not
+  # show up as a fall anywhere.
+  declaration-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/checkout@v7
+        with:
+          repository: tamnd/gql-compat
+          path: gql-compat
+      - run: cargo build --release -p zu-cli
+      - name: Build the harness
+        run: go build -o "$RUNNER_TEMP/gql-compat" ./cmd/gql-compat
+        working-directory: gql-compat
+      # Condition cases only. They are the cheapest run that still makes
+      # the gqlstatus claim fire, and --verify fails on a claim that
+      # nothing exercised.
+      - name: Run the condition cases
+        run: |
+          "$RUNNER_TEMP/gql-compat" run \
+            -adapter zu -binary ./target/release/zu \
+            -kind condition -fail-on none -format json -out "$RUNNER_TEMP/report" \
+            || echo "harness exit $? recorded; --verify decides"
+      - name: The report agrees with conformance.toml
+        run: ./target/release/zu conformance --verify "$RUNNER_TEMP/report/zu.json"
+
+  # Nightly and on demand. The whole corpus, every kind, plus the tally
+  # the scoreboard is built from. It uploads the tally rather than
+  # committing it: a bot that pushes its own scoreboard is a bot that can
+  # make the number go up without anyone reading why.
+  conformance-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/checkout@v7
+        with:
+          repository: tamnd/gql-compat
+          path: gql-compat
+      - run: cargo build --release -p zu-cli
+      - name: Build the harness
+        run: go build -o "$RUNNER_TEMP/gql-compat" ./cmd/gql-compat
+        working-directory: gql-compat
+      - name: Run the whole corpus
+        run: |
+          "$RUNNER_TEMP/gql-compat" run \
+            -adapter zu -binary ./target/release/zu \
+            -fail-on none -out "$RUNNER_TEMP/report" \
+            || echo "harness exit $? recorded; the gate below decides"
+      - name: Distil a tally
+        run: ./target/release/zu conformance --tally "$RUNNER_TEMP/report/zu.json" | tee "$RUNNER_TEMP/zu.json"
+      - name: The report agrees with conformance.toml
+        run: ./target/release/zu conformance --verify "$RUNNER_TEMP/report/zu.json"
+      # Runs on GitHub's hardware rather than the gate machines the
+      # milestone asks for, so the counts are comparable to yesterday's
+      # nightly and not to a tally taken on a laptop. That is why this
+      # job compares and uploads and does not commit.
+      - name: Nothing regressed against the checked-in tally
+        run: ./target/release/zu conformance --regressed "$RUNNER_TEMP/report/zu.json" docs/conformance/zu.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-full
+          path: |
+            ${{ runner.temp }}/report
+            ${{ runner.temp }}/zu.json
+          if-no-files-found: warn

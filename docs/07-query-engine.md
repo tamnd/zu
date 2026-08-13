@@ -16,7 +16,7 @@ text → AST → bind (catalog, types) → logical plan (graph algebra)
      → physical plan (pipelines) → morsel-parallel execution
 ```
 
-Plans cached by (query text, catalog epoch, param types), LDBC short reads are parameterized point queries; plan cache is mandatory for G2 (< 1 ms includes zero planning on repeat).
+Plans cached by (query text, catalog epoch, param types), LDBC short reads are parameterized point queries; plan cache is mandatory for T2 (< 1 ms includes zero planning on repeat).
 
 ## 3. Vectors & factorization (execution kernel)
 

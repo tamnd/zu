@@ -51,7 +51,7 @@ Background task folds WAL objects into fresh segment packs (rewriting only dirty
 3. Every subsequent manifest swap carries the epoch; a fenced (stale) writer's If-Match fails permanently ⇒ it demotes itself. WAL objects embed the writer epoch; readers ignore WAL objects from superseded epochs.
 4. No leases, no clocks, no DynamoDB, no coordination service. Contention costs only retried requests.
 
-Readers are stateless: read `CURRENT` → manifest → serve; poll `CURRENT` (default every 1 s, conditional GET = $0.40/M) or accept bounded staleness. Horizontal read scale-out is trivial (G10); zone-aligned deployments read their own cache tier first (WarpStream lesson), cross-AZ S3 traffic is free in-region, so this is a latency, not cost, optimization.
+Readers are stateless: read `CURRENT` → manifest → serve; poll `CURRENT` (default every 1 s, conditional GET = $0.40/M) or accept bounded staleness. Horizontal read scale-out is trivial (T10); zone-aligned deployments read their own cache tier first (WarpStream lesson), cross-AZ S3 traffic is free in-region, so this is a latency, not cost, optimization.
 
 ## 4. Caching (where latency is won)
 
@@ -68,7 +68,7 @@ Three tiers, managed by **foyer** (hybrid memory+disk cache, Rust; used by Risin
 - **Pinned tier**: manifests, footers, CSR offset segments, pk-index buckets, and (if `vector`) HNSW upper layers are `pin=true`, the "hot topology never leaves cache" BG3 rule. Rule of thumb: topology ≈ 4–8 bits/edge ⇒ a 10 B-edge graph's full adjacency ≈ 5–10 GiB, pinnable on one NVMe.
 - Cold-query discipline (turbopuffer lesson): planner annotates each pipeline with max S3 round trips; multi-hop expansion against uncached groups executes as **batched frontier prefetch** (gather all needed ranges per BFS level → parallel ranged GETs), never pointer-chase per node against S3.
 
-## 5. Cost model (G9 verification, us-east-1 Standard, 2026 prices)
+## 5. Cost model (T9 verification, us-east-1 Standard, 2026 prices)
 
 Scenario: 1 TB logical graph (compressed), read-mostly 100 QPS, 1 K writes/s batched, NVMe cache 128 GiB with 95% hit rate, checkpoint hourly.
 

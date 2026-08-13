@@ -33,7 +33,7 @@ parallel-edges = true  # a second edge over the same ordered pair survives
 [capabilities]
 gqlstatus = true  # every reply carries a code from the ISO conditions artifact
 parameters = true  # the shell takes a params object and prepare reports its names
-transactions = false  # no START TRANSACTION, COMMIT or ROLLBACK yet; G6
+transactions = false  # no START TRANSACTION, COMMIT or ROLLBACK yet; milestone G6
 multiple-statements = true  # one shell process runs a case's setup list in order
 isolated = true  # reset drops the file, which is the most complete reset there is
 

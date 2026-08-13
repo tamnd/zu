@@ -1,5 +1,5 @@
 //! A small JSON reader for the shell's request frames. The CLI carries
-//! no JSON crate (G7 caps the binary at 15 MiB), and the frames it has
+//! no JSON crate (T7 caps the binary at 15 MiB), and the frames it has
 //! to read are one-line objects with string, number, bool, and flat
 //! object values, so a few hundred lines here beat a dependency.
 

@@ -877,7 +877,7 @@ mod tests {
         assert!(decode_manifest(&bad_rows).is_err(), "count mismatch");
     }
 
-    /// Not a gate, a manual probe for the G4 ingest target. Run with
+    /// Not a gate, a manual probe for the T4 ingest target. Run with
     /// `cargo test -q -p zu-zu1 --release ingest_throughput -- --ignored --nocapture`.
     #[test]
     #[ignore = "manual throughput probe"]

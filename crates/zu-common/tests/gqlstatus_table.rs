@@ -242,7 +242,12 @@ fn generated_table_matches_the_artifact() {
         std::fs::write(&path, &rendered).expect("write generated table");
         return;
     }
-    let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+    // Checkout on Windows rewrites the line endings, so compare the
+    // content rather than the bytes, the same way the TCK scoreboard
+    // test does.
+    let on_disk = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     assert_eq!(
         on_disk, rendered,
         "src/gqlstatus/generated.rs is stale; rerun with ZU_UPDATE_GQLSTATUS=1"

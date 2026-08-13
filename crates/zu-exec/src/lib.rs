@@ -22,6 +22,7 @@
 //! [`Snapshot`]: zu_query::snapshot::Snapshot
 
 mod compile;
+pub mod decide;
 mod group;
 pub mod join;
 mod pool;
@@ -47,6 +48,29 @@ pub fn try_execute(
     params: &[Value],
     options: &Options,
 ) -> Result<Option<QueryResult>> {
+    if options.flat {
+        return Ok(None);
+    }
+    let Some(exec_plan) = compile::compile(plan, query, schema, snap, params, options)? else {
+        return Ok(None);
+    };
+    run::run(&exec_plan, snap, options).map(|(rows, _)| Some(rows))
+}
+
+/// The same run handing back the decisions it made as well, which is
+/// what EXPLAIN ANALYZE prints under the plan. Every run keeps the
+/// record, since it is a handful of counters a worker already had to
+/// have; this entry point is only about whether the caller is handed
+/// it, and [`try_execute`] drops it because a query run for its answer
+/// has nothing to say about it.
+pub fn try_execute_profiled(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    snap: &mut dyn Snapshot,
+    params: &[Value],
+    options: &Options,
+) -> Result<Option<(QueryResult, decide::Decisions)>> {
     if options.flat {
         return Ok(None);
     }

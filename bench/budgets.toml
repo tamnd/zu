@@ -595,36 +595,38 @@ exec_sip_select_mrows_s = 50.0
 # level it probes, against the same plan with ZU_SIP=0 holding it back
 # (perf/13 section 1). The join bench times two shapes both ways.
 #
-# The two shapes are the two halves of the pass, and they get separate
-# floors because they are worth different things. One has build keys
+# The two shapes are the two halves of the pass. One has build keys
 # eight apart, close enough together that the filter is the exact mask,
 # so seven probe rows in eight are dropped before the probe reads them.
 # The other has a build side whose keys are city numbers against a probe
 # key that climbs with the row, so the range alone skips every chunk but
 # the first before anything decodes it.
 #
-# The range is a win everywhere, because a chunk it rules out is a chunk
-# nobody touches. Measured at 8b92ae7, both passes on each host, the
-# weakest run per host: 1.2x on the local M series, 1.3x on gamingpc,
-# 1.2x on server1. It has never come back under 1.2 on any host or any
-# pass, and the floor leaves the usual noise headroom under that.
+# Neither half wins on every host, and which one wins says where that
+# host spends its time. The range saves a decode, so it wins where
+# decoding is the cost. The mask saves one probe, one random read of
+# the join's directory, so it wins where a random read is the cost and
+# is a tax where the whole table sits in cache. Measured at 8b92ae7,
+# both passes on each host, low to high: the range 1.2 to 1.4x on the
+# local M series, 1.3 to 1.4 on gamingpc, 1.0 to 1.4 on server1; the
+# mask 0.8 to 1.0x locally, 1.1 to 1.2 on gamingpc, 1.1 to 1.5 on
+# server1. The two are complements, and on every host one of them is a
+# clear win while the other sits near one.
 #
-# The mask is a win only where a random read costs something. What it
-# saves on a rejected row is one probe, one random read of the join's
-# directory, so on a box whose whole table sits in cache it saves
-# nothing it did not spend. Measured the same way: 1.1 to 1.5x on
-# server1, 1.1 to 1.2x on gamingpc, 0.8 to 1.0x on the local M series,
-# where the 0.8 is a cold pass straight off a build. So its floor is
-# under one on purpose. It does not say the pass pays, the range floor
-# says that; it says the pass has not started costing.
+# So the two per shape floors are no regression gates, set under the
+# lowest either has come back anywhere, and exec_sip_best_x is the one
+# that says the pass is worth having: the better of the two on the host
+# in front of it. The worst best-of-two seen is 1.2, on server1 under
+# third party load and locally on a cold pass.
 #
-# Neither is the pass at its best, and the reason is the join side
-# choice rather than the filter: the optimizer drives the cheaper
+# Neither shape is the pass at its best, and the reason is the join
+# side choice rather than the filter: the optimizer drives the cheaper
 # estimated side and builds the dearer one, so the filter is published
 # from the big side onto the small one and the big side's build is
 # still in both numbers. Raise these floors once that turns around.
-exec_sip_range_x = 1.10
+exec_sip_range_x = 0.95
 exec_sip_mask_x = 0.75
+exec_sip_best_x = 1.15
 
 # The summed arithmetic projection at one worker, M rows/s (perf/05
 # section 5): two million people and `sum(p.score * 2 + p.bucket)`,

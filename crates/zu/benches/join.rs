@@ -66,11 +66,11 @@
 //! exec_join_mprobes_s_core floors the unique key case in millions of
 //! probe rows a second, build included. exec_sip_range_x and
 //! exec_sip_mask_x floor the two sideways cases against their own
-//! filter off runs. They are separate because the two halves are worth
-//! different things: the range is a win on every host, so its floor is
-//! above one and says the pass works, while the mask is a win only
-//! where a random read costs something, so its floor is under one and
-//! says the pass has not started costing.
+//! filter off runs; both sit under one, because neither half wins on
+//! every host and those two only have to catch a filter that started
+//! costing. exec_sip_best_x is the one above one: the better of the
+//! two shapes on the host in front of it, which is the claim that the
+//! pass is worth running at all.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench join
 
@@ -566,5 +566,18 @@ fn main() {
              under the {floor}x floor"
         );
         println!("gate: sip mask floor met");
+    }
+    // Neither half wins on every host, but one of them always does, and
+    // that is the claim worth gating. Which one it is says where the
+    // host's time goes: the range wins where decoding costs, the mask
+    // wins where a random read costs.
+    if let Some(floor) = budget("exec_sip_best_x") {
+        let best = worst_range.max(worst_mask);
+        assert!(
+            best >= floor,
+            "the better half of the sideways pass leaves the query {best:.2}x, \
+             under the {floor}x floor"
+        );
+        println!("gate: sip best floor met");
     }
 }

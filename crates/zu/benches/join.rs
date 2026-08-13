@@ -92,7 +92,7 @@ fn miss(i: u64) -> u64 {
 /// Half the rows carry a key that is there and half carry one that is
 /// not, so a left join over this misses every other outer row.
 fn half(i: u64) -> u64 {
-    if i % 2 == 0 { i } else { miss(i) }
+    if i.is_multiple_of(2) { i } else { miss(i) }
 }
 
 /// The row whose pair is `i`, which is what a probe on the dense id

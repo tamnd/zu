@@ -21,13 +21,17 @@
 //! table order, and that is what makes the answer match the old engine
 //! row for row rather than just as a set.
 //!
-//! Five shapes. A unique build key, where every probe finds exactly one
-//! row and the table is at its widest. A key with a thousand rows under
-//! it, where the probe side is small and the cost is streaming payload.
-//! A probe that misses everything, which is the tag doing its job and
-//! the payload never being touched. A group by a column of the joined
-//! side, which reads the level the join built. And a hop off that
-//! level, which is the join feeding a walk.
+//! Seven shapes. A unique build key, where every probe finds exactly
+//! one row and the table is at its widest. A key with a thousand rows
+//! under it, where the probe side is small and the cost is streaming
+//! payload. A probe that misses everything, which is the tag doing its
+//! job and the payload never being touched. A group by a column of the
+//! joined side, which reads the level the join built. A hop off that
+//! level, which is the join feeding a walk. And two left joins, an
+//! OPTIONAL MATCH tied by an equality, one where every probe hits and
+//! one where every other probe misses and the outer row goes on with a
+//! null bound to it. The miss case is the one that would halve its own
+//! answer if a miss were dropped instead of kept.
 //!
 //! Every case is crosschecked against the generators, so a join that
 //! loses rows, repeats them or lands them on the wrong key fails here.
@@ -83,6 +87,12 @@ fn city(i: u64) -> u64 {
 /// A key no row carries, so every probe of it is a miss.
 fn miss(i: u64) -> u64 {
     i + 2 * NODES
+}
+
+/// Half the rows carry a key that is there and half carry one that is
+/// not, so a left join over this misses every other outer row.
+fn half(i: u64) -> u64 {
+    if i.is_multiple_of(2) { i } else { miss(i) }
 }
 
 /// The row whose pair is `i`, which is what a probe on the dense id
@@ -170,6 +180,7 @@ fn main() {
     let pairs: Vec<u64> = (0..NODES).map(pair).collect();
     let cities: Vec<u64> = (0..NODES).map(city).collect();
     let misses: Vec<u64> = (0..NODES).map(miss).collect();
+    let halves: Vec<u64> = (0..NODES).map(half).collect();
     store_props(
         &mut db,
         "person",
@@ -177,6 +188,7 @@ fn main() {
             ("pair", PropValues::Int(&pairs)),
             ("city", PropValues::Int(&cities)),
             ("far", PropValues::Int(&misses)),
+            ("half", PropValues::Int(&halves)),
         ],
     )
     .expect("props");
@@ -316,6 +328,48 @@ fn main() {
             },
             probes: NODES,
             out: hop_out,
+        },
+        Case {
+            what: "left join, every probe hits",
+            new: "MATCH (a:person) OPTIONAL MATCH (b:person) WHERE b.pair = a.id \
+                  RETURN count(*) AS n"
+                .into(),
+            old: format!(
+                "MATCH (a:person) WHERE a.id < {OLD_PROBES} OPTIONAL MATCH (b:person) \
+                 WHERE b.pair = a.id RETURN count(*) AS n"
+            ),
+            want: Want {
+                rows: 1,
+                total: NODES as i64,
+            },
+            old_want: Want {
+                rows: 1,
+                total: OLD_PROBES as i64,
+            },
+            probes: NODES,
+            out: NODES,
+        },
+        Case {
+            what: "left join, every other probe misses",
+            new: "MATCH (a:person) OPTIONAL MATCH (b:person) WHERE b.pair = a.half \
+                  RETURN count(*) AS n"
+                .into(),
+            old: format!(
+                "MATCH (a:person) WHERE a.id < {OLD_PROBES} OPTIONAL MATCH (b:person) \
+                 WHERE b.pair = a.half RETURN count(*) AS n"
+            ),
+            // The outer rows survive either way, so a miss that got
+            // dropped would halve this.
+            want: Want {
+                rows: 1,
+                total: NODES as i64,
+            },
+            old_want: Want {
+                rows: 1,
+                total: OLD_PROBES as i64,
+            },
+            probes: NODES,
+            out: NODES,
         },
     ];
 

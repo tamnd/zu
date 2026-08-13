@@ -454,6 +454,26 @@ fn covered_shapes_match_the_old_engine() {
         // join goes in once the first one has placed its level.
         "MATCH (a:person), (b:person), (c:person) WHERE a.id < 5 AND a.age = b.score \
          AND a.age = c.score RETURN count(*) AS n",
+        // The left join: an OPTIONAL MATCH over a pattern that shares
+        // no variable, tied by an equality. An outer row the probe
+        // finds nothing for keeps going with the level bound to one
+        // null row, so the row counts stay the outer ones. Once with
+        // hits and misses mixed, once with a group predicate that turns
+        // hits into misses, once reading a string off the joined level,
+        // once counted, once with the equality the other way round, and
+        // once ordered by the outer side.
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.score = a.age \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) \
+         WHERE b.score = a.age AND b.age > 90 RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.score = a.age \
+         RETURN a.id AS a, b.name AS name",
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.score = a.age \
+         RETURN count(*) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE a.age = b.score \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.score = a.age \
+         RETURN a.id AS a, b.id AS b ORDER BY a DESC LIMIT 8",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -562,6 +582,14 @@ fn unclaimed_shapes_fall_back() {
         // to the pipeline. It is still a cross product, just a smaller
         // one.
         "MATCH (a:person), (b:person) WHERE a.id < 50 AND b.age = 13 RETURN count(*) AS n",
+        // An OPTIONAL MATCH over an untied pattern keeps every outer
+        // row against the whole of the other side, which is a cross
+        // product with a bracket around it, and a string tie is the
+        // same key the table has no room for.
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.age > 90 \
+         RETURN count(*) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.name = a.name \
+         RETURN count(*) AS n",
     ];
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);

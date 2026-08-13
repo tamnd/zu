@@ -876,7 +876,7 @@ impl<'a> Worker<'a> {
                 from,
                 to,
             } => self.branch(*rel, *dirs, *from, *to, rest, set),
-            Op::Join { table, key, to } => self.join(table, *key, *to, rest, set),
+            Op::Join { table, key, to } => self.join(table, *key, *to, rest, set, None),
             Op::Intersect {
                 seed,
                 probe,
@@ -895,6 +895,20 @@ impl<'a> Worker<'a> {
             // expand; a bracket that drove the group itself paid for
             // all of that once per outer row.
             Op::Optional { len, level } => {
+                // A left join wears the same bracket: the probe is what
+                // decides the row rather than the walk, and a probe
+                // that lands on nothing is the miss.
+                if let Op::Join { table, key, to } = &rest[0] {
+                    let table = table.clone();
+                    return self.join(
+                        &table,
+                        *key,
+                        *to,
+                        &rest[1..],
+                        set,
+                        Some((*level, &rest[*len..])),
+                    );
+                }
                 let &Op::Expand {
                     rel,
                     dirs,
@@ -1250,6 +1264,7 @@ impl<'a> Worker<'a> {
         to: usize,
         rest: &[Op],
         set: &mut ChunkSet,
+        opt: Option<(usize, &[Op])>,
     ) -> Result<()> {
         let src = set.chunks.len() - 1;
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -1264,11 +1279,34 @@ impl<'a> Worker<'a> {
         let mut result = Ok(());
         'srcs: for &phys in &idxs {
             set.chunks[src].cur = Some(phys);
-            let Some(k) = int_key(set, key, phys as usize) else {
-                continue;
-            };
-            for part in table.lookup(k).chunks(zu_vector::VECTOR_SIZE) {
-                if let Err(e) = self.descend(to, part, rest, set) {
+            self.opt_hit = false;
+            // A null key matches nothing on either engine, so it walks
+            // no rows. Under a bracket it is still a source row, and a
+            // source row that matched nothing is a miss.
+            if let Some(k) = int_key(set, key, phys as usize) {
+                for part in table.lookup(k).chunks(zu_vector::VECTOR_SIZE) {
+                    if let Err(e) = self.descend(to, part, rest, set) {
+                        result = Err(e);
+                        break 'srcs;
+                    }
+                }
+            }
+            // The probe is done by here, and so are the group's own
+            // predicates, which sit between the descent and the flag.
+            if let Some((level, cont)) = opt
+                && !self.opt_hit
+            {
+                let chunk = match self.null.take() {
+                    Some(c) => c,
+                    None => self.null_level(level),
+                };
+                set.chunks.push(chunk);
+                let res = self.run_ops(cont, set);
+                let mut chunk = set.chunks.pop().expect("just pushed the null level");
+                chunk.sel = None;
+                chunk.cur = None;
+                self.null = Some(chunk);
+                if let Err(e) = res {
                     result = Err(e);
                     break 'srcs;
                 }

@@ -39,7 +39,7 @@ zu query social.zu1 -c "MATCH ..." --format json|csv|table|arrow
 zu copy --from follows.parquet --to social.zu1 --table Follows --reorder degree
 zu convert social.db social.zu1    # engine ↔ engine
 zu verify social.zu1               # CRC/structure audit
-zu stat social.zu1                 # sizes, encodings, bits/edge, cache stats
+zu stat social.zu1 [--format json] # sizes, encodings, bits/edge, cache stats
 zu analyze social.zu1              # rebuild the optimizer's COLOR summaries (§07 §6)
 zu bench ldbc --sf 1 --engine zu1  # built-in benchmark harness (§11)
 zu s3 gc s3://bucket/graphs/social # manual GC / checkpoint / inspect manifest
@@ -47,6 +47,10 @@ zu mcp social.zu1                  # MCP server over stdio (2026 table stakes)
 ```
 
 REPL niceties are product features, not extras: `\d` schema, `\timing`, `EXPLAIN (ANALYZE, FORMAT text|json)` with per-operator rows/time/factorization stats, ASCII plan trees.
+
+`zu shell --format jsonl` is the same session over a pipe, one JSON frame per line, for a harness or an editor rather than a person: `query`, `prepare`/`execute`/`close_stmt`, `explain`, `explain_analyze`, `quit`. The two explain frames are deliberately distinct. `explain_analyze` runs the statement and reports what each operator actually did; `explain` compiles and renders and runs nothing, which is the one a caller can afford beside a latency it measured separately, and the only one that is safe to ask about a statement that writes.
+
+`zu stat --format json` prints the same facts as one object, including the store's size split into schema, free and data. The schema figure is what a database of this shape costs holding nothing, and it exists so that a tool dividing a store by the graph in it can subtract the part that is not the graph. Four blocks of 256 KiB is more than most test fixtures weigh, and a bits-per-edge figure that has not had them taken out of it is a measurement of the header.
 
 ## 3. Server (optional, crate `zudb-server`)
 

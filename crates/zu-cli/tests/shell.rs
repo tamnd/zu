@@ -76,6 +76,34 @@ fn one_process_serves_statements_frames_and_errors() {
     let r = ask(r#"{"op":"close_stmt","stmt":1}"#);
     assert_eq!(r, "{\"closed\":false}");
 
+    // An explain frame answers with the plan and no rows. The listing
+    // names operators and carries no counters: a caller recording a
+    // plan beside a latency it measured separately must not be paying
+    // for an execution to get it, and a counter in here would be proof
+    // that it did.
+    let r = ask(r#"{"op":"explain","q":"MATCH (a:person)-[:follows]->(b) RETURN count(b) AS n"}"#);
+    assert!(r.starts_with("{\"text\":\""), "got {r}");
+    assert!(r.contains("Aggregate"), "got {r}");
+    assert!(r.contains("ScanNodes"), "got {r}");
+    assert!(
+        !r.contains("rows"),
+        "the plan was measured, not compiled: {r}"
+    );
+    assert!(!r.contains("\"columns\""), "got {r}");
+
+    // The same statement through explain_analyze does run, and says so
+    // with the counters this shell's other explain refuses to invent.
+    let r = ask(
+        r#"{"op":"explain_analyze","q":"MATCH (a:person)-[:follows]->(b) RETURN count(b) AS n"}"#,
+    );
+    assert!(r.contains("rows"), "got {r}");
+
+    // A statement that does not compile fails the explain the same way
+    // it would fail a query, with a code rather than a bare message.
+    let r = ask(r#"{"op":"explain","q":"MATCH (a:person"}"#);
+    assert!(r.contains("\"failure\""), "got {r}");
+    assert!(r.contains("42001"), "got {r}");
+
     // Broken input gets an error line too, then real work continues.
     let r = ask(r#"{"op":"query","q":"#);
     assert!(r.contains("bad frame"), "got {r}");

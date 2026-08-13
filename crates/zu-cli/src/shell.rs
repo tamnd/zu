@@ -6,13 +6,14 @@
 //!
 //! Input is line-oriented and comes in two spellings. A line starting
 //! with `{` is a frame: `{"op":"query","q":"...","params":{...}}`,
-//! plus `prepare`, `execute`, `close_stmt`, `explain_analyze`, and
-//! `quit`. Any other non-empty line is a bare statement run with no
-//! parameters, with `\n`, `\t`, and `\\` unfolded so a multi-line
-//! statement can travel on one line. Responses are `{"gqlstatus":...,
-//! "columns":...,"rows":...}` for results and `{"error":"..."}` for
-//! failures, and an error never kills the loop: the session and its
-//! caches survive a bad statement.
+//! plus `prepare`, `execute`, `close_stmt`, `explain`,
+//! `explain_analyze`, and `quit`. Any other non-empty line is a bare
+//! statement run with no parameters, with `\n`, `\t`, and `\\`
+//! unfolded so a multi-line statement can travel on one line.
+//! Responses are `{"gqlstatus":...,"columns":...,"rows":...}` for
+//! results, `{"text":"..."}` for the two explain frames, and
+//! `{"error":"..."}` for failures, and an error never kills the loop:
+//! the session and its caches survive a bad statement.
 //!
 //! Both response shapes carry GQLSTATUS when there is one
 //! (Spec/2064g/gql/plan/07). A successful result leads with the
@@ -105,6 +106,7 @@ fn respond(session: &mut Session, line: &str) -> (String, bool) {
     match frame.get("op").and_then(Json::as_str) {
         Some("query") => (run_frame(session, &frame, false), false),
         Some("explain_analyze") => (run_frame(session, &frame, true), false),
+        Some("explain") => (explain_frame(session, &frame), false),
         Some("prepare") => {
             let Some(q) = frame.get("q").and_then(Json::as_str) else {
                 return (error_line("prepare needs a string q"), false);
@@ -153,6 +155,32 @@ fn respond(session: &mut Session, line: &str) -> (String, bool) {
         Some("quit") => ("{\"bye\":true}\n".to_string(), true),
         Some(op) => (error_line(&format!("unknown op {op:?}")), false),
         None => (error_line("frame needs a string op"), false),
+    }
+}
+
+/// Answers an `explain` frame with the plan and nothing else.
+///
+/// The frame carries `q` and no parameters. `explain_analyze` needs
+/// them because it runs the statement; this does not run anything, and
+/// zu's plan is a function of the text and the schema, so a `params`
+/// object here would be a field with no effect and a reader would be
+/// entitled to assume it had one.
+///
+/// The reply is `{"text":...}`, the same shape `explain_analyze`
+/// answers with, because the two differ in what the listing contains
+/// and not in what a caller has to do with it.
+fn explain_frame(session: &mut Session, frame: &Json) -> String {
+    let Some(q) = frame.get("q").and_then(Json::as_str) else {
+        return error_line("explain needs a string q");
+    };
+    match session.explain(q) {
+        Ok(text) => {
+            let mut s = String::from("{\"text\":");
+            crate::write_json_str(&mut s, &text);
+            s.push_str("}\n");
+            s
+        }
+        Err(e) => failure_line(&e),
     }
 }
 

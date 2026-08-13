@@ -54,7 +54,7 @@ Inside `commit()` before WAL append: pk uniqueness (probe index + batch dedup), 
 
 - Sort/partition input by (table, group), build sealed node groups + CSR with full compression off-thread (parallel by group), optional REORDER (§04 §5), then a single `ingest()` commit (IngestRef WAL record).
 - Not MVCC-overlaid: ingest of *new* groups is invisible until commit epoch; ingest into existing tables appends whole groups (fast path) or falls back to normal DML for partial-group tails.
-- Target G4 (> 1 M edges/s/core) is met by never touching the WAL with data and compressing group-parallel.
+- Target T4 (> 1 M edges/s/core) is met by never touching the WAL with data and compressing group-parallel.
 
 ## 7. Recovery matrix
 

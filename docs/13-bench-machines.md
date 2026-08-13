@@ -9,7 +9,7 @@ Performance gates run on real hardware, not on shared CI runners. GitHub-hosted 
 | gamingpc | Intel i9-13900K (WSL2 Ubuntu on Windows 11) | 32 threads | 64 GB | primary perf gate: B1 to B8, decode floors, LDBC warm runs |
 | server3 | AMD EPYC vCPU | 8 | 23 GB | Linux perf runs, dataset host, later the s3 engine chaos and conformance suites |
 | server2 | AMD EPYC vCPU | 6 | 11 GB | correctness and differential testing only, disk is tight |
-| server1 | AMD EPYC vCPU | 4 | 5 GB | resource-floor runs: the G6 32 MiB and 128 MiB budgets, and the slowest-machine decode floor |
+| server1 | AMD EPYC vCPU | 4 | 5 GB | resource-floor runs: the T6 32 MiB and 128 MiB budgets, and the slowest-machine decode floor |
 
 Floors in `bench/budgets.toml` are set for the slowest gate machine (server1) so a pass there passes everywhere. Headline numbers are reported from gamingpc.
 

@@ -42,7 +42,7 @@ Everything above the `GraphStore` trait is engine-agnostic. Engines differ in *w
 | `zu-cli` | bin `zu` | shell, COPY, EXPLAIN, bench, MCP server | `zu-core` |
 | `zu-server` | `zudb-server` (opt) | HTTP + Arrow IPC endpoint | `zu-core` |
 
-Feature flags on `zudb`: `zu1` (default), `sqlite`, `s3`, `io-uring`, `vector` (HNSW), `fts`, `server`, `arrow` (zero-copy Arrow interop). G12: `zudb` default features build with zero C/C++ (rusqlite only in `sqlite` feature, bundled; zstd optional behind `zstd` feature using `ruzstd` decode fallback).
+Feature flags on `zudb`: `zu1` (default), `sqlite`, `s3`, `io-uring`, `vector` (HNSW), `fts`, `server`, `arrow` (zero-copy Arrow interop). T12: `zudb` default features build with zero C/C++ (rusqlite only in `sqlite` feature, bundled; zstd optional behind `zstd` feature using `ruzstd` decode fallback).
 
 ## 3. The `GraphStore` trait (heart of the design)
 
@@ -51,7 +51,7 @@ Granularity: the engine serves **immutable snapshot views** of columnar data + a
 ```rust
 /// One engine instance == one attached graph database.
 pub trait GraphStore: Send + Sync {
-    /// Open handles; must be O(1) I/O (G8): read headers/manifest only.
+    /// Open handles; must be O(1) I/O (T8): read headers/manifest only.
     fn catalog(&self) -> Arc<Catalog>;
 
     /// Pin a consistent snapshot (epoch). Cheap; readers hold Arc.

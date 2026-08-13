@@ -51,9 +51,9 @@ Config in §06 §4. Integration notes:
 - Sequential scan readahead: 4-block window when ≥ 2 adjacent misses.
 - Zone-map-driven skip happens *before* prefetch (never fetch skipped groups).
 
-## 6. Resource discipline (G6/G7 enforcement)
+## 6. Resource discipline (T6/T7 enforcement)
 
 - 32 MiB floor CI job: full test suite under `memory_limit = 32 MiB`, `threads = 1` (spills exercised).
 - No allocation on the per-vector hot path: vectors, masks, and hash-table scratch come from a per-morsel bump arena reset between morsels.
-- Binary size: `opt-level = "s"` on parser/CLI crates, `panic = "abort"` on release CLI, no default `regex`/`chrono` heavy deps (own date code); measured in CI (G7 gate: 15 MiB).
+- Binary size: `opt-level = "s"` on parser/CLI crates, `panic = "abort"` on release CLI, no default `regex`/`chrono` heavy deps (own date code); measured in CI (T7 gate: 15 MiB).
 - CPU: workers park when idle (no spinning); background tasks (s3 flusher) tick at flush_interval only when dirty.

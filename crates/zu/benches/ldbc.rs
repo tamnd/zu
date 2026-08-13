@@ -11,7 +11,7 @@
 //! keyed COPY takes; the profiles land as props columns on the person
 //! table, so the query path reads them the way any client would.
 //!
-//! B1 is warm 1-hop expands at deg <= 100 (the G1 workload shape), p50
+//! B1 is warm 1-hop expands at deg <= 100 (the T1 workload shape), p50
 //! in us. B2 is warm primary-key lookups, p50 in us. B4 is the 2-hop
 //! factorized count over the whole graph through the query engine, p50
 //! in ms. Triangle is the unseeded directed triangle count over the
@@ -23,7 +23,7 @@
 //! undirected, the shape that keeps the binary probe and so runs the
 //! semijoin folded into the expand, p50 in ms. IS is the IS1-shaped
 //! profile read by original
-//! id, all eight properties through zu::query::run, gated at the G2 1
+//! id, all eight properties through zu::query::run, gated at the T2 1
 //! ms warm p50.
 //! IC is an IC-shaped 2-hop friends-of-friends read with DISTINCT,
 //! ORDER BY, and LIMIT, p50 in ms. Distinct two-hop is the same
@@ -165,7 +165,7 @@ fn load(data: &str, path: &std::path::Path) -> (Vec<(u32, u32)>, Vec<u64>, Profi
     (dense, by_row, profiles)
 }
 
-/// B1: warm 1-hop expands over rows with out-degree at most 100, the G1
+/// B1: warm 1-hop expands over rows with out-degree at most 100, the T1
 /// workload shape docs/11 defines the budget on. The gated number goes
 /// through the cached-group path, the read the executor's Expand makes
 /// once a query is warm; the storage point path prints alongside as

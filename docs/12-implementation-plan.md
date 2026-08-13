@@ -13,7 +13,7 @@
 | Parallelism | own morsel scheduler on `std::thread` + crossbeam deques | no rayon/tokio in query path |
 | Arrow | `arrow` behind feature | interop only, not internal representation |
 | Parser | hand-written | error quality, fuzzability, zero deps |
-| zstd | `zstd` (feature) + `ruzstd` read-fallback | G12 pure-Rust default |
+| zstd | `zstd` (feature) + `ruzstd` read-fallback | T12 pure-Rust default |
 
 ## 1. Milestones
 
@@ -33,7 +33,7 @@ WAL, single-writer commit, overlays, checkpoint, recovery, crash-injection harne
 RecursiveBFS (hybrid morsels), path modes/selectors, PMR path returns, bidirectional shortest, MultiwayIntersect + optimizer injection, COLOR summaries + pessimistic bounds, table functions (pagerank, wcc, sssp, louvain). **Exit: B5; Graphalytics kernels; SNB IC13/14-class path queries.**
 
 ### M5, s3 engine
-Manifest/CAS/fencing, WAL objects + durability modes, segment packs + footers, foyer integration, frontier prefetch, checkpoint/GC, request accountant, CAS conformance suite, partitions. **Exit: B9/B10; G9 scenario demonstrated on real S3 + R2; chaos suite green.**
+Manifest/CAS/fencing, WAL objects + durability modes, segment packs + footers, foyer integration, frontier prefetch, checkpoint/GC, request accountant, CAS conformance suite, partitions. **Exit: B9/B10; T9 scenario demonstrated on real S3 + R2; chaos suite green.**
 
 ### M6, Polish → v1.0
 GQL conformance declaration, vector (HNSW) + FTS features, Python binding, server + MCP, docs deliverables (§10 §6), benchmark publication + harness repo, OSS-Fuzz, format freeze (`min_reader_version` policy).

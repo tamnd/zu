@@ -2,7 +2,7 @@
 //!
 //! Subcommands (shell, query, copy, convert, verify, stat, bench) are
 //! specified in `docs/10-api-and-tooling.md` and land with their layers.
-//! Argument parsing is hand-rolled: the surface is small and G7 caps the
+//! Argument parsing is hand-rolled: the surface is small and T7 caps the
 //! binary at 15 MiB, so no clap.
 
 use std::fmt::Write as _;
@@ -13,6 +13,7 @@ use zu::{DiagnosticRecord, Severity};
 
 mod conformance;
 mod json;
+mod scoreboard;
 mod shell;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -641,7 +642,7 @@ fn query(
 /// Renders a result as one JSON object:
 /// `{"gqlstatus":"00000","columns":[...],"rows":[[...]]}`, with a
 /// `"notices"` array when the statement raised a condition it survived.
-/// Hand-rolled because the CLI carries no JSON crate; G7 caps the binary
+/// Hand-rolled because the CLI carries no JSON crate; T7 caps the binary
 /// at 15 MiB and this is the only place that needs one.
 ///
 /// `gqlstatus` is always present, because a statement that succeeded
@@ -935,6 +936,8 @@ fn print_usage() {
     println!("{QUERY_USAGE}");
     println!("zu shell <file.zu1> [--format jsonl]");
     println!("zu conformance --declare [--format toml|json] | --verify <report.json>");
+    println!("zu conformance --tally <report.json> | --scoreboard <tally.json>...");
+    println!("zu conformance --regressed <report.json> <baseline.json>");
 }
 
 #[cfg(test)]

@@ -42,7 +42,7 @@ PRAGMA foreign_keys=OFF;  -- integrity enforced by zu layer (same rules as zu1)
 PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=2000;
 ```
 
-`rusqlite` with `bundled` (pinned SQLite ≥ 3.50) under the `sqlite` feature only, keeps G12 for default builds.
+`rusqlite` with `bundled` (pinned SQLite ≥ 3.50) under the `sqlite` feature only, keeps T12 for default builds.
 
 ## 4. Serving the `GraphStore` contract
 

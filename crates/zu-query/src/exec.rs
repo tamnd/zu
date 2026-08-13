@@ -5841,7 +5841,7 @@ mod tests {
         // No statement zu parses reaches this yet: the grammar requires
         // a projection, so `columns` is never empty from a real query.
         // The rule lives on the result anyway, so the first write
-        // statement in G3 gets it without anyone remembering to.
+        // statement in milestone G3 gets it without anyone remembering to.
         let omitted = QueryResult::new(Vec::new(), Vec::new());
         assert_eq!(omitted.status().code(), "00001");
         assert!(omitted.status().severity().is_success());

@@ -6,30 +6,30 @@ Discipline rule (SoK arXiv:2404.00766): publish only reproducible, spec-complian
 
 | ID | Micro-benchmark | Target | Gate |
 |---|---|---|---|
-| B1 | 1-hop expand, warm, deg ≤ 100 (G1) | < 10 µs p50 | regress > 10% fails CI |
+| B1 | 1-hop expand, warm, deg ≤ 100 (T1) | < 10 µs p50 | regress > 10% fails CI |
 | B2 | pk point lookup, warm | < 2 µs |〃 |
-| B3 | int64 column scan+sum, 100 M rows | > 2 GB/s/core decoded (G3) | 〃 |
+| B3 | int64 column scan+sum, 100 M rows | > 2 GB/s/core decoded (T3) | 〃 |
 | B4 | 2-hop factorized count, LDBC SF1 | < 10 ms | 〃 |
 | B5 | triangle count (WCOJ), Graph500-22 | competitive with Umbra published class | tracked |
-| B6 | COPY 100 M edges (G4) | > 1 M edges/s/core | 〃 |
-| B7 | open 10 GB file (G8) | < 10 ms | 〃 |
-| B8 | adjacency size, reordered LiveJournal | ≤ 8 bits/edge (G5) | 〃 |
+| B6 | COPY 100 M edges (T4) | > 1 M edges/s/core | 〃 |
+| B7 | open 10 GB file (T8) | < 10 ms | 〃 |
+| B8 | adjacency size, reordered LiveJournal | ≤ 8 bits/edge (T5) | 〃 |
 | B9 | s3 cold 3-hop (Standard, frontier prefetch) | < 500 ms | tracked |
-| B10 | s3 monthly bill, G9 scenario replay | < $40 ±10% | simulated from request log |
+| B10 | s3 monthly bill, T9 scenario replay | < $40 ±10% | simulated from request log |
 | B11 | cardinality q-error, generated graphs | p50 ≤ 2, p90 ≤ 10, p99 ≤ 100 | runs in CI, any bound violation fails |
 
 B11 is `cargo bench -p zu --bench cardinality`. It builds its own uniform, hub, and funnel graphs rather than reading a dataset, which is why it runs in CI where the LDBC gate cannot. The same q-errors over LDBC SF1 come out of the `ldbc` bench on the gate machines. A bound violation, meaning an operator that produced more rows than the optimizer's pessimistic ceiling allowed, fails the run gated or not: the join order DP is built on those ceilings holding.
 
 ## 2. Macro benchmarks
 
-- **LDBC SNB Interactive v2** SF1–SF100: short reads (IS*) p50 < 1 ms warm (G2); complex reads competitive with published Kùzu-class results; audited submission is a post-1.0 goal, spec-compliant unaudited runs before that.
+- **LDBC SNB Interactive v2** SF1–SF100: short reads (IS*) p50 < 1 ms warm (T2); complex reads competitive with published Kùzu-class results; audited submission is a post-1.0 goal, spec-compliant unaudited runs before that.
 - **LDBC SNB BI** SF100: exercises columnar scans + bulk path-finding.
 - **LDBC Graphalytics** (BFS, PageRank, WCC, SSSP) on Graph500 + real graphs (LiveJournal, Twitter-2010, Friendster): table-function kernels.
 - **Comparison set**: LadybugDB (Kùzu lineage), DuckPGQ, Neo4j (block format), FalkorDB Rust, Memgraph, same machine, published harness repo (`tamnd/zu-bench`), engine versions pinned.
 
 ## 3. Cost benchmarks (s3 engine, first-class, nobody else does this)
 
-`zu bench s3cost` replays workload traces against the request accountant (unit-priced S3/R2/GCS tables checked into the repo with a date) and emits $/month + request histograms. Scenarios: G9 (1 TB/100 QPS), write-heavy agent memory (10 K writes/s batched), cold analytics (BI over 10 TB), PB partitioned. Assertions on *bill shape* (flat under 10× QPS spike with warm cache), not just totals.
+`zu bench s3cost` replays workload traces against the request accountant (unit-priced S3/R2/GCS tables checked into the repo with a date) and emits $/month + request histograms. Scenarios: T9 (1 TB/100 QPS), write-heavy agent memory (10 K writes/s batched), cold analytics (BI over 10 TB), PB partitioned. Assertions on *bill shape* (flat under 10× QPS spike with warm cache), not just totals.
 
 ## 4. Correctness verification
 

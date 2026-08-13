@@ -1,6 +1,6 @@
 //! B7 open-latency bench: a 10 GB zu1 file must open in under 10 ms.
 //!
-//! Open is specified as O(1) I/O (docs/04 §1, G8): read 12 KiB of
+//! Open is specified as O(1) I/O (docs/04 §1, T8): read 12 KiB of
 //! headers, pick the valid one with the highest epoch, load the free
 //! list, and page everything else lazily. This bench pins that down
 //! against a real multi-gigabyte file so an accidentally eager open

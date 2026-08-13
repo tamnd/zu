@@ -41,7 +41,7 @@ sidecar         <db>.zu1.wal                    redo WAL (§08)
 | stats_root | BlockPtr | statistics blocks |
 | crc32c | u32 | over the header |
 
-Open procedure (G8: O(1) I/O): read 12 KiB, pick valid header with max epoch, lazily page everything else. `BlockPtr = u64` block index; meta-block chains are linked lists of 256 KiB blocks whose payload is a versioned, length-prefixed binary encoding (hand-rolled, spec'd in `format/meta.rs`; no serde on disk).
+Open procedure (T8: O(1) I/O): read 12 KiB, pick valid header with max epoch, lazily page everything else. `BlockPtr = u64` block index; meta-block chains are linked lists of 256 KiB blocks whose payload is a versioned, length-prefixed binary encoding (hand-rolled, spec'd in `format/meta.rs`; no serde on disk).
 
 ## 2. Node groups
 

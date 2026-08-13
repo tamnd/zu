@@ -24,18 +24,20 @@ zu is an **embedded, in-process property-graph database** in the DuckDB/Kùzu mo
 
 | # | Goal | Target |
 |---|------|--------|
-| G1 | Latency, hot 1-hop neighborhood (cached, ≤100 neighbors) | < 10 µs p50, < 100 µs p99 |
-| G2 | Latency, LDBC SNB short reads (IS1–IS7 class), warm | < 1 ms p50 |
-| G3 | Scan/decode throughput (int/float columns, in-memory) | > 2 GB/s/core decoded |
-| G4 | Ingest (bulk COPY, zu1) | > 1 M edges/s/core |
-| G5 | Compression vs raw CSV | ≥ 5× typical; adjacency ≤ 8 bits/edge on reordered social graphs |
-| G6 | RAM floor | fully functional in 128 MiB budget; useful in 32 MiB |
-| G7 | Binary size (`zu` CLI, release, stripped) | < 15 MiB default features |
-| G8 | Cold start (open 10 GB zu1 file) | < 10 ms (no eager loads) |
-| G9 | S3 engine cost, 1 TB graph, 100 QPS read-mostly | < $40/month total, bill flat ±10% month-over-month |
-| G10 | S3 engine scale | 1 PB logical graph across partitioned manifests; stateless readers scale horizontally |
-| G11 | Crash safety | power-cut safe at every instant, all engines; no fsck |
-| G12 | Dependencies | core (`zudb-core` + `zu1`) builds with no C/C++ deps |
+| T1 | Latency, hot 1-hop neighborhood (cached, ≤100 neighbors) | < 10 µs p50, < 100 µs p99 |
+| T2 | Latency, LDBC SNB short reads (IS1–IS7 class), warm | < 1 ms p50 |
+| T3 | Scan/decode throughput (int/float columns, in-memory) | > 2 GB/s/core decoded |
+| T4 | Ingest (bulk COPY, zu1) | > 1 M edges/s/core |
+| T5 | Compression vs raw CSV | ≥ 5× typical; adjacency ≤ 8 bits/edge on reordered social graphs |
+| T6 | RAM floor | fully functional in 128 MiB budget; useful in 32 MiB |
+| T7 | Binary size (`zu` CLI, release, stripped) | < 15 MiB default features |
+| T8 | Cold start (open 10 GB zu1 file) | < 10 ms (no eager loads) |
+| T9 | S3 engine cost, 1 TB graph, 100 QPS read-mostly | < $40/month total, bill flat ±10% month-over-month |
+| T10 | S3 engine scale | 1 PB logical graph across partitioned manifests; stateless readers scale horizontally |
+| T11 | Crash safety | power-cut safe at every instant, all engines; no fsck |
+| T12 | Dependencies | core (`zudb-core` + `zu1`) builds with no C/C++ deps |
+
+These were numbered G1–G12 until the GQL conformance milestones arrived, which are also numbered G0–G10 and tracked as issues. Two different G7s in one repository is the kind of thing that survives a long time and then costs somebody an afternoon, so the targets here are T for target and G now means a milestone everywhere.
 
 ## 4. Non-goals (v1)
 
@@ -74,3 +76,4 @@ One database = one engine at a time; `COPY TO / ATTACH` moves graphs between eng
 | `10-api-and-tooling.md` | Rust API, CLI, server, bindings |
 | `11-benchmarks-and-targets.md` | Perf budgets, LDBC plan, CI regression gates |
 | `12-implementation-plan.md` | Milestones M0–M6, dependency choices, risks |
+| `gql-conformance.md` | Generated scoreboard: where zu and other engines stand on the ISO GQL corpus |

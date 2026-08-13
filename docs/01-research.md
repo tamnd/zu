@@ -39,7 +39,7 @@ Findings from a four-track survey (systems, storage formats, S3-native design, q
 - Kùzu node-group CSR with slack gaps = the proven updatable-CSR-on-disk design.
 - Dynamic in-memory structures (GFE line): **Sortledton** (VLDB 2022), sorted neighborhood blocks, analytics within 1.22× of static CSR at 2.1× CSR memory; insight: *sequential neighborhood access* matters, not vertex-array purity. Teseo, LiveGraph, RadixGraph (arXiv:2601.01444, 2026 SOTA claim).
 - **Adjacency compression** (WebGraph/BV, LLP, arXiv:1011.5425): web graphs 1.2–3.8 bits/link; social graphs 5–11 bits/link; **dense-ID relabeling (BFS/ degree ordering) is cheap and yields ~25%+ compression + traversal locality**; LLP gains another ~25% but costs hours at billions of edges. webgraph-rs (Vigna) is production Rust prior art. k²-trees: 2–5 bits/edge but µs-scale neighbor access, archival tier only.
-- **zu conclusion**: CSR per node group = two integer columns (offsets bitpacked, neighbors delta+bitpacked); optional `REORDER` (BFS/degree) at bulk load; expect 4–8 bits/edge on reordered social graphs (G5).
+- **zu conclusion**: CSR per node group = two integer columns (offsets bitpacked, neighbors delta+bitpacked); optional `REORDER` (BFS/degree) at bulk load; expect 4–8 bits/edge on reordered social graphs (T5).
 
 ### 2.3 Single-file design & buffer management
 - **DuckDB file format** (best modern reference): 4 KB header ×3 with two alternating DatabaseHeaders → atomic root flip; fixed 256 KB blocks; meta-block chains; row groups 122,880; per-segment codec by analyze pass; WAL sidecar replayed on startup; **bulk loads bypass WAL** via optimistic new-block writes. MVCC optimized for few-large-writers/many-readers (duckdb.org/2024/10/30/analytics-optimized-concurrent-transactions).

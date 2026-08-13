@@ -147,6 +147,28 @@ impl Session {
         self.stmts.remove(&stmt).is_some()
     }
 
+    /// The plan this session would run for `source`, rendered, without
+    /// running it.
+    ///
+    /// [`Self::explain_analyze`] is the same listing with the observed
+    /// counters in it, and it costs a full execution to produce. A
+    /// caller that wants to record how a statement ran beside a latency
+    /// it measured somewhere else cannot afford that execution: for a
+    /// read it would double the work being timed, and for a write it
+    /// would apply the write a second time. This one compiles and
+    /// renders, which on a warm session is a hash lookup and a string.
+    ///
+    /// It takes no parameters because zu plans on the statement text
+    /// and the schema alone. Accepting them would say the plan depends
+    /// on their values, and then a caller would have some reason to
+    /// pass the ones it is about to bind.
+    pub fn explain(&mut self, source: &str) -> Result<String> {
+        self.refresh()?;
+        let cached = self.plan_for(source)?;
+        let listing = zu_query::plan::explain(&cached.plan, &cached.query, &self.schema);
+        Ok(query::noted(cached.notes.clone(), listing))
+    }
+
     /// EXPLAIN ANALYZE through the session: same cache, same options,
     /// profiled execution.
     pub fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {

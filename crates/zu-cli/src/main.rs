@@ -31,10 +31,7 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::SUCCESS
         }
-        Some("stat") => match args.get(1) {
-            Some(path) => stat(std::path::Path::new(path)),
-            None => usage_error("zu stat <file.zu1>"),
-        },
+        Some("stat") => stat_command(&args[1..]),
         Some("analyze") => match args.get(1) {
             Some(path) => analyze(std::path::Path::new(path)),
             None => usage_error("zu analyze <file.zu1>"),
@@ -133,6 +130,161 @@ fn main() -> ExitCode {
     }
 }
 
+const STAT_USAGE: &str = "zu stat <file.zu1> [--format text|json]";
+
+/// Parses the `stat` argument list.
+fn stat_command(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--format" | "-f" => match args.get(i + 1).map(String::as_str) {
+                Some("text") => i += 2,
+                Some("json") => {
+                    json = true;
+                    i += 2;
+                }
+                _ => return usage_error(STAT_USAGE),
+            },
+            arg if arg.starts_with('-') => return usage_error(STAT_USAGE),
+            arg if path.is_none() => {
+                path = Some(arg);
+                i += 1;
+            }
+            _ => return usage_error(STAT_USAGE),
+        }
+    }
+    let Some(path) = path else {
+        return usage_error(STAT_USAGE);
+    };
+    let path = std::path::Path::new(path);
+    if json { stat_json(path) } else { stat(path) }
+}
+
+/// The size breakdown, as three lines a person reads in the order they
+/// matter: what the file weighs, what the schema costs before any rows
+/// exist, and what is left, which is the graph.
+///
+/// The schema line is the one with a use beyond curiosity. A store's
+/// size divided by the graph in it is only an encoding once the schema
+/// has come out of the numerator, and zu's schema is four blocks of
+/// 256 KiB, which is larger than most of the graphs a conformance
+/// suite loads.
+fn print_layout(path: &std::path::Path) {
+    match zu::zu1::layout(path) {
+        Ok(l) => {
+            let kib = l.block_size / 1024;
+            println!(
+                "size:            {} ({} blocks of {kib} KiB)",
+                bytes_human(l.bytes()),
+                l.blocks
+            );
+            println!(
+                "  schema:        {} ({} blocks: header, catalog, table index, stats)",
+                bytes_human(l.schema_bytes()),
+                l.schema_blocks
+            );
+            println!(
+                "  free:          {} ({} blocks)",
+                bytes_human(l.free_bytes()),
+                l.free_blocks
+            );
+            println!(
+                "  data:          {} ({} blocks)",
+                bytes_human(l.data_bytes()),
+                l.data_blocks
+            );
+        }
+        // A layout that will not read is worth a line rather than an
+        // exit code: the rest of stat is still true, and the reader
+        // came here to find out what is wrong with the file.
+        Err(e) => println!("size:            unreadable: {e}"),
+    }
+}
+
+/// Bytes with a unit, in the powers of two the format allocates in.
+fn bytes_human(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.2} {}", UNITS[unit])
+    }
+}
+
+/// The same facts as one JSON object, for a caller that has to do
+/// arithmetic with them.
+///
+/// This exists for the gql-compat harness, which measures what a store
+/// weighs after a load and needs the schema figure to subtract before
+/// it divides. Everything here is either an exact byte count or a
+/// count of rows; the color line the text form prints is prose about a
+/// heuristic and has no place in a file something parses.
+fn stat_json(path: &std::path::Path) -> ExitCode {
+    let mut db = match zu::zu1::file::Zu1File::open(path) {
+        Ok(db) => db,
+        Err(e) => return command_error("stat", &e),
+    };
+    let layout = match zu::zu1::layout(path) {
+        Ok(l) => l,
+        Err(e) => return command_error("stat", &e),
+    };
+    let catalog = match zu::zu1::catalog::Catalog::load(&mut db) {
+        Ok(c) => c,
+        Err(e) => return command_error("stat", &e),
+    };
+    let dh = db.db_header();
+    let mut out = String::from("{\"file\":");
+    write_json_str(&mut out, &path.display().to_string());
+    out.push_str(&format!(
+        ",\"format_version\":{},\"epoch\":{},\"block_size\":{},\"blocks\":{}",
+        db.file_header().format_version,
+        dh.epoch,
+        layout.block_size,
+        layout.blocks
+    ));
+    out.push_str(&format!(
+        ",\"bytes\":{},\"schema_bytes\":{},\"free_bytes\":{},\"data_bytes\":{}",
+        layout.bytes(),
+        layout.schema_bytes(),
+        layout.free_bytes(),
+        layout.data_bytes()
+    ));
+    out.push_str(",\"node_tables\":[");
+    for (i, t) in catalog.node_tables().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        write_json_str(&mut out, &t.name);
+        out.push_str(&format!(",\"nodes\":{}}}", t.node_count));
+    }
+    out.push_str("],\"rel_tables\":[");
+    for (i, t) in catalog.rel_tables().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let name = |id| catalog.node_by_id(id).map_or("?", |t| t.name.as_str());
+        out.push_str("{\"name\":");
+        write_json_str(&mut out, &t.name);
+        out.push_str(",\"from\":");
+        write_json_str(&mut out, name(t.from));
+        out.push_str(",\"to\":");
+        write_json_str(&mut out, name(t.to));
+        out.push_str(&format!(",\"edges\":{}}}", t.edge_count));
+    }
+    out.push_str("]}");
+    println!("{out}");
+    ExitCode::SUCCESS
+}
+
 fn stat(path: &std::path::Path) -> ExitCode {
     match zu::zu1::file::Zu1File::open(path) {
         Ok(mut db) => {
@@ -165,12 +317,17 @@ fn stat(path: &std::path::Path) -> ExitCode {
             );
             println!("block size:      {} KiB", fh.block_size / 1024);
             println!("epoch:           {}", dh.epoch);
-            println!("blocks:          {}", dh.block_count);
+            // Named for what it is rather than "blocks", which sat one
+            // line above a size in blocks that was larger by one and
+            // invited the reader to find the file short a block. This
+            // is the high-water mark and block 0 is not in it.
+            println!("high water:      block {}", dh.block_count);
             println!("wal seq:         {}", dh.wal_seq);
             println!(
                 "roots:           catalog={} tables={} free={} stats={}",
                 dh.catalog_root, dh.table_index_root, dh.free_list_root, dh.stats_root
             );
+            print_layout(path);
             let stats = zu::zu1::stats::Stats::load(&mut db).unwrap_or_default();
             match zu::zu1::catalog::Catalog::load(&mut db) {
                 Ok(catalog) => {
@@ -935,6 +1092,7 @@ fn print_usage() {
     println!();
     println!("{QUERY_USAGE}");
     println!("zu shell <file.zu1> [--format jsonl]");
+    println!("{STAT_USAGE}");
     println!("zu conformance --declare [--format toml|json] | --verify <report.json>");
     println!("zu conformance --tally <report.json> | --scoreboard <tally.json>...");
     println!("zu conformance --regressed <report.json> <baseline.json>");

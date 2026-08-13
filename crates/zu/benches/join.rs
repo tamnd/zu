@@ -64,10 +64,13 @@
 //! Everything runs at one worker, so the rate is per core.
 //!
 //! exec_join_mprobes_s_core floors the unique key case in millions of
-//! probe rows a second, build included. exec_sip_worst_x floors the
-//! weakest of the two sideways cases against its own filter off run,
-//! which is a no regression gate: a filter that costs more than it
-//! saves fails here.
+//! probe rows a second, build included. exec_sip_range_x and
+//! exec_sip_mask_x floor the two sideways cases against their own
+//! filter off runs. They are separate because the two halves are worth
+//! different things: the range is a win on every host, so its floor is
+//! above one and says the pass works, while the mask is a win only
+//! where a random read costs something, so its floor is under one and
+//! says the pass has not started costing.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench join
 
@@ -205,11 +208,24 @@ struct Case {
     old_want: Want,
     probes: u64,
     out: u64,
-    /// Whether to run this one a second time with the sideways filter
-    /// off and report what it was worth. Only the shapes it can do
-    /// something for carry this; on the rest the two runs are the same
-    /// plan and the line would say nothing.
-    sip: bool,
+    /// Which half of the sideways pass this shape is here to measure,
+    /// if it is here for that at all. A shape carrying one of the two
+    /// runs a second time with the filter held back, so the line says
+    /// what the filter was worth against the same plan. On the rest the
+    /// two runs are the same plan and the line would say nothing.
+    sip: Sip,
+}
+
+/// The two halves get their own floors because they are worth
+/// different things. The range is a win on every host, since a chunk
+/// it rules out is a chunk nobody decodes. The mask saves one probe
+/// per rejected row, so it is a win where a random read costs
+/// something and a wash where the whole table sits in cache.
+#[derive(PartialEq)]
+enum Sip {
+    No,
+    Mask,
+    Range,
 }
 
 fn main() {
@@ -315,7 +331,7 @@ fn main() {
             },
             probes: NODES,
             out: unique_out,
-            sip: false,
+            sip: Sip::No,
         },
         Case {
             what: "thousand a key",
@@ -337,7 +353,7 @@ fn main() {
             },
             probes: city_probes,
             out: city_out,
-            sip: false,
+            sip: Sip::No,
         },
         Case {
             what: "every probe misses",
@@ -350,7 +366,7 @@ fn main() {
             old_want: Want { rows: 1, total: 0 },
             probes: NODES,
             out: 0,
-            sip: false,
+            sip: Sip::No,
         },
         Case {
             what: "grouped by the joined side",
@@ -371,7 +387,7 @@ fn main() {
             },
             probes: NODES,
             out: unique_out,
-            sip: false,
+            sip: Sip::No,
         },
         Case {
             what: "hop off the joined side",
@@ -392,7 +408,7 @@ fn main() {
             },
             probes: NODES,
             out: hop_out,
-            sip: false,
+            sip: Sip::No,
         },
         Case {
             what: "left join, every probe hits",
@@ -413,7 +429,7 @@ fn main() {
             },
             probes: NODES,
             out: NODES,
-            sip: false,
+            sip: Sip::No,
         },
         Case {
             what: "left join, every other probe misses",
@@ -436,7 +452,7 @@ fn main() {
             },
             probes: NODES,
             out: NODES,
-            sip: false,
+            sip: Sip::No,
         },
         Case {
             what: "one probe row in eight survives",
@@ -455,7 +471,7 @@ fn main() {
             },
             probes: NODES,
             out: sparse_out,
-            sip: true,
+            sip: Sip::Mask,
         },
         Case {
             what: "the build side's keys fit in one chunk of the probe",
@@ -474,18 +490,19 @@ fn main() {
             },
             probes: NODES,
             out: zone_out,
-            sip: true,
+            sip: Sip::Range,
         },
     ];
 
     let mut unique = 0.0;
-    let mut worst_sip = f64::MAX;
+    let mut worst_mask = f64::MAX;
+    let mut worst_range = f64::MAX;
     for case in cases {
         let new = measure(&mut db, &case.new, &case.want, 5);
         // The same plan with the join's filter withheld, which is the
         // baseline the sideways pass is worth measuring against: same
         // rows, same order, one less thing known.
-        let off = case.sip.then(|| {
+        let off = (case.sip != Sip::No).then(|| {
             // SAFETY: same as the worker count above.
             unsafe { std::env::set_var("ZU_SIP", "0") };
             let ms = measure(&mut db, &case.new, &case.want, 5);
@@ -501,8 +518,13 @@ fn main() {
         let old_us = old * 1e3 / OLD_PROBES as f64;
         let sip = match off {
             Some(off) => {
-                worst_sip = worst_sip.min(off / new);
-                format!(", filter off {off:.1} ms {:.1}x", off / new)
+                let x = off / new;
+                match case.sip {
+                    Sip::Mask => worst_mask = worst_mask.min(x),
+                    Sip::Range => worst_range = worst_range.min(x),
+                    Sip::No => unreachable!("only a sip case times twice"),
+                }
+                format!(", filter off {off:.1} ms {x:.1}x")
             }
             None => String::new(),
         };
@@ -529,12 +551,20 @@ fn main() {
         );
         println!("gate: join floor met");
     }
-    if let Some(floor) = budget("exec_sip_worst_x") {
+    if let Some(floor) = budget("exec_sip_range_x") {
         assert!(
-            worst_sip >= floor,
-            "the sideways filter leaves the query {worst_sip:.2}x at its weakest, \
+            worst_range >= floor,
+            "the published range leaves the query {worst_range:.2}x, \
              under the {floor}x floor"
         );
-        println!("gate: sip floor met");
+        println!("gate: sip range floor met");
+    }
+    if let Some(floor) = budget("exec_sip_mask_x") {
+        assert!(
+            worst_mask >= floor,
+            "the membership test leaves the query {worst_mask:.2}x, \
+             under the {floor}x floor"
+        );
+        println!("gate: sip mask floor met");
     }
 }

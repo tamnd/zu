@@ -90,19 +90,22 @@
 //! rejected row is one probe, which is one random read of the join's
 //! directory, so a test that costs a random read of its own and is
 //! sometimes wrong about the row has nothing left to win. On the join
-//! bench, against the same plan with ZU_SIP=0, the mask runs 1.0x on
-//! the local M series and 1.1x on gamingpc and server1, and the bloom
-//! ran 0.8 to 0.9x locally before it was taken back out. The range is
-//! published either way and is worth 1.3x on all three. A scan that
-//! took the filter instead of an operator over rows it has already
-//! decoded is what would give the inexact one something real to save,
-//! and that is not written yet.
+//! bench, against the same plan with ZU_SIP=0, the mask runs 0.8 to
+//! 1.0x on the local M series, 1.1 to 1.2x on gamingpc and 1.1 to 1.5x
+//! on server1, and the bloom ran 0.8 to 0.9x locally before it was
+//! taken back out. The range is published either way and is worth 1.2
+//! to 1.4x on all three. A scan that took the filter instead of an
+//! operator over rows it has already decoded is what would give the
+//! inexact one something real to save, and that is not written yet.
 //!
-//! The mask does better on the slower boxes than on the fast one, up
-//! to 1.4x on server1 with a cold page cache, for the same reason it
+//! Read the mask numbers the right way round. It does nothing on the
+//! fast box and everything on the slow one for the same reason it
 //! earns anything at all: what it saves is a random read, and a random
-//! read is only worth saving where it costs something. Neither shape
-//! is the pass at its best. The optimizer
+//! read is only worth saving where it costs something. On the local M
+//! series the join's directory is in cache and the probe it skips was
+//! never expensive, so the test is a tax. That is why the bench floors
+//! the two halves separately, the range above one and the mask under
+//! it. Neither shape is the pass at its best. The optimizer
 //! drives the side it estimated cheaper and builds the dearer one, so
 //! the filter is published from the big side onto the small one, which
 //! is the direction with the least to gain, and the build of the big

@@ -231,3 +231,93 @@ fn null_properties_error_cleanly() {
     let err = sqlite_to_zu1(&db, &dir.path().join("b.zu1")).unwrap_err();
     assert!(format!("{err}").contains("null"), "unexpected error: {err}");
 }
+
+/// A float column and a byte string column survive both hops, and the
+/// query layer reads the float back as a float rather than as the word
+/// the lane holds it in.
+#[test]
+fn float_and_byte_columns_survive_both_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    let scores = [1.5f64, -0.25, 3.75, 0.0, 1e300, -1e-300];
+    let raw: [&[u8]; 6] = [b"\x00\xff", b"", b"\x01", b"\xfe\xed", b"zz", b"\x7f"];
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table(
+        "person",
+        &[("score", ColumnType::Real), ("tag", ColumnType::Blob)],
+    )
+    .unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
+    sq.begin().unwrap();
+    for row in 0..6usize {
+        sq.insert_node_at(
+            "person",
+            row as i64,
+            &[
+                SqlValue::Real(scores[row]),
+                SqlValue::Blob(raw[row].to_vec()),
+            ],
+        )
+        .unwrap();
+    }
+    for &(src, dst) in &EDGES {
+        sq.insert_rel("knows", i64::from(src), i64::from(dst), &[])
+            .unwrap();
+    }
+    sq.commit().unwrap();
+    drop(sq);
+
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut zu = Zu1File::open(&b).unwrap();
+    let person = Catalog::load(&mut zu)
+        .unwrap()
+        .node_by_name("person")
+        .unwrap()
+        .id;
+    let mut reader = PropsReader::new(load_props(&mut zu, person).unwrap().unwrap());
+    let score = reader.col("score").unwrap();
+    let tag = reader.col("tag").unwrap();
+    let mut buf = Vec::new();
+    for row in 0..6u64 {
+        let word = reader.read_int(&mut zu, score, row).unwrap();
+        assert_eq!(f64::from_bits(word), scores[row as usize]);
+        buf.clear();
+        reader.read_str(&mut zu, tag, row, &mut buf).unwrap();
+        assert_eq!(buf, raw[row as usize]);
+    }
+    let got = run_zu1(
+        "MATCH (p:person) RETURN p.score AS s ORDER BY s",
+        &mut zu,
+        &[],
+    )
+    .unwrap();
+    let mut want = scores;
+    want.sort_by(f64::total_cmp);
+    let read: Vec<f64> = got
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            zu::query::Value::Float(f) => f,
+            ref other => panic!("expected a float, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(read, want);
+
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    for row in 0..6i64 {
+        assert_eq!(
+            back.read_node_prop("person", row, "score").unwrap(),
+            SqlValue::Real(scores[row as usize])
+        );
+        assert_eq!(
+            back.read_node_prop("person", row, "tag").unwrap(),
+            SqlValue::Blob(raw[row as usize].to_vec())
+        );
+    }
+}

@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use zu_common::{Result, ZuError};
+use zu_common::{IntBits, LogicalType, Result, ZuError};
 use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
 
 pub use zu_query::snapshot::{
@@ -25,7 +25,7 @@ use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
-use crate::zu1::props::{PropType, PropsReader, load_props};
+use crate::zu1::props::{PropsReader, load_props};
 
 fn direction(dir: Dir) -> Direction {
     match dir {
@@ -224,12 +224,23 @@ impl Snapshot for Zu1Snapshot<'_> {
         let Some(reader) = self.props.get(&table).expect("just loaded") else {
             return Ok(None);
         };
-        Ok(reader.col(name).map(|ix| {
-            let ty = match reader.columns()[ix].ty {
-                PropType::Int => ColType::Int,
-                PropType::Str => ColType::Str,
+        // The vector layer types a column as one of two things, so a
+        // column that is neither is not resolvable here and the
+        // compiler declines the plan rather than reading a float or a
+        // date as though it were a count. The row at a time executor
+        // reads those, and widening this is the vector layer's own
+        // change (G1, the `PhysType` move).
+        Ok(reader.col(name).and_then(|ix| {
+            let ty = match &reader.columns()[ix].ty {
+                LogicalType::Int {
+                    signed: true,
+                    bits: IntBits::B64,
+                    ..
+                } => ColType::Int,
+                LogicalType::Str { .. } => ColType::Str,
+                _ => return None,
             };
-            (ix as ColId, ty)
+            Some((ix as ColId, ty))
         }))
     }
 
@@ -306,29 +317,26 @@ impl Snapshot for Zu1Snapshot<'_> {
         let mut columns = Vec::with_capacity(cols.len());
         for &c in cols {
             let col = check_col(reader, c)?;
-            match reader.columns()[col].ty {
-                PropType::Int => {
-                    if have != Some(col) {
-                        reader.scan_int_chunk(db, col, chunk_ix, scratch)?;
-                        have = Some(col);
-                    }
-                    columns.push(ValueVector::flat_from(
-                        arena,
-                        PhysType::Int64,
-                        &scratch[..rows],
-                    ));
+            if reader.columns()[col].is_lane() {
+                if have != Some(col) {
+                    reader.scan_int_chunk(db, col, chunk_ix, scratch)?;
+                    have = Some(col);
                 }
-                PropType::Str => {
-                    reader.scan_str_range(
-                        db,
-                        col,
-                        row_base,
-                        row_base + rows as u64,
-                        str_bytes,
-                        str_ends,
-                    )?;
-                    columns.push(str_views(arena, str_bytes, str_ends));
-                }
+                columns.push(ValueVector::flat_from(
+                    arena,
+                    PhysType::Int64,
+                    &scratch[..rows],
+                ));
+            } else {
+                reader.scan_str_range(
+                    db,
+                    col,
+                    row_base,
+                    row_base + rows as u64,
+                    str_bytes,
+                    str_ends,
+                )?;
+                columns.push(str_views(arena, str_bytes, str_ends));
             }
         }
         Ok(Some(ScanChunk {
@@ -365,15 +373,12 @@ impl Snapshot for Zu1Snapshot<'_> {
         } = self;
         let reader = props_of(props, table)?;
         let ix = check_col(reader, col)?;
-        match reader.columns()[ix].ty {
-            PropType::Int => {
-                reader.gather_int(db, ix, rows, scratch)?;
-                Ok(ValueVector::flat_from(arena, PhysType::Int64, scratch))
-            }
-            PropType::Str => {
-                reader.gather_str(db, ix, rows, str_bytes, str_ends)?;
-                Ok(str_views(arena, str_bytes, str_ends))
-            }
+        if reader.columns()[ix].is_lane() {
+            reader.gather_int(db, ix, rows, scratch)?;
+            Ok(ValueVector::flat_from(arena, PhysType::Int64, scratch))
+        } else {
+            reader.gather_str(db, ix, rows, str_bytes, str_ends)?;
+            Ok(str_views(arena, str_bytes, str_ends))
         }
     }
 

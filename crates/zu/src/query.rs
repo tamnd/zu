@@ -15,7 +15,8 @@ use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
-use crate::zu1::props::{PropType, PropsReader, load_props};
+use crate::zu1::props::{PropsReader, load_props};
+use zu_common::{FloatBits, LogicalType};
 
 /// The types [`run`] speaks, re-exported here so a caller that depends
 /// on `zu` alone can bind a parameter and read a row back without also
@@ -123,6 +124,33 @@ impl Drop for Db<'_> {
             db.recycle();
         }
     }
+}
+
+/// Turns one word out of a fixed width property column into the value
+/// its column's type says it holds. The lane stores 64 bit words and
+/// nothing else, so this is the only place that knows a word out of a
+/// boolean column is a truth value and a word out of a float column is
+/// an IEEE bit pattern.
+fn word_value(ty: &LogicalType, word: u64, key: &str) -> Result<Value> {
+    Ok(match ty {
+        LogicalType::Bool => Value::Bool(word != 0),
+        LogicalType::Int { .. } => Value::Int(word as i64),
+        LogicalType::Float { bits, .. } => match bits {
+            FloatBits::B32 => Value::Float(f64::from(f32::from_bits(word as u32))),
+            _ => Value::Float(f64::from_bits(word)),
+        },
+        other => return Err(unreadable(other, key)),
+    })
+}
+
+/// A column zu can store but the runtime has no value for yet. The
+/// temporal types are stored here before the executor can hold one, so
+/// a read of one says what it met rather than handing back a word
+/// dressed as an integer.
+fn unreadable(ty: &LogicalType, key: &str) -> ZuError {
+    ZuError::InvalidArgument(format!(
+        "property '{key}' holds {ty}, which this engine cannot yet read into a value"
+    ))
 }
 
 /// The executor's view of one open zu1 file: readers load lazily per
@@ -277,9 +305,13 @@ impl Graph for Zu1Graph<'_> {
         if let Some(reader) = props.get_mut(&table).expect("just loaded")
             && let Some(col) = reader.col(key)
         {
-            return match reader.columns()[col].ty {
-                PropType::Int => Ok(Value::Int(reader.read_int(db, col, offset)? as i64)),
-                PropType::Str => {
+            let ty = reader.columns()[col].ty.clone();
+            if reader.columns()[col].is_lane() {
+                let word = reader.read_int(db, col, offset)?;
+                return word_value(&ty, word, key);
+            }
+            return match ty {
+                LogicalType::Str { .. } => {
                     let mut bytes = Vec::new();
                     reader.read_str(db, col, offset, &mut bytes)?;
                     let text = String::from_utf8(bytes).map_err(|_| ZuError::Corrupt {
@@ -288,6 +320,7 @@ impl Graph for Zu1Graph<'_> {
                     })?;
                     Ok(Value::Str(text))
                 }
+                other => Err(unreadable(&other, key)),
             };
         }
         // Without a stored `id` column the id is the offset, the dense

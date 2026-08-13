@@ -36,7 +36,7 @@ use crate::graph::{
 };
 use crate::keys::write_key_index;
 use crate::meta;
-use crate::props::{PropType, PropsDirectory, free_props};
+use crate::props::{PropsDirectory, free_props};
 use crate::segment::{read_segment, write_segment};
 use crate::txn::{Cell, Mvcc};
 use crate::wal::Wal;
@@ -238,46 +238,47 @@ fn fold_props(
     };
     let mut columns = Vec::with_capacity(dir.columns.len());
     for (ci, col) in dir.columns.iter().enumerate() {
-        let meta = match col.ty {
-            PropType::Int => {
-                let mut values = Vec::with_capacity(new_count as usize);
-                read_segment(db, &col.meta, &mut values)?;
-                for offset in 0..new_count {
-                    match mvcc.cell(table, base, offset, ci as u32, epoch) {
-                        Some(Cell::Int(x)) if offset < base => values[offset as usize] = x,
-                        Some(Cell::Int(x)) => values.push(x),
-                        Some(Cell::Str(_)) => return Err(mismatch(&col.name, offset)),
-                        None if offset < base => {}
-                        None => return Err(missing(&col.name, offset)),
-                    }
+        // The fold splits the way storage does, on the lane against
+        // the blob, because that is what it rewrites. Cells the overlay
+        // holds are words or byte strings and the column's type says
+        // which of the two it must be.
+        let meta = if col.is_lane() {
+            let mut values = Vec::with_capacity(new_count as usize);
+            read_segment(db, &col.meta, &mut values)?;
+            for offset in 0..new_count {
+                match mvcc.cell(table, base, offset, ci as u32, epoch) {
+                    Some(Cell::Int(x)) if offset < base => values[offset as usize] = x,
+                    Some(Cell::Int(x)) => values.push(x),
+                    Some(Cell::Str(_)) => return Err(mismatch(&col.name, offset)),
+                    None if offset < base => {}
+                    None => return Err(missing(&col.name, offset)),
                 }
-                write_segment(db, &values)?
             }
-            PropType::Str => {
-                let (mut bytes, mut ends) = (Vec::new(), Vec::new());
-                read_blob_segment(db, &col.meta, &mut bytes, &mut ends)?;
-                let mut values: Vec<Vec<u8>> = Vec::with_capacity(new_count as usize);
-                let mut start = 0usize;
-                for &end in &ends {
-                    values.push(bytes[start..end as usize].to_vec());
-                    start = end as usize;
-                }
-                for offset in 0..new_count {
-                    match mvcc.cell(table, base, offset, ci as u32, epoch) {
-                        Some(Cell::Str(s)) if offset < base => values[offset as usize] = s,
-                        Some(Cell::Str(s)) => values.push(s),
-                        Some(Cell::Int(_)) => return Err(mismatch(&col.name, offset)),
-                        None if offset < base => {}
-                        None => return Err(missing(&col.name, offset)),
-                    }
-                }
-                let refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
-                write_blob_segment(db, &refs)?
+            write_segment(db, &values)?
+        } else {
+            let (mut bytes, mut ends) = (Vec::new(), Vec::new());
+            read_blob_segment(db, &col.meta, &mut bytes, &mut ends)?;
+            let mut values: Vec<Vec<u8>> = Vec::with_capacity(new_count as usize);
+            let mut start = 0usize;
+            for &end in &ends {
+                values.push(bytes[start..end as usize].to_vec());
+                start = end as usize;
             }
+            for offset in 0..new_count {
+                match mvcc.cell(table, base, offset, ci as u32, epoch) {
+                    Some(Cell::Str(s)) if offset < base => values[offset as usize] = s,
+                    Some(Cell::Str(s)) => values.push(s),
+                    Some(Cell::Int(_)) => return Err(mismatch(&col.name, offset)),
+                    None if offset < base => {}
+                    None => return Err(missing(&col.name, offset)),
+                }
+            }
+            let refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
+            write_blob_segment(db, &refs)?
         };
         columns.push(crate::props::PropColumn {
             name: col.name.clone(),
-            ty: col.ty,
+            ty: col.ty.clone(),
             meta,
         });
     }

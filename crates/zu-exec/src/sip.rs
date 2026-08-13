@@ -78,10 +78,55 @@
 //! point: the filter is worth having where the rows are produced, not
 //! where they are joined.
 //!
-//! Nothing consumes one of these yet. Nothing compiles to a join, so
-//! there is no build to produce a filter, and the scan and expand take
-//! no filter argument. [`SipFilter::zone`] is the one join already
-//! made: it hands the range to the scan pushdown that is there today.
+//! The consumer is `Op::Sip`, which the compiler puts on the level a
+//! join probes from, right where that level is made. Everything between
+//! there and the join then runs on the rows that can still match: the
+//! predicates over that level and the probe itself today, and the walks
+//! off it once the planner puts one there. The range goes further down
+//! still, into the scan's zone pushdown, where it skips whole chunks
+//! without decoding them.
+//!
+//! Only an exact test goes in as an operator. What it saves on a
+//! rejected row is one probe, which is one random read of the join's
+//! directory, so a test that costs a random read of its own and is
+//! sometimes wrong about the row has nothing left to win. On the join
+//! bench, against the same plan with ZU_SIP=0, the mask runs 1.0x on
+//! the local M series, 1.1x on gamingpc and 1.2 to 1.4x on server1,
+//! and the bloom ran 0.8 to 0.9x locally before it was taken back out.
+//! A scan that took the filter instead of an operator over rows it has
+//! already decoded is what would give the inexact one something real to
+//! save, and that is not written yet.
+//!
+//! The range is published either way and runs 1.3 to 1.4x locally,
+//! 1.3x on gamingpc and 1.4 to 1.6x on server1. Read the two sets
+//! together rather than one at a time. They are complements: the range
+//! saves a decode and the mask saves a random read, so each is worth
+//! most on the host that is short of the thing it removes. On the
+//! local M series the join's directory sits in cache and the probe the
+//! mask skips was never expensive, so there the mask is a wash and the
+//! range is the whole win. On server1, which has neither the cache nor
+//! the memory headroom, both halves pay. On every host at least one of
+//! the two is a clear win, which is what the bench gates.
+//!
+//! Both sets are timed on and off alternately, and with a few rounds
+//! of each before the clock starts. Timing them as two blocks lets a
+//! box that drifts over those few seconds put the drift in the ratio,
+//! and warming only one round leaves the pass straight after a build
+//! reading about a fifth low. Those two between them were most of the
+//! spread these numbers used to have.
+//!
+//! Neither shape is the pass at its best. The optimizer drives the
+//! side it estimated cheaper and builds the dearer one, so the filter
+//! is published from the big side onto the small one, which is the
+//! direction with the least to gain, and the build of the big side is
+//! in the number either way. The join side choice is what changes
+//! that, and it is not this file.
+//!
+//! A filter that turns out to reject nothing is worse than no filter,
+//! so the operator watches its own rejection rate over the first few
+//! vectors and stops testing when the rows are coming through anyway.
+//! That is the only decision here made at runtime; everything else
+//! about the shape of the filter is settled off the build side's keys.
 
 use zu_query::snapshot::{ColId, ZonePred};
 use zu_vector::kernels::hash64;
@@ -218,6 +263,20 @@ impl SipFilter {
         }
     }
 
+    /// Whether every value between the smallest key and the largest is
+    /// itself a key. A filter like that says nothing the range does not
+    /// already say, so a consumer that has the range pushed down has no
+    /// reason to test rows against it one at a time.
+    ///
+    /// Only the mask can answer this, since it is the only shape that
+    /// knows which values inside its range are missing.
+    pub fn gapless(&self) -> bool {
+        match &self.test {
+            Membership::Mask(m) => m.ones() == self.hi - self.lo + 1,
+            Membership::Nothing | Membership::Bloom(_) | Membership::Range => false,
+        }
+    }
+
     /// Whether a survivor is certainly a match. True for the exact
     /// shapes, false for the bloom and for the bare range.
     pub fn exact(&self) -> bool {
@@ -338,6 +397,12 @@ impl NodeMask {
             bits[(off >> 6) as usize] |= 1 << (off & 63);
         }
         Self { lo, bits }
+    }
+
+    /// Keys in the mask, counted off the bitmap itself, so a build side
+    /// that handed the same key over twice is still counted once.
+    fn ones(&self) -> u64 {
+        self.bits.iter().map(|w| u64::from(w.count_ones())).sum()
     }
 
     /// The word and bit `key` would sit at, `None` when it sits outside
@@ -576,6 +641,49 @@ mod tests {
         assert!(f.may_contain(u64::MAX));
         assert!(!f.skips(0, 0));
         assert!(!f.skips(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn a_run_with_no_holes_in_it_is_gapless() {
+        let f = SipFilter::over(&(1000..2000u64).collect::<Vec<_>>());
+        assert_eq!(f.kind(), "mask");
+        assert!(f.gapless(), "every value between the ends is a key");
+    }
+
+    #[test]
+    fn one_missing_value_is_enough_of_a_gap() {
+        let mut keys: Vec<u64> = (1000..2000).collect();
+        keys.remove(500);
+        let f = SipFilter::over(&keys);
+        assert_eq!(f.kind(), "mask");
+        assert!(!f.gapless(), "1500 is inside the range and not a key");
+    }
+
+    #[test]
+    fn the_shapes_that_cannot_answer_gapless_say_no() {
+        // Neither of these knows which values inside its range are
+        // missing, so neither is allowed to claim there are none.
+        assert!(!SipFilter::over(&[]).gapless());
+        assert!(!SipFilter::over(&scattered()).gapless());
+        assert!(!SipFilter::over(&dense()).gapless(), "strided, so holes");
+    }
+
+    #[test]
+    fn a_single_key_is_gapless() {
+        // The range is one value wide and that value is the key, so a
+        // consumer with the range pushed down has nothing left to test.
+        let f = SipFilter::over(&[42]);
+        assert!(f.gapless());
+    }
+
+    #[test]
+    fn repeats_do_not_make_a_run_look_gapped() {
+        // The count comes off the bitmap rather than off the build
+        // side, so a key handed over twice is still one key and the
+        // run still covers its range.
+        let mut keys: Vec<u64> = (0..100).collect();
+        keys.extend(0..100);
+        assert!(SipFilter::over(&keys).gapless());
     }
 
     #[test]

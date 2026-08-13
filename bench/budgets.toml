@@ -880,3 +880,33 @@ exec_hub_mpairs_s_core = 10.0
 # It sits under the worst the shared box has printed. Raise it, never
 # lower it.
 exec_join_mprobes_s_core = 0.8
+
+# G0 refusal gates (Spec/2064g/gql/plan/08 section 1.2, zu#115),
+# benches/refuse.rs on the same synthetic 10k-node graph the session
+# gates use. The milestone asks for one thing: refusing a statement has
+# to cost less than answering one. It is worth gating because a
+# conformance corpus is mostly statements this engine cannot run, 156
+# of 377 in the run of 2026-08-12 ended in a refusal, and because a
+# refusal that costs more than an answer hands anyone sending nonsense
+# a cheaper way to spend a core than a client sending work.
+#
+# refuse_over_answer is the slowest gated refusal p50 over the warm
+# point read p50 measured in the same run, so it compares two paths on
+# one machine and does not move with the host. Three refusals are timed,
+# one per stage a statement can die at: syntax in the parser, an
+# undefined reference after the parse, and a missing parameter at bind
+# time on a plan that is already cached and correct. Measured on the
+# local M series against a 3.62 us answer: syntax 0.54 (0.15x),
+# undefined reference 1.21 (0.33x), missing parameter 0.04 (0.01x).
+# The milestone only asks for a ratio under 1.0; the ceiling sits at
+# 0.6 because 0.33 is what the engine actually does and a refusal that
+# drifted up to two thirds of an answer would be worth looking at.
+#
+# refuse_p50_us is the absolute backstop on the same worst refusal, so
+# a run where both paths got slower together still fails. It is set
+# from the local 1.21 with room for the fleet spread the session gates
+# document, where server1 runs this class of work at roughly twice the
+# local number, and it comes down when the gate machines report their
+# own. Lower these ceilings, never raise them.
+refuse_over_answer = 0.6
+refuse_p50_us = 4.0

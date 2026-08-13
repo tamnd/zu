@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, Graph};
@@ -490,15 +491,22 @@ pub(crate) fn compile(
 }
 
 /// Resolves caller parameters against the binder's parameter order.
+///
+/// A parameter the caller did not supply is a reference in the
+/// statement that resolves to nothing, which is what `42002 invalid
+/// reference` is for. It used to come back as an engine-internal
+/// invalid argument with no condition at all, which left a client
+/// unable to tell a statement it got wrong from an engine that broke.
 pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Vec<Value>> {
     let mut args = Vec::with_capacity(names.len());
     for name in names {
         match params.iter().find(|(n, _)| n == name) {
             Some((_, v)) => args.push(v.clone()),
             None => {
-                return Err(ZuError::InvalidArgument(format!(
-                    "missing parameter ${name}"
-                )));
+                return Err(ZuError::gql(
+                    codes::C42002,
+                    format!("missing parameter ${name}"),
+                ));
             }
         }
     }

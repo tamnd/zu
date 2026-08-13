@@ -123,6 +123,19 @@ jobs:
       # first ceiling the data walks through.
       - run: ZU_GATE=1 cargo bench -p zu --bench cardinality
 
+  refusal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The G0 gate from gql plan/08 section 1.2: saying no has to cost
+      # less than saying yes. Builds its own graph like the cardinality
+      # gate above, so it needs no dataset. The number it enforces is a
+      # ratio between two paths timed in the same run on the same
+      # machine, which is why it can gate on a shared runner at all.
+      - run: ZU_GATE=1 cargo bench -p zu --bench refuse
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

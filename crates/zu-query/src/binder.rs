@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use zu_common::gqlstatus::codes;
-use zu_common::{Result, ZuError};
+use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
     self, BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, Projection, RelDirection,
@@ -717,6 +717,14 @@ pub enum BoundExpr {
     },
     List(Vec<BoundExpr>),
     Map(Vec<(String, BoundExpr)>),
+    /// `CAST(expr AS type)`. The target keeps its full lattice type
+    /// rather than collapsing to [`Type`], because the width and the
+    /// declared digit count are exactly what the executor checks and
+    /// [`Type`] has room for neither.
+    Cast {
+        expr: Box<BoundExpr>,
+        ty: LogicalType,
+    },
 }
 
 /// Binds a parsed query against a schema.
@@ -1468,6 +1476,16 @@ impl Binder<'_> {
                 }
                 Ok((BoundExpr::Map(bound), Type::Map))
             }
+            Expr::Cast { expr, ty } => {
+                let (bound, _) = self.bind_expr(expr, ctx)?;
+                Ok((
+                    BoundExpr::Cast {
+                        expr: Box::new(bound),
+                        ty: ty.clone(),
+                    },
+                    plan_type(ty),
+                ))
+            }
         }
     }
 
@@ -1685,6 +1703,23 @@ pub fn text(expr: &Expr) -> String {
                 .collect();
             format!("{{{}}}", rendered.join(", "))
         }
+        Expr::Cast { expr, ty } => format!("CAST({} AS {ty})", text(expr)),
+    }
+}
+
+/// The plan-time type a cast target lands in.
+///
+/// [`Type`] is the coarse type the rest of the binder reasons in and it
+/// has one integer and one float, so every width in the tower answers
+/// the same here. Nothing is lost: the width lives on in the bound
+/// cast, which is what the executor reads.
+fn plan_type(ty: &LogicalType) -> Type {
+    match ty.base() {
+        LogicalType::Bool => Type::Bool,
+        LogicalType::Int { .. } => Type::Int,
+        LogicalType::Float { .. } => Type::Float,
+        LogicalType::Str { .. } => Type::Str,
+        _ => Type::Any,
     }
 }
 

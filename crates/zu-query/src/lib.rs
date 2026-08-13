@@ -12,6 +12,7 @@
 
 pub mod ast;
 pub mod binder;
+pub mod cast;
 pub mod csr;
 pub mod exec;
 pub mod kernels;
@@ -21,3 +22,4 @@ pub mod parser;
 pub mod plan;
 pub mod recursive;
 pub mod snapshot;
+pub mod value_type;

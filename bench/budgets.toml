@@ -598,13 +598,24 @@ exec_sip_select_mrows_s = 50.0
 # a filter that costs more than it saves fails here.
 #
 # The two shapes are the two halves of the pass. One has build keys
-# sixty four apart, so the membership test rejects all but one probe
-# row in sixty four; the other has a build side whose keys are city
-# numbers against a probe key that climbs with the row, so the range
-# alone skips every chunk but the first before it is decoded.
+# eight apart, close enough together that the filter is the exact mask
+# and one probe row in eight survives the test; the other has a build
+# side whose keys are city numbers against a probe key that climbs with
+# the row, so the range alone skips every chunk but the first before it
+# is decoded.
 #
-# The range one is worth having and the membership one is a wash today
-# LOCALFLEET
+# The range one is worth having everywhere and the membership one only
+# pays where a probe is dear. Measured at 622e4ba, second pass on each
+# host, in ms with the filter on against the same plan with ZU_SIP=0:
+# the mask 43.7 against 45.6 on the local M series, 38.3 against 42.3
+# on gamingpc and 171.1 against 228.3 on server1, so 1.0, 1.1 and 1.3x.
+# The range 14.1 against 16.5, 15.0 against 19.9 and 86.1 against 120.5,
+# so 1.2, 1.3 and 1.4x. The slowest box gets the most out of the mask
+# and the fastest gets nothing, which is the same story as everywhere
+# else: the mask saves a random read, and a random read is only worth
+# saving when it costs something. The worst either shape has come back
+# on any pass is 0.9, the local mask on a cold one, and the floor sits
+# just under that.
 #
 # Neither is the pass at its best, and the reason is the join side
 # choice rather than the filter: the optimizer drives the cheaper

@@ -1347,6 +1347,24 @@ impl Compiler<'_> {
             if filter.gapless() {
                 continue;
             }
+            // An inexact test does not pay for itself here. What the
+            // operator saves on a rejected row is one probe, which is
+            // one random read of the join's directory, and what it
+            // costs is a random read of its own. So it has to be both
+            // cheaper than the probe and right about the row, and only
+            // the mask is: a shift and a bit test in a bitmap an order
+            // of magnitude smaller than the directory. On the join
+            // bench the mask runs 0.9 to 1.1x against the same plan
+            // with ZU_SIP=0 and the bloom 0.8 to 0.9x. The range is
+            // worth publishing either way and that part is done above.
+            //
+            // This is where a scan that took the filter would change
+            // the arithmetic, since then a rejected row would cost no
+            // column decode at all and an inexact test would have
+            // something real to save.
+            if !filter.exact() {
+                continue;
+            }
             let slot = inserts.len();
             inserts.push((
                 at,

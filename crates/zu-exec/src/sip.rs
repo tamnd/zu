@@ -86,8 +86,19 @@
 //! still, into the scan's zone pushdown, where it skips whole chunks
 //! without decoding them.
 //!
-//! On the join bench the range is worth a scan and the membership test
-//! is a wash, and neither is the pass at its best. The optimizer drives
+//! Only an exact test goes in as an operator. What it saves on a
+//! rejected row is one probe, which is one random read of the join's
+//! directory, so a test that costs a random read of its own and is
+//! sometimes wrong about the row has nothing left to win. On the join
+//! bench, against the same plan with ZU_SIP=0, the mask runs 0.9 to
+//! 1.1x on the local M series and the bloom 0.8 to 0.9x. The range is
+//! published either way. A scan that took the filter instead of an
+//! operator over rows it has already decoded is what would give the
+//! inexact one something real to save, and that is not written yet.
+//!
+//! So on that bench the range is worth a fifth to a half of the query
+//! and the membership test is a wash, and neither is the pass at its
+//! best. The optimizer drives
 //! the side it estimated cheaper and builds the dearer one, so the
 //! filter is published from the big side onto the small one, which is
 //! the direction with the least to gain, and the build of the big side

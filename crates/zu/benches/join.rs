@@ -36,12 +36,12 @@
 //! The last two are the sideways pass of perf/13 section 1, and each
 //! is timed twice, once with the join publishing what it knows about
 //! its keys to the level it probes and once with ZU_SIP=0 holding it
-//! back. One of them is the membership test earning its keep: the
-//! build keys are sixty four apart, so the filter rejects all but one
-//! probe row in sixty four before the probe. The other is the range
-//! going down into the scan: the build side's keys are city numbers
-//! and the probe's climb with the row, so every chunk but the first
-//! sits outside the range and is skipped without being decoded.
+//! back. One is the membership test: the build keys are eight apart,
+//! which is dense enough for the exact filter, so seven probe rows in
+//! eight are dropped before the probe reads them. The other is the
+//! range going down into the scan: the build side's keys are city
+//! numbers and the probe's climb with the row, so every chunk but the
+//! first sits outside the range and is skipped without being decoded.
 //!
 //! What those two ratios do not show yet is the pass at its best. The
 //! join builds the side the optimizer estimated dearer and drives the
@@ -49,7 +49,10 @@
 //! small one, which is the direction with the least to gain, and the
 //! build of the big side is what is left in the number either way.
 //! Turning that around is the join side choice, not this, and it is
-//! the next thing on zu#76.
+//! the next thing on zu#76. The other half of it is the scan taking
+//! the filter rather than an operator reading rows the scan has
+//! already decoded, which is what would make an inexact filter worth
+//! running at all.
 //!
 //! Every case is crosschecked against the generators, so a join that
 //! loses rows, repeats them or lands them on the wrong key fails here.
@@ -106,10 +109,10 @@ fn city(i: u64) -> u64 {
 }
 
 /// How far apart the sparse build keys sit, and how many of the probe
-/// side's rows therefore land on one. Sixty four is past the point a
-/// mask stops being the cheaper filter, so this build side publishes a
-/// bloom and the probe rows that survive it are one in sixty four.
-const SPREAD: u64 = 64;
+/// side's rows therefore land on one. Eight is inside the point where
+/// a bitmap is still the cheaper filter, so this build side publishes
+/// an exact one and one probe row in eight survives it.
+const SPREAD: u64 = 8;
 
 /// A key sparse enough that a filter over it rejects nearly every probe
 /// row, and unique, so a survivor matches exactly one build row and the
@@ -267,15 +270,15 @@ fn main() {
     let old_hop_out: u64 = (0..OLD_PROBES)
         .map(|i| out_degree[inv[i as usize] as usize])
         .sum();
-    // The sparse key is one build row per key, sixty four apart, so a
+    // The sparse key is one build row per key, a spread apart, so a
     // probe row survives exactly when its pair is a multiple of the
     // spread.
     let sparse_hit = |i: u64| pair(i).is_multiple_of(SPREAD);
     let sparse_out = (0..NODES).filter(|&i| sparse_hit(i)).count() as u64;
     let old_sparse_out = (0..OLD_PROBES).filter(|&i| sparse_hit(i)).count() as u64;
     // The sparse key against the city key: a probe row matches when its
-    // own key is a city, and the keys climb sixty four at a time, so
-    // the only rows low enough are the first few of the table. Each of
+    // own key is a city, and the keys climb a spread at a time, so the
+    // only rows low enough are the first few of the table. Each of
     // them matches every row carrying that city. Both engines answer
     // the same number, since the old engine's cut down driving side
     // already holds all the rows that match.
@@ -436,7 +439,7 @@ fn main() {
             sip: false,
         },
         Case {
-            what: "one probe row in sixty four survives",
+            what: "one probe row in eight survives",
             new: "MATCH (a:person), (b:person) WHERE a.pair = b.sparse RETURN count(*) AS n"
                 .into(),
             old: format!(

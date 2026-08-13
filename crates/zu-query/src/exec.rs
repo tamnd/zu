@@ -3955,7 +3955,10 @@ impl AggState {
                     ),
                     Value::Float(f) => Value::Float(f * mult as f64),
                     other => {
-                        return Err(invalid(format!("sum() needs numbers, got {other:?}")));
+                        return Err(gql(
+                            codes::C22G03,
+                            format!("sum() needs numbers, got {other:?}"),
+                        ));
                     }
                 };
                 *acc = Some(match acc.take() {
@@ -3964,8 +3967,8 @@ impl AggState {
                 });
             }
             Acc::Avg { sum, n } => {
-                let x =
-                    as_f64(&v).ok_or_else(|| invalid(format!("avg() needs numbers, got {v:?}")))?;
+                let x = as_f64(&v)
+                    .ok_or_else(|| gql(codes::C22G03, format!("avg() needs numbers, got {v:?}")))?;
                 *sum += x * mult as f64;
                 *n += mult;
             }
@@ -4868,6 +4871,12 @@ mod tests {
         fn property(&mut self, _table: u32, offset: u64, key: &str) -> Result<Value> {
             match key {
                 "id" => Ok(Value::Int(offset as i64)),
+                // A property the binder cannot type as numeric, so an
+                // operator that wants a number has to find out when the
+                // row arrives rather than when the plan is built. That
+                // is the only way to exercise the run-time half of the
+                // type checks from here.
+                "name" => Ok(Value::Str(format!("p{offset}"))),
                 other => Err(invalid(format!("unknown property '{other}'"))),
             }
         }
@@ -5715,6 +5724,34 @@ mod tests {
             status_of("MATCH (a:Person) RETURN a.id AS id LIMIT 'two'"),
             "22G03"
         );
+    }
+
+    #[test]
+    fn a_type_the_operator_does_not_take_is_22g03_wherever_it_is_caught() {
+        // Every one of these is the same mistake, an operand whose type
+        // the position does not accept, and every one has to answer with
+        // the same code. Some are decided from the catalog before the
+        // plan is built and some only once a value arrives, and which
+        // side catches it is not something a statement's author can see.
+        for source in [
+            // Caught statically: both operand types are known.
+            "MATCH (a:Person) RETURN 1 + 'a' AS v",
+            "MATCH (a:Person) RETURN 'x' - 1 AS v",
+            "MATCH (a:Person) RETURN -'x' AS v",
+            "MATCH (a:Person) RETURN NOT 1 AS v",
+            "MATCH (a:Person) RETURN 1 AND true AS v",
+            "MATCH (a:Person) RETURN 1 STARTS WITH 'a' AS v",
+            "MATCH (a:Person) RETURN 1 IN 2 AS v",
+            "MATCH (a:Person) RETURN size(1) AS v",
+            "MATCH (a:Person) RETURN id(1) AS v",
+            "MATCH (a:Person) RETURN sum(a.name) AS v",
+            "MATCH (a:Person) RETURN avg(a.name) AS v",
+            // Caught at run time: the column answers a string and the
+            // operator only finds out when the row arrives.
+            "MATCH (a:Person) RETURN 1 + a.name AS v",
+        ] {
+            assert_eq!(status_of(source), "22G03", "for {source}");
+        }
     }
 
     #[test]

@@ -37,6 +37,18 @@ fn bad_reference(detail: String) -> ZuError {
 /// `22G03 data exception, invalid value type`: the expression is well
 /// formed and every name in it resolves, but its type is not one this
 /// position accepts.
+///
+/// Every type check in this file uses this, and so does the evaluator,
+/// on purpose. zu decides some of these statically and some at run time
+/// depending on whether the type is known from the catalog or only from
+/// the value, and which side catches it is an implementation detail of
+/// the plan cache. A statement has to answer with the same code either
+/// way or a harness is measuring where zu happened to look rather than
+/// what the standard says.
+///
+/// The standard has a second code with the same name, `22G12`, and the
+/// artifacts give no text separating the two, so an engine that picks
+/// either has not made a mistake anyone can point at.
 fn bad_type(detail: String) -> ZuError {
     ZuError::gql(codes::C22G03, detail)
 }
@@ -1386,13 +1398,13 @@ impl Binder<'_> {
                 let out = match op {
                     UnaryOp::Not => {
                         if !ty.is_bool() {
-                            return Err(invalid(format!("NOT needs a boolean, got {ty}")));
+                            return Err(bad_type(format!("NOT needs a boolean, got {ty}")));
                         }
                         Type::Bool
                     }
                     UnaryOp::Neg => {
                         if !ty.is_numeric() {
-                            return Err(invalid(format!("unary minus needs a number, got {ty}")));
+                            return Err(bad_type(format!("unary minus needs a number, got {ty}")));
                         }
                         ty
                     }
@@ -1506,13 +1518,13 @@ impl Binder<'_> {
             Func::Count => Type::Int,
             Func::Sum => {
                 if !arg_ty.is_numeric() {
-                    return Err(invalid(format!("sum() needs a number, got {arg_ty}")));
+                    return Err(bad_type(format!("sum() needs a number, got {arg_ty}")));
                 }
                 arg_ty
             }
             Func::Avg => {
                 if !arg_ty.is_numeric() {
-                    return Err(invalid(format!("avg() needs a number, got {arg_ty}")));
+                    return Err(bad_type(format!("avg() needs a number, got {arg_ty}")));
                 }
                 Type::Float
             }
@@ -1520,7 +1532,7 @@ impl Binder<'_> {
             Func::Collect => Type::List(Box::new(arg_ty)),
             Func::Id => {
                 if !matches!(arg_ty, Type::Node | Type::Rel | Type::Any) {
-                    return Err(invalid(format!("id() needs a node or rel, got {arg_ty}")));
+                    return Err(bad_type(format!("id() needs a node or rel, got {arg_ty}")));
                 }
                 Type::Int
             }
@@ -1528,7 +1540,7 @@ impl Binder<'_> {
                 // A path is its alternating node and rel list, so
                 // size() applies to it like any other list.
                 if !matches!(arg_ty, Type::List(_) | Type::Str | Type::Path | Type::Any) {
-                    return Err(invalid(format!(
+                    return Err(bad_type(format!(
                         "size() needs a list or string, got {arg_ty}"
                     )));
                 }
@@ -1549,7 +1561,7 @@ impl Binder<'_> {
     fn binary_type(&self, op: BinaryOp, lhs: &Type, rhs: &Type) -> Result<Type> {
         let numeric = |lhs: &Type, rhs: &Type| -> Result<Type> {
             if !lhs.is_numeric() || !rhs.is_numeric() {
-                return Err(invalid(format!(
+                return Err(bad_type(format!(
                     "{op:?} needs numbers, got {lhs} and {rhs}"
                 )));
             }
@@ -1562,7 +1574,7 @@ impl Binder<'_> {
         match op {
             BinaryOp::Or | BinaryOp::Xor | BinaryOp::And => {
                 if !lhs.is_bool() || !rhs.is_bool() {
-                    return Err(invalid(format!(
+                    return Err(bad_type(format!(
                         "{op:?} needs booleans, got {lhs} and {rhs}"
                     )));
                 }
@@ -1582,13 +1594,13 @@ impl Binder<'_> {
             BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => numeric(lhs, rhs),
             BinaryOp::In => {
                 if !matches!(rhs, Type::List(_) | Type::Any) {
-                    return Err(invalid(format!("IN needs a list on the right, got {rhs}")));
+                    return Err(bad_type(format!("IN needs a list on the right, got {rhs}")));
                 }
                 Ok(Type::Bool)
             }
             BinaryOp::StartsWith | BinaryOp::EndsWith | BinaryOp::Contains => {
                 if !lhs.is_str() || !rhs.is_str() {
-                    return Err(invalid(format!(
+                    return Err(bad_type(format!(
                         "{op:?} needs strings, got {lhs} and {rhs}"
                     )));
                 }

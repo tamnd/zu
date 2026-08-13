@@ -10,13 +10,19 @@
 //! through one depth guard.
 
 use zu_common::gqlstatus::codes;
-use zu_common::{Result, ZuError};
+use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
     BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, PathPattern, Projection,
     ProjectionItem, Query, RelDirection, RelPattern, Selector, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
+use crate::value_type;
+
+/// A name written where a value type belongs and spelling none.
+fn unknown_type(name: &str) -> ZuError {
+    ZuError::gql(codes::C42001, format!("unknown value type '{name}'"))
+}
 
 /// Hard cap on expression nesting; hostile input past it errors instead
 /// of overflowing the parser's stack.
@@ -725,7 +731,16 @@ impl Parser<'_> {
                 let name = name.clone();
                 self.pos += 1;
                 if self.at(&TokenKind::LParen) {
-                    self.parse_call(name)
+                    // CAST is written like a call and is not one: its
+                    // second argument is a type, which no expression
+                    // grammar can produce, so it is taken here rather
+                    // than left to a function that would receive a
+                    // variable named INT8.
+                    if name.eq_ignore_ascii_case("CAST") {
+                        self.parse_cast()
+                    } else {
+                        self.parse_call(name)
+                    }
                 } else {
                     Ok(Expr::Variable(name))
                 }
@@ -737,6 +752,68 @@ impl Parser<'_> {
             }
             _ => Err(self.error("an expression")),
         }
+    }
+
+    /// `CAST(expr AS type)`, the opening parenthesis unconsumed.
+    fn parse_cast(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let expr = self.parse_expr()?;
+        self.expect_kw("AS")?;
+        let ty = self.parse_value_type()?;
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::Cast {
+            expr: Box::new(expr),
+            ty,
+        })
+    }
+
+    /// A value type name, with its optional precision and its optional
+    /// `NOT NULL`.
+    ///
+    /// A target without `NOT NULL` is nullable, which is the standard's
+    /// default and not a convenience: `CAST(NULL AS INT)` has to be
+    /// null rather than an error, or every optional property that ever
+    /// meets a cast becomes one.
+    fn parse_value_type(&mut self) -> Result<LogicalType> {
+        let name = match self.peek() {
+            Some(Token {
+                kind: TokenKind::Ident(s),
+                ..
+            }) => s.clone(),
+            _ => return Err(self.error("a value type")),
+        };
+        self.pos += 1;
+        let ty = if self.eat(&TokenKind::LParen) {
+            let precision = match self.peek() {
+                Some(Token {
+                    kind: TokenKind::Int(v),
+                    ..
+                }) => u16::try_from(*v).map_err(|_| self.error("a precision in digits"))?,
+                _ => return Err(self.error("a precision in digits")),
+            };
+            self.pos += 1;
+            self.expect(&TokenKind::RParen)?;
+            // Two messages, because the two mistakes are different: a
+            // name nobody knows and a name that knows no precision.
+            if value_type::by_name(&name).is_none() {
+                return Err(unknown_type(&name));
+            }
+            value_type::by_name_with_precision(&name, precision).ok_or_else(|| {
+                ZuError::gql(
+                    codes::C42001,
+                    format!(
+                        "'{name}' does not take a precision, or {precision} is too many digits"
+                    ),
+                )
+            })?
+        } else {
+            value_type::by_name(&name).ok_or_else(|| unknown_type(&name))?
+        };
+        if self.eat_kw("NOT") {
+            self.expect_kw("NULL")?;
+            return Ok(ty);
+        }
+        Ok(LogicalType::Nullable(Box::new(ty)))
     }
 
     fn parse_call(&mut self, name: String) -> Result<Expr> {

@@ -1127,6 +1127,7 @@ fn expr_slots(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
                 expr_slots(v, out);
             }
         }
+        BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
     }
 }
 
@@ -3890,6 +3891,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Ok(Value::List(out))
         }
         BoundExpr::Map(_) => Err(invalid("map values are not supported yet".into())),
+        BoundExpr::Cast { expr, ty } => crate::cast::cast(eval(ctx, expr)?, ty),
     }
 }
 

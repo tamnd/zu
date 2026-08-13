@@ -5,6 +5,8 @@
 //! what a label means) belong to the binder, so the AST stays a plain
 //! description of the text.
 
+use zu_common::LogicalType;
+
 /// A whole query: clauses in source order, ending in `RETURN`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
@@ -155,6 +157,11 @@ pub enum Expr {
     },
     List(Vec<Expr>),
     Map(Vec<(String, Expr)>),
+    /// `CAST(expr AS type)`, ISO's GA05.
+    Cast {
+        expr: Box<Expr>,
+        ty: LogicalType,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

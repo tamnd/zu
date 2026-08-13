@@ -712,10 +712,7 @@ pub(crate) fn finish_agg(
             }
         }
         let row = states.into_iter().map(Acc::finalize).collect();
-        return Ok(QueryResult {
-            columns,
-            rows: apply_post(post, vec![row]),
-        });
+        return Ok(QueryResult::new(columns, apply_post(post, vec![row])));
     }
     // Fold every other worker into the first non-empty table rather
     // than into a fresh one, so the biggest partial is usually the one
@@ -744,10 +741,7 @@ pub(crate) fn finish_agg(
         }
         rows.push(row);
     }
-    Ok(QueryResult {
-        columns,
-        rows: apply_post(post, rows),
-    })
+    Ok(QueryResult::new(columns, apply_post(post, rows)))
 }
 
 /// Folds the workers' tables and answers with how many groups they
@@ -780,10 +774,10 @@ pub(crate) fn finish_rows(
         && partials.iter().all(|p| p.top.is_some())
     {
         let tops = partials.iter_mut().filter_map(|p| p.top.take()).collect();
-        return QueryResult {
+        return QueryResult::new(
             columns,
-            rows: apply_post(&post[1..], merge_topn(keys, need, tops)),
-        };
+            apply_post(&post[1..], merge_topn(keys, need, tops)),
+        );
     }
     let mut batches: Vec<(usize, Vec<Vec<Value>>)> =
         partials.into_iter().flat_map(|p| p.batches).collect();
@@ -792,10 +786,7 @@ pub(crate) fn finish_rows(
     for (_, mut b) in batches {
         rows.append(&mut b);
     }
-    QueryResult {
-        columns,
-        rows: apply_post(post, rows),
-    }
+    QueryResult::new(columns, apply_post(post, rows))
 }
 
 #[cfg(test)]

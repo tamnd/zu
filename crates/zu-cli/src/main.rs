@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::process::ExitCode;
 
 use zu::query::{QueryResult, Value};
+use zu::{DiagnosticRecord, Severity};
 
 mod json;
 mod shell;
@@ -635,9 +636,14 @@ fn query(
     }
 }
 
-/// Renders a result as one JSON object: `{"columns":[...],"rows":[[...]]}`.
-/// Hand-rolled because the CLI carries no JSON crate; G7 caps the binary
-/// at 15 MiB and this is the only place that needs one.
+/// Renders a result as one JSON object: `{"columns":[...],"rows":[[...]]}`,
+/// with a `"notices"` array when the statement raised a condition it
+/// survived. Hand-rolled because the CLI carries no JSON crate; G7 caps
+/// the binary at 15 MiB and this is the only place that needs one.
+///
+/// `notices` is omitted rather than empty on the common path. A reader
+/// that wants it can ask for the key; a reader that does not pays no
+/// bytes for it, and almost every statement raises nothing.
 fn render_json(r: &QueryResult) -> String {
     let mut out = String::from("{\"columns\":[");
     for (i, c) in r.columns.iter().enumerate() {
@@ -660,8 +666,44 @@ fn render_json(r: &QueryResult) -> String {
         }
         out.push(']');
     }
-    out.push_str("]}\n");
+    out.push(']');
+    if !r.notices.is_empty() {
+        out.push_str(",\"notices\":[");
+        for (i, n) in r.notices.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_diagnostic(&mut out, n);
+        }
+        out.push(']');
+    }
+    out.push_str("}\n");
     out
+}
+
+/// One diagnostic record on the wire. The standard's code and the
+/// standard's own text go in fields of their own, apart from zu's
+/// message, so a harness grades the code and never has to parse prose.
+pub(crate) fn write_json_diagnostic(out: &mut String, d: &DiagnosticRecord) {
+    out.push_str("{\"gqlstatus\":");
+    write_json_str(out, d.status.code());
+    out.push_str(",\"condition\":");
+    write_json_str(out, &d.status.standard_text());
+    out.push_str(",\"severity\":");
+    write_json_str(out, severity_name(d.severity()));
+    out.push_str(",\"message\":");
+    write_json_str(out, &d.detail);
+    out.push('}');
+}
+
+pub(crate) fn severity_name(s: Severity) -> &'static str {
+    match s {
+        Severity::Success => "success",
+        Severity::NoData => "no data",
+        Severity::Warning => "warning",
+        Severity::Informational => "informational",
+        Severity::Exception => "exception",
+    }
 }
 
 fn write_json_value(out: &mut String, v: &Value) {
@@ -973,6 +1015,7 @@ mod tests {
                 vec![Value::Int(3), Value::Str("Ada".into())],
                 vec![Value::Null, Value::Bool(true)],
             ],
+            notices: Vec::new(),
         };
         assert_eq!(
             render_json(&r),
@@ -984,8 +1027,37 @@ mod tests {
         let empty = QueryResult {
             columns: vec!["d".into()],
             rows: vec![],
+            notices: Vec::new(),
         };
         assert_eq!(render_json(&empty), "{\"columns\":[\"d\"],\"rows\":[]}\n");
+    }
+
+    #[test]
+    fn a_surviving_condition_rides_with_the_rows() {
+        use zu::gqlstatus::codes;
+
+        let mut r = QueryResult::new(vec!["c".into()], vec![vec![Value::Int(2)]]);
+        r.notice(DiagnosticRecord::new(
+            codes::C01G11,
+            "avg(n.age) skipped 3 nulls",
+        ));
+        assert_eq!(
+            render_json(&r),
+            "{\"columns\":[\"c\"],\"rows\":[[2]],\"notices\":[{\"gqlstatus\":\"01G11\",\
+             \"condition\":\"warning, null value eliminated in set function\",\
+             \"severity\":\"warning\",\"message\":\"avg(n.age) skipped 3 nulls\"}]}\n"
+        );
+    }
+
+    #[test]
+    fn the_same_warning_from_every_group_is_reported_once() {
+        use zu::gqlstatus::codes;
+
+        let mut r = QueryResult::new(vec!["c".into()], vec![]);
+        for _ in 0..1000 {
+            r.notice(DiagnosticRecord::new(codes::C01G11, "nulls skipped"));
+        }
+        assert_eq!(r.notices.len(), 1);
     }
 
     #[test]
@@ -1000,6 +1072,7 @@ mod tests {
                 vec![Value::Float(f64::NAN)],
                 vec![Value::Float(f64::INFINITY)],
             ],
+            notices: Vec::new(),
         };
         assert_eq!(
             render_json(&r),
@@ -1024,6 +1097,7 @@ mod tests {
                 },
                 Value::List(vec![Value::Int(1), Value::List(vec![Value::Int(2)])]),
             ]],
+            notices: Vec::new(),
         };
         assert_eq!(
             render_json(&r),
@@ -1040,6 +1114,7 @@ mod tests {
                 vec![Value::Int(1), Value::Str("Ada".into())],
                 vec![Value::Int(1000), Value::Str("Grace".into())],
             ],
+            notices: Vec::new(),
         };
         assert_eq!(
             render_table(&r),
@@ -1049,6 +1124,7 @@ mod tests {
         let one = QueryResult {
             columns: vec!["n".into()],
             rows: vec![vec![Value::Int(5)]],
+            notices: Vec::new(),
         };
         assert_eq!(one.rows.len(), 1);
         assert_eq!(render_table(&one), "n\n5\n(1 row)\n");

@@ -880,3 +880,38 @@ exec_hub_mpairs_s_core = 10.0
 # It sits under the worst the shared box has printed. Raise it, never
 # lower it.
 exec_join_mprobes_s_core = 0.8
+
+# G0 refusal gates (Spec/2064g/gql/plan/08 section 1.2, zu#115),
+# benches/refuse.rs on the same synthetic 10k-node graph the session
+# gates use. The milestone asks for one thing: refusing a statement has
+# to cost less than answering one. It is worth gating because a
+# conformance corpus is mostly statements this engine cannot run, 156
+# of 377 in the run of 2026-08-12 ended in a refusal, and because a
+# refusal that costs more than an answer hands anyone sending nonsense
+# a cheaper way to spend a core than a client sending work.
+#
+# refuse_over_answer is the slowest gated refusal p50 over the warm
+# point read p50 measured in the same run, so it compares two paths on
+# one machine and does not move with the host. Three refusals are timed,
+# one per stage a statement can die at: syntax in the parser, an
+# undefined reference after the parse, and a missing parameter at bind
+# time on a plan that is already cached and correct. Measured on the
+# local M series against a 3.62 us answer: syntax 0.54 (0.15x),
+# undefined reference 1.21 (0.33x), missing parameter 0.04 (0.01x).
+# The GitHub runner the gate job uses is slower on both sides and lands
+# on the same ratio: answer 6.13, syntax 0.86 (0.14x), undefined
+# reference 2.04 (0.33x), missing parameter 0.11 (0.02x). That the two
+# machines agree to two decimal places on the ratio while disagreeing
+# by 1.7x on the latencies is the reason the gate is written this way.
+# The milestone only asks for a ratio under 1.0; the ceiling sits at
+# 0.6 because 0.33 is what the engine actually does and a refusal that
+# drifted up to two thirds of an answer would be worth looking at.
+#
+# refuse_p50_us is the absolute backstop on the same worst refusal, so
+# a run where both paths got slower together still fails. It sits at
+# twice what the slowest measured machine reads rather than near it,
+# because the number it exists to catch is a refusal that started doing
+# real work, and that lands far past 4. Lower these ceilings, never
+# raise them.
+refuse_over_answer = 0.6
+refuse_p50_us = 4.0

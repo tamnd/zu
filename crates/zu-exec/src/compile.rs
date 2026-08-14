@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use zu_common::Result;
-use zu_query::ast::{BinaryOp, Literal, RelDirection};
+use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::LogicalPlan;
@@ -329,10 +329,11 @@ impl AggSpec {
 /// Post steps above the sink, in plan order.
 pub(crate) enum PostSpec {
     Distinct,
-    /// ORDER BY over output columns: the column each key reads and
-    /// whether it ascends. A key that names something the projection
-    /// does not output falls back to the old engine.
-    Sort(Vec<(usize, bool)>),
+    /// ORDER BY over output columns: the column each key reads, which
+    /// way round it goes and where its nulls sit. A key that names
+    /// something the projection does not output falls back to the old
+    /// engine.
+    Sort(Vec<SortKey<usize>>),
     Skip(u64),
     Limit(u64),
 }
@@ -1269,7 +1270,7 @@ impl Compiler<'_> {
                 SinkSpec::Count => true,
                 SinkSpec::Rows { items, post } => post.iter().all(|p| match p {
                     PostSpec::Distinct => false,
-                    PostSpec::Sort(cols) => cols.iter().all(|&(at, _)| items[at].level() != opt),
+                    PostSpec::Sort(cols) => cols.iter().all(|k| items[k.expr].level() != opt),
                     PostSpec::Skip(_) | PostSpec::Limit(_) => true,
                 }),
                 SinkSpec::CountDistinct { keys } => keys.iter().all(|k| k.level() != opt),
@@ -1300,7 +1301,7 @@ impl Compiler<'_> {
                 SinkSpec::Count => true,
                 SinkSpec::Rows { items, post } => post.iter().all(|p| match p {
                     PostSpec::Distinct => !items.iter().any(reads),
-                    PostSpec::Sort(cols) => !cols.iter().any(|&(at, _)| reads(&items[at])),
+                    PostSpec::Sort(cols) => !cols.iter().any(|k| reads(&items[k.expr])),
                     PostSpec::Skip(_) | PostSpec::Limit(_) => true,
                 }),
                 SinkSpec::CountDistinct { keys } => !keys.iter().any(reads),
@@ -1836,17 +1837,18 @@ impl Compiler<'_> {
     /// when p is still in scope. Anything else, an expression over a
     /// column the query does not return, needs the key materialized
     /// next to the row and goes back to the old engine.
-    fn sort_cols(&self, keys: &[(BoundExpr, bool)]) -> Option<Vec<(usize, bool)>> {
+    fn sort_cols(&self, keys: &[SortKey<BoundExpr>]) -> Option<Vec<SortKey<usize>>> {
         let BoundClause::Project { items, .. } = self.query.clauses.last()? else {
             return None;
         };
         let mut cols = Vec::with_capacity(keys.len());
-        for (expr, asc) in keys {
+        for key in keys {
+            let expr = &key.expr;
             let at = items.iter().position(|item| {
                 item.expr == *expr
                     || matches!(expr, BoundExpr::Var(slot) if self.item_slot(item) == Some(*slot))
             })?;
-            cols.push((at, *asc));
+            cols.push(key.with_expr(at));
         }
         Some(cols)
     }

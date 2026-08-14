@@ -49,10 +49,56 @@ pub struct Projection {
     /// `RETURN *`; may still carry explicit items after a comma.
     pub star: bool,
     pub items: Vec<ProjectionItem>,
-    /// `(expr, ascending)` pairs in `ORDER BY` order.
-    pub order_by: Vec<(Expr, bool)>,
+    /// The `ORDER BY` keys, in the order they were written.
+    pub order_by: Vec<SortKey<Expr>>,
     pub skip: Option<Expr>,
     pub limit: Option<Expr>,
+}
+
+/// Where the null value sorts in one `ORDER BY` key, ISO subclause
+/// 16.17 `<null ordering>`.
+///
+/// The standard leaves the implicit ordering to the implementation and
+/// zu's answer is last, in both directions, which is impdef IS001. A
+/// key that says `NULLS FIRST` or `NULLS LAST` says it outright and the
+/// direction does not enter into it either way: `NULLS FIRST` means the
+/// head of the result, not the small end of the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NullOrder {
+    /// What a key that says neither one gets.
+    #[default]
+    Last,
+    First,
+}
+
+/// One `ORDER BY` key: what to sort on, which way round, and where the
+/// nulls go.
+///
+/// `E` is whatever stands for the key at that point in the pipeline, so
+/// the parser's `Expr`, the binder's `BoundExpr` and the compiler's
+/// output column index all read the same three fields under one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortKey<E> {
+    pub expr: E,
+    pub ascending: bool,
+    pub nulls: NullOrder,
+}
+
+impl<E> SortKey<E> {
+    /// The key with a different expression and the same direction and
+    /// null ordering, which is what every rewrite of a sort key wants.
+    pub fn with_expr<T>(&self, expr: T) -> SortKey<T> {
+        SortKey {
+            expr,
+            ascending: self.ascending,
+            nulls: self.nulls,
+        }
+    }
+
+    /// True when a null in this key sorts ahead of every value.
+    pub fn nulls_first(&self) -> bool {
+        matches!(self.nulls, NullOrder::First)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

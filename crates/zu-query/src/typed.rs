@@ -15,11 +15,11 @@
 //! written without `NOT NULL` admits a null.
 //!
 //! What is missing here is missing from the value model rather than
-//! from this module. zu has no byte string value and no record value,
-//! so a byte string type and a record type are inhabited by nothing at
-//! runtime, and the predicate says false rather than pretending. Those
-//! answers change when the values arrive, and the corpus cases that ask
-//! them are written over integers so they stay honest either way.
+//! from this module. zu has no byte string value, so a byte string
+//! type is inhabited by nothing at runtime and the predicate says
+//! false rather than pretending. That answer changes when the value
+//! arrives, and the corpus cases that ask it are written over integers
+//! so they stay honest either way.
 
 use zu_common::{IntBits, LogicalType};
 
@@ -113,7 +113,24 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
             }
             _ => false,
         },
-        LogicalType::Record(_) => false,
+        // GV45 to GV48. An open record type says nothing about the
+        // fields it does not name, so it admits a record that carries
+        // more; a closed one names every field the record may have.
+        // Either way a field the type names has to be there and has to
+        // belong to its declared type, which is what separates this
+        // from a cast: this answers, and the cast raises the two
+        // conditions ISO gives it.
+        LogicalType::Record(rt) => match v {
+            Value::Record(fields) => {
+                let named = |name: &str| rt.field(name).is_some();
+                (rt.open || fields.iter().all(|(name, _)| named(name)))
+                    && rt.fields.iter().all(|f| match v.field(&f.name) {
+                        Some(value) => is_of(value, &f.ty),
+                        None => false,
+                    })
+            }
+            _ => false,
+        },
     }
 }
 

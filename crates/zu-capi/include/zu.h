@@ -35,6 +35,7 @@ typedef struct zu_result zu_result;
 #define ZU_TYPE_LIST 7
 #define ZU_TYPE_PATH 8
 #define ZU_TYPE_TEMPORAL 9
+#define ZU_TYPE_RECORD 10
 
 /* Static version string; do not free. */
 const char *zu_version(void);

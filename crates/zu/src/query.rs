@@ -622,7 +622,38 @@ pub(crate) fn env_options() -> exec::Options {
 /// entry point.
 pub fn explain_analyze(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<String> {
     let (profile, notes) = profile_noted(source, db, params)?;
-    Ok(noted(notes, profile.render()))
+    let listing = match decisions(source, db, params)? {
+        Some(d) => format!("{}decisions:\n{}", profile.render(), d.render()),
+        None => profile.render(),
+    };
+    Ok(noted(notes, listing))
+}
+
+/// The decisions the pipeline executor made on this query, `None` when
+/// it is not the engine that would run it. This is a second run of the
+/// query, on the other engine, because the counters above come from the
+/// old executor and the record below is only the new one's to keep.
+/// EXPLAIN ANALYZE is a debugging tool and can afford the second run;
+/// nothing on the answering path pays for it.
+fn decisions(
+    source: &str,
+    db: &mut Zu1File,
+    params: &[(&str, Value)],
+) -> Result<Option<zu_exec::decide::Decisions>> {
+    if !exec2_enabled() {
+        return Ok(None);
+    }
+    let p = prepare(source, db, params)?;
+    let mut snap = crate::snapshot::Zu1Snapshot::new(db, p.catalog.clone());
+    let run = zu_exec::try_execute_profiled(
+        &p.plan,
+        &p.query,
+        &p.schema,
+        &mut snap,
+        &p.args,
+        &env_options(),
+    )?;
+    Ok(run.map(|(_, d)| d))
 }
 
 /// The same profiled run handing back the counters instead of the
@@ -1020,6 +1051,45 @@ mod tests {
             text.contains("ExpandCount (b)-[:follows]->(c)"),
             "got:\n{text}"
         );
+    }
+
+    #[test]
+    fn the_listing_ends_with_the_decisions_the_pipeline_made() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("decide.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let mut edges: Vec<(u32, u32)> = (0..400u32).map(|i| (i % 97, (i * 7 + 3) % 89)).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let text = explain_analyze(
+            "MATCH (a:person)-[:follows]->(b) RETURN count(b) AS n",
+            &mut db,
+            &[],
+        )
+        .expect("explain analyze");
+        // The split is the one decision every covered run makes, so it
+        // is the one that is always there to read.
+        assert!(text.contains("decisions:"), "got:\n{text}");
+        assert!(text.contains("split scan into"), "got:\n{text}");
+
+        // Pinned to the old engine there is no pipeline to report on,
+        // and the listing says nothing rather than saying zero.
+        // SAFETY: single-threaded test, no other thread reads the
+        // environment while this is set.
+        unsafe { std::env::set_var("ZU_EXEC2", "0") };
+        let text = explain_analyze(
+            "MATCH (a:person)-[:follows]->(b) RETURN count(b) AS n",
+            &mut db,
+            &[],
+        )
+        .expect("explain analyze");
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ZU_EXEC2") };
+        assert!(!text.contains("decisions:"), "got:\n{text}");
     }
 
     #[test]

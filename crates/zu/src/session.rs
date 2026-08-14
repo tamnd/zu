@@ -173,7 +173,44 @@ impl Session {
     /// profiled execution.
     pub fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {
         let notes = self.plan_for(source)?.notes.clone();
-        Ok(query::noted(notes, self.profile(source, params)?.render()))
+        let listing = self.profile(source, params)?.render();
+        let listing = match self.decisions(source, params)? {
+            Some(d) => format!("{listing}decisions:\n{}", d.render()),
+            None => listing,
+        };
+        Ok(query::noted(notes, listing))
+    }
+
+    /// The record the pipeline executor keeps of what it decided while
+    /// it ran, `None` when this query is not one it covers. The
+    /// counters above come from the old executor, so reading the record
+    /// costs a second run of the query on the other engine; EXPLAIN
+    /// ANALYZE already costs one execution and is not on any path that
+    /// answers a caller.
+    fn decisions(
+        &mut self,
+        source: &str,
+        params: &[(&str, Value)],
+    ) -> Result<Option<zu_exec::decide::Decisions>> {
+        if !query::exec2_enabled() {
+            return Ok(None);
+        }
+        let cached = self.plan_for(source)?;
+        let args = query::bind_args(&cached.query.params, params)?;
+        let catalog = self.graph.catalog().clone();
+        let warm = std::mem::take(&mut self.snap);
+        let mut snap =
+            crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
+        let out = zu_exec::try_execute_profiled(
+            &cached.plan,
+            &cached.query,
+            &self.schema,
+            &mut snap,
+            &args,
+            &query::env_options(),
+        );
+        self.snap = snap.into_cache();
+        Ok(out?.map(|(_, d)| d))
     }
 
     /// The same run, handing back the counters instead of the

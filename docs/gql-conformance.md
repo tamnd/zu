@@ -6,21 +6,21 @@ Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) c
 
 ## Where each engine stands
 
-| | ladybug | zu |
-|---|---|---|
-| version | Lbug 0.19.1 | zu 0.0.1 |
-| measured | 2026-08-13 | 2026-08-14 |
-| on | darwin arm64, Apple M4 | darwin arm64, Apple M4 |
-| harness | gql-compat devel | gql-compat devel |
-| corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
-| cases | 377 | 377 |
-| judged (pass + fail) | 253 | 232 |
-| **passed** | **72** (28.5%) | **123** (53.0%) |
-| failed | 181 | 109 |
-| skipped, cannot hold the fixture | 72 | 128 |
-| never reached a verdict | 52 | 17 |
-| ISO features with a passing case | 22 of 189 | 63 of 189 |
-| distinct GQLSTATUS values produced | 0 | 12 |
+| | ladybug | neo4j | zu |
+|---|---|---|---|
+| version | Lbug 0.19.1 | Neo4j Kernel 2026.07.1 community, Cypher 5/25, default language CYPHER 25 | zu 0.0.1 |
+| measured | 2026-08-13 | 2026-08-14 | 2026-08-14 |
+| on | darwin arm64, Apple M4 | darwin arm64, Apple M4 | darwin arm64, Apple M4 |
+| harness | gql-compat devel | gql-compat devel | gql-compat devel |
+| corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
+| cases | 377 | 377 | 377 |
+| judged (pass + fail) | 253 | 324 | 232 |
+| **passed** | **72** (28.5%) | **186** (57.4%) | **123** (53.0%) |
+| failed | 181 | 138 | 109 |
+| skipped, cannot hold the fixture | 72 | 39 | 128 |
+| never reached a verdict | 52 | 14 | 17 |
+| ISO features with a passing case | 22 of 189 | 69 of 189 | 63 of 189 |
+| distinct GQLSTATUS values produced | 0 | 9 | 12 |
 
 ## By kind of case
 
@@ -29,14 +29,19 @@ Pass over judged, then the two exclusions. Read the exclusions first. An engine 
 | kind | engine | cases | pass | fail | skip | error | pass of judged |
 |---|---|---|---|---|---|---|---|
 | mandatory | ladybug | 70 | 30 | 14 | 5 | 21 | 68.2% |
+| mandatory | neo4j | 70 | 67 | 0 | 3 | 0 | 100.0% |
 | mandatory | zu | 70 | 17 | 10 | 43 | 0 | 63.0% |
 | optional | ladybug | 201 | 22 | 153 | 5 | 21 | 12.6% |
+| optional | neo4j | 201 | 76 | 107 | 5 | 13 | 41.5% |
 | optional | zu | 201 | 62 | 70 | 53 | 16 | 47.0% |
 | condition | ladybug | 66 | 0 | 4 | 62 | 0 | 0.0% |
+| condition | neo4j | 66 | 6 | 28 | 31 | 1 | 17.6% |
 | condition | zu | 66 | 13 | 20 | 32 | 1 | 39.4% |
 | grammar | ladybug | 17 | 11 | 4 | 0 | 2 | 73.3% |
+| grammar | neo4j | 17 | 14 | 3 | 0 | 0 | 82.4% |
 | grammar | zu | 17 | 14 | 3 | 0 | 0 | 82.4% |
 | performance | ladybug | 23 | 9 | 6 | 0 | 8 | 60.0% |
+| performance | neo4j | 23 | 23 | 0 | 0 | 0 | 100.0% |
 | performance | zu | 23 | 17 | 6 | 0 | 0 | 73.9% |
 
 ## What the numbers do not say

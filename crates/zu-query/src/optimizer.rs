@@ -1529,7 +1529,7 @@ fn split_and(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
 fn expr_slots(expr: &BoundExpr, out: &mut HashSet<usize>) {
     match expr {
         BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
-        BoundExpr::Var(slot) => {
+        BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => {
             out.insert(*slot);
         }
         BoundExpr::Property { base, key: _ } => expr_slots(base, out),
@@ -2095,11 +2095,13 @@ mod tests {
                     id: 0,
                     name: "Person".into(),
                     node_count: 9000,
+                    labels: Vec::new(),
                 },
                 NodeDef {
                     id: 1,
                     name: "Place".into(),
                     node_count: 1400,
+                    labels: Vec::new(),
                 },
             ],
             vec![

@@ -389,6 +389,15 @@ pub trait Graph {
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
+    /// The labels one node carries, one bit per label id of the
+    /// graph's dictionary. The default is what an engine that stores no
+    /// label beyond the table's own says, and the binder has already
+    /// answered that one by narrowing the tables, so a test that
+    /// reaches here is asking about a label such an engine cannot have.
+    fn labels(&mut self, table: u32, offset: u64) -> Result<u64> {
+        let _ = (table, offset);
+        Ok(0)
+    }
     /// One property of one edge, named by the endpoints a rel value
     /// carries. The default is the answer an engine that stores nothing
     /// on an edge gives, which is the answer every engine gave before
@@ -1300,7 +1309,7 @@ impl StageBuilder {
 fn expr_slots(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
     match expr {
         BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
-        BoundExpr::Var(slot) => {
+        BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => {
             out.insert(*slot);
         }
         BoundExpr::Property { base, .. } => expr_slots(base, out),
@@ -4307,6 +4316,16 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
         BoundExpr::Var(slot) => value_of(ctx, *slot),
+        BoundExpr::HasLabels { slot, mask } => match value_of(ctx, *slot)? {
+            Value::Node { table, offset } => {
+                let word = ctx.graph.labels(table, offset)?;
+                Ok(Value::Bool(word & mask == *mask))
+            }
+            // An unmatched optional row has no labels to test, and a
+            // null predicate is what keeps its row.
+            Value::Null => Ok(Value::Null),
+            other => Err(invalid(format!("label test on {other:?}, expected a node"))),
+        },
         BoundExpr::Property { base, key } => match eval(ctx, base)? {
             Value::Node { table, offset } => ctx.graph.property(table, offset, key),
             // A field the record does not have is null rather than an
@@ -5496,11 +5515,13 @@ mod tests {
                     id: 0,
                     name: "Person".into(),
                     node_count: 6,
+                    labels: Vec::new(),
                 },
                 NodeDef {
                     id: 1,
                     name: "Place".into(),
                     node_count: 3,
+                    labels: Vec::new(),
                 },
             ],
             vec![
@@ -5855,6 +5876,7 @@ mod tests {
                 id: 0,
                 name: "Person".into(),
                 node_count: 5,
+                labels: Vec::new(),
             }],
             vec![RelDef {
                 id: 2,

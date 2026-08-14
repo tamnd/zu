@@ -32,6 +32,7 @@ pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
             id: n.id,
             name: n.name.clone(),
             node_count: n.node_count,
+            labels: n.labels.clone(),
         })
         .collect();
     let rels = catalog
@@ -45,7 +46,7 @@ pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
             edge_count: r.edge_count,
         })
         .collect();
-    let mut schema = Schema::new(nodes, rels)?;
+    let mut schema = Schema::with_labels(nodes, rels, catalog.labels().to_vec())?;
     // perf/12 §2.4 wants the dual run threshold tunable. Default is
     // 100x; lower it to reach for the robust join order sooner on data
     // whose estimates cannot be trusted.
@@ -406,6 +407,22 @@ impl Graph for Zu1Graph<'_> {
                 "unknown property '{other}' on table {table}"
             ))),
         }
+    }
+
+    fn labels(&mut self, table: u32, offset: u64) -> Result<u64> {
+        self.ensure_props(table)?;
+        // A table whose rows all carry its own label and nothing else
+        // stores no bitset, and the catalog is then the whole answer.
+        let primary = self
+            .catalog
+            .node_by_id(table)
+            .map_or(0, |t| 1 << t.primary_label());
+        let Self { db, props, .. } = self;
+        let word = match props.get_mut(&table).expect("just loaded") {
+            Some(reader) => reader.label_word(db, offset)?,
+            None => None,
+        };
+        Ok(word.unwrap_or(primary))
     }
 
     fn rel_property(&mut self, rel: u32, src: u64, dst: u64, key: &str) -> Result<Value> {
@@ -1178,6 +1195,68 @@ mod tests {
         )
         .expect("missing key");
         assert_eq!(r.rows, [[Value::Null], [Value::Null]]);
+    }
+
+    /// A secondary label is a bit on the row, so a pattern naming one
+    /// reads the same rows the table holds and keeps the ones whose
+    /// word has the bit. The table's own label costs nothing.
+    #[test]
+    fn matches_a_node_by_a_label_its_table_declares() {
+        use crate::zu1::props::store_labels;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("labels.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let edges = [(0u32, 1u32), (1, 2), (2, 3), (3, 0)];
+        graph::bulk_load_as(&mut db, "person", "knows", 4, &edges).expect("load");
+        store_labels(
+            &mut db,
+            "person",
+            &[
+                vec!["Employee"],
+                vec![],
+                vec!["Employee", "Manager"],
+                vec!["Manager"],
+            ],
+        )
+        .expect("labels");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let mut ids = |source: &str| {
+            run(source, &mut db, &[])
+                .expect("run")
+                .rows
+                .into_iter()
+                .map(|r| r[0].clone())
+                .collect::<Vec<Value>>()
+        };
+        assert_eq!(
+            ids("MATCH (n:person) RETURN n.id AS id ORDER BY id"),
+            [Value::Int(0), Value::Int(1), Value::Int(2), Value::Int(3)]
+        );
+        assert_eq!(
+            ids("MATCH (n:Employee) RETURN n.id AS id ORDER BY id"),
+            [Value::Int(0), Value::Int(2)]
+        );
+        assert_eq!(
+            ids("MATCH (n:person:Manager) RETURN n.id AS id ORDER BY id"),
+            [Value::Int(2), Value::Int(3)]
+        );
+        assert_eq!(
+            ids("MATCH (n:Employee:Manager) RETURN n.id AS id"),
+            [Value::Int(2)]
+        );
+        // The bit travels with the node however it was reached, so a
+        // label on the far end of an expand reads the same way.
+        assert_eq!(
+            ids("MATCH (a:person {id: 1})-[:knows]->(b:Manager) RETURN b.id AS id"),
+            [Value::Int(2)]
+        );
+        // A label the graph never declared names no rows, and saying
+        // so is the binder's job rather than the executor's.
+        let err = run("MATCH (n:Ghost) RETURN n", &mut db, &[]).expect_err("unknown label");
+        assert!(err.to_string().contains("unknown label 'Ghost'"), "{err}");
     }
 
     #[test]

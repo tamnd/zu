@@ -1178,8 +1178,17 @@ impl<'a> Worker<'a> {
                 };
                 self.expand(hop, &rest[1..], set, Some(br))
             }
-            Op::HasEdge { rel, dirs, negated } => {
-                if !self.has_edge(*rel, *dirs, *negated, set)? {
+            Op::HasEdge {
+                rel,
+                dirs,
+                from,
+                negated,
+            } => {
+                let kept = match *from == set.chunks.len() - 1 {
+                    true => self.has_edge(*rel, *dirs, *negated, set)?,
+                    false => self.pinned_edge(*rel, *dirs, *from, *negated, set)?,
+                };
+                if !kept {
                     return Ok(());
                 }
                 self.run_ops(rest, set)
@@ -1315,6 +1324,39 @@ impl<'a> Worker<'a> {
         self.scratch = rows;
         self.keep = poss;
         res.map(|()| kept > 0)
+    }
+
+    /// The same block asked about a level the pipeline has walked past.
+    ///
+    /// There the question is about one row, the one that level's pin
+    /// holds, and every row in hand descends from it, so the answer is
+    /// a single degree read and it decides for the whole vector rather
+    /// than selecting inside it. A block written this way costs less
+    /// the further the pipeline has walked from it, which is the
+    /// opposite of the walk it stands for.
+    fn pinned_edge(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        from: usize,
+        negated: bool,
+        set: &ChunkSet,
+    ) -> Result<bool> {
+        let src = &set.chunks[from];
+        let mut rows = std::mem::take(&mut self.scratch);
+        rows.clear();
+        rows.push(row_at(src, pinned_pos(src)));
+        self.deg.clear();
+        self.deg.resize(1, 0);
+        let mut res = Ok(());
+        for dir in sides(dirs) {
+            if let Err(e) = self.snap.get().degrees(rel, &rows, dir, &mut self.deg) {
+                res = Err(e);
+                break;
+            }
+        }
+        self.scratch = rows;
+        res.map(|()| (self.deg[0] > 0) != negated)
     }
 
     /// Runs what is past a bracket for one outer row, with the group's

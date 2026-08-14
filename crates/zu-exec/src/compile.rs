@@ -225,9 +225,17 @@ pub(crate) enum Op {
     /// filter over the level the block was written on and a hub costs
     /// what a leaf costs. `negated` is the anti bracket, where having
     /// one is what drops the row.
+    ///
+    /// `from` is the newest level where the block was written on the
+    /// level the pipeline is standing on, and a lower one where it was
+    /// written on a level the pipeline has walked past. That second
+    /// one is a question about the row that level's pin holds, so the
+    /// answer is one degree read and it decides for the whole vector:
+    /// every row in hand came off that one row.
     HasEdge {
         rel: RelId,
         dirs: Dirs,
+        from: usize,
         negated: bool,
     },
     /// Bottom of the bracket, reached only when the group produced a
@@ -418,7 +426,8 @@ fn names_level(op: &Op, level: usize) -> bool {
         Op::DegreeProduct { from, .. } => *from == level,
         Op::Join { key, to, .. } => key.level() == level || *to == level,
         Op::Sip { key, .. } => key.level() == level,
-        Op::Filter { .. } | Op::BracketHit { .. } | Op::HasEdge { .. } => false,
+        Op::HasEdge { from, .. } => *from == level,
+        Op::Filter { .. } | Op::BracketHit { .. } => false,
     }
 }
 
@@ -432,17 +441,18 @@ fn reads_newest(above: &[Op]) -> bool {
     for op in above {
         match op {
             // A filter refines the newest level and so does the
-            // sideways one, and so does the degree an EXISTS block
-            // asks for, which are all the same read of the same rows.
-            Op::Filter { .. }
-            | Op::Sip { .. }
-            | Op::Semi { .. }
-            | Op::Intersect { .. }
-            | Op::HasEdge { .. } => {
+            // sideways one, which are the same read of the same rows.
+            // A bare block reads rows the same way but says which
+            // level it means, so it is names_level's business and not
+            // this one's.
+            Op::Filter { .. } | Op::Sip { .. } | Op::Semi { .. } | Op::Intersect { .. } => {
                 return true;
             }
             Op::Expand { .. } | Op::Branch { .. } | Op::Join { .. } => return false,
-            Op::Bracket { .. } | Op::BracketHit { .. } | Op::DegreeProduct { .. } => {}
+            Op::Bracket { .. }
+            | Op::BracketHit { .. }
+            | Op::HasEdge { .. }
+            | Op::DegreeProduct { .. } => {}
         }
     }
     false
@@ -493,6 +503,9 @@ fn batch_expands(ops: &mut [Op], sink: &SinkSpec, levels: &[LevelBuild]) {
             // sits below the newest level, and this expand's source is
             // below the newest level from the moment it runs.
             Op::Join { key, .. } => key.level() == from,
+            // A block on a level the pipeline has walked past is the
+            // same read: whether that one pinned row has an edge.
+            Op::HasEdge { from: src, .. } => *src == from,
             _ => false,
         };
         // The expand's own fused close counts: it reads the probe
@@ -853,7 +866,7 @@ impl Compiler<'_> {
     /// already registered when this runs, so what drives the plan, a
     /// scan, a seek, a batch of them or a kernel, only shows up in the
     /// source it ends up carrying.
-    fn rest<'p, I: Iterator<Item = &'p LogicalPlan>>(
+    fn rest<'p, I: Iterator<Item = &'p LogicalPlan> + Clone>(
         &mut self,
         mut it: std::iter::Peekable<I>,
         table: TableId,
@@ -877,13 +890,20 @@ impl Compiler<'_> {
         let mut pending: Vec<(usize, TableId)> = Vec::new();
         let mut waiting: Vec<&BoundExpr> = Vec::new();
         loop {
-            // An open bracket ends the pipeline: the group's level is
-            // the newest one and it may be null, so nothing walks off
-            // it or filters on it here. Whatever is left goes to the
-            // sink match below, which takes a projection or an
-            // aggregate and sends anything else back to the old
-            // engine.
-            if self.bracketed() {
+            // An open bracket all but ends the pipeline: the group's
+            // level is the newest one and it may be null, so nothing
+            // walks off it or filters on it here. Whatever is left goes
+            // to the sink match below, which takes a projection or an
+            // aggregate and sends anything else back to the old engine.
+            //
+            // A second block over a bare pattern is the exception, and
+            // it is a common enough way to write two of them. What it
+            // reads is a pinned row and the degrees under it, never the
+            // newest level, so the null the group left there is nothing
+            // to it. The arm below settles whether the block really is
+            // that shape and falls back where it is not, so this only
+            // has to be right about what is worth trying.
+            if self.bracketed() && !bare_block(&mut it.clone()) {
                 break;
             }
             match it.peek() {
@@ -1121,14 +1141,13 @@ impl Compiler<'_> {
                     //
                     // Bare means the group ends at this hop: another
                     // operator inside it, a second step or a predicate
-                    // on the far node, is a group and goes below. The
-                    // block also has to be written on the level the
-                    // pipeline is standing on, since a filter refines
-                    // the newest one and a block on a level below is a
-                    // question about a row that is pinned rather than
-                    // about the rows in hand.
-                    let alone = it.peek().and_then(|p| node_bracket(p)) != Some(group_id)
-                        && src + 1 == self.levels.len();
+                    // on the far node, is a group and goes below. Which
+                    // level the block was written on does not have to
+                    // be the one the pipeline is standing on: a block
+                    // on a level below asks about the row that level's
+                    // pin holds, which is one degree read for the whole
+                    // vector, since every row in hand came off it.
+                    let alone = it.peek().and_then(|p| node_bracket(p)) != Some(group_id);
                     let def = self.schema.rel_by_id(rel_id);
                     let far = def.and_then(|d| match dirs {
                         Dirs::One(Dir::Fwd) => Some(d.to),
@@ -1142,9 +1161,17 @@ impl Compiler<'_> {
                         ops.push(Op::HasEdge {
                             rel: rel_id,
                             dirs,
+                            from: src,
                             negated: kind == BracketKind::Anti,
                         });
                         continue;
+                    }
+                    // Anything else the block wants is a group, and a
+                    // group standing in another bracket's continuation
+                    // would walk off the null level that one left as
+                    // the newest.
+                    if self.bracketed() {
+                        return Ok(None);
                     }
                     let to_level = self.levels.len();
                     self.levels.push(LevelBuild {
@@ -1770,7 +1797,8 @@ impl Compiler<'_> {
                     | ScalarRef::RowId { level }
                     | ScalarRef::Col { level, .. } => *level = map[*level],
                 },
-                Op::Filter { .. } | Op::BracketHit { .. } | Op::HasEdge { .. } => {}
+                Op::HasEdge { from, .. } => *from = map[*from],
+                Op::Filter { .. } | Op::BracketHit { .. } => {}
             }
         }
         let fix = |r: &mut ScalarRef| match r {
@@ -3050,6 +3078,23 @@ fn conjuncts<'e>(expr: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
 
 /// The bracket a plan node was written inside, for the three kinds of
 /// node that can carry one.
+/// Whether the next node is an existence block over a bare pattern:
+/// one hop under a semi or an anti bracket with nothing else in the
+/// group. That is the block the degrees answer on their own, and the
+/// only one that can stand inside another bracket's continuation.
+fn bare_block<'a>(it: &mut impl Iterator<Item = &'a LogicalPlan>) -> bool {
+    let Some(LogicalPlan::Expand {
+        range: None,
+        into: false,
+        bracket: Some(group),
+        ..
+    }) = it.next()
+    else {
+        return false;
+    };
+    group.kind != BracketKind::Optional && it.next().and_then(node_bracket) != Some(*group)
+}
+
 fn node_bracket(plan: &LogicalPlan) -> Option<Bracket> {
     match plan {
         LogicalPlan::ScanNodes { bracket, .. }
@@ -3179,21 +3224,23 @@ mod tests {
 
     /// A bare EXISTS block reads the rows of the level it sits on, the
     /// same as a filter, so the walk that built them cannot be fused
-    /// into a degree read and taken away underneath it.
+    /// into a degree read and taken away underneath it. It says which
+    /// level that is, so the question is names_level's and the answer
+    /// holds for the level it names and no other.
     #[test]
-    fn a_bare_block_reads_the_level_under_it() {
-        let block = Op::HasEdge {
+    fn a_bare_block_reads_the_level_it_names() {
+        let block = |from| Op::HasEdge {
             rel: 0,
             dirs: Dirs::One(Dir::Fwd),
+            from,
             negated: false,
         };
-        assert!(reads_newest(std::slice::from_ref(&block)));
-        assert!(reads_newest(&[
-            Op::BracketHit {
-                kind: BracketKind::Optional
-            },
-            block
-        ]));
+        assert!(names_level(&block(1), 1));
+        assert!(!names_level(&block(1), 0));
+        // A block on a level the pipeline has walked past leaves the
+        // newest one alone, so an expand that built it is still free
+        // to fuse away.
+        assert!(!reads_newest(&[block(0)]));
     }
 
     #[test]

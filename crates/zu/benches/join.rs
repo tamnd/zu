@@ -21,7 +21,7 @@
 //! table order, and that is what makes the answer match the old engine
 //! row for row rather than just as a set.
 //!
-//! Nine shapes. A unique build key, where every probe finds exactly
+//! Eleven shapes. A unique build key, where every probe finds exactly
 //! one row and the table is at its widest. A key with a thousand rows
 //! under it, where the probe side is small and the cost is streaming
 //! payload. A probe that misses everything, which is the tag doing its
@@ -31,7 +31,13 @@
 //! OPTIONAL MATCH tied by an equality, one where every probe hits and
 //! one where every other probe misses and the outer row goes on with a
 //! null bound to it. The miss case is the one that would halve its own
-//! answer if a miss were dropped instead of kept.
+//! answer if a miss were dropped instead of kept. Then the semi and
+//! the anti, an EXISTS block tied by an equality, which is the same
+//! probe asked a yes or no question: the semi's key has a thousand
+//! rows under it and the answer needs one of them, so it is where
+//! stopping at the first match is worth something, and the anti's key
+//! is there for every other outer row, so it is the one that would
+//! double its own answer if a hit failed to drop the row.
 //!
 //! The last two are the sideways pass of perf/13 section 1, and each
 //! is timed twice, once with the join publishing what it knows about
@@ -64,7 +70,10 @@
 //! Everything runs at one worker, so the rate is per core.
 //!
 //! exec_join_mprobes_s_core floors the unique key case in millions of
-//! probe rows a second, build included. exec_sip_range_x and
+//! probe rows a second, build included. exec_semi_mprobes_s_core does
+//! the same for the semi, which is the case that reads a key's run only
+//! until one row of it answers, and the only one that would notice if
+//! it stopped doing that. exec_sip_range_x and
 //! exec_sip_mask_x floor the two sideways cases against their own
 //! filter off runs; both sit under one, because neither half wins on
 //! every host and those two only have to catch a filter that started
@@ -498,6 +507,54 @@ fn main() {
             sip: Sip::No,
         },
         Case {
+            what: "semi join, a thousand rows a key",
+            new: "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.city = a.city } \
+                  RETURN count(a) AS n"
+                .into(),
+            old: format!(
+                "MATCH (a:person) WHERE a.id < {OLD_PROBES} \
+                 AND EXISTS {{ MATCH (b:person) WHERE b.city = a.city }} RETURN count(a) AS n"
+            ),
+            // One row a probe, not a thousand: every outer row has a
+            // city and every city has a thousand rows under it, so a
+            // semi that handed its matches up instead of the row that
+            // asked would answer a thousand times this.
+            want: Want {
+                rows: 1,
+                total: NODES as i64,
+            },
+            old_want: Want {
+                rows: 1,
+                total: OLD_PROBES as i64,
+            },
+            probes: NODES,
+            out: NODES,
+            sip: Sip::No,
+        },
+        Case {
+            what: "anti join, every other probe hits",
+            new: "MATCH (a:person) WHERE NOT EXISTS { MATCH (b:person) WHERE b.pair = a.half } \
+                  RETURN count(a) AS n"
+                .into(),
+            old: format!(
+                "MATCH (a:person) WHERE a.id < {OLD_PROBES} \
+                 AND NOT EXISTS {{ MATCH (b:person) WHERE b.pair = a.half }} RETURN count(a) AS n"
+            ),
+            // Half the outer rows carry a key nothing has, and those
+            // are the ones an anti keeps.
+            want: Want {
+                rows: 1,
+                total: (NODES / 2) as i64,
+            },
+            old_want: Want {
+                rows: 1,
+                total: (OLD_PROBES / 2) as i64,
+            },
+            probes: NODES,
+            out: NODES / 2,
+            sip: Sip::No,
+        },
+        Case {
             what: "one probe row in eight survives",
             new: "MATCH (a:person), (b:person) WHERE a.pair = b.sparse RETURN count(*) AS n".into(),
             old: format!(
@@ -538,6 +595,7 @@ fn main() {
     ];
 
     let mut unique = 0.0;
+    let mut semi = 0.0;
     let mut worst_mask = f64::MAX;
     let mut worst_range = f64::MAX;
     for case in cases {
@@ -580,6 +638,9 @@ fn main() {
         if case.what == "unique key" {
             unique = mprobes;
         }
+        if case.what == "semi join, a thousand rows a key" {
+            semi = mprobes;
+        }
     }
 
     if std::env::var("ZU_GATE").as_deref() != Ok("1") {
@@ -591,6 +652,16 @@ fn main() {
             "the unique key join probes {unique:.2} M rows/s, under the {floor} M floor"
         );
         println!("gate: join floor met");
+    }
+    // The semi has its own floor because it is the one shape here that
+    // is allowed to stop reading a key's run early, and nothing else in
+    // the bench would notice if it stopped doing that.
+    if let Some(floor) = budget("exec_semi_mprobes_s_core") {
+        assert!(
+            semi >= floor,
+            "the semi join probes {semi:.2} M rows/s, under the {floor} M floor"
+        );
+        println!("gate: semi floor met");
     }
     if let Some(floor) = budget("exec_sip_range_x") {
         assert!(

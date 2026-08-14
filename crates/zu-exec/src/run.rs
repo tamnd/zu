@@ -728,6 +728,56 @@ struct Worker<'a> {
     null: Option<DataChunk>,
 }
 
+/// How a run of rows is cut into the vectors a walk descends on.
+///
+/// Ordinarily that is a full vector at a time, which is what the rest
+/// of the pipeline is sized for. A bracket that stops at its first
+/// match takes it in doubling steps instead, because there the whole
+/// run is only worth reading until one row of it answers: a source row
+/// whose first match is early costs a handful of rows rather than a
+/// vector, and a source row nothing matches for still costs one pass
+/// over the run, in a logarithmic number of descents rather than one.
+///
+/// The first step is eight and not one because a descent is not free,
+/// and most runs are short. A pair of neighbors is one part either way,
+/// which is what it was before any of this, and it is the run of a
+/// thousand that the doubling is for.
+struct Parts<'a> {
+    rows: &'a [u64],
+    at: usize,
+    step: usize,
+}
+
+/// Rows in the first part of a run a bracket stops early on.
+const FIRST_PART: usize = 8;
+
+impl<'a> Iterator for Parts<'a> {
+    type Item = &'a [u64];
+
+    fn next(&mut self) -> Option<&'a [u64]> {
+        if self.at == self.rows.len() {
+            return None;
+        }
+        let take = self.step.min(self.rows.len() - self.at);
+        let part = &self.rows[self.at..self.at + take];
+        self.at += take;
+        self.step = (self.step * 2).min(zu_vector::VECTOR_SIZE);
+        Some(part)
+    }
+}
+
+fn parts(rows: &[u64], stop_early: bool) -> Parts<'_> {
+    Parts {
+        rows,
+        at: 0,
+        step: if stop_early {
+            FIRST_PART
+        } else {
+            zu_vector::VECTOR_SIZE
+        },
+    }
+}
+
 impl<'a> Worker<'a> {
     fn new(plan: &'a ExecPlan, snap: SnapHandle<'a>, stop: &'a StopState, work: Work) -> Self {
         Worker {
@@ -1475,7 +1525,7 @@ impl<'a> Worker<'a> {
                     }
                     continue;
                 }
-                for part in list.chunks(zu_vector::VECTOR_SIZE) {
+                for part in parts(list, stop_early) {
                     if let Err(e) = self.descend(to, part, rest, set) {
                         result = Err(e);
                         break 'srcs;
@@ -1702,6 +1752,7 @@ impl<'a> Worker<'a> {
                 None => idxs.extend(0..chunk.count),
             }
         }
+        let stop_early = brk.is_some_and(|b| b.stops_at_first());
         let mut result = Ok(());
         'srcs: for &phys in &idxs {
             set.chunks[src].cur = Some(phys);
@@ -1710,10 +1761,17 @@ impl<'a> Worker<'a> {
             // no rows. Under a bracket it is still a source row, and a
             // source row that matched nothing is a miss.
             if let Some(k) = int_key(set, key, phys as usize) {
-                for part in table.lookup(k).chunks(zu_vector::VECTOR_SIZE) {
+                for part in parts(table.lookup(k), stop_early) {
                     if let Err(e) = self.descend(to, part, rest, set) {
                         result = Err(e);
                         break 'srcs;
+                    }
+                    // A semi or an anti block is a question, and one
+                    // row that passes the group's predicates answers
+                    // it, so the rest of a long run of matches is not
+                    // probed.
+                    if stop_early && self.bracket_hit {
+                        break;
                     }
                 }
             }

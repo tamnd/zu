@@ -21,7 +21,11 @@ projection      = [ "DISTINCT" ] , ( "*" | projection_item ) ,
                   [ order_by ] , [ "SKIP" , expression ] , [ "LIMIT" , expression ] ;
 projection_item = expression , [ "AS" , name ] ;
 order_by        = "ORDER" , "BY" , sort_item , { "," , sort_item } ;
-sort_item       = expression , [ "ASC" | "ASCENDING" | "DESC" | "DESCENDING" ] ;
+sort_item       = expression , [ "ASC" | "ASCENDING" | "DESC" | "DESCENDING" ] ,
+                  [ null_ordering ] ;
+(* ISO 16.17. A key that names neither one sorts its nulls last, in
+   both directions, which is impdef IS001. *)
+null_ordering   = "NULLS" , ( "FIRST" | "LAST" ) ;
 
 (* Patterns. *)
 

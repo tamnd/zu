@@ -60,7 +60,7 @@ use std::time::Instant;
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
 use zu_common::{DurationKind, Result, Temporal, ZuError, temporal};
 
-use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
+use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
 use crate::plan::{LogicalPlan, expr_text};
 
@@ -1085,7 +1085,7 @@ enum OpDesc {
 enum PostOp {
     Distinct,
     Filter(BoundExpr),
-    Sort(Vec<(BoundExpr, bool)>),
+    Sort(Vec<SortKey<BoundExpr>>),
     Skip(BoundExpr),
     Limit(BoundExpr),
 }
@@ -1717,7 +1717,7 @@ fn post_refs(post: &[PostOp], out: &mut BTreeSet<usize>) {
     for op in post {
         match op {
             PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => expr_slots(e, out),
-            PostOp::Sort(keys) => keys.iter().for_each(|(e, _)| expr_slots(e, out)),
+            PostOp::Sort(keys) => keys.iter().for_each(|k| expr_slots(&k.expr, out)),
             PostOp::Distinct => {}
         }
     }
@@ -4673,7 +4673,37 @@ fn item_slot(item: &BoundItem, query: &BoundQuery) -> Option<usize> {
     query.variables.iter().rposition(|v| v.name == item.name)
 }
 
-fn sort_exprs(sink: &SinkDef) -> &[(BoundExpr, bool)] {
+/// Two values compared the way one ORDER BY key reads them.
+///
+/// A null sits outside the direction. `NULLS FIRST` is the head of the
+/// result and not the small end of the order, so reversing a descending
+/// key would put the nulls at the wrong end; the null placement is read
+/// off the key and the direction covers only what is left.
+fn sort_cmp(key: &SortKey<BoundExpr>, a: &OrdValue, b: &OrdValue) -> Ordering {
+    let null = |v: &OrdValue| matches!(v.0, Value::Null);
+    match (null(a), null(b)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => {
+            return if key.nulls_first() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        (false, true) => {
+            return if key.nulls_first() {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        (false, false) => {}
+    }
+    let ord = a.cmp(b);
+    if key.ascending { ord } else { ord.reverse() }
+}
+
+fn sort_exprs(sink: &SinkDef) -> &[SortKey<BoundExpr>] {
     for op in &sink.post {
         if let PostOp::Sort(keys) = op {
             return keys;
@@ -4709,7 +4739,7 @@ fn materialize(sink: &SinkDef, query: &BoundQuery, ctx: &mut StageCtx) -> Result
         }
     }
     let mut keys = Vec::new();
-    for (expr, _) in sort_exprs(sink) {
+    for SortKey { expr, .. } in sort_exprs(sink) {
         keys.push(OrdValue(settle(eval(ctx, expr)?)));
     }
     let mut extra = BTreeMap::new();
@@ -4808,7 +4838,7 @@ fn finalize_group(
         }
     }
     let mut keys = Vec::new();
-    for (expr, _) in sort_exprs(sink) {
+    for SortKey { expr, .. } in sort_exprs(sink) {
         keys.push(OrdValue(eval(ctx, expr)?));
     }
     let extra = ctx.overlay.clone();
@@ -4865,11 +4895,9 @@ fn apply_post(sink: &SinkDef, ctx: &mut StageCtx, mut rows: Vec<Row>) -> Result<
                 rows = kept;
             }
             PostOp::Sort(keys) => {
-                let dirs: Vec<bool> = keys.iter().map(|(_, asc)| *asc).collect();
                 rows.sort_by(|a, b| {
-                    for (ix, asc) in dirs.iter().enumerate() {
-                        let ord = a.keys[ix].cmp(&b.keys[ix]);
-                        let ord = if *asc { ord } else { ord.reverse() };
+                    for (ix, key) in keys.iter().enumerate() {
+                        let ord = sort_cmp(key, &a.keys[ix], &b.keys[ix]);
                         if ord != Ordering::Equal {
                             return ord;
                         }

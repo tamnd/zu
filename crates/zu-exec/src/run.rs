@@ -2453,8 +2453,8 @@ impl<'a> Worker<'a> {
                     // already holds is never built.
                     if let Some(top) = self.sink.top.as_mut() {
                         self.keybuf.clear();
-                        for &(col, _) in top.keys() {
-                            self.keybuf.push(scalar(plan, set, items[col], pos)?);
+                        for key in top.keys() {
+                            self.keybuf.push(scalar(plan, set, items[key.expr], pos)?);
                         }
                         if !top.wants(&self.keybuf) {
                             continue;

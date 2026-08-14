@@ -315,18 +315,33 @@ impl Snapshot for Zu1Snapshot<'_> {
             }
             reader.scan_int_chunk(db, col, chunk_ix, scratch)?;
             have = Some(col);
-            // The selection builds in the unsigned domain, the same
-            // ordering the zone maps skip by.
-            let mut s = SelVector::with_capacity(arena, rows);
-            for (i, &v) in scratch.iter().enumerate() {
-                if v >= p.lo && v <= p.hi {
-                    s.push(i as u16);
-                }
-            }
-            if s.is_empty() {
+            // The count comes first and the selection only if it is
+            // worth carrying. Counting is a branchless pass the
+            // compiler vectorizes; building the selection is a push per
+            // surviving row, and every operator above a chunk that has
+            // one reads its rows through it rather than straight down
+            // the vector. The predicate is still in the residual
+            // program, so a chunk handed on whole gets the same answer
+            // from the kernels; what the selection buys is the rows
+            // those kernels never see. Below half the chunk that is
+            // worth having and above it the thinning costs more than
+            // the rows it removes, which is where a bound like
+            // `age > 30` over a table of ages sits.
+            let kept = scratch
+                .iter()
+                .take(rows)
+                .filter(|&&v| v >= p.lo && v <= p.hi)
+                .count();
+            if kept == 0 {
                 return Ok(None);
             }
-            if s.len() < rows {
+            if kept * 2 <= rows {
+                let mut s = SelVector::with_capacity(arena, rows);
+                for (i, &v) in scratch.iter().take(rows).enumerate() {
+                    if v >= p.lo && v <= p.hi {
+                        s.push(i as u16);
+                    }
+                }
                 sel = Some(s);
             }
         }

@@ -41,8 +41,12 @@ impl CmpOp {
         }
     }
 
+    /// Whether the op holds between two values. This is the whole
+    /// definition of the op, which is why it is public: a caller that
+    /// rewrites a predicate before compiling it can check the rewrite
+    /// against the kernel's own rule rather than against a copy of it.
     #[inline(always)]
-    fn holds<T: PartialOrd>(self, a: T, b: T) -> bool {
+    pub fn holds<T: PartialOrd>(self, a: T, b: T) -> bool {
         match self {
             CmpOp::Eq => a == b,
             CmpOp::Ne => a != b,

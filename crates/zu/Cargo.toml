@@ -53,6 +53,10 @@ name = "cardinality"
 harness = false
 
 [[bench]]
+name = "compare"
+harness = false
+
+[[bench]]
 name = "project"
 harness = false
 

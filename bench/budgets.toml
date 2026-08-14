@@ -663,6 +663,44 @@ exec_sip_best_x = 1.15
 # measured there. Raise this floor, never lower it.
 exec_project_mrows_s_core = 25.0
 
+# A bound written as a float over an integer column, at one worker, M
+# rows/s (Spec/2064g/gql/plan, zu#116): two million people and
+# `WHERE p.age > 30.5`, counted, so the number is the scan and the
+# comparison and nothing else. The bound narrows to `p.age > 30` at
+# compile time and runs the integer kernel; before that the mixed
+# physical types sent the whole query to the row engine, which reads a
+# tag per value.
+#
+# The bench prints seven predicates and each one twice, once through
+# the pipeline and once with ZU_EXEC2=0, which is where every float
+# bound ran before. Measured at 33c0dba, one worker, in ms for the
+# pipeline against the old engine: the integer bound 2.8 against 108.9
+# on the local M series, 3.8 against 133.0 on gamingpc, 9.3 against
+# 401.8 on server1; the float bound 2.9 against 115.5, 3.6 against
+# 138.4 and 10.0 against 401.1; the selective float bound 2.7 against
+# 94.6, 2.9 against 117.4 and 10.7 against 407.5; the conjunction 5.8
+# against 169.9, 6.8 against 200.4 and 23.2 against 656.3. So the two
+# spellings cost the same, which is the point, and the float bound is
+# 40x, 39x and 40x what it was.
+#
+# The ordered column is the other half: a bound three quarters of the
+# way up a column that climbs with the row, where the zone map rules
+# chunks out before anything is decoded. The float spelling now reads
+# the narrowed bound too, so it skips what the integer spelling skips:
+# 1.0 ms against 0.9 on the local M series, 1.1 against 1.1 on
+# gamingpc, 4.0 against 3.2 on server1, all of them around 100x the
+# old engine.
+#
+# The last predicate is one the rewrite refuses, `p.age < 1e300`,
+# which is past the point where the two domains agree. It still falls
+# back and comes in at 1.02x, 1.00x and 1.10x, which is the fallback
+# doing its job.
+#
+# The floor is set off server1, the slowest host and the one that
+# gates with no free page cache, at about two thirds of what it
+# measured there. Raise this floor, never lower it.
+exec_compare_mrows_s_core = 130.0
+
 # The OPTIONAL MATCH bracket at one worker, M outer rows/s (docs/07):
 # two million people of whom every fourth is isolated, so a quarter of
 # the outer rows take the miss path and the number is not the matching

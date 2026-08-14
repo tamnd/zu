@@ -1086,6 +1086,21 @@ mod tests {
         // is the one that is always there to read.
         assert!(text.contains("decisions:"), "got:\n{text}");
         assert!(text.contains("split scan into"), "got:\n{text}");
+        // The count above is answered off degrees and never reads a
+        // neighbor, so it decodes no group and the line stays away. A
+        // walk that has to look at the neighbors themselves reads the
+        // group whole, since a scan wants every list in it.
+        assert!(!text.contains("whole group(s)"), "got:\n{text}");
+        let walked = explain_analyze(
+            "MATCH (a:person)-[:follows]->(b) RETURN b.id AS b",
+            &mut db,
+            &[],
+        )
+        .expect("explain analyze");
+        assert!(
+            walked.contains("decoded 1 whole group(s) and read around 0 more"),
+            "got:\n{walked}"
+        );
 
         // Pinned to the old engine there is no pipeline to report on,
         // and the listing says nothing rather than saying zero.

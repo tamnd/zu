@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
-use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, GroupId, RelId, SCAN_ROWS, Snapshot};
+use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{
     Bitmap, ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector,
     VecEncoding,
@@ -118,6 +118,38 @@ struct Hop {
     to: usize,
     batch: bool,
     close: Option<Close>,
+}
+
+/// One node's neighbor list, however storage handed it over: borrowed
+/// out of a pinned group where pinning was the cheaper read, copied
+/// into a scratch buffer where reading the range the list occupies
+/// was. The operators that hold a pinned end's list for a whole vector
+/// take it this way, since one list is never enough to pay for
+/// decoding the group around it on a graph of any size.
+enum RowList {
+    Pinned(CsrPin),
+    Read(Vec<u64>),
+}
+
+/// A node's lists, one per side of the direction it was read in, in
+/// the order the sides are walked.
+struct RowLists {
+    sides: Vec<RowList>,
+    /// The node's position inside its group, where the pinned sides
+    /// find it.
+    at: usize,
+}
+
+impl RowLists {
+    fn slices(&self) -> Vec<&[u64]> {
+        self.sides
+            .iter()
+            .map(|side| match side {
+                RowList::Pinned(pin) => pin.list(self.at),
+                RowList::Read(list) => &list[..],
+            })
+            .collect()
+    }
 }
 
 /// One query's morsels: what a morsel means, the ranges themselves,
@@ -238,8 +270,10 @@ fn seek_work(
     };
     // Weigh the frontier by the next hop when there is one, so a
     // neighbor with a thousand edges counts for a thousand.
-    let list = snap.csr(rel, group_of(seed), dir)?;
-    let list = list.list((seed % u64::from(GROUP_ROWS)) as usize).to_vec();
+    // One list, read as a range: the seed's group holds every edge of
+    // a hundred and thirty thousand nodes and this wants one node's.
+    let mut list = Vec::new();
+    snap.list_into(rel, seed, dir, &mut list)?;
     let mut weight = vec![1u64; list.len()];
     if let Some(&Op::Expand {
         rel: next,
@@ -320,10 +354,6 @@ fn seeks_work(keys: &[u64], options: &Options) -> Schedule {
         morsels,
         threads,
     }
-}
-
-fn group_of(row: u64) -> GroupId {
-    (row / u64::from(GROUP_ROWS)) as GroupId
 }
 
 /// Where one worker leaves what it finished with, empty until it does.
@@ -832,8 +862,19 @@ impl<'a> Worker<'a> {
         let mut level0 = self.make_level(0, &[seed], &[], &[])?;
         level0.cur = Some(0);
         let mut set = ChunkSet::new(vec![level0]);
-        let pin = self.pin(rel, dir, seed)?;
-        let list = pin.list((seed % u64::from(GROUP_ROWS)) as usize);
+        // One list, and every worker on this seed wants the same one, so
+        // pinning the group means each of them decoding a group's worth
+        // of neighbors for the slice of one list it owns.
+        let held = self.hold(rel, dir, seed, 1)?;
+        let mut owned = self.row_pool.pop().unwrap_or_default();
+        let list: &[u64] = match &held {
+            Some(pin) => pin.list((seed % u64::from(GROUP_ROWS)) as usize),
+            None => {
+                owned.clear();
+                self.snap.get().list_into(rel, seed, dir, &mut owned)?;
+                &owned
+            }
+        };
         let mut result = Ok(());
         for part in list[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
             let chunk = match self.make_level(to, part, &set.chunks, &[]) {
@@ -854,6 +895,7 @@ impl<'a> Worker<'a> {
                 break;
             }
         }
+        self.row_pool.push(owned);
         result
     }
 
@@ -1115,21 +1157,21 @@ impl<'a> Worker<'a> {
         // That level sits below the one being walked, so its pin does
         // not move while this runs, and a probe side with no edges at
         // all rejects every neighbor before any of them is built.
-        let mut close_pins = Vec::new();
-        let mut close_at = 0;
-        if let Some(c) = close {
-            let far = &set.chunks[c.probe_level];
-            let prow = row_at(far, pinned_pos(far));
-            close_at = (prow % u64::from(GROUP_ROWS)) as usize;
-            for dir in sides(c.dirs) {
-                close_pins.push(self.pin(c.rel, dir, prow)?);
+        let probe = match close {
+            Some(c) => {
+                let far = &set.chunks[c.probe_level];
+                let prow = row_at(far, pinned_pos(far));
+                let lists = self.row_lists(c.rel, c.dirs, prow)?;
+                if lists.slices().iter().all(|l| l.is_empty()) {
+                    self.recycle(lists);
+                    self.decisions.empty_close += 1;
+                    return Ok(());
+                }
+                Some(lists)
             }
-            if close_pins.iter().all(|p| p.list(close_at).is_empty()) {
-                self.decisions.empty_close += 1;
-                return Ok(());
-            }
-        }
-        let close_lists: Vec<&[u64]> = close_pins.iter().map(|p| p.list(close_at)).collect();
+            None => None,
+        };
+        let close_lists: Vec<&[u64]> = probe.as_ref().map(RowLists::slices).unwrap_or_default();
         // Copy the active rows out first: pinning mutates the chunk the
         // selection and values are read from.
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -1182,7 +1224,14 @@ impl<'a> Worker<'a> {
         // direction, around a body whose real work is one slice of the
         // group's neighbor array. One slot per side, since an
         // undirected expand reads two pins that move together.
-        let mut held: [Option<(u32, CsrPin)>; 2] = [None, None];
+        // A pin is `None` where the group turned out to be worth
+        // reading a list at a time instead, which is what a point
+        // seeded walk wants: the pin would decode the whole group's
+        // neighbor array for the dozen edges one seed has, and on a
+        // graph bigger than the decoded pool it would not even hold on
+        // to them until the next request.
+        let mut held: [Option<(u32, Option<CsrPin>)>; 2] = [None, None];
+        let mut point = self.row_pool.pop().unwrap_or_default();
         // The batched descent fills this across source rows and hands
         // it down whole. Nothing above the expand reads the source
         // level in that case, so the pin only has to keep the level's
@@ -1207,8 +1256,8 @@ impl<'a> Worker<'a> {
             self.opt_hit = false;
             let group = (row / u64::from(GROUP_ROWS)) as u32;
             for (slot, dir) in sides(dirs).enumerate() {
-                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
-                    match self.pin(rel, dir, row) {
+                if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
+                    match self.hold(rel, dir, row, self.wanted(rows.len())) {
                         Ok(p) => held[slot] = Some((group, p)),
                         Err(e) => {
                             result = Err(e);
@@ -1216,8 +1265,18 @@ impl<'a> Worker<'a> {
                         }
                     }
                 }
-                let pin = &held[slot].as_ref().expect("just pinned").1;
-                let list = pin.list((row % u64::from(GROUP_ROWS)) as usize);
+                let local = (row % u64::from(GROUP_ROWS)) as usize;
+                let list = match &held[slot].as_ref().expect("just held").1 {
+                    Some(pin) => pin.list(local),
+                    None => {
+                        point.clear();
+                        if let Err(e) = self.snap.get().list_into(rel, row, dir, &mut point) {
+                            result = Err(e);
+                            break 'srcs;
+                        }
+                        &point[..]
+                    }
+                };
                 // The close judges the neighbors here, where they are
                 // still a sorted list and nothing has been built for
                 // them. Both lists ascend, so the probe walks forward
@@ -1307,6 +1366,10 @@ impl<'a> Worker<'a> {
             self.bwts = fillw;
         }
         set.chunks[src].cur = None;
+        drop(close_lists);
+        if let Some(lists) = probe {
+            self.recycle(lists);
+        }
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
         self.row_pool.push(fill);
@@ -1334,12 +1397,11 @@ impl<'a> Worker<'a> {
     ) -> Result<()> {
         let far = &set.chunks[from];
         let prow = row_at(far, pinned_pos(far));
-        let mut pins = Vec::with_capacity(2);
-        for dir in sides(dirs) {
-            pins.push(self.pin(rel, dir, prow)?);
-        }
-        let at = (prow % u64::from(GROUP_ROWS)) as usize;
-        if pins.iter().all(|p| p.list(at).is_empty()) {
+        let held = self.row_lists(rel, dirs, prow)?;
+        let lists = held.slices();
+        if lists.iter().all(|l| l.is_empty()) {
+            drop(lists);
+            self.recycle(held);
             return Ok(());
         }
         let src = set.chunks.len() - 1;
@@ -1355,8 +1417,8 @@ impl<'a> Worker<'a> {
         let mut result = Ok(());
         'srcs: for &phys in &idxs {
             set.chunks[src].cur = Some(phys);
-            for pin in &pins {
-                for part in pin.list(at).chunks(zu_vector::VECTOR_SIZE) {
+            for list in &lists {
+                for part in list.chunks(zu_vector::VECTOR_SIZE) {
                     if let Err(e) = self.descend(to, part, rest, set) {
                         result = Err(e);
                         break 'srcs;
@@ -1368,6 +1430,8 @@ impl<'a> Worker<'a> {
             }
         }
         set.chunks[src].cur = None;
+        drop(lists);
+        self.recycle(held);
         self.idx_pool.push(idxs);
         result
     }
@@ -1556,27 +1620,26 @@ impl<'a> Worker<'a> {
         let src = set.chunks.len() - 1;
         let far = &set.chunks[probe_level];
         let prow = row_at(far, pinned_pos(far));
-        let pat = (prow % u64::from(GROUP_ROWS)) as usize;
-        let mut ppins = Vec::new();
-        for dir in sides(probe.1) {
-            ppins.push(self.pin(probe.0, dir, prow)?);
-        }
+        let pheld = self.row_lists(probe.0, probe.1, prow)?;
+        let pl = pheld.slices();
         // An undirected probe end asks whether an edge exists either
         // way, so the two stored lists become one sorted set here and
         // the walk below stays a single leapfrog. The union is built
         // once for the whole vector, the same as the single list case.
         let mut union = self.row_pool.pop().unwrap_or_default();
         union.clear();
-        let plist: &[u64] = match ppins.as_slice() {
-            [one] => one.list(pat),
+        let plist: &[u64] = match pl.as_slice() {
+            [one] => one,
             [a, b] => {
-                merge_sorted(a.list(pat), b.list(pat), &mut union);
+                merge_sorted(a, b, &mut union);
                 &union
             }
             _ => unreachable!("an expand walks one side or two"),
         };
         if plist.is_empty() {
             self.row_pool.push(union);
+            drop(pl);
+            self.recycle(pheld);
             return Ok(());
         }
         // Copy the active rows out first: pinning mutates the chunk the
@@ -1609,7 +1672,11 @@ impl<'a> Worker<'a> {
         // is a hash of the pin key and this loop runs once per edge
         // under the scan. One slot per side, since an undirected seed
         // reads two pins that move together.
-        let mut held: [Option<(u32, CsrPin)>; 2] = [None, None];
+        // A pin is `None` where the group is worth more than the rows
+        // this vector holds in it, the same rule the expand follows,
+        // and then the seed's list is read on its own.
+        let mut held: [Option<(u32, Option<CsrPin>)>; 2] = [None, None];
+        let mut point = self.row_pool.pop().unwrap_or_default();
         'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
             set.chunks[src].cur = Some(phys);
             let group = (row / u64::from(GROUP_ROWS)) as u32;
@@ -1619,8 +1686,8 @@ impl<'a> Worker<'a> {
             // both ways is two edges and closes the wedge twice, which
             // is what the row by row expand this replaces would count.
             for (slot, dir) in sides(seed.1).enumerate() {
-                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
-                    match self.pin(seed.0, dir, row) {
+                if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
+                    match self.hold(seed.0, dir, row, self.wanted(rows.len())) {
                         Ok(p) => held[slot] = Some((group, p)),
                         Err(e) => {
                             result = Err(e);
@@ -1628,8 +1695,18 @@ impl<'a> Worker<'a> {
                         }
                     }
                 }
-                let spin = &held[slot].as_ref().expect("just pinned").1;
-                leapfrog(spin.list(at), plist, &mut hits);
+                let slist = match &held[slot].as_ref().expect("just held").1 {
+                    Some(pin) => pin.list(at),
+                    None => {
+                        point.clear();
+                        if let Err(e) = self.snap.get().list_into(seed.0, row, dir, &mut point) {
+                            result = Err(e);
+                            break 'srcs;
+                        }
+                        &point[..]
+                    }
+                };
+                leapfrog(slist, plist, &mut hits);
             }
             for part in hits.chunks(zu_vector::VECTOR_SIZE) {
                 let chunk = match self.make_level(to, part, &set.chunks, &[]) {
@@ -1655,7 +1732,10 @@ impl<'a> Worker<'a> {
         self.hits = hits;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
+        self.row_pool.push(point);
         self.row_pool.push(union);
+        drop(pl);
+        self.recycle(pheld);
         result
     }
 
@@ -1675,13 +1755,11 @@ impl<'a> Worker<'a> {
     ) -> Result<()> {
         let far = &set.chunks[probe_level];
         let prow = row_at(far, pinned_pos(far));
-        let mut pins = Vec::with_capacity(2);
-        for dir in sides(dirs) {
-            pins.push(self.pin(rel, dir, prow)?);
-        }
-        let at = (prow % u64::from(GROUP_ROWS)) as usize;
-        let lists: Vec<&[u64]> = pins.iter().map(|p| p.list(at)).collect();
+        let held = self.row_lists(rel, dirs, prow)?;
+        let lists = held.slices();
         if lists.iter().all(|l| l.is_empty()) {
+            drop(lists);
+            self.recycle(held);
             self.decisions.empty_close += 1;
             return Ok(());
         }
@@ -1711,6 +1789,8 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        drop(lists);
+        self.recycle(held);
         let mut result = Ok(());
         if !keep.is_empty() {
             let mut sel = SelVector::with_capacity(&mut self.arena, keep.len());
@@ -1724,12 +1804,78 @@ impl<'a> Worker<'a> {
         result
     }
 
+    /// How many lists of one group the walk is about to want, given the
+    /// vector in hand. Under a scan the answer is all of them: a pin is
+    /// held for the whole query, and the same group comes back around
+    /// on every vector the scan draws, including the short vectors a
+    /// nested walk hands its lists down in. Under a seed the vector in
+    /// hand is the whole of it, since nothing is going to ask again.
+    fn wanted(&self, rows: usize) -> usize {
+        match self.plan.source {
+            Source::Scan(_) => usize::MAX,
+            _ => rows,
+        }
+    }
+
+    /// The pin for a group, or `None` when the caller is better off
+    /// reading its lists one at a time. `wanted` is how many of the
+    /// group's lists this walk will read, and the snapshot says how
+    /// many it takes for the pin to pay: a scan is always over it, a
+    /// point lookup holds one row and is almost never.
+    fn hold(&mut self, rel: RelId, dir: Dir, row: u64, wanted: usize) -> Result<Option<CsrPin>> {
+        let group = (row / u64::from(GROUP_ROWS)) as u32;
+        let key = (rel, matches!(dir, Dir::Bwd), group);
+        if self.pins.contains_key(&key) {
+            return Ok(Some(self.pins[&key].clone()));
+        }
+        if wanted < self.snap.get().list_threshold(rel, group, dir)? {
+            self.decisions.point_reads += 1;
+            return Ok(None);
+        }
+        Ok(Some(self.pin(rel, dir, row)?))
+    }
+
+    /// One row's neighbor lists, one per side of `dirs`, read the way
+    /// the group they sit in is worth reading. Every caller of this
+    /// holds one row's lists for a whole vector of work, so `wanted` is
+    /// one list per side and the group gets pinned only where it is
+    /// small enough for that to be the cheaper read.
+    fn row_lists(&mut self, rel: RelId, dirs: Dirs, row: u64) -> Result<RowLists> {
+        let mut out = RowLists {
+            sides: Vec::with_capacity(2),
+            at: (row % u64::from(GROUP_ROWS)) as usize,
+        };
+        for dir in sides(dirs) {
+            out.sides
+                .push(match self.hold(rel, dir, row, self.wanted(1))? {
+                    Some(pin) => RowList::Pinned(pin),
+                    None => {
+                        let mut list = self.row_pool.pop().unwrap_or_default();
+                        list.clear();
+                        self.snap.get().list_into(rel, row, dir, &mut list)?;
+                        RowList::Read(list)
+                    }
+                });
+        }
+        Ok(out)
+    }
+
+    /// Hands a row's read lists back to the pool they came from.
+    fn recycle(&mut self, lists: RowLists) {
+        for side in lists.sides {
+            if let RowList::Read(list) = side {
+                self.row_pool.push(list);
+            }
+        }
+    }
+
     fn pin(&mut self, rel: RelId, dir: Dir, row: u64) -> Result<CsrPin> {
         let group = (row / u64::from(GROUP_ROWS)) as u32;
         let key = (rel, matches!(dir, Dir::Bwd), group);
         if let Some(p) = self.pins.get(&key) {
             return Ok(p.clone());
         }
+        self.decisions.group_pins += 1;
         let p = self.snap.get().csr(rel, group, dir)?;
         self.pins.insert(key, p.clone());
         Ok(p)
@@ -1834,6 +1980,12 @@ impl<'a> Worker<'a> {
     /// the row is in rather than the group the first row happened to be
     /// in. `rows` ascending is what keeps that one pin per group; what
     /// comes back is summed, so the caller is free to sort.
+    ///
+    /// How many rows of the run land in a group is known before it is
+    /// read, since the rows arrive sorted, so a run too short to pay
+    /// for the group reads its lists one at a time instead. That is the
+    /// two hop count off a seed: a dozen neighbors spread over a few
+    /// groups, none of which is worth decoding whole.
     fn concat_lists(
         &mut self,
         rel: RelId,
@@ -1842,14 +1994,23 @@ impl<'a> Worker<'a> {
         out: &mut Vec<u64>,
     ) -> Result<()> {
         for dir in sides(dirs) {
-            let mut held: Option<(u64, CsrPin)> = None;
-            for &row in rows {
-                let group = row / u64::from(GROUP_ROWS);
-                if held.as_ref().is_none_or(|&(g, _)| g != group) {
-                    held = Some((group, self.pin(rel, dir, row)?));
+            let mut at = 0;
+            while at < rows.len() {
+                let group = rows[at] / u64::from(GROUP_ROWS);
+                let run = rows[at..].partition_point(|r| r / u64::from(GROUP_ROWS) == group);
+                match self.hold(rel, dir, rows[at], self.wanted(run))? {
+                    Some(pin) => {
+                        for &row in &rows[at..at + run] {
+                            out.extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
+                        }
+                    }
+                    None => {
+                        for &row in &rows[at..at + run] {
+                            self.snap.get().list_into(rel, row, dir, out)?;
+                        }
+                    }
                 }
-                let pin = &held.as_ref().expect("just pinned").1;
-                out.extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
+                at += run;
             }
         }
         Ok(())
@@ -2007,15 +2168,19 @@ impl<'a> Worker<'a> {
         out: &mut Vec<u64>,
         ends: &mut Vec<u32>,
     ) -> Result<()> {
-        let mut held: [Option<(u64, CsrPin)>; 2] = [None, None];
+        let mut held: [Option<(u64, Option<CsrPin>)>; 2] = [None, None];
         for &row in rows {
             let group = row / u64::from(GROUP_ROWS);
             for (slot, dir) in sides(dirs).enumerate() {
-                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
-                    held[slot] = Some((group, self.pin(rel, dir, row)?));
+                if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
+                    held[slot] = Some((group, self.hold(rel, dir, row, self.wanted(rows.len()))?));
                 }
-                let pin = &held[slot].as_ref().expect("just pinned").1;
-                out.extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
+                match &held[slot].as_ref().expect("just held").1 {
+                    Some(pin) => {
+                        out.extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
+                    }
+                    None => self.snap.get().list_into(rel, row, dir, out)?,
+                }
             }
             ends.push(out.len() as u32);
         }
@@ -2793,6 +2958,11 @@ mod tests {
         fwd: (Arc<Vec<u64>>, Arc<Vec<u64>>),
         bwd: (Arc<Vec<u64>>, Arc<Vec<u64>>),
         forkable: bool,
+        /// Answers the threshold with something no caller can reach, so
+        /// every list goes the one at a time way a point read does.
+        point: bool,
+        /// Lists served that way, shared with the forks.
+        lists: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Mock {
@@ -2818,7 +2988,20 @@ mod tests {
                 fwd: (Arc::new(fo), Arc::new(fnb)),
                 bwd: (Arc::new(bo), Arc::new(bnb)),
                 forkable,
+                point: false,
+                lists: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
+        }
+
+        /// The same graph read the way storage reads one when a group
+        /// holds far more edges than the caller asked for.
+        fn point(mut self) -> Mock {
+            self.point = true;
+            self
+        }
+
+        fn lists(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn side(&self, dir: Dir) -> &(Arc<Vec<u64>>, Arc<Vec<u64>>) {
@@ -2886,6 +3069,25 @@ mod tests {
             assert_eq!(group, 0, "the mock fits one group");
             let (offsets, neighbors) = self.side(dir).clone();
             Ok(CsrPin { offsets, neighbors })
+        }
+
+        fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<usize> {
+            Ok(if self.point { usize::MAX } else { 0 })
+        }
+
+        fn list_into(
+            &mut self,
+            _rel: RelId,
+            node: u64,
+            dir: Dir,
+            out: &mut Vec<u64>,
+        ) -> Result<()> {
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (offsets, neighbors) = self.side(dir);
+            let (lo, hi) = (offsets[node as usize], offsets[node as usize + 1]);
+            out.extend_from_slice(&neighbors[lo as usize..hi as usize]);
+            Ok(())
         }
 
         fn gather(
@@ -3289,6 +3491,81 @@ mod tests {
             [1, 2, 0, 1].map(Value::Int).to_vec(),
             "forward list lands before the backward list"
         );
+    }
+
+    /// Reading a list at a time instead of pinning the group around it
+    /// is a storage decision, and the walk above it is not allowed to
+    /// notice: same neighbors, same order. What the point path exists
+    /// for is the case a pin is ruinous at, a handful of seeds into a
+    /// group holding millions of edges, and what this checks is that
+    /// the two agree on a graph small enough to hold both answers in
+    /// one assert.
+    #[test]
+    fn a_point_read_hands_down_what_a_pinned_group_does() {
+        let shape = |keys: Vec<u64>| {
+            let mut p = plan(
+                vec![bare_level(), bare_level()],
+                vec![Op::Expand {
+                    rel: 0,
+                    dirs: Dirs::Both,
+                    from: 0,
+                    to: 1,
+                    batch: false,
+                    close: None,
+                }],
+                SinkSpec::Rows {
+                    items: vec![ScalarRef::RowId { level: 1 }],
+                    post: Vec::new(),
+                },
+                &["m"],
+            );
+            p.source = Source::Seeks(keys);
+            p
+        };
+        let seeks = shape((10..14).collect());
+        let mut pinned = Mock::new(64, |i| i as i64, false);
+        let mut point = Mock::new(64, |i| i as i64, false).point();
+        let a = run(&seeks, &mut pinned, &seq()).unwrap().0;
+        let b = run(&seeks, &mut point, &seq()).unwrap().0;
+        assert_eq!(a.rows.len(), 8, "four seeds, a neighbor either way");
+        assert_eq!(b.rows, a.rows, "the point path walked a different graph");
+        assert_eq!(pinned.lists(), 0, "a pinned group serves its own lists");
+        assert_eq!(
+            point.lists(),
+            8,
+            "one read per seed per direction, empty lists included"
+        );
+    }
+
+    /// A scan comes back around to the same group on every vector it
+    /// draws and the pin is held for the whole query, so the vector in
+    /// hand says nothing about how many of the group's lists the walk
+    /// is going to want. The mock here says every list is better read
+    /// on its own, which is the strongest thing storage can say, and a
+    /// scan is still supposed to pin: the read counter staying at zero
+    /// is the assertion.
+    #[test]
+    fn a_scan_pins_the_group_however_short_its_vectors_are() {
+        let p = plan(
+            vec![bare_level(), bare_level()],
+            vec![Op::Expand {
+                rel: 0,
+                dirs: Dirs::One(Dir::Fwd),
+                from: 0,
+                to: 1,
+                batch: false,
+                close: None,
+            }],
+            SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 1 }],
+                post: Vec::new(),
+            },
+            &["m"],
+        );
+        let mut snap = Mock::new(64, |i| i as i64, false).point();
+        let out = run(&p, &mut snap, &seq()).unwrap().0;
+        assert_eq!(out.rows.len(), 63, "one forward edge per row but the last");
+        assert_eq!(snap.lists(), 0, "a scan driven walk read a list at a time");
     }
 
     /// The batched descent is only worth having if it is invisible:

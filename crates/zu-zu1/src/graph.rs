@@ -675,6 +675,20 @@ impl GraphReader {
         self.neighbors_dir(db, node, Direction::Fwd)
     }
 
+    /// Chunks the neighbor array of `group` in `dir` is stored in,
+    /// directory only, no decode. This is what says whether pinning a
+    /// group is worth it: the pin decodes every one of these chunks,
+    /// and reading one node's list as a range decodes about one of
+    /// them, so a caller wanting fewer lists than there are chunks is
+    /// better off reading each one. It is the same rule
+    /// [`Self::degrees_into`] uses on the offset array.
+    pub fn list_chunks(&self, group: usize, dir: Direction) -> usize {
+        match self.directory.groups.get(group) {
+            Some(g) => g.dir(dir).neighbors.chunk_count(),
+            None => 0,
+        }
+    }
+
     /// Pool-backed pins of one group's CSR in `dir`: the offset and
     /// neighbor arrays as shared handles. Warm calls are two pool map
     /// probes and two `Arc` clones, no decode and no copy, which is

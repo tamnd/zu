@@ -27,6 +27,14 @@ use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
 use crate::zu1::props::{PropsReader, load_props};
 
+/// Whether every neighbor list is to be read on its own, whatever the
+/// group it sits in costs. Read once: this sits under the walk and the
+/// answer cannot change while a process runs.
+fn forced_point_reads() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var("ZU_POINT_READS").as_deref() == Ok("1"))
+}
+
 fn direction(dir: Dir) -> Direction {
     match dir {
         Dir::Fwd => Direction::Fwd,
@@ -353,6 +361,33 @@ impl Snapshot for Zu1Snapshot<'_> {
         let (offsets, neighbors) =
             reader.csr_group(&mut self.db, group as usize, direction(dir))?;
         Ok(CsrPin { offsets, neighbors })
+    }
+
+    fn list_threshold(&mut self, rel: RelId, group: GroupId, dir: Dir) -> Result<usize> {
+        // The point path only comes up on groups far larger than a test
+        // builds, so ZU_POINT_READS=1 asks for it everywhere and the
+        // whole query suite runs through it. Nothing outside a test run
+        // sets this.
+        if forced_point_reads() {
+            return Ok(usize::MAX);
+        }
+        self.ensure_reader(rel)?;
+        let reader = self.readers.get(&rel).expect("just loaded");
+        // Reading one list decodes about four chunks: two on the
+        // offsets to find where the list starts and ends, and one or
+        // two on the neighbors to cover it. The pin decodes every
+        // chunk of the group once, so it starts paying for itself at
+        // roughly a quarter as many lists as the group has chunks,
+        // and a scan morsel is far past that while a seed is far
+        // short of it.
+        Ok(reader.list_chunks(group as usize, direction(dir)) / 4)
+    }
+
+    fn list_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        let reader = readers.get(&rel).expect("just loaded");
+        reader.neighbors_dir_into(db, node, direction(dir), out)
     }
 
     fn gather(

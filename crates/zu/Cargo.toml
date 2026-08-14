@@ -84,6 +84,10 @@ harness = false
 name = "refuse"
 harness = false
 
+[[bench]]
+name = "tail"
+harness = false
+
 [features]
 arrow = ["zu-zu1/arrow"]
 

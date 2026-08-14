@@ -15,7 +15,7 @@ use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
-use crate::zu1::props::{PropsReader, load_props};
+use crate::zu1::props::{ListElement, PropsReader, list_elements, load_props};
 use zu_common::{FloatBits, LogicalType, Temporal};
 
 /// The types [`run`] speaks, re-exported here so a caller that depends
@@ -330,6 +330,31 @@ impl Graph for Zu1Graph<'_> {
                         detail: format!("'{key}' row {offset} is not UTF-8"),
                     })?;
                     Ok(Value::Str(text))
+                }
+                // A stored list comes back as the list value the rest
+                // of the engine already has, element by element through
+                // the same reading a scalar column of that type gets,
+                // so `b.xs` and a list literal are the same value and
+                // CARDINALITY cannot tell them apart.
+                LogicalType::List { ref elem, .. } => {
+                    let mut bytes = Vec::new();
+                    reader.read_str(db, col, offset, &mut bytes)?;
+                    let items = list_elements(elem, &bytes)?;
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        out.push(match item {
+                            ListElement::Word(word) => word_value(elem, word, key)?,
+                            ListElement::Blob(bytes) => Value::Str(
+                                std::str::from_utf8(bytes)
+                                    .map_err(|_| ZuError::Corrupt {
+                                        what: "props column",
+                                        detail: format!("'{key}' row {offset} is not UTF-8"),
+                                    })?
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    Ok(Value::List(out))
                 }
                 other => Err(unreadable(&other, key)),
             };

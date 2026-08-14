@@ -8,8 +8,10 @@
 //! directly, because the spellings are half of GV50.
 
 use zu::query::{Value, run};
+use zu_common::{IntBits, LogicalType};
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::bulk_load_as;
+use zu_zu1::props::{ListElement, PropValues, store_props};
 
 fn graph(dir: &std::path::Path) -> Zu1File {
     let mut zu = Zu1File::create(&dir.join("lists.zu1")).unwrap();
@@ -141,6 +143,73 @@ fn cardinality_counts_a_list_and_refuses_what_is_not_one() {
     assert_eq!(one(&mut db, "RETURN CARDINALITY(null) AS v"), Value::Null);
     assert_eq!(code(&mut db, "RETURN CARDINALITY('abc') AS v"), "22G03");
     assert_eq!(one(&mut db, "RETURN SIZE('abc') AS v"), Value::Int(3));
+}
+
+/// A list in a property column is the same value a list literal is,
+/// which is the point of storing one: the count, the membership test
+/// and the elements all answer the way they answer for a literal.
+#[test]
+fn a_stored_list_is_the_same_value_a_written_one_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stored.zu1");
+    let mut db = Zu1File::create(&path).unwrap();
+    bulk_load_as(&mut db, "person", "knows", 2, &[(0, 1)]).unwrap();
+    let first: Vec<ListElement> = [1u64, 2, 3].iter().map(|&w| ListElement::Word(w)).collect();
+    let second: Vec<ListElement> = vec![ListElement::Word(7)];
+    let rows: Vec<&[ListElement]> = vec![&first, &second];
+    let names: Vec<&[ListElement]> =
+        vec![&[ListElement::Blob(b"ay"), ListElement::Blob(b"bee")], &[]];
+    let int = LogicalType::Int {
+        signed: true,
+        bits: IntBits::B64,
+        precision: None,
+    };
+    let text = LogicalType::Str {
+        min: None,
+        max: None,
+        fixed: false,
+    };
+    store_props(
+        &mut db,
+        "person",
+        &[
+            (
+                "xs",
+                PropValues::List {
+                    elem: &int,
+                    rows: &rows,
+                },
+            ),
+            (
+                "tags",
+                PropValues::List {
+                    elem: &text,
+                    rows: &names,
+                },
+            ),
+        ],
+    )
+    .unwrap();
+
+    let source = "MATCH (p:person) RETURN CARDINALITY(p.xs) AS n ORDER BY n DESC";
+    let result = run(source, &mut db, &[]).unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Int(3)], vec![Value::Int(1)]]);
+    let source = "MATCH (p:person) WHERE p.id = 0 RETURN p.xs AS v";
+    assert_eq!(
+        one(&mut db, source),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+    let source = "MATCH (p:person) WHERE p.id = 0 RETURN p.tags AS v";
+    assert_eq!(
+        one(&mut db, source),
+        Value::List(vec![Value::Str("ay".into()), Value::Str("bee".into())])
+    );
+    let source = "MATCH (p:person) WHERE p.id = 1 RETURN SIZE(p.tags) AS v";
+    assert_eq!(one(&mut db, source), Value::Int(0));
+    let source = "MATCH (p:person) WHERE p.id = 0 RETURN (p.xs IS TYPED LIST<INT>) AS v";
+    assert_eq!(one(&mut db, source), Value::Bool(true));
+    let source = "MATCH (p:person) WHERE p.id = 0 RETURN (p.xs IS TYPED LIST<STRING>) AS v";
+    assert_eq!(one(&mut db, source), Value::Bool(false));
 }
 
 /// A type name is a name until a type is what is being asked for, so a

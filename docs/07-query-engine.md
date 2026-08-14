@@ -59,7 +59,7 @@ Plans cached by (query text, catalog epoch, param types), LDBC short reads are p
 
 ## 7. Execution-time adaptivity (small, deterministic)
 
-The set is closed on purpose. An engine that may adapt anywhere is an engine whose plan does not predict its behaviour, and a slow query then has no explanation short of a profiler. Seven decisions, each named, each counted, each printed under the plan by EXPLAIN ANALYZE, is a budget: a new one has to displace an old one or argue its way in. Everything else about a query is settled before a row moves, and what is left here is only the choices that need a number the statistics do not have, because only the data itself has it.
+The set is closed on purpose. An engine that may adapt anywhere is an engine whose plan does not predict its behaviour, and a slow query then has no explanation short of a profiler. Eight decisions, each named, each counted, each printed under the plan by EXPLAIN ANALYZE, is a budget: a new one has to displace an old one or argue its way in. Everything else about a query is settled before a row moves, and what is left here is only the choices that need a number the statistics do not have, because only the data itself has it.
 
 1. **How the driving source is cut up.** The scheduler sizes the morsels off the rows the source actually reports and the workers it actually has, group-aligned so a morsel's CSR pins and zone reads stay inside one group. A seed's frontier is cut by weight rather than by position when the seed is a celebrity, since equal slices of a skewed neighbourhood are not equal work.
 2. **Chunks the range pushdown empties before decoding.** The zone map answers off the chunk summary, so the payload bytes are never touched.
@@ -68,6 +68,7 @@ The set is closed on purpose. An engine that may adapt anywhere is an engine who
 5. **A close that ends before it builds anything**, the far end of it having no edges at all.
 6. **A bounded sink stopping a morsel** with the rows the limit asked for already in hand.
 7. **Which worker takes which morsel.** Nothing hands them out in advance; a worker takes the next one when it has finished the last, so the spread between the busiest and the idlest worker is the only record of how evenly the work actually fell.
+8. **Whether a neighbor list is read off a group decoded whole or out of the chunks that one list covers.** The walk knows how many of the group's lists it is about to want, storage knows how many chunks the group holds, and the pin starts paying at roughly a quarter as many lists as chunks. A scan morsel is far past that line and a point seed is far short of it, and the difference between the two on a seeded read is three orders of magnitude, since pinning decodes a group's two million edges to hand back one node's sixteen.
 
 None of them persists. Nothing a run learns is written back into the statistics or carried into the next query, so two runs of the same query over the same data make the same decisions from the same evidence. What does move between runs is how the morsels landed on the workers, since decisions 4 and 7 are judged per worker off the rows that worker drew, and the rendering says which of the lines that applies to. The totals underneath are the same either way, because worker-local counts are added.
 

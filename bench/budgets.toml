@@ -964,3 +964,33 @@ exec_join_mprobes_s_core = 0.8
 # raise them.
 refuse_over_answer = 0.6
 refuse_p50_us = 4.0
+
+# Tail latency of a served read (perf/05, zu#76), benches/tail.rs: the
+# p99 of a point seeded one hop over the p50 of the same stream, on a
+# graph with no skew and on one with a lot of it. Half a million people
+# and eight million edges either way, two thousand requests per shape,
+# seeds spread evenly over people because that is how requests arrive.
+#
+# The ratio is gated rather than the latency because it is the number a
+# caller can put a timeout on, and because it holds still across hosts
+# that differ by more than 2x on the latencies themselves. The uniform
+# graph gets 5x since every seed has the same sixteen friends and any
+# spread left is the engine. The power law graph gets 10x because a seed
+# stream over that data really does hand some requests a hundred
+# thousand times the work of the median one, and answering those in
+# order is the job, not a defect to gate away.
+#
+# Writing this bench found one. Before it, a point seeded expand pinned
+# the whole CSR group to read one seed's list, which decodes two million
+# edges to hand back sixteen, and on a working set past the adjacency
+# pool it re-decodes them on every request. The uniform stream read p50
+# 1902.0 us and p99 4354.8 (2.29x), the power law one p50 837.6 and p99
+# 15113.2 (18.04x). Reading only the chunks the list covers, which the
+# snapshot now picks between per group by chunk count, put the same
+# streams at p50 5.9 p99 7.1 (1.21x) and p50 6.1 p99 11.4 (1.88x) on the
+# local M series, and the counts, which never touch a neighbor, at 1.19x
+# on both. So the ceilings sit at roughly 4x and 5x what the engine
+# reads, which leaves room for a slower box without leaving room for
+# that defect to come back.
+tail_p99_p50_uniform_x = 5.0
+tail_p99_p50_power_x = 10.0

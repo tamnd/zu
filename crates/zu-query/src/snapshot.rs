@@ -153,6 +153,30 @@ pub trait Snapshot {
     /// Pins one CSR group of `rel` in `dir`.
     fn csr(&mut self, rel: RelId, group: GroupId, dir: Dir) -> Result<CsrPin>;
 
+    /// How many lists of one group a caller has to want before pinning
+    /// the group beats reading each list on its own. A pin decodes the
+    /// group's whole neighbor array, so it is the right read for a scan
+    /// and the wrong one for a point lookup: a seed with sixteen
+    /// friends does not need the two million edges its group holds
+    /// decoded, and on a working set larger than the decoded pool it
+    /// does not even get to keep them. Backends that decode nothing
+    /// lazily answer 0, which asks for the pin every time.
+    fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Appends one node's sorted neighbor list in `dir` to `out`,
+    /// reading the range that list occupies rather than the group
+    /// around it. Worth it below [`Snapshot::list_threshold`] lists per
+    /// group and a loss above it, since a range read pays its own way
+    /// in per list where a pin pays once for all of them.
+    fn list_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {
+        let group = (node / u64::from(zu_common::GROUP_ROWS)) as GroupId;
+        let pin = self.csr(rel, group, dir)?;
+        out.extend_from_slice(pin.list((node % u64::from(zu_common::GROUP_ROWS)) as usize));
+        Ok(())
+    }
+
     /// Gathers a property column for arbitrary `rows` into one vector
     /// in argument order, decoding each touched chunk once.
     fn gather(

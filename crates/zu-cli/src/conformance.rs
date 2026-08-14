@@ -78,8 +78,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "temporal-values",
-        supported: false,
-        why: "no temporal type in the zu1 column model",
+        supported: true,
+        why: "dates, local times and durations ride their own lanes, declared across the sqlite staging hop",
     },
     Declared {
         key: "list-values",

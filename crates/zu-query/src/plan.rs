@@ -524,6 +524,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::Literal(Literal::Int(v)) => v.to_string(),
         BoundExpr::Literal(Literal::Float(v)) => v.to_string(),
         BoundExpr::Literal(Literal::Str(s)) => format!("'{s}'"),
+        BoundExpr::Literal(Literal::Temporal(t)) => t.to_string(),
         BoundExpr::Param(ix) => format!("${}", query.params[*ix]),
         BoundExpr::Var(slot) => slot_name(query, *slot).to_string(),
         BoundExpr::Property { base, key } => format!("{}.{key}", expr_text(base, query)),

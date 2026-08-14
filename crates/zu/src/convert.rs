@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use zu_common::{FloatBits, LogicalType, Result, ZuError};
+use zu_common::{DurationKind, FloatBits, LogicalType, Result, ZuError};
 use zu_sqlite::{ColumnType, SqliteStore, TableDef, Value};
 use zu_storage::Direction;
 use zu_zu1::catalog::Catalog;
@@ -43,11 +43,15 @@ fn sqlite_type(ty: &LogicalType, name: &str) -> Result<ColumnType> {
         LogicalType::Bytes { .. } => ColumnType::Blob,
         LogicalType::Float { .. } => ColumnType::Real,
         LogicalType::Bool => ColumnType::Boolean,
-        LogicalType::Int { .. }
-        | LogicalType::Date
-        | LogicalType::LocalTime
-        | LogicalType::LocalDatetime
-        | LogicalType::Duration(_) => ColumnType::Integer,
+        LogicalType::Int { .. } => ColumnType::Integer,
+        // The temporal columns keep their declaration on the way out,
+        // so a file that round trips through sqlite comes back holding
+        // dates rather than counts of days.
+        LogicalType::Date => ColumnType::Date,
+        LogicalType::LocalTime => ColumnType::LocalTime,
+        LogicalType::LocalDatetime => ColumnType::LocalDatetime,
+        LogicalType::Duration(DurationKind::DayTime) => ColumnType::Duration,
+        LogicalType::Duration(DurationKind::YearMonth) => ColumnType::YearMonthDuration,
         other => {
             return Err(ZuError::InvalidArgument(format!(
                 "column '{name}' holds {other}, which has no sqlite storage class"
@@ -156,6 +160,22 @@ enum ColumnData {
     Float(Vec<f64>),
     Str(Vec<Vec<u8>>),
     Bytes(Vec<Vec<u8>>),
+    Date(Vec<i32>),
+    /// A count of nanoseconds or of months, whichever the declared type
+    /// asked for, kept together because the lane is the same.
+    Counts(Vec<i64>),
+}
+
+/// What a temporal declaration is called, for the one error that has to
+/// name it.
+fn temporal_name(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Date => "DATE",
+        ColumnType::LocalTime => "LOCALTIME",
+        ColumnType::LocalDatetime => "LOCALDATETIME",
+        ColumnType::YearMonthDuration => "YEARMONTHDURATION",
+        _ => "DURATION",
+    }
 }
 
 /// Converts a sqlite store into a fresh zu1 file at `zu1_path`.
@@ -241,6 +261,47 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             data.push(column.unwrap_or(ColumnData::Int(Vec::new())));
         }
 
+        // The temporal columns arrive as integers too, and like a
+        // boolean they are told apart by the declaration and nothing
+        // else. A date is narrowed here rather than at store time so a
+        // count of days no date can name is refused with the column
+        // that holds it named.
+        for ((name, ty), column) in declared.iter().zip(&mut data) {
+            let want = match ty {
+                ColumnType::Date
+                | ColumnType::LocalTime
+                | ColumnType::LocalDatetime
+                | ColumnType::Duration
+                | ColumnType::YearMonthDuration => *ty,
+                _ => continue,
+            };
+            let ColumnData::Int(vals) = column else {
+                return Err(ZuError::InvalidArgument(format!(
+                    "'{}' column '{name}' is declared {} and does not hold integers",
+                    node.name,
+                    temporal_name(want)
+                )));
+            };
+            let counts: Vec<i64> = vals.iter().map(|&v| v as i64).collect();
+            *column = if want == ColumnType::Date {
+                ColumnData::Date(
+                    counts
+                        .iter()
+                        .map(|&v| {
+                            i32::try_from(v).map_err(|_| {
+                                ZuError::InvalidArgument(format!(
+                                    "'{}' column '{name}' holds {v}, which is no day of any date",
+                                    node.name
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<i32>>>()?,
+                )
+            } else {
+                ColumnData::Counts(counts)
+            };
+        }
+
         // A boolean arrives as integers, because that is all sqlite has
         // to store one in, and the declaration is what says the column
         // was meant as truth values. Anything outside 0 and 1 under that
@@ -282,13 +343,23 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             .iter()
             .zip(&data)
             .zip(&str_refs)
-            .map(|((name, c), refs)| {
+            .zip(&declared)
+            .map(|(((name, c), refs), (_, ty))| {
                 let values = match c {
                     ColumnData::Int(vals) => PropValues::Int(vals),
                     ColumnData::Bool(vals) => PropValues::Bool(vals),
                     ColumnData::Float(vals) => PropValues::Float(vals),
                     ColumnData::Str(_) => PropValues::Str(refs),
                     ColumnData::Bytes(_) => PropValues::Bytes(refs),
+                    ColumnData::Date(vals) => PropValues::Date(vals),
+                    ColumnData::Counts(vals) => match ty {
+                        ColumnType::LocalTime => PropValues::LocalTime(vals),
+                        ColumnType::LocalDatetime => PropValues::LocalDatetime(vals),
+                        ColumnType::YearMonthDuration => {
+                            PropValues::Duration(DurationKind::YearMonth, vals)
+                        }
+                        _ => PropValues::Duration(DurationKind::DayTime, vals),
+                    },
                 };
                 (name.as_str(), values)
             })

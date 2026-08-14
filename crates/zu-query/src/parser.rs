@@ -10,7 +10,7 @@
 //! through one depth guard.
 
 use zu_common::gqlstatus::codes;
-use zu_common::{Field, LogicalType, RecordType, Result, ZuError};
+use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
     BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, PathPattern, Projection,
@@ -22,6 +22,19 @@ use crate::value_type;
 /// A name written where a value type belongs and spelling none.
 fn unknown_type(name: &str) -> ZuError {
     ZuError::gql(codes::C42001, format!("unknown value type '{name}'"))
+}
+
+/// Whether a type is one a temporal literal can be written for.
+fn is_temporal(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::Date
+            | LogicalType::LocalTime
+            | LogicalType::ZonedTime
+            | LogicalType::LocalDatetime
+            | LogicalType::ZonedDatetime
+            | LogicalType::Duration(_)
+    )
 }
 
 /// Hard cap on expression nesting; hostile input past it errors instead
@@ -728,34 +741,9 @@ impl Parser<'_> {
                 Ok(Expr::Map(props))
             }
             TokenKind::Ident(ref name) => {
-                if name.eq_ignore_ascii_case("null") {
-                    self.pos += 1;
-                    return Ok(Expr::Literal(Literal::Null));
-                }
-                if name.eq_ignore_ascii_case("true") {
-                    self.pos += 1;
-                    return Ok(Expr::Literal(Literal::Bool(true)));
-                }
-                if name.eq_ignore_ascii_case("false") {
-                    self.pos += 1;
-                    return Ok(Expr::Literal(Literal::Bool(false)));
-                }
                 let name = name.clone();
                 self.pos += 1;
-                if self.at(&TokenKind::LParen) {
-                    // CAST is written like a call and is not one: its
-                    // second argument is a type, which no expression
-                    // grammar can produce, so it is taken here rather
-                    // than left to a function that would receive a
-                    // variable named INT8.
-                    if name.eq_ignore_ascii_case("CAST") {
-                        self.parse_cast()
-                    } else {
-                        self.parse_call(name)
-                    }
-                } else {
-                    Ok(Expr::Variable(name))
-                }
+                self.parse_named(name)
             }
             TokenKind::QuotedIdent(ref name) => {
                 let name = name.clone();
@@ -764,6 +752,104 @@ impl Parser<'_> {
             }
             _ => Err(self.error("an expression")),
         }
+    }
+
+    /// An expression that begins with an identifier, the identifier
+    /// already read.
+    ///
+    /// This is its own function rather than an arm of `parse_primary`
+    /// because a word can begin four different things and none of them
+    /// recurse: a keyword literal, a temporal literal, a call, or a
+    /// variable. Keeping them out of the dispatch keeps the frame that
+    /// a nested expression pays for on every level down to the
+    /// dispatch itself.
+    fn parse_named(&mut self, name: String) -> Result<Expr> {
+        if name.eq_ignore_ascii_case("null") {
+            return Ok(Expr::Literal(Literal::Null));
+        }
+        if name.eq_ignore_ascii_case("true") {
+            return Ok(Expr::Literal(Literal::Bool(true)));
+        }
+        if name.eq_ignore_ascii_case("false") {
+            return Ok(Expr::Literal(Literal::Bool(false)));
+        }
+        // A temporal literal is a type name and a string, and it has to
+        // be taken before the name becomes a variable, because DATE is
+        // a perfectly good variable name right up until a string
+        // follows it.
+        if let Some(literal) = self.temporal_literal(&name)? {
+            return Ok(literal);
+        }
+        if !self.at(&TokenKind::LParen) {
+            return Ok(Expr::Variable(name));
+        }
+        // CAST is written like a call and is not one: its second
+        // argument is a type, which no expression grammar can produce,
+        // so it is taken here rather than left to a function that would
+        // receive a variable named INT8.
+        if name.eq_ignore_ascii_case("CAST") {
+            self.parse_cast()
+        } else {
+            self.parse_call(name)
+        }
+    }
+
+    /// `DATE '2024-01-15'` and the rest, the type name already read.
+    ///
+    /// The type is what says how to read the string, which is why
+    /// `TIME '10:00:00'` is refused and `LOCAL TIME '10:00:00'` is not:
+    /// a zoned time without an offset is missing the part that makes it
+    /// zoned, and guessing UTC would be inventing a fact.
+    ///
+    /// `None` means this was not a temporal literal at all and the
+    /// caller should carry on reading a variable or a call.
+    fn temporal_literal(&mut self, name: &str) -> Result<Option<Expr>> {
+        let words = match self.peek() {
+            Some(Token {
+                kind: TokenKind::Ident(second),
+                ..
+            }) => {
+                let joined = format!("{name} {second}");
+                let followed = matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token {
+                        kind: TokenKind::Str(_),
+                        ..
+                    })
+                );
+                if followed && value_type::is_type_name(&joined) {
+                    Some(joined)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let (name, skip) = match words {
+            Some(joined) => (joined, 1),
+            None => (name.to_string(), 0),
+        };
+        let text = match self.tokens.get(self.pos + skip) {
+            Some(Token {
+                kind: TokenKind::Str(s),
+                ..
+            }) => s.clone(),
+            _ => return Ok(None),
+        };
+        let Some(ty) = value_type::spelled(&name, &[]) else {
+            return Ok(None);
+        };
+        if !is_temporal(&ty) {
+            return Ok(None);
+        }
+        self.pos += skip + 1;
+        let value = Temporal::parse(&ty, &text).ok_or_else(|| {
+            ZuError::gql(
+                codes::C22007,
+                format!("'{text}' is not a {ty} anyone can read"),
+            )
+        })?;
+        Ok(Some(Expr::Literal(Literal::Temporal(value))))
     }
 
     /// `CAST(expr AS type)`, the opening parenthesis unconsumed.

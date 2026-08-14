@@ -389,6 +389,14 @@ pub trait Graph {
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
+    /// One property of one edge, named by the endpoints a rel value
+    /// carries. The default is the answer an engine that stores nothing
+    /// on an edge gives, which is the answer every engine gave before
+    /// edges could hold anything.
+    fn rel_property(&mut self, rel: u32, src: u64, dst: u64, key: &str) -> Result<Value> {
+        let _ = (rel, src, dst, key);
+        Ok(Value::Null)
+    }
     /// An independent reader over the same storage for a morsel
     /// worker, with its own decoded-state caches. The default `None`
     /// keeps every query on one thread; engines that can open a second
@@ -4307,7 +4315,8 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             // on is one the query declared, and that is what a cast to
             // a record type is for.
             ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
-            Value::Null | Value::Rel { .. } => Ok(Value::Null),
+            Value::Rel { table, src, dst } => ctx.graph.rel_property(table, src, dst, key),
+            Value::Null => Ok(Value::Null),
             other => Err(invalid(format!(
                 "property access on {other:?}, expected a node"
             ))),

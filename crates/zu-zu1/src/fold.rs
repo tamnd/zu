@@ -29,10 +29,11 @@ use std::collections::HashSet;
 use zu_common::{Epoch, GROUP_ROWS, Result, ZuError};
 
 use crate::catalog::{Catalog, RelTable, TableIndex};
-use crate::file::Zu1File;
+use crate::file::{NULL_BLOCK, Zu1File};
 use crate::fullzip::{read_blob_segment, write_blob_segment};
 use crate::graph::{
-    Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain, free_directory,
+    Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain,
+    free_directory_keeping_props, group_bases,
 };
 use crate::keys::write_key_index;
 use crate::meta;
@@ -363,6 +364,19 @@ fn fold_rel(
     let mut reader = GraphReader::load_table(db, &rel.name)?;
     let old = reader.directory().clone();
     let overlay: Vec<(u64, u64)> = mvcc.edges(rel.id, epoch).collect();
+    // An edge property column is in load order, and a rebuild that only
+    // widens the row domain leaves that order alone: the same edges come
+    // back out of the forward CSR in the same sequence, so the columns
+    // carry over untouched. An edge the overlay adds does change the
+    // order, and it arrives with no value for any column, which a dense
+    // column has no way to hold. Rather than invent one the fold refuses;
+    // the write statements of G3 are what has to answer it.
+    if old.props != NULL_BLOCK && !overlay.is_empty() {
+        return Err(ZuError::Unsupported {
+            what: "folding an overlay edge into a rel table that stores edge properties",
+            id: rel.id,
+        });
+    }
     let mut edges: Vec<(u32, u32)> = Vec::with_capacity(old.edge_count as usize + overlay.len());
     for node in 0..old.node_count {
         for &dst in reader.neighbors_dir(db, node, Direction::Fwd)? {
@@ -401,18 +415,20 @@ fn fold_rel(
             Some(by_row)
         }
     };
-    free_directory(db, root)?;
+    free_directory_keeping_props(db, root)?;
     let fwd = build_direction(db, new_count, &edges)?;
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
     rev.sort_unstable();
     let bwd = build_direction(db, new_count, &rev)?;
     drop(rev);
+    let bases = group_bases(new_count, &edges);
     let groups = fwd
         .into_iter()
         .zip(bwd)
         .enumerate()
         .map(|(g, (fwd, bwd))| GroupMeta {
             row_count: (new_count - g as u64 * GROUP_ROWS as u64).min(GROUP_ROWS as u64) as u32,
+            edge_base: bases[g],
             fwd,
             bwd,
         })
@@ -423,6 +439,7 @@ fn fold_rel(
         keys: key_by_row
             .map(|keys| write_key_index(db, &keys))
             .transpose()?,
+        props: old.props,
         groups,
     };
     index.set(rel.id, meta::write_chain(db, &directory.encode())?);
@@ -708,6 +725,89 @@ mod tests {
         txn.commit(&mut wal).unwrap();
         let err = checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap_err();
         assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
+    }
+
+    /// Growing the row domain rebuilds the CSR and leaves the load
+    /// order alone, so the edge columns come through the fold naming
+    /// the same edges they named before it.
+    #[test]
+    fn edge_columns_survive_a_rebuild_over_a_grown_row_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relfold.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        store_props(
+            &mut db,
+            "person",
+            &[("age", PropValues::Int(&[10, 20, 30, 40]))],
+        )
+        .unwrap();
+        crate::props::store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1, 2, 3]))])
+            .unwrap();
+        let catalog = Catalog::load(&mut db).unwrap();
+        let person = catalog.node_by_name("person").unwrap().id;
+        let knows = catalog.rel_by_name("knows").unwrap().id;
+        let mut wal = Wal::open(&dir.path().join("relfold.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.insert_nodes(person, vec![(0, vec![Cell::Int(50), Cell::Int(60)])])
+            .unwrap();
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        assert_eq!(
+            Catalog::load(&mut db)
+                .unwrap()
+                .node_by_id(person)
+                .unwrap()
+                .node_count,
+            6
+        );
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let col = reader.col("since").unwrap();
+        let graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        for (i, (src, dst)) in [(0u64, 1u64), (1, 2), (2, 3)].into_iter().enumerate() {
+            let row = graph.edge_ordinal(&mut db, src, dst).unwrap().unwrap();
+            assert_eq!(row, i as u64);
+            assert_eq!(reader.read_int(&mut db, col, row).unwrap(), i as u64 + 1);
+        }
+        let path = dir.path().join("relfold.zu1");
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// An overlay edge arrives with no value for a column that has one
+    /// per edge, so folding it into a table that stores edge properties
+    /// is refused whole, with the log left holding the txn.
+    #[test]
+    fn an_overlay_edge_on_a_table_with_edge_columns_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relrefuse.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2)]).unwrap();
+        crate::props::store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1, 2]))])
+            .unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("relrefuse.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.insert_rel(knows, 3, 0);
+        txn.commit(&mut wal).unwrap();
+        let err = checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap_err();
+        assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
+        assert!(!wal.is_empty(), "the log still holds the txn");
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let col = reader.col("since").unwrap();
+        assert_eq!(reader.read_int(&mut db, col, 1).unwrap(), 2);
     }
 
     /// A rel table nobody touched keeps its directory root: the fold

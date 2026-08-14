@@ -83,10 +83,12 @@ For each rel table and each direction (FWD keyed by src, BWD keyed by dst):
 CsrGroup {
   offsets:  MiniBlock segment of u32 slot-offsets  (131,073 entries, FOR+bitpack)
   nbr_ids:  segment of u64 NodeIds → stored as (table_id dict) + delta+bitpack row ids
-  rel_cols: parallel segments per rel property, CSR order
+  edge_base: u64 ordinal of this group's first FWD edge (directory version 8)
   slack:    per-list gap slots (see below)
 }
 ```
+
+- **Edge properties** (directory version 8): a rel table's columns are one `PropsDirectory`, the same container a node table's columns use, rooted in the group directory rather than in the table index, whose slot for a rel id already holds that directory. A column's row domain is the **edge ordinal**: an edge's position in the load order, which is sorted by source and then by destination, which is also its position in the concatenated FWD neighbor arrays. So the ordinal is `edge_base + slot`, and the slot is what the binary search inside a list already finds, which makes a backward-reached edge cost the one search a probe costs and a forward walk cost nothing beyond counting. No permutation is stored in either direction, and `zu copy --reorder`, which rewrites the load order, carries none. The derivation names one edge only when the endpoints do, so a rel table that stores properties may not hold the same pair twice, and a store that would make one is refused before anything is written.
 
 - **Sorted neighbor lists** (by neighbor id) → delta+bitpack compresses to the 4–8 bits/edge target on reordered graphs (research §2.2); binary search inside a list for `(a)-[]->(b)` existence checks; galloping intersect for WCOJ.
 - **Slack gaps** (updatable CSR, Kùzu #1474): at build, each list gets `ceil(len * 0.2) + 1` empty slots (growth factor 1.2). Inserts fill slack; a full list triggers **group-local rebuild** (rewrite that CsrGroup only, ~O(≤ few MB)); never a global rebuild. Deletes tombstone in-place (validity bit), compacted at checkpoint when `deleted > 12.5%`.

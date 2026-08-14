@@ -316,6 +316,12 @@ impl Graph for Zu1Graph<'_> {
         if let Some(reader) = props.get_mut(&table).expect("just loaded")
             && let Some(col) = reader.col(key)
         {
+            // A column that holds a null holds a placeholder in the row
+            // that is null, so the mask is asked before the value is
+            // read and the placeholder never leaves storage.
+            if reader.is_nullable(col) && !reader.is_valid(db, col, offset)? {
+                return Ok(Value::Null);
+            }
             let ty = reader.columns()[col].ty.clone();
             if reader.columns()[col].is_lane() {
                 let word = reader.read_int(db, col, offset)?;

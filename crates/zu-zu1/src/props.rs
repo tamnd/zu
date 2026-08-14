@@ -15,7 +15,17 @@
 //! Directory layout: `version: u16`, `node_count: u64`,
 //! `column_count: u32`, then per column `name_len: u16` + UTF-8 bytes,
 //! `type: u8` (a code from [`TYPE_CODES`], or the list code and then
-//! the element's code), and the column's `SegmentMeta`.
+//! the element's code), the column's `SegmentMeta`, and from version 4
+//! a `nullable: u8` flag followed, when it is set, by the segment meta
+//! of the column's validity words.
+//!
+//! A column is dense whether or not it holds a null: every row of the
+//! table's domain has a value in the column's segment. What a null adds
+//! is a second segment saying which of those values a reader may look
+//! at, one bit per row packed into 64 bit words that ride the same
+//! integer cascade the fixed width columns do. A column with no null in
+//! it has no validity segment, so nothing written before a property
+//! could be null costs anything to read now.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -39,9 +49,12 @@ use crate::stats;
 /// nothing else. Version 2 holds a code from [`TYPE_CODES`], which is
 /// the storable part of the logical lattice. Version 3 adds the one
 /// type that needs a second byte, a list, whose code is followed by the
-/// code of its element type. Older directories are still read, because
-/// a file written before this is not wrong, it is just narrow.
-const PROPS_VERSION: u16 = 3;
+/// code of its element type. Version 4 adds the validity flag, which is
+/// the first thing a column entry carries that is not about what the
+/// column holds but about which rows of it hold anything. Older
+/// directories are still read, because a file written before this is
+/// not wrong, it is just narrow.
+const PROPS_VERSION: u16 = 4;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -217,6 +230,11 @@ pub struct PropColumn {
     pub name: String,
     pub ty: LogicalType,
     pub meta: SegmentMeta,
+    /// The column's validity words, one bit per row and the low bit of
+    /// a word first, set where the row holds a value. `None` is a
+    /// column every row of which holds one, which is what every column
+    /// was before a property could be null.
+    pub validity: Option<SegmentMeta>,
 }
 
 impl PropColumn {
@@ -530,6 +548,13 @@ impl PropsDirectory {
             // that reached the directory has a code.
             out.extend_from_slice(&type_bytes(&col.ty).expect("column type is storable"));
             col.meta.encode(&mut out);
+            match &col.validity {
+                Some(meta) => {
+                    out.push(1);
+                    meta.encode(&mut out);
+                }
+                None => out.push(0),
+            }
         }
         out
     }
@@ -600,7 +625,33 @@ impl PropsDirectory {
             pos += 1;
             let (meta, next) = SegmentMeta::decode(bytes, pos)?;
             pos = next;
-            columns.push(PropColumn { name, ty, meta });
+            // A directory older than version 4 has no flag byte and no
+            // null, which is the same column read either way.
+            let validity = if version >= 4 {
+                match bytes.get(pos) {
+                    Some(0) => {
+                        pos += 1;
+                        None
+                    }
+                    Some(1) => {
+                        let (meta, next) = SegmentMeta::decode(bytes, pos + 1)?;
+                        pos = next;
+                        Some(meta)
+                    }
+                    Some(other) => {
+                        return Err(corrupt(format!("validity flag {other} is not 0 or 1")));
+                    }
+                    None => return Err(corrupt("truncated validity flag".into())),
+                }
+            } else {
+                None
+            };
+            columns.push(PropColumn {
+                name,
+                ty,
+                meta,
+                validity,
+            });
         }
         if pos != bytes.len() {
             return Err(corrupt("trailing bytes".into()));
@@ -618,11 +669,61 @@ pub(crate) fn free_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
         for &ptr in &col.meta.blocks {
             db.free_block(ptr)?;
         }
+        for &ptr in col.validity.iter().flat_map(|m| &m.blocks) {
+            db.free_block(ptr)?;
+        }
     }
     for ptr in meta::chain_blocks(db, root)? {
         db.free_block(ptr)?;
     }
     Ok(())
+}
+
+/// Whether a mask says every one of `rows` rows holds a value. The
+/// bits past the last row are not the caller's to set, so they are not
+/// read here either.
+fn all_set(mask: &[u64], rows: usize) -> bool {
+    let whole = rows / 64;
+    let rest = rows % 64;
+    mask[..whole].iter().all(|&w| w == u64::MAX)
+        && (rest == 0 || mask[whole] & ((1u64 << rest) - 1) == (1u64 << rest) - 1)
+}
+
+/// One column at store time: what it is called, the value of every row
+/// of it, and which of those rows hold one.
+#[derive(Debug, Clone, Copy)]
+pub struct PropInput<'a> {
+    pub name: &'a str,
+    pub values: PropValues<'a>,
+    /// One bit per row, the low bit of a word first, set where the row
+    /// holds a value. `None` is a column with a value in every row.
+    ///
+    /// A null row still needs something in `values`, because the column
+    /// is dense either way; what goes there is never read, so a zero or
+    /// an empty string is the usual choice. The mask is what a reader
+    /// consults, and it is the only thing that says the row is null.
+    pub validity: Option<&'a [u64]>,
+}
+
+impl<'a> PropInput<'a> {
+    /// A column with a value in every row.
+    pub fn dense(name: &'a str, values: PropValues<'a>) -> Self {
+        Self {
+            name,
+            values,
+            validity: None,
+        }
+    }
+
+    /// Whether row `row` holds a value.
+    fn holds(&self, row: usize) -> bool {
+        match self.validity {
+            Some(words) => words
+                .get(row / 64)
+                .is_some_and(|w| w & (1u64 << (row % 64)) != 0),
+            None => true,
+        }
+    }
 }
 
 /// Stores the property columns of `node_table`, replacing any earlier
@@ -634,16 +735,39 @@ pub fn store_props(
     node_table: &str,
     columns: &[(&str, PropValues)],
 ) -> Result<PropsDirectory> {
+    let inputs: Vec<PropInput> = columns
+        .iter()
+        .map(|(name, values)| PropInput::dense(name, *values))
+        .collect();
+    store_props_nullable(db, node_table, &inputs)
+}
+
+/// The same store, for columns some rows of which hold no value.
+pub fn store_props_nullable(
+    db: &mut Zu1File,
+    node_table: &str,
+    columns: &[PropInput],
+) -> Result<PropsDirectory> {
     let catalog = Catalog::load(db)?;
     let table = catalog
         .node_by_name(node_table)
         .ok_or_else(|| ZuError::InvalidArgument(format!("no node table '{node_table}'")))?;
     let (table_id, node_count) = (table.id, table.node_count);
-    for (name, values) in columns {
+    let words = (node_count as usize).div_ceil(64);
+    for column in columns {
+        let (name, values) = (column.name, &column.values);
         if values.len() as u64 != node_count {
             return Err(ZuError::InvalidArgument(format!(
                 "column '{name}' holds {} values over {node_count} rows",
                 values.len()
+            )));
+        }
+        if let Some(mask) = column.validity
+            && mask.len() != words
+        {
+            return Err(ZuError::InvalidArgument(format!(
+                "column '{name}' has {} validity words over {node_count} rows, which wants {words}",
+                mask.len()
             )));
         }
     }
@@ -654,7 +778,8 @@ pub fn store_props(
     }
     let mut cols = Vec::with_capacity(columns.len());
     let mut col_stats = BTreeMap::new();
-    for (name, values) in columns {
+    for column in columns {
+        let (name, values) = (column.name, &column.values);
         // The values are all in hand here and nowhere else, so this is
         // where the estimator's statistics get built: a COPY that
         // brings properties leaves the optimizer able to reason about
@@ -676,32 +801,52 @@ pub fn store_props(
             _ => Vec::new(),
         };
         let blobs: Vec<&[u8]> = encoded.iter().map(|b| &b[..]).collect();
-        let stat = match values.keys() {
-            Some(keys) => {
-                let keys: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
-                stats::column_stats(&keys)
-            }
-            // A list column's statistics are built over its encoded
-            // rows, which counts distinct lists correctly and gives a
-            // range no comparison asks about, since a list column is
-            // not a column anything ranges over.
-            None => match values {
-                PropValues::Str(v) | PropValues::Bytes(v) => stats::column_stats(v),
-                PropValues::List { .. } => stats::column_stats(&blobs),
-                _ => unreachable!("every fixed width column has lane keys"),
-            },
+        let lane_keys = values.keys();
+        // A list column's statistics are built over its encoded rows,
+        // which counts distinct lists correctly and gives a range no
+        // comparison asks about, since a list column is not a column
+        // anything ranges over.
+        let sortable: Vec<&[u8]> = match (&lane_keys, values) {
+            (Some(keys), _) => keys.iter().map(|k| &k[..]).collect(),
+            (None, PropValues::Str(v) | PropValues::Bytes(v)) => v.to_vec(),
+            (None, PropValues::List { .. }) => blobs.clone(),
+            (None, _) => unreachable!("every fixed width column has lane keys"),
         };
-        col_stats.insert((*name).to_string(), stat);
+        // Statistics describe what a query can find, and a null row
+        // holds nothing to find, so the rows without a value are left
+        // out of them. A column whose range came from its placeholders
+        // would have the optimizer expecting rows no predicate returns.
+        let stat = match column.validity {
+            None => stats::column_stats(&sortable),
+            Some(_) => {
+                let live: Vec<&[u8]> = sortable
+                    .iter()
+                    .enumerate()
+                    .filter(|(row, _)| column.holds(*row))
+                    .map(|(_, value)| *value)
+                    .collect();
+                stats::column_stats(&live)
+            }
+        };
+        col_stats.insert(name.to_string(), stat);
         let meta = match (values.lane(), values) {
             (Some(words), _) => write_segment(db, &words)?,
             (None, PropValues::Str(v) | PropValues::Bytes(v)) => write_blob_segment(db, v)?,
             (None, PropValues::List { .. }) => write_blob_segment(db, &blobs)?,
             (None, _) => unreachable!("every variable width column is a blob"),
         };
+        // A mask with every bit set says nothing a reader does not
+        // already assume, so it is not written: a caller that hands one
+        // over gets the column it would have got without it.
+        let validity = match column.validity {
+            Some(mask) if !all_set(mask, node_count as usize) => Some(write_segment(db, mask)?),
+            _ => None,
+        };
         cols.push(PropColumn {
-            name: (*name).to_string(),
+            name: name.to_string(),
             ty,
             meta,
+            validity,
         });
     }
     let directory = PropsDirectory {
@@ -753,6 +898,11 @@ pub struct PropsReader {
     directory: PropsDirectory,
     int_state: BTreeMap<usize, (Arc<ChunkDirectory>, ChunkCache)>,
     str_state: BTreeMap<usize, StrChunk>,
+    /// The same cache again for the validity words of the columns that
+    /// have any. It is a second map rather than a second entry in the
+    /// first because most columns have no validity segment and the ones
+    /// that do are read through a different index, a word per 64 rows.
+    valid_state: BTreeMap<usize, (Arc<ChunkDirectory>, ChunkCache)>,
     /// Row order scratch for the gathers, reused across calls.
     order_scratch: Vec<u32>,
 }
@@ -763,8 +913,34 @@ impl PropsReader {
             directory,
             int_state: BTreeMap::new(),
             str_state: BTreeMap::new(),
+            valid_state: BTreeMap::new(),
             order_scratch: Vec::new(),
         }
+    }
+
+    /// Whether row `row` of `col` holds a value.
+    ///
+    /// A column with no validity segment holds one in every row, which
+    /// is the answer without a read, so a graph that stores no null
+    /// pays nothing for the question.
+    pub fn is_valid(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<bool> {
+        let Some(meta) = self.directory.columns[col].validity.clone() else {
+            return Ok(true);
+        };
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.valid_state.entry(col) {
+            let pools = db.pools();
+            let dir = load_chunk_directory_pooled(db, &pools.fences, &meta)?;
+            slot.insert((dir, ChunkCache::default()));
+        }
+        let (dir, cache) = self.valid_state.get_mut(&col).expect("just inserted");
+        let word = read_one_cached(db, &meta, dir, cache, row / 64)?;
+        Ok(word & (1u64 << (row % 64)) != 0)
+    }
+
+    /// Whether `col` has a null in it anywhere, which is what says
+    /// whether a reader has to ask [`Self::is_valid`] at all.
+    pub fn is_nullable(&self, col: usize) -> bool {
+        self.directory.columns[col].validity.is_some()
     }
 
     pub fn columns(&self) -> &[PropColumn] {
@@ -1594,5 +1770,78 @@ mod tests {
         let mut trailing = good;
         trailing.push(0);
         assert!(PropsDirectory::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn a_column_says_which_of_its_rows_hold_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let ids = [10u64, 0, 30, 0];
+        let names: Vec<&[u8]> = vec![b"Ada", b"Grace", b"Edsger", b"Barbara"];
+        // Rows 0 and 2 hold an id, rows 1 and 3 do not. The placeholder
+        // is still written, because the column is dense either way.
+        let mask = [0b0101u64];
+        let stored = store_props_nullable(
+            &mut db,
+            "person",
+            &[
+                PropInput {
+                    name: "id",
+                    values: PropValues::Int(&ids),
+                    validity: Some(&mask),
+                },
+                PropInput::dense("firstName", PropValues::Str(&names)),
+            ],
+        )
+        .unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let loaded = load_props(&mut db, table).unwrap().unwrap();
+        assert_eq!(loaded, stored);
+
+        let mut reader = PropsReader::new(loaded);
+        let id = reader.col("id").unwrap();
+        let name = reader.col("firstName").unwrap();
+        assert!(reader.is_nullable(id));
+        // A column with a value on every row carries no validity words
+        // at all, so it costs nothing to be able to hold a null.
+        assert!(!reader.is_nullable(name));
+        for row in 0..4u64 {
+            assert_eq!(
+                reader.is_valid(&mut db, id, row).unwrap(),
+                row % 2 == 0,
+                "row {row}"
+            );
+            assert!(reader.is_valid(&mut db, name, row).unwrap());
+        }
+        assert_eq!(reader.read_int(&mut db, id, 2).unwrap(), 30);
+
+        // The statistics a scan reads count only the rows holding a
+        // value, so a null cannot pass for one the planner then counts.
+        let stats = stats::Stats::load(&mut db).unwrap();
+        let col = &stats.cols[&table]["id"];
+        assert_eq!(col.rows, 2);
+    }
+
+    #[test]
+    fn a_validity_mask_of_the_wrong_length_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let ids = [1u64, 2, 3, 4];
+        let short: [u64; 0] = [];
+        let err = store_props_nullable(
+            &mut db,
+            "person",
+            &[PropInput {
+                name: "id",
+                values: PropValues::Int(&ids),
+                validity: Some(&short),
+            }],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("validity"), "{err}");
     }
 }

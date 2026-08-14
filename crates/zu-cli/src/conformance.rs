@@ -88,8 +88,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "null-properties",
-        supported: false,
-        why: "property columns are dense, so there is no null to store",
+        supported: true,
+        why: "a column is dense either way and carries validity words saying which of its rows hold a value",
     },
     Declared {
         key: "float-values",

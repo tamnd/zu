@@ -235,6 +235,17 @@ pub fn ingest_nodes(
                 stored.name, stored.ty
             )));
         }
+        // An appended row would have no bit in the column's validity
+        // mask, and there is no way in this call to say whether it
+        // holds a value. Refused here rather than at the fold, so the
+        // message names the column; G3's write statements are what has
+        // to answer it.
+        if stored.validity.is_some() {
+            return Err(ZuError::Unsupported {
+                what: "appending rows to a column that holds a null",
+                id: col,
+            });
+        }
         if std::mem::replace(&mut covered[col as usize], true) {
             return Err(ZuError::InvalidArgument(format!(
                 "ingest carries column '{}' twice",

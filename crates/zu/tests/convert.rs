@@ -212,8 +212,111 @@ fn distinct_endpoint_rels_error_cleanly() {
     );
 }
 
+/// A null crosses the hop as a null and not as the placeholder the row
+/// holds underneath it, including when it is the first row of the column
+/// and the type has to come from a row further down.
 #[test]
-fn null_properties_error_cleanly() {
+fn null_properties_survive_the_hop_and_read_back_as_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let mut sq = SqliteStore::open(&db).unwrap();
+    sq.create_node_table(
+        "person",
+        &[("age", ColumnType::Integer), ("name", ColumnType::Text)],
+    )
+    .unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
+    sq.begin().unwrap();
+    sq.insert_node_at(
+        "person",
+        0,
+        &[SqlValue::Null, SqlValue::Text("ada".to_owned())],
+    )
+    .unwrap();
+    sq.insert_node_at(
+        "person",
+        1,
+        &[SqlValue::Int(31), SqlValue::Text("bob".to_owned())],
+    )
+    .unwrap();
+    sq.insert_node_at("person", 2, &[SqlValue::Null, SqlValue::Null])
+        .unwrap();
+    sq.insert_rel("knows", 0, 1, &[]).unwrap();
+    sq.commit().unwrap();
+    drop(sq);
+
+    let out = dir.path().join("b.zu1");
+    sqlite_to_zu1(&db, &out).unwrap();
+    let mut zu = Zu1File::open(&out).unwrap();
+
+    let q = "MATCH (p:person) RETURN p.id AS id, p.age AS age, p.name AS name ORDER BY id";
+    let got = run_zu1(q, &mut zu, &[]).unwrap();
+    assert_eq!(got.rows.len(), 3);
+    assert_eq!(format!("{:?}", got.rows[0][1]), "Null");
+    assert_eq!(format!("{:?}", got.rows[2][1]), "Null");
+    assert_eq!(format!("{:?}", got.rows[2][2]), "Null");
+    assert_ne!(format!("{:?}", got.rows[1][1]), "Null");
+
+    // The predicates a null answers are the two that ask about it, and a
+    // comparison against one is unknown rather than false, so neither the
+    // equality nor its negation picks up the rows holding nothing.
+    let counts = |q: &str, zu: &mut Zu1File| -> usize { run_zu1(q, zu, &[]).unwrap().rows.len() };
+    assert_eq!(
+        counts("MATCH (p:person) WHERE p.age IS NULL RETURN p.id", &mut zu),
+        2
+    );
+    assert_eq!(
+        counts(
+            "MATCH (p:person) WHERE p.age IS NOT NULL RETURN p.id",
+            &mut zu
+        ),
+        1
+    );
+    assert_eq!(
+        counts("MATCH (p:person) WHERE p.age = 31 RETURN p.id", &mut zu),
+        1
+    );
+    assert_eq!(
+        counts("MATCH (p:person) WHERE p.age <> 31 RETURN p.id", &mut zu),
+        0
+    );
+
+    // A set function drops the nulls before it counts, so COUNT over the
+    // column is not COUNT over the rows.
+    let agg = run_zu1(
+        "MATCH (p:person) RETURN count(p.age) AS have, count(*) AS rows",
+        &mut zu,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(format!("{:?}", agg.rows[0][0]), "Int(1)");
+    assert_eq!(format!("{:?}", agg.rows[0][1]), "Int(3)");
+
+    // And back the other way, where writing the placeholder out would
+    // turn the null into a zero and an empty string.
+    let back = dir.path().join("c.db");
+    zu1_to_sqlite(&out, &back).unwrap();
+    let sq = SqliteStore::open(&back).unwrap();
+    assert_eq!(
+        sq.read_node_prop("person", 0, "age").unwrap(),
+        SqlValue::Null
+    );
+    assert_eq!(
+        sq.read_node_prop("person", 1, "age").unwrap(),
+        SqlValue::Int(31)
+    );
+    assert_eq!(
+        sq.read_node_prop("person", 2, "name").unwrap(),
+        SqlValue::Null
+    );
+}
+
+/// A column that is null on every row still has a type, because the
+/// sqlite table declared one, so it stores as an empty column of that
+/// type with no row set in its validity words.
+#[test]
+fn a_column_of_nothing_but_nulls_takes_its_type_from_the_declaration() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("a.db");
     let mut sq = SqliteStore::open(&db).unwrap();
@@ -222,14 +325,21 @@ fn null_properties_error_cleanly() {
     sq.create_rel_table("knows", "person", "person", &[])
         .unwrap();
     sq.begin().unwrap();
-    sq.insert_node_at("person", 0, &[SqlValue::Int(31)])
-        .unwrap();
+    sq.insert_node_at("person", 0, &[SqlValue::Null]).unwrap();
     sq.insert_node_at("person", 1, &[SqlValue::Null]).unwrap();
     sq.insert_rel("knows", 0, 1, &[]).unwrap();
     sq.commit().unwrap();
     drop(sq);
-    let err = sqlite_to_zu1(&db, &dir.path().join("b.zu1")).unwrap_err();
-    assert!(format!("{err}").contains("null"), "unexpected error: {err}");
+    let out = dir.path().join("b.zu1");
+    sqlite_to_zu1(&db, &out).unwrap();
+    let mut zu = Zu1File::open(&out).unwrap();
+    let got = run_zu1(
+        "MATCH (p:person) WHERE p.age IS NULL RETURN p.id",
+        &mut zu,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(got.rows.len(), 2);
 }
 
 /// A float column and a byte string column survive both hops, and the

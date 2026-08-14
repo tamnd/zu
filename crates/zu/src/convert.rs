@@ -25,7 +25,10 @@ use zu_storage::Direction;
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{Direction as Zu1Direction, GraphReader, bulk_load_as};
-use zu_zu1::props::{ListElement, PropValues, PropsReader, list_elements, load_props, store_props};
+use zu_zu1::props::{
+    ListElement, PropInput, PropValues, PropsReader, list_elements, load_props,
+    store_props_nullable,
+};
 
 /// The staged element kind a stored list's element type names, `None`
 /// for a type no staging column declares.
@@ -120,6 +123,13 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
             let mut values = Vec::with_capacity(cols.len());
             if let Some(reader) = reader.as_mut() {
                 for (ci, (name, ty)) in cols.iter().enumerate() {
+                    // A row holding nothing holds a placeholder underneath,
+                    // and writing that out would turn a null into a zero or
+                    // an empty string on the way back.
+                    if reader.is_nullable(ci) && !reader.is_valid(&mut zu, ci, row)? {
+                        values.push(Value::Null);
+                        continue;
+                    }
                     values.push(match ty {
                         LogicalType::Str { .. } => {
                             buf.clear();
@@ -246,6 +256,45 @@ enum ColumnData {
     List(LogicalType, Vec<Vec<OwnedElement>>),
 }
 
+impl ColumnData {
+    /// An empty column of the kind this declaration asks for, which is
+    /// the only thing that says what a column holds when every row of
+    /// it is null and there is no value to read the kind off.
+    fn empty(ty: ColumnType) -> Self {
+        match ty {
+            ColumnType::Real => ColumnData::Float(Vec::new()),
+            ColumnType::Text
+            | ColumnType::IntegerList
+            | ColumnType::RealList
+            | ColumnType::TextList
+            | ColumnType::BooleanList => ColumnData::Str(Vec::new()),
+            ColumnType::Blob => ColumnData::Bytes(Vec::new()),
+            _ => ColumnData::Int(Vec::new()),
+        }
+    }
+
+    /// Puts something in the slot of a row that holds nothing.
+    ///
+    /// The column is dense whether or not a row of it is null, so every
+    /// row needs a value here and the mask is what says which of them
+    /// mean anything. Nothing reads this one. A list column takes the
+    /// empty array rather than the empty string, because the pass that
+    /// reads a list out of its staged text reads every row including
+    /// this one, and the empty string is not an array.
+    fn push_placeholder(&mut self, listed: bool) {
+        match self {
+            ColumnData::Int(vals) => vals.push(0),
+            ColumnData::Bool(vals) => vals.push(false),
+            ColumnData::Float(vals) => vals.push(0.0),
+            ColumnData::Str(vals) => vals.push(if listed { b"[]".to_vec() } else { Vec::new() }),
+            ColumnData::Bytes(vals) => vals.push(Vec::new()),
+            ColumnData::Date(vals) => vals.push(0),
+            ColumnData::Counts(vals) => vals.push(0),
+            ColumnData::List(_, rows) => rows.push(Vec::new()),
+        }
+    }
+}
+
 /// A [`ListElement`] that owns what it points at.
 enum OwnedElement {
     Word(u64),
@@ -361,8 +410,17 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
         let cols: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
         let count = sq.node_count(&node.name)?;
         let mut data = Vec::with_capacity(cols.len());
-        for col in &cols {
+        let mut masks = Vec::with_capacity(cols.len());
+        for (col, declared_ty) in &declared {
+            let listed = staged_list(*declared_ty).is_some();
             let mut column: Option<ColumnData> = None;
+            // One bit per row, set where the row holds a value. A null
+            // row before the first value has nowhere to put its
+            // placeholder yet, because the kind of the column is read
+            // off the first value there is, so those are counted and
+            // filled in once there is one.
+            let mut mask = vec![0u64; (count as usize).div_ceil(64)];
+            let mut leading = 0usize;
             for row in 0..count {
                 let bad = |what: &str| {
                     ZuError::InvalidArgument(format!(
@@ -371,22 +429,45 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                         node.name
                     ))
                 };
-                match (sq.read_node_prop(&node.name, row, col)?, &mut column) {
-                    (Value::Int(v), None) => column = Some(ColumnData::Int(vec![v as u64])),
-                    (Value::Int(v), Some(ColumnData::Int(vals))) => vals.push(v as u64),
-                    (Value::Real(v), None) => column = Some(ColumnData::Float(vec![v])),
-                    (Value::Real(v), Some(ColumnData::Float(vals))) => vals.push(v),
-                    (Value::Text(v), None) => {
-                        column = Some(ColumnData::Str(vec![v.into_bytes()]));
+                let value = sq.read_node_prop(&node.name, row, col)?;
+                if matches!(value, Value::Null) {
+                    match &mut column {
+                        Some(data) => data.push_placeholder(listed),
+                        None => leading += 1,
                     }
-                    (Value::Text(v), Some(ColumnData::Str(vals))) => vals.push(v.into_bytes()),
-                    (Value::Blob(v), None) => column = Some(ColumnData::Bytes(vec![v])),
-                    (Value::Blob(v), Some(ColumnData::Bytes(vals))) => vals.push(v),
-                    (Value::Null, _) => return Err(bad("is null")),
-                    (_, Some(_)) => return Err(bad("changes type")),
+                    continue;
                 }
+                if column.is_none() {
+                    let mut fresh = match &value {
+                        Value::Real(_) => ColumnData::Float(Vec::new()),
+                        Value::Text(_) => ColumnData::Str(Vec::new()),
+                        Value::Blob(_) => ColumnData::Bytes(Vec::new()),
+                        _ => ColumnData::Int(Vec::new()),
+                    };
+                    for _ in 0..leading {
+                        fresh.push_placeholder(listed);
+                    }
+                    column = Some(fresh);
+                }
+                match (value, column.as_mut().expect("just set")) {
+                    (Value::Int(v), ColumnData::Int(vals)) => vals.push(v as u64),
+                    (Value::Real(v), ColumnData::Float(vals)) => vals.push(v),
+                    (Value::Text(v), ColumnData::Str(vals)) => vals.push(v.into_bytes()),
+                    (Value::Blob(v), ColumnData::Bytes(vals)) => vals.push(v),
+                    _ => return Err(bad("changes type")),
+                }
+                mask[row as usize / 64] |= 1u64 << (row % 64);
             }
-            data.push(column.unwrap_or(ColumnData::Int(Vec::new())));
+            data.push(column.unwrap_or_else(|| {
+                // Every row is null, so the declaration is the only
+                // thing left that says what the column holds.
+                let mut empty = ColumnData::empty(*declared_ty);
+                for _ in 0..leading {
+                    empty.push_placeholder(listed);
+                }
+                empty
+            }));
+            masks.push(mask);
         }
 
         // The temporal columns arrive as integers too, and like a
@@ -527,13 +608,14 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                 _ => Vec::new(),
             })
             .collect();
-        let columns: Vec<(&str, PropValues)> = cols
+        let columns: Vec<PropInput> = cols
             .iter()
             .zip(&data)
             .zip(&str_refs)
             .zip(&declared)
             .zip(&list_rows)
-            .map(|((((name, c), refs), (_, ty)), lists)| {
+            .zip(&masks)
+            .map(|(((((name, c), refs), (_, ty)), lists), mask)| {
                 let values = match c {
                     ColumnData::Int(vals) => PropValues::Int(vals),
                     ColumnData::Bool(vals) => PropValues::Bool(vals),
@@ -551,10 +633,17 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                         _ => PropValues::Duration(DurationKind::DayTime, vals),
                     },
                 };
-                (name.as_str(), values)
+                // The mask goes over whether or not the column has a
+                // null in it; a mask with every bit set is not written,
+                // so a column with no null is stored the way it was.
+                PropInput {
+                    name: name.as_str(),
+                    values,
+                    validity: Some(mask),
+                }
             })
             .collect();
-        store_props(&mut zu, &node.name, &columns)?;
+        store_props_nullable(&mut zu, &node.name, &columns)?;
     }
     Ok(())
 }

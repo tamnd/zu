@@ -16,7 +16,7 @@ use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
 use crate::zu1::props::{PropsReader, load_props};
-use zu_common::{FloatBits, LogicalType};
+use zu_common::{FloatBits, LogicalType, Temporal};
 
 /// The types [`run`] speaks, re-exported here so a caller that depends
 /// on `zu` alone can bind a parameter and read a row back without also
@@ -139,14 +139,25 @@ fn word_value(ty: &LogicalType, word: u64, key: &str) -> Result<Value> {
             FloatBits::B32 => Value::Float(f64::from(f32::from_bits(word as u32))),
             _ => Value::Float(f64::from_bits(word)),
         },
+        // The temporal lanes are counts with a meaning: days since the
+        // epoch, nanoseconds since midnight or since the epoch, and
+        // months or nanoseconds for the two duration kinds. The lane
+        // does not carry a zone, so the zoned types are not among them
+        // and say so rather than reading as though they were local.
+        LogicalType::Date => Value::Temporal(Temporal::Date(
+            i32::try_from(word as i64).map_err(|_| unreadable(ty, key))?,
+        )),
+        LogicalType::LocalTime => Value::Temporal(Temporal::LocalTime(word as i64)),
+        LogicalType::LocalDatetime => Value::Temporal(Temporal::LocalDatetime(word as i64)),
+        LogicalType::Duration(kind) => Value::Temporal(Temporal::Duration(*kind, word as i64)),
         other => return Err(unreadable(other, key)),
     })
 }
 
 /// A column zu can store but the runtime has no value for yet. The
-/// temporal types are stored here before the executor can hold one, so
-/// a read of one says what it met rather than handing back a word
-/// dressed as an integer.
+/// zoned temporal types are stored here before the lane can carry the
+/// offset that makes them zoned, so a read of one says what it met
+/// rather than handing back a word dressed as an integer.
 fn unreadable(ty: &LogicalType, key: &str) -> ZuError {
     ZuError::InvalidArgument(format!(
         "property '{key}' holds {ty}, which this engine cannot yet read into a value"

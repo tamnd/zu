@@ -5,7 +5,7 @@
 //! what a label means) belong to the binder, so the AST stays a plain
 //! description of the text.
 
-use zu_common::LogicalType;
+use zu_common::{LogicalType, Temporal};
 
 /// A whole query: clauses in source order, ending in `RETURN`.
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +179,10 @@ pub enum Literal {
     Int(i64),
     Float(f64),
     Str(String),
+    /// A temporal value written with its type, as in `DATE '2024-01-15'`.
+    /// The text is read at parse time, so the plan carries the instant
+    /// and never the spelling.
+    Temporal(Temporal),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

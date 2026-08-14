@@ -50,15 +50,30 @@ xor_expr        = and_expr , { "XOR" , and_expr } ;
 and_expr        = not_expr , { "AND" , not_expr } ;
 not_expr        = { "NOT" } , comparison ;
 comparison      = additive , { comparison_op , additive
-                             | "IS" , [ "NOT" ] , "NULL" } ;
+                             | "IS" , [ "NOT" ] , "NULL"
+                             | "IS" , [ "NOT" ] , "TYPED" , value_type } ;
 comparison_op   = "=" | "<>" | "<" | "<=" | ">" | ">=" | "IN"
                 | "STARTS" , "WITH" | "ENDS" , "WITH" | "CONTAINS" ;
 additive        = multiplicative , { ( "+" | "-" ) , multiplicative } ;
 multiplicative  = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
-primary         = literal | parameter | name | function_call
+primary         = literal | temporal_literal | parameter | name
+                | function_call | cast
                 | "(" , expression , ")" | list | map ;
+
+cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
+(* A value type is a name, its arguments, and whether it admits null.
+   The names are the ISO spellings and live in one table; see
+   crates/zu-query/src/value_type.rs. *)
+value_type      = type_component , { "|" , type_component } ,
+                  [ "NOT" , "NULL" ] ;
+type_component  = "ANY" , [ "VALUE" | "RECORD" | "GRAPH"
+                          | "PROPERTY" , "VALUE" ]
+                | "RECORD" , [ record_fields ]
+                | type_name , [ "(" , integer , { "," , integer } , ")" ] ;
+record_fields   = "{" , [ name , "::" , value_type ,
+                  { "," , name , "::" , value_type } ] , "}" ;
 
 function_call   = name , "(" , [ "DISTINCT" ] ,
                   [ "*" | expression , { "," , expression } ] , ")" ;
@@ -66,6 +81,18 @@ list            = "[" , [ expression , { "," , expression } ] , "]" ;
 map             = property_map ;
 
 literal         = "NULL" | "TRUE" | "FALSE" | integer | float | string ;
+(* A temporal literal is a type name and the value written as a string,
+   so DATE '2024-01-15' and DURATION 'P2D'. The name is read as a type
+   only when a string follows it, which leaves DATE usable as a name. *)
+temporal_literal = temporal_name , string ;
+temporal_name   = "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "DURATION"
+                | "INTERVAL" | ( "LOCAL" | "ZONED" ) ,
+                  ( "TIME" | "DATETIME" | "TIMESTAMP" ) ;
+(* Every ISO spelling of a type: the integer tower and its word
+   spellings, the decimals, the floats, BOOL, the string and byte string
+   names, the temporal names above, PATH, BINDING TABLE, NULL and
+   NOTHING. *)
+type_name       = identifier , [ identifier ] ;
 
 (* Lexical shapes. *)
 

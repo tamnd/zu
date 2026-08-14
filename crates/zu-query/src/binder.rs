@@ -1373,6 +1373,11 @@ impl Binder<'_> {
                     Literal::Int(_) => Type::Int,
                     Literal::Float(_) => Type::Float,
                     Literal::Str(_) => Type::Str,
+                    // The static lattice has no temporal type yet, so a
+                    // temporal literal is only known to be a value. It
+                    // reaches the runtime typed and the checks that
+                    // matter happen there.
+                    Literal::Temporal(_) => Type::Any,
                 };
                 Ok((BoundExpr::Literal(lit.clone()), ty))
             }
@@ -1656,6 +1661,7 @@ pub fn text(expr: &Expr) -> String {
         Expr::Literal(Literal::Int(v)) => v.to_string(),
         Expr::Literal(Literal::Float(v)) => v.to_string(),
         Expr::Literal(Literal::Str(s)) => format!("'{s}'"),
+        Expr::Literal(Literal::Temporal(t)) => t.to_string(),
         Expr::Param(p) => format!("${p}"),
         Expr::Variable(v) => v.clone(),
         Expr::Property { base, key } => format!("{}.{key}", text(base)),

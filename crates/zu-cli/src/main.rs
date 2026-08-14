@@ -896,6 +896,10 @@ fn write_json_value(out: &mut String, v: &Value) {
         }
         Value::Float(_) => out.push_str("null"),
         Value::Str(s) => write_json_str(out, s),
+        // A temporal value goes out as the text it was written
+        // with. JSON has no date, and a reader that gets a number of
+        // days has to know which epoch to count from.
+        Value::Temporal(t) => write_json_str(out, &t.to_string()),
         Value::Node { table, offset } => {
             let _ = write!(out, "{{\"table\":{table},\"offset\":{offset}}}");
         }
@@ -1001,6 +1005,7 @@ fn display_value(v: &Value) -> String {
             let parts: Vec<String> = items.iter().map(display_value).collect();
             format!("[{}]", parts.join(", "))
         }
+        Value::Temporal(t) => t.to_string(),
         Value::Path(_) => "path".to_owned(),
     }
 }

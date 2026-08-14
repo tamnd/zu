@@ -56,7 +56,7 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
         // constructed types are the ones it cannot hold.
         LogicalType::AnyProperty => matches!(
             v,
-            Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+            Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Temporal(_)
         ),
         // GV71 and GV72. The null type has one value and this is not
         // it, and the empty type has none.
@@ -85,12 +85,18 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
         },
         LogicalType::Bytes { .. } => false,
 
+        // A temporal value knows which of the six it is, and the two
+        // duration kinds are two types rather than one, so a day time
+        // duration is not a year month one.
         LogicalType::Date
         | LogicalType::LocalTime
         | LogicalType::LocalDatetime
         | LogicalType::ZonedTime
         | LogicalType::ZonedDatetime
-        | LogicalType::Duration(_) => false,
+        | LogicalType::Duration(_) => match v {
+            Value::Temporal(t) => t.logical_type() == *ty,
+            _ => false,
+        },
 
         LogicalType::Node(_) => matches!(v, Value::Node { .. }),
         LogicalType::Edge(_) => matches!(v, Value::Rel { .. }),

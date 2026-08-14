@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
-use zu_common::{Result, ZuError};
+use zu_common::{DurationKind, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
@@ -99,6 +99,11 @@ pub enum Value {
         dst: u64,
     },
     List(Vec<Value>),
+    /// A date, a time, a datetime or a duration. One arm rather than
+    /// six, because a temporal value is a count and a meaning and the
+    /// meaning is what [`Temporal`] carries; the executor treats them
+    /// alike everywhere except where the calendar is involved.
+    Temporal(Temporal),
     /// A PMR chain (docs/07 §5): the executor-internal form of a
     /// variable-length path. [`settle`] turns it into the edge list
     /// before any value leaves the pipeline, so results never hold one.
@@ -713,9 +718,15 @@ impl Ord for OrdValue {
                 Value::Bool(_) => 1,
                 Value::Int(_) | Value::Float(_) => 2,
                 Value::Str(_) => 3,
-                Value::Node { .. } => 4,
-                Value::Rel { .. } => 5,
-                Value::List(_) | Value::Path(_) => 6,
+                // A temporal value sorts after the strings and before
+                // the references, and two of different kinds sort by
+                // kind, because a date and a duration have no order
+                // between them and the total order still owes an
+                // answer.
+                Value::Temporal(_) => 4,
+                Value::Node { .. } => 5,
+                Value::Rel { .. } => 6,
+                Value::List(_) | Value::Path(_) => 7,
             }
         }
         if matches!(self.0, Value::Path(_)) || matches!(other.0, Value::Path(_)) {
@@ -728,6 +739,7 @@ impl Ord for OrdValue {
             (Value::Float(a), Value::Int(b)) => a.total_cmp(&(*b as f64)),
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
             (Value::Str(a), Value::Str(b)) => a.cmp(b),
+            (Value::Temporal(a), Value::Temporal(b)) => temporal_key(a).cmp(&temporal_key(b)),
             (
                 Value::Node {
                     table: t1,
@@ -3574,6 +3586,11 @@ fn cmp_eq(a: &Value, b: &Value) -> Option<bool> {
         (Value::Float(x), Value::Int(y)) => Some(*x == (*y as f64)),
         (Value::Bool(x), Value::Bool(y)) => Some(x == y),
         (Value::Str(x), Value::Str(y)) => Some(x == y),
+        // Two temporal values are equal when they are the same kind
+        // and the same count. A zoned value carries UTC, so two
+        // spellings of one instant are equal and the offset each was
+        // written with is not part of the comparison.
+        (Value::Temporal(x), Value::Temporal(y)) => Some(same_instant(x, y)),
         (
             Value::Node {
                 table: t1,
@@ -3614,6 +3631,53 @@ fn cmp_eq(a: &Value, b: &Value) -> Option<bool> {
     }
 }
 
+/// Whether two temporal values are the same value.
+///
+/// A zoned value is stored as the instant, so the offset is not
+/// compared: `2024-01-15T10:00+07:00` and `2024-01-15T03:00Z` are one
+/// instant written twice. Two of different kinds are not equal, and
+/// that includes the two duration kinds, because no number of days is
+/// a month.
+fn same_instant(a: &Temporal, b: &Temporal) -> bool {
+    match (a, b) {
+        (Temporal::ZonedDatetime { nanos: x, .. }, Temporal::ZonedDatetime { nanos: y, .. }) => {
+            x == y
+        }
+        (
+            Temporal::ZonedTime {
+                nanos: x,
+                offset: ox,
+            },
+            Temporal::ZonedTime {
+                nanos: y,
+                offset: oy,
+            },
+        ) => zoned_time_key(*x, *ox) == zoned_time_key(*y, *oy),
+        _ => a == b,
+    }
+}
+
+/// A zoned time as an instant in the day, so two spellings of one
+/// moment compare equal the way two zoned datetimes do.
+fn zoned_time_key(nanos: i64, offset: i16) -> i64 {
+    nanos - i64::from(offset) * 60 * 1_000_000_000
+}
+
+/// A temporal value as a sortable pair: which kind it is, then its
+/// count. Two kinds have no order between them and the total order
+/// still owes an answer, so the kind decides and the answer is stable.
+fn temporal_key(t: &Temporal) -> (u8, i64) {
+    match t {
+        Temporal::Date(days) => (0, i64::from(*days)),
+        Temporal::LocalTime(nanos) => (1, *nanos),
+        Temporal::ZonedTime { nanos, offset } => (2, zoned_time_key(*nanos, *offset)),
+        Temporal::LocalDatetime(nanos) => (3, *nanos),
+        Temporal::ZonedDatetime { nanos, .. } => (4, *nanos),
+        Temporal::Duration(DurationKind::YearMonth, count) => (5, *count),
+        Temporal::Duration(DurationKind::DayTime, count) => (6, *count),
+    }
+}
+
 /// Ordering for comparisons; `None` when null or incomparable types
 /// are involved, which makes the comparison null.
 fn cmp_ord(a: &Value, b: &Value) -> Option<Ordering> {
@@ -3621,6 +3685,14 @@ fn cmp_ord(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        // Same kind orders by count, and two kinds do not order at
+        // all: a date is not earlier or later than a duration, so the
+        // comparison is null rather than an arbitrary answer.
+        (Value::Temporal(x), Value::Temporal(y)) => {
+            let (kx, cx) = temporal_key(x);
+            let (ky, cy) = temporal_key(y);
+            (kx == ky).then(|| cx.cmp(&cy))
+        }
         _ => match (as_f64(a), as_f64(b)) {
             (Some(x), Some(y)) => x.partial_cmp(&y),
             _ => None,
@@ -3643,6 +3715,9 @@ fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
             }
             _ => {}
         }
+    }
+    if matches!(a, Value::Temporal(_)) || matches!(b, Value::Temporal(_)) {
+        return temporal_arith(op, &a, &b);
     }
     let overflow = || invalid("integer overflow".into());
     match (&a, &b) {
@@ -3697,6 +3772,221 @@ fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
     }
 }
 
+/// `22008 datetime field overflow`, for a result outside the calendar.
+fn datetime_overflow(detail: String) -> ZuError {
+    gql(codes::C22008, detail)
+}
+
+/// `22G14 invalid duration unit group`, for an operand whose unit group
+/// the other side has nowhere to put.
+fn wrong_unit_group(detail: String) -> ZuError {
+    gql(codes::C22G14, detail)
+}
+
+/// Arithmetic where at least one side is temporal.
+///
+/// Only the combinations the standard defines are here, and the rest
+/// are 22G03, because a date times a number is not an operation with a
+/// sensible answer and inventing one is worse than refusing.
+fn temporal_arith(op: BinaryOp, a: &Value, b: &Value) -> Result<Value> {
+    use BinaryOp::*;
+    let refuse = || {
+        Err(gql(
+            codes::C22G03,
+            format!("cannot apply {op:?} to {a:?} and {b:?}"),
+        ))
+    };
+    // A duration scaled by a number is the one mixed operation the
+    // standard has, and the overflow it can produce is 22015 rather
+    // than 22008: what ran out of room is the length, not a field of
+    // any calendar.
+    if let (Mul | Div, Value::Temporal(Temporal::Duration(kind, count)), factor)
+    | (Mul, factor, Value::Temporal(Temporal::Duration(kind, count))) = (op, a, b)
+    {
+        let scaled = match (factor, op) {
+            (Value::Int(n), Mul) => count.checked_mul(*n),
+            (Value::Int(0), Div) => return Err(gql(codes::C22012, "division by zero".into())),
+            (Value::Int(n), Div) => count.checked_div(*n),
+            (Value::Float(f), Mul) => whole_nanos(*count as f64 * f),
+            (Value::Float(f), Div) => whole_nanos(*count as f64 / f),
+            _ => return refuse(),
+        };
+        let scaled = scaled.ok_or_else(|| {
+            gql(
+                codes::C22015,
+                format!(
+                    "{} does not scale by {factor:?} inside a duration",
+                    Temporal::Duration(*kind, *count)
+                ),
+            )
+        })?;
+        return Ok(Value::Temporal(Temporal::Duration(*kind, scaled)));
+    }
+    let (Value::Temporal(x), Value::Temporal(y)) = (a, b) else {
+        return refuse();
+    };
+    match (op, x, y) {
+        // A duration on either side of a plus shifts the instant, and
+        // a duration on the right of a minus shifts it back. A minus
+        // with the duration on the left is not an operation: an
+        // instant subtracted from a length of time means nothing.
+        (Add, Temporal::Duration(kind, count), other)
+        | (Add, other, Temporal::Duration(kind, count)) => shift(other, *kind, *count),
+        (Sub, other, Temporal::Duration(kind, count)) => {
+            let count = count.checked_neg().ok_or_else(|| {
+                datetime_overflow(format!(
+                    "{} has no negation",
+                    Temporal::Duration(*kind, *count)
+                ))
+            })?;
+            shift(other, *kind, count)
+        }
+        // Two instants of one kind subtract to the length between
+        // them, which is a day-time duration because the calendar is
+        // not involved in counting it.
+        (Sub, Temporal::Date(p), Temporal::Date(q)) => Ok(Value::Temporal(Temporal::Duration(
+            DurationKind::DayTime,
+            (i64::from(*p) - i64::from(*q)) * temporal::NANOS_PER_DAY,
+        ))),
+        (Sub, Temporal::LocalDatetime(p), Temporal::LocalDatetime(q))
+        | (Sub, Temporal::LocalTime(p), Temporal::LocalTime(q)) => Ok(Value::Temporal(
+            Temporal::Duration(DurationKind::DayTime, p - q),
+        )),
+        (
+            Sub,
+            Temporal::ZonedDatetime { nanos: p, .. },
+            Temporal::ZonedDatetime { nanos: q, .. },
+        ) => Ok(Value::Temporal(Temporal::Duration(
+            DurationKind::DayTime,
+            p - q,
+        ))),
+        _ => refuse(),
+    }
+}
+
+/// A scaled duration as whole units, `None` when the answer is not a
+/// number or does not fit one.
+fn whole_nanos(scaled: f64) -> Option<i64> {
+    (scaled.is_finite() && scaled.abs() < 9.2e18).then(|| scaled.trunc() as i64)
+}
+
+/// An instant shifted by a duration of one kind.
+///
+/// The two kinds are not interchangeable and this is where that is
+/// enforced. Months land on a date by naming the month and clamping
+/// the day, and nanoseconds land on a date only when they are a whole
+/// number of days, because a date has no room for an hour. That is
+/// 22G14 and not a promotion to a datetime: an engine that promoted
+/// answered a different question.
+fn shift(instant: &Temporal, kind: DurationKind, count: i64) -> Result<Value> {
+    let out = match (instant, kind) {
+        (Temporal::Date(days), DurationKind::YearMonth) => temporal::add_months(*days, count)
+            .map(Temporal::Date)
+            .ok_or_else(|| {
+                datetime_overflow(format!(
+                    "{} shifted by {} leaves the calendar",
+                    Temporal::Date(*days),
+                    Temporal::Duration(kind, count)
+                ))
+            })?,
+        (Temporal::Date(days), DurationKind::DayTime) => {
+            if count % temporal::NANOS_PER_DAY != 0 {
+                return Err(wrong_unit_group(format!(
+                    "{} has a time of day and {} has nowhere to put one",
+                    Temporal::Duration(kind, count),
+                    Temporal::Date(*days)
+                )));
+            }
+            let shifted = i64::from(*days) + count / temporal::NANOS_PER_DAY;
+            let shifted = i32::try_from(shifted)
+                .ok()
+                .filter(|d| (temporal::MIN_DAY..=temporal::MAX_DAY).contains(d));
+            Temporal::Date(shifted.ok_or_else(|| {
+                datetime_overflow(format!(
+                    "{} shifted by {} leaves the calendar",
+                    Temporal::Date(*days),
+                    Temporal::Duration(kind, count)
+                ))
+            })?)
+        }
+        (Temporal::LocalTime(nanos), DurationKind::DayTime) => {
+            Temporal::LocalTime((nanos + count).rem_euclid(temporal::NANOS_PER_DAY))
+        }
+        (Temporal::ZonedTime { nanos, offset }, DurationKind::DayTime) => Temporal::ZonedTime {
+            nanos: (nanos + count).rem_euclid(temporal::NANOS_PER_DAY),
+            offset: *offset,
+        },
+        (Temporal::LocalDatetime(nanos), DurationKind::DayTime) => {
+            Temporal::LocalDatetime(add_nanos(*nanos, count)?)
+        }
+        (Temporal::ZonedDatetime { nanos, offset }, DurationKind::DayTime) => {
+            Temporal::ZonedDatetime {
+                nanos: add_nanos(*nanos, count)?,
+                offset: *offset,
+            }
+        }
+        // A datetime takes months by taking them on its date, which
+        // keeps the time of day and clamps the day the same way.
+        (Temporal::LocalDatetime(nanos), DurationKind::YearMonth) => {
+            Temporal::LocalDatetime(add_months_to_nanos(*nanos, count)?)
+        }
+        (Temporal::ZonedDatetime { nanos, offset }, DurationKind::YearMonth) => {
+            Temporal::ZonedDatetime {
+                nanos: add_months_to_nanos(*nanos, count)?,
+                offset: *offset,
+            }
+        }
+        // Two durations of one kind add, and two of different kinds do
+        // not, which is the rule the kinds exist for.
+        (Temporal::Duration(have, count_a), _) if *have == kind => Temporal::Duration(
+            kind,
+            count_a.checked_add(count).ok_or_else(|| {
+                datetime_overflow("the two durations do not add without overflowing".into())
+            })?,
+        ),
+        (Temporal::Duration(have, _), _) => {
+            return Err(wrong_unit_group(format!(
+                "a {have:?} duration and a {kind:?} duration do not add"
+            )));
+        }
+        (other, _) => {
+            return Err(wrong_unit_group(format!(
+                "{} cannot take {}",
+                other.logical_type(),
+                Temporal::Duration(kind, count)
+            )));
+        }
+    };
+    Ok(Value::Temporal(out))
+}
+
+/// An instant in nanoseconds shifted, refusing a result off the
+/// calendar rather than wrapping into a year the type cannot spell.
+fn add_nanos(nanos: i64, count: i64) -> Result<i64> {
+    let out = nanos
+        .checked_add(count)
+        .ok_or_else(|| datetime_overflow("the shifted instant does not fit".into()))?;
+    let days = out.div_euclid(temporal::NANOS_PER_DAY);
+    if !(i64::from(temporal::MIN_DAY)..=i64::from(temporal::MAX_DAY)).contains(&days) {
+        return Err(datetime_overflow(
+            "the shifted instant leaves the calendar".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// A datetime shifted by whole months: the date takes the months and
+/// the time of day rides along unchanged.
+fn add_months_to_nanos(nanos: i64, months: i64) -> Result<i64> {
+    let days = nanos.div_euclid(temporal::NANOS_PER_DAY);
+    let rest = nanos.rem_euclid(temporal::NANOS_PER_DAY);
+    let days = i32::try_from(days)
+        .ok()
+        .and_then(|d| temporal::add_months(d, months))
+        .ok_or_else(|| datetime_overflow("the shifted instant leaves the calendar".into()))?;
+    Ok(i64::from(days) * temporal::NANOS_PER_DAY + rest)
+}
+
 /// `22012 data exception, division by zero`, for both `/` and `%`. The
 /// standard's name says division, and the modulus of a zero divisor is
 /// undefined for exactly the same reason.
@@ -3717,6 +4007,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Int(i) => Value::Int(*i),
             Literal::Float(f) => Value::Float(*f),
             Literal::Str(s) => Value::Str(s.clone()),
+            Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
         BoundExpr::Var(slot) => value_of(ctx, *slot),

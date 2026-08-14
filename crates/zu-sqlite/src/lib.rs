@@ -25,6 +25,13 @@ pub const SCHEMA_VERSION: i32 = 2;
 /// SQLite column affinity for a property column.
 /// The zu type mapping is specified in `docs/05-storage-sqlite.md` §2.
 ///
+/// The temporal ones are the same shape of problem as `Boolean` and are
+/// solved the same way. A date is a count of days and a duration is a
+/// count of nanoseconds or of months, and sqlite has one class for all
+/// three, so the declared type is what says which count it is. None of
+/// these names carries a sqlite affinity keyword, so a column declared
+/// with one takes NUMERIC affinity and stores its counts as integers.
+///
 /// `Boolean` is the odd one. SQLite has four storage classes and a
 /// truth value is not among them: a boolean is stored as the integers
 /// 0 and 1, and the only place the distinction can live is the column's
@@ -39,6 +46,16 @@ pub enum ColumnType {
     Text,
     Blob,
     Boolean,
+    /// Days since the epoch.
+    Date,
+    /// Nanoseconds since midnight.
+    LocalTime,
+    /// Nanoseconds since the epoch.
+    LocalDatetime,
+    /// Nanoseconds.
+    Duration,
+    /// Months.
+    YearMonthDuration,
 }
 
 impl ColumnType {
@@ -49,6 +66,11 @@ impl ColumnType {
             Self::Text => "TEXT",
             Self::Blob => "BLOB",
             Self::Boolean => "BOOLEAN",
+            Self::Date => "DATE",
+            Self::LocalTime => "LOCALTIME",
+            Self::LocalDatetime => "LOCALDATETIME",
+            Self::Duration => "DURATION",
+            Self::YearMonthDuration => "YEARMONTHDURATION",
         }
     }
 
@@ -61,6 +83,11 @@ impl ColumnType {
             "TEXT" => Self::Text,
             "BLOB" => Self::Blob,
             "BOOLEAN" => Self::Boolean,
+            "DATE" => Self::Date,
+            "LOCALTIME" => Self::LocalTime,
+            "LOCALDATETIME" => Self::LocalDatetime,
+            "DURATION" => Self::Duration,
+            "YEARMONTHDURATION" => Self::YearMonthDuration,
             _ => return None,
         })
     }

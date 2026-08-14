@@ -17,7 +17,7 @@
 //! what this module returns rather than this module doing it: the
 //! wrapper belongs to the syntax that asked for it.
 
-use zu_common::{FloatBits, IntBits, LogicalType};
+use zu_common::{DurationKind, FloatBits, IntBits, LogicalType};
 
 /// What a name means once its arguments are known.
 ///
@@ -111,6 +111,17 @@ static NAMES: &[(&str, Family)] = &[
     ("ZONED DATETIME", Family::Simple(LogicalType::ZonedDatetime)),
     ("DATETIME", Family::Simple(LogicalType::ZonedDatetime)),
     ("TIMESTAMP", Family::Simple(LogicalType::ZonedDatetime)),
+    // GV41 and GV42. The two duration kinds do not mix, and a bare
+    // DURATION is the day time one, which is the reading every engine
+    // that spells it DURATION already has.
+    (
+        "DURATION",
+        Family::Simple(LogicalType::Duration(DurationKind::DayTime)),
+    ),
+    (
+        "INTERVAL",
+        Family::Simple(LogicalType::Duration(DurationKind::DayTime)),
+    ),
     // GV55, GV61 and the two immaterial types, GV71 and GV72.
     ("PATH", Family::Simple(LogicalType::Path(None))),
     (

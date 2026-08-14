@@ -916,6 +916,22 @@ fn write_json_value(out: &mut String, v: &Value) {
             }
             out.push(']');
         }
+        // A record goes out as a JSON object. The fields are held in
+        // name order, so the object is too, which makes two records
+        // with the same fields one line of output however the query
+        // spelled them.
+        Value::Record(fields) => {
+            out.push('{');
+            for (i, (name, value)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_str(out, name);
+                out.push(':');
+                write_json_value(out, value);
+            }
+            out.push('}');
+        }
         // The executor settles every PMR chain into an edge list before
         // a value leaves the pipeline, so a result never carries one.
         Value::Path(_) => out.push_str("null"),
@@ -1006,6 +1022,13 @@ fn display_value(v: &Value) -> String {
             format!("[{}]", parts.join(", "))
         }
         Value::Temporal(t) => t.to_string(),
+        Value::Record(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", display_value(value)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
         Value::Path(_) => "path".to_owned(),
     }
 }

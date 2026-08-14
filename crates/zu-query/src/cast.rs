@@ -39,6 +39,7 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
         LogicalType::Decimal { precision, scale } => to_decimal(v, *precision, *scale),
         LogicalType::Str { min, max, .. } => to_str(v, *min, *max),
         LogicalType::List { elem, max } => to_list(v, elem, *max),
+        LogicalType::Record(rt) => to_record(v, rt),
         other => Err(ZuError::gql(
             codes::C22G03,
             format!("casting to '{other}' is not implemented"),
@@ -75,6 +76,51 @@ fn to_list(v: Value, elem: &LogicalType, max: Option<u32>) -> Result<Value> {
         out.push(cast);
     }
     Ok(Value::List(out))
+}
+
+/// A cast to a record type is the fieldwise cast, GV46.
+///
+/// ISO separates the two ways it fails and the separation is the point.
+/// `22G0Y` is a field the type declares and the record does not carry,
+/// which is a fact about the record's shape, and `22G0X` is a field
+/// that is there and will not go into its declared type, which is a
+/// fact about that field's value and carries its own condition in the
+/// message. A field the type does not name is dropped by a closed
+/// record type, because a closed type says what the record has, and
+/// kept by an open one, because an open type says only what it has at
+/// least.
+fn to_record(v: Value, rt: &zu_common::RecordType) -> Result<Value> {
+    let Value::Record(fields) = v else {
+        return Err(not_castable(&v, "a record"));
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for declared in &rt.fields {
+        let Some(value) = fields
+            .iter()
+            .find(|(name, _)| *name == declared.name)
+            .map(|(_, value)| value.clone())
+        else {
+            return Err(ZuError::gql(
+                codes::C22G0Y,
+                format!("the record has no field '{}'", declared.name),
+            ));
+        };
+        let cast = cast(value, &declared.ty).map_err(|e| {
+            ZuError::gql(
+                codes::C22G0X,
+                format!("field '{}' of the record: {e}", declared.name),
+            )
+        })?;
+        out.push((declared.name.clone(), cast));
+    }
+    if rt.open {
+        for (name, value) in fields {
+            if rt.field(&name).is_none() {
+                out.push((name, value));
+            }
+        }
+    }
+    Ok(Value::record(out))
 }
 
 /// `22018 invalid character value for cast`, the condition for a value

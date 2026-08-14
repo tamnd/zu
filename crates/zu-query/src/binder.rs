@@ -459,7 +459,7 @@ pub enum Type {
     Rel,
     Path,
     List(Box<Type>),
-    Map,
+    Record,
 }
 
 impl Type {
@@ -488,7 +488,7 @@ impl fmt::Display for Type {
             Type::Rel => write!(f, "REL"),
             Type::Path => write!(f, "PATH"),
             Type::List(t) => write!(f, "LIST<{t}>"),
-            Type::Map => write!(f, "MAP"),
+            Type::Record => write!(f, "RECORD"),
         }
     }
 }
@@ -1404,9 +1404,9 @@ impl Binder<'_> {
             }
             Expr::Property { base, key } => {
                 let (bound, ty) = self.bind_expr(base, ctx)?;
-                if !matches!(ty, Type::Node | Type::Rel | Type::Map | Type::Any) {
+                if !matches!(ty, Type::Node | Type::Rel | Type::Record | Type::Any) {
                     return Err(invalid(format!(
-                        "property access needs a node, rel, or map, got {ty} from {}",
+                        "property access needs a node, rel, or record, got {ty} from {}",
                         text(base)
                     )));
                 }
@@ -1496,13 +1496,23 @@ impl Binder<'_> {
                 }
                 Ok((BoundExpr::List(bound), Type::List(Box::new(element))))
             }
+            // GV45, the record constructor. A field named twice is
+            // refused here rather than resolved by a rule, because
+            // both rules are defensible and neither is what the query
+            // meant: `{a: 1, a: 2}` is a typo every time.
             Expr::Map(entries) => {
-                let mut bound = Vec::new();
+                let mut bound: Vec<(String, BoundExpr)> = Vec::new();
                 for (key, value) in entries {
+                    if bound.iter().any(|(seen, _)| seen == key) {
+                        return Err(ZuError::gql(
+                            codes::C42001,
+                            format!("a record names the field '{key}' twice"),
+                        ));
+                    }
                     let (b, _) = self.bind_expr(value, ctx)?;
                     bound.push((key.clone(), b));
                 }
-                Ok((BoundExpr::Map(bound), Type::Map))
+                Ok((BoundExpr::Map(bound), Type::Record))
             }
             Expr::Cast { expr, ty } => {
                 let (bound, _) = self.bind_expr(expr, ctx)?;

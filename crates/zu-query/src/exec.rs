@@ -99,6 +99,12 @@ pub enum Value {
         dst: u64,
     },
     List(Vec<Value>),
+    /// GV45. A record: named fields, each holding a value. The fields
+    /// are kept sorted by name and a name appears once, which is what
+    /// makes two records with the same fields written in different
+    /// orders one value rather than two. Build one with
+    /// [`Value::record`] rather than by hand, so that holds.
+    Record(Vec<(String, Value)>),
     /// A date, a time, a datetime or a duration. One arm rather than
     /// six, because a temporal value is a count and a meaning and the
     /// meaning is what [`Temporal`] carries; the executor treats them
@@ -108,6 +114,35 @@ pub enum Value {
     /// variable-length path. [`settle`] turns it into the edge list
     /// before any value leaves the pipeline, so results never hold one.
     Path(Arc<PathLink>),
+}
+
+impl Value {
+    /// A record out of the fields as they were written.
+    ///
+    /// The fields are sorted by name here rather than compared by name
+    /// later, because every reader of a record then gets the cheap
+    /// version of the question: two records have the same fields when
+    /// their name lists are equal, and equality is a walk down the two
+    /// in step. A field written twice is the caller's error and the
+    /// binder refuses it before this is reached, so the first one
+    /// stands rather than this having an error path nothing can reach.
+    pub fn record(mut fields: Vec<(String, Value)>) -> Value {
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        fields.dedup_by(|a, b| a.0 == b.0);
+        Value::Record(fields)
+    }
+
+    /// The value of the field named `name`, or `None` when the record
+    /// has no such field.
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        let Value::Record(fields) = self else {
+            return None;
+        };
+        fields
+            .binary_search_by(|(n, _)| n.as_str().cmp(name))
+            .ok()
+            .map(|ix| &fields[ix].1)
+    }
 }
 
 /// One link of a PMR chain: a persistent predecessor list. Every DFS
@@ -144,6 +179,11 @@ fn settle(v: Value) -> Value {
     match v {
         Value::Path(link) => path_rels(&link),
         Value::List(items) => Value::List(items.into_iter().map(settle).collect()),
+        // A field can hold a chain the same way a list element can,
+        // and for the same reason: `{p: p}` names a path variable.
+        Value::Record(fields) => {
+            Value::Record(fields.into_iter().map(|(n, v)| (n, settle(v))).collect())
+        }
         other => other,
     }
 }
@@ -698,7 +738,7 @@ fn sink_name(sink: &SinkDef) -> String {
 
 /// Total order over values for grouping, DISTINCT, and ORDER BY:
 /// nulls first, then booleans, numbers (int and float compare
-/// numerically), strings, nodes, rels, lists.
+/// numerically), strings, nodes, rels, lists, records.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrdValue(pub Value);
 
@@ -727,6 +767,13 @@ impl Ord for OrdValue {
                 Value::Node { .. } => 5,
                 Value::Rel { .. } => 6,
                 Value::List(_) | Value::Path(_) => 7,
+                // A record sorts after every list, and two records
+                // sort by their fields, name first and then value.
+                // The order between two records is not a question ISO
+                // answers, but DISTINCT and ORDER BY have to answer
+                // it, so it is answered here and stated rather than
+                // left to whatever the enum's declaration order was.
+                Value::Record(_) => 8,
             }
         }
         if matches!(self.0, Value::Path(_)) || matches!(other.0, Value::Path(_)) {
@@ -765,6 +812,17 @@ impl Ord for OrdValue {
             (Value::List(a), Value::List(b)) => {
                 for (x, y) in a.iter().zip(b) {
                     let ord = OrdValue(x.clone()).cmp(&OrdValue(y.clone()));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Value::Record(a), Value::Record(b)) => {
+                for ((na, va), (nb, vb)) in a.iter().zip(b) {
+                    let ord = na
+                        .cmp(nb)
+                        .then_with(|| OrdValue(va.clone()).cmp(&OrdValue(vb.clone())));
                     if ord != Ordering::Equal {
                         return ord;
                     }
@@ -3575,10 +3633,15 @@ fn as_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// Three-valued equality: `None` when null is involved, `Some(false)`
-/// across mismatched types.
-fn cmp_eq(a: &Value, b: &Value) -> Option<bool> {
-    match (a, b) {
+/// Three-valued equality: `Ok(None)` when null is involved,
+/// `Ok(Some(false))` across mismatched types.
+///
+/// The error arm is for the one comparison ISO refuses to answer
+/// rather than answer falsely: two records whose fields differ. Every
+/// other mismatch is a false, because a query that compares a number
+/// with a string has asked a question with an answer.
+fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
+    Ok(match (a, b) {
         (Value::Null, _) | (_, Value::Null) => None,
         (Value::Int(x), Value::Int(y)) => Some(x == y),
         (Value::Float(x), Value::Float(y)) => Some(x == y),
@@ -3615,12 +3678,40 @@ fn cmp_eq(a: &Value, b: &Value) -> Option<bool> {
         ) => Some(t1 == t2 && s1 == s2 && d1 == d2),
         (Value::List(x), Value::List(y)) => {
             if x.len() != y.len() {
-                return Some(false);
+                return Ok(Some(false));
             }
             let mut saw_null = false;
             for (a, b) in x.iter().zip(y) {
-                match cmp_eq(a, b) {
-                    Some(false) => return Some(false),
+                match cmp_eq(a, b)? {
+                    Some(false) => return Ok(Some(false)),
+                    Some(true) => {}
+                    None => saw_null = true,
+                }
+            }
+            if saw_null { None } else { Some(true) }
+        }
+        // 22G0U. Two records are comparable when they name the same
+        // fields, and these do not, so there is no field by field
+        // comparison to make. False would be the wrong answer here in
+        // the way that matters: it is the answer a query gets when the
+        // records differ in a value, and a query that misspelled a
+        // field name would read it as data rather than as the mistake
+        // it is.
+        (Value::Record(x), Value::Record(y)) => {
+            if !same_fields(x, y) {
+                return Err(gql(
+                    codes::C22G0U,
+                    format!(
+                        "a record with fields {} cannot be compared with one with fields {}",
+                        field_names(x),
+                        field_names(y)
+                    ),
+                ));
+            }
+            let mut saw_null = false;
+            for ((_, a), (_, b)) in x.iter().zip(y) {
+                match cmp_eq(a, b)? {
+                    Some(false) => return Ok(Some(false)),
                     Some(true) => {}
                     None => saw_null = true,
                 }
@@ -3628,7 +3719,19 @@ fn cmp_eq(a: &Value, b: &Value) -> Option<bool> {
             if saw_null { None } else { Some(true) }
         }
         _ => Some(false),
-    }
+    })
+}
+
+/// Whether two records name the same fields. Both lists are sorted by
+/// name, so this is a walk rather than a set.
+fn same_fields(x: &[(String, Value)], y: &[(String, Value)]) -> bool {
+    x.len() == y.len() && x.iter().zip(y).all(|((a, _), (b, _))| a == b)
+}
+
+/// A record's field names for a message, in the order they are held.
+fn field_names(fields: &[(String, Value)]) -> String {
+    let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+    format!("({})", names.join(", "))
 }
 
 /// Whether two temporal values are the same value.
@@ -4013,6 +4116,12 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         BoundExpr::Var(slot) => value_of(ctx, *slot),
         BoundExpr::Property { base, key } => match eval(ctx, base)? {
             Value::Node { table, offset } => ctx.graph.property(table, offset, key),
+            // A field the record does not have is null rather than an
+            // error, which is what a property a node does not have
+            // already answers. A record whose shape a query can rely
+            // on is one the query declared, and that is what a cast to
+            // a record type is for.
+            ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
             Value::Null | Value::Rel { .. } => Ok(Value::Null),
             other => Err(invalid(format!(
                 "property access on {other:?}, expected a node"
@@ -4074,7 +4183,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 Eq | Ne => {
                     let l = settle(eval(ctx, lhs)?);
                     let r = settle(eval(ctx, rhs)?);
-                    Ok(match cmp_eq(&l, &r) {
+                    Ok(match cmp_eq(&l, &r)? {
                         Some(b) => Value::Bool(if *op == Eq { b } else { !b }),
                         None => Value::Null,
                     })
@@ -4108,7 +4217,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                         Value::List(items) => {
                             let mut saw_null = false;
                             for item in &items {
-                                match cmp_eq(&l, item) {
+                                match cmp_eq(&l, item)? {
                                     Some(true) => return Ok(Value::Bool(true)),
                                     None => saw_null = true,
                                     Some(false) => {}
@@ -4201,7 +4310,16 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             }
             Ok(Value::List(out))
         }
-        BoundExpr::Map(_) => Err(invalid("map values are not supported yet".into())),
+        // GV45. The fields are evaluated in the order they were
+        // written and sorted by name on the way in, so a record is one
+        // value however the query spelled it.
+        BoundExpr::Map(pairs) => {
+            let mut fields = Vec::with_capacity(pairs.len());
+            for (name, item) in pairs {
+                fields.push((name.clone(), eval(ctx, item)?));
+            }
+            Ok(Value::record(fields))
+        }
         BoundExpr::Cast { expr, ty } => crate::cast::cast(eval(ctx, expr)?, ty),
     }
 }

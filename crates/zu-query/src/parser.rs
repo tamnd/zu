@@ -780,6 +780,24 @@ impl Parser<'_> {
         if let Some(literal) = self.temporal_literal(&name)? {
             return Ok(literal);
         }
+        // GE06, and taken here for the reason the temporal literals
+        // are: PATH is a variable name right up until a bracket
+        // follows it. Nothing else in the expression grammar puts a
+        // bracket after a name, so the two readings never overlap.
+        if name.eq_ignore_ascii_case("path") && self.at(&TokenKind::LBracket) {
+            self.pos += 1;
+            let mut elements = Vec::new();
+            if !self.at(&TokenKind::RBracket) {
+                loop {
+                    elements.push(self.parse_expr()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RBracket)?;
+            return Ok(Expr::Path(elements));
+        }
         if !self.at(&TokenKind::LParen) {
             return Ok(Expr::Variable(name));
         }

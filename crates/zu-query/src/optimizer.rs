@@ -1554,6 +1554,11 @@ fn expr_slots(expr: &BoundExpr, out: &mut HashSet<usize>) {
                 expr_slots(value, out);
             }
         }
+        BoundExpr::Path(elements) => {
+            for element in elements {
+                expr_slots(element, out);
+            }
+        }
         BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
     }
 }

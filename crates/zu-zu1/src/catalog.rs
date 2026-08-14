@@ -14,7 +14,18 @@
 //! `id: u32`, `name_len: u16` + UTF-8 bytes, `node_count: u64`,
 //! `declared_label_count: u16` and that many `label: u16`, then per rel
 //! table `id: u32`, name, `from: u32`, `to: u32`, `edge_count: u64`,
-//! then the label dictionary as `label_count` names.
+//! then the label dictionary as `label_count` names, then
+//! `graph_type_count: u32` and that many graph types.
+//!
+//! A graph type is a name, a closed flag, and its element types: each a
+//! name, a kind byte, a flag byte, a label set, a key label set behind
+//! the byte that says which of the three kinds it is, the two endpoint
+//! names for an edge type, and the properties it declares as a name, a
+//! type code, and an optionality byte. Properties hang off the element
+//! type rather than off the graph, which is what pays for the three
+//! relaxed consistency features at once (GG24 to GG26): two element
+//! types may share a key label set and disagree about what a property
+//! of the same name holds.
 //!
 //! The dictionary is per file and a label is its position in it, which
 //! is what makes a label set a bitset: a node's labels are a word with
@@ -27,16 +38,18 @@
 //! Table index layout: `version: u16`, `entry_count: u32`, then per
 //! entry `table_id: u32`, `directory_root: u64`.
 
-use zu_common::{Result, ZuError};
+use zu_common::{LogicalType, Result, ZuError};
 
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
-use crate::meta;
+use crate::{meta, props};
 
 /// Version 1 had no labels: a node's only label was the name of its
 /// table. Version 2 adds the label dictionary and the set each node
 /// table declares. A version 1 catalog still reads, and reads as the
 /// graph it always was, one label per table carrying the table's name.
-const CATALOG_VERSION: u16 = 2;
+/// Version 3 adds graph types, and a version 2 catalog reads as a file
+/// that declares none, which is the open graph it has always been.
+const CATALOG_VERSION: u16 = 3;
 const TABLE_INDEX_VERSION: u16 = 1;
 
 /// The label dictionary is bounded by the width of the bitset a node
@@ -88,6 +101,321 @@ pub struct RelTable {
     pub edge_count: u64,
 }
 
+/// Whether an element type describes nodes or edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementKind {
+    Node,
+    Edge,
+}
+
+/// One property an element type declares (GG26). The declaration hangs
+/// off the element type rather than off a name shared by the graph, so
+/// two element types may declare `since` with different types and both
+/// are right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyType {
+    pub name: String,
+    pub ty: LogicalType,
+    /// Whether an element of the type may leave the property out.
+    pub optional: bool,
+}
+
+/// The label subset that picks an element type out of a graph type
+/// (GG21 to GG23).
+///
+/// ISO lets a type declare one, lets it be inferred from the whole
+/// label set when it is not declared, and lets an open graph type hold
+/// a type with none at all. The three cases select differently at
+/// insert time, so they are three cases here and not one `Option`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyLabels {
+    /// GG21: written out in the type definition.
+    Declared(Vec<u16>),
+    /// GG22: not written, so it is the whole label set.
+    Inferred(Vec<u16>),
+    /// GG23: the type has none. Open graph types only, and selection
+    /// falls back to matching the whole label set.
+    None,
+}
+
+impl KeyLabels {
+    /// The label ids the key names, empty when there is no key.
+    pub fn ids(&self) -> &[u16] {
+        match self {
+            KeyLabels::Declared(ids) | KeyLabels::Inferred(ids) => ids,
+            KeyLabels::None => &[],
+        }
+    }
+
+    fn code(&self) -> u8 {
+        match self {
+            KeyLabels::Declared(_) => 0,
+            KeyLabels::Inferred(_) => 1,
+            KeyLabels::None => 2,
+        }
+    }
+}
+
+/// One element type of a graph type (GG20 to GG26).
+///
+/// Two element types may share a key label set and differ in their
+/// properties (GG24) or, for edges, in their endpoints (GG25). Nothing
+/// here forbids that, on purpose: the shape that would have forbidden
+/// it is a per graph property table, and the whole point of hanging
+/// properties off the element type is that the relaxed features cost
+/// the strict case nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementType {
+    pub name: String,
+    pub kind: ElementKind,
+    /// The labels an element of this type carries, as dictionary ids.
+    pub labels: Vec<u16>,
+    pub key_labels: KeyLabels,
+    pub properties: Vec<PropertyType>,
+    /// GG01 at the element level: an open type permits properties it
+    /// never declared.
+    pub open: bool,
+    /// Edge types only: the element type names of the two endpoints.
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// GH02: whether an edge of this type has a direction. It is a
+    /// property of the type rather than of the pattern, which is why
+    /// it lives here and not in the query.
+    pub undirected: bool,
+}
+
+impl ElementType {
+    /// A node type carrying `labels`, with the key label set inferred
+    /// from them, which is what a definition that names no key means.
+    pub fn node(name: &str, labels: Vec<u16>) -> Self {
+        ElementType {
+            name: name.to_string(),
+            kind: ElementKind::Node,
+            key_labels: KeyLabels::Inferred(labels.clone()),
+            labels,
+            properties: Vec::new(),
+            open: false,
+            from: None,
+            to: None,
+            undirected: false,
+        }
+    }
+
+    /// An edge type between two node types, key label set inferred.
+    pub fn edge(name: &str, labels: Vec<u16>, from: &str, to: &str) -> Self {
+        ElementType {
+            kind: ElementKind::Edge,
+            from: Some(from.to_string()),
+            to: Some(to.to_string()),
+            ..Self::node(name, labels)
+        }
+    }
+
+    /// The same type with the key label set written out (GG21).
+    pub fn with_key(mut self, key: Vec<u16>) -> Self {
+        self.key_labels = KeyLabels::Declared(key);
+        self
+    }
+
+    /// The same type with no key label set at all (GG23).
+    pub fn without_key(mut self) -> Self {
+        self.key_labels = KeyLabels::None;
+        self
+    }
+
+    pub fn with_property(mut self, name: &str, ty: LogicalType, optional: bool) -> Self {
+        self.properties.push(PropertyType {
+            name: name.to_string(),
+            ty,
+            optional,
+        });
+        self
+    }
+
+    pub fn label_mask(&self) -> u64 {
+        self.labels.iter().fold(0u64, |m, &l| m | 1 << l)
+    }
+
+    /// The mask an element's label set must contain for this type to
+    /// describe it. A type with no key label set is selected by its
+    /// whole label set, which is the fallback GG23 asks for.
+    pub fn selection_mask(&self) -> u64 {
+        match &self.key_labels {
+            KeyLabels::None => self.label_mask(),
+            key => key.ids().iter().fold(0u64, |m, &l| m | 1 << l),
+        }
+    }
+
+    /// The type a property of this name has here, `None` when the type
+    /// does not declare one. An open type may still carry it.
+    pub fn property(&self, name: &str) -> Option<&PropertyType> {
+        self.properties.iter().find(|p| p.name == name)
+    }
+}
+
+/// A graph type: the element types a graph's elements may have, and
+/// whether that list is the whole of it (GG01, GG02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphType {
+    pub name: String,
+    /// GG02. A closed type is a guarantee rather than a description:
+    /// every element matches a declared element type, so the planner
+    /// may resolve a property to a column without asking the row.
+    pub closed: bool,
+    pub elements: Vec<ElementType>,
+}
+
+impl GraphType {
+    /// An open graph type, which is what a graph with no type declared
+    /// for it has.
+    pub fn open(name: &str) -> Self {
+        GraphType {
+            name: name.to_string(),
+            closed: false,
+            elements: Vec::new(),
+        }
+    }
+
+    pub fn closed(name: &str) -> Self {
+        GraphType {
+            name: name.to_string(),
+            closed: true,
+            elements: Vec::new(),
+        }
+    }
+
+    pub fn with(mut self, element: ElementType) -> Self {
+        self.elements.push(element);
+        self
+    }
+
+    pub fn element(&self, name: &str) -> Option<&ElementType> {
+        self.elements.iter().find(|e| e.name == name)
+    }
+
+    /// Every element type an element carrying `labels` could have.
+    ///
+    /// More than one is not an error: GG24 and GG25 are exactly the
+    /// case where two types share a key label set and differ in what
+    /// hangs off it, and the caller picks by what it is doing. An
+    /// empty key label set is contained in every label set and so
+    /// selects every element of its kind, which is what an edge type
+    /// inferred from a rel table has and why the caller narrows those
+    /// by their endpoints.
+    pub fn types_for(&self, kind: ElementKind, labels: u64) -> Vec<&ElementType> {
+        self.elements
+            .iter()
+            .filter(|e| e.kind == kind)
+            .filter(|e| labels & e.selection_mask() == e.selection_mask())
+            .collect()
+    }
+
+    /// Checks the type against the graph's label dictionary and its own
+    /// rules. A closed type has to be self-contained, which is what
+    /// makes it worth anything to the planner.
+    fn validate(&self, labels: usize) -> Result<()> {
+        let mut names: Vec<&str> = self.elements.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        if names.windows(2).any(|w| w[0] == w[1]) {
+            return Err(corrupt(
+                "catalog",
+                format!("graph type '{}' declares an element type twice", self.name),
+            ));
+        }
+        for element in &self.elements {
+            let where_ = || format!("element type '{}.{}'", self.name, element.name);
+            for &label in element.labels.iter().chain(element.key_labels.ids()) {
+                if usize::from(label) >= labels {
+                    return Err(corrupt(
+                        "catalog",
+                        format!("{} names label {label} of {labels}", where_()),
+                    ));
+                }
+            }
+            for &key in element.key_labels.ids() {
+                if !element.labels.contains(&key) {
+                    return Err(corrupt(
+                        "catalog",
+                        format!("{} keys on label {key}, which it does not carry", where_()),
+                    ));
+                }
+            }
+            let mut props: Vec<&str> = element.properties.iter().map(|p| p.name.as_str()).collect();
+            props.sort_unstable();
+            if props.windows(2).any(|w| w[0] == w[1]) {
+                return Err(corrupt(
+                    "catalog",
+                    format!("{} declares a property twice", where_()),
+                ));
+            }
+            // The catalog writes a declared type with the codes a
+            // column stores, so a type no column can hold is a type no
+            // element type can name. This is where that is refused; the
+            // encoder past this point may assume it.
+            for prop in &element.properties {
+                if props::declared_type_bytes(&prop.ty).is_none() {
+                    return Err(corrupt(
+                        "catalog",
+                        format!(
+                            "{} declares '{}' with a type this file cannot write",
+                            where_(),
+                            prop.name
+                        ),
+                    ));
+                }
+            }
+            match element.kind {
+                ElementKind::Node => {
+                    if element.from.is_some() || element.to.is_some() {
+                        return Err(corrupt(
+                            "catalog",
+                            format!("{} is a node type with endpoints", where_()),
+                        ));
+                    }
+                }
+                ElementKind::Edge => {
+                    for end in [&element.from, &element.to] {
+                        let end = end.as_deref().ok_or_else(|| {
+                            corrupt(
+                                "catalog",
+                                format!("{} is an edge type with no endpoint", where_()),
+                            )
+                        })?;
+                        match self.element(end) {
+                            Some(e) if e.kind == ElementKind::Node => {}
+                            _ => {
+                                return Err(corrupt(
+                                    "catalog",
+                                    format!(
+                                        "{} ends at '{end}', which is no node type here",
+                                        where_()
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // GG23 says a type may have no key label set; a closed
+            // graph type is the promise that every element matches a
+            // declared type, and a type nothing selects cannot keep it.
+            if self.closed && matches!(element.key_labels, KeyLabels::None) {
+                return Err(corrupt(
+                    "catalog",
+                    format!("{} has no key label set in a closed graph type", where_()),
+                ));
+            }
+            if self.closed && element.open {
+                return Err(corrupt(
+                    "catalog",
+                    format!("{} is open in a closed graph type", where_()),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The table definitions of one zu1 file. Names share a single
 /// namespace across both kinds, so a rel table cannot shadow a node
 /// table.
@@ -96,6 +424,7 @@ pub struct Catalog {
     nodes: Vec<NodeTable>,
     rels: Vec<RelTable>,
     labels: Vec<String>,
+    graph_types: Vec<GraphType>,
 }
 
 fn corrupt(what: &'static str, detail: String) -> ZuError {
@@ -124,6 +453,116 @@ fn decode_name(bytes: &[u8], pos: &mut usize, what: &'static str) -> Result<Stri
         .ok_or_else(|| corrupt(what, "truncated name".into()))?;
     *pos += len;
     String::from_utf8(raw.to_vec()).map_err(|_| corrupt(what, "name is not UTF-8".into()))
+}
+
+fn encode_labels(out: &mut Vec<u8>, labels: &[u16]) {
+    out.extend_from_slice(&(labels.len() as u16).to_le_bytes());
+    for &label in labels {
+        out.extend_from_slice(&label.to_le_bytes());
+    }
+}
+
+fn decode_labels(bytes: &[u8], pos: &mut usize) -> Result<Vec<u16>> {
+    const WHAT: &str = "catalog";
+    let count = read_u16(bytes, pos, WHAT)? as usize;
+    if count > MAX_LABELS {
+        return Err(corrupt(
+            WHAT,
+            format!("a label set of {count} above {MAX_LABELS}"),
+        ));
+    }
+    let mut labels = Vec::with_capacity(count);
+    for _ in 0..count {
+        labels.push(read_u16(bytes, pos, WHAT)?);
+    }
+    Ok(labels)
+}
+
+fn decode_graph_type(bytes: &[u8], pos: &mut usize) -> Result<GraphType> {
+    const WHAT: &str = "catalog";
+    let name = decode_name(bytes, pos, WHAT)?;
+    let closed = read_flag(bytes, pos, "graph type closedness")?;
+    let count = read_u32(bytes, pos, WHAT)? as usize;
+    let mut elements = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        let name = decode_name(bytes, pos, WHAT)?;
+        let kind = match bytes.get(*pos) {
+            Some(0) => ElementKind::Node,
+            Some(1) => ElementKind::Edge,
+            Some(&other) => {
+                return Err(corrupt(WHAT, format!("element kind {other}")));
+            }
+            None => return Err(corrupt(WHAT, "truncated element kind".into())),
+        };
+        *pos += 1;
+        let flags = match bytes.get(*pos) {
+            Some(&flags) if flags & !0b11 == 0 => flags,
+            Some(&other) => return Err(corrupt(WHAT, format!("element type flags {other:#x}"))),
+            None => return Err(corrupt(WHAT, "truncated element type flags".into())),
+        };
+        *pos += 1;
+        let labels = decode_labels(bytes, pos)?;
+        let key_code = match bytes.get(*pos) {
+            Some(&code @ 0..=2) => code,
+            Some(&other) => return Err(corrupt(WHAT, format!("key label set kind {other}"))),
+            None => return Err(corrupt(WHAT, "truncated key label set kind".into())),
+        };
+        *pos += 1;
+        let key_ids = decode_labels(bytes, pos)?;
+        let key_labels = match key_code {
+            0 => KeyLabels::Declared(key_ids),
+            1 => KeyLabels::Inferred(key_ids),
+            _ if key_ids.is_empty() => KeyLabels::None,
+            _ => return Err(corrupt(WHAT, "a key label set that is not one".into())),
+        };
+        let (from, to) = match kind {
+            ElementKind::Node => (None, None),
+            ElementKind::Edge => (
+                Some(decode_name(bytes, pos, WHAT)?),
+                Some(decode_name(bytes, pos, WHAT)?),
+            ),
+        };
+        let prop_count = read_u16(bytes, pos, WHAT)? as usize;
+        let mut properties = Vec::with_capacity(prop_count.min(64));
+        for _ in 0..prop_count {
+            let name = decode_name(bytes, pos, WHAT)?;
+            let ty = props::decode_declared_type(bytes, pos)?;
+            let optional = read_flag(bytes, pos, "a property's optionality")?;
+            properties.push(PropertyType { name, ty, optional });
+        }
+        elements.push(ElementType {
+            name,
+            kind,
+            labels,
+            key_labels,
+            properties,
+            open: flags & 1 != 0,
+            from,
+            to,
+            undirected: flags & 0b10 != 0,
+        });
+    }
+    Ok(GraphType {
+        name,
+        closed,
+        elements,
+    })
+}
+
+/// A byte that stands for a boolean, and is one of the two bytes that
+/// do. A file saying anything else about a flag is a file saying
+/// something nobody wrote.
+fn read_flag(bytes: &[u8], pos: &mut usize, what: &str) -> Result<bool> {
+    let flag = match bytes.get(*pos) {
+        Some(0) => false,
+        Some(1) => true,
+        Some(&other) => {
+            return Err(corrupt("catalog", format!("{what} is {other}, not 0 or 1")));
+        }
+        None => return Err(corrupt("catalog", format!("truncated {what}"))),
+    };
+    *pos += 1;
+    Ok(flag)
 }
 
 fn read_u32(bytes: &[u8], pos: &mut usize, what: &'static str) -> Result<u32> {
@@ -158,6 +597,22 @@ impl Catalog {
             return Ok(Self::default());
         }
         Self::decode(&meta::read_chain(db, root)?)
+    }
+
+    /// Publishes the catalog: the old chain goes back to the free list,
+    /// the new one is written into free space, and the header flip
+    /// makes it the committed one. Nothing else in the file moves,
+    /// which is what makes a catalog change cheap however large the
+    /// graph under it is.
+    pub fn store(&self, db: &mut Zu1File) -> Result<()> {
+        self.validate()?;
+        let old = db.db_header().catalog_root;
+        if old != NULL_BLOCK {
+            crate::graph::free_chain(db, old)?;
+        }
+        let root = meta::write_chain(db, &self.encode())?;
+        db.db_header_mut().catalog_root = root;
+        db.checkpoint()
     }
 
     pub fn node_tables(&self) -> &[NodeTable] {
@@ -235,6 +690,71 @@ impl Catalog {
             table.labels.push(id);
         }
         Ok(id)
+    }
+
+    /// The graph types this file holds.
+    pub fn graph_types(&self) -> &[GraphType] {
+        &self.graph_types
+    }
+
+    pub fn graph_type(&self, name: &str) -> Option<&GraphType> {
+        self.graph_types.iter().find(|t| t.name == name)
+    }
+
+    /// Adds a graph type, refusing a name the file already holds and a
+    /// type its own rules reject. The labels it names must already be
+    /// in the dictionary, since a type describes the graph it is for
+    /// rather than adding to it.
+    pub fn add_graph_type(&mut self, ty: GraphType) -> Result<()> {
+        if self.graph_type(&ty.name).is_some() {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{}' is already a graph type",
+                ty.name
+            )));
+        }
+        ty.validate(self.labels.len())?;
+        self.graph_types.push(ty);
+        Ok(())
+    }
+
+    /// Drops a graph type, answering whether there was one.
+    pub fn drop_graph_type(&mut self, name: &str) -> bool {
+        let before = self.graph_types.len();
+        self.graph_types.retain(|t| t.name != name);
+        self.graph_types.len() != before
+    }
+
+    /// A closed graph type inferred from the tables this file holds
+    /// (GG04): one node element type per node table keyed on the
+    /// table's own label, one edge element type per rel table between
+    /// them. It reads the catalog and never the data, so it costs
+    /// nothing on a large graph.
+    pub fn infer_graph_type(&self, name: &str) -> Result<GraphType> {
+        let mut ty = GraphType::closed(name);
+        for table in &self.nodes {
+            ty.elements.push(
+                ElementType::node(&table.name, table.labels.clone())
+                    .with_key(vec![table.primary_label()]),
+            );
+        }
+        for rel in &self.rels {
+            let from = self.node_by_id(rel.from).ok_or_else(|| {
+                ZuError::InvalidArgument(format!("rel table '{}' has no FROM node table", rel.name))
+            })?;
+            let to = self.node_by_id(rel.to).ok_or_else(|| {
+                ZuError::InvalidArgument(format!("rel table '{}' has no TO node table", rel.name))
+            })?;
+            // A rel table's name is not a label, so an edge type has an
+            // empty label set and is selected by its endpoints.
+            ty.elements.push(ElementType::edge(
+                &rel.name,
+                Vec::new(),
+                &from.name,
+                &to.name,
+            ));
+        }
+        ty.validate(self.labels.len())?;
+        Ok(ty)
     }
 
     /// Every node table that declares `label`, which is the scan set a
@@ -348,6 +868,39 @@ impl Catalog {
         for label in &self.labels {
             encode_name(&mut out, label);
         }
+        out.extend_from_slice(&(self.graph_types.len() as u32).to_le_bytes());
+        for ty in &self.graph_types {
+            encode_name(&mut out, &ty.name);
+            out.push(u8::from(ty.closed));
+            out.extend_from_slice(&(ty.elements.len() as u32).to_le_bytes());
+            for element in &ty.elements {
+                encode_name(&mut out, &element.name);
+                out.push(match element.kind {
+                    ElementKind::Node => 0,
+                    ElementKind::Edge => 1,
+                });
+                let flags = u8::from(element.open) | u8::from(element.undirected) << 1;
+                out.push(flags);
+                encode_labels(&mut out, &element.labels);
+                out.push(element.key_labels.code());
+                encode_labels(&mut out, element.key_labels.ids());
+                if element.kind == ElementKind::Edge {
+                    encode_name(&mut out, element.from.as_deref().unwrap_or_default());
+                    encode_name(&mut out, element.to.as_deref().unwrap_or_default());
+                }
+                out.extend_from_slice(&(element.properties.len() as u16).to_le_bytes());
+                for prop in &element.properties {
+                    encode_name(&mut out, &prop.name);
+                    // A type nothing can be declared with never reaches
+                    // the catalog: `GraphType::validate` refuses it
+                    // when the type is added.
+                    out.extend_from_slice(
+                        &props::declared_type_bytes(&prop.ty).expect("property type is declarable"),
+                    );
+                    out.push(u8::from(prop.optional));
+                }
+            }
+        }
         out
     }
 
@@ -412,6 +965,14 @@ impl Catalog {
         }
         for _ in 0..label_count {
             catalog.labels.push(decode_name(bytes, &mut pos, WHAT)?);
+        }
+        if version >= 3 {
+            let count = read_u32(bytes, &mut pos, WHAT)? as usize;
+            for _ in 0..count {
+                catalog
+                    .graph_types
+                    .push(decode_graph_type(bytes, &mut pos)?);
+            }
         }
         if pos != bytes.len() {
             return Err(corrupt(WHAT, "trailing bytes".into()));
@@ -522,6 +1083,14 @@ impl Catalog {
                 }
             }
         }
+        let mut type_names: Vec<&str> = self.graph_types.iter().map(|t| t.name.as_str()).collect();
+        type_names.sort_unstable();
+        if type_names.windows(2).any(|w| w[0] == w[1]) {
+            return Err(corrupt("catalog", "duplicate graph type name".into()));
+        }
+        for ty in &self.graph_types {
+            ty.validate(self.labels.len())?;
+        }
         Ok(())
     }
 }
@@ -630,6 +1199,290 @@ mod tests {
         c.upsert_rel("follows", person, person, 4000).unwrap();
         c.upsert_rel("works_at", person, org, 450).unwrap();
         c
+    }
+
+    /// The string type, which is the one every property test here uses
+    /// except where the point is that two types differ.
+    fn text() -> LogicalType {
+        LogicalType::Str {
+            min: None,
+            max: None,
+            fixed: false,
+        }
+    }
+
+    fn list_of(elem: LogicalType) -> LogicalType {
+        LogicalType::List {
+            elem: Box::new(elem),
+            max: None,
+        }
+    }
+
+    fn int() -> LogicalType {
+        LogicalType::Int {
+            signed: true,
+            bits: zu_common::IntBits::B64,
+            precision: None,
+        }
+    }
+
+    #[test]
+    fn a_graph_type_names_the_elements_a_graph_may_hold() {
+        let mut c = sample();
+        let person = c.label_id("person").unwrap();
+        let employee = c.intern_label("Employee").unwrap();
+        let ty = GraphType::closed("company")
+            .with(
+                ElementType::node("PersonType", vec![person, employee])
+                    .with_key(vec![person])
+                    .with_property("name", text(), false)
+                    .with_property("badge", int(), true),
+            )
+            .with(ElementType::edge(
+                "KnowsType",
+                Vec::new(),
+                "PersonType",
+                "PersonType",
+            ));
+        c.add_graph_type(ty).unwrap();
+        // A name is taken once.
+        assert!(
+            c.add_graph_type(GraphType::open("company")).is_err(),
+            "a graph type name is taken once"
+        );
+        let ty = c.graph_type("company").unwrap();
+        assert!(ty.closed);
+        let person_type = ty.element("PersonType").unwrap();
+        assert_eq!(person_type.key_labels, KeyLabels::Declared(vec![person]));
+        assert!(person_type.property("badge").unwrap().optional);
+        assert!(person_type.property("nickname").is_none());
+        // The key label set is what selects, so an element carrying
+        // both labels is a Person and so is one carrying only the key.
+        let mask = |ids: &[u16]| ids.iter().fold(0u64, |m, &l| m | 1 << l);
+        assert_eq!(
+            ty.types_for(ElementKind::Node, mask(&[person, employee]))
+                .len(),
+            1
+        );
+        assert_eq!(ty.types_for(ElementKind::Node, mask(&[person])).len(), 1);
+        assert_eq!(ty.types_for(ElementKind::Node, mask(&[employee])).len(), 0);
+        // The whole thing survives the round trip, and dropping it
+        // leaves the file with the tables it always had.
+        assert_eq!(Catalog::decode(&c.encode()).unwrap(), c);
+        assert!(c.drop_graph_type("company"));
+        assert!(!c.drop_graph_type("company"));
+        assert!(c.graph_types().is_empty());
+    }
+
+    #[test]
+    fn a_key_label_set_is_declared_inferred_or_absent() {
+        let mut c = sample();
+        let person = c.label_id("person").unwrap();
+        let employee = c.intern_label("Employee").unwrap();
+        // Not written out, so it is the whole label set.
+        let inferred = ElementType::node("A", vec![person, employee]);
+        assert_eq!(
+            inferred.key_labels,
+            KeyLabels::Inferred(vec![person, employee])
+        );
+        assert_eq!(
+            inferred.selection_mask(),
+            1 << person | 1 << employee,
+            "an inferred key selects on the whole set"
+        );
+        // Written out, so it is what was written.
+        let declared = ElementType::node("B", vec![person, employee]).with_key(vec![employee]);
+        assert_eq!(declared.selection_mask(), 1 << employee);
+        // Absent, so selection falls back to the whole label set, and
+        // a closed graph type will not have it.
+        let none = ElementType::node("C", vec![person, employee]).without_key();
+        assert_eq!(none.key_labels, KeyLabels::None);
+        assert_eq!(none.selection_mask(), 1 << person | 1 << employee);
+        c.add_graph_type(GraphType::open("loose").with(none.clone()))
+            .unwrap();
+        let err = c
+            .add_graph_type(GraphType::closed("strict").with(none))
+            .expect_err("a closed type needs a key on every element type")
+            .to_string();
+        assert!(
+            err.contains("no key label set in a closed graph type"),
+            "{err}"
+        );
+        // A key has to be part of the label set it keys.
+        let err = c
+            .add_graph_type(
+                GraphType::open("wrong")
+                    .with(ElementType::node("D", vec![person]).with_key(vec![employee])),
+            )
+            .expect_err("a key outside the label set")
+            .to_string();
+        assert!(err.contains("which it does not carry"), "{err}");
+    }
+
+    #[test]
+    fn two_element_types_may_share_a_key_and_disagree_about_the_rest() {
+        let mut c = sample();
+        let person = c.label_id("person").unwrap();
+        let org = c.label_id("org").unwrap();
+        // GG24 and GG26: the same key label set, different properties,
+        // and a property of the same name holding a different type.
+        let ty = GraphType::open("relaxed")
+            .with(
+                ElementType::node("Staff", vec![person])
+                    .with_key(vec![person])
+                    .with_property("badge", int(), false),
+            )
+            .with(
+                ElementType::node("Guest", vec![person])
+                    .with_key(vec![person])
+                    .with_property("badge", text(), true)
+                    .with_property("tags", list_of(text()), true),
+            )
+            // GG25: two edge types on one key label set with different
+            // endpoints.
+            .with(ElementType::node("Org", vec![org]).with_key(vec![org]))
+            .with(ElementType::edge("At", Vec::new(), "Staff", "Org"))
+            .with(ElementType::edge("With", Vec::new(), "Staff", "Guest"));
+        c.add_graph_type(ty).unwrap();
+        let ty = c.graph_type("relaxed").unwrap();
+        let both = ty.types_for(ElementKind::Node, 1 << person);
+        assert_eq!(both.len(), 2, "one key label set, two element types");
+        assert_eq!(both[0].property("badge").unwrap().ty, int());
+        assert_eq!(both[1].property("badge").unwrap().ty, text());
+        // The two edge types differ in where they end, and both stay.
+        let edges = ty.types_for(ElementKind::Edge, 0);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].to.as_deref(), Some("Org"));
+        assert_eq!(edges[1].to.as_deref(), Some("Guest"));
+        let raw = c.encode();
+        assert_eq!(Catalog::decode(&raw).unwrap(), c);
+        // A declared type is written with the codes a column stores, so
+        // a type no column can hold is refused where it is written and
+        // not where it is encoded.
+        let err = c
+            .add_graph_type(GraphType::open("deep").with(
+                ElementType::node("Nested", vec![person]).with_property(
+                    "tree",
+                    list_of(list_of(text())),
+                    true,
+                ),
+            ))
+            .expect_err("a list of lists is not a column type")
+            .to_string();
+        assert!(err.contains("a type this file cannot write"), "{err}");
+    }
+
+    #[test]
+    fn a_graph_type_is_inferred_from_the_tables_a_file_holds() {
+        let c = sample();
+        let ty = c.infer_graph_type("like_this").unwrap();
+        assert!(ty.closed, "what the catalog says is all there is");
+        let names: Vec<&str> = ty.elements.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["person", "org", "follows", "works_at"]);
+        let person = ty.element("person").unwrap();
+        assert_eq!(person.kind, ElementKind::Node);
+        assert_eq!(
+            person.key_labels,
+            KeyLabels::Declared(vec![c.label_id("person").unwrap()])
+        );
+        let works_at = ty.element("works_at").unwrap();
+        assert_eq!(works_at.kind, ElementKind::Edge);
+        assert_eq!(works_at.from.as_deref(), Some("person"));
+        assert_eq!(works_at.to.as_deref(), Some("org"));
+    }
+
+    #[test]
+    fn a_graph_type_refuses_what_it_cannot_describe() {
+        let mut c = sample();
+        let person = c.label_id("person").unwrap();
+        let cases: Vec<(&str, GraphType)> = vec![
+            (
+                "declares an element type twice",
+                GraphType::open("a")
+                    .with(ElementType::node("N", vec![person]))
+                    .with(ElementType::node("N", vec![person])),
+            ),
+            (
+                "names label 9",
+                GraphType::open("b").with(ElementType::node("N", vec![9])),
+            ),
+            (
+                "declares a property twice",
+                GraphType::open("c").with(
+                    ElementType::node("N", vec![person])
+                        .with_property("p", text(), false)
+                        .with_property("p", int(), false),
+                ),
+            ),
+            (
+                "which is no node type here",
+                GraphType::open("d").with(ElementType::edge("E", Vec::new(), "N", "N")),
+            ),
+            (
+                "is a node type with endpoints",
+                GraphType::open("e").with(ElementType {
+                    from: Some("N".into()),
+                    ..ElementType::node("N", vec![person])
+                }),
+            ),
+        ];
+        for (expected, ty) in cases {
+            let err = c.add_graph_type(ty).expect_err(expected).to_string();
+            assert!(err.contains(expected), "expected {expected}, got {err}");
+        }
+        assert!(c.graph_types().is_empty(), "nothing broken was kept");
+    }
+
+    #[test]
+    fn a_graph_type_survives_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("types.zu1");
+        let mut db = Zu1File::create(&path).unwrap();
+        crate::graph::bulk_load_keyed(&mut db, "person", "knows", 4, &[(0, 1), (2, 3)], None)
+            .unwrap();
+        let mut catalog = Catalog::load(&mut db).unwrap();
+        let person = catalog.label_id("person").unwrap();
+        catalog
+            .add_graph_type(
+                GraphType::closed("company").with(
+                    ElementType::node("PersonType", vec![person])
+                        .with_key(vec![person])
+                        .with_property("name", text(), false),
+                ),
+            )
+            .unwrap();
+        catalog.store(&mut db).unwrap();
+        drop(db);
+
+        crate::verify(&path).unwrap();
+        let mut db = Zu1File::open(&path).unwrap();
+        let read = Catalog::load(&mut db).unwrap();
+        assert_eq!(read, catalog);
+        // Storing again gives the blocks the old catalog held back to the
+        // free list and takes them straight out again, so a file that is
+        // written over and over settles at a size and stays there.
+        read.store(&mut db).unwrap();
+        read.store(&mut db).unwrap();
+        let settled = db.db_header().block_count;
+        read.store(&mut db).unwrap();
+        read.store(&mut db).unwrap();
+        assert_eq!(db.db_header().block_count, settled);
+    }
+
+    #[test]
+    fn a_version_two_catalog_reads_as_a_file_with_no_graph_types() {
+        let mut c = sample();
+        c.add_graph_type(GraphType::open("t")).unwrap();
+        let raw = c.encode();
+        // The version 2 encoding is this one without the graph type
+        // section, which is everything the count and the type add.
+        let mut old = raw.clone();
+        old.truncate(raw.len() - (4 + 2 + 1 + 1 + 4));
+        old[0] = 2;
+        let read = Catalog::decode(&old).unwrap();
+        assert!(read.graph_types().is_empty());
+        assert_eq!(read.node_tables(), c.node_tables());
+        assert_eq!(read.labels(), c.labels());
     }
 
     #[test]

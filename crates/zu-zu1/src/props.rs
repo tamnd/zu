@@ -227,6 +227,34 @@ fn code_type(code: u8) -> Option<LogicalType> {
         .map(|(_, t)| t.clone())
 }
 
+/// The bytes a declared type is written as, for a container that names
+/// a type without storing values of it. `None` is a type nothing can be
+/// declared with, which the caller refuses before writing anything.
+pub(crate) fn declared_type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
+    type_bytes(ty)
+}
+
+/// Reads a type written by [`declared_type_bytes`], leaving `pos` after
+/// it. The codes are the column codes, so a type the catalog names and
+/// a type a column stores are the same byte.
+pub(crate) fn decode_declared_type(bytes: &[u8], pos: &mut usize) -> Result<LogicalType> {
+    let ty = match bytes.get(*pos) {
+        Some(&LIST_CODE) => {
+            *pos += 1;
+            let elem = bytes
+                .get(*pos)
+                .ok_or_else(|| corrupt("truncated list element type".into()))?;
+            let elem =
+                code_type(*elem).ok_or_else(|| corrupt(format!("unknown element type {elem}")))?;
+            list_of(elem)
+        }
+        Some(&code) => code_type(code).ok_or_else(|| corrupt(format!("unknown type {code}")))?,
+        None => return Err(corrupt("truncated type".into())),
+    };
+    *pos += 1;
+    Ok(ty)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropColumn {
     pub name: String,

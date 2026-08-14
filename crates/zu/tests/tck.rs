@@ -186,6 +186,27 @@ fn scenarios() -> Vec<Scenario> {
             vec![vec![Value::Int(8), Value::Int(7)]],
         ),
         s(
+            "exists",
+            "pattern predicate keeps the rows that match",
+            "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 35 } \
+             RETURN a.id AS id ORDER BY id",
+            int_rows(&[1, 2, 3]),
+        ),
+        s(
+            "exists",
+            "a matching row arrives once however many matched",
+            "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
+             RETURN count(a) AS n",
+            int_rows(&[5]),
+        ),
+        s(
+            "exists",
+            "negated pattern predicate keeps the rest",
+            "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(b) } \
+             RETURN a.id AS id ORDER BY id",
+            int_rows(&[5]),
+        ),
+        s(
             "aggregation",
             "grouped degree",
             "MATCH (a:person)-[:knows]->(b) \

@@ -44,13 +44,20 @@
 //! underneath is the rest of milestone 4.
 //!
 //! OPTIONAL MATCH executes as a left-outer group. Every flatten the
-//! group needs on outer chunks sits below an `OptionalBegin` that
+//! group needs on outer chunks sits below a `BracketBegin` that
 //! yields each outer configuration exactly once per activation, the
-//! group's operators run above it, and `OptionalEnd` passes matches
+//! group's operators run above it, and `BracketEnd` passes matches
 //! through or, when an outer configuration produced nothing, binds the
 //! group's chunks to a single null row. Filters born inside the
-//! optional clause compile into the group, so a WHERE there gates
+//! bracketed clause compile into the group, so a WHERE there gates
 //! matches within the group instead of dropping the null row.
+//!
+//! `EXISTS { ... }` and `NOT EXISTS { ... }` compile into the same
+//! bracket with a different kind on the end. A semi bracket hands the
+//! outer row up on the first match and never asks the group for a
+//! second one, an anti bracket does the opposite, and both collapse the
+//! group's chunks to one row on the way out because the slots the block
+//! introduced are out of scope above it.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,7 +69,7 @@ use zu_common::{DurationKind, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
-use crate::plan::{LogicalPlan, expr_text};
+use crate::plan::{Bracket, BracketKind, LogicalPlan, expr_text};
 
 /// Vector width of one chunk fill.
 pub const VECTOR_SIZE: usize = 2048;
@@ -470,7 +477,7 @@ pub struct OpProfile {
     pub flat: u64,
     /// What the optimizer expected this operator to produce, when the
     /// operator is one that produces rows at all. `None` for the
-    /// source, the flattens, and the optional brackets, which pass
+    /// source, the flattens, and the brackets themselves, which pass
     /// their input through and have no cardinality of their own.
     pub est: Option<f64>,
     /// The most rows the optimizer's ceiling allowed this operator,
@@ -772,13 +779,18 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             let cols: Vec<&str> = stage.chunk_slots[*chunk].iter().map(|&s| var(s)).collect();
             format!("Call {}({table}) YIELD {}", func.name(), cols.join(", "))
         }
-        OpDesc::OptionalBegin => "OptionalBegin".into(),
-        OpDesc::OptionalEnd { chunks, .. } => {
+        OpDesc::BracketBegin => "BracketBegin".into(),
+        OpDesc::BracketEnd { chunks, kind, .. } => {
             let slots: Vec<usize> = chunks
                 .iter()
                 .flat_map(|&c| stage.chunk_slots[c].iter().copied())
                 .collect();
-            format!("Optional {}", slot_names(&slots, query))
+            let name = match kind {
+                BracketKind::Optional => "Optional",
+                BracketKind::Semi => "Semi",
+                BracketKind::Anti => "Anti",
+            };
+            format!("{name} {}", slot_names(&slots, query))
         }
     }
 }
@@ -1066,18 +1078,20 @@ enum OpDesc {
         args: Vec<BoundExpr>,
         chunk: usize,
     },
-    /// Bottom of an OPTIONAL MATCH group: yields the current outer
+    /// Bottom of a bracketed group: yields the current outer
     /// configuration exactly once per activation, so the group's
     /// operators exhaust per outer row and a miss is detectable.
-    OptionalBegin,
-    /// Top of an OPTIONAL MATCH group: passes group matches through,
-    /// and when an outer configuration produced nothing, binds every
-    /// chunk the group introduced to a single null row.
-    OptionalEnd {
-        /// Index of the matching `OptionalBegin` in the stage.
+    BracketBegin,
+    /// Top of a bracketed group. What it does with a match and with a
+    /// miss is the kind's business; the chunks are the group's own, and
+    /// they are bound to a single null row wherever a row leaves here
+    /// without one of the group's matches behind it.
+    BracketEnd {
+        /// Index of the matching `BracketBegin` in the stage.
         begin: usize,
-        /// Chunks introduced inside the group, nulled on a miss.
+        /// Chunks introduced inside the group.
         chunks: Vec<usize>,
+        kind: BracketKind,
     },
 }
 
@@ -1118,7 +1132,7 @@ struct SinkDef {
 struct StageDef {
     descs: Vec<OpDesc>,
     /// The optimizer's row estimate for each operator, `None` where no
-    /// logical operator owns it (the source, the optional brackets,
+    /// logical operator owns it (the source, the brackets,
     /// the flattens the builder inserts on its own).
     est: Vec<Option<crate::optimizer::Estimate>>,
     /// Slots of each chunk, in column order.
@@ -1362,21 +1376,21 @@ fn rel_steps(rel_slot: usize, query: &BoundQuery, schema: &Schema) -> Result<Vec
     Ok(steps)
 }
 
-/// The OPTIONAL MATCH group of a plan operator, `None` for required
-/// operators and for operators that never carry a group.
-fn optional_group(op: &LogicalPlan) -> Option<usize> {
+/// The bracket a plan operator sits in, `None` for a plain match and
+/// for the operators that never carry one.
+fn bracket_of(op: &LogicalPlan) -> Option<Bracket> {
     match op {
-        LogicalPlan::ScanNodes { optional, .. }
-        | LogicalPlan::Expand { optional, .. }
-        | LogicalPlan::Filter { optional, .. } => *optional,
+        LogicalPlan::ScanNodes { bracket, .. }
+        | LogicalPlan::Expand { bracket, .. }
+        | LogicalPlan::Filter { bracket, .. } => *bracket,
         _ => None,
     }
 }
 
 /// Whether the operator after an expand is an edge probe into that
 /// expand's endpoint that the WCOJ fusion can absorb: a single-step
-/// fixed-direction closing expand in the same optional group whose
-/// other end is already bound, carrying the optimizer's mark unless
+/// fixed-direction closing expand in the same group whose other end is
+/// already bound, carrying the optimizer's mark unless
 /// the mode forces the fusion. Returns the probe's rel slot, source
 /// slot, direction, and rel step, and flattens the source's chunk so
 /// the fused operator reads one configuration per pull.
@@ -1384,7 +1398,7 @@ fn wcoj_fusion(
     b: &mut StageBuilder,
     lookahead: Option<&LogicalPlan>,
     to: usize,
-    optional: Option<usize>,
+    bracket: Option<Bracket>,
     query: &BoundQuery,
     schema: &Schema,
 ) -> Result<Option<(usize, usize, RelDirection, RelStep)>> {
@@ -1396,13 +1410,13 @@ fn wcoj_fusion(
         range: None,
         into: true,
         wcoj,
-        optional: opt2,
+        bracket: probe_bracket,
         ..
     }) = lookahead
     else {
         return Ok(None);
     };
-    if *opt2 != optional || !(*wcoj || b.wcoj == Wcoj::Force) {
+    if *probe_bracket != bracket || !(*wcoj || b.wcoj == Wcoj::Force) {
         return Ok(None);
     }
     let steps = rel_steps(*rel, query, schema)?;
@@ -1437,9 +1451,9 @@ fn wcoj_fusion(
 /// Compiles one ScanNodes, Expand, or Filter into the builder.
 /// `lookahead` is the next linear operator, offered for IndexLookup
 /// fusion; returns true when it was fused and the caller must skip it.
-/// Fusion requires the filter to share the scan's group, otherwise an
-/// optional `{id: k}` filter would fuse into a required scan and turn
-/// the left-outer group inner.
+/// Fusion requires the filter to share the scan's group, otherwise a
+/// bracketed `{id: k}` filter would fuse into a plain scan and take
+/// the group's own predicate out of it.
 fn compile_match_op(
     b: &mut StageBuilder,
     op: &LogicalPlan,
@@ -1448,7 +1462,7 @@ fn compile_match_op(
     schema: &Schema,
 ) -> Result<bool> {
     match op {
-        LogicalPlan::ScanNodes { slot, optional, .. } => {
+        LogicalPlan::ScanNodes { slot, bracket, .. } => {
             let tables = query.variables[*slot].node_tables.clone();
             if tables.is_empty() {
                 return Err(invalid(format!(
@@ -1459,9 +1473,9 @@ fn compile_match_op(
             let fused = lookahead.and_then(|next| match next {
                 LogicalPlan::Filter {
                     expr,
-                    optional: fopt,
+                    bracket: filter_bracket,
                     ..
-                } if fopt == optional => index_key(expr, *slot),
+                } if filter_bracket == bracket => index_key(expr, *slot),
                 _ => None,
             });
             let consumed = fused.is_some();
@@ -1482,7 +1496,7 @@ fn compile_match_op(
             range,
             into,
             asp,
-            optional,
+            bracket,
             ..
         } => {
             let rels = rel_steps(*rel, query, schema)?;
@@ -1502,7 +1516,7 @@ fn compile_match_op(
                 && !*into
                 && rels.len() == 1
                 && usable_side(&rels[0], *direction)
-                && let Some(fused) = wcoj_fusion(b, lookahead, *to, *optional, query, schema)?
+                && let Some(fused) = wcoj_fusion(b, lookahead, *to, *bracket, query, schema)?
             {
                 let (rel2, probe, probe_dir, probe_step) = fused;
                 let chunk = b.new_chunk(vec![*to, *rel, rel2], false);
@@ -1610,11 +1624,11 @@ fn compile_match_op(
     }
 }
 
-/// Compiles one OPTIONAL MATCH group: flattens for the outer chunks
-/// the group reads, then `OptionalBegin`, the group's operators, and
-/// the `OptionalEnd` that binds nulls on a miss. Returns the linear
-/// index just past the group.
-fn compile_optional_group(
+/// Compiles one bracketed group: flattens for the outer chunks the
+/// group reads, then `BracketBegin`, the group's operators, and the
+/// `BracketEnd` that decides what an outer row is worth. Returns the
+/// linear index just past the group.
+fn compile_bracket(
     b: &mut StageBuilder,
     linear: &[&LogicalPlan],
     start: usize,
@@ -1622,13 +1636,13 @@ fn compile_optional_group(
     schema: &Schema,
     est: &[crate::optimizer::Estimate],
 ) -> Result<usize> {
-    let group = optional_group(linear[start]);
+    let group = bracket_of(linear[start]);
     let mut end = start + 1;
-    while end < linear.len() && optional_group(linear[end]) == group {
+    while end < linear.len() && bracket_of(linear[end]) == group {
         end += 1;
     }
     // Every outer chunk the group reads must flatten below the
-    // boundary, so one `OptionalBegin` activation is exactly one outer
+    // boundary, so one `BracketBegin` activation is exactly one outer
     // configuration and a miss is detectable per outer row. Slots the
     // group introduces itself are not bound yet and fall through.
     let mut read = BTreeSet::new();
@@ -1654,9 +1668,9 @@ fn compile_optional_group(
     // The brackets belong to no logical operator, so they carry no
     // estimate and the profile leaves their column blank.
     b.cur_est = None;
-    b.push(OpDesc::OptionalBegin);
+    b.push(OpDesc::BracketBegin);
     // Nothing below the boundary may compact through the group, and
-    // nothing above may compact through the `OptionalEnd`.
+    // nothing above may compact through the `BracketEnd`.
     b.compactable = None;
     let first_chunk = b.chunk_slots.len();
     let mut i = start;
@@ -1678,9 +1692,10 @@ fn compile_optional_group(
         i += 1;
     }
     b.cur_est = None;
-    b.push(OpDesc::OptionalEnd {
+    b.push(OpDesc::BracketEnd {
         begin,
         chunks: (first_chunk..b.chunk_slots.len()).collect(),
+        kind: group.expect("a bracket group has a kind").kind,
     });
     b.compactable = None;
     Ok(end)
@@ -1707,8 +1722,8 @@ fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
         | OpDesc::RowSource { .. }
         | OpDesc::Scan { .. }
         | OpDesc::Flatten { .. }
-        | OpDesc::OptionalBegin
-        | OpDesc::OptionalEnd { .. } => {}
+        | OpDesc::BracketBegin
+        | OpDesc::BracketEnd { .. } => {}
     }
 }
 
@@ -1749,11 +1764,11 @@ fn rewrite_count_expand(
     extra: &BTreeSet<usize>,
     aggregate: bool,
 ) {
-    // Optional groups hold absolute operator indices and their own
-    // null semantics; leave their stages alone.
+    // A bracket holds absolute operator indices and decides its own
+    // multiplicity; leave its stages alone.
     if b.descs
         .iter()
-        .any(|d| matches!(d, OpDesc::OptionalBegin | OpDesc::OptionalEnd { .. }))
+        .any(|d| matches!(d, OpDesc::BracketBegin | OpDesc::BracketEnd { .. }))
     {
         return;
     }
@@ -2035,8 +2050,8 @@ fn build_stages(
     let mut i = 0;
     while i < linear.len() {
         b.cur_est = est.get(i).copied();
-        if optional_group(linear[i]).is_some() {
-            i = compile_optional_group(&mut b, &linear, i, query, schema, &est)?;
+        if bracket_of(linear[i]).is_some() {
+            i = compile_bracket(&mut b, &linear, i, query, schema, &est)?;
             continue;
         }
         match linear[i] {
@@ -2303,8 +2318,8 @@ struct StageCtx<'a> {
     scratch: Vec<u64>,
     /// The accumulated edge sets of each ASP join, keyed by operator
     /// index and built on the join's first pull, one set per rel step
-    /// in storage orientation. Deliberately outside `states` so an
-    /// optional group's rearm never throws the accumulate away, and
+    /// in storage orientation. Deliberately outside `states` so a
+    /// bracket's rearm never throws the accumulate away, and
     /// kept across morsels so a worker accumulates once per query.
     edge_sets: BTreeMap<usize, Vec<EdgeSet>>,
     /// Each intersect's cached probe-side adjacency, keyed by operator
@@ -2492,8 +2507,8 @@ fn live_unflat(descs: &[OpDesc]) -> Vec<Vec<usize>> {
             | OpDesc::TableFunction { chunk, .. } => {
                 unflat.insert(*chunk);
             }
-            OpDesc::Source | OpDesc::Filter { .. } | OpDesc::OptionalBegin => {}
-            OpDesc::OptionalEnd { .. } => {}
+            OpDesc::Source | OpDesc::Filter { .. } | OpDesc::BracketBegin => {}
+            OpDesc::BracketEnd { .. } => {}
         }
         out.push(unflat.iter().copied().collect());
     }
@@ -2512,15 +2527,12 @@ fn flat_rows(ctx: &StageCtx, i: usize) -> u64 {
 
 /// Whether this operator's flat row count is an output cardinality an
 /// estimate can be judged against. The source, the flattens, and the
-/// optional brackets pass rows through without producing any, so
+/// brackets pass rows through without producing any, so
 /// their count belongs to whatever is under them.
 fn counts_rows(desc: &OpDesc) -> bool {
     !matches!(
         desc,
-        OpDesc::Source
-            | OpDesc::Flatten { .. }
-            | OpDesc::OptionalBegin
-            | OpDesc::OptionalEnd { .. }
+        OpDesc::Source | OpDesc::Flatten { .. } | OpDesc::BracketBegin | OpDesc::BracketEnd { .. }
     )
 }
 
@@ -2531,7 +2543,7 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
     match &descs[i] {
         OpDesc::Source | OpDesc::Flatten { .. } => 1,
         OpDesc::Filter { compact: None, .. } => 1,
-        OpDesc::OptionalBegin | OpDesc::OptionalEnd { .. } => 1,
+        OpDesc::BracketBegin | OpDesc::BracketEnd { .. } => 1,
         OpDesc::Filter {
             compact: Some(c), ..
         } => ctx.chunks[*c].size as u64,
@@ -3660,7 +3672,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             c.cur = None;
             Ok(true)
         }
-        OpDesc::OptionalBegin => {
+        OpDesc::BracketBegin => {
             if ctx.states[i].active {
                 return Ok(false);
             }
@@ -3670,12 +3682,35 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             ctx.states[i].active = true;
             Ok(true)
         }
-        OpDesc::OptionalEnd { begin, chunks } => loop {
+        OpDesc::BracketEnd {
+            begin,
+            chunks,
+            kind,
+        } => loop {
+            // A semi or an anti bracket is a question about the outer
+            // row and one match answers it, so once it has answered,
+            // the group is rearmed on the spot and the rest of its
+            // matches are never drawn. An optional wants them all.
+            if ctx.states[i].pos == 1 && *kind != BracketKind::Optional {
+                rearm_bracket(ctx, *begin, i);
+            }
             if next(descs, ctx, i - 1)? {
                 // `pos` doubles as the emitted flag for the current
                 // outer configuration.
                 ctx.states[i].pos = 1;
-                return Ok(true);
+                match kind {
+                    BracketKind::Optional => return Ok(true),
+                    BracketKind::Semi => {
+                        // Nothing above reads the group's slots, so the
+                        // match is worth exactly one row and its vectors
+                        // collapse to one before they are counted.
+                        null_chunks(ctx, chunks);
+                        return Ok(true);
+                    }
+                    // A hit is what an anti bracket rejects, and the
+                    // group's remaining matches would say the same.
+                    BracketKind::Anti => continue,
+                }
             }
             if !ctx.states[*begin].active {
                 // The begin never yielded: the outer input is done.
@@ -3683,22 +3718,35 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             }
             let missed = ctx.states[i].pos == 0;
             // Rearm the group for the next outer configuration.
-            for s in &mut ctx.states[*begin..i] {
-                *s = OpState::default();
-            }
-            ctx.states[i].pos = 0;
-            if missed {
-                for &c in chunks {
-                    let chunk = &mut ctx.chunks[c];
-                    for col in &mut chunk.cols {
-                        *col = vec![Value::Null];
-                    }
-                    chunk.size = 1;
-                    chunk.cur = Some(0);
-                }
+            rearm_bracket(ctx, *begin, i);
+            if missed && *kind != BracketKind::Semi {
+                null_chunks(ctx, chunks);
                 return Ok(true);
             }
         },
+    }
+}
+
+/// Puts a bracket's operators back where they started so the next pull
+/// through the begin draws the next outer configuration.
+fn rearm_bracket(ctx: &mut StageCtx, begin: usize, end: usize) {
+    for s in &mut ctx.states[begin..end] {
+        *s = OpState::default();
+    }
+    ctx.states[end].pos = 0;
+}
+
+/// Binds a bracket's chunks to a single null row, which is both what an
+/// outer row that matched nothing carries above and the collapse a semi
+/// bracket does to a match nothing above is allowed to read.
+fn null_chunks(ctx: &mut StageCtx, chunks: &[usize]) {
+    for &c in chunks {
+        let chunk = &mut ctx.chunks[c];
+        for col in &mut chunk.cols {
+            *col = vec![Value::Null];
+        }
+        chunk.size = 1;
+        chunk.cur = Some(0);
     }
 }
 
@@ -5820,7 +5868,7 @@ mod tests {
         let scan = LogicalPlan::ScanNodes {
             input: Box::new(LogicalPlan::Empty),
             slot: c,
-            optional: None,
+            bracket: None,
         };
         let expand = |input, rel, from, to, direction, into, asp| LogicalPlan::Expand {
             input: Box::new(input),
@@ -5832,7 +5880,7 @@ mod tests {
             into,
             asp,
             wcoj: false,
-            optional: None,
+            bracket: None,
         };
         let b_from_c = expand(scan, hop2, c, b, RelDirection::In, false, false);
         let a_from_c = expand(b_from_c, close, c, a, RelDirection::In, false, false);
@@ -6085,7 +6133,7 @@ mod tests {
     }
 
     #[test]
-    fn multiway_intersect_inside_an_optional_group() {
+    fn multiway_intersect_inside_an_optional_bracket() {
         // The fusion fires inside the optional group and a miss still
         // nulls the whole fused chunk, c and both rels.
         let source = "MATCH (a:Person)-[:KNOWS]->(b) \
@@ -7203,6 +7251,141 @@ mod tests {
                 [Value::Int(5), Value::Null],
             ]
         );
+    }
+
+    #[test]
+    fn exists_keeps_the_people_with_a_far_friend() {
+        // Out-neighbors over 3: 2 -> 4, 3 -> 4, 4 -> 5. The block's own
+        // WHERE runs inside the bracket, so it decides the match rather
+        // than the row.
+        let r = run(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 } \
+             RETURN a.id AS id ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[2], [3], [4]]);
+    }
+
+    #[test]
+    fn not_exists_keeps_the_rest() {
+        let r = run(
+            "MATCH (a:Person) WHERE NOT EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 } \
+             RETURN a.id AS id ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0], [1], [5]]);
+    }
+
+    #[test]
+    fn exists_hands_the_row_up_once_however_many_matched() {
+        // Everyone knows someone and 0 and 1 know two people each, so a
+        // bracket that passed its matches through the way an optional
+        // does would count eight rows here instead of six.
+        let r = run(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN count(*) AS n",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[6]]);
+    }
+
+    #[test]
+    fn exists_ties_its_block_to_the_row_being_tested() {
+        // b is the outer variable, c is the block's own, and the answer
+        // is per edge: only the four edges whose far end has an
+        // out-neighbor other than 4 survive, plus (2, 4) and (3, 4)
+        // where 4's only friend is 5.
+        let r = run(
+            "MATCH (a:Person)-[:KNOWS]->(b) \
+             WHERE NOT EXISTS { MATCH (b)-[:KNOWS]->(c) WHERE c.id = 4 } \
+             RETURN a.id AS a, b.id AS b ORDER BY a, b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0, 1], [2, 4], [3, 4], [4, 5], [5, 0]]);
+    }
+
+    #[test]
+    fn exists_runs_a_two_hop_block() {
+        // Two-hop trails from a that end at 0: 4 -> 5 -> 0 alone, and
+        // the block rearms per outer row the same way an optional does.
+        let r = run(
+            "MATCH (a:Person) \
+             WHERE EXISTS { MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE c.id = 0 } \
+             RETURN a.id AS id ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[4]]);
+    }
+
+    #[test]
+    fn exists_sits_next_to_an_ordinary_predicate() {
+        // The conjunct that is not a block stays an ordinary filter and
+        // the two are anded, whichever order they are written in.
+        let r = run(
+            "MATCH (a:Person) WHERE a.id < 4 AND EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 } \
+             RETURN a.id AS id ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[2], [3]]);
+        let r = run(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 } AND a.id < 4 \
+             RETURN a.id AS id ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[2], [3]]);
+    }
+
+    #[test]
+    fn exists_and_not_exists_stack() {
+        // Two blocks off one WHERE, each its own bracket: people with a
+        // friend over 3 and no friend under 2. 2 -> 4, 3 -> 4 and
+        // 4 -> 5 pass the first, and 4 keeps nothing under 2 either.
+        let r = run(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 } \
+             AND NOT EXISTS { MATCH (a)-[:KNOWS]->(c) WHERE c.id < 2 } \
+             RETURN a.id AS id ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[2], [3], [4]]);
+    }
+
+    #[test]
+    fn exists_reads_the_pattern_alone() {
+        // No block WHERE at all: the pattern is the whole question, and
+        // an inline property in it is a filter inside the bracket.
+        let r = run(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->({id: 4}) } \
+             RETURN a.id AS id ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[2], [3]]);
+    }
+
+    #[test]
+    fn exists_after_a_with_tests_the_projected_row() {
+        // Degree over 1 leaves 0 and 1, and of those only 1 knows
+        // someone over 2, so the block runs on the grouped rows.
+        let r = run(
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS deg WHERE deg > 1 \
+             AND EXISTS { MATCH (a)-[:KNOWS]->(c) WHERE c.id > 2 } \
+             RETURN a.id AS id, deg ORDER BY id",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[1, 2]]);
+    }
+
+    #[test]
+    fn exists_counts_the_outer_row_and_not_the_block() {
+        // count(a) is over the outer rows the semi bracket kept, and
+        // nothing the block bound is alive to be counted.
+        let r = run(
+            "MATCH (a:Person)-[:KNOWS]->(f) \
+             WHERE EXISTS { MATCH (a)-[:IS_LOCATED_IN]->(p) WHERE p.id = 0 } \
+             RETURN count(*) AS edges, count(DISTINCT a.id) AS people",
+            &[],
+        );
+        // Places: 0 -> 0 and 3 -> 0. Edges out of them: 0 -> 1, 0 -> 2,
+        // 3 -> 4.
+        assert_eq!(int_rows(&r), [[3, 2]]);
     }
 
     #[test]

@@ -22,6 +22,9 @@ parity means the engines returned identical rows.
 | where | not equals | pass | pass | pass |
 | optional | unmatched row keeps null | pass | pass | pass |
 | optional | counts over optional rows | pass | pass | pass |
+| exists | pattern predicate keeps the rows that match | pass | pass | pass |
+| exists | a matching row arrives once however many matched | pass | pass | pass |
+| exists | negated pattern predicate keeps the rest | pass | pass | pass |
 | aggregation | grouped degree | pass | pass | pass |
 | aggregation | sum | pass | pass | pass |
 | aggregation | min and max | pass | pass | pass |
@@ -36,4 +39,4 @@ parity means the engines returned identical rows.
 | unwind | literal list | pass | pass | pass |
 | null | is null projects a boolean | pass | pass | pass |
 
-28 scenarios: zu1 28/28, sqlite 28/28, parity 28/28.
+31 scenarios: zu1 31/31, sqlite 31/31, parity 31/31.

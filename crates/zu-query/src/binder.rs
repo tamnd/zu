@@ -53,6 +53,67 @@ fn bad_type(detail: String) -> ZuError {
     ZuError::gql(codes::C22G03, detail)
 }
 
+/// One existence block lifted out of a WHERE, with the NOT in front of
+/// it folded in: `NOT EXISTS { ... }` is the same match asked the other
+/// way round, and asking it the other way round is one flag rather than
+/// a second operator.
+struct ExistsBlock<'a> {
+    negated: bool,
+    patterns: &'a [ast::PathPattern],
+    filter: &'a Option<Box<Expr>>,
+}
+
+/// Takes the existence blocks off the top of a WHERE and returns the
+/// predicate that is left, `None` when the WHERE was nothing else.
+///
+/// Only the top level of the AND chain is taken. A block under an OR,
+/// or anywhere a value is wanted, is left where it is and the binder
+/// refuses it there: turning one into a boolean column is a mark join
+/// and this is not one.
+fn peel_exists<'a>(expr: &'a Expr, out: &mut Vec<ExistsBlock<'a>>) -> Option<Expr> {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            lhs,
+            rhs,
+        } => match (peel_exists(lhs, out), peel_exists(rhs, out)) {
+            (Some(lhs), Some(rhs)) => Some(Expr::Binary {
+                op: BinaryOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            }),
+            (Some(one), None) | (None, Some(one)) => Some(one),
+            (None, None) => None,
+        },
+        Expr::Exists { patterns, filter } => {
+            out.push(ExistsBlock {
+                negated: false,
+                patterns,
+                filter,
+            });
+            None
+        }
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Exists { patterns, filter } => {
+                out.push(ExistsBlock {
+                    negated: true,
+                    patterns,
+                    filter,
+                });
+                None
+            }
+            _ => Some(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: expr.clone(),
+            }),
+        },
+        other => Some(other.clone()),
+    }
+}
+
 /// One node table: a label naming the row domain `0..node_count`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDef {
@@ -520,10 +581,29 @@ pub struct BoundQuery {
     pub path_shapes: BTreeMap<usize, Vec<PathPart>>,
 }
 
+/// What a match does with the rows underneath it.
+///
+/// The first two are written as MATCH and OPTIONAL MATCH. The other
+/// two are what an existence predicate becomes: `EXISTS { ... }` is a
+/// match whose rows are never returned and whose only use is that
+/// there was one, and `NOT EXISTS { ... }` is the same match keeping
+/// the rows it found nothing for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Required,
+    Optional,
+    /// `EXISTS { ... }`: the outer row survives if the match finds
+    /// anything, once, however much it finds.
+    Semi,
+    /// `NOT EXISTS { ... }`: the outer row survives if it finds
+    /// nothing.
+    Anti,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundClause {
     Match {
-        optional: bool,
+        kind: MatchKind,
         patterns: Vec<BoundPath>,
         filter: Option<BoundExpr>,
     },
@@ -757,6 +837,7 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         params: Vec::new(),
         columns: Vec::new(),
         path_shapes: BTreeMap::new(),
+        pending: Vec::new(),
     };
     let mut clauses = Vec::new();
     for (i, clause) in query.clauses.iter().enumerate() {
@@ -767,6 +848,10 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
             ));
         }
         clauses.push(binder.bind_clause(clause)?);
+        // An existence block written in the clause's WHERE is a match
+        // of its own and runs where the predicate would have, which is
+        // straight after the clause it was written in.
+        clauses.append(&mut binder.pending);
     }
     Ok(BoundQuery {
         clauses,
@@ -786,6 +871,10 @@ struct Binder<'a> {
     params: Vec<String>,
     columns: Vec<String>,
     path_shapes: BTreeMap<usize, Vec<PathPart>>,
+    /// Matches lifted out of the clause being bound, in written order.
+    /// Drained by [`bind`] once the clause itself is bound, so an
+    /// existence block lands where its predicate would have.
+    pending: Vec<BoundClause>,
 }
 
 /// Expression context: where aggregates are legal and whether one was
@@ -848,12 +937,12 @@ impl Binder<'_> {
                 for path in &bound {
                     self.narrow_path(path)?;
                 }
-                let filter = match filter {
-                    Some(expr) => Some(self.bind_bool(expr, "WHERE")?),
-                    None => None,
-                };
+                let filter = self.bind_where(filter)?;
                 Ok(BoundClause::Match {
-                    optional: *optional,
+                    kind: match optional {
+                        true => MatchKind::Optional,
+                        false => MatchKind::Required,
+                    },
                     patterns: bound,
                     filter,
                 })
@@ -878,6 +967,62 @@ impl Binder<'_> {
             Clause::With { projection, filter } => self.bind_projection(projection, false, filter),
             Clause::Return { projection } => self.bind_projection(projection, true, &None),
         }
+    }
+
+    /// Binds a WHERE, the existence blocks in it lifted into matches of
+    /// their own first.
+    ///
+    /// A block is a match and not a value, so it cannot be bound where
+    /// it was written: what comes back here is the predicate that is
+    /// left, and the blocks are queued in `pending` to run after the
+    /// clause. Only the top level of the AND chain is lifted, since a
+    /// block under an OR is asking for a boolean and this is not the
+    /// thing that produces one.
+    fn bind_where(&mut self, filter: &Option<Expr>) -> Result<Option<BoundExpr>> {
+        let Some(expr) = filter else {
+            return Ok(None);
+        };
+        let mut blocks = Vec::new();
+        let rest = peel_exists(expr, &mut blocks);
+        for block in blocks {
+            let clause = self.bind_exists(block)?;
+            self.pending.push(clause);
+        }
+        match rest {
+            Some(expr) => Ok(Some(self.bind_bool(&expr, "WHERE")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Binds one existence block into the match it stands for.
+    ///
+    /// The block sees the scope around it, which is what ties it to the
+    /// row being tested, and the names it writes itself are gone again
+    /// when it ends: an EXISTS says whether a match was there and hands
+    /// back nothing to read, so a variable of its own that outlived it
+    /// would name a row nobody kept.
+    fn bind_exists(&mut self, block: ExistsBlock) -> Result<BoundClause> {
+        let outer = self.scope.clone();
+        let mut bound = Vec::new();
+        for path in block.patterns {
+            bound.push(self.bind_path(path)?);
+        }
+        for path in &bound {
+            self.narrow_path(path)?;
+        }
+        let filter = match &block.filter {
+            Some(expr) => Some(self.bind_bool(expr, "WHERE")?),
+            None => None,
+        };
+        self.scope = outer;
+        Ok(BoundClause::Match {
+            kind: match block.negated {
+                true => MatchKind::Anti,
+                false => MatchKind::Semi,
+            },
+            patterns: bound,
+            filter,
+        })
     }
 
     fn bind_table_call(
@@ -1070,12 +1215,12 @@ impl Binder<'_> {
         let skip = self.bind_count_limit(&projection.skip, "SKIP")?;
         let limit = self.bind_count_limit(&projection.limit, "LIMIT")?;
 
-        // The clause's ongoing scope is exactly the projected names.
+        // The clause's ongoing scope is exactly the projected names,
+        // which is also what an existence block in the WHERE sees: the
+        // block runs after the projection, so it reads the projected
+        // names and nothing the projection dropped.
         self.scope = new_scope;
-        let filter = match filter {
-            Some(expr) => Some(self.bind_bool(expr, "WHERE")?),
-            None => None,
-        };
+        let filter = self.bind_where(filter)?;
         if is_return {
             self.columns = items.iter().map(|i| i.name.clone()).collect();
             for item in &mut items {
@@ -1556,6 +1701,14 @@ impl Binder<'_> {
                     plan_type(ty),
                 ))
             }
+            // Everything that could be lifted was lifted before this
+            // ran, so a block reaching here is one in a place that
+            // wants a value out of it.
+            Expr::Exists { .. } => Err(invalid(
+                "EXISTS is a match and not a value: write it as a whole conjunct of a WHERE, \
+                 on its own or under NOT"
+                    .into(),
+            )),
         }
     }
 
@@ -1805,6 +1958,10 @@ pub fn text(expr: &Expr) -> String {
             format!("PATH [{}]", rendered.join(", "))
         }
         Expr::Cast { expr, ty } => format!("CAST({} AS {ty})", text(expr)),
+        // The patterns are not rendered: this text names a column and
+        // titles an operator, and a whole match inside one of those
+        // reads worse than the word does.
+        Expr::Exists { .. } => "EXISTS { ... }".into(),
     }
 }
 
@@ -2031,6 +2188,139 @@ mod tests {
         };
         assert_eq!(patterns[0].start.props[0].0, "id");
         assert_eq!(patterns[0].start.props[0].1, BoundExpr::Param(0));
+    }
+
+    #[test]
+    fn an_exists_block_becomes_a_match_of_its_own() {
+        let q = bound(
+            "MATCH (a:Person) WHERE a.id > 1 AND EXISTS { MATCH (a)-[:KNOWS]->(b) } \
+             RETURN a.id AS id",
+        );
+        let BoundClause::Match { kind, filter, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        assert_eq!(*kind, MatchKind::Required);
+        assert!(filter.is_some(), "the conjunct that is not a block stayed");
+        let BoundClause::Match {
+            kind,
+            patterns,
+            filter,
+        } = &q.clauses[1]
+        else {
+            panic!("the block runs after the clause it was written in");
+        };
+        assert_eq!(*kind, MatchKind::Semi);
+        assert_eq!(patterns[0].steps.len(), 1);
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn a_negated_block_binds_the_other_way_round() {
+        let q = bound("MATCH (a:Person) WHERE NOT EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN a");
+        let BoundClause::Match { kind, filter, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        assert_eq!(*kind, MatchKind::Required);
+        assert!(filter.is_none(), "the WHERE was the block and nothing else");
+        let BoundClause::Match { kind, .. } = &q.clauses[1] else {
+            panic!("the block");
+        };
+        assert_eq!(*kind, MatchKind::Anti);
+    }
+
+    #[test]
+    fn two_blocks_keep_their_written_order() {
+        let q = bound(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) } \
+             AND NOT EXISTS { MATCH (a)-[:IS_LOCATED_IN]->(p) } RETURN a",
+        );
+        let kinds: Vec<MatchKind> = q
+            .clauses
+            .iter()
+            .filter_map(|c| match c {
+                BoundClause::Match { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [MatchKind::Required, MatchKind::Semi, MatchKind::Anti]
+        );
+    }
+
+    #[test]
+    fn a_block_variable_does_not_outlive_the_block() {
+        let e = bind_err("MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN b.id");
+        assert!(e.contains("variable 'b' is not defined"), "got: {e}");
+        // The same name in two blocks is two variables and neither is
+        // the other's, so writing it twice is not a redeclaration.
+        bound(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) } \
+             AND EXISTS { MATCH (a)<-[:KNOWS]-(b) } RETURN a",
+        );
+    }
+
+    #[test]
+    fn a_block_sees_the_scope_around_it() {
+        // b is the outer variable here, so the block joins to it rather
+        // than introducing a second one.
+        let q = bound(
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE EXISTS { MATCH (b)-[:KNOWS]->(a) } RETURN a",
+        );
+        let BoundClause::Match { patterns, .. } = &q.clauses[1] else {
+            panic!("the block");
+        };
+        let outer = q.variables.iter().position(|v| v.name == "b").expect("b");
+        assert_eq!(patterns[0].start.slot, outer);
+    }
+
+    #[test]
+    fn a_block_after_a_with_reads_the_projected_names() {
+        let q = bound(
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS deg WHERE deg > 1 \
+             AND EXISTS { MATCH (a)-[:KNOWS]->(c) } RETURN a.id AS id",
+        );
+        let BoundClause::Match { kind, .. } = &q.clauses[2] else {
+            panic!(
+                "the block runs after the projection, got {:?}",
+                q.clauses[2]
+            );
+        };
+        assert_eq!(*kind, MatchKind::Semi);
+        let a = q.variables.iter().position(|v| v.name == "a").expect("a");
+        let BoundClause::Match { patterns, .. } = &q.clauses[2] else {
+            unreachable!()
+        };
+        assert_eq!(patterns[0].start.slot, a, "the block joined to the group");
+
+        // A name the projection dropped is out of scope by the time the
+        // block runs, so writing it in the block's pattern introduces a
+        // variable of the block's own the way any fresh name does.
+        let q = bound(
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS deg \
+             WHERE EXISTS { MATCH (b)-[:KNOWS]->(c) } RETURN a.id AS id",
+        );
+        let BoundClause::Match { patterns, .. } = &q.clauses[2] else {
+            panic!("the block");
+        };
+        let outer = q
+            .variables
+            .iter()
+            .position(|v| v.name == "b")
+            .expect("the outer b");
+        assert_ne!(patterns[0].start.slot, outer);
+    }
+
+    #[test]
+    fn a_block_is_not_a_value() {
+        let e = bind_err("MATCH (a:Person) RETURN EXISTS { MATCH (a)-[:KNOWS]->(b) } AS friendly");
+        assert!(e.contains("EXISTS is a match and not a value"), "got: {e}");
+        // Under an OR it is being asked for a boolean, which is a mark
+        // join and not this.
+        let e = bind_err(
+            "MATCH (a:Person) WHERE a.id = 0 OR EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN a",
+        );
+        assert!(e.contains("EXISTS is a match and not a value"), "got: {e}");
     }
 
     #[test]

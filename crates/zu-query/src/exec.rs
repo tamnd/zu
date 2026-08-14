@@ -813,9 +813,13 @@ fn sink_name(sink: &SinkDef) -> String {
     name
 }
 
-/// Total order over values for grouping, DISTINCT, and ORDER BY:
-/// nulls first, then booleans, numbers (int and float compare
-/// numerically), strings, nodes, rels, lists, records.
+/// Total order over values for grouping, DISTINCT, ORDER BY and the
+/// inequality operators: nulls first, then booleans, numbers (int and
+/// float compare numerically), strings, temporals, nodes, rels, lists,
+/// records, paths.
+///
+/// The wrapper is the sort key; [`value_order`] is the order itself
+/// and is what a predicate calls, so the two never drift apart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrdValue(pub Value);
 
@@ -829,99 +833,122 @@ impl PartialOrd for OrdValue {
 
 impl Ord for OrdValue {
     fn cmp(&self, other: &Self) -> Ordering {
-        fn rank(v: &Value) -> u8 {
-            match v {
-                Value::Null => 0,
-                Value::Bool(_) => 1,
-                Value::Int(_) | Value::Float(_) => 2,
-                Value::Str(_) => 3,
-                // A temporal value sorts after the strings and before
-                // the references, and two of different kinds sort by
-                // kind, because a date and a duration have no order
-                // between them and the total order still owes an
-                // answer.
-                Value::Temporal(_) => 4,
-                Value::Node { .. } => 5,
-                Value::Rel { .. } => 6,
-                Value::List(_) | Value::Chain(_) => 7,
-                // A record sorts after every list, and two records
-                // sort by their fields, name first and then value.
-                // The order between two records is not a question ISO
-                // answers, but DISTINCT and ORDER BY have to answer
-                // it, so it is answered here and stated rather than
-                // left to whatever the enum's declaration order was.
-                Value::Record(_) => 8,
-                // A path sorts after every record, and two paths sort
-                // by their elements, which is the list order over the
-                // same sequence. ISO orders two paths no more than it
-                // orders two records, and the same reason applies.
-                Value::Path(_) => 9,
-            }
-        }
-        if matches!(self.0, Value::Chain(_)) || matches!(other.0, Value::Chain(_)) {
-            return OrdValue(settle(self.0.clone())).cmp(&OrdValue(settle(other.0.clone())));
-        }
-        match (&self.0, &other.0) {
-            (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
-            (Value::Int(a), Value::Float(b)) => (*a as f64).total_cmp(b),
-            (Value::Float(a), Value::Int(b)) => a.total_cmp(&(*b as f64)),
-            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            (Value::Str(a), Value::Str(b)) => a.cmp(b),
-            (Value::Temporal(a), Value::Temporal(b)) => temporal_key(a).cmp(&temporal_key(b)),
-            (
-                Value::Node {
-                    table: t1,
-                    offset: o1,
-                },
-                Value::Node {
-                    table: t2,
-                    offset: o2,
-                },
-            ) => (t1, o1).cmp(&(t2, o2)),
-            (
-                Value::Rel {
-                    table: t1,
-                    src: s1,
-                    dst: d1,
-                },
-                Value::Rel {
-                    table: t2,
-                    src: s2,
-                    dst: d2,
-                },
-            ) => (t1, s1, d1).cmp(&(t2, s2, d2)),
-            (Value::List(a), Value::List(b)) => {
-                for (x, y) in a.iter().zip(b) {
-                    let ord = OrdValue(x.clone()).cmp(&OrdValue(y.clone()));
-                    if ord != Ordering::Equal {
-                        return ord;
-                    }
+        value_order(&self.0, &other.0)
+    }
+}
+
+/// Which of two types comes first when a comparison meets both.
+///
+/// GA04 is universal comparison and ISO does not say what the order
+/// between two types is, so this table is zu's answer to IV010 and it
+/// is one answer for the whole engine: a sort key, a DISTINCT, a GROUP
+/// BY and a `<` all read it. It is stated here rather than left to
+/// whatever order the enum happened to be declared in, because a
+/// documented choice can be relied on and a declaration order cannot.
+fn rank(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) | Value::Float(_) => 2,
+        Value::Str(_) => 3,
+        // A temporal value sorts after the strings and before the
+        // references, and two of different kinds sort by kind, because
+        // a date and a duration have no order between them and the
+        // total order still owes an answer.
+        Value::Temporal(_) => 4,
+        Value::Node { .. } => 5,
+        Value::Rel { .. } => 6,
+        Value::List(_) | Value::Chain(_) => 7,
+        // A record sorts after every list, and two records sort by
+        // their fields, name first and then value.
+        Value::Record(_) => 8,
+        // A path sorts after every record, and two paths sort by their
+        // elements, which is the list order over the same sequence.
+        Value::Path(_) => 9,
+    }
+}
+
+/// The order between any two values, which is total: every pair has an
+/// answer and the answer is the same one wherever it is asked.
+///
+/// Within a type it is the type's own order. Between two types it is
+/// [`rank`]. The null is smaller than every value here, which is not
+/// where a query sees it: an ORDER BY that names neither NULLS FIRST
+/// nor NULLS LAST moves it to the end (IS001) and a comparison against
+/// it is the unknown truth value rather than a true or a false, both of
+/// which the callers handle before reaching this.
+pub fn value_order(a: &Value, b: &Value) -> Ordering {
+    if matches!(a, Value::Chain(_)) || matches!(b, Value::Chain(_)) {
+        return value_order(&settle(a.clone()), &settle(b.clone()));
+    }
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Float(a), Value::Float(b)) => float_order(*a, *b),
+        (Value::Int(a), Value::Float(b)) => float_order(*a as f64, *b),
+        (Value::Float(a), Value::Int(b)) => float_order(*a, *b as f64),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Str(a), Value::Str(b)) => a.cmp(b),
+        (Value::Temporal(a), Value::Temporal(b)) => temporal_key(a).cmp(&temporal_key(b)),
+        (
+            Value::Node {
+                table: t1,
+                offset: o1,
+            },
+            Value::Node {
+                table: t2,
+                offset: o2,
+            },
+        ) => (t1, o1).cmp(&(t2, o2)),
+        (
+            Value::Rel {
+                table: t1,
+                src: s1,
+                dst: d1,
+            },
+            Value::Rel {
+                table: t2,
+                src: s2,
+                dst: d2,
+            },
+        ) => (t1, s1, d1).cmp(&(t2, s2, d2)),
+        (Value::List(a), Value::List(b)) | (Value::Path(a), Value::Path(b)) => {
+            for (x, y) in a.iter().zip(b) {
+                let ord = value_order(x, y);
+                if ord != Ordering::Equal {
+                    return ord;
                 }
-                a.len().cmp(&b.len())
             }
-            (Value::Path(a), Value::Path(b)) => {
-                for (x, y) in a.iter().zip(b) {
-                    let ord = OrdValue(x.clone()).cmp(&OrdValue(y.clone()));
-                    if ord != Ordering::Equal {
-                        return ord;
-                    }
-                }
-                a.len().cmp(&b.len())
-            }
-            (Value::Record(a), Value::Record(b)) => {
-                for ((na, va), (nb, vb)) in a.iter().zip(b) {
-                    let ord = na
-                        .cmp(nb)
-                        .then_with(|| OrdValue(va.clone()).cmp(&OrdValue(vb.clone())));
-                    if ord != Ordering::Equal {
-                        return ord;
-                    }
-                }
-                a.len().cmp(&b.len())
-            }
-            (a, b) => rank(a).cmp(&rank(b)),
+            a.len().cmp(&b.len())
         }
+        (Value::Record(a), Value::Record(b)) => {
+            for ((na, va), (nb, vb)) in a.iter().zip(b) {
+                let ord = na.cmp(nb).then_with(|| value_order(va, vb));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+        (a, b) => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// Two floats in the total order.
+///
+/// A NaN is neither less than, equal to, nor greater than any number,
+/// and the order still owes an answer, so every NaN sorts after every
+/// number and two NaNs sort equal. That is GA01's placement and it is
+/// not [`f64::total_cmp`], which would read the sign bit of a NaN as
+/// part of the value and put a negative one below every number. The
+/// two zeroes sort equal for the same reason `=` says they are equal:
+/// an order that disagreed with equality would make DISTINCT keep two
+/// values a query cannot tell apart.
+fn float_order(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).expect("neither operand is NaN"),
     }
 }
 
@@ -3938,26 +3965,27 @@ fn temporal_key(t: &Temporal) -> (u8, i64) {
     }
 }
 
-/// Ordering for comparisons; `None` when null or incomparable types
-/// are involved, which makes the comparison null.
-fn cmp_ord(a: &Value, b: &Value) -> Option<Ordering> {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
-        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
-        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
-        // Same kind orders by count, and two kinds do not order at
-        // all: a date is not earlier or later than a duration, so the
-        // comparison is null rather than an arbitrary answer.
-        (Value::Temporal(x), Value::Temporal(y)) => {
-            let (kx, cx) = temporal_key(x);
-            let (ky, cy) = temporal_key(y);
-            (kx == ky).then(|| cx.cmp(&cy))
-        }
-        _ => match (as_f64(a), as_f64(b)) {
-            (Some(x), Some(y)) => x.partial_cmp(&y),
-            _ => None,
-        },
-    }
+/// The order `<`, `<=`, `>` and `>=` read, which is the order ORDER BY
+/// reads and not a second one.
+///
+/// GA04 is universal comparison and zu reports it supported, so every
+/// pair of values has an answer here: within a type the type's own
+/// order, and between two types the precedence in [`value_order`],
+/// which is ISO's IV010 and a choice zu documents rather than one it
+/// derives. A number is therefore less than a string, and a date is
+/// less than a duration, and neither comparison is the unknown truth
+/// value: an engine whose `x < y` said unknown while its `ORDER BY x`
+/// put x first would have two orders and be wrong in one of them.
+///
+/// The null does not reach this. A comparison with one is unknown,
+/// which is a rule about null and not a gap in the order, and the
+/// caller answers it before calling.
+fn cmp_ord(a: &Value, b: &Value) -> Ordering {
+    debug_assert!(
+        !matches!(a, Value::Null) && !matches!(b, Value::Null),
+        "the caller answers a comparison against null"
+    );
+    value_order(a, b)
 }
 
 fn arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
@@ -4351,16 +4379,14 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     if matches!(l, Value::Null) || matches!(r, Value::Null) {
                         return Ok(Value::Null);
                     }
-                    Ok(match cmp_ord(&l, &r) {
-                        Some(ord) => Value::Bool(match op {
-                            Lt => ord == Ordering::Less,
-                            Le => ord != Ordering::Greater,
-                            Gt => ord == Ordering::Greater,
-                            Ge => ord != Ordering::Less,
-                            _ => unreachable!(),
-                        }),
-                        None => Value::Null,
-                    })
+                    let ord = cmp_ord(&l, &r);
+                    Ok(Value::Bool(match op {
+                        Lt => ord == Ordering::Less,
+                        Le => ord != Ordering::Greater,
+                        Gt => ord == Ordering::Greater,
+                        Ge => ord != Ordering::Less,
+                        _ => unreachable!(),
+                    }))
                 }
                 Add | Sub | Mul | Div | Mod => {
                     let l = settle(eval(ctx, lhs)?);

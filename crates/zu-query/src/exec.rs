@@ -110,10 +110,16 @@ pub enum Value {
     /// meaning is what [`Temporal`] carries; the executor treats them
     /// alike everywhere except where the calendar is involved.
     Temporal(Temporal),
+    /// GV55. A path: the nodes and edges of a walk, alternating, a node
+    /// at each end. A one node path has no edges and is the shortest
+    /// there is; there is no empty path, because a path is a walk and a
+    /// walk starts somewhere. Build one with [`Value::path`], which
+    /// checks that shape.
+    Path(Vec<Value>),
     /// A PMR chain (docs/07 §5): the executor-internal form of a
     /// variable-length path. [`settle`] turns it into the edge list
     /// before any value leaves the pipeline, so results never hold one.
-    Path(Arc<PathLink>),
+    Chain(Arc<PathLink>),
 }
 
 impl Value {
@@ -130,6 +136,65 @@ impl Value {
         fields.sort_by(|a, b| a.0.cmp(&b.0));
         fields.dedup_by(|a, b| a.0 == b.0);
         Value::Record(fields)
+    }
+
+    /// A path out of an alternating element list, or the condition the
+    /// list breaks.
+    ///
+    /// GE06 builds a path from elements the query names, which means
+    /// the two things a matched path gets for free have to be checked
+    /// here instead. The shape is the first: nodes and edges alternate
+    /// and a node is at each end, so an even length or an edge in a
+    /// node's place is not a path at all. The joining is the second and
+    /// is the one worth having: an edge between two nodes it does not
+    /// touch is a sequence of the right shape that describes a walk
+    /// nobody can take, and 22G0Z is the condition for exactly that. An
+    /// edge is allowed to be traversed against its direction, because a
+    /// walk may go either way along one and ISO's path values are not
+    /// directed.
+    pub fn path(elements: Vec<Value>) -> Result<Value> {
+        if elements.is_empty() || elements.len().is_multiple_of(2) {
+            return Err(gql(
+                codes::C22G0Z,
+                format!(
+                    "a path is a node, then an edge and a node for each hop, so it has an odd \
+                     number of elements and not {}",
+                    elements.len()
+                ),
+            ));
+        }
+        for (ix, element) in elements.iter().enumerate() {
+            let wanted_node = ix.is_multiple_of(2);
+            let ok = match element {
+                Value::Node { .. } => wanted_node,
+                Value::Rel { .. } => !wanted_node,
+                _ => false,
+            };
+            if !ok {
+                let wanted = if wanted_node { "a node" } else { "an edge" };
+                return Err(gql(
+                    codes::C22G0Z,
+                    format!("element {} of the path is not {wanted}", ix + 1),
+                ));
+            }
+        }
+        for hop in elements.windows(3).step_by(2) {
+            let [
+                Value::Node { offset: from, .. },
+                Value::Rel { src, dst, .. },
+                Value::Node { offset: to, .. },
+            ] = hop
+            else {
+                unreachable!("the loop above accepted the element kinds")
+            };
+            if !((from == src && to == dst) || (from == dst && to == src)) {
+                return Err(gql(
+                    codes::C22G0Z,
+                    "an edge of the path does not join the two nodes it sits between".to_owned(),
+                ));
+            }
+        }
+        Ok(Value::Path(elements))
     }
 
     /// The value of the field named `name`, or `None` when the record
@@ -177,7 +242,7 @@ fn path_rels(link: &PathLink) -> Value {
 /// sort keys, and aggregate arguments.
 fn settle(v: Value) -> Value {
     match v {
-        Value::Path(link) => path_rels(&link),
+        Value::Chain(link) => path_rels(&link),
         Value::List(items) => Value::List(items.into_iter().map(settle).collect()),
         // A field can hold a chain the same way a list element can,
         // and for the same reason: `{p: p}` names a path variable.
@@ -766,7 +831,7 @@ impl Ord for OrdValue {
                 Value::Temporal(_) => 4,
                 Value::Node { .. } => 5,
                 Value::Rel { .. } => 6,
-                Value::List(_) | Value::Path(_) => 7,
+                Value::List(_) | Value::Chain(_) => 7,
                 // A record sorts after every list, and two records
                 // sort by their fields, name first and then value.
                 // The order between two records is not a question ISO
@@ -774,9 +839,14 @@ impl Ord for OrdValue {
                 // it, so it is answered here and stated rather than
                 // left to whatever the enum's declaration order was.
                 Value::Record(_) => 8,
+                // A path sorts after every record, and two paths sort
+                // by their elements, which is the list order over the
+                // same sequence. ISO orders two paths no more than it
+                // orders two records, and the same reason applies.
+                Value::Path(_) => 9,
             }
         }
-        if matches!(self.0, Value::Path(_)) || matches!(other.0, Value::Path(_)) {
+        if matches!(self.0, Value::Chain(_)) || matches!(other.0, Value::Chain(_)) {
             return OrdValue(settle(self.0.clone())).cmp(&OrdValue(settle(other.0.clone())));
         }
         match (&self.0, &other.0) {
@@ -810,6 +880,15 @@ impl Ord for OrdValue {
                 },
             ) => (t1, s1, d1).cmp(&(t2, s2, d2)),
             (Value::List(a), Value::List(b)) => {
+                for (x, y) in a.iter().zip(b) {
+                    let ord = OrdValue(x.clone()).cmp(&OrdValue(y.clone()));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Value::Path(a), Value::Path(b)) => {
                 for (x, y) in a.iter().zip(b) {
                     let ord = OrdValue(x.clone()).cmp(&OrdValue(y.clone()));
                     if ord != Ordering::Equal {
@@ -1196,6 +1275,11 @@ fn expr_slots(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
         BoundExpr::Map(pairs) => {
             for (_, v) in pairs {
                 expr_slots(v, out);
+            }
+        }
+        BoundExpr::Path(elements) => {
+            for element in elements {
+                expr_slots(element, out);
             }
         }
         BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
@@ -2283,7 +2367,7 @@ fn assemble_path(ctx: &mut StageCtx, parts: &[PathPart]) -> Result<Value> {
             },
             PathPart::VarRel(slot) => match value_of(ctx, *slot)? {
                 Value::Null => return Ok(Value::Null),
-                Value::Path(link) => {
+                Value::Chain(link) => {
                     let mut hops = Vec::new();
                     let mut cur = Some(&link);
                     while let Some(l) = cur {
@@ -2309,7 +2393,16 @@ fn assemble_path(ctx: &mut StageCtx, parts: &[PathPart]) -> Result<Value> {
             },
         }
     }
-    Ok(Value::List(out))
+    // Not `Value::path`: a matched path is joined by construction, the
+    // pattern having walked the edges it names, so re-deriving that on
+    // every row would pay for a check that cannot fail. GE06 is where
+    // the elements come from the query instead and the check earns its
+    // cost.
+    debug_assert!(
+        !out.len().is_multiple_of(2),
+        "a matched path alternates: {out:?}"
+    );
+    Ok(Value::Path(out))
 }
 
 fn node_value(v: Value, what: &str) -> Result<(u32, u64)> {
@@ -2547,7 +2640,7 @@ fn enumerate_paths(
     let depth = link.hops;
     if depth >= spec.min && spec.to_tables.contains(&table) {
         far.push(Value::Node { table, offset });
-        trails.push(Value::Path(link.clone()));
+        trails.push(Value::Chain(link.clone()));
     }
     if spec.max.is_some_and(|m| depth >= m) {
         return Ok(());
@@ -3172,7 +3265,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                             table: t,
                             offset: o,
                         });
-                        trails.push(Value::Path(chains[&(t, o)].clone()));
+                        trails.push(Value::Chain(chains[&(t, o)].clone()));
                     }
                 }
                 Some(Selector::AllShortest) => {
@@ -3717,6 +3810,22 @@ fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
                 }
             }
             if saw_null { None } else { Some(true) }
+        }
+        // GA09. Two paths are the same path when they are the same walk,
+        // so this is the element comparison a list gets and not an
+        // identity: the path a pattern matched and the one GE06 built
+        // out of the elements it matched are equal, which is what makes
+        // a constructed path a value rather than a copy of one.
+        (Value::Path(x), Value::Path(y)) => {
+            if x.len() != y.len() {
+                return Ok(Some(false));
+            }
+            for (a, b) in x.iter().zip(y) {
+                if cmp_eq(a, b)? != Some(true) {
+                    return Ok(Some(false));
+                }
+            }
+            Some(true)
         }
         _ => Some(false),
     })
@@ -4275,8 +4384,13 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 match eval(ctx, &args[0])? {
                     // The chain stores its length, so size(r) on a
                     // variable-length rel never materializes the list.
-                    Value::Path(link) => Ok(Value::Int(link.hops as i64)),
-                    Value::List(items) => Ok(Value::Int(items.len() as i64)),
+                    Value::Chain(link) => Ok(Value::Int(link.hops as i64)),
+                    // A path answers with its element count, which is
+                    // the count of the list it used to be, so a query
+                    // written against that still gets the same number.
+                    // PATH_LENGTH is the edge count and the other
+                    // question.
+                    Value::List(items) | Value::Path(items) => Ok(Value::Int(items.len() as i64)),
                     Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
                     Value::Null => Ok(Value::Null),
                     other => Err(invalid(format!(
@@ -4296,6 +4410,21 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     Value::Null => Ok(Value::Null),
                     other => Err(invalid(format!(
                         "cardinality() expects a list, got {other:?}"
+                    ))),
+                }
+            }
+            // GF04. Edges, not elements: a path of two nodes has three
+            // elements and a length of one, and a path of one node has
+            // a length of zero.
+            Func::PathLength => {
+                if *star || args.len() != 1 {
+                    return Err(invalid("path_length() takes exactly one argument".into()));
+                }
+                match eval(ctx, &args[0])? {
+                    Value::Path(elements) => Ok(Value::Int((elements.len() / 2) as i64)),
+                    Value::Null => Ok(Value::Null),
+                    other => Err(invalid(format!(
+                        "path_length() expects a path, got {other:?}"
                     ))),
                 }
             }
@@ -4319,6 +4448,19 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 fields.push((name.clone(), eval(ctx, item)?));
             }
             Ok(Value::record(fields))
+        }
+        // GE06. A null element nulls the whole path, the way a null
+        // endpoint nulls a matched one under OPTIONAL MATCH: there is
+        // no path with a hole in it.
+        BoundExpr::Path(elements) => {
+            let mut out = Vec::with_capacity(elements.len());
+            for element in elements {
+                match eval(ctx, element)? {
+                    Value::Null => return Ok(Value::Null),
+                    v => out.push(v),
+                }
+            }
+            Value::path(out)
         }
         BoundExpr::Cast { expr, ty } => crate::cast::cast(eval(ctx, expr)?, ty),
     }
@@ -4361,7 +4503,7 @@ impl AggState {
             Func::Min => Acc::Min(None),
             Func::Max => Acc::Max(None),
             Func::Collect => Acc::Collect(Vec::new()),
-            Func::Id | Func::Size | Func::Cardinality => {
+            Func::Id | Func::Size | Func::Cardinality | Func::PathLength => {
                 unreachable!("scalar function as an aggregate")
             }
         };
@@ -6484,6 +6626,14 @@ mod tests {
         Value::Rel { table: 2, src, dst }
     }
 
+    /// The expected path, built through the constructor so the elements
+    /// a test writes down have to be a walk somebody can take. A test
+    /// that expected a malformed path would be asserting against a
+    /// value the engine cannot produce.
+    fn path(elements: Vec<Value>) -> Value {
+        Value::path(elements).expect("the expected path is a path")
+    }
+
     #[test]
     fn path_variables_return_the_alternating_list() {
         let r = run(
@@ -6494,14 +6644,8 @@ mod tests {
         assert_eq!(
             r.rows,
             [
-                vec![
-                    Value::List(vec![node(0), knows(0, 1), node(1)]),
-                    Value::Int(1)
-                ],
-                vec![
-                    Value::List(vec![node(0), knows(0, 2), node(2)]),
-                    Value::Int(2)
-                ],
+                vec![path(vec![node(0), knows(0, 1), node(1)]), Value::Int(1)],
+                vec![path(vec![node(0), knows(0, 2), node(2)]), Value::Int(2)],
             ]
         );
     }
@@ -6517,21 +6661,21 @@ mod tests {
         assert_eq!(
             r.rows,
             [
-                [Value::List(vec![
+                [path(vec![
                     node(0),
                     knows(0, 1),
                     node(1),
                     knows(1, 2),
                     node(2)
                 ])],
-                [Value::List(vec![
+                [path(vec![
                     node(0),
                     knows(0, 1),
                     node(1),
                     knows(1, 3),
                     node(3)
                 ])],
-                [Value::List(vec![
+                [path(vec![
                     node(0),
                     knows(0, 2),
                     node(2),
@@ -6551,23 +6695,23 @@ mod tests {
         assert_eq!(
             r.rows,
             [
-                [Value::List(vec![node(0), knows(0, 1), node(1)])],
-                [Value::List(vec![
+                [path(vec![node(0), knows(0, 1), node(1)])],
+                [path(vec![
                     node(0),
                     knows(0, 1),
                     node(1),
                     knows(1, 3),
                     node(3)
                 ])],
-                [Value::List(vec![node(0), knows(0, 2), node(2)])],
-                [Value::List(vec![
+                [path(vec![node(0), knows(0, 2), node(2)])],
+                [path(vec![
                     node(0),
                     knows(0, 2),
                     node(2),
                     knows(2, 4),
                     node(4)
                 ])],
-                [Value::List(vec![
+                [path(vec![
                     node(0),
                     knows(0, 2),
                     node(2),
@@ -6593,7 +6737,7 @@ mod tests {
             r.rows,
             [vec![
                 Value::Int(5),
-                Value::List(vec![node(0), knows(0, 2), node(2), knows(2, 4), node(4)]),
+                path(vec![node(0), knows(0, 2), node(2), knows(2, 4), node(4)]),
             ]]
         );
     }
@@ -6673,7 +6817,7 @@ mod tests {
         let mut links = BTreeSet::new();
         let mut total_hops = 0u64;
         for trail in &trails {
-            let Value::Path(link) = trail else {
+            let Value::Chain(link) = trail else {
                 panic!("var expand emits chains, got {trail:?}");
             };
             total_hops += link.hops;

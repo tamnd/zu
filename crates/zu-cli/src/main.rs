@@ -932,9 +932,21 @@ fn write_json_value(out: &mut String, v: &Value) {
             }
             out.push('}');
         }
+        // A path goes out as the array of its elements, which is what
+        // it is: nodes and edges alternating, a node at each end.
+        Value::Path(elements) => {
+            out.push('[');
+            for (i, element) in elements.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_value(out, element);
+            }
+            out.push(']');
+        }
         // The executor settles every PMR chain into an edge list before
         // a value leaves the pipeline, so a result never carries one.
-        Value::Path(_) => out.push_str("null"),
+        Value::Chain(_) => out.push_str("null"),
     }
 }
 
@@ -1029,7 +1041,14 @@ fn display_value(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
-        Value::Path(_) => "path".to_owned(),
+        // A path reads as the walk it is, so the arrow between two
+        // elements is the reader's clue that this is not a list of the
+        // same things.
+        Value::Path(elements) => {
+            let parts: Vec<String> = elements.iter().map(display_value).collect();
+            parts.join("-")
+        }
+        Value::Chain(_) => "path".to_owned(),
     }
 }
 

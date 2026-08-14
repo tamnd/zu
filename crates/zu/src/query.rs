@@ -972,7 +972,7 @@ mod tests {
         .expect("path return");
         assert_eq!(r.rows.len(), reached.len());
         for row in &r.rows {
-            let (Value::List(p), Value::List(rels), Value::Int(b)) = (&row[0], &row[1], &row[2])
+            let (Value::Path(p), Value::List(rels), Value::Int(b)) = (&row[0], &row[1], &row[2])
             else {
                 panic!("expected a path, a rel list, and an id, got {row:?}");
             };

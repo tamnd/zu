@@ -663,6 +663,10 @@ pub enum Func {
     /// GF12. The element count of a list, which is `SIZE` asked for by
     /// its other name and refused on anything that is not a list.
     Cardinality,
+    /// GF04. The number of edges in a path, which is one less than the
+    /// number of hops in the element list and not the element count:
+    /// a two node path has three elements and a length of one.
+    PathLength,
 }
 
 impl Func {
@@ -678,6 +682,7 @@ impl Func {
             "id" => Func::Id,
             "size" => Func::Size,
             "cardinality" => Func::Cardinality,
+            "path_length" => Func::PathLength,
             _ => return None,
         })
     }
@@ -729,6 +734,10 @@ pub enum BoundExpr {
     },
     List(Vec<BoundExpr>),
     Map(Vec<(String, BoundExpr)>),
+    /// GE06. The elements of a path, in the order the query wrote
+    /// them. Whether they make a path is a runtime question, because
+    /// whether an edge joins two nodes is not something a type knows.
+    Path(Vec<BoundExpr>),
     /// `CAST(expr AS type)`. The target keeps its full lattice type
     /// rather than collapsing to [`Type`], because the width and the
     /// declared digit count are exactly what the executor checks and
@@ -1514,6 +1523,29 @@ impl Binder<'_> {
                 }
                 Ok((BoundExpr::Map(bound), Type::Record))
             }
+            // GE06. The element types are checked here because a query
+            // that wrote a number where an edge goes is wrong before it
+            // is run, and the joining is left to the executor because
+            // no type says which nodes an edge touches.
+            Expr::Path(elements) => {
+                let mut bound = Vec::new();
+                for (ix, element) in elements.iter().enumerate() {
+                    let (b, t) = self.bind_expr(element, ctx)?;
+                    let wanted = if ix.is_multiple_of(2) {
+                        Type::Node
+                    } else {
+                        Type::Rel
+                    };
+                    if t != wanted && t != Type::Any {
+                        return Err(bad_type(format!(
+                            "element {} of a path is {t} and a path alternates node, edge, node",
+                            ix + 1
+                        )));
+                    }
+                    bound.push(b);
+                }
+                Ok((BoundExpr::Path(bound), Type::Path))
+            }
             Expr::Cast { expr, ty } => {
                 let (bound, _) = self.bind_expr(expr, ctx)?;
                 Ok((
@@ -1609,6 +1641,17 @@ impl Binder<'_> {
                 if !matches!(arg_ty, Type::List(_) | Type::Any) {
                     return Err(bad_type(format!(
                         "cardinality() needs a list, got {arg_ty}"
+                    )));
+                }
+                Type::Int
+            }
+            // A path and nothing else. A list of the same elements is
+            // not a path, so counting one here would answer a question
+            // about a value that is not the one asked about.
+            Func::PathLength => {
+                if !matches!(arg_ty, Type::Path | Type::Any) {
+                    return Err(bad_type(format!(
+                        "path_length() needs a path, got {arg_ty}"
                     )));
                 }
                 Type::Int
@@ -1756,6 +1799,10 @@ pub fn text(expr: &Expr) -> String {
                 .map(|(k, v)| format!("{k}: {}", text(v)))
                 .collect();
             format!("{{{}}}", rendered.join(", "))
+        }
+        Expr::Path(elements) => {
+            let rendered: Vec<String> = elements.iter().map(text).collect();
+            format!("PATH [{}]", rendered.join(", "))
         }
         Expr::Cast { expr, ty } => format!("CAST({} AS {ty})", text(expr)),
     }

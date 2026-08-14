@@ -61,6 +61,10 @@ name = "optional"
 harness = false
 
 [[bench]]
+name = "exists"
+harness = false
+
+[[bench]]
 name = "batch"
 harness = false
 

@@ -60,6 +60,13 @@ jobs:
           cargo test -p zu-capi --all-features
       - if: matrix.os != 'windows-latest'
         run: cargo test --workspace --all-features
+      # The point read path, where a walk reads one neighbor list rather
+      # than decoding the group around it, only comes up on groups far
+      # bigger than a test builds. This env asks for it on every list, so
+      # the differential suite compares the two executors with the whole
+      # engine on that side of the choice.
+      - if: matrix.os == 'ubuntu-latest'
+        run: ZU_POINT_READS=1 cargo test -p zu --test differential
 
   membudget:
     runs-on: ubuntu-latest

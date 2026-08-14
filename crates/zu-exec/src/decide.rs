@@ -11,9 +11,19 @@
 //!
 //! The set is closed on purpose. An engine that may adapt anywhere is
 //! an engine whose plan does not predict its behaviour, and a slow
-//! query then has no explanation short of a profiler. Seven decisions,
+//! query then has no explanation short of a profiler. Eight decisions,
 //! each named, each counted, each printed by EXPLAIN ANALYZE, is a
 //! budget: a new one has to displace an old one or argue its way in.
+//!
+//! The eighth argued its way in. How a neighbor list is read, off a
+//! group decoded whole or out of the chunks that one list covers, is
+//! not something the plan can settle: it turns on how many lists of
+//! that group this walk is about to want against how many chunks the
+//! group holds, and the second number is storage's, not the
+//! optimizer's. It is here rather than buried in the read path because
+//! getting it wrong is worth three orders of magnitude on a point
+//! query, which is exactly the case where nothing else in this listing
+//! has anything to say.
 //!
 //! None of them persists. Nothing a run learns is written back into
 //! the statistics or carried into the next query, so two runs of the
@@ -83,6 +93,12 @@ pub struct Decisions {
     /// has finished the last, so the spread here is the only record of
     /// how evenly the work actually fell.
     pub claims: Vec<u64>,
+    /// Decision 8, one side: groups decoded whole because the walk
+    /// wanted enough of their lists to pay for it.
+    pub group_pins: u64,
+    /// Decision 8, the other side: times a walk left a group undecoded
+    /// and read the chunks its lists cover instead.
+    pub point_reads: u64,
 }
 
 impl Decisions {
@@ -103,6 +119,8 @@ impl Decisions {
         self.zone_thinned += other.zone_thinned;
         self.empty_close += other.empty_close;
         self.quota_stop += other.quota_stop;
+        self.group_pins += other.group_pins;
+        self.point_reads += other.point_reads;
         self.claims.extend_from_slice(&other.claims);
         for (mine, theirs) in self.sip.iter_mut().zip(&other.sip) {
             mine.probes += theirs.probes;
@@ -154,6 +172,14 @@ impl Decisions {
                 out,
                 "  close ended early on {} vector(s), the far end had no edges",
                 self.empty_close
+            );
+        }
+        if self.group_pins > 0 || self.point_reads > 0 {
+            let _ = writeln!(
+                out,
+                "  decoded {} whole group(s) and read around {} more, \
+                 list by list",
+                self.group_pins, self.point_reads
             );
         }
         if self.claims.len() > 1 {
@@ -237,7 +263,12 @@ mod tests {
         d.sip[0].kept = 2;
         d.sip[0].workers = 1;
         d.empty_close = 2;
+        d.point_reads = 3;
         let text = d.render();
+        assert!(
+            text.contains("decoded 0 whole group(s) and read around 3 more"),
+            "got:\n{text}"
+        );
         assert!(
             text.contains("rejected 6 of 8 probe(s), 75.0%"),
             "got:\n{text}"

@@ -115,13 +115,24 @@ type_name       = identifier , [ identifier ] ;
 name            = identifier | "`" , { character - "`" } , "`" ;
 identifier      = ( letter | "_" ) , { letter | digit | "_" } ;
 parameter       = "$" , ( letter | digit | "_" ) , { letter | digit | "_" } ;
-integer         = digit , { digit } ;
-float           = digit , { digit } , "." , digit , { digit } , [ exponent ]
-                | digit , { digit } , exponent ;
+(* A number may be written in another radix, and it may say which kind
+   of number it means: M for an exact one, F and D for an approximate
+   one. An exact number with no fraction is an integer; zu has no
+   decimal type, so an exact fraction is widened to a double. *)
+integer         = digit , { digit } , [ "M" ]
+                | ( "0x" | "0o" | "0b" ) , radix_digit , { radix_digit } ;
+float           = digit , { digit } , "." , digit , { digit } , [ exponent ] , [ suffix ]
+                | digit , { digit } , exponent , [ suffix ]
+                | digit , { digit } , ( "F" | "D" ) ;
+suffix          = "M" | "F" | "D" ;
 exponent        = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
-string          = "'" , { character } , "'" | '"' , { character } , '"' ;
-(* String escapes: \\ \' \" \n \r \t. Comments are // to end of line and
-   /* ... */; both are whitespace to the parser. *)
+radix_digit     = digit | "a" | "b" | "c" | "d" | "e" | "f" ;
+string          = [ "@" ] , "'" , { character } , "'"
+                | [ "@" ] , '"' , { character } , '"' ;
+(* String escapes: \\ \' \" \n \r \t. An @ before the quote turns escape
+   processing off, and a doubled quote is then the only way to write one.
+   Comments are // to end of line and /* ... */; both are whitespace to
+   the parser. *)
 
 (* Reserved but not yet parsed; the parser rejects them by name:
    CREATE, SET, DELETE, DETACH, MERGE, CALL, FILTER, LET, NEXT. *)

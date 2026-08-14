@@ -34,7 +34,15 @@ path            = [ name , "=" ] , [ selector ] , [ path_mode ] ,
                   node , { relationship , node } ;
 selector        = ( "ANY" | "ALL" ) , "SHORTEST" ;
 path_mode       = "WALK" | "TRAIL" | "ACYCLIC" ;
-node            = "(" , [ name ] , { ":" , name } , [ property_map ] , ")" ;
+node            = "(" , [ name ] , { ":" , label_expr } ,
+                  [ property_map ] , ")" ;
+label_expr      = label_term , { "|" , label_term } ;
+label_term      = label_factor , { "&" , label_factor } ;
+label_factor    = { "!" } , label_atom ;
+label_atom      = name | "%" | "(" , label_expr , ")" ;
+(* A repeated colon is a conjunction, so `(n:A:B)` and `(n:A&B)` are
+   the same pattern, and `%` holds of every element because an element
+   always carries the label of the table it lives in. *)
 
 relationship    = "<" , "-" , [ rel_detail ] , "-"
                 | "-" , [ rel_detail ] , "-" , [ ">" ] ;

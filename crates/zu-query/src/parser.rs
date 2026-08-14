@@ -13,8 +13,8 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, Clause, Expr, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection,
-    ProjectionItem, Query, RelDirection, RelPattern, Selector, SortKey, UnaryOp,
+    BinaryOp, Clause, Expr, LabelExpr, Literal, NodePattern, NullOrder, PathMode, PathPattern,
+    Projection, ProjectionItem, Query, RelDirection, RelPattern, Selector, SortKey, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -381,9 +381,15 @@ impl Parser<'_> {
             }
             _ => None,
         };
-        let mut labels = Vec::new();
+        // A repeated colon is a conjunction, which is how Cypher writes
+        // one and what `(n:A:B)` has always meant here.
+        let mut label: Option<LabelExpr> = None;
         while self.eat(&TokenKind::Colon) {
-            labels.push(self.expect_name("a label name")?);
+            let next = self.parse_label_expr()?;
+            label = Some(match label {
+                None => next,
+                Some(prev) => LabelExpr::And(Box::new(prev), Box::new(next)),
+            });
         }
         let props = if self.at(&TokenKind::LBrace) {
             self.parse_property_map()?
@@ -391,7 +397,42 @@ impl Parser<'_> {
             Vec::new()
         };
         self.expect(&TokenKind::RParen)?;
-        Ok(NodePattern { var, labels, props })
+        Ok(NodePattern { var, label, props })
+    }
+
+    /// A label expression, `|` binding loosest and `!` tightest, the
+    /// precedence GQL gives them.
+    fn parse_label_expr(&mut self) -> Result<LabelExpr> {
+        let mut expr = self.parse_label_and()?;
+        while self.eat(&TokenKind::Pipe) {
+            let rhs = self.parse_label_and()?;
+            expr = LabelExpr::Or(Box::new(expr), Box::new(rhs));
+        }
+        Ok(expr)
+    }
+
+    fn parse_label_and(&mut self) -> Result<LabelExpr> {
+        let mut expr = self.parse_label_atom()?;
+        while self.eat(&TokenKind::Amp) {
+            let rhs = self.parse_label_atom()?;
+            expr = LabelExpr::And(Box::new(expr), Box::new(rhs));
+        }
+        Ok(expr)
+    }
+
+    fn parse_label_atom(&mut self) -> Result<LabelExpr> {
+        if self.eat(&TokenKind::Bang) {
+            return Ok(LabelExpr::Not(Box::new(self.parse_label_atom()?)));
+        }
+        if self.eat(&TokenKind::Percent) {
+            return Ok(LabelExpr::Wildcard);
+        }
+        if self.eat(&TokenKind::LParen) {
+            let inner = self.parse_label_expr()?;
+            self.expect(&TokenKind::RParen)?;
+            return Ok(inner);
+        }
+        Ok(LabelExpr::Label(self.expect_name("a label name")?))
     }
 
     /// Parses the relationship between two nodes. `<-` and `->` are not
@@ -1213,6 +1254,68 @@ mod tests {
         parse(source).expect_err("should fail").to_string()
     }
 
+    /// The label expression on the first node of the first pattern.
+    fn label_of(source: &str) -> LabelExpr {
+        let Clause::Match { patterns, .. } = &parsed(source).clauses[0] else {
+            panic!("a MATCH");
+        };
+        patterns[0].start.label.clone().expect("a label")
+    }
+
+    fn label(name: &str) -> LabelExpr {
+        LabelExpr::Label(name.into())
+    }
+
+    fn and(lhs: LabelExpr, rhs: LabelExpr) -> LabelExpr {
+        LabelExpr::And(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn or(lhs: LabelExpr, rhs: LabelExpr) -> LabelExpr {
+        LabelExpr::Or(Box::new(lhs), Box::new(rhs))
+    }
+
+    #[test]
+    fn a_label_expression_binds_or_loosest_and_not_tightest() {
+        // A repeated colon is the conjunction Cypher writes, and `&`
+        // is the same thing in GQL's own spelling.
+        assert_eq!(
+            label_of("MATCH (n:A:B) RETURN n"),
+            and(label("A"), label("B"))
+        );
+        assert_eq!(
+            label_of("MATCH (n:A&B) RETURN n"),
+            and(label("A"), label("B"))
+        );
+        // `|` is looser than `&`, so this reads A or (B and C).
+        assert_eq!(
+            label_of("MATCH (n:A|B&C) RETURN n"),
+            or(label("A"), and(label("B"), label("C")))
+        );
+        // Parentheses say the other grouping.
+        assert_eq!(
+            label_of("MATCH (n:(A|B)&C) RETURN n"),
+            and(or(label("A"), label("B")), label("C"))
+        );
+        // `!` binds tighter than either, and stacks.
+        assert_eq!(
+            label_of("MATCH (n:!A&B) RETURN n"),
+            and(LabelExpr::Not(Box::new(label("A"))), label("B"))
+        );
+        assert_eq!(
+            label_of("MATCH (n:!!A) RETURN n"),
+            LabelExpr::Not(Box::new(LabelExpr::Not(Box::new(label("A")))))
+        );
+        // `%` is a label expression of its own.
+        assert_eq!(label_of("MATCH (n:%) RETURN n"), LabelExpr::Wildcard);
+        assert_eq!(
+            label_of("MATCH (n:!(A|B)) RETURN n"),
+            LabelExpr::Not(Box::new(or(label("A"), label("B"))))
+        );
+        // And the operators still need something to work on.
+        assert!(parse_err("MATCH (n:A&) RETURN n").contains("a label name"));
+        assert!(parse_err("MATCH (n:(A|B) RETURN n").contains("')'"));
+    }
+
     #[test]
     fn point_lookup_shape() {
         // LDBC short-read shape: one labeled node with a param prop.
@@ -1229,7 +1332,7 @@ mod tests {
         assert!(!optional && filter.is_none());
         let node = &patterns[0].start;
         assert_eq!(node.var.as_deref(), Some("n"));
-        assert_eq!(node.labels, ["Person"]);
+        assert_eq!(node.label, Some(LabelExpr::Label("Person".into())));
         assert_eq!(node.props[0].0, "id");
         assert_eq!(node.props[0].1, Expr::Param("personId".into()));
         let Clause::Return { projection } = &q.clauses[1] else {

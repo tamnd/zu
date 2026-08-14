@@ -442,6 +442,20 @@ fn covered_shapes_match_the_old_engine() {
          AND NOT EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } RETURN count(a) AS n",
         "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
          AND NOT EXISTS { MATCH (a)-[:knows]->(c) } RETURN count(a) AS n",
+        // A block over a pattern with no variable in common with the
+        // outer row, tied to it by an equality: the walk a hop would do
+        // is a probe into a table built off the other side, and the
+        // bracket is the same one either way. Once as a semi, once
+        // negated, once with a predicate of the block's own beside the
+        // tie, and once counted.
+        "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.score = a.age } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE NOT EXISTS { MATCH (b:person) WHERE b.score = a.age } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.score = a.age AND b.age > 90 } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.score = a.age } \
+         RETURN count(a) AS n",
         // A leading UNWIND whose values are what the scan seeks on:
         // the list is the batch of point reads and the keys drive the
         // plan. Once bare, once with the key itself returned beside
@@ -709,10 +723,9 @@ fn unclaimed_shapes_fall_back() {
         // is.
         "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 AND EXISTS { MATCH (a)-[:knows]->(c) } \
          RETURN a.id AS a, b.id AS b",
-        // A block over a pattern tied to the outer row by a predicate
-        // rather than an edge is a semi join, and the bracket the
-        // pipeline compiles is a walk.
-        "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.score = a.age } \
+        // A block over an untied pattern is a cross product against the
+        // whole of the other side, which the probe has no key for.
+        "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age > 90 } \
          RETURN count(a) AS n",
     ];
     for q in fallback_queries {

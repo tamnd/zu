@@ -1002,6 +1002,27 @@ exec_hub_mpairs_s_core = 10.0
 # lower it.
 exec_join_mprobes_s_core = 0.8
 
+# The semi join at one worker, M probe rows/s (docs/07): the same
+# million people over a thousand cities, asked whether anyone shares
+# their city rather than for the rows. A thousand rows sit under every
+# key and the answer needs one of them, which is the whole reason this
+# case is here and has its own floor. Nothing else in the bench reads a
+# key's run partly, so nothing else would notice if the early stop
+# stopped working and the semi went back to walking a thousand rows to
+# answer a question the first one answers.
+#
+# Measured at b0df8c9, one worker: 76.3 ms on gamingpc and 361.4 on
+# server1 at a load average of 10, against 460.7 and 1372.7 us a probe
+# for the old engine over two hundred probe rows, so 6037x and 3798x per
+# probe. Before the run was cut into doubling parts the same case read
+# 530.3 ms locally, slower than the left join it is the cheaper version
+# of, and it is 85.4 there now.
+#
+# The floor is set off server1, the slowest host and the one that gates
+# under other tenants' load, at about two thirds of its worse run. Raise
+# this floor, never lower it.
+exec_semi_mprobes_s_core = 1.8
+
 # G0 refusal gates (Spec/2064g/gql/plan/08 section 1.2, zu#115),
 # benches/refuse.rs on the same synthetic 10k-node graph the session
 # gates use. The milestone asks for one thing: refusing a statement has

@@ -36,7 +36,8 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
             precision,
         } => to_int(v, *signed, *bits, *precision),
         LogicalType::Float { bits, .. } => to_float(v, *bits),
-        LogicalType::Str { max, .. } => to_str(v, *max),
+        LogicalType::Decimal { precision, scale } => to_decimal(v, *precision, *scale),
+        LogicalType::Str { min, max, .. } => to_str(v, *min, *max),
         other => Err(ZuError::gql(
             codes::C22G03,
             format!("casting to '{other}' is not implemented"),
@@ -164,21 +165,105 @@ fn to_float(v: Value, bits: FloatBits) -> Result<Value> {
     Ok(Value::Float(narrowed))
 }
 
-fn to_str(v: Value, max: Option<u32>) -> Result<Value> {
-    let s = match &v {
+/// An exact decimal with `precision` digits in all and `scale` of them
+/// after the point, GV17.
+///
+/// The check is exact and the carrier is not, which is worth stating
+/// plainly. The digits are counted on an unscaled integer, so a number
+/// with too many of them is refused rather than quietly rounded away,
+/// and the result is then handed back as binary floating point because
+/// that is the only number a row carries today. An exact carrier
+/// arrives with the physical decimal column, and the check written here
+/// is the one it will use.
+fn to_decimal(v: Value, precision: u16, scale: u16) -> Result<Value> {
+    let text = match &v {
+        Value::Str(s) => s.trim().to_string(),
+        Value::Int(i) => i.to_string(),
+        // A float is already inexact, so it is scaled and rounded the
+        // same way a written number is, and the digit count is then
+        // checked on the result.
+        Value::Float(f) if f.is_finite() => format!("{f}"),
+        other => return Err(not_castable(other, "an exact number")),
+    };
+    let spelled = format!("DECIMAL({precision}, {scale})");
+    let unscaled = unscaled(&text, scale).ok_or_else(|| not_castable(&v, "an exact number"))?;
+    let limit = 10i128
+        .checked_pow(u32::from(precision))
+        .ok_or_else(|| out_of_range(text.clone(), &spelled))?;
+    if unscaled >= limit || unscaled <= -limit {
+        return Err(out_of_range(text, &spelled));
+    }
+    Ok(Value::Float(unscaled as f64 / 10f64.powi(i32::from(scale))))
+}
+
+/// `text` read as a decimal and multiplied by ten to the `scale`, with
+/// anything past the scale rounded half away from zero. `None` when the
+/// text is not a number at all.
+fn unscaled(text: &str, scale: u16) -> Option<i128> {
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1i128, rest),
+        None => (1i128, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (digits, ""),
+    };
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut n: i128 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let scale = scale as usize;
+    for i in 0..scale {
+        n = n.checked_mul(10)?;
+        n += i128::from(fraction.as_bytes().get(i).map_or(0, |b| b - b'0'));
+    }
+    // The first digit the scale drops decides the rounding, half away
+    // from zero, which is what a written decimal means by rounding.
+    if fraction.as_bytes().get(scale).is_some_and(|b| *b >= b'5') {
+        n = n.checked_add(1)?;
+    }
+    Some(sign * n)
+}
+
+/// A character string, GV30 to GV32.
+///
+/// The minimum length and the fixed length are one rule and not two: a
+/// value shorter than the minimum is padded with spaces, and a fixed
+/// length type is one whose minimum equals its maximum, so `CHAR(3)`
+/// pads without needing a case of its own. Past the maximum is 22001,
+/// because there is nowhere for the characters to go.
+fn to_str(v: Value, min: Option<u32>, max: Option<u32>) -> Result<Value> {
+    let mut s = match &v {
         Value::Str(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         other => return Err(not_castable(other, "a string")),
     };
+    let len = s.chars().count();
     if let Some(max) = max
-        && s.chars().count() > max as usize
+        && len > max as usize
     {
         return Err(ZuError::gql(
             codes::C22001,
-            format!("'{s}' is longer than STRING({max})"),
+            format!("'{s}' is {len} characters and the target holds {max}"),
         ));
+    }
+    if let Some(min) = min
+        && len < min as usize
+    {
+        s.extend(std::iter::repeat_n(' ', min as usize - len));
     }
     Ok(Value::Str(s))
 }
@@ -191,10 +276,10 @@ fn name(signed: bool, bits: IntBits) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value_type::{by_name, by_name_with_precision};
+    use crate::value_type::spelled;
 
     fn ty(name: &str) -> LogicalType {
-        by_name(name).expect("a known type")
+        spelled(name, &[]).expect("a known type")
     }
 
     fn status(e: &ZuError) -> String {
@@ -233,7 +318,7 @@ mod tests {
     /// precision can refuse a number the width would have taken.
     #[test]
     fn a_declared_precision_refuses_what_the_width_would_have_taken() {
-        let t = by_name_with_precision("INT", 3).expect("INT(3)");
+        let t = spelled("INT", &[3]).expect("INT(3)");
         assert_eq!(cast(Value::Int(100), &t).unwrap(), Value::Int(100));
         assert_eq!(status(&cast(Value::Int(1000), &t).unwrap_err()), "22003");
     }
@@ -257,6 +342,60 @@ mod tests {
         );
         assert_eq!(
             status(&cast(Value::Str("forty two".into()), &ty("INT")).unwrap_err()),
+            "22018"
+        );
+    }
+
+    /// A minimum length pads and a maximum length refuses, and a fixed
+    /// length is the case where the two are the same number, which is
+    /// why `CHAR` needs no rule of its own.
+    #[test]
+    fn a_length_pads_at_the_bottom_and_refuses_at_the_top() {
+        let fixed = spelled("CHAR", &[3]).expect("CHAR(3)");
+        assert_eq!(
+            cast(Value::Str("a".into()), &fixed).unwrap(),
+            Value::Str("a  ".into())
+        );
+        assert_eq!(
+            status(&cast(Value::Str("abcd".into()), &fixed).unwrap_err()),
+            "22001"
+        );
+        let ranged = spelled("STRING", &[2, 10]).expect("STRING(2, 10)");
+        assert_eq!(
+            cast(Value::Str("abc".into()), &ranged).unwrap(),
+            Value::Str("abc".into())
+        );
+        assert_eq!(
+            cast(Value::Str("a".into()), &ranged).unwrap(),
+            Value::Str("a ".into())
+        );
+    }
+
+    /// The scale says how many digits survive the point and the
+    /// precision says how many there are in all, so a number with too
+    /// many is refused rather than rounded into range.
+    #[test]
+    fn a_decimal_rounds_to_its_scale_and_refuses_past_its_precision() {
+        let t = spelled("DECIMAL", &[5, 2]).expect("DECIMAL(5, 2)");
+        assert_eq!(
+            cast(Value::Str("1.20".into()), &t).unwrap(),
+            Value::Float(1.2)
+        );
+        assert_eq!(
+            cast(Value::Str("1.235".into()), &t).unwrap(),
+            Value::Float(1.24)
+        );
+        assert_eq!(
+            cast(Value::Str("-1.235".into()), &t).unwrap(),
+            Value::Float(-1.24)
+        );
+        // 1000.00 is seven digits unscaled and the type holds five.
+        assert_eq!(
+            status(&cast(Value::Str("1000.00".into()), &t).unwrap_err()),
+            "22003"
+        );
+        assert_eq!(
+            status(&cast(Value::Str("one".into()), &t).unwrap_err()),
             "22018"
         );
     }

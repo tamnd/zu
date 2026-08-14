@@ -81,6 +81,70 @@ fn a_string_and_an_integer_cast_into_each_other() {
     );
 }
 
+/// The float widths and the two synonyms, plus the one type name ISO
+/// writes as two words.
+#[test]
+fn every_float_spelling_carries_a_value_that_is_exact_in_all_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    for source in [
+        "RETURN CAST(0.5 AS FLOAT16) AS v",
+        "RETURN CAST(0.5 AS FLOAT32) AS v",
+        "RETURN CAST(0.5 AS FLOAT64) AS v",
+        "RETURN CAST(0.5 AS FLOAT128) AS v",
+        "RETURN CAST(0.5 AS FLOAT256) AS v",
+        "RETURN CAST(0.5 AS FLOAT(10)) AS v",
+        "RETURN CAST(0.5 AS REAL) AS v",
+        "RETURN CAST(0.5 AS DOUBLE) AS v",
+        "RETURN CAST(0.5 AS DOUBLE PRECISION) AS v",
+    ] {
+        assert_eq!(one(&mut db, source), Value::Float(0.5), "{source}");
+    }
+}
+
+#[test]
+fn a_length_pads_at_the_bottom_and_refuses_at_the_top() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    assert_eq!(
+        one(&mut db, "RETURN CAST('abc' AS STRING(10)) AS v"),
+        Value::Str("abc".into())
+    );
+    assert_eq!(
+        one(&mut db, "RETURN CAST('abc' AS STRING(2, 10)) AS v"),
+        Value::Str("abc".into())
+    );
+    assert_eq!(
+        one(&mut db, "RETURN CAST('a' AS CHAR(3)) AS v"),
+        Value::Str("a  ".into())
+    );
+    assert_eq!(
+        status(&mut db, "RETURN CAST('abc' AS CHAR(2)) AS v"),
+        "22001"
+    );
+}
+
+#[test]
+fn a_decimal_takes_a_precision_and_a_scale() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    assert_eq!(
+        one(&mut db, "RETURN CAST('1.20' AS DECIMAL(5, 2)) AS v"),
+        Value::Float(1.2)
+    );
+    assert_eq!(
+        status(&mut db, "RETURN CAST('1000.00' AS DECIMAL(5, 2)) AS v"),
+        "22003"
+    );
+    // A scale past the precision names digits the number cannot hold,
+    // which is a statement nobody can mean rather than a value nobody
+    // can store, so it is refused at parse time.
+    assert_eq!(
+        status(&mut db, "RETURN CAST('1.20' AS DECIMAL(2, 5)) AS v"),
+        "42001"
+    );
+}
+
 #[test]
 fn the_two_conditions_come_back_with_their_codes() {
     let dir = tempfile::tempdir().unwrap();

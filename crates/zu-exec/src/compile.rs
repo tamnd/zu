@@ -935,11 +935,16 @@ impl Compiler<'_> {
                     };
                     pending.push((*slot, build));
                 }
-                // An OPTIONAL MATCH over a pattern that shares no
-                // variable with the pipeline, tied by an equality. That
-                // is a left join: probe the held side and, where the
-                // probe finds nothing, bind the level to one null row
-                // instead of dropping the outer one.
+                // A bracketed pattern that shares no variable with the
+                // pipeline and is tied to it by an equality. Where a
+                // hop would walk, this probes a table built off the
+                // other side, and what the bracket does with the answer
+                // is the kind's business: an OPTIONAL MATCH is a left
+                // join, binding the level to one null row where the
+                // probe finds nothing instead of dropping the outer
+                // row, and an existence block is the semi or the anti,
+                // where the outer row is what survives and the probe
+                // only decides whether it does.
                 //
                 // The bracket is the same one a hop uses. What sits
                 // under it is a join rather than an expand, and the
@@ -950,7 +955,7 @@ impl Compiler<'_> {
                     slot,
                     bracket: Some(group),
                     ..
-                }) if group.nulls_on_miss() => {
+                }) => {
                     let group = *group;
                     let slot = *slot;
                     it.next();
@@ -974,9 +979,10 @@ impl Compiler<'_> {
                         it.next();
                     }
                     // One of the group's predicates has to be the tie.
-                    // Without one the optional pattern is a cross
-                    // product that keeps every outer row, and the old
-                    // engine's nested loop is where that belongs.
+                    // Without one the bracketed pattern is a cross
+                    // product against the whole of the other side, and
+                    // the old engine's nested loop is where that
+                    // belongs.
                     let Some(at) = ({
                         let mut found = None;
                         for (i, expr) in group_filters.iter().enumerate() {
@@ -1003,7 +1009,7 @@ impl Compiler<'_> {
                     ops.push(Op::Bracket {
                         len: 0,
                         level: to_level,
-                        kind: BracketKind::Optional,
+                        kind: group.kind,
                     });
                     ops.push(Op::Join {
                         table,
@@ -1016,15 +1022,17 @@ impl Compiler<'_> {
                         };
                         ops.push(Op::Filter { prog });
                     }
-                    ops.push(Op::BracketHit {
-                        kind: BracketKind::Optional,
-                    });
+                    ops.push(Op::BracketHit { kind: group.kind });
                     let len = ops.len() - head - 1;
                     let Op::Bracket { len: slot, .. } = &mut ops[head] else {
                         unreachable!("just pushed the bracket");
                     };
                     *slot = len;
-                    self.optional_level = Some(to_level);
+                    if group.kind == BracketKind::Optional {
+                        self.optional_level = Some(to_level);
+                    } else {
+                        self.exists_level = Some(to_level);
+                    }
                 }
                 Some(LogicalPlan::Expand {
                     rel,

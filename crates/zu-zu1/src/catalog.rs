@@ -10,9 +10,19 @@
 //! `docs/04-storage-zu1-format.md` §1.
 //!
 //! Catalog layout: `version: u16`, `node_table_count: u32`,
-//! `rel_table_count: u32`, then per node table `id: u32`,
-//! `name_len: u16` + UTF-8 bytes, `node_count: u64`, then per rel table
-//! `id: u32`, name, `from: u32`, `to: u32`, `edge_count: u64`.
+//! `rel_table_count: u32`, `label_count: u32`, then per node table
+//! `id: u32`, `name_len: u16` + UTF-8 bytes, `node_count: u64`,
+//! `declared_label_count: u16` and that many `label: u16`, then per rel
+//! table `id: u32`, name, `from: u32`, `to: u32`, `edge_count: u64`,
+//! then the label dictionary as `label_count` names.
+//!
+//! The dictionary is per file and a label is its position in it, which
+//! is what makes a label set a bitset: a node's labels are a word with
+//! one bit per dictionary entry, and a pattern's labels are a mask over
+//! the same word. A node table declares which labels its rows may
+//! carry, the first of which is the table's own name and the one every
+//! row carries, so a label a table never declares prunes that table at
+//! plan time rather than being tested a row at a time.
 //!
 //! Table index layout: `version: u16`, `entry_count: u32`, then per
 //! entry `table_id: u32`, `directory_root: u64`.
@@ -22,8 +32,18 @@ use zu_common::{Result, ZuError};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::meta;
 
-const CATALOG_VERSION: u16 = 1;
+/// Version 1 had no labels: a node's only label was the name of its
+/// table. Version 2 adds the label dictionary and the set each node
+/// table declares. A version 1 catalog still reads, and reads as the
+/// graph it always was, one label per table carrying the table's name.
+const CATALOG_VERSION: u16 = 2;
 const TABLE_INDEX_VERSION: u16 = 1;
+
+/// The label dictionary is bounded by the width of the bitset a node
+/// carries. One word per node is the fast path the whole design is
+/// sized for (LDBC SNB declares 13 labels, LinkBench and Graph500 one),
+/// and a wider set waits for the spill representation.
+pub const MAX_LABELS: usize = 64;
 
 /// Table ids live in the 14-bit field of `NodeId`.
 pub const MAX_TABLE_ID: u32 = (1 << 14) - 1;
@@ -37,6 +57,24 @@ pub struct NodeTable {
     pub id: u32,
     pub name: String,
     pub node_count: u64,
+    /// The labels rows of this table may carry, as dictionary ids.
+    /// `labels[0]` is the table's own name, which every row carries;
+    /// the rest are optional per row and the bitset column says which
+    /// rows have them.
+    pub labels: Vec<u16>,
+}
+
+impl NodeTable {
+    /// The label every row of this table carries: the table's name.
+    pub fn primary_label(&self) -> u16 {
+        self.labels[0]
+    }
+
+    /// The declared set as a mask, which is what a plan time prune
+    /// tests a pattern's mask against.
+    pub fn label_mask(&self) -> u64 {
+        self.labels.iter().fold(0u64, |m, &l| m | 1 << l)
+    }
 }
 
 /// A rel table: a bulk-loaded CSR pair over `from` and `to` node tables,
@@ -57,6 +95,7 @@ pub struct RelTable {
 pub struct Catalog {
     nodes: Vec<NodeTable>,
     rels: Vec<RelTable>,
+    labels: Vec<String>,
 }
 
 fn corrupt(what: &'static str, detail: String) -> ZuError {
@@ -93,6 +132,14 @@ fn read_u32(bytes: &[u8], pos: &mut usize, what: &'static str) -> Result<u32> {
         .ok_or_else(|| corrupt(what, "truncated entry".into()))?;
     *pos += 4;
     Ok(u32::from_le_bytes(raw.try_into().unwrap()))
+}
+
+fn read_u16(bytes: &[u8], pos: &mut usize, what: &'static str) -> Result<u16> {
+    let raw = bytes
+        .get(*pos..*pos + 2)
+        .ok_or_else(|| corrupt(what, "truncated entry".into()))?;
+    *pos += 2;
+    Ok(u16::from_le_bytes(raw.try_into().unwrap()))
 }
 
 fn read_u64(bytes: &[u8], pos: &mut usize, what: &'static str) -> Result<u64> {
@@ -137,6 +184,69 @@ impl Catalog {
         self.rels.iter().find(|t| t.id == id)
     }
 
+    /// The label dictionary, a label's id being its position.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    pub fn label_id(&self, name: &str) -> Option<u16> {
+        self.labels.iter().position(|l| l == name).map(|i| i as u16)
+    }
+
+    pub fn label_name(&self, id: u16) -> Option<&str> {
+        self.labels.get(id as usize).map(String::as_str)
+    }
+
+    /// Interns a label name and returns its id, which is stable for the
+    /// life of the file because ids are positions and nothing is ever
+    /// removed from the dictionary.
+    pub fn intern_label(&mut self, name: &str) -> Result<u16> {
+        if let Some(id) = self.label_id(name) {
+            return Ok(id);
+        }
+        if name.is_empty() || name.len() > MAX_NAME_LEN {
+            return Err(ZuError::InvalidArgument(format!(
+                "label name length {} out of 1..{MAX_NAME_LEN}",
+                name.len()
+            )));
+        }
+        if self.labels.len() == MAX_LABELS {
+            return Err(ZuError::Unsupported {
+                what: "a label dictionary wider than one bitset word",
+                id: MAX_LABELS as u32,
+            });
+        }
+        self.labels.push(name.to_string());
+        Ok((self.labels.len() - 1) as u16)
+    }
+
+    /// Declares that rows of `table` may carry `label`, interning the
+    /// name if the graph has not seen it, and returns its id. Declaring
+    /// is what a plan time prune reads: a table that never declared a
+    /// label cannot hold a row with it.
+    pub fn declare_label(&mut self, table: u32, label: &str) -> Result<u16> {
+        let id = self.intern_label(label)?;
+        let table = self
+            .nodes
+            .iter_mut()
+            .find(|t| t.id == table)
+            .ok_or_else(|| ZuError::InvalidArgument(format!("no node table with id {table}")))?;
+        if !table.labels.contains(&id) {
+            table.labels.push(id);
+        }
+        Ok(id)
+    }
+
+    /// Every node table that declares `label`, which is the scan set a
+    /// pattern naming that label alone runs over.
+    pub fn tables_with_label(&self, label: u16) -> Vec<u32> {
+        self.nodes
+            .iter()
+            .filter(|t| t.labels.contains(&label))
+            .map(|t| t.id)
+            .collect()
+    }
+
     fn name_taken_by_other_kind(&self, name: &str, node: bool) -> bool {
         if node {
             self.rel_by_name(name).is_some()
@@ -176,10 +286,15 @@ impl Catalog {
             return Ok(t.id);
         }
         let id = self.next_id()?;
+        // The table's name is a label like any other, and the one every
+        // row carries, so it is interned before the table exists and
+        // heads the declared set.
+        let primary = self.intern_label(name)?;
         self.nodes.push(NodeTable {
             id,
             name: name.to_string(),
             node_count,
+            labels: vec![primary],
         });
         Ok(id)
     }
@@ -213,10 +328,15 @@ impl Catalog {
         out.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
         out.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.rels.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.labels.len() as u32).to_le_bytes());
         for t in &self.nodes {
             out.extend_from_slice(&t.id.to_le_bytes());
             encode_name(&mut out, &t.name);
             out.extend_from_slice(&t.node_count.to_le_bytes());
+            out.extend_from_slice(&(t.labels.len() as u16).to_le_bytes());
+            for &label in &t.labels {
+                out.extend_from_slice(&label.to_le_bytes());
+            }
         }
         for t in &self.rels {
             out.extend_from_slice(&t.id.to_le_bytes());
@@ -224,6 +344,9 @@ impl Catalog {
             out.extend_from_slice(&t.from.to_le_bytes());
             out.extend_from_slice(&t.to.to_le_bytes());
             out.extend_from_slice(&t.edge_count.to_le_bytes());
+        }
+        for label in &self.labels {
+            encode_name(&mut out, label);
         }
         out
     }
@@ -234,7 +357,7 @@ impl Catalog {
             .get(..10)
             .ok_or_else(|| corrupt(WHAT, "truncated header".into()))?;
         let version = u16::from_le_bytes(head[..2].try_into().unwrap());
-        if version != CATALOG_VERSION {
+        if version == 0 || version > CATALOG_VERSION {
             return Err(ZuError::Unsupported {
                 what: "catalog version",
                 id: u32::from(version),
@@ -243,15 +366,34 @@ impl Catalog {
         let node_count = u32::from_le_bytes(head[2..6].try_into().unwrap()) as usize;
         let rel_count = u32::from_le_bytes(head[6..10].try_into().unwrap()) as usize;
         let mut pos = 10;
+        let label_count = if version >= 2 {
+            read_u32(bytes, &mut pos, WHAT)? as usize
+        } else {
+            0
+        };
         let mut catalog = Self::default();
         for _ in 0..node_count {
             let id = read_u32(bytes, &mut pos, WHAT)?;
             let name = decode_name(bytes, &mut pos, WHAT)?;
             let node_count = read_u64(bytes, &mut pos, WHAT)?;
+            let mut labels = Vec::new();
+            if version >= 2 {
+                let count = read_u16(bytes, &mut pos, WHAT)? as usize;
+                if count > label_count {
+                    return Err(corrupt(
+                        WHAT,
+                        format!("table '{name}' declares {count} of {label_count} labels"),
+                    ));
+                }
+                for _ in 0..count {
+                    labels.push(read_u16(bytes, &mut pos, WHAT)?);
+                }
+            }
             catalog.nodes.push(NodeTable {
                 id,
                 name,
                 node_count,
+                labels,
             });
         }
         for _ in 0..rel_count {
@@ -268,8 +410,22 @@ impl Catalog {
                 edge_count,
             });
         }
+        for _ in 0..label_count {
+            catalog.labels.push(decode_name(bytes, &mut pos, WHAT)?);
+        }
         if pos != bytes.len() {
             return Err(corrupt(WHAT, "trailing bytes".into()));
+        }
+        if version < 2 {
+            // A version 1 file is the graph it always was: one label
+            // per node table, the table's name, carried by every row.
+            // Interning them in table order is what makes reading such
+            // a file twice give the same ids.
+            for i in 0..catalog.nodes.len() {
+                let name = catalog.nodes[i].name.clone();
+                let id = catalog.intern_label(&name)?;
+                catalog.nodes[i].labels.push(id);
+            }
         }
         catalog.validate()?;
         Ok(catalog)
@@ -305,6 +461,53 @@ impl Catalog {
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             return Err(corrupt("catalog", "duplicate table name".into()));
+        }
+        if self.labels.len() > MAX_LABELS {
+            return Err(corrupt(
+                "catalog",
+                format!("{} labels above {MAX_LABELS}", self.labels.len()),
+            ));
+        }
+        let mut label_names: Vec<&str> = self.labels.iter().map(String::as_str).collect();
+        label_names.sort_unstable();
+        if label_names.windows(2).any(|w| w[0] == w[1]) {
+            return Err(corrupt("catalog", "duplicate label name".into()));
+        }
+        for table in &self.nodes {
+            // The declared set heads with the table's own name, which is
+            // the label every row carries and the one a pattern naming
+            // the table is asking for.
+            match table.labels.first() {
+                Some(&first) if self.label_name(first) == Some(table.name.as_str()) => {}
+                _ => {
+                    return Err(corrupt(
+                        "catalog",
+                        format!("node table '{}' does not declare its own name", table.name),
+                    ));
+                }
+            }
+            let mut declared = table.labels.clone();
+            declared.sort_unstable();
+            let total = declared.len();
+            declared.dedup();
+            if declared.len() != total {
+                return Err(corrupt(
+                    "catalog",
+                    format!("node table '{}' declares a label twice", table.name),
+                ));
+            }
+            if let Some(&worst) = declared.last()
+                && worst as usize >= self.labels.len()
+            {
+                return Err(corrupt(
+                    "catalog",
+                    format!(
+                        "node table '{}' declares label {worst} of {}",
+                        table.name,
+                        self.labels.len()
+                    ),
+                ));
+            }
         }
         for rel in &self.rels {
             for end in [rel.from, rel.to] {
@@ -494,6 +697,85 @@ mod tests {
         let mut c = sample();
         c.nodes[0].id = MAX_TABLE_ID + 1;
         c.rels.clear();
+        assert!(Catalog::decode(&c.encode()).is_err());
+    }
+
+    #[test]
+    fn a_label_is_declared_once_and_named_by_id() {
+        let mut c = sample();
+        let person = c.node_by_name("person").unwrap().id;
+        let org = c.node_by_name("org").unwrap().id;
+        // Every table starts with its own name, which is why the ids
+        // here begin at 2.
+        assert_eq!(c.labels(), ["person", "org"]);
+        assert_eq!(c.declare_label(person, "Employee").unwrap(), 2);
+        assert_eq!(c.declare_label(org, "Employee").unwrap(), 2);
+        assert_eq!(c.declare_label(person, "Employee").unwrap(), 2);
+        assert_eq!(c.node_by_id(person).unwrap().labels, [0, 2]);
+        assert_eq!(c.label_id("Employee"), Some(2));
+        assert_eq!(c.label_id("Manager"), None);
+        assert_eq!(c.label_name(1), Some("org"));
+        assert_eq!(c.label_name(9), None);
+        assert_eq!(c.tables_with_label(2), [person, org]);
+        assert_eq!(c.node_by_id(person).unwrap().label_mask(), 0b101);
+        assert!(c.declare_label(person, "").is_err());
+        assert!(c.declare_label(4242, "Employee").is_err());
+        assert_eq!(Catalog::decode(&c.encode()).unwrap(), c);
+        // One word per row is the whole budget, so the dictionary ends
+        // at 64 names and says which limit it hit.
+        for i in c.labels().len()..MAX_LABELS {
+            c.declare_label(person, &format!("L{i}")).unwrap();
+        }
+        assert!(matches!(
+            c.declare_label(person, "one_too_many"),
+            Err(ZuError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn a_version_one_catalog_reads_as_one_label_per_table() {
+        // Version 1 had no dictionary, so the bytes end after the rel
+        // tables and every table carries its own name and nothing else.
+        let c = sample();
+        let mut old = 1u16.to_le_bytes().to_vec();
+        old.extend_from_slice(&(c.nodes.len() as u32).to_le_bytes());
+        old.extend_from_slice(&(c.rels.len() as u32).to_le_bytes());
+        for t in &c.nodes {
+            old.extend_from_slice(&t.id.to_le_bytes());
+            encode_name(&mut old, &t.name);
+            old.extend_from_slice(&t.node_count.to_le_bytes());
+        }
+        for t in &c.rels {
+            old.extend_from_slice(&t.id.to_le_bytes());
+            encode_name(&mut old, &t.name);
+            old.extend_from_slice(&t.from.to_le_bytes());
+            old.extend_from_slice(&t.to.to_le_bytes());
+            old.extend_from_slice(&t.edge_count.to_le_bytes());
+        }
+        assert_eq!(Catalog::decode(&old).unwrap(), c);
+    }
+
+    #[test]
+    fn decode_rejects_bad_label_sets() {
+        // A table that does not carry its own name first.
+        let mut c = sample();
+        c.nodes[0].labels[0] = 1;
+        assert!(Catalog::decode(&c.encode()).is_err());
+        // A label id with no name behind it.
+        let mut c = sample();
+        c.nodes[0].labels.push(7);
+        assert!(Catalog::decode(&c.encode()).is_err());
+        // The same label declared twice on one table.
+        let mut c = sample();
+        c.nodes[0].labels.push(0);
+        assert!(Catalog::decode(&c.encode()).is_err());
+        // Two names for one id.
+        let mut c = sample();
+        c.labels[1] = c.labels[0].clone();
+        assert!(Catalog::decode(&c.encode()).is_err());
+        // A count that outruns the dictionary dies before it allocates.
+        let mut c = sample();
+        c.nodes[0].labels = vec![0; 300];
         assert!(Catalog::decode(&c.encode()).is_err());
     }
 

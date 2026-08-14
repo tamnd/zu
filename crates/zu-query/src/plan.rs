@@ -313,6 +313,7 @@ fn build_path(
             bracket,
         };
     }
+    plan = label_filter(plan, &path.start, bracket);
     plan = prop_filters(plan, path.start.slot, &path.start.props, bracket);
     let mut from = path.start.slot;
     for (rel, node) in &path.steps {
@@ -337,10 +338,34 @@ fn build_path(
             bracket,
         };
         plan = prop_filters(plan, rel.slot, &rel.props, bracket);
+        plan = label_filter(plan, node, bracket);
         plan = prop_filters(plan, node.slot, &node.props, bracket);
         from = node.slot;
     }
     Ok(plan)
+}
+
+/// The bitset test a label set leaves behind, right where the slot
+/// appears. Most patterns leave none: the binder drops the tables that
+/// cannot satisfy the labels and the tables that are left carry them on
+/// every row, so this plants an operator only for a label some rows of
+/// a candidate table hold and others do not.
+fn label_filter(
+    plan: LogicalPlan,
+    node: &crate::binder::BoundNode,
+    bracket: Option<Bracket>,
+) -> LogicalPlan {
+    match node.labels {
+        0 => plan,
+        mask => LogicalPlan::Filter {
+            input: plan.boxed(),
+            expr: BoundExpr::HasLabels {
+                slot: node.slot,
+                mask,
+            },
+            bracket,
+        },
+    }
 }
 
 /// Inline `{key: value}` predicates become equality filters right where
@@ -586,6 +611,18 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::Literal(Literal::Temporal(t)) => t.to_string(),
         BoundExpr::Param(ix) => format!("${}", query.params[*ix]),
         BoundExpr::Var(slot) => slot_name(query, *slot).to_string(),
+        BoundExpr::HasLabels { slot, mask } => {
+            let names: Vec<&str> = (0..u64::BITS as u16)
+                .filter(|bit| mask & 1 << bit != 0)
+                .map(|bit| {
+                    query
+                        .labels
+                        .get(usize::from(bit))
+                        .map_or("?", String::as_str)
+                })
+                .collect();
+            format!("{}:{}", slot_name(query, *slot), names.join("&"))
+        }
         BoundExpr::Property { base, key } => format!("{}.{key}", expr_text(base, query)),
         BoundExpr::Unary { op, expr } => match op {
             UnaryOp::Not => format!("NOT {}", expr_text(expr, query)),
@@ -691,11 +728,13 @@ mod tests {
                     id: 0,
                     name: "Person".into(),
                     node_count: 9000,
+                    labels: Vec::new(),
                 },
                 NodeDef {
                     id: 1,
                     name: "Place".into(),
                     node_count: 1400,
+                    labels: Vec::new(),
                 },
             ],
             vec![
@@ -870,6 +909,38 @@ mod tests {
     fn unlabeled_scan_lists_every_candidate() {
         let text = explained("MATCH (n) RETURN n LIMIT 1");
         assert!(text.contains("ScanNodes n: Person|Place"), "got:\n{text}");
+    }
+
+    /// The graph type is what decides whether a label costs anything:
+    /// a label every row of the scanned table carries is a fact about
+    /// the table, and the plan holds no operator for it.
+    #[test]
+    fn a_declared_label_filters_and_a_table_label_does_not() {
+        let schema = Schema::with_labels(
+            vec![NodeDef {
+                id: 0,
+                name: "Person".into(),
+                node_count: 9000,
+                labels: vec![0, 1],
+            }],
+            Vec::new(),
+            vec!["Person".into(), "Employee".into()],
+        )
+        .expect("schema");
+        let explained = |source: &str| {
+            let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");
+            let plan = build(&query).expect("plan");
+            explain(&plan, &query, &schema)
+        };
+        let text = explained("MATCH (n:Person) RETURN n");
+        assert!(!text.contains("Filter"), "got:\n{text}");
+        let text = explained("MATCH (n:Person:Employee) RETURN n");
+        let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+        assert_eq!(
+            lines,
+            ["Project n", "Filter n:Employee", "ScanNodes n: Person"],
+            "got:\n{text}"
+        );
     }
 
     #[test]

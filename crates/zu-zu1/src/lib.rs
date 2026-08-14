@@ -137,6 +137,47 @@ pub fn verify(path: &Path) -> Result<u64> {
                 }
                 bytes += col.meta.payload_len;
                 live.extend(col.meta.blocks.iter().copied());
+                if let Some(meta) = &col.validity {
+                    values.clear();
+                    segment::read_segment(&mut db, meta, &mut values)?;
+                    bytes += meta.payload_len;
+                    live.extend(meta.blocks.iter().copied());
+                }
+            }
+            // The label bitset is checked against the catalog, which is
+            // the only place that says what a bit means: a row may carry
+            // a label its table declares, and it carries the table's own
+            // label whatever else it holds.
+            if let Some(meta) = &props.labels {
+                if meta.value_count != props.node_count {
+                    return Err(corrupt(
+                        "props directory",
+                        format!(
+                            "'{}' labels hold {} words over {} rows",
+                            node.name, meta.value_count, props.node_count
+                        ),
+                    ));
+                }
+                values.clear();
+                segment::read_segment(&mut db, meta, &mut values)?;
+                let declared = node.label_mask();
+                let primary = 1u64 << node.primary_label();
+                if let Some((row, word)) = values
+                    .iter()
+                    .enumerate()
+                    .find(|(_, w)| *w & !declared != 0 || *w & primary == 0)
+                {
+                    return Err(corrupt(
+                        "props directory",
+                        format!(
+                            "'{}' row {row} carries labels {word:#x} against a declared \
+                             {declared:#x}",
+                            node.name
+                        ),
+                    ));
+                }
+                bytes += meta.payload_len;
+                live.extend(meta.blocks.iter().copied());
             }
             continue;
         }
@@ -214,6 +255,12 @@ pub fn verify(path: &Path) -> Result<u64> {
                 }
                 bytes += col.meta.payload_len;
                 live.extend(col.meta.blocks.iter().copied());
+                if let Some(meta) = &col.validity {
+                    values.clear();
+                    segment::read_segment(&mut db, meta, &mut values)?;
+                    bytes += meta.payload_len;
+                    live.extend(meta.blocks.iter().copied());
+                }
             }
         }
         if let Some(keys) = &directory.keys {

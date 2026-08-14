@@ -83,8 +83,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "list-values",
-        supported: false,
-        why: "property columns are scalar; the loader refuses anything structured",
+        supported: true,
+        why: "a list column holds one element type, staged as a JSON array in a text column",
     },
     Declared {
         key: "null-properties",

@@ -152,7 +152,7 @@ fn verify_accepts_a_report_that_agrees_and_rejects_one_that_does_not() {
     let agreeing = r#"{"engine":{"adapter":"zu","capabilities":{
         "Data":{"labels":true,"multi-label":false,"node-properties":true,
         "edge-properties":false,"edge-types":true,"multiple-edge-types":true,
-        "multiple-node-labels":false,"temporal-values":true,"list-values":false,
+        "multiple-node-labels":false,"temporal-values":true,"list-values":true,
         "null-properties":false,"float-values":true,"boolean-values":true,
         "undirected-edges":false,"self-loops":true,"parallel-edges":true},
         "GQLStatus":true,"Parameters":true,"Transactions":false,

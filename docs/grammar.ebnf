@@ -71,7 +71,15 @@ value_type      = type_component , { "|" , type_component } ,
 type_component  = "ANY" , [ "VALUE" | "RECORD" | "GRAPH"
                           | "PROPERTY" , "VALUE" ]
                 | "RECORD" , [ record_fields ]
-                | type_name , [ "(" , integer , { "," , integer } , ")" ] ;
+                | list_type
+                | type_name , [ "(" , integer , { "," , integer } , ")" ] ,
+                  [ list_name , [ "(" , integer , ")" ] ] ;
+(* A list type either names the element type inside angle brackets or
+   follows it, and a list type with neither admits a list of anything.
+   The count in parentheses is the maximum length. *)
+list_type       = list_name , [ "<" , value_type , ">" ] ,
+                  [ "(" , integer , ")" ] ;
+list_name       = [ "GROUP" ] , ( "LIST" | "ARRAY" ) ;
 record_fields   = "{" , [ name , "::" , value_type ,
                   { "," , name , "::" , value_type } ] , "}" ;
 

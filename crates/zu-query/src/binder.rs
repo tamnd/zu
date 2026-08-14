@@ -660,6 +660,9 @@ pub enum Func {
     Collect,
     Id,
     Size,
+    /// GF12. The element count of a list, which is `SIZE` asked for by
+    /// its other name and refused on anything that is not a list.
+    Cardinality,
 }
 
 impl Func {
@@ -674,6 +677,7 @@ impl Func {
             "collect" => Func::Collect,
             "id" => Func::Id,
             "size" => Func::Size,
+            "cardinality" => Func::Cardinality,
             _ => return None,
         })
     }
@@ -1584,6 +1588,17 @@ impl Binder<'_> {
                 if !matches!(arg_ty, Type::List(_) | Type::Str | Type::Path | Type::Any) {
                     return Err(bad_type(format!(
                         "size() needs a list or string, got {arg_ty}"
+                    )));
+                }
+                Type::Int
+            }
+            // ISO defines CARDINALITY over lists and groups and nothing
+            // else, so unlike size() it refuses a string rather than
+            // counting its characters, which is CHAR_LENGTH's question.
+            Func::Cardinality => {
+                if !matches!(arg_ty, Type::List(_) | Type::Any) {
+                    return Err(bad_type(format!(
+                        "cardinality() needs a list, got {arg_ty}"
                     )));
                 }
                 Type::Int

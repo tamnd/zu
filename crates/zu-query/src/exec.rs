@@ -4175,6 +4175,21 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     ))),
                 }
             }
+            // GF12. The same count as size(), over lists only: a
+            // string has a length and not a cardinality, and answering
+            // anyway would let a query that meant CHAR_LENGTH pass.
+            Func::Cardinality => {
+                if *star || args.len() != 1 {
+                    return Err(invalid("cardinality() takes exactly one argument".into()));
+                }
+                match eval(ctx, &args[0])? {
+                    Value::List(items) => Ok(Value::Int(items.len() as i64)),
+                    Value::Null => Ok(Value::Null),
+                    other => Err(invalid(format!(
+                        "cardinality() expects a list, got {other:?}"
+                    ))),
+                }
+            }
             _ => Err(invalid(
                 "aggregate call outside a projection, this is a bug".into(),
             )),
@@ -4228,7 +4243,9 @@ impl AggState {
             Func::Min => Acc::Min(None),
             Func::Max => Acc::Max(None),
             Func::Collect => Acc::Collect(Vec::new()),
-            Func::Id | Func::Size => unreachable!("scalar function as an aggregate"),
+            Func::Id | Func::Size | Func::Cardinality => {
+                unreachable!("scalar function as an aggregate")
+            }
         };
         let distinct = (spec.distinct && !spec.star).then(BTreeSet::new);
         AggState {

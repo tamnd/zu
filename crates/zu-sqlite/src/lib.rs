@@ -39,6 +39,12 @@ pub const SCHEMA_VERSION: i32 = 2;
 /// exists so a reader can tell a truth value from a count that happens
 /// to be 0 or 1. Everything else here is a storage class under its own
 /// name.
+///
+/// The four list types are the same idea once more. sqlite has no list,
+/// so a list column holds a JSON array as text and the declaration says
+/// what the array's elements are. A list column is a staging shape: it
+/// is how a list gets into a zu1 file and back out again, not something
+/// this crate queries over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColumnType {
     Integer,
@@ -56,6 +62,14 @@ pub enum ColumnType {
     Duration,
     /// Months.
     YearMonthDuration,
+    /// A list of integers, written as a JSON array in a text column.
+    IntegerList,
+    /// A list of doubles, written as a JSON array in a text column.
+    RealList,
+    /// A list of strings, written as a JSON array in a text column.
+    TextList,
+    /// A list of truth values, written as a JSON array in a text column.
+    BooleanList,
 }
 
 impl ColumnType {
@@ -71,6 +85,10 @@ impl ColumnType {
             Self::LocalDatetime => "LOCALDATETIME",
             Self::Duration => "DURATION",
             Self::YearMonthDuration => "YEARMONTHDURATION",
+            Self::IntegerList => "INTEGERLIST",
+            Self::RealList => "REALLIST",
+            Self::TextList => "TEXTLIST",
+            Self::BooleanList => "BOOLEANLIST",
         }
     }
 
@@ -88,6 +106,10 @@ impl ColumnType {
             "LOCALDATETIME" => Self::LocalDatetime,
             "DURATION" => Self::Duration,
             "YEARMONTHDURATION" => Self::YearMonthDuration,
+            "INTEGERLIST" => Self::IntegerList,
+            "REALLIST" => Self::RealList,
+            "TEXTLIST" => Self::TextList,
+            "BOOLEANLIST" => Self::BooleanList,
             _ => return None,
         })
     }

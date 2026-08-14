@@ -585,6 +585,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 Func::Collect => "collect",
                 Func::Id => "id",
                 Func::Size => "size",
+                Func::Cardinality => "cardinality",
             };
             let inner = if *star {
                 "*".to_string()

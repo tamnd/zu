@@ -10,7 +10,7 @@
 //! through one depth guard.
 
 use zu_common::gqlstatus::codes;
-use zu_common::{LogicalType, Result, ZuError};
+use zu_common::{Field, LogicalType, RecordType, Result, ZuError};
 
 use crate::ast::{
     BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, PathPattern, Projection,
@@ -561,6 +561,18 @@ impl Parser<'_> {
                     if self.at_kw("IS") {
                         self.pos += 1;
                         let negated = self.eat_kw("NOT");
+                        // GA06. `IS NULL` and `IS TYPED` share their
+                        // first two words, and NULL is also the name of
+                        // a type, so the null test is the one written
+                        // without TYPED and nothing else has to change.
+                        if self.eat_kw("TYPED") {
+                            lhs = Expr::IsTyped {
+                                expr: Box::new(lhs),
+                                ty: self.parse_value_type()?,
+                                negated,
+                            };
+                            continue;
+                        }
                         self.expect_kw("NULL")?;
                         lhs = Expr::IsNull {
                             expr: Box::new(lhs),
@@ -767,14 +779,63 @@ impl Parser<'_> {
         })
     }
 
-    /// A value type name, with its optional precision and its optional
-    /// `NOT NULL`.
+    /// A value type: one or more components separated by vertical
+    /// bars, and an optional `NOT NULL`.
     ///
-    /// A target without `NOT NULL` is nullable, which is the standard's
+    /// A type without `NOT NULL` is nullable, which is the standard's
     /// default and not a convenience: `CAST(NULL AS INT)` has to be
     /// null rather than an error, or every optional property that ever
-    /// meets a cast becomes one.
+    /// meets a cast becomes one. The wrapper goes on the whole type
+    /// rather than on each component, because `INT | STRING NOT NULL`
+    /// says one thing about the union and not two about its members.
     fn parse_value_type(&mut self) -> Result<LogicalType> {
+        let first = self.parse_type_component()?;
+        // GV67, the closed dynamic union. One component is a type and
+        // not a union of one, so a query that never writes a bar never
+        // pays for the vector.
+        let ty = if self.at(&TokenKind::Pipe) {
+            let mut members = vec![first];
+            while self.eat(&TokenKind::Pipe) {
+                members.push(self.parse_type_component()?);
+            }
+            LogicalType::Union(members)
+        } else {
+            first
+        };
+        if self.eat_kw("NOT") {
+            self.expect_kw("NULL")?;
+            return Ok(ty);
+        }
+        Ok(LogicalType::Nullable(Box::new(ty)))
+    }
+
+    /// One member of a value type.
+    ///
+    /// Most of these are a name and its arguments, which is a table
+    /// lookup. The ones that are not are the types with structure in
+    /// them: `ANY` is a prefix rather than a name, and a record type
+    /// carries a list of fields that are themselves types.
+    fn parse_type_component(&mut self) -> Result<LogicalType> {
+        // GV47, GV60, GV66 and GV68 all begin with ANY, and it opens
+        // whatever follows it rather than naming a type of its own,
+        // except when nothing follows, where it is the open union.
+        if self.eat_kw("ANY") {
+            if self.eat_kw("RECORD") {
+                return Ok(LogicalType::Record(RecordType::open(Vec::new())));
+            }
+            if self.eat_kw("GRAPH") {
+                return Ok(LogicalType::Graph(None));
+            }
+            if self.eat_kw("PROPERTY") {
+                self.expect_kw("VALUE")?;
+                return Ok(LogicalType::AnyProperty);
+            }
+            self.eat_kw("VALUE");
+            return Ok(LogicalType::Any);
+        }
+        if self.eat_kw("RECORD") {
+            return Ok(LogicalType::Record(self.parse_record_type()?));
+        }
         let mut name = match self.peek() {
             Some(Token {
                 kind: TokenKind::Ident(s),
@@ -783,12 +844,19 @@ impl Parser<'_> {
             _ => return Err(self.error("a value type")),
         };
         self.pos += 1;
-        // GV23 spells one type in two words. Nothing else does, so the
-        // second word is taken only after the first, and only when the
-        // pair is a name; a bare DOUBLE stays a bare DOUBLE.
-        if name.eq_ignore_ascii_case("DOUBLE") && self.at_kw("PRECISION") {
-            self.pos += 1;
-            name = format!("{name} PRECISION");
+        // A few names are two words. The pair is taken only when the
+        // pair is itself a name, so DOUBLE PRECISION is one type and a
+        // bare DOUBLE followed by anything else is another.
+        if let Some(Token {
+            kind: TokenKind::Ident(second),
+            ..
+        }) = self.peek()
+        {
+            let joined = format!("{name} {second}");
+            if value_type::is_type_name(&joined) {
+                self.pos += 1;
+                name = joined;
+            }
         }
         if !value_type::is_type_name(&name) {
             return Err(unknown_type(&name));
@@ -813,11 +881,55 @@ impl Parser<'_> {
                 ),
             )
         })?;
-        if self.eat_kw("NOT") {
-            self.expect_kw("NULL")?;
-            return Ok(ty);
+        Ok(ty)
+    }
+
+    /// The fields of a record type, GV46, or no fields at all.
+    ///
+    /// A record type written without a field list is the open record
+    /// type of GV47, which admits records with any fields, so a bare
+    /// `RECORD` and `ANY RECORD` are the same type. GV48, a record
+    /// inside a record, needs nothing of its own: a field's type is a
+    /// value type and a record type is one.
+    fn parse_record_type(&mut self) -> Result<RecordType> {
+        if !self.eat(&TokenKind::LBrace) {
+            return Ok(RecordType::open(Vec::new()));
         }
-        Ok(LogicalType::Nullable(Box::new(ty)))
+        let mut fields = Vec::new();
+        if !self.at(&TokenKind::RBrace) {
+            loop {
+                let name = self.expect_name("a field name")?;
+                self.expect_double_colon()?;
+                let ty = self.parse_value_type()?;
+                fields.push(Field { name, ty });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(RecordType::closed(fields))
+    }
+
+    /// The `::` that separates a field name from its type.
+    ///
+    /// The lexer has no token for it, so this is two colons, and they
+    /// have to be adjacent: `a : : INT` is not a field and reading it
+    /// as one would let a typo through as a type.
+    fn expect_double_colon(&mut self) -> Result<()> {
+        let adjacent = match (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)) {
+            (Some(first), Some(second)) => {
+                first.kind == TokenKind::Colon
+                    && second.kind == TokenKind::Colon
+                    && first.start + 1 == second.start
+            }
+            _ => false,
+        };
+        if !adjacent {
+            return Err(self.error("'::'"));
+        }
+        self.pos += 2;
+        Ok(())
     }
 
     /// One number inside a type's parentheses: a digit count, a scale

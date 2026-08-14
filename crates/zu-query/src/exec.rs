@@ -1112,6 +1112,7 @@ fn expr_slots(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
             expr_slots(rhs, out);
         }
         BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
+        BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
         BoundExpr::Call { args, .. } => {
             for arg in args {
                 expr_slots(arg, out);
@@ -3849,6 +3850,10 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         BoundExpr::IsNull { expr, negated } => {
             let is_null = matches!(eval(ctx, expr)?, Value::Null);
             Ok(Value::Bool(is_null != *negated))
+        }
+        BoundExpr::IsTyped { expr, ty, negated } => {
+            let is_typed = crate::typed::is_of(&eval(ctx, expr)?, ty);
+            Ok(Value::Bool(is_typed != *negated))
         }
         BoundExpr::Call {
             func, star, args, ..

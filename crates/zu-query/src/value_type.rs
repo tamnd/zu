@@ -83,8 +83,9 @@ static NAMES: &[(&str, Family)] = &[
     ("FLOAT256", Family::Float(FloatBits::B256)),
     ("REAL", Family::Float(FloatBits::B32)),
     ("DOUBLE", Family::Float(FloatBits::B64)),
-    // GV23 writes this one as two words. The parser joins them with a
-    // single space before it looks the name up.
+    // A handful of names are two words. The parser joins a pair with a
+    // single space and looks the pair up before the first word alone,
+    // so DOUBLE PRECISION is one name and a bare DOUBLE is another.
     ("DOUBLE PRECISION", Family::Float(FloatBits::B64)),
     ("FLOAT", Family::Float(FloatBits::B64)),
     ("BOOL", Family::Simple(LogicalType::Bool)),
@@ -95,6 +96,29 @@ static NAMES: &[(&str, Family)] = &[
     ("BYTES", Family::Octets { fixed: false }),
     ("VARBINARY", Family::Octets { fixed: false }),
     ("BINARY", Family::Octets { fixed: true }),
+    // GV39 and GV40. A bare TIME or DATETIME carries a zone, which is
+    // GQL's default and the opposite of the one most engines picked,
+    // so the local types are the ones that have to say so.
+    ("DATE", Family::Simple(LogicalType::Date)),
+    ("LOCAL TIME", Family::Simple(LogicalType::LocalTime)),
+    ("LOCAL DATETIME", Family::Simple(LogicalType::LocalDatetime)),
+    (
+        "LOCAL TIMESTAMP",
+        Family::Simple(LogicalType::LocalDatetime),
+    ),
+    ("ZONED TIME", Family::Simple(LogicalType::ZonedTime)),
+    ("TIME", Family::Simple(LogicalType::ZonedTime)),
+    ("ZONED DATETIME", Family::Simple(LogicalType::ZonedDatetime)),
+    ("DATETIME", Family::Simple(LogicalType::ZonedDatetime)),
+    ("TIMESTAMP", Family::Simple(LogicalType::ZonedDatetime)),
+    // GV55, GV61 and the two immaterial types, GV71 and GV72.
+    ("PATH", Family::Simple(LogicalType::Path(None))),
+    (
+        "BINDING TABLE",
+        Family::Simple(LogicalType::BindingTable(None)),
+    ),
+    ("NULL", Family::Simple(LogicalType::Null)),
+    ("NOTHING", Family::Simple(LogicalType::Nothing)),
 ];
 
 const fn int(signed: bool, bits: IntBits) -> Family {

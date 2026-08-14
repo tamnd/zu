@@ -13,8 +13,9 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, Clause, Expr, LabelExpr, Literal, NodePattern, NullOrder, PathMode, PathPattern,
-    Projection, ProjectionItem, Query, RelDirection, RelPattern, Selector, SortKey, UnaryOp,
+    BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphTypeSource,
+    LabelExpr, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection, ProjectionItem,
+    PropertyDef, Query, RelDirection, RelPattern, Selector, SortKey, Statement, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -41,6 +42,26 @@ fn is_temporal(ty: &LogicalType) -> bool {
 /// of overflowing the parser's stack.
 const MAX_DEPTH: usize = 128;
 
+/// How many labels a written key label set may name, impdef IL003.
+///
+/// A label set is a 64 bit mask, and a written key label set is the
+/// labels before the arrow with at least one more after it, so 63 is
+/// the most that leaves the whole set a set this file can hold.
+const MAX_KEY_LABELS: usize = 63;
+
+/// What an edge type's end refers to. An endpoint written as a bare
+/// name and nothing else is a reference to a node type declared
+/// elsewhere in the same graph type; anything with a label or a
+/// property in it declares the node type where it stands.
+fn endpoint(def: ElementTypeDef) -> Endpoint {
+    match &def.name {
+        Some(name) if def.labels.is_empty() && def.properties.is_empty() => {
+            Endpoint::Named(name.clone())
+        }
+        _ => Endpoint::Inline(Box::new(def)),
+    }
+}
+
 /// Clause keywords the surface reserves but the v0 core does not parse
 /// yet; naming them beats "expected MATCH" when someone writes CREATE.
 const UNIMPLEMENTED: &[&str] = &[
@@ -49,6 +70,18 @@ const UNIMPLEMENTED: &[&str] = &[
 
 /// Parses one zuQL query.
 pub fn parse(source: &str) -> Result<Query> {
+    match parse_statement(source)? {
+        Statement::Query(q) => Ok(q),
+        Statement::Catalog(_) => Err(ZuError::gql(
+            codes::C42001,
+            "a catalog statement changes the file and answers no rows, so it runs through the session rather than the query path".to_string(),
+        )),
+    }
+}
+
+/// Parses one statement, which is either a query or a catalog
+/// statement. The first word tells them apart.
+pub fn parse_statement(source: &str) -> Result<Statement> {
     let tokens = lex(source)?;
     let mut parser = Parser {
         source,
@@ -56,7 +89,11 @@ pub fn parse(source: &str) -> Result<Query> {
         pos: 0,
         depth: 0,
     };
-    parser.parse_query()
+    if parser.at_catalog_stmt() {
+        let stmt = parser.parse_catalog_stmt()?;
+        return Ok(Statement::Catalog(stmt));
+    }
+    Ok(Statement::Query(parser.parse_query()?))
 }
 
 struct Parser<'a> {
@@ -86,6 +123,12 @@ impl Parser<'_> {
     /// True when the next token is the given keyword, case-insensitive.
     fn at_kw(&self, kw: &str) -> bool {
         matches!(self.peek(), Some(Token { kind: TokenKind::Ident(s), .. }) if s.eq_ignore_ascii_case(kw))
+    }
+
+    /// The same test, `offset` tokens further on. Two statements begin
+    /// with `CREATE` and the word after it is what tells them apart.
+    fn kw_at(&self, offset: usize, kw: &str) -> bool {
+        matches!(self.tokens.get(self.pos + offset), Some(Token { kind: TokenKind::Ident(s), .. }) if s.eq_ignore_ascii_case(kw))
     }
 
     fn eat_kw(&mut self, kw: &str) -> bool {
@@ -143,6 +186,340 @@ impl Parser<'_> {
             }
             _ => Err(self.error(what)),
         }
+    }
+
+    /// Whether this statement changes the catalog rather than reading
+    /// the graph. `CREATE` opens statements that are not here yet, so
+    /// the words after it decide: `GRAPH`, and `PROPERTY GRAPH` and `OR
+    /// REPLACE` ahead of either, are all the same statement.
+    fn at_catalog_stmt(&self) -> bool {
+        if !self.at_kw("CREATE") && !self.at_kw("DROP") {
+            return false;
+        }
+        let mut at = 1;
+        if self.kw_at(at, "OR") && self.kw_at(at + 1, "REPLACE") {
+            at += 2;
+        }
+        if self.kw_at(at, "PROPERTY") {
+            at += 1;
+        }
+        self.kw_at(at, "GRAPH")
+    }
+
+    /// `CREATE GRAPH TYPE` and `DROP GRAPH TYPE`, with the `IF EXISTS`
+    /// and `IF NOT EXISTS` modifiers GC03 asks for.
+    ///
+    /// `PROPERTY` is a word the statement may carry and none of the two
+    /// mean anything different for it, so it is eaten and forgotten:
+    /// every graph zu holds is a property graph.
+    fn parse_catalog_stmt(&mut self) -> Result<CatalogStmt> {
+        let creating = self.eat_kw("CREATE");
+        if !creating {
+            self.expect_kw("DROP")?;
+        }
+        let or_replace = if creating && self.at_kw("OR") {
+            self.expect_kw("OR")?;
+            self.expect_kw("REPLACE")?;
+            true
+        } else {
+            false
+        };
+        self.eat_kw("PROPERTY");
+        self.expect_kw("GRAPH")?;
+        if !self.eat_kw("TYPE") {
+            let what = if creating {
+                "CREATE GRAPH"
+            } else {
+                "DROP GRAPH"
+            };
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!("{what} is not implemented yet, a zu1 file holds one graph"),
+            ));
+        }
+        let stmt = if creating {
+            let if_not_exists = self.eat_if_exists(true)?;
+            if or_replace && if_not_exists {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "OR REPLACE takes the name over and IF NOT EXISTS leaves it alone, so a statement saying both says nothing".to_string(),
+                ));
+            }
+            let name = self.expect_name("a graph type name")?;
+            let source = self.parse_graph_type_source()?;
+            CatalogStmt::CreateGraphType {
+                name,
+                if_not_exists,
+                or_replace,
+                source,
+            }
+        } else {
+            let if_exists = self.eat_if_exists(false)?;
+            let name = self.expect_name("a graph type name")?;
+            CatalogStmt::DropGraphType { name, if_exists }
+        };
+        self.eat(&TokenKind::Semicolon);
+        if let Some(token) = self.peek() {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{}: nothing may follow a catalog statement, found {}",
+                    position(self.source, token.start),
+                    token.kind.describe()
+                ),
+            ));
+        }
+        Ok(stmt)
+    }
+
+    /// `IF NOT EXISTS` when creating, `IF EXISTS` when dropping. The
+    /// wrong one of the two is a mistake worth naming, since a `DROP
+    /// GRAPH TYPE IF NOT EXISTS` reads like it means something.
+    fn eat_if_exists(&mut self, creating: bool) -> Result<bool> {
+        if !self.eat_kw("IF") {
+            return Ok(false);
+        }
+        let negated = self.eat_kw("NOT");
+        self.expect_kw("EXISTS")?;
+        if negated != creating {
+            let wanted = if creating {
+                "IF NOT EXISTS"
+            } else {
+                "IF EXISTS"
+            };
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!("the modifier here is {wanted}"),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Where the element types come from: written out in braces (GG03),
+    /// or read off a graph's tables after `LIKE` (GG04). `AS` before
+    /// either is a word ISO allows and neither reading needs.
+    fn parse_graph_type_source(&mut self) -> Result<GraphTypeSource> {
+        self.eat_kw("AS");
+        if self.eat_kw("LIKE") {
+            // A zu1 file holds one graph, so the reference here names
+            // it whatever it is called and the type is read off the
+            // tables rather than off the rows.
+            let graph = self.expect_name("the graph a type is taken from")?;
+            return Ok(GraphTypeSource::Like(graph));
+        }
+        self.expect(&TokenKind::LBrace)?;
+        let mut elements = Vec::new();
+        if !self.at(&TokenKind::RBrace) {
+            elements.push(self.parse_element_type()?);
+            while self.eat(&TokenKind::Comma) {
+                elements.push(self.parse_element_type()?);
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(GraphTypeSource::Elements(elements))
+    }
+
+    /// One element type, written the way ISO writes it: as the pattern
+    /// an element of it matches.
+    ///
+    /// `NODE TYPE PersonType (:Person)` is the same type as `(:Person)`
+    /// with a name on it (GG20), and an edge type is two node type
+    /// patterns with an arc between them.
+    fn parse_element_type(&mut self) -> Result<ElementTypeDef> {
+        let mut name = None;
+        if self.eat_kw("NODE") || self.eat_kw("EDGE") || self.eat_kw("RELATIONSHIP") {
+            self.expect_kw("TYPE")?;
+            name = Some(self.expect_name("an element type name")?);
+        }
+        let mut def = self.parse_node_type_pattern()?;
+        if !self.at(&TokenKind::Minus) && !self.at(&TokenKind::Lt) {
+            if def.name.is_none() {
+                def.name = name;
+            }
+            return Ok(def);
+        }
+        // What was read as a node type is the left endpoint of an edge
+        // type, and the arc says which way the edge points. The name
+        // written before the pattern belongs to the edge, not to the
+        // endpoint it starts with.
+        let from = endpoint(def);
+        let (mut edge, undirected, reversed) = self.parse_arc()?;
+        let to = endpoint(self.parse_node_type_pattern()?);
+        let (from, to) = if reversed { (to, from) } else { (from, to) };
+        if edge.name.is_none() {
+            edge.name = name;
+        }
+        edge.kind = ElementDefKind::Edge {
+            from,
+            to,
+            undirected,
+        };
+        Ok(edge)
+    }
+
+    /// `(:Person => :Employee {name :: STRING})`: an alias, the labels
+    /// an element of the type is keyed on, the rest of its labels, and
+    /// what it declares.
+    ///
+    /// Everything in it is optional, which is what the GG2x features
+    /// are about. The labels before the arrow are the key label set
+    /// (GG21); with no arrow written there is no declared key and the
+    /// whole label set stands in for one (GG22).
+    fn parse_node_type_pattern(&mut self) -> Result<ElementTypeDef> {
+        self.expect(&TokenKind::LParen)?;
+        let def = self.parse_type_body(true)?;
+        self.expect(&TokenKind::RParen)?;
+        Ok(def)
+    }
+
+    /// The inside of a node type pattern or of an arc's bracket. They
+    /// are written the same and differ only in which limit an empty or
+    /// oversized key label set raises.
+    fn parse_type_body(&mut self, node: bool) -> Result<ElementTypeDef> {
+        // The name is what is written before the labels, and everything
+        // that could stand there instead says the type has none.
+        let anonymous = [
+            TokenKind::Colon,
+            TokenKind::Eq,
+            TokenKind::RParen,
+            TokenKind::RBracket,
+            TokenKind::LBrace,
+        ]
+        .iter()
+        .any(|kind| self.at(kind));
+        let name = if anonymous {
+            None
+        } else {
+            Some(self.expect_name("an element type name")?)
+        };
+        let mut first = Vec::new();
+        if self.eat(&TokenKind::Colon) {
+            first = self.parse_label_set()?;
+        }
+        let mut key_labels = Vec::new();
+        let mut labels = first;
+        // `=>` is two tokens, the way `->` is: the lexer has no arrow.
+        if self.at(&TokenKind::Eq)
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|t| t.kind == TokenKind::Gt)
+        {
+            self.pos += 2;
+            key_labels = std::mem::take(&mut labels);
+            self.check_key_labels(&key_labels, node)?;
+            self.expect(&TokenKind::Colon)?;
+            // The key labels are labels an element carries too, and the
+            // catalog keeps one set with the key marked inside it. They
+            // go first because that is the order they were written in.
+            labels = key_labels.clone();
+            for label in self.parse_label_set()? {
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        let properties = self.parse_property_types()?;
+        Ok(ElementTypeDef {
+            name,
+            kind: ElementDefKind::Node,
+            key_labels,
+            labels,
+            properties,
+        })
+    }
+
+    /// The limits on a written key label set, which is the one place a
+    /// graph type meets a number zu chose (IL003).
+    ///
+    /// An empty one is written rather than absent, so it is a statement
+    /// asking for a type nothing selects, and a set of 64 is one label
+    /// short of the label set that has to contain it plus whatever the
+    /// arrow adds, which does not fit the 64 bit mask a label set is.
+    fn check_key_labels(&self, labels: &[String], node: bool) -> Result<()> {
+        if labels.is_empty() {
+            let code = if node { codes::C42012 } else { codes::C42014 };
+            return Err(ZuError::gql(
+                code,
+                "a key label set that was written has to name a label".to_string(),
+            ));
+        }
+        if labels.len() > MAX_KEY_LABELS {
+            let code = if node { codes::C42013 } else { codes::C42015 };
+            return Err(ZuError::gql(
+                code,
+                format!(
+                    "{} key labels, and this file holds {MAX_KEY_LABELS}",
+                    labels.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `A&B&C` in an element type, which is a label set and not the
+    /// label expression a pattern takes: an element type says which
+    /// labels an element of it carries, so there is nothing to negate.
+    fn parse_label_set(&mut self) -> Result<Vec<String>> {
+        let mut labels = vec![self.expect_name("a label")?];
+        while self.eat(&TokenKind::Amp) {
+            labels.push(self.expect_name("a label")?);
+        }
+        Ok(labels)
+    }
+
+    /// The arc of an edge type pattern, from `-[` through `]-` and the
+    /// arrowhead at whichever end has one. Answers the edge type the
+    /// bracket describes, whether it is undirected (GH02), and whether
+    /// the arrow points back at the endpoint already read.
+    fn parse_arc(&mut self) -> Result<(ElementTypeDef, bool, bool)> {
+        let reversed = self.eat(&TokenKind::Lt);
+        self.expect(&TokenKind::Minus)?;
+        self.expect(&TokenKind::LBracket)?;
+        let def = self.parse_type_body(false)?;
+        self.expect(&TokenKind::RBracket)?;
+        self.expect(&TokenKind::Minus)?;
+        let forward = self.eat(&TokenKind::Gt);
+        if reversed && forward {
+            return Err(self.error("an arc with one arrowhead"));
+        }
+        Ok((def, !reversed && !forward, reversed))
+    }
+
+    /// `{ name :: TYPE, ... }`, `NO PROPERTIES`, or nothing written at
+    /// all, which declares none either way.
+    fn parse_property_types(&mut self) -> Result<Vec<PropertyDef>> {
+        if self.eat_kw("NO") {
+            self.expect_kw("PROPERTIES")?;
+            return Ok(Vec::new());
+        }
+        self.eat_kw("PROPERTIES");
+        if !self.eat(&TokenKind::LBrace) {
+            return Ok(Vec::new());
+        }
+        let mut properties = Vec::new();
+        if !self.at(&TokenKind::RBrace) {
+            loop {
+                let name = self.expect_name("a property name")?;
+                if !self.eat_kw("TYPED") {
+                    self.expect_double_colon()?;
+                }
+                // A property whose type admits null is one an element
+                // may leave out; `NOT NULL` is what says it may not.
+                // One rule about null rather than two.
+                let ty = self.parse_value_type()?;
+                let (ty, optional) = match ty {
+                    LogicalType::Nullable(inner) => (*inner, true),
+                    other => (other, false),
+                };
+                properties.push(PropertyDef { name, ty, optional });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(properties)
     }
 
     fn parse_query(&mut self) -> Result<Query> {
@@ -1252,6 +1629,214 @@ mod tests {
 
     fn parse_err(source: &str) -> String {
         parse(source).expect_err("should fail").to_string()
+    }
+
+    fn catalog_stmt(source: &str) -> CatalogStmt {
+        match parse_statement(source).expect("parse") {
+            Statement::Catalog(stmt) => stmt,
+            Statement::Query(_) => panic!("parsed as a query"),
+        }
+    }
+
+    fn catalog_err(source: &str) -> String {
+        parse_statement(source)
+            .expect_err("should fail")
+            .to_string()
+    }
+
+    /// The labels an endpoint written out in the pattern carries.
+    fn labels_of(end: &Endpoint) -> Vec<String> {
+        match end {
+            Endpoint::Inline(def) => def.labels.clone(),
+            Endpoint::Named(name) => panic!("'{name}' is a reference, not a pattern"),
+        }
+    }
+
+    fn text_type() -> LogicalType {
+        LogicalType::Str {
+            min: None,
+            max: None,
+            fixed: false,
+        }
+    }
+
+    #[test]
+    fn a_graph_type_is_created_from_the_element_type_patterns_it_holds() {
+        let stmt = catalog_stmt(
+            "CREATE PROPERTY GRAPH TYPE IF NOT EXISTS social {
+               NODE TYPE PersonType (:Person => :Employee
+                 {name :: STRING NOT NULL, nickname :: STRING}),
+               (:Org),
+               (:Person)-[:KNOWS => :Close]->(:Org),
+               (:Person)<-[:EMPLOYS]-(:Org),
+               (:Person)-[:MEETS]-(:Person)
+             }",
+        );
+        let CatalogStmt::CreateGraphType {
+            name,
+            if_not_exists,
+            or_replace,
+            source,
+        } = stmt
+        else {
+            panic!("not a create");
+        };
+        assert_eq!(name, "social");
+        assert!(if_not_exists);
+        assert!(!or_replace);
+        let GraphTypeSource::Elements(elements) = source else {
+            panic!("not written out");
+        };
+        assert_eq!(elements.len(), 5);
+        assert_eq!(elements[0].name.as_deref(), Some("PersonType"));
+        assert_eq!(elements[0].key_labels, ["Person"]);
+        // The key labels are labels the element carries as well, so the
+        // label set holds both and the key is the part before the arrow.
+        assert_eq!(elements[0].labels, ["Person", "Employee"]);
+        // A type that admits null is one an element may leave out.
+        assert_eq!(
+            elements[0].properties,
+            vec![
+                PropertyDef {
+                    name: "name".into(),
+                    ty: text_type(),
+                    optional: false,
+                },
+                PropertyDef {
+                    name: "nickname".into(),
+                    ty: text_type(),
+                    optional: true,
+                },
+            ]
+        );
+        // No arrow, so nothing is declared and the whole label set
+        // stands in for the key.
+        assert!(elements[1].name.is_none());
+        assert!(elements[1].key_labels.is_empty());
+        assert_eq!(elements[1].labels, ["Org"]);
+        let ElementDefKind::Edge {
+            from,
+            to,
+            undirected,
+        } = &elements[2].kind
+        else {
+            panic!("not an edge");
+        };
+        assert!(!undirected);
+        assert_eq!(labels_of(from), ["Person"]);
+        assert_eq!(labels_of(to), ["Org"]);
+        assert_eq!(elements[2].key_labels, ["KNOWS"]);
+        // An arrow pointing left is the same edge type read the other
+        // way round, so the endpoints come out in the order it means.
+        let ElementDefKind::Edge { from, to, .. } = &elements[3].kind else {
+            panic!("not an edge");
+        };
+        assert_eq!(labels_of(from), ["Org"]);
+        assert_eq!(labels_of(to), ["Person"]);
+        let ElementDefKind::Edge { undirected, .. } = &elements[4].kind else {
+            panic!("not an edge");
+        };
+        assert!(undirected, "an arc with no arrowhead is undirected");
+    }
+
+    #[test]
+    fn a_graph_type_may_be_taken_from_a_graph_or_dropped() {
+        assert_eq!(
+            catalog_stmt("CREATE GRAPH TYPE mirror LIKE social"),
+            CatalogStmt::CreateGraphType {
+                name: "mirror".into(),
+                if_not_exists: false,
+                or_replace: false,
+                source: GraphTypeSource::Like("social".into()),
+            }
+        );
+        assert_eq!(
+            catalog_stmt("CREATE OR REPLACE PROPERTY GRAPH TYPE mirror AS LIKE social"),
+            CatalogStmt::CreateGraphType {
+                name: "mirror".into(),
+                if_not_exists: false,
+                or_replace: true,
+                source: GraphTypeSource::Like("social".into()),
+            }
+        );
+        assert_eq!(
+            catalog_stmt("DROP PROPERTY GRAPH TYPE IF EXISTS mirror;"),
+            CatalogStmt::DropGraphType {
+                name: "mirror".into(),
+                if_exists: true,
+            }
+        );
+        // An endpoint written as a name alone points at a type declared
+        // elsewhere rather than declaring one.
+        let stmt = catalog_stmt(
+            "CREATE GRAPH TYPE t { EDGE TYPE Knows (PersonType)-[:KNOWS]->(PersonType) }",
+        );
+        let CatalogStmt::CreateGraphType { source, .. } = stmt else {
+            panic!("not a create");
+        };
+        let GraphTypeSource::Elements(elements) = source else {
+            panic!("not written out");
+        };
+        assert_eq!(elements[0].name.as_deref(), Some("Knows"));
+        let ElementDefKind::Edge { from, .. } = &elements[0].kind else {
+            panic!("not an edge");
+        };
+        assert_eq!(*from, Endpoint::Named("PersonType".into()));
+    }
+
+    #[test]
+    fn a_key_label_set_that_was_written_has_a_size_this_file_holds() {
+        // Written and empty is a type nothing selects, and the node and
+        // the edge case have a condition each.
+        assert!(catalog_err("CREATE GRAPH TYPE t { (=> :Narrow) }").starts_with("42012"));
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { (:A)-[=> :Narrow]->(:B) }").starts_with("42014")
+        );
+        let wide = (1..=64)
+            .map(|n| format!("K{n:02}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert!(
+            catalog_err(&format!("CREATE GRAPH TYPE t {{ (:{wide} => :Wide) }}"))
+                .starts_with("42013")
+        );
+        assert!(
+            catalog_err(&format!(
+                "CREATE GRAPH TYPE t {{ (:N)-[:{wide} => :Wide]->(:N) }}"
+            ))
+            .starts_with("42015")
+        );
+    }
+
+    #[test]
+    fn a_catalog_statement_says_what_it_could_not_read() {
+        assert!(
+            catalog_err("DROP GRAPH TYPE IF NOT EXISTS t")
+                .contains("the modifier here is IF EXISTS"),
+            "the two modifiers are not interchangeable"
+        );
+        assert!(
+            catalog_err("CREATE OR REPLACE GRAPH TYPE IF NOT EXISTS t { (:A) }")
+                .contains("says nothing"),
+            "taking the name over and leaving it alone are different answers"
+        );
+        assert!(catalog_err("CREATE GRAPH g").contains("CREATE GRAPH is not implemented yet"));
+        assert!(catalog_err("CREATE GRAPH TYPE t { (: ) }").contains("expected a label"));
+        assert!(catalog_err("CREATE GRAPH TYPE t { NODE (:A) }").contains("expected TYPE"));
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { (:A)<-[:R]->(:B) }")
+                .contains("an arc with one arrowhead")
+        );
+        assert!(
+            catalog_err("CREATE GRAPH TYPE t { (:A) } RETURN 1")
+                .contains("nothing may follow a catalog statement")
+        );
+        assert!(
+            parse_err("CREATE GRAPH TYPE t LIKE social").contains("runs through the session"),
+            "the query path does not run a statement that writes"
+        );
+        // CREATE that is not a catalog statement still says what it is.
+        assert!(parse_err("CREATE (n) RETURN n").contains("CREATE is not implemented yet"));
     }
 
     /// The label expression on the first node of the first pattern.

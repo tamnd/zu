@@ -660,6 +660,19 @@ pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Ve
     Ok(args)
 }
 
+/// The catalog statement this source is, `None` when it is a query.
+///
+/// Every entry point that takes statement text checks this first: a
+/// catalog statement has no binding table and no plan, so a caller that
+/// sent one and got "expected MATCH" back would be told the wrong
+/// thing.
+pub(crate) fn catalog_statement(source: &str) -> Result<Option<zu_query::ast::CatalogStmt>> {
+    match zu_query::parser::parse_statement(source)? {
+        zu_query::ast::Statement::Catalog(stmt) => Ok(Some(stmt)),
+        zu_query::ast::Statement::Query(_) => Ok(None),
+    }
+}
+
 fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
     let (catalog, schema) = load_schema(db)?;
     let (query, plan, notes) = compile(source, &schema)?;
@@ -680,6 +693,10 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 /// environment overrides the count, `ZU_THREADS=1` forces sequential
 /// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
+    if let Some(stmt) = catalog_statement(source)? {
+        crate::catalog_stmt::apply(db, &stmt)?;
+        return Ok(QueryResult::new(Vec::new(), Vec::new()));
+    }
     let p = prepare(source, db, params)?;
     let options = env_options();
     if exec2_enabled() {

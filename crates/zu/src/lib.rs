@@ -12,6 +12,7 @@ pub use zu_common::{DiagnosticRecord, Epoch, GqlStatus, NodeId, Result, Severity
 pub use zu_storage::{CheckpointMode, Direction, GraphStore, Snapshot};
 pub use zu_zu1 as zu1;
 
+pub mod catalog_stmt;
 pub mod convert;
 #[cfg(test)]
 mod exec2_tests;

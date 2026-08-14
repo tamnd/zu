@@ -73,6 +73,15 @@ impl Session {
     /// and reusing the cached plan afterwards.
     pub fn run(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.refresh()?;
+        // A catalog statement publishes a new epoch, and the plans and
+        // readers this session holds describe the old one. Refreshing
+        // after it is what drops them, so the next query compiles
+        // against the catalog the statement just wrote.
+        if let Some(stmt) = query::catalog_statement(source)? {
+            crate::catalog_stmt::apply(self.graph.file_mut(), &stmt)?;
+            self.refresh()?;
+            return Ok(QueryResult::new(Vec::new(), Vec::new()));
+        }
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
         let options = query::env_options();
@@ -399,5 +408,133 @@ mod tests {
             .expect("after epoch move");
         assert_eq!(session.plans.len(), 1);
         assert_eq!(session.epoch, session.graph.file().db_header().epoch);
+    }
+
+    #[test]
+    fn a_catalog_statement_publishes_and_the_session_sees_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("types.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (a:person) RETURN count(a) AS n", &[])
+            .expect("warm");
+        assert_eq!(session.plans.len(), 1);
+        let before = session.epoch;
+
+        let result = session
+            .run(
+                "CREATE PROPERTY GRAPH TYPE social {
+                   NODE TYPE PersonType (:person {name :: STRING}),
+                   (PersonType)-[:follows]->(PersonType)
+                 }",
+                &[],
+            )
+            .expect("create graph type");
+        assert!(
+            result.columns.is_empty(),
+            "a statement that answers no rows"
+        );
+        assert_eq!(result.status(), zu_common::gqlstatus::codes::C00001);
+        assert!(session.epoch > before, "the statement published an epoch");
+        assert!(session.plans.is_empty(), "the plans went with the epoch");
+        let ty = session
+            .graph
+            .catalog()
+            .graph_type("social")
+            .expect("the session reloaded the catalog it just wrote");
+        assert!(ty.closed);
+        assert_eq!(ty.elements.len(), 2);
+
+        // The graph still answers the query it answered before, now
+        // against a catalog that declares a type for it.
+        session
+            .run("MATCH (a:person) RETURN count(a) AS n", &[])
+            .expect("after the statement");
+
+        // GC03: the modifier is what turns a taken name into a
+        // statement that did nothing.
+        let err = session
+            .run("CREATE GRAPH TYPE social { (:person) }", &[])
+            .expect_err("the name is taken")
+            .to_string();
+        assert!(err.contains("already a graph type"), "{err}");
+        session
+            .run("CREATE GRAPH TYPE IF NOT EXISTS social { (:person) }", &[])
+            .expect("if not exists");
+        assert_eq!(session.graph.catalog().graph_types().len(), 1);
+        // The other answer to a taken name: take it over.
+        session
+            .run("CREATE OR REPLACE GRAPH TYPE social { (:person) }", &[])
+            .expect("or replace");
+        assert_eq!(session.graph.catalog().graph_types().len(), 1);
+        assert_eq!(
+            session
+                .graph
+                .catalog()
+                .graph_type("social")
+                .expect("social")
+                .elements
+                .len(),
+            1,
+            "the replacement is the type that is there now"
+        );
+
+        // GG04, off the tables and not off the data.
+        session
+            .run("CREATE GRAPH TYPE mirror LIKE social", &[])
+            .expect("like the graph this file holds");
+        let mirror = session
+            .graph
+            .catalog()
+            .graph_type("mirror")
+            .expect("mirror");
+        assert_eq!(
+            mirror
+                .elements
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["person", "follows"]
+        );
+
+        session.run("DROP GRAPH TYPE mirror", &[]).expect("drop");
+        assert!(session.graph.catalog().graph_type("mirror").is_none());
+        let err = session
+            .run("DROP GRAPH TYPE mirror", &[])
+            .expect_err("gone already")
+            .to_string();
+        assert!(err.contains("is no graph type here"), "{err}");
+        session
+            .run("DROP GRAPH TYPE IF EXISTS mirror", &[])
+            .expect("if exists");
+    }
+
+    #[test]
+    fn a_graph_type_that_cannot_be_kept_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("refused.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let epoch = session.epoch;
+        let labels = session.graph.catalog().labels().len();
+        // The catalog writes a property type with the codes a column
+        // stores, and a list of lists is not one of them. The statement
+        // interned `Ghost` on the way to finding that out, and the file
+        // still has to come out unchanged.
+        let err = session
+            .run(
+                "CREATE GRAPH TYPE strict { (:Ghost {seen :: LIST<LIST<STRING>>}) }",
+                &[],
+            )
+            .expect_err("a property type no column can hold")
+            .to_string();
+        assert!(err.contains("a type this file cannot write"), "{err}");
+        session.refresh().expect("refresh");
+        assert_eq!(session.epoch, epoch, "nothing was published");
+        assert_eq!(session.graph.catalog().labels().len(), labels);
+        assert!(session.graph.catalog().graph_type("strict").is_none());
     }
 }

@@ -7,6 +7,103 @@
 
 use zu_common::{LogicalType, Temporal};
 
+/// One statement: a query that reads, or a catalog statement that
+/// changes what the file declares.
+///
+/// The two are parsed by the same entry point and told apart by their
+/// first word, because a caller with a string in its hand does not know
+/// which it has. They share nothing after that: a catalog statement has
+/// no binding table, so it never reaches the binder or the planner.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    Query(Query),
+    Catalog(CatalogStmt),
+}
+
+/// A statement that changes the catalog (docs/07 §9, GC03).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CatalogStmt {
+    CreateGraphType {
+        name: String,
+        /// GC03. With it, a name already taken is a statement that did
+        /// nothing rather than an error.
+        if_not_exists: bool,
+        /// `OR REPLACE`, which is the other answer to the same
+        /// question: the name is taken, so take it over.
+        or_replace: bool,
+        source: GraphTypeSource,
+    },
+    DropGraphType {
+        name: String,
+        if_exists: bool,
+    },
+}
+
+/// Where a graph type's element types come from (GG03, GG04).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphTypeSource {
+    /// GG03: the element types written out where the type is created,
+    /// which is a closed type (GG02).
+    Elements(Vec<ElementTypeDef>),
+    /// GG04: the closed type a graph's tables already describe, read
+    /// off the catalog and not off the data.
+    Like(String),
+}
+
+/// One element type as it was written, in ISO's pattern spelling:
+/// `(:Person => :Employee {name :: STRING})` is a node type keyed on
+/// `Person` that also carries `Employee`.
+///
+/// Names here are names, not dictionary ids: the label dictionary
+/// belongs to the catalog and the parser has never seen one. The name
+/// is optional because ISO's element types are anonymous unless GG20
+/// gives them one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementTypeDef {
+    /// `NODE TYPE PersonType (...)` (GG20), or the alias written inside
+    /// the pattern, which is the name an endpoint refers to it by.
+    pub name: Option<String>,
+    pub kind: ElementDefKind,
+    /// GG21: the labels written before `=>`, empty when none were, in
+    /// which case the key label set is inferred from the whole label
+    /// set (GG22).
+    pub key_labels: Vec<String>,
+    /// The labels after `=>`, or all of them when there is no `=>`.
+    /// The element carries the key labels and these together.
+    pub labels: Vec<String>,
+    pub properties: Vec<PropertyDef>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElementDefKind {
+    Node,
+    Edge {
+        from: Endpoint,
+        to: Endpoint,
+        /// GH02: `(a)-[:T]-(b)`, an edge type with no direction.
+        undirected: bool,
+    },
+}
+
+/// What an edge type's end refers to: a node type by the name it was
+/// given, or one written out where the edge type is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Endpoint {
+    Named(String),
+    Inline(Box<ElementTypeDef>),
+}
+
+/// One property declaration. `optional` is where the type's
+/// nullability went: `name :: STRING` may be left out and `name ::
+/// STRING NOT NULL` may not, which is one rule about null rather than
+/// two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyDef {
+    pub name: String,
+    pub ty: LogicalType,
+    pub optional: bool,
+}
+
 /// A whole query: clauses in source order, ending in `RETURN`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {

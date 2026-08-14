@@ -79,3 +79,33 @@ This list replaces three earlier sketches that did not survive contact with the 
 ## 8. DML execution
 
 Writes compile to the same pipelines producing a `CommitBatch`: node inserts append to group deltas; rel inserts go to CSR slack (or delta overlay if slack exhausted; folded at checkpoint); `MERGE` = IndexLookup + conditional insert under the writer lock. Constraint checks (pk uniqueness, endpoint existence) execute inside the batch before commit (§08).
+
+## 9. Catalog statements
+
+`CREATE GRAPH TYPE` and `DROP GRAPH TYPE` change what a file declares rather than reading what it holds (GC03, grammar in `docs/grammar.ebnf`). They share the parser with queries and nothing after it: a catalog statement has no binding table, so it never reaches the binder or the planner, and it answers no columns, which the standard has a condition for (`00001 successful completion, omitted result`).
+
+ISO writes an element type as the pattern an element of it matches, and almost every part of that pattern is optional. A statement lists them:
+
+```
+CREATE PROPERTY GRAPH TYPE IF NOT EXISTS social {
+  NODE TYPE PersonType (:Person => :Employee
+    {name :: STRING NOT NULL, nickname :: STRING}),
+  (:Person)-[:KNOWS => :Close {since :: DATE}]->(:Company)
+}
+```
+
+The labels before the `=>` are the key label set, the ones after it are the rest of the labels the element carries, and a pattern with no arrow declares no key at all, in which case the whole label set stands in for one (GG21, GG22). A name before the pattern is GG20, and it is what an endpoint elsewhere in the same graph type refers the type by: `(PersonType)-[:KNOWS]->(PersonType)` points at a type declared once, while `(:Person)-[:KNOWS]->(:Person)` declares it where it stands.
+
+A property whose type admits null is one an element may leave out, so `NOT NULL` is what makes a property mandatory: one rule about null rather than two, and the value type grammar already had it.
+
+A graph type written out in braces is closed, because a list nobody qualified is the whole list (GG02). Open graph types are spelled on the graph rather than on the type, which is `CREATE GRAPH g ANY` and the next statement to land.
+
+The catalog holds one name per element type, since a name is what an endpoint points at, and ISO's element types are anonymous. A pattern that carries no name gets one made of its labels, `KNOWS&Close` for the edge type above, with a number after it when that name is taken: GG24 is two node types over one label in one graph type, and the number is what keeps the second one from being the first one written twice. An endpoint written out is folded into a node type the graph type already has when it declares nothing of its own, so the three `(:Person)` patterns of a two edge type graph type name one node type between them.
+
+One number in all of this is zu's rather than the standard's, impdef IL003: a written key label set names between 1 and 63 labels. Empty is a type nothing selects and 64 leaves no room in the 64 bit mask a label set is for the label the arrow adds, so the four conditions ISO reserves for the two ends of that range are raised here (`42012` to `42015`).
+
+`CREATE GRAPH TYPE t LIKE g` is GG04: the closed type the file's tables already describe, read off the catalog and not off the data, so it costs a catalog walk on a graph of any size. A zu1 file holds one graph, so the reference names it whatever it is called. The tables stay the storage unit either way; a graph type describes them, it does not replace them (§03 §6).
+
+`CREATE OR REPLACE` and `CREATE ... IF NOT EXISTS` are the two answers to a name that is taken, and a statement saying both says nothing, so it is refused. The replacement is built before the old type goes, which is why a replacement that cannot be kept leaves the type that was there.
+
+Applying one is read, change, publish: the change happens on the catalog the call loaded and reaches the file through the same checkpoint every other write uses, so a statement that turns out to be impossible halfway through leaves the file exactly as it was, labels included. A session that runs one publishes a new epoch and refreshes itself, which drops the cached plans and readers that describe the catalog it just replaced.

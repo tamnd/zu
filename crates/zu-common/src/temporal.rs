@@ -33,9 +33,11 @@ use std::fmt;
 
 use crate::types::{DurationKind, LogicalType};
 
-/// Nanoseconds in one second, minute, hour and day.
+/// Nanoseconds in one second, minute, hour and day. The minute and the
+/// day are public because an offset and a calendar day are the two
+/// units a conversion between temporal types is stated in.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
-const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SEC;
+pub const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SEC;
 const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
 pub const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
 
@@ -264,10 +266,18 @@ fn split_offset(text: &str) -> Option<(&str, Option<i16>)> {
 /// `yyyy-mm-ddThh:mm:ss` as nanoseconds since the epoch, plus the
 /// offset when one is written.
 fn parse_datetime(text: &str) -> Option<(i64, Option<i16>)> {
-    let (date, time) = text
+    let Some((date, time)) = text
         .split_once('T')
         .or_else(|| text.split_once('t'))
-        .or_else(|| text.split_once(' '))?;
+        .or_else(|| text.split_once(' '))
+    else {
+        // A date on its own is midnight, which is what the standard's
+        // datetime literal says and what the cast matrix expects of
+        // `CAST('2024-01-15' AS DATETIME)`. There is no offset to read
+        // out of a date, so the value is local until a zoned type asks
+        // for one and gets UTC.
+        return Some((i64::from(parse_date(text)?) * NANOS_PER_DAY, None));
+    };
     let days = parse_date(date)?;
     let (nanos, offset) = parse_time(time)?;
     Some((i64::from(days) * NANOS_PER_DAY + nanos, offset))

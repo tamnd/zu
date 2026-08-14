@@ -193,7 +193,7 @@ fn casting_to_a_record_type_casts_the_fields_and_names_the_one_that_fails() {
     // same way wrapping one in a list of one would.
     assert_eq!(
         code(&mut db, "RETURN CAST(1 AS RECORD { a :: INT }) AS v"),
-        "22018"
+        "22G03"
     );
     assert_eq!(
         one(&mut db, "RETURN CAST(null AS RECORD { a :: INT }) AS v"),

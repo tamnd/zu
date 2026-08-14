@@ -32,14 +32,7 @@ fn yes(db: &mut Zu1File, source: &str) -> bool {
 /// One value written per type, in the order zu puts them in. A
 /// comparison between any two of these is a comparison between two
 /// types, which is the whole subject here.
-const TOWER: [&str; 6] = [
-    "FALSE",
-    "1",
-    "'a'",
-    "DATE '2024-01-15'",
-    "[1]",
-    "{ a: 1 }",
-];
+const TOWER: [&str; 6] = ["FALSE", "1", "'a'", "DATE '2024-01-15'", "[1]", "{ a: 1 }"];
 
 #[test]
 fn a_value_of_one_type_compares_with_a_value_of_another() {
@@ -52,7 +45,10 @@ fn a_value_of_one_type_compares_with_a_value_of_another() {
         for high in &TOWER[i + 1..] {
             assert!(yes(&mut db, &format!("{low} < {high}")), "{low} < {high}");
             assert!(yes(&mut db, &format!("{high} > {low}")), "{high} > {low}");
-            assert!(!yes(&mut db, &format!("{low} >= {high}")), "{low} >= {high}");
+            assert!(
+                !yes(&mut db, &format!("{low} >= {high}")),
+                "{low} >= {high}"
+            );
         }
     }
 }

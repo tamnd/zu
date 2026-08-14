@@ -1257,7 +1257,7 @@ impl<'a> Worker<'a> {
             let group = (row / u64::from(GROUP_ROWS)) as u32;
             for (slot, dir) in sides(dirs).enumerate() {
                 if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
-                    match self.hold(rel, dir, row, rows.len()) {
+                    match self.hold(rel, dir, row, self.wanted(rows.len())) {
                         Ok(p) => held[slot] = Some((group, p)),
                         Err(e) => {
                             result = Err(e);
@@ -1687,7 +1687,7 @@ impl<'a> Worker<'a> {
             // is what the row by row expand this replaces would count.
             for (slot, dir) in sides(seed.1).enumerate() {
                 if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
-                    match self.hold(seed.0, dir, row, rows.len()) {
+                    match self.hold(seed.0, dir, row, self.wanted(rows.len())) {
                         Ok(p) => held[slot] = Some((group, p)),
                         Err(e) => {
                             result = Err(e);
@@ -1804,11 +1804,24 @@ impl<'a> Worker<'a> {
         result
     }
 
+    /// How many lists of one group the walk is about to want, given the
+    /// vector in hand. Under a scan the answer is all of them: a pin is
+    /// held for the whole query, and the same group comes back around
+    /// on every vector the scan draws, including the short vectors a
+    /// nested walk hands its lists down in. Under a seed the vector in
+    /// hand is the whole of it, since nothing is going to ask again.
+    fn wanted(&self, rows: usize) -> usize {
+        match self.plan.source {
+            Source::Scan(_) => usize::MAX,
+            _ => rows,
+        }
+    }
+
     /// The pin for a group, or `None` when the caller is better off
-    /// reading its lists one at a time. `wanted` is how many source
-    /// rows the caller holds, and the snapshot says how many it takes
-    /// for the pin to pay: a scan holds a morsel and is always over
-    /// it, a point lookup holds one row and is almost never.
+    /// reading its lists one at a time. `wanted` is how many of the
+    /// group's lists this walk will read, and the snapshot says how
+    /// many it takes for the pin to pay: a scan is always over it, a
+    /// point lookup holds one row and is almost never.
     fn hold(&mut self, rel: RelId, dir: Dir, row: u64, wanted: usize) -> Result<Option<CsrPin>> {
         let group = (row / u64::from(GROUP_ROWS)) as u32;
         let key = (rel, matches!(dir, Dir::Bwd), group);
@@ -1833,15 +1846,16 @@ impl<'a> Worker<'a> {
             at: (row % u64::from(GROUP_ROWS)) as usize,
         };
         for dir in sides(dirs) {
-            out.sides.push(match self.hold(rel, dir, row, 1)? {
-                Some(pin) => RowList::Pinned(pin),
-                None => {
-                    let mut list = self.row_pool.pop().unwrap_or_default();
-                    list.clear();
-                    self.snap.get().list_into(rel, row, dir, &mut list)?;
-                    RowList::Read(list)
-                }
-            });
+            out.sides
+                .push(match self.hold(rel, dir, row, self.wanted(1))? {
+                    Some(pin) => RowList::Pinned(pin),
+                    None => {
+                        let mut list = self.row_pool.pop().unwrap_or_default();
+                        list.clear();
+                        self.snap.get().list_into(rel, row, dir, &mut list)?;
+                        RowList::Read(list)
+                    }
+                });
         }
         Ok(out)
     }
@@ -1984,7 +1998,7 @@ impl<'a> Worker<'a> {
             while at < rows.len() {
                 let group = rows[at] / u64::from(GROUP_ROWS);
                 let run = rows[at..].partition_point(|r| r / u64::from(GROUP_ROWS) == group);
-                match self.hold(rel, dir, rows[at], run)? {
+                match self.hold(rel, dir, rows[at], self.wanted(run))? {
                     Some(pin) => {
                         for &row in &rows[at..at + run] {
                             out.extend_from_slice(pin.list((row % u64::from(GROUP_ROWS)) as usize));
@@ -2159,7 +2173,7 @@ impl<'a> Worker<'a> {
             let group = row / u64::from(GROUP_ROWS);
             for (slot, dir) in sides(dirs).enumerate() {
                 if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
-                    held[slot] = Some((group, self.hold(rel, dir, row, rows.len())?));
+                    held[slot] = Some((group, self.hold(rel, dir, row, self.wanted(rows.len()))?));
                 }
                 match &held[slot].as_ref().expect("just held").1 {
                     Some(pin) => {
@@ -3053,7 +3067,6 @@ mod tests {
 
         fn csr(&mut self, _rel: RelId, group: GroupId, dir: Dir) -> Result<CsrPin> {
             assert_eq!(group, 0, "the mock fits one group");
-            assert!(!self.point, "a point mock pins nothing");
             let (offsets, neighbors) = self.side(dir).clone();
             Ok(CsrPin { offsets, neighbors })
         }
@@ -3483,16 +3496,61 @@ mod tests {
     /// Reading a list at a time instead of pinning the group around it
     /// is a storage decision, and the walk above it is not allowed to
     /// notice: same neighbors, same order. What the point path exists
-    /// for is the case a pin is ruinous at, one seed of a group holding
-    /// millions of edges, and what this checks is that the two agree on
-    /// a graph small enough to hold both answers in one assert.
+    /// for is the case a pin is ruinous at, a handful of seeds into a
+    /// group holding millions of edges, and what this checks is that
+    /// the two agree on a graph small enough to hold both answers in
+    /// one assert.
     #[test]
     fn a_point_read_hands_down_what_a_pinned_group_does() {
-        let shape = plan(
+        let shape = |keys: Vec<u64>| {
+            let mut p = plan(
+                vec![bare_level(), bare_level()],
+                vec![Op::Expand {
+                    rel: 0,
+                    dirs: Dirs::Both,
+                    from: 0,
+                    to: 1,
+                    batch: false,
+                    close: None,
+                }],
+                SinkSpec::Rows {
+                    items: vec![ScalarRef::RowId { level: 1 }],
+                    post: Vec::new(),
+                },
+                &["m"],
+            );
+            p.source = Source::Seeks(keys);
+            p
+        };
+        let seeks = shape((10..14).collect());
+        let mut pinned = Mock::new(64, |i| i as i64, false);
+        let mut point = Mock::new(64, |i| i as i64, false).point();
+        let a = run(&seeks, &mut pinned, &seq()).unwrap().0;
+        let b = run(&seeks, &mut point, &seq()).unwrap().0;
+        assert_eq!(a.rows.len(), 8, "four seeds, a neighbor either way");
+        assert_eq!(b.rows, a.rows, "the point path walked a different graph");
+        assert_eq!(pinned.lists(), 0, "a pinned group serves its own lists");
+        assert_eq!(
+            point.lists(),
+            8,
+            "one read per seed per direction, empty lists included"
+        );
+    }
+
+    /// A scan comes back around to the same group on every vector it
+    /// draws and the pin is held for the whole query, so the vector in
+    /// hand says nothing about how many of the group's lists the walk
+    /// is going to want. The mock here says every list is better read
+    /// on its own, which is the strongest thing storage can say, and a
+    /// scan is still supposed to pin: the read counter staying at zero
+    /// is the assertion.
+    #[test]
+    fn a_scan_pins_the_group_however_short_its_vectors_are() {
+        let p = plan(
             vec![bare_level(), bare_level()],
             vec![Op::Expand {
                 rel: 0,
-                dirs: Dirs::Both,
+                dirs: Dirs::One(Dir::Fwd),
                 from: 0,
                 to: 1,
                 batch: false,
@@ -3504,18 +3562,10 @@ mod tests {
             },
             &["m"],
         );
-        let mut pinned = Mock::new(64, |i| i as i64, false);
-        let mut point = Mock::new(64, |i| i as i64, false).point();
-        let a = run(&shape, &mut pinned, &seq()).unwrap().0;
-        let b = run(&shape, &mut point, &seq()).unwrap().0;
-        assert_eq!(a.rows.len(), 126, "63 forward neighbors and 63 backward");
-        assert_eq!(b.rows, a.rows, "the point path walked a different graph");
-        assert_eq!(pinned.lists(), 0, "a pinned group serves its own lists");
-        assert_eq!(
-            point.lists(),
-            128,
-            "one read per source row per direction, empty lists included"
-        );
+        let mut snap = Mock::new(64, |i| i as i64, false).point();
+        let out = run(&p, &mut snap, &seq()).unwrap().0;
+        assert_eq!(out.rows.len(), 63, "one forward edge per row but the last");
+        assert_eq!(snap.lists(), 0, "a scan driven walk read a list at a time");
     }
 
     /// The batched descent is only worth having if it is invisible:

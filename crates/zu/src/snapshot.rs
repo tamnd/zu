@@ -239,6 +239,14 @@ impl Snapshot for Zu1Snapshot<'_> {
         // reads those, and widening this is the vector layer's own
         // change (G1, the `PhysType` move).
         Ok(reader.col(name).and_then(|ix| {
+            // A vector carries a validity mask of its own, but a scan
+            // does not fill one from storage yet, so a column that
+            // holds a null is not resolvable here either and the row at
+            // a time executor reads it. Widening this is the same
+            // change as widening the two types below.
+            if reader.columns()[ix].validity.is_some() {
+                return None;
+            }
             let ty = match &reader.columns()[ix].ty {
                 LogicalType::Int {
                     signed: true,

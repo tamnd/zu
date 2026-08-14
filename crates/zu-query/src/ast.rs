@@ -219,6 +219,15 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: LogicalType,
     },
+    /// `EXISTS { MATCH (a)-[:knows]->(b) WHERE b.id > 10 }`, the pattern
+    /// existence predicate. The block is a match of its own that binds
+    /// nothing outside itself: variables written in it live for the
+    /// length of the block, variables already in scope tie it to the
+    /// row being tested, and the answer is a boolean.
+    Exists {
+        patterns: Vec<PathPattern>,
+        filter: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

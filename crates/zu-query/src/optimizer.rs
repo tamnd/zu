@@ -1,7 +1,7 @@
 //! Plan rewrites: DP join ordering driven by degree statistics and
 //! filter placement at the earliest bound point (docs/07 §3).
 //!
-//! The optimizer rewrites maximal runs of non-optional ScanNodes,
+//! The optimizer rewrites maximal runs of unbracketed ScanNodes,
 //! Expand, and Filter operators. Within a run it splits AND
 //! conjunctions into single predicates, builds the join graph over node
 //! slots, and orders every connected component by dynamic programming
@@ -19,8 +19,9 @@
 //! expand that completes them.
 //!
 //! Components with more than twelve relationships keep their written
-//! order, and optional operators are never reordered: left-outer
-//! semantics pin them where the query put them.
+//! order, and bracketed operators are never reordered: a bracket
+//! answers per outer row and what it does with a miss depends on where
+//! the query put it, so it stays there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -76,7 +77,7 @@ pub fn optimize_noted(
 /// Only a marked close moves anything. An unmarked one runs the binary
 /// probe either way, and there the predicate first is the better order.
 /// A lifted predicate cannot name the rel the close binds, since it was
-/// placed before that rel was bound, and it keeps its own optional
+/// placed before that rel was bound, and it keeps its own bracket
 /// group, so this is a reorder of two row filters and nothing else.
 fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
     match plan {
@@ -84,11 +85,11 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::ScanNodes {
             input,
             slot,
-            optional,
+            bracket,
         } => LogicalPlan::ScanNodes {
             input: Box::new(lift_close_filters(*input)),
             slot,
-            optional,
+            bracket,
         },
         LogicalPlan::Expand {
             input,
@@ -100,7 +101,7 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             into,
             asp,
             wcoj,
-            optional,
+            bracket,
         } => {
             let mut below = lift_close_filters(*input);
             let mut lifted = Vec::new();
@@ -108,21 +109,21 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
                 while let LogicalPlan::Filter {
                     input: inner,
                     expr,
-                    optional: fopt,
+                    bracket: filter_bracket,
                 } = below
                 {
                     let mut slots = HashSet::new();
                     expr_slots(&expr, &mut slots);
-                    if fopt != optional || slots.contains(&rel) {
+                    if filter_bracket != bracket || slots.contains(&rel) {
                         below = LogicalPlan::Filter {
                             input: inner,
                             expr,
-                            optional: fopt,
+                            bracket: filter_bracket,
                         };
                         break;
                     }
                     below = *inner;
-                    lifted.push((expr, fopt));
+                    lifted.push((expr, filter_bracket));
                 }
             }
             let mut plan = LogicalPlan::Expand {
@@ -135,13 +136,13 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
                 into,
                 asp,
                 wcoj,
-                optional,
+                bracket,
             };
-            for (expr, optional) in lifted.into_iter().rev() {
+            for (expr, bracket) in lifted.into_iter().rev() {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     expr,
-                    optional,
+                    bracket,
                 };
             }
             plan
@@ -149,11 +150,11 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Filter {
             input,
             expr,
-            optional,
+            bracket,
         } => LogicalPlan::Filter {
             input: Box::new(lift_close_filters(*input)),
             expr,
-            optional,
+            bracket,
         },
         LogicalPlan::Unwind { input, expr, slot } => LogicalPlan::Unwind {
             input: Box::new(lift_close_filters(*input)),
@@ -480,7 +481,7 @@ fn mark_asp_node(
         LogicalPlan::ScanNodes {
             input,
             slot,
-            optional,
+            bracket,
         } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             let card = slot_card(slot, query, schema);
@@ -494,7 +495,7 @@ fn mark_asp_node(
                 LogicalPlan::ScanNodes {
                     input: Box::new(input),
                     slot,
-                    optional,
+                    bracket,
                 },
                 est,
             )
@@ -509,7 +510,7 @@ fn mark_asp_node(
             into,
             asp: _,
             wcoj: _,
-            optional,
+            bracket,
         } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             let e = ExpandOp {
@@ -527,7 +528,7 @@ fn mark_asp_node(
                     .filter_map(|id| schema.rel_by_id(*id))
                     .map(|rd| rd.edge_count as f64)
                     .sum();
-                let asp = optional.is_none() && range.is_none() && est > edges.max(1.0);
+                let asp = bracket.is_none() && range.is_none() && est > edges.max(1.0);
                 // A closing expand completes a cycle in the join graph
                 // by construction, so docs/07 §4 injects the multiway
                 // intersection here. Multi-table rels keep the binary
@@ -590,7 +591,7 @@ fn mark_asp_node(
                     into,
                     asp,
                     wcoj,
-                    optional,
+                    bracket,
                 },
                 est.max(1e-6),
             )
@@ -598,7 +599,7 @@ fn mark_asp_node(
         LogicalPlan::Filter {
             input,
             expr,
-            optional,
+            bracket,
         } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // `distinct` is the seed scan and nothing above it, which is
@@ -615,7 +616,7 @@ fn mark_asp_node(
                 LogicalPlan::Filter {
                     input: Box::new(input),
                     expr,
-                    optional,
+                    bracket,
                 },
                 est,
             )
@@ -740,9 +741,9 @@ fn rewrite(
 ) -> Result<LogicalPlan> {
     if matches!(
         &plan,
-        LogicalPlan::Filter { optional: None, .. }
-            | LogicalPlan::ScanNodes { optional: None, .. }
-            | LogicalPlan::Expand { optional: None, .. }
+        LogicalPlan::Filter { bracket: None, .. }
+            | LogicalPlan::ScanNodes { bracket: None, .. }
+            | LogicalPlan::Expand { bracket: None, .. }
     ) {
         return reorder_run(plan, query, schema, notes);
     }
@@ -751,20 +752,20 @@ fn rewrite(
         LogicalPlan::Filter {
             input,
             expr,
-            optional,
+            bracket,
         } => Ok(LogicalPlan::Filter {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
-            optional,
+            bracket,
         }),
         LogicalPlan::ScanNodes {
             input,
             slot,
-            optional,
+            bracket,
         } => Ok(LogicalPlan::ScanNodes {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             slot,
-            optional,
+            bracket,
         }),
         LogicalPlan::Expand {
             input,
@@ -776,7 +777,7 @@ fn rewrite(
             into,
             asp,
             wcoj,
-            optional,
+            bracket,
         } => Ok(LogicalPlan::Expand {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             rel,
@@ -787,7 +788,7 @@ fn rewrite(
             into,
             asp,
             wcoj,
-            optional,
+            bracket,
         }),
         LogicalPlan::Unwind { input, expr, slot } => Ok(LogicalPlan::Unwind {
             input: Box::new(rewrite(*input, query, schema, notes)?),
@@ -887,7 +888,7 @@ fn reorder_run(
             LogicalPlan::Filter {
                 input,
                 expr,
-                optional: None,
+                bracket: None,
             } => {
                 ops.push(RunOp::Filter(expr));
                 *input
@@ -895,7 +896,7 @@ fn reorder_run(
             LogicalPlan::ScanNodes {
                 input,
                 slot,
-                optional: None,
+                bracket: None,
             } => {
                 ops.push(RunOp::Scan(slot));
                 *input
@@ -910,7 +911,7 @@ fn reorder_run(
                 into,
                 asp: _,
                 wcoj: _,
-                optional: None,
+                bracket: None,
             } => {
                 ops.push(RunOp::Expand(ExpandOp {
                     rel,
@@ -993,7 +994,7 @@ fn reorder_run(
                     LogicalPlan::ScanNodes {
                         input: Box::new(plan),
                         slot: *slot,
-                        optional: None,
+                        bracket: None,
                     }
                 }
                 Step::Expand { ix, from, to, into } => {
@@ -1016,7 +1017,7 @@ fn reorder_run(
                         into: *into,
                         asp: false,
                         wcoj: false,
-                        optional: None,
+                        bracket: None,
                     }
                 }
             };
@@ -1030,7 +1031,7 @@ fn reorder_run(
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 expr: filter.clone(),
-                optional: None,
+                bracket: None,
             };
         }
     }
@@ -1045,7 +1046,7 @@ fn rebuild(ops: Vec<RunOp>, below: LogicalPlan) -> LogicalPlan {
             RunOp::Scan(slot) => LogicalPlan::ScanNodes {
                 input: Box::new(plan),
                 slot,
-                optional: None,
+                bracket: None,
             },
             RunOp::Expand(e) => LogicalPlan::Expand {
                 input: Box::new(plan),
@@ -1057,12 +1058,12 @@ fn rebuild(ops: Vec<RunOp>, below: LogicalPlan) -> LogicalPlan {
                 into: e.into,
                 asp: false,
                 wcoj: false,
-                optional: None,
+                bracket: None,
             },
             RunOp::Filter(expr) => LogicalPlan::Filter {
                 input: Box::new(plan),
                 expr,
-                optional: None,
+                bracket: None,
             },
         };
     }
@@ -1453,7 +1454,7 @@ fn place_filters(
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 expr: filter.clone(),
-                optional: None,
+                bracket: None,
             };
         }
     }

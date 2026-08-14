@@ -15,7 +15,51 @@ use std::fmt::Write as _;
 use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
-use crate::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
+use crate::binder::{
+    BoundClause, BoundExpr, BoundItem, BoundQuery, Func, MatchKind, Schema, TableFunc,
+};
+
+/// What a bracket does with an outer row the operators inside it
+/// found nothing for, and which bracket in the query this is.
+///
+/// The operators of one bracket share the id and nothing else does, so
+/// a run of them is found by looking at the ids alone. The kinds are
+/// the three things a match can be other than plain: OPTIONAL MATCH,
+/// and the two halves of an existence predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bracket {
+    pub id: usize,
+    pub kind: BracketKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BracketKind {
+    /// The outer row survives a miss, the bracket's slots bound null,
+    /// and a hit is handed up as many times as it matched.
+    Optional,
+    /// The outer row survives a hit, once, however many there were,
+    /// and the bracket's slots are never read above it.
+    Semi,
+    /// The outer row survives a miss, and a hit ends it.
+    Anti,
+}
+
+impl Bracket {
+    /// True where the bracket keeps a row it found nothing for, which
+    /// is where a null can reach the operators above.
+    pub fn nulls_on_miss(&self) -> bool {
+        matches!(self.kind, BracketKind::Optional)
+    }
+
+    /// What the plan text writes in front of a bracketed operator.
+    pub fn prefix(&self) -> &'static str {
+        match self.kind {
+            BracketKind::Optional => "Optional",
+            BracketKind::Semi => "Semi",
+            BracketKind::Anti => "Anti",
+        }
+    }
+}
 
 /// The hop range of a variable-length expand together with the path
 /// mode and selector that govern its enumeration (docs/07 §1, §5).
@@ -34,14 +78,14 @@ pub enum LogicalPlan {
     /// One row, no columns: the seed under the first scan or unwind.
     Empty,
     /// Introduces every row of a node slot's candidate tables.
-    /// `optional` carries the OPTIONAL MATCH group this operator
-    /// belongs to, `None` for a required match. Operators and filters
-    /// sharing a group form one left-outer unit at execution: when the
-    /// group produces nothing for an outer row, its slots bind null.
+    /// `bracket` carries the group this operator belongs to, `None`
+    /// for a plain match. Operators and filters sharing a group run as
+    /// one unit against each outer row, and the kind says what becomes
+    /// of an outer row the unit found nothing for.
     ScanNodes {
         input: Box<LogicalPlan>,
         slot: usize,
-        optional: Option<usize>,
+        bracket: Option<Bracket>,
     },
     /// Walks a rel from a bound slot, introducing (or joining into)
     /// the far node.
@@ -68,15 +112,15 @@ pub enum LogicalPlan {
         /// the two are adjacent; when they are not, `asp` still
         /// decides the binary fallback.
         wcoj: bool,
-        optional: Option<usize>,
+        bracket: Option<Bracket>,
     },
-    /// `optional` ties a filter into its OPTIONAL MATCH group: inline
-    /// props and the clause's WHERE gate matches inside the group
-    /// rather than dropping the null row the group emits on a miss.
+    /// `bracket` ties a filter into its group: inline props and the
+    /// clause's WHERE gate matches inside the group rather than
+    /// dropping the row the group hands up for a miss.
     Filter {
         input: Box<LogicalPlan>,
         expr: BoundExpr,
-        optional: Option<usize>,
+        bracket: Option<Bracket>,
     },
     Unwind {
         input: Box<LogicalPlan>,
@@ -131,18 +175,28 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
     let mut plan = LogicalPlan::Empty;
     // Slots a plan operator has already introduced.
     let mut bound: HashSet<usize> = HashSet::new();
-    // Each OPTIONAL MATCH clause is its own left-outer group.
-    let mut opt_groups = 0;
+    // Every bracketed clause is a group of its own, counted in written
+    // order.
+    let mut groups = 0;
     for clause in &query.clauses {
         match clause {
             BoundClause::Match {
-                optional,
+                kind,
                 patterns,
                 filter,
             } => {
-                let group = optional.then(|| {
-                    opt_groups += 1;
-                    opt_groups - 1
+                let kind = match kind {
+                    MatchKind::Required => None,
+                    MatchKind::Optional => Some(BracketKind::Optional),
+                    MatchKind::Semi => Some(BracketKind::Semi),
+                    MatchKind::Anti => Some(BracketKind::Anti),
+                };
+                let group = kind.map(|kind| {
+                    groups += 1;
+                    Bracket {
+                        id: groups - 1,
+                        kind,
+                    }
                 });
                 for path in patterns {
                     plan = build_path(plan, path, &mut bound, group)?;
@@ -151,7 +205,7 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                     plan = LogicalPlan::Filter {
                         input: plan.boxed(),
                         expr: expr.clone(),
-                        optional: group,
+                        bracket: group,
                     };
                 }
             }
@@ -216,7 +270,7 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                     plan = LogicalPlan::Filter {
                         input: plan.boxed(),
                         expr: expr.clone(),
-                        optional: None,
+                        bracket: None,
                     };
                 }
                 if !order_by.is_empty() {
@@ -247,7 +301,7 @@ fn build_path(
     mut plan: LogicalPlan,
     path: &crate::binder::BoundPath,
     bound: &mut HashSet<usize>,
-    optional: Option<usize>,
+    bracket: Option<Bracket>,
 ) -> Result<LogicalPlan> {
     // A path variable adds no operator: the binder records its shape
     // and the executor assembles the value from the pattern's slots.
@@ -256,10 +310,10 @@ fn build_path(
         plan = LogicalPlan::ScanNodes {
             input: plan.boxed(),
             slot: path.start.slot,
-            optional,
+            bracket,
         };
     }
-    plan = prop_filters(plan, path.start.slot, &path.start.props, optional);
+    plan = prop_filters(plan, path.start.slot, &path.start.props, bracket);
     let mut from = path.start.slot;
     for (rel, node) in &path.steps {
         let into = bound.contains(&node.slot);
@@ -280,10 +334,10 @@ fn build_path(
             into,
             asp: false,
             wcoj: false,
-            optional,
+            bracket,
         };
-        plan = prop_filters(plan, rel.slot, &rel.props, optional);
-        plan = prop_filters(plan, node.slot, &node.props, optional);
+        plan = prop_filters(plan, rel.slot, &rel.props, bracket);
+        plan = prop_filters(plan, node.slot, &node.props, bracket);
         from = node.slot;
     }
     Ok(plan)
@@ -297,7 +351,7 @@ fn prop_filters(
     mut plan: LogicalPlan,
     slot: usize,
     props: &[(String, BoundExpr)],
-    optional: Option<usize>,
+    bracket: Option<Bracket>,
 ) -> LogicalPlan {
     for (key, value) in props {
         let expr = BoundExpr::Binary {
@@ -311,7 +365,7 @@ fn prop_filters(
         plan = LogicalPlan::Filter {
             input: plan.boxed(),
             expr,
-            optional,
+            bracket,
         };
     }
     plan
@@ -354,9 +408,9 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
         LogicalPlan::ScanNodes {
             input,
             slot,
-            optional,
+            bracket,
         } => {
-            let opt = if optional.is_some() { "Optional" } else { "" };
+            let opt = bracket.map_or("", |b| b.prefix());
             let _ = writeln!(
                 out,
                 "{pad}{opt}ScanNodes {}: {}",
@@ -375,7 +429,7 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             into,
             asp,
             wcoj: _,
-            optional,
+            bracket,
         } => {
             let hops = match range {
                 None => String::new(),
@@ -401,7 +455,7 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 RelDirection::In => ("<-", "-"),
                 RelDirection::Undirected => ("-", "-"),
             };
-            let opt = if optional.is_some() { "Optional" } else { "" };
+            let opt = bracket.map_or("", |b| b.prefix());
             let kind = if *asp {
                 "AspJoin"
             } else if *into {
@@ -422,9 +476,9 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
         LogicalPlan::Filter {
             input,
             expr,
-            optional,
+            bracket,
         } => {
-            let opt = if optional.is_some() { "Optional" } else { "" };
+            let opt = bracket.map_or("", |b| b.prefix());
             let _ = writeln!(out, "{pad}{opt}Filter {}", expr_text(expr, query));
             render(input, query, schema, depth + 1, out);
         }
@@ -783,6 +837,26 @@ mod tests {
         assert!(
             !text.contains("OptionalScanNodes"),
             "a was already bound:\n{text}"
+        );
+    }
+
+    #[test]
+    fn existence_blocks_mark_their_operators() {
+        let text = explained(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.id > 3 } \
+             AND NOT EXISTS { MATCH (a)-[:IS_LOCATED_IN]->(p) } RETURN a",
+        );
+        let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+        assert_eq!(
+            lines,
+            [
+                "Project a",
+                "AntiExpand (a)-[#3:IS_LOCATED_IN]->(p)",
+                "SemiFilter b.id > 3",
+                "SemiExpand (a)-[#1:KNOWS]->(b)",
+                "ScanNodes a: Person",
+            ],
+            "got:\n{text}"
         );
     }
 

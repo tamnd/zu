@@ -14,13 +14,13 @@ Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) c
 | harness | gql-compat devel | gql-compat devel | gql-compat devel |
 | corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
 | cases | 377 | 377 | 377 |
-| judged (pass + fail) | 253 | 324 | 235 |
-| **passed** | **72** (28.5%) | **186** (57.4%) | **126** (53.6%) |
+| judged (pass + fail) | 253 | 324 | 238 |
+| **passed** | **72** (28.5%) | **186** (57.4%) | **129** (54.2%) |
 | failed | 181 | 138 | 109 |
-| skipped, cannot hold the fixture | 72 | 39 | 125 |
+| skipped, cannot hold the fixture | 72 | 39 | 122 |
 | never reached a verdict | 52 | 14 | 17 |
 | ISO features with a passing case | 22 of 189 | 69 of 189 | 65 of 189 |
-| distinct GQLSTATUS values produced | 0 | 9 | 13 |
+| distinct GQLSTATUS values produced | 0 | 9 | 16 |
 
 ## By kind of case
 
@@ -36,7 +36,7 @@ Pass over judged, then the two exclusions. Read the exclusions first. An engine 
 | optional | zu | 201 | 64 | 70 | 51 | 16 | 47.8% |
 | condition | ladybug | 66 | 0 | 4 | 62 | 0 | 0.0% |
 | condition | neo4j | 66 | 6 | 28 | 31 | 1 | 17.6% |
-| condition | zu | 66 | 14 | 20 | 31 | 1 | 41.2% |
+| condition | zu | 66 | 17 | 20 | 28 | 1 | 45.9% |
 | grammar | ladybug | 17 | 11 | 4 | 0 | 2 | 73.3% |
 | grammar | neo4j | 17 | 14 | 3 | 0 | 0 | 82.4% |
 | grammar | zu | 17 | 14 | 3 | 0 | 0 | 82.4% |

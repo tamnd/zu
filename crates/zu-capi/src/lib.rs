@@ -39,6 +39,7 @@ pub const ZU_TYPE_REL: i32 = 6;
 pub const ZU_TYPE_LIST: i32 = 7;
 pub const ZU_TYPE_PATH: i32 = 8;
 pub const ZU_TYPE_TEMPORAL: i32 = 9;
+pub const ZU_TYPE_RECORD: i32 = 10;
 
 /// An open database session. Opaque to C.
 pub struct ZuSession {
@@ -311,6 +312,7 @@ pub unsafe extern "C" fn zu_result_cell_type(result: *const ZuResult, row: u64, 
         Some(Value::Rel { .. }) => ZU_TYPE_REL,
         Some(Value::List(_)) => ZU_TYPE_LIST,
         Some(Value::Path(_)) => ZU_TYPE_PATH,
+        Some(Value::Record(_)) => ZU_TYPE_RECORD,
         Some(Value::Temporal(_)) => ZU_TYPE_TEMPORAL,
         None => -1,
     }

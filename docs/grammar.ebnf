@@ -60,7 +60,7 @@ unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
                 | function_call | cast
-                | "(" , expression , ")" | list | map ;
+                | "(" , expression , ")" | list | record ;
 
 cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
 (* A value type is a name, its arguments, and whether it admits null.
@@ -86,7 +86,10 @@ record_fields   = "{" , [ name , "::" , value_type ,
 function_call   = name , "(" , [ "DISTINCT" ] ,
                   [ "*" | expression , { "," , expression } ] , ")" ;
 list            = "[" , [ expression , { "," , expression } ] , "]" ;
-map             = property_map ;
+(* The same braces are an inline property predicate inside a pattern
+   and a record constructor in an expression. A field name written
+   twice is refused rather than resolved. *)
+record          = property_map ;
 
 literal         = "NULL" | "TRUE" | "FALSE" | integer | float | string ;
 (* A temporal literal is a type name and the value written as a string,

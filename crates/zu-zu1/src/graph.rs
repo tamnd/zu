@@ -12,15 +12,26 @@
 //!
 //! Directory layout (version-prefixed, hand-rolled):
 //! `version: u16`, `node_count: u64`, `edge_count: u64`,
-//! `group_count: u32`, `has_keys: u8`, then when `has_keys` is 1 the key
-//! and row `SegmentMeta` of the primary-key index, then per group
-//! `row_count: u32` followed by the fwd offsets, fwd neighbors, bwd
-//! offsets, and bwd neighbors `SegmentMeta`.
+//! `props: BlockPtr`, `group_count: u32`, `has_keys: u8`, then when
+//! `has_keys` is 1 the key and row `SegmentMeta` of the primary-key
+//! index, then per group `row_count: u32`, `edge_base: u64`, and the fwd
+//! offsets, fwd neighbors, bwd offsets, and bwd neighbors `SegmentMeta`.
 //!
 //! Each rel table's directory is its own meta chain, reached through the
 //! catalog and the table index of `crate::catalog`, so one file holds any
 //! number of named graphs and a bulk load replaces only the table it
 //! names.
+//!
+//! Edges carry properties the way nodes do, through a props directory of
+//! `crate::props`, hung off `props` here rather than off the table index,
+//! whose entry for a rel id is this directory. The row domain of those
+//! columns is the edge ordinal: the position of an edge in the sorted
+//! load order, which is also its position in the forward neighbor arrays
+//! read group after group, so `edge_base` plus the slot a destination
+//! sits in names the row without anything being stored per edge to say
+//! so. Reading a property backward costs the search that finds the slot
+//! (see [`GraphReader::edge_ordinal`]), and nothing in either direction
+//! costs a permutation on disk.
 
 use std::io::BufRead;
 use std::path::Path;
@@ -34,12 +45,13 @@ use crate::keys::{KeyIndex, KeyReader, write_key_index};
 use crate::meta;
 use crate::segment::{SegmentMeta, probe, read_range, read_segment_pooled, write_segment};
 
+// Version 8 added the edge property root and the per-group edge base.
 // Version 7 widened SegmentMeta with the structural layout byte for
 // FullZip, so version 6 files must fail as unsupported here rather than
 // misread downstream. Version 6 had added the has_keys byte and the
 // primary-key index segments to the header, version 5 the SegmentMeta
 // zone map, version 4 the per-chunk fence array.
-const DIRECTORY_VERSION: u16 = 7;
+const DIRECTORY_VERSION: u16 = 8;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -65,6 +77,12 @@ pub struct DirectionMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMeta {
     pub row_count: u32,
+    /// How many edges the groups before this one hold, which is the
+    /// ordinal of this group's first forward edge. Stored rather than
+    /// summed on load because summing means reading the last offset of
+    /// every group's offsets segment, a chunk read per group, before a
+    /// reader answers anything.
+    pub edge_base: u64,
     pub fwd: DirectionMeta,
     pub bwd: DirectionMeta,
 }
@@ -86,6 +104,9 @@ pub struct Directory {
     /// Primary-key index over original node ids, present when the load
     /// relabeled rows.
     pub keys: Option<KeyIndex>,
+    /// Root of the edge property chain, [`NULL_BLOCK`] when the table
+    /// stores none. Its row domain is the edge ordinal.
+    pub props: BlockPtr,
     pub groups: Vec<GroupMeta>,
 }
 
@@ -95,6 +116,7 @@ impl Directory {
         out.extend_from_slice(&DIRECTORY_VERSION.to_le_bytes());
         out.extend_from_slice(&self.node_count.to_le_bytes());
         out.extend_from_slice(&self.edge_count.to_le_bytes());
+        out.extend_from_slice(&self.props.to_le_bytes());
         out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
         out.push(u8::from(self.keys.is_some()));
         if let Some(keys) = &self.keys {
@@ -103,6 +125,7 @@ impl Directory {
         }
         for g in &self.groups {
             out.extend_from_slice(&g.row_count.to_le_bytes());
+            out.extend_from_slice(&g.edge_base.to_le_bytes());
             g.fwd.offsets.encode(&mut out);
             g.fwd.neighbors.encode(&mut out);
             g.bwd.offsets.encode(&mut out);
@@ -119,7 +142,7 @@ impl Directory {
             what: "group directory",
             detail: detail.to_string(),
         };
-        let head = bytes.get(..23).ok_or_else(|| corrupt("truncated header"))?;
+        let head = bytes.get(..31).ok_or_else(|| corrupt("truncated header"))?;
         let version = u16::from_le_bytes(head[..2].try_into().unwrap());
         if version != DIRECTORY_VERSION {
             return Err(ZuError::Unsupported {
@@ -129,9 +152,10 @@ impl Directory {
         }
         let node_count = u64::from_le_bytes(head[2..10].try_into().unwrap());
         let edge_count = u64::from_le_bytes(head[10..18].try_into().unwrap());
-        let group_count = u32::from_le_bytes(head[18..22].try_into().unwrap()) as usize;
-        let mut pos = 23usize;
-        let keys = match head[22] {
+        let props = u64::from_le_bytes(head[18..26].try_into().unwrap());
+        let group_count = u32::from_le_bytes(head[26..30].try_into().unwrap()) as usize;
+        let mut pos = 31usize;
+        let keys = match head[30] {
             0 => None,
             1 => {
                 let (keys, next) = SegmentMeta::decode(bytes, pos)?;
@@ -141,19 +165,20 @@ impl Directory {
             }
             flag => return Err(corrupt(&format!("has_keys byte is {flag}"))),
         };
-        // A group entry is at least 200 bytes (row count plus four empty
-        // segment metas), so a count the payload cannot hold is rejected
-        // before it sizes an allocation.
-        if group_count > bytes.len().saturating_sub(pos) / 200 {
+        // A group entry is at least 208 bytes (row count, edge base, and
+        // four empty segment metas), so a count the payload cannot hold
+        // is rejected before it sizes an allocation.
+        if group_count > bytes.len().saturating_sub(pos) / 208 {
             return Err(corrupt("truncated group entry"));
         }
         let mut groups = Vec::with_capacity(group_count);
         for _ in 0..group_count {
             let rc = bytes
-                .get(pos..pos + 4)
+                .get(pos..pos + 12)
                 .ok_or_else(|| corrupt("truncated group entry"))?;
-            let row_count = u32::from_le_bytes(rc.try_into().unwrap());
-            pos += 4;
+            let row_count = u32::from_le_bytes(rc[..4].try_into().unwrap());
+            let edge_base = u64::from_le_bytes(rc[4..].try_into().unwrap());
+            pos += 12;
             let mut metas = Vec::with_capacity(4);
             for _ in 0..4 {
                 let (meta, next) = SegmentMeta::decode(bytes, pos)?;
@@ -163,6 +188,7 @@ impl Directory {
             let mut it = metas.into_iter();
             groups.push(GroupMeta {
                 row_count,
+                edge_base,
                 fwd: DirectionMeta {
                     offsets: it.next().unwrap(),
                     neighbors: it.next().unwrap(),
@@ -180,6 +206,7 @@ impl Directory {
             node_count,
             edge_count,
             keys,
+            props,
             groups,
         })
     }
@@ -398,11 +425,43 @@ pub(crate) fn build_direction(
     Ok(dirs)
 }
 
+/// The ordinal of each group's first edge: how many of `edges` name a
+/// source in an earlier group. The edges must be sorted, which is the
+/// contract of every caller that builds a direction out of them.
+pub(crate) fn group_bases(node_count: u64, edges: &[(u32, u32)]) -> Vec<u64> {
+    let group_rows = GROUP_ROWS as u64;
+    let group_count = node_count.div_ceil(group_rows).max(1) as usize;
+    let mut bases = Vec::with_capacity(group_count);
+    let mut at = 0usize;
+    for g in 0..group_count as u64 {
+        bases.push(at as u64);
+        let end = (g + 1) * group_rows;
+        at += edges[at..].partition_point(|&(s, _)| u64::from(s) < end);
+    }
+    bases
+}
+
 /// Frees every block of the directory chain at `root` plus all four
-/// segments per group it lists. The blocks recycle at the next
-/// checkpoint per the shadow-publishing rules.
+/// segments per group it lists and the edge property columns it points
+/// at. The blocks recycle at the next checkpoint per the
+/// shadow-publishing rules.
 pub(crate) fn free_directory(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+    free_directory_parts(db, root, true)
+}
+
+/// [`free_directory`] leaving the edge property chain alone, for a
+/// rebuild that hands the same columns to the directory it writes. The
+/// caller owns the root from then on: nothing else names it once the old
+/// directory is gone.
+pub(crate) fn free_directory_keeping_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+    free_directory_parts(db, root, false)
+}
+
+fn free_directory_parts(db: &mut Zu1File, root: BlockPtr, props: bool) -> Result<()> {
     let directory = Directory::decode(&meta::read_chain(db, root)?)?;
+    if props && directory.props != NULL_BLOCK {
+        crate::props::free_props(db, directory.props)?;
+    }
     if let Some(keys) = &directory.keys {
         for seg in [&keys.keys, &keys.rows] {
             for &ptr in &seg.blocks {
@@ -509,12 +568,14 @@ pub fn bulk_load_keyed(
         let first_row = g * GROUP_ROWS as u64;
         (node_count - first_row).min(GROUP_ROWS as u64) as u32
     };
+    let bases = group_bases(node_count, edges);
     let groups = fwd
         .into_iter()
         .zip(bwd)
         .enumerate()
         .map(|(g, (fwd, bwd))| GroupMeta {
             row_count: row_counts(g as u64),
+            edge_base: bases[g],
             fwd,
             bwd,
         })
@@ -525,6 +586,7 @@ pub fn bulk_load_keyed(
         keys: key_by_row
             .map(|keys| write_key_index(db, keys))
             .transpose()?,
+        props: NULL_BLOCK,
         groups,
     };
     let root = meta::write_chain(db, &directory.encode())?;
@@ -862,6 +924,39 @@ impl GraphReader {
     /// Edge probe on the forward direction: does `src` point at `dst`?
     pub fn has_edge(&self, db: &mut Zu1File, src: u64, dst: u64) -> Result<bool> {
         self.has_edge_dir(db, src, dst, Direction::Fwd)
+    }
+
+    /// The row of the edge property columns that `src -> dst` holds,
+    /// and `None` when the edge is not there.
+    ///
+    /// The ordinal is the edge's place in the load order, which the
+    /// forward CSR lays out group after group and list after list, so
+    /// it is the group's base plus the slot the destination sits in.
+    /// Finding that slot is the same search [`Self::has_edge`] runs, at
+    /// the same cost: two offset values and the one neighbor chunk the
+    /// fences admit, whatever the degree. An edge reached forward could
+    /// have its ordinal counted out as the expand walks the list, and
+    /// the vectorized read does exactly that; this is the answer for an
+    /// edge that arrived any other way, a backward expand above all,
+    /// where the slot in the backward array says nothing about the
+    /// forward one.
+    ///
+    /// Edges are unique in a table that stores properties, which
+    /// [`crate::props::store_rel_props`] is what enforces, so the pair
+    /// names one edge and the ordinal is that edge's.
+    pub fn edge_ordinal(&self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>> {
+        let (g, row) = self.locate(src)?;
+        let group = &self.directory.groups[g];
+        let mut offs = Vec::with_capacity(2);
+        read_range(
+            db,
+            &group.fwd.offsets,
+            row as u64,
+            row as u64 + 2,
+            &mut offs,
+        )?;
+        let slot = crate::segment::locate(db, &group.fwd.neighbors, offs[0], offs[1], dst)?;
+        Ok(slot.map(|slot| group.edge_base + slot))
     }
 
     /// Point access to the in-neighbor list.
@@ -1384,12 +1479,59 @@ mod tests {
     }
 
     #[test]
+    fn an_edge_ordinal_is_its_place_in_the_load_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ord.zu1");
+        // Edges over three groups, a hub whose list spans several
+        // chunks, and a tail group, so the ordinal is asked across
+        // every boundary it has.
+        let rows = GROUP_ROWS;
+        let node_count = u64::from(rows) * 2 + 10;
+        let mut edges: Vec<(u32, u32)> = (0..3000).map(|d| (7u32, d * 2)).collect();
+        edges.extend([
+            (0, 1),
+            (rows - 1, 0),
+            (rows, rows + 1),
+            (rows + 5, 3),
+            (2 * rows + 9, 2),
+        ]);
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let reader = GraphReader::load(&mut db).unwrap();
+        // The load order is the sorted edge list, so an edge's ordinal
+        // is its index in it, and every edge has to answer its own.
+        for (want, &(s, d)) in edges.iter().enumerate() {
+            assert_eq!(
+                reader
+                    .edge_ordinal(&mut db, u64::from(s), u64::from(d))
+                    .unwrap(),
+                Some(want as u64),
+                "edge {s}->{d}"
+            );
+        }
+        // An edge that is not there has no ordinal, whether or not its
+        // source has a list at all.
+        for (s, d) in [(7u64, 1u64), (7, 5999), (0, 2), (5, 0), (node_count - 1, 0)] {
+            assert_eq!(
+                reader.edge_ordinal(&mut db, s, d).unwrap(),
+                None,
+                "{s}->{d}"
+            );
+        }
+        assert!(reader.edge_ordinal(&mut db, node_count, 0).is_err());
+    }
+
+    #[test]
     fn hostile_group_count_rejected() {
         // A header claiming u32::MAX groups must die on the size check,
         // not in the allocator.
         let mut bytes = DIRECTORY_VERSION.to_le_bytes().to_vec();
         bytes.extend_from_slice(&10u64.to_le_bytes());
         bytes.extend_from_slice(&20u64.to_le_bytes());
+        bytes.extend_from_slice(&NULL_BLOCK.to_le_bytes());
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         bytes.push(0);
         let err = Directory::decode(&bytes).unwrap_err();

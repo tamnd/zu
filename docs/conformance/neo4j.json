@@ -1,0 +1,23 @@
+{
+  "engine": "neo4j",
+  "version": "Neo4j Kernel 2026.07.1 community, Cypher 5/25, default language CYPHER 25",
+  "tool": "gql-compat devel",
+  "host": "darwin arm64, Apple M4",
+  "taken": "2026-08-14",
+  "selector": "the whole corpus apart from its large fixtures",
+  "cases": 377,
+  "pass": 186,
+  "fail": 138,
+  "skip": 39,
+  "error": 14,
+  "features_passing": 69,
+  "features_touched": 189,
+  "conditions_seen": 9,
+  "by_kind": {
+    "mandatory": {"cases": 70, "pass": 67, "fail": 0, "skip": 3, "error": 0},
+    "optional": {"cases": 201, "pass": 76, "fail": 107, "skip": 5, "error": 13},
+    "condition": {"cases": 66, "pass": 6, "fail": 28, "skip": 31, "error": 1},
+    "grammar": {"cases": 17, "pass": 14, "fail": 3, "skip": 0, "error": 0},
+    "performance": {"cases": 23, "pass": 23, "fail": 0, "skip": 0, "error": 0}
+  }
+}

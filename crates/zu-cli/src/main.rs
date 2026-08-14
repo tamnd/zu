@@ -350,6 +350,14 @@ fn stat(path: &std::path::Path) -> ExitCode {
                         );
                         println!("  colors:        {}", color_line(&stats, t));
                     }
+                    for t in catalog.graph_types() {
+                        println!(
+                            "graph type:      {} ({}, {} element types)",
+                            t.name,
+                            if t.closed { "closed" } else { "open" },
+                            t.elements.len()
+                        );
+                    }
                 }
                 Err(e) => return command_error("stat", &e),
             }

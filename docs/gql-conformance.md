@@ -9,18 +9,18 @@ Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) c
 | | ladybug | neo4j | zu |
 |---|---|---|---|
 | version | Lbug 0.19.1 | Neo4j Kernel 2026.07.1 community, Cypher 5/25, default language CYPHER 25 | zu 0.0.1 |
-| measured | 2026-08-13 | 2026-08-14 | 2026-08-14 |
+| measured | 2026-08-13 | 2026-08-14 | 2026-08-15 |
 | on | darwin arm64, Apple M4 | darwin arm64, Apple M4 | darwin arm64, Apple M4 |
 | harness | gql-compat devel | gql-compat devel | gql-compat devel |
 | corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
 | cases | 377 | 377 | 385 |
-| judged (pass + fail) | 253 | 324 | 251 |
-| **passed** | **72** (28.5%) | **186** (57.4%) | **155** (61.8%) |
-| failed | 181 | 138 | 96 |
+| judged (pass + fail) | 253 | 324 | 252 |
+| **passed** | **72** (28.5%) | **186** (57.4%) | **167** (66.3%) |
+| failed | 181 | 138 | 85 |
 | skipped, cannot hold the fixture | 72 | 39 | 117 |
-| never reached a verdict | 52 | 14 | 17 |
-| ISO features with a passing case | 22 of 189 | 69 of 189 | 78 of 189 |
-| distinct GQLSTATUS values produced | 0 | 9 | 17 |
+| never reached a verdict | 52 | 14 | 16 |
+| ISO features with a passing case | 22 of 189 | 69 of 189 | 88 of 189 |
+| distinct GQLSTATUS values produced | 0 | 9 | 21 |
 
 ## By kind of case
 
@@ -33,10 +33,10 @@ Pass over judged, then the two exclusions. Read the exclusions first. An engine 
 | mandatory | zu | 70 | 20 | 10 | 40 | 0 | 66.7% |
 | optional | ladybug | 201 | 22 | 153 | 5 | 21 | 12.6% |
 | optional | neo4j | 201 | 76 | 107 | 5 | 13 | 41.5% |
-| optional | zu | 208 | 84 | 58 | 50 | 16 | 59.2% |
+| optional | zu | 208 | 91 | 52 | 50 | 15 | 63.6% |
 | condition | ladybug | 66 | 0 | 4 | 62 | 0 | 0.0% |
 | condition | neo4j | 66 | 6 | 28 | 31 | 1 | 17.6% |
-| condition | zu | 67 | 20 | 19 | 27 | 1 | 51.3% |
+| condition | zu | 67 | 25 | 14 | 27 | 1 | 64.1% |
 | grammar | ladybug | 17 | 11 | 4 | 0 | 2 | 73.3% |
 | grammar | neo4j | 17 | 14 | 3 | 0 | 0 | 82.4% |
 | grammar | zu | 17 | 14 | 3 | 0 | 0 | 82.4% |

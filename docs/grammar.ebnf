@@ -1,12 +1,62 @@
 (* zuQL v0 core grammar, frozen per docs/07 §1.
    This file describes exactly what crates/zu-query/src/parser.rs accepts.
    Keywords are case-insensitive and are ordinary identifiers to the lexer;
-   the parser gives them meaning by position. `<-` and `->` are not lexer
-   tokens, so `a < -1` lexes as less-than then minus and the parser
-   assembles pattern arrows from single characters. Changes here require a
+   the parser gives them meaning by position. `<-`, `->` and `=>` are not
+   lexer tokens, so `a < -1` lexes as less-than then minus and the parser
+   assembles every arrow from single characters. Changes here require a
    spec change to docs/07 first. *)
 
+statement       = query | catalog_statement ;
 query           = { reading_clause } , return_clause , [ ";" ] ;
+
+(* Catalog statements (docs/07 §9). They change what the file declares
+   and answer no rows, so they are told apart from a query by their
+   first two words and never reach the binder. *)
+
+catalog_statement = create_graph_type | drop_graph_type ;
+create_graph_type = "CREATE" , [ "OR" , "REPLACE" ] , [ "PROPERTY" ] , "GRAPH" ,
+                    "TYPE" , [ "IF" , "NOT" , "EXISTS" ] , name , [ "AS" ] ,
+                    graph_type_source , [ ";" ] ;
+drop_graph_type = "DROP" , [ "PROPERTY" ] , "GRAPH" , "TYPE" ,
+                  [ "IF" , "EXISTS" ] , name , [ ";" ] ;
+(* PROPERTY is a word the statement may carry and neither reading needs:
+   every graph zu holds is a property graph. OR REPLACE takes a taken
+   name over and IF NOT EXISTS leaves it alone, so a statement saying
+   both says nothing and is refused. *)
+graph_type_source = element_type_list | "LIKE" , name ;
+(* A graph type written out in braces is closed: a list nobody qualified
+   is the whole list. LIKE reads the tables of the one graph a zu1 file
+   holds, not the data. *)
+element_type_list = "{" , [ element_type , { "," , element_type } ] , "}" ;
+element_type    = [ ( "NODE" | "EDGE" | "RELATIONSHIP" ) , "TYPE" , name ] ,
+                  node_type_pattern , [ arc , node_type_pattern ] ;
+(* An element type is the pattern an element of it matches. One pattern
+   is a node type; two with an arc between them are an edge type, and
+   the name written before the first belongs to the edge. *)
+node_type_pattern = "(" , type_body , ")" ;
+arc             = "-" , "[" , type_body , "]" , "-" , [ ">" ]
+                | "<" , "-" , "[" , type_body , "]" , "-" ;
+(* An arc with no arrowhead is an undirected edge type, which is GH02
+   and a property of the type rather than of the pattern. *)
+type_body       = [ name ] , [ ":" , label_set ] ,
+                  [ "=>" , ":" , label_set ] , [ property_types ] ;
+(* The labels before the arrow are the key label set (GG21) and the ones
+   after it are the rest of what the element carries. No arrow declares
+   no key, in which case the whole label set stands in for one (GG22).
+   A written key label set names between 1 and 63 labels, impdef IL003:
+   empty is a type nothing selects and 64 leaves no room in the 64 bit
+   mask a label set is for the label the arrow adds, which is where
+   42012 to 42015 are raised. A body that is a name and nothing else is
+   a reference to an element type declared elsewhere, and a body with a
+   label or a property in it declares one where it stands. *)
+label_set       = name , { "&" , name } ;
+property_types  = "NO" , "PROPERTIES"
+                | [ "PROPERTIES" ] , "{" , [ property_type ,
+                  { "," , property_type } ] , "}" ;
+property_type   = name , ( "::" | "TYPED" ) , value_type ;
+(* A property whose type admits null is one an element may leave out,
+   so NOT NULL is what makes a property mandatory. One rule about null
+   rather than two. *)
 
 reading_clause  = match_clause | unwind_clause | with_clause ;
 
@@ -159,4 +209,7 @@ string          = [ "@" ] , "'" , { character } , "'"
    the parser. *)
 
 (* Reserved but not yet parsed; the parser rejects them by name:
-   CREATE, SET, DELETE, DETACH, MERGE, CALL, FILTER, LET, NEXT. *)
+   CREATE, SET, DELETE, DETACH, MERGE, CALL, FILTER, LET, NEXT.
+   CREATE is a statement only where GRAPH follows it, with OR REPLACE
+   and PROPERTY allowed in between; anywhere else it is still the write
+   nobody has implemented. *)

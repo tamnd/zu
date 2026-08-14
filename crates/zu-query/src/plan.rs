@@ -586,6 +586,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 Func::Id => "id",
                 Func::Size => "size",
                 Func::Cardinality => "cardinality",
+                Func::PathLength => "path_length",
             };
             let inner = if *star {
                 "*".to_string()
@@ -609,6 +610,10 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 .map(|(k, v)| format!("{k}: {}", expr_text(v, query)))
                 .collect();
             format!("{{{}}}", rendered.join(", "))
+        }
+        BoundExpr::Path(elements) => {
+            let rendered: Vec<String> = elements.iter().map(|e| expr_text(e, query)).collect();
+            format!("PATH [{}]", rendered.join(", "))
         }
         BoundExpr::Cast { expr, ty } => format!("CAST({} AS {ty})", expr_text(expr, query)),
     }

@@ -165,6 +165,9 @@ pub enum Expr {
     },
     List(Vec<Expr>),
     Map(Vec<(String, Expr)>),
+    /// `PATH [a, e, b]`, ISO's GE06: a path built out of the elements
+    /// the query names rather than out of a pattern it matched.
+    Path(Vec<Expr>),
     /// `CAST(expr AS type)`, ISO's GA05.
     Cast {
         expr: Box<Expr>,

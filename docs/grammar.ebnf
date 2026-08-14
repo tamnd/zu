@@ -59,7 +59,7 @@ multiplicative  = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
-                | function_call | cast
+                | function_call | cast | path_constructor
                 | "(" , expression , ")" | list | record ;
 
 cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
@@ -90,6 +90,11 @@ list            = "[" , [ expression , { "," , expression } ] , "]" ;
    and a record constructor in an expression. A field name written
    twice is refused rather than resolved. *)
 record          = property_map ;
+(* GE06. PATH is a name until a bracket follows it, the same way DATE is
+   a name until a string does. The elements alternate node and edge with
+   a node at each end, and each edge has to join the two nodes it sits
+   between, which is 22G0Z and a question only the graph answers. *)
+path_constructor = "PATH" , "[" , [ expression , { "," , expression } ] , "]" ;
 
 literal         = "NULL" | "TRUE" | "FALSE" | integer | float | string ;
 (* A temporal literal is a type name and the value written as a string,

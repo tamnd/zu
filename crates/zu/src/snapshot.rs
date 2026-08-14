@@ -355,6 +355,26 @@ impl Snapshot for Zu1Snapshot<'_> {
         Ok(CsrPin { offsets, neighbors })
     }
 
+    fn list_threshold(&mut self, rel: RelId, group: GroupId, dir: Dir) -> Result<usize> {
+        self.ensure_reader(rel)?;
+        let reader = self.readers.get(&rel).expect("just loaded");
+        // Reading one list decodes about four chunks: two on the
+        // offsets to find where the list starts and ends, and one or
+        // two on the neighbors to cover it. The pin decodes every
+        // chunk of the group once, so it starts paying for itself at
+        // roughly a quarter as many lists as the group has chunks,
+        // and a scan morsel is far past that while a seed is far
+        // short of it.
+        Ok(reader.list_chunks(group as usize, direction(dir)) / 4)
+    }
+
+    fn list_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        let reader = readers.get(&rel).expect("just loaded");
+        reader.neighbors_dir_into(db, node, direction(dir), out)
+    }
+
     fn gather(
         &mut self,
         table: TableId,

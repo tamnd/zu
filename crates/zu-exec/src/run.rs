@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
-use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, GroupId, RelId, SCAN_ROWS, Snapshot};
+use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{
     Bitmap, ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector,
     VecEncoding,
@@ -238,8 +238,10 @@ fn seek_work(
     };
     // Weigh the frontier by the next hop when there is one, so a
     // neighbor with a thousand edges counts for a thousand.
-    let list = snap.csr(rel, group_of(seed), dir)?;
-    let list = list.list((seed % u64::from(GROUP_ROWS)) as usize).to_vec();
+    // One list, read as a range: the seed's group holds every edge of
+    // a hundred and thirty thousand nodes and this wants one node's.
+    let mut list = Vec::new();
+    snap.list_into(rel, seed, dir, &mut list)?;
     let mut weight = vec![1u64; list.len()];
     if let Some(&Op::Expand {
         rel: next,
@@ -320,10 +322,6 @@ fn seeks_work(keys: &[u64], options: &Options) -> Schedule {
         morsels,
         threads,
     }
-}
-
-fn group_of(row: u64) -> GroupId {
-    (row / u64::from(GROUP_ROWS)) as GroupId
 }
 
 /// Where one worker leaves what it finished with, empty until it does.
@@ -1182,7 +1180,14 @@ impl<'a> Worker<'a> {
         // direction, around a body whose real work is one slice of the
         // group's neighbor array. One slot per side, since an
         // undirected expand reads two pins that move together.
-        let mut held: [Option<(u32, CsrPin)>; 2] = [None, None];
+        // A pin is `None` where the group turned out to be worth
+        // reading a list at a time instead, which is what a point
+        // seeded walk wants: the pin would decode the whole group's
+        // neighbor array for the dozen edges one seed has, and on a
+        // graph bigger than the decoded pool it would not even hold on
+        // to them until the next request.
+        let mut held: [Option<(u32, Option<CsrPin>)>; 2] = [None, None];
+        let mut point = self.row_pool.pop().unwrap_or_default();
         // The batched descent fills this across source rows and hands
         // it down whole. Nothing above the expand reads the source
         // level in that case, so the pin only has to keep the level's
@@ -1207,8 +1212,8 @@ impl<'a> Worker<'a> {
             self.opt_hit = false;
             let group = (row / u64::from(GROUP_ROWS)) as u32;
             for (slot, dir) in sides(dirs).enumerate() {
-                if held[slot].as_ref().is_none_or(|&(g, _)| g != group) {
-                    match self.pin(rel, dir, row) {
+                if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
+                    match self.hold(rel, dir, row, rows.len()) {
                         Ok(p) => held[slot] = Some((group, p)),
                         Err(e) => {
                             result = Err(e);
@@ -1216,8 +1221,18 @@ impl<'a> Worker<'a> {
                         }
                     }
                 }
-                let pin = &held[slot].as_ref().expect("just pinned").1;
-                let list = pin.list((row % u64::from(GROUP_ROWS)) as usize);
+                let local = (row % u64::from(GROUP_ROWS)) as usize;
+                let list = match &held[slot].as_ref().expect("just held").1 {
+                    Some(pin) => pin.list(local),
+                    None => {
+                        point.clear();
+                        if let Err(e) = self.snap.get().list_into(rel, row, dir, &mut point) {
+                            result = Err(e);
+                            break 'srcs;
+                        }
+                        &point[..]
+                    }
+                };
                 // The close judges the neighbors here, where they are
                 // still a sorted list and nothing has been built for
                 // them. Both lists ascend, so the probe walks forward
@@ -1722,6 +1737,23 @@ impl<'a> Worker<'a> {
         }
         self.keep = keep;
         result
+    }
+
+    /// The pin for a group, or `None` when the caller is better off
+    /// reading its lists one at a time. `wanted` is how many source
+    /// rows the caller holds, and the snapshot says how many it takes
+    /// for the pin to pay: a scan holds a morsel and is always over
+    /// it, a point lookup holds one row and is almost never.
+    fn hold(&mut self, rel: RelId, dir: Dir, row: u64, wanted: usize) -> Result<Option<CsrPin>> {
+        let group = (row / u64::from(GROUP_ROWS)) as u32;
+        let key = (rel, matches!(dir, Dir::Bwd), group);
+        if self.pins.contains_key(&key) {
+            return Ok(Some(self.pins[&key].clone()));
+        }
+        if wanted < self.snap.get().list_threshold(rel, group, dir)? {
+            return Ok(None);
+        }
+        Ok(Some(self.pin(rel, dir, row)?))
     }
 
     fn pin(&mut self, rel: RelId, dir: Dir, row: u64) -> Result<CsrPin> {
@@ -2793,6 +2825,11 @@ mod tests {
         fwd: (Arc<Vec<u64>>, Arc<Vec<u64>>),
         bwd: (Arc<Vec<u64>>, Arc<Vec<u64>>),
         forkable: bool,
+        /// Answers the threshold with something no caller can reach, so
+        /// every list goes the one at a time way a point read does.
+        point: bool,
+        /// Lists served that way, shared with the forks.
+        lists: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Mock {
@@ -2818,7 +2855,20 @@ mod tests {
                 fwd: (Arc::new(fo), Arc::new(fnb)),
                 bwd: (Arc::new(bo), Arc::new(bnb)),
                 forkable,
+                point: false,
+                lists: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
+        }
+
+        /// The same graph read the way storage reads one when a group
+        /// holds far more edges than the caller asked for.
+        fn point(mut self) -> Mock {
+            self.point = true;
+            self
+        }
+
+        fn lists(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn side(&self, dir: Dir) -> &(Arc<Vec<u64>>, Arc<Vec<u64>>) {
@@ -2884,8 +2934,28 @@ mod tests {
 
         fn csr(&mut self, _rel: RelId, group: GroupId, dir: Dir) -> Result<CsrPin> {
             assert_eq!(group, 0, "the mock fits one group");
+            assert!(!self.point, "a point mock pins nothing");
             let (offsets, neighbors) = self.side(dir).clone();
             Ok(CsrPin { offsets, neighbors })
+        }
+
+        fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<usize> {
+            Ok(if self.point { usize::MAX } else { 0 })
+        }
+
+        fn list_into(
+            &mut self,
+            _rel: RelId,
+            node: u64,
+            dir: Dir,
+            out: &mut Vec<u64>,
+        ) -> Result<()> {
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (offsets, neighbors) = self.side(dir);
+            let (lo, hi) = (offsets[node as usize], offsets[node as usize + 1]);
+            out.extend_from_slice(&neighbors[lo as usize..hi as usize]);
+            Ok(())
         }
 
         fn gather(
@@ -3288,6 +3358,44 @@ mod tests {
             got,
             [1, 2, 0, 1].map(Value::Int).to_vec(),
             "forward list lands before the backward list"
+        );
+    }
+
+    /// Reading a list at a time instead of pinning the group around it
+    /// is a storage decision, and the walk above it is not allowed to
+    /// notice: same neighbors, same order. What the point path exists
+    /// for is the case a pin is ruinous at, one seed of a group holding
+    /// millions of edges, and what this checks is that the two agree on
+    /// a graph small enough to hold both answers in one assert.
+    #[test]
+    fn a_point_read_hands_down_what_a_pinned_group_does() {
+        let shape = plan(
+            vec![bare_level(), bare_level()],
+            vec![Op::Expand {
+                rel: 0,
+                dirs: Dirs::Both,
+                from: 0,
+                to: 1,
+                batch: false,
+                close: None,
+            }],
+            SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 1 }],
+                post: Vec::new(),
+            },
+            &["m"],
+        );
+        let mut pinned = Mock::new(64, |i| i as i64, false);
+        let mut point = Mock::new(64, |i| i as i64, false).point();
+        let a = run(&shape, &mut pinned, &seq()).unwrap().0;
+        let b = run(&shape, &mut point, &seq()).unwrap().0;
+        assert_eq!(a.rows.len(), 126, "63 forward neighbors and 63 backward");
+        assert_eq!(b.rows, a.rows, "the point path walked a different graph");
+        assert_eq!(pinned.lists(), 0, "a pinned group serves its own lists");
+        assert_eq!(
+            point.lists(),
+            128,
+            "one read per source row per direction, empty lists included"
         );
     }
 

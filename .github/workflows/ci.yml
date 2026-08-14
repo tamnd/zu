@@ -136,6 +136,20 @@ jobs:
       # machine, which is why it can gate on a shared runner at all.
       - run: ZU_GATE=1 cargo bench -p zu --bench refuse
 
+  tail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The perf/05 tail gate: the p99 of a point seeded read against
+      # the p50 of the same stream, on uniform data and on power law
+      # data. Builds both graphs itself, half a million people and
+      # eight million edges each, in a few seconds. Like the two gates
+      # above it enforces a ratio between numbers timed in one run on
+      # one machine, so a shared runner cannot move it.
+      - run: ZU_GATE=1 cargo bench -p zu --bench tail
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

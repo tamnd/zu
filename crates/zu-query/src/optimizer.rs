@@ -1538,6 +1538,7 @@ fn expr_slots(expr: &BoundExpr, out: &mut HashSet<usize>) {
             expr_slots(rhs, out);
         }
         BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
+        BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
         BoundExpr::Call { args, .. } => {
             for arg in args {
                 expr_slots(arg, out);

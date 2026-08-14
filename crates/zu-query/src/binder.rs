@@ -709,6 +709,14 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         negated: bool,
     },
+    /// `expr IS TYPED type`. The target keeps its lattice type for the
+    /// same reason a cast's does: the width, the declared digits and
+    /// the nullability are exactly what the predicate reads.
+    IsTyped {
+        expr: Box<BoundExpr>,
+        ty: LogicalType,
+        negated: bool,
+    },
     Call {
         func: Func,
         distinct: bool,
@@ -1448,6 +1456,17 @@ impl Binder<'_> {
                     Type::Bool,
                 ))
             }
+            Expr::IsTyped { expr, ty, negated } => {
+                let (bound, _) = self.bind_expr(expr, ctx)?;
+                Ok((
+                    BoundExpr::IsTyped {
+                        expr: Box::new(bound),
+                        ty: ty.clone(),
+                        negated: *negated,
+                    },
+                    Type::Bool,
+                ))
+            }
             Expr::Call {
                 name,
                 distinct,
@@ -1673,6 +1692,10 @@ pub fn text(expr: &Expr) -> String {
             } else {
                 format!("{} IS NULL", text(expr))
             }
+        }
+        Expr::IsTyped { expr, ty, negated } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}TYPED {ty}", text(expr))
         }
         Expr::Call {
             name,

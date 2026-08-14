@@ -565,6 +565,10 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 format!("{} IS NULL", expr_text(expr, query))
             }
         }
+        BoundExpr::IsTyped { expr, ty, negated } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}TYPED {ty}", expr_text(expr, query))
+        }
         BoundExpr::Call {
             func,
             distinct,

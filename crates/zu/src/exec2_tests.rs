@@ -124,6 +124,29 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (p:person) WHERE p.age > 50 RETURN count(p) AS n",
         "MATCH (p:person) WHERE p.age > 50 AND p.score > 600 RETURN count(p) AS n",
         "MATCH (p:person) WHERE p.age = 999 RETURN count(p) AS n",
+        // An integer column against a float constant. The two operands
+        // have one static type each and neither is the other's, and the
+        // compiler moves the bound into the column's type rather than
+        // handing the query to an engine that reads a tag per value.
+        // The fixture holds every age from 0 to 99, so a bound between
+        // two of them and a bound on one of them are different rows and
+        // the closed side of the operator is what decides.
+        "MATCH (p:person) WHERE p.age > 30.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age >= 30.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age < 30.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age <= 30.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age > 30.0 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age <= 30.0 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age = 30.0 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age = 30.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age <> 30.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age > -0.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age < -0.5 RETURN count(p) AS n",
+        // The constant on the left is the same predicate written the
+        // other way round, and a fraction against a string column is
+        // neither and stays with the old engine.
+        "MATCH (p:person) WHERE 30.5 < p.age RETURN count(p) AS n",
+        "MATCH (p:person) WHERE 30.5 >= p.age AND p.score > 600 RETURN count(p) AS n",
         // Row sinks, including strings, nodes, and dense ids.
         "MATCH (p:person) WHERE p.score = 300 RETURN p.name AS name, p.age AS age",
         "MATCH (p:person) WHERE p.age = 7 RETURN p AS node, p.id AS id",
@@ -639,6 +662,16 @@ fn unclaimed_shapes_fall_back() {
         "CALL sssp('knows', 1) YIELD node, distance RETURN DISTINCT distance AS d",
         "CALL sssp('knows', 1) YIELD node, distance RETURN node.id AS id, distance \
          ORDER BY distance LIMIT 5",
+        // A bound above 2^53 is where an integer stops converting to a
+        // float without losing a digit, so the two domains stop
+        // agreeing and the rewrite that moves the bound into the
+        // column's type is refused rather than made approximate.
+        "MATCH (p:person) WHERE p.age < 1e300 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.age > 9007199254740993.0 RETURN count(p) AS n",
+        // A string column against a number is not a pair of types any
+        // kernel compares. The old engine answers it from the type
+        // precedence, which is where an answer of that kind belongs.
+        "MATCH (p:person) WHERE p.name < 1.5 RETURN count(p) AS n",
         // Two patterns nothing ties together is a cross product, and
         // this pipeline would have to read a whole table into a join
         // to answer what the old engine's nested loop already does.
@@ -685,6 +718,101 @@ fn unclaimed_shapes_fall_back() {
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);
     }
+}
+
+/// Chunks the scan never decoded, which is what the zone map bought
+/// this query.
+fn zone_skipped(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
+    let (query, plan, _) = query::compile(source, schema).unwrap();
+    let options = Options {
+        threads: 1,
+        ..Options::default()
+    };
+    let mut snap = Zu1Snapshot::new(db, catalog.clone());
+    let run =
+        zu_exec::try_execute_profiled(&plan, &query, schema, &mut snap, &[], &options).unwrap();
+    run.unwrap_or_else(|| panic!("the pipeline should run: {source}"))
+        .1
+        .zone_skipped
+}
+
+/// The score column climbs with the row, so a lower bound on it rules
+/// out whole chunks before anything is decoded. A bound written as a
+/// float rules out the same ones: it narrows to an integer bound in
+/// the compiler, and the zone map is asked the question the narrowed
+/// bound asks. Without that, spelling a bound `6000.5` instead of
+/// `6000` would quietly read the whole table.
+#[test]
+fn a_float_bound_skips_the_chunks_its_integer_bound_skips() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, catalog, schema) = setup(&dir.path().join("zone.zu1"));
+    let want = zone_skipped(
+        &mut db,
+        &catalog,
+        &schema,
+        "MATCH (p:person) WHERE p.score > 6000 RETURN count(p) AS n",
+    );
+    assert!(want > 0, "the bound rules out chunks of an ordered column");
+    for source in [
+        "MATCH (p:person) WHERE p.score > 6000.0 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.score > 6000.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.score >= 6000.5 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE 6000.5 < p.score RETURN count(p) AS n",
+    ] {
+        assert_eq!(
+            zone_skipped(&mut db, &catalog, &schema, source),
+            want,
+            "{source}"
+        );
+    }
+}
+
+/// Chunks the scan decoded and then took rows out of.
+fn zone_thinned(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
+    let (query, plan, _) = query::compile(source, schema).unwrap();
+    let options = Options {
+        threads: 1,
+        ..Options::default()
+    };
+    let mut snap = Zu1Snapshot::new(db, catalog.clone());
+    let run =
+        zu_exec::try_execute_profiled(&plan, &query, schema, &mut snap, &[], &options).unwrap();
+    run.unwrap_or_else(|| panic!("the pipeline should run: {source}"))
+        .1
+        .zone_thinned
+}
+
+/// A chunk the zone map could not rule out is handed on whole unless
+/// the bound takes most of it away. Everything above a thinned chunk
+/// reads its rows through a selection instead of straight down the
+/// vector, and the predicate is still in the program either way, so
+/// thinning a chunk that keeps nearly all of its rows costs a pass and
+/// saves nothing.
+#[test]
+fn a_chunk_is_thinned_only_when_the_bound_takes_most_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, catalog, schema) = setup(&dir.path().join("thin.zu1"));
+    // Ages cycle through a hundred values in every chunk, so no chunk
+    // is ruled out and the bound decides on its own.
+    assert_eq!(
+        zone_thinned(
+            &mut db,
+            &catalog,
+            &schema,
+            "MATCH (p:person) WHERE p.age > 10 RETURN count(p) AS n",
+        ),
+        0,
+        "a bound nine rows in ten pass is not worth a selection"
+    );
+    assert!(
+        zone_thinned(
+            &mut db,
+            &catalog,
+            &schema,
+            "MATCH (p:person) WHERE p.age > 90 RETURN count(p) AS n",
+        ) > 0,
+        "a bound one row in ten passes is"
+    );
 }
 
 #[test]

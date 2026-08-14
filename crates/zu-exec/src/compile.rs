@@ -2581,15 +2581,20 @@ impl Compiler<'_> {
             return Ok(None);
         };
         if let Some(cmp) = cmp_op(*op) {
+            if let Some(dst) = self.narrowed_reg(b, *op, lhs, rhs, level)? {
+                return Ok(Some(dst));
+            }
             let Some(l) = self.value_reg(b, lhs, level, true)? else {
                 return Ok(None);
             };
             let Some(r) = self.value_reg(b, rhs, level, true)? else {
                 return Ok(None);
             };
-            // The kernels compare within one physical type; mixed
-            // int/float and mistyped compares keep old-engine
-            // semantics by falling back.
+            // The kernels compare within one physical type, and the one
+            // pair of types a query writes on purpose has been moved
+            // into a single type above, so what is left here is a
+            // mistyped compare and it keeps old-engine semantics by
+            // falling back.
             if b.types[l as usize] != b.types[r as usize] {
                 return Ok(None);
             }
@@ -2616,6 +2621,52 @@ impl Compiler<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// An integer column against a float constant, compiled as one
+    /// integer comparison, or `None` when the predicate is not that
+    /// shape.
+    ///
+    /// This is the only pair of physical types a query writes on
+    /// purpose: `p.age > 30.5` reads a stored integer and compares it
+    /// with a literal the lexer had to make a float. The kernels
+    /// compare within one type, so before this the whole query went
+    /// back to the old engine, which reads the tag of every value of
+    /// every row to find out that one side is an integer and the other
+    /// is not. The types are known at compile time, so the constant is
+    /// moved into the column's type here and the comparison runs in the
+    /// monomorphic integer kernel.
+    fn narrowed_reg(
+        &mut self,
+        b: &mut ProgBuilder,
+        op: BinaryOp,
+        lhs: &BoundExpr,
+        rhs: &BoundExpr,
+        level: usize,
+    ) -> Result<Option<Reg>> {
+        // The constant may be written on either side, and a flipped
+        // operator is what makes the two spellings one shape.
+        let (col_expr, c, op) = match (self.const_float(lhs), self.const_float(rhs)) {
+            (None, Some(c)) => (lhs, c, op),
+            (Some(c), None) => match flip_cmp(op) {
+                Some(op) => (rhs, c, op),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Some((cmp, k)) = narrow_float(op, c) else {
+            return Ok(None);
+        };
+        let Some(l) = self.value_reg(b, col_expr, level, true)? else {
+            return Ok(None);
+        };
+        if b.types[l as usize] != PhysType::Int64 {
+            return Ok(None);
+        }
+        let r = b.push_const(OwnedValue::Int(k))?;
+        let dst = b.push_type(PhysType::Bool)?;
+        b.ops.push(ExprOp::Compare { op: cmp, l, r, dst });
+        Ok(Some(dst))
     }
 
     /// One operand of a predicate, compiled into a register.
@@ -2709,6 +2760,11 @@ impl Compiler<'_> {
     /// their flipped forms) are sound here: the zones compare unsigned,
     /// so an upper bound could skip chunks whose matches are stored as
     /// negative values. The residual program still runs either way.
+    ///
+    /// A bound written as a float narrows to an integer bound first, so
+    /// `age > 30.5` skips the chunks `age > 30` skips. Which chunks a
+    /// query reads is then a question about the bound rather than about
+    /// how the bound was spelled.
     fn zone_pred(&mut self, expr: &BoundExpr) -> Result<Option<ZonePred>> {
         let BoundExpr::Binary { op, lhs, rhs } = expr else {
             return Ok(None);
@@ -2719,18 +2775,11 @@ impl Compiler<'_> {
             }
             return self.zone_pred(rhs);
         }
-        let (col_expr, const_expr, op) = if self.const_int(rhs).is_some() {
-            (lhs, rhs, *op)
-        } else if self.const_int(lhs).is_some() {
-            let Some(flipped) = flip_cmp(*op) else {
-                return Ok(None);
-            };
-            (rhs, lhs, flipped)
-        } else {
-            return Ok(None);
-        };
-        let Some(c) = self.const_int(const_expr) else {
-            return Ok(None);
+        let flipped = flip_cmp(*op).and_then(|f| self.const_bound(f, lhs));
+        let (col_expr, cmp, c) = match (self.const_bound(*op, rhs), flipped) {
+            (Some((cmp, c)), _) => (lhs, cmp, c),
+            (None, Some((cmp, c))) => (rhs, cmp, c),
+            (None, None) => return Ok(None),
         };
         if c < 0 {
             return Ok(None);
@@ -2754,16 +2803,26 @@ impl Compiler<'_> {
             unreachable!("a property registers as a stored column");
         };
         let c = c as u64;
-        let (lo, hi) = match op {
-            BinaryOp::Eq => (c, c),
-            BinaryOp::Ge => (c, u64::MAX),
-            BinaryOp::Gt => match c.checked_add(1) {
+        let (lo, hi) = match cmp {
+            CmpOp::Eq => (c, c),
+            CmpOp::Ge => (c, u64::MAX),
+            CmpOp::Gt => match c.checked_add(1) {
                 Some(lo) => (lo, u64::MAX),
                 None => return Ok(None),
             },
             _ => return Ok(None),
         };
         Ok(Some(ZonePred { col, lo, hi }))
+    }
+
+    /// The integer bound `expr` stands for on the right of `op`, read
+    /// off an integer constant or off a float constant that narrows to
+    /// one, and `None` when `expr` is not a constant the zones can use.
+    fn const_bound(&self, op: BinaryOp, expr: &BoundExpr) -> Option<(CmpOp, i64)> {
+        match self.const_int(expr) {
+            Some(c) => cmp_op(op).map(|cmp| (cmp, c)),
+            None => narrow_float(op, self.const_float(expr)?),
+        }
     }
 
     fn const_int(&self, expr: &BoundExpr) -> Option<i64> {
@@ -2776,6 +2835,58 @@ impl Compiler<'_> {
             _ => None,
         }
     }
+
+    /// A float the query wrote or bound, whichever way it wrote it.
+    fn const_float(&self, expr: &BoundExpr) -> Option<f64> {
+        match expr {
+            BoundExpr::Literal(Literal::Float(f)) => Some(*f),
+            BoundExpr::Param(ix) => match self.params.get(*ix) {
+                Some(Value::Float(f)) => Some(*f),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// `x op c` over an integer `x` and a float `c`, rewritten as a
+/// comparison against an integer.
+///
+/// A float that is not a whole number falls between two integers, so
+/// the bound moves to the integer on the closed side and the operator
+/// closes with it: `x > 30.5` is `x > 30` and `x < 30.5` is `x <= 30`.
+/// A whole number keeps both the bound and the operator. Equality
+/// against a fraction holds for no integer and its negation holds for
+/// every one, and `i64::MIN` is the bound that says so without a
+/// second kind of op: nothing is below it and everything is at or
+/// above it.
+///
+/// The rewrite is refused above 2^53, which is where the two domains
+/// stop agreeing. Under it every integer the comparison can meet
+/// converts to a float without losing a digit, so the integer answer
+/// and the float answer are the same answer; over it they are not, and
+/// an engine that quietly gave a different one here than the row
+/// engine gives would have made this an optimization with a result.
+fn narrow_float(op: BinaryOp, c: f64) -> Option<(CmpOp, i64)> {
+    const EXACT: f64 = (1u64 << 53) as f64;
+    // A NaN is refused with them: it is not a bound at all, and every
+    // comparison against it is false, which is an answer the kernel
+    // has no integer to give.
+    if c.is_nan() || c.abs() >= EXACT {
+        return None;
+    }
+    let floor = c.floor();
+    let k = floor as i64;
+    if c == floor {
+        return cmp_op(op).map(|cmp| (cmp, k));
+    }
+    Some(match op {
+        BinaryOp::Lt | BinaryOp::Le => (CmpOp::Le, k),
+        BinaryOp::Gt | BinaryOp::Ge => (CmpOp::Gt, k),
+        BinaryOp::Eq => (CmpOp::Lt, i64::MIN),
+        BinaryOp::Ne => (CmpOp::Ge, i64::MIN),
+        _ => return None,
+    })
 }
 
 /// Register and type bookkeeping for one program build.
@@ -2964,6 +3075,55 @@ fn expand_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every integer the rewritten predicate answers the same way the
+    /// float one does, which is the whole claim the rewrite makes.
+    #[test]
+    fn a_float_bound_moves_into_the_integer_domain_without_moving_the_answer() {
+        let ops = [
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+        ];
+        for c in [30.5, 30.0, -0.5, -30.5, 0.0, -1.0, 1e15, 8.5e15] {
+            for op in ops {
+                let (cmp, k) = narrow_float(op, c).unwrap_or_else(|| panic!("{op:?} {c}"));
+                for x in [-31i64, -1, 0, 30, 31, 1_000_000_000_000_000] {
+                    let float_answer = match op {
+                        BinaryOp::Lt => (x as f64) < c,
+                        BinaryOp::Le => (x as f64) <= c,
+                        BinaryOp::Gt => (x as f64) > c,
+                        BinaryOp::Ge => (x as f64) >= c,
+                        BinaryOp::Eq => (x as f64) == c,
+                        BinaryOp::Ne => (x as f64) != c,
+                        _ => unreachable!("the list above is comparisons"),
+                    };
+                    assert_eq!(cmp.holds(x, k), float_answer, "{x} {op:?} {c}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_the_two_domains_disagree_about_is_refused() {
+        // 2^53 and up, where an integer stops surviving the conversion,
+        // and the two values that are not bounds at all.
+        for c in [
+            9.007199254740992e15,
+            -9.007199254740992e15,
+            1e300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ] {
+            assert!(narrow_float(BinaryOp::Lt, c).is_none(), "{c}");
+        }
+        // Not a comparison, so there is nothing to move.
+        assert!(narrow_float(BinaryOp::Add, 1.5).is_none());
+    }
 
     fn hop(from: usize, to: usize) -> Op {
         Op::Expand {

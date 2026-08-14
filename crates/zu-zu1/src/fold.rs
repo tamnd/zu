@@ -143,10 +143,10 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
         let node = catalog.node_by_id(table).ok_or_else(|| {
             ZuError::InvalidArgument(format!("overlay names unknown node table {table}"))
         })?;
-        let (name, base) = (node.name.clone(), node.node_count);
+        let (name, base, primary) = (node.name.clone(), node.node_count, node.primary_label());
         let appended = mvcc.appended_rows(table, epoch);
         if appended > 0 || mvcc.has_updates(table, epoch) {
-            changed |= fold_props(db, mvcc, &mut index, table, base, epoch)?;
+            changed |= fold_props(db, mvcc, &mut index, table, primary, base, epoch)?;
         }
         if appended > 0 {
             catalog.upsert_node(&name, base + appended)?;
@@ -204,6 +204,7 @@ fn fold_props(
     mvcc: &Mvcc,
     index: &mut TableIndex,
     table: u32,
+    primary: u16,
     base: u64,
     epoch: Epoch,
 ) -> Result<bool> {
@@ -297,10 +298,24 @@ fn fold_props(
             validity: None,
         });
     }
+    // The label bitset grows with the row domain, and an appended row
+    // carries the table's own label and nothing else: nothing in an
+    // overlay says otherwise yet, and a row of a table is what that
+    // table is called.
+    let labels = match &dir.labels {
+        None => None,
+        Some(meta) => {
+            let mut words = Vec::with_capacity(new_count as usize);
+            read_segment(db, meta, &mut words)?;
+            words.resize(new_count as usize, 1u64 << primary);
+            Some(write_segment(db, &words)?)
+        }
+    };
     free_props(db, root)?;
     let new_dir = PropsDirectory {
         node_count: new_count,
         columns,
+        labels,
     };
     index.set(table, meta::write_chain(db, &new_dir.encode())?);
     Ok(true)
@@ -557,6 +572,33 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let path = dir.path().join("fold.zu1");
+        drop(f);
+        crate::verify(&path).unwrap();
+    }
+
+    /// An appended row carries the table's own label and nothing else,
+    /// which is what the insert said, and the rows that were already
+    /// there keep the labels they had.
+    #[test]
+    fn labels_grow_with_the_row_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        crate::props::store_labels(
+            &mut f.db,
+            "person",
+            &[vec!["Bot"], vec![], vec!["Bot", "Admin"], vec![]],
+        )
+        .unwrap();
+        checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap();
+        let directory = load_props(&mut f.db, f.person).unwrap().unwrap();
+        assert_eq!(directory.node_count, 6);
+        let mut reader = PropsReader::new(directory);
+        let words: Vec<u64> = (0..6)
+            .map(|row| reader.label_word(&mut f.db, row).unwrap().unwrap())
+            .collect();
+        assert_eq!(words, [0b011, 0b001, 0b111, 0b001, 0b001, 0b001]);
+        assert_eq!(read_age(&mut f.db, f.person, 5), 60);
         let path = dir.path().join("fold.zu1");
         drop(f);
         crate::verify(&path).unwrap();

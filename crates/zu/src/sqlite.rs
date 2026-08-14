@@ -37,6 +37,10 @@ pub fn schema_of(store: &SqliteStore) -> Result<Schema> {
                 id: table.id,
                 name: table.name.clone(),
                 node_count: store.node_count(&table.name)? as u64,
+                // The sqlite store has no label dictionary, so a table
+                // name is the whole of what its rows carry and
+                // `Schema::new` fills that in.
+                labels: Vec::new(),
             }),
             "rel" => {
                 let endpoint = |end: &Option<String>| {

@@ -909,6 +909,61 @@ fn an_edge_property_falls_back_and_still_answers() {
     assert_eq!(r.rows, [[Value::Int(late)]]);
 }
 
+/// A label bit is not a column, so the pipeline compiler has nothing
+/// to read it with and hands the query back. The row engine answers
+/// it, and a pattern whose labels the narrowing settled stays on the
+/// pipeline because it plants no predicate at all.
+#[test]
+fn a_secondary_label_falls_back_and_still_answers() {
+    use crate::zu1::props::store_labels;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("labels.zu1");
+    let mut db = Zu1File::create(&path).unwrap();
+    let n = N as u32;
+    let mut edges: Vec<(u32, u32)> = (0..n).map(|i| (i, (i * 7 + 3) % n)).collect();
+    edges.sort_unstable();
+    edges.dedup();
+    bulk_load_keyed(&mut db, "person", "knows", N, &edges, None).unwrap();
+    let age: Vec<u64> = (0..N).map(|i| (i * 37) % 100).collect();
+    store_props(&mut db, "person", &[("age", PropValues::Int(&age))]).unwrap();
+    let rows: Vec<Vec<&str>> = (0..N)
+        .map(|i| match i % 3 {
+            0 => vec!["Employee"],
+            1 => vec!["Employee", "Manager"],
+            _ => vec![],
+        })
+        .collect();
+    store_labels(&mut db, "person", &rows).unwrap();
+    drop(db);
+
+    let mut db = Zu1File::open(&path).unwrap();
+    let (catalog, schema) = query::load_schema(&mut db).unwrap();
+    falls_back(
+        &mut db,
+        &catalog,
+        &schema,
+        "MATCH (p:Employee) RETURN count(p) AS n",
+    );
+    let covered = "MATCH (p:person) WHERE p.age > 50 RETURN count(p) AS n";
+    let (new, old) = run_both(&mut db, &catalog, &schema, covered, 1, Sip::On);
+    assert!(new.is_some(), "a table label plants no predicate");
+    assert_eq!(new.unwrap().rows, old.rows);
+
+    let employees = rows.iter().filter(|r| r.contains(&"Employee")).count() as i64;
+    let managers = rows.iter().filter(|r| r.contains(&"Manager")).count() as i64;
+    assert!(managers > 0 && employees > managers);
+    let r = query::run("MATCH (p:Employee) RETURN count(p) AS n", &mut db, &[]).unwrap();
+    assert_eq!(r.rows, [[Value::Int(employees)]]);
+    let r = query::run(
+        "MATCH (p:Employee:Manager) RETURN count(p) AS n",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Int(managers)]]);
+}
+
 #[test]
 #[ignore = "scratch"]
 fn dump_plans() {

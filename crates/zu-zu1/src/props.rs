@@ -53,8 +53,10 @@ use crate::stats;
 /// the first thing a column entry carries that is not about what the
 /// column holds but about which rows of it hold anything. Older
 /// directories are still read, because a file written before this is
-/// not wrong, it is just narrow.
-const PROPS_VERSION: u16 = 4;
+/// not wrong, it is just narrow. Version 5 adds the label bitset, the
+/// second thing after validity that is about the rows rather than about
+/// what a column holds.
+const PROPS_VERSION: u16 = 5;
 const MAX_NAME_LEN: usize = 256;
 
 /// The code a list column is written under, followed on disk by the
@@ -279,6 +281,18 @@ fn lane_type(ty: &LogicalType) -> bool {
 pub struct PropsDirectory {
     pub node_count: u64,
     pub columns: Vec<PropColumn>,
+    /// The label bitset, one word per row, bit `i` set where the row
+    /// carries dictionary label `i`. `None` is a table whose rows carry
+    /// its name and nothing else, which is every table until something
+    /// declares a second label, and reading one costs nothing because
+    /// there is nothing to read.
+    ///
+    /// It rides here rather than in `columns` because it is not a
+    /// property: no query names it, no schema declares it, and its
+    /// meaning is fixed by the catalog's dictionary rather than by a
+    /// column type. Physically it is a column like any other, one lane
+    /// segment over the table's row domain.
+    pub labels: Option<SegmentMeta>,
 }
 
 /// Row-ordered values for one column at store time.
@@ -556,6 +570,13 @@ impl PropsDirectory {
                 None => out.push(0),
             }
         }
+        match &self.labels {
+            Some(meta) => {
+                out.push(1);
+                meta.encode(&mut out);
+            }
+            None => out.push(0),
+        }
         out
     }
 
@@ -653,18 +674,57 @@ impl PropsDirectory {
                 validity,
             });
         }
+        // A directory older than version 5 has no label bitset, which
+        // is a table whose rows carry its name and nothing else.
+        let labels = if version >= 5 {
+            match bytes.get(pos) {
+                Some(0) => {
+                    pos += 1;
+                    None
+                }
+                Some(1) => {
+                    let (meta, next) = SegmentMeta::decode(bytes, pos + 1)?;
+                    pos = next;
+                    Some(meta)
+                }
+                Some(other) => {
+                    return Err(corrupt(format!("label flag {other} is not 0 or 1")));
+                }
+                None => return Err(corrupt("truncated label flag".into())),
+            }
+        } else {
+            None
+        };
         if pos != bytes.len() {
             return Err(corrupt("trailing bytes".into()));
         }
         Ok(Self {
             node_count,
             columns,
+            labels,
         })
     }
 }
 
 pub(crate) fn free_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+    free_props_parts(db, root, true)
+}
+
+/// Frees everything a props chain owns apart from the label bitset,
+/// which the caller is carrying into the directory that replaces this
+/// one. Storing a property column has nothing to say about which labels
+/// a row holds, so it leaves that segment where it is.
+pub(crate) fn free_props_keeping_labels(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
+    free_props_parts(db, root, false)
+}
+
+fn free_props_parts(db: &mut Zu1File, root: BlockPtr, labels: bool) -> Result<()> {
     let directory = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
+    if labels {
+        for &ptr in directory.labels.iter().flat_map(|m| &m.blocks) {
+            db.free_block(ptr)?;
+        }
+    }
     for col in &directory.columns {
         for &ptr in &col.meta.blocks {
             db.free_block(ptr)?;
@@ -755,11 +815,16 @@ pub fn store_props_nullable(
     let (table_id, node_count) = (table.id, table.node_count);
     check_columns(node_count, columns)?;
     let mut index = TableIndex::load(db)?;
+    // Which labels a row carries is not the business of a property
+    // store, so the bitset moves to the new directory rather than being
+    // rewritten or dropped.
+    let mut labels = None;
     if let Some(root) = index.get(table_id) {
-        free_props(db, root)?;
+        labels = load_props_at(db, root)?.labels;
+        free_props_keeping_labels(db, root)?;
         index.remove(table_id);
     }
-    let (root, directory, col_stats) = write_props(db, node_count, columns)?;
+    let (root, directory, col_stats) = write_props(db, node_count, columns, labels)?;
     index.set(table_id, root);
     crate::graph::free_chain(db, db.db_header().table_index_root)?;
     let index_root = meta::write_chain(db, &index.encode())?;
@@ -811,6 +876,7 @@ fn write_props(
     db: &mut Zu1File,
     rows: u64,
     columns: &[PropInput],
+    labels: Option<SegmentMeta>,
 ) -> Result<(BlockPtr, PropsDirectory, BTreeMap<String, stats::ColStats>)> {
     let node_count = rows;
     let mut cols = Vec::with_capacity(columns.len());
@@ -889,6 +955,7 @@ fn write_props(
     let directory = PropsDirectory {
         node_count,
         columns: cols,
+        labels,
     };
     let root = meta::write_chain(db, &directory.encode())?;
     Ok((root, directory, col_stats))
@@ -940,7 +1007,7 @@ pub fn store_rel_props_nullable(
     if directory.props != crate::file::NULL_BLOCK {
         free_props(db, directory.props)?;
     }
-    let (props_root, stored, col_stats) = write_props(db, edge_count, columns)?;
+    let (props_root, stored, col_stats) = write_props(db, edge_count, columns, None)?;
     directory.props = props_root;
     crate::graph::free_chain(db, root)?;
     index.set(rel_id, meta::write_chain(db, &directory.encode())?);
@@ -955,6 +1022,73 @@ pub fn store_rel_props_nullable(
 
     db.checkpoint()?;
     Ok(stored)
+}
+
+/// Stores the label bitset of a node table, replacing any earlier one,
+/// and declares in the catalog every label a row of it carries.
+///
+/// Word `i` is row `i` of the table and bit `l` of it says the row
+/// carries dictionary label `l`. The table's own label is set on every
+/// row whether the caller sets it or not: a row of a table is what that
+/// table is called, and a bitset that said otherwise would answer a
+/// pattern differently from the catalog.
+///
+/// Declaring is the point of the catalog half. A table that never
+/// declares a label cannot hold a row with it, so a pattern naming that
+/// label prunes the table at plan time rather than reading a word per
+/// row to find out.
+pub fn store_labels<S: AsRef<str>>(
+    db: &mut Zu1File,
+    node_table: &str,
+    rows: &[Vec<S>],
+) -> Result<()> {
+    let mut catalog = Catalog::load(db)?;
+    let table = catalog
+        .node_by_name(node_table)
+        .ok_or_else(|| ZuError::InvalidArgument(format!("no node table '{node_table}'")))?;
+    let (table_id, node_count, primary) = (table.id, table.node_count, table.primary_label());
+    if rows.len() as u64 != node_count {
+        return Err(ZuError::InvalidArgument(format!(
+            "node table '{node_table}' holds {node_count} rows and the label set holds {}",
+            rows.len()
+        )));
+    }
+    let mut words = Vec::with_capacity(rows.len());
+    for labels in rows {
+        let mut word = 1u64 << primary;
+        for label in labels {
+            word |= 1 << catalog.declare_label(table_id, label.as_ref())?;
+        }
+        words.push(word);
+    }
+
+    let mut index = TableIndex::load(db)?;
+    let mut directory = match index.get(table_id) {
+        Some(root) => {
+            let directory = load_props_at(db, root)?;
+            for &ptr in directory.labels.iter().flat_map(|m| &m.blocks) {
+                db.free_block(ptr)?;
+            }
+            crate::graph::free_chain(db, root)?;
+            index.remove(table_id);
+            directory
+        }
+        None => PropsDirectory {
+            node_count,
+            columns: Vec::new(),
+            labels: None,
+        },
+    };
+    directory.labels = Some(write_segment(db, &words)?);
+    index.set(table_id, meta::write_chain(db, &directory.encode())?);
+    crate::graph::free_chain(db, db.db_header().table_index_root)?;
+    let index_root = meta::write_chain(db, &index.encode())?;
+    db.db_header_mut().table_index_root = index_root;
+    crate::graph::free_chain(db, db.db_header().catalog_root)?;
+    let catalog_root = meta::write_chain(db, &catalog.encode())?;
+    db.db_header_mut().catalog_root = catalog_root;
+    db.checkpoint()?;
+    Ok(())
 }
 
 /// Errors when any node lists a destination twice.
@@ -1043,6 +1177,9 @@ pub struct PropsReader {
     /// first because most columns have no validity segment and the ones
     /// that do are read through a different index, a word per 64 rows.
     valid_state: BTreeMap<usize, (Arc<ChunkDirectory>, ChunkCache)>,
+    /// The same again for the label bitset, which is one word per row
+    /// rather than one per 64 and belongs to no column.
+    label_state: Option<(Arc<ChunkDirectory>, ChunkCache)>,
     /// Row order scratch for the gathers, reused across calls.
     order_scratch: Vec<u32>,
 }
@@ -1054,6 +1191,7 @@ impl PropsReader {
             int_state: BTreeMap::new(),
             str_state: BTreeMap::new(),
             valid_state: BTreeMap::new(),
+            label_state: None,
             order_scratch: Vec::new(),
         }
     }
@@ -1075,6 +1213,29 @@ impl PropsReader {
         let (dir, cache) = self.valid_state.get_mut(&col).expect("just inserted");
         let word = read_one_cached(db, &meta, dir, cache, row / 64)?;
         Ok(word & (1u64 << (row % 64)) != 0)
+    }
+
+    /// The label bitset of row `row`, `None` when the table stores
+    /// none, which is a table whose rows carry its name and nothing
+    /// else. The bits are dictionary positions, so a caller tests a
+    /// pattern's mask against the word with one AND.
+    pub fn label_word(&mut self, db: &mut Zu1File, row: u64) -> Result<Option<u64>> {
+        let Some(meta) = self.directory.labels.clone() else {
+            return Ok(None);
+        };
+        if self.label_state.is_none() {
+            let pools = db.pools();
+            let dir = load_chunk_directory_pooled(db, &pools.fences, &meta)?;
+            self.label_state = Some((dir, ChunkCache::default()));
+        }
+        let (dir, cache) = self.label_state.as_mut().expect("just inserted");
+        Ok(Some(read_one_cached(db, &meta, dir, cache, row)?))
+    }
+
+    /// Whether the table stores a label bitset at all, which is what
+    /// says whether a scan has a word to read per row.
+    pub fn has_labels(&self) -> bool {
+        self.directory.labels.is_some()
     }
 
     /// Whether `col` has a null in it anywhere, which is what says
@@ -1530,6 +1691,200 @@ mod tests {
             before,
             db.db_header().block_count
         );
+    }
+
+    #[test]
+    fn a_node_carries_its_table_label_and_whatever_else_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("labels.zu1");
+        let mut db = Zu1File::create(&path).unwrap();
+        bulk_load_keyed(&mut db, "person", "knows", 4, &[(0, 1), (2, 3)], None).unwrap();
+        store_labels(
+            &mut db,
+            "person",
+            &[
+                vec![],
+                vec!["Employee"],
+                vec!["Employee", "Manager"],
+                vec!["Manager"],
+            ],
+        )
+        .unwrap();
+
+        let catalog = Catalog::load(&mut db).unwrap();
+        // The table's own name is a label, and it is the first one,
+        // because a table exists before anything is declared on it.
+        assert_eq!(catalog.labels(), ["person", "Employee", "Manager"]);
+        let person = catalog.node_by_name("person").unwrap();
+        assert_eq!(person.labels, [0, 1, 2]);
+        assert_eq!(person.primary_label(), 0);
+        assert_eq!(person.label_mask(), 0b111);
+        assert_eq!(catalog.tables_with_label(1), [person.id]);
+        assert!(catalog.tables_with_label(9).is_empty());
+
+        let table = person.id;
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        assert!(reader.has_labels());
+        let words: Vec<u64> = (0..4)
+            .map(|row| reader.label_word(&mut db, row).unwrap().unwrap())
+            .collect();
+        assert_eq!(words, [0b001, 0b011, 0b111, 0b101]);
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    #[test]
+    fn labels_and_columns_do_not_disturb_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both.zu1");
+        let mut db = Zu1File::create(&path).unwrap();
+        bulk_load_keyed(&mut db, "person", "knows", 4, &[(0, 1), (2, 3)], None).unwrap();
+        store_labels(
+            &mut db,
+            "person",
+            &[vec![], vec!["Bot"], vec![], vec!["Bot"]],
+        )
+        .unwrap();
+        // A property store says nothing about labels, so it carries the
+        // bitset across to the directory it writes rather than dropping
+        // it or rewriting it.
+        store_props(
+            &mut db,
+            "person",
+            &[("age", PropValues::Int(&[10, 20, 30, 40]))],
+        )
+        .unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        assert_eq!(reader.label_word(&mut db, 1).unwrap(), Some(0b11));
+        assert_eq!(reader.read_int(&mut db, 0, 1).unwrap(), 20);
+
+        // And the other way round: storing labels again leaves the
+        // columns where they are.
+        store_labels(&mut db, "person", &[vec!["Bot"], vec![], vec![], vec![]]).unwrap();
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        assert_eq!(reader.label_word(&mut db, 0).unwrap(), Some(0b11));
+        assert_eq!(reader.label_word(&mut db, 1).unwrap(), Some(0b01));
+        assert_eq!(reader.read_int(&mut db, 0, 3).unwrap(), 40);
+        assert_eq!(reader.columns().len(), 1);
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    #[test]
+    fn a_table_without_a_bitset_answers_from_the_catalog_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        store_props(
+            &mut db,
+            "person",
+            &[("age", PropValues::Int(&[1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        // Nothing declared a second label, so there is no word per row
+        // to read and the table's own label is the whole answer.
+        assert!(!reader.has_labels());
+        assert_eq!(reader.label_word(&mut db, 2).unwrap(), None);
+        assert_eq!(
+            Catalog::load(&mut db)
+                .unwrap()
+                .node_by_id(table)
+                .unwrap()
+                .labels,
+            [0]
+        );
+    }
+
+    #[test]
+    fn a_label_set_that_does_not_fit_the_table_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let err = store_labels(&mut db, "person", &[vec!["Bot"], vec![]]).unwrap_err();
+        assert!(
+            err.to_string().contains("4 rows and the label set holds 2"),
+            "{err}"
+        );
+        let err = store_labels(&mut db, "nobody", &[vec!["Bot"]]).unwrap_err();
+        assert!(err.to_string().contains("no node table"), "{err}");
+        // A bitset is one word, so the dictionary stops at 64 names and
+        // says so rather than writing a bit nothing can read.
+        let names: Vec<String> = (0..64).map(|i| format!("L{i}")).collect();
+        let rows: Vec<Vec<&str>> = vec![
+            names.iter().map(String::as_str).skip(1).collect(),
+            vec![],
+            vec![],
+            vec![],
+        ];
+        store_labels(&mut db, "person", &rows).unwrap();
+        let err = store_labels(
+            &mut db,
+            "person",
+            &[vec!["one_too_many"], vec![], vec![], vec![]],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
+    }
+
+    /// Builds a file whose person table declares `Bot` and then puts
+    /// `words` in the bitset behind the writer's back, which is the
+    /// only way a file gets a bitset the catalog disagrees with.
+    fn file_with_label_words(path: &std::path::Path, words: &[u64]) {
+        let mut db = Zu1File::create(path).unwrap();
+        bulk_load_keyed(&mut db, "person", "knows", 4, &[(0, 1), (2, 3)], None).unwrap();
+        store_labels(&mut db, "person", &[vec!["Bot"], vec![], vec![], vec![]]).unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut index = TableIndex::load(&mut db).unwrap();
+        let root = index.get(table).unwrap();
+        let mut directory = load_props_at(&mut db, root).unwrap();
+        for &ptr in directory.labels.iter().flat_map(|m| &m.blocks) {
+            db.free_block(ptr).unwrap();
+        }
+        crate::graph::free_chain(&mut db, root).unwrap();
+        index.remove(table);
+        directory.labels = Some(write_segment(&mut db, words).unwrap());
+        index.set(
+            table,
+            meta::write_chain(&mut db, &directory.encode()).unwrap(),
+        );
+        let old_index = db.db_header().table_index_root;
+        crate::graph::free_chain(&mut db, old_index).unwrap();
+        let index_root = meta::write_chain(&mut db, &index.encode()).unwrap();
+        db.db_header_mut().table_index_root = index_root;
+        db.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn verify_refuses_a_bitset_the_catalog_does_not_back() {
+        let dir = tempfile::tempdir().unwrap();
+        // A bit no table declared.
+        let path = dir.path().join("undeclared.zu1");
+        file_with_label_words(&path, &[0b11, 0b101, 1, 1]);
+        let err = crate::verify(&path).unwrap_err().to_string();
+        assert!(err.contains("row 1 carries labels 0x5"), "{err}");
+        // A row that dropped the label its table gives every row.
+        let path = dir.path().join("missing.zu1");
+        file_with_label_words(&path, &[0b11, 0, 1, 1]);
+        let err = crate::verify(&path).unwrap_err().to_string();
+        assert!(err.contains("row 1 carries labels 0x0"), "{err}");
+        // A bitset that does not cover the rows.
+        let path = dir.path().join("short.zu1");
+        file_with_label_words(&path, &[1, 1, 1]);
+        let err = crate::verify(&path).unwrap_err().to_string();
+        assert!(err.contains("3 words over 4 rows"), "{err}");
     }
 
     #[test]

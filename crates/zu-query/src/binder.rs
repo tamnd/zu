@@ -120,6 +120,27 @@ pub struct NodeDef {
     pub id: u32,
     pub name: String,
     pub node_count: u64,
+    /// The labels this table's rows may carry, as ids into
+    /// [`Schema::labels`], the table's own name first. Every row
+    /// carries that first one and any of the rest. Empty here means the
+    /// caller left it to [`Schema::new`], which fills in the table's
+    /// own name and nothing else.
+    pub labels: Vec<u16>,
+}
+
+impl NodeDef {
+    /// The label every row of this table carries, which is the table's
+    /// own name.
+    pub fn primary_label(&self) -> u16 {
+        self.labels.first().copied().unwrap_or(0)
+    }
+
+    /// The bits a row of this table may hold. A pattern asking for a
+    /// bit outside this mask cannot be satisfied here, which is what
+    /// lets the binder drop the table before the plan is built.
+    pub fn label_mask(&self) -> u64 {
+        self.labels.iter().fold(0, |mask, &l| mask | 1 << l)
+    }
 }
 
 /// One rel table: a typed CSR pair between two node tables.
@@ -373,6 +394,12 @@ pub struct Schema {
     /// perf/12 §1 landed. Absent means the estimator falls back to the
     /// fixed selectivities it used before.
     col_stats: BTreeMap<u32, BTreeMap<String, ColStats>>,
+    /// The graph's label dictionary, a name at the position of its id.
+    /// The ids are the engine's, because the bits the binder compiles a
+    /// pattern into are read straight out of storage, so a schema built
+    /// from a catalog carries that catalog's order rather than one of
+    /// its own.
+    labels: Vec<String>,
     /// How far the summed ceilings may run past the summed estimates
     /// before the join order DP reruns minimizing the ceiling instead
     /// (perf/12 §2.4). Higher trusts the estimates further, lower
@@ -380,23 +407,66 @@ pub struct Schema {
     bound_disagreement: f64,
 }
 
+/// The most labels one graph holds, one bit of the word a row carries.
+pub const MAX_LABELS: usize = 64;
+
 /// The factor the ceilings have to beat the estimates by before the
 /// join order DP takes the robust order, when nothing overrides it.
 pub const DEFAULT_BOUND_DISAGREEMENT: f64 = 100.0;
 
 impl Schema {
-    /// Builds a schema, rejecting duplicate names and rel endpoints
-    /// that name no node table.
+    /// Builds a schema whose only labels are the node table names, in
+    /// table order, which is the graph a file written before label sets
+    /// existed describes and the graph every caller that says nothing
+    /// about labels means.
     pub fn new(nodes: Vec<NodeDef>, rels: Vec<RelDef>) -> Result<Self> {
-        let schema = Schema {
+        let labels = nodes.iter().map(|n| n.name.clone()).collect();
+        Self::with_labels(nodes, rels, labels)
+    }
+
+    /// Builds a schema over a graph's label dictionary. A node table
+    /// that declares nothing gets its own name, which is the label
+    /// every one of its rows carries.
+    pub fn with_labels(
+        nodes: Vec<NodeDef>,
+        rels: Vec<RelDef>,
+        labels: Vec<String>,
+    ) -> Result<Self> {
+        let mut schema = Schema {
             nodes,
             rels,
             degree_hists: BTreeMap::new(),
             degree_norms: BTreeMap::new(),
             color_summaries: BTreeMap::new(),
             col_stats: BTreeMap::new(),
+            labels,
             bound_disagreement: DEFAULT_BOUND_DISAGREEMENT,
         };
+        if schema.labels.len() > MAX_LABELS {
+            return Err(invalid(format!(
+                "a graph holds at most {MAX_LABELS} labels and this one holds {}",
+                schema.labels.len()
+            )));
+        }
+        for i in 0..schema.nodes.len() {
+            if schema.nodes[i].labels.is_empty() {
+                let own = schema.label_id(&schema.nodes[i].name).ok_or_else(|| {
+                    invalid(format!(
+                        "node table '{}' is not in the label dictionary",
+                        schema.nodes[i].name
+                    ))
+                })?;
+                schema.nodes[i].labels.push(own);
+            }
+            for &label in &schema.nodes[i].labels {
+                if usize::from(label) >= schema.labels.len() {
+                    return Err(invalid(format!(
+                        "node table '{}' declares label {label}, which no name backs",
+                        schema.nodes[i].name
+                    )));
+                }
+            }
+        }
         let mut seen = HashMap::new();
         for n in &schema.nodes {
             if seen.insert(n.name.clone(), ()).is_some() {
@@ -439,6 +509,21 @@ impl Schema {
 
     pub fn rel_by_id(&self, id: u32) -> Option<&RelDef> {
         self.rels.iter().find(|r| r.id == id)
+    }
+
+    /// The label dictionary, a name at the position of its id.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// The id of a label name, `None` when the graph has no such label.
+    pub fn label_id(&self, name: &str) -> Option<u16> {
+        self.labels.iter().position(|l| l == name).map(|i| i as u16)
+    }
+
+    /// The name behind a label id.
+    pub fn label_name(&self, id: u16) -> Option<&str> {
+        self.labels.get(usize::from(id)).map(String::as_str)
     }
 
     /// Attaches the engine's degree histograms, forward then backward
@@ -579,6 +664,10 @@ pub struct BoundQuery {
     pub columns: Vec<String>,
     /// Shape of each path variable by slot, for `RETURN p` assembly.
     pub path_shapes: BTreeMap<usize, Vec<PathPart>>,
+    /// The label dictionary the query was bound against, so a label
+    /// predicate can be printed with the names the query wrote rather
+    /// than with the bits it compiled to.
+    pub labels: Vec<String>,
 }
 
 /// What a match does with the rows underneath it.
@@ -669,6 +758,10 @@ pub struct BoundNode {
     pub slot: usize,
     /// Inline `{key: expr}` equality predicates.
     pub props: Vec<(String, BoundExpr)>,
+    /// The label bits this occurrence asks for that the candidate
+    /// tables do not already guarantee, zero when the narrowing
+    /// answered the whole pattern.
+    pub labels: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -826,6 +919,14 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         ty: LogicalType,
     },
+    /// Whether the node in `slot` carries every label in `mask`, the
+    /// runtime half of a label set. The binder only plants one for the
+    /// bits a candidate table does not already guarantee, so a pattern
+    /// naming a table's own label compiles to no predicate at all.
+    HasLabels {
+        slot: usize,
+        mask: u64,
+    },
 }
 
 /// Binds a parsed query against a schema.
@@ -859,6 +960,7 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         params: binder.params,
         columns: binder.columns,
         path_shapes: binder.path_shapes,
+        labels: schema.labels.clone(),
     })
 }
 
@@ -1294,24 +1396,40 @@ impl Binder<'_> {
     }
 
     fn bind_node(&mut self, pat: &NodePattern) -> Result<BoundNode> {
-        let candidates: Vec<u32> = match pat.labels.len() {
-            0 => self.schema.nodes.iter().map(|n| n.id).collect(),
-            1 => {
-                let label = &pat.labels[0];
-                let node = self
-                    .schema
-                    .node_by_name(label)
-                    .ok_or_else(|| bad_reference(format!("unknown label '{label}'")))?;
-                vec![node.id]
-            }
-            _ => {
-                return Err(invalid(format!(
-                    "node '{}' has {} labels, v0 nodes have exactly one table",
-                    pat.var.as_deref().unwrap_or(""),
-                    pat.labels.len()
-                )));
-            }
-        };
+        // A label set is a bitset: the pattern names bits, a table
+        // whose declared set is missing one of them can hold no row
+        // that satisfies the pattern and is dropped here, and what is
+        // left over after the table's own label is the runtime test.
+        let mut wanted = 0u64;
+        for label in &pat.labels {
+            let id = self
+                .schema
+                .label_id(label)
+                .ok_or_else(|| bad_reference(format!("unknown label '{label}'")))?;
+            wanted |= 1 << id;
+        }
+        let candidates: Vec<u32> = self
+            .schema
+            .nodes
+            .iter()
+            .filter(|n| n.label_mask() & wanted == wanted)
+            .map(|n| n.id)
+            .collect();
+        if candidates.is_empty() {
+            return Err(invalid(format!(
+                "no node table declares every label on '{}'",
+                pat.var.as_deref().unwrap_or("")
+            )));
+        }
+        // Every candidate carries its own label on every row, so the
+        // bits all of them guarantee need no test. With one candidate
+        // that is the whole of a single label pattern, which is why
+        // the common shape plans as a bare scan.
+        let guaranteed = candidates
+            .iter()
+            .filter_map(|id| self.schema.node_by_id(*id))
+            .fold(u64::MAX, |mask, n| mask & 1 << n.primary_label());
+        let residue = wanted & !guaranteed;
         let slot = match &pat.var {
             Some(name) => match self.scope.get(name).copied() {
                 Some(slot) => {
@@ -1350,7 +1468,11 @@ impl Binder<'_> {
             }
         };
         let props = self.bind_props(&pat.props)?;
-        Ok(BoundNode { slot, props })
+        Ok(BoundNode {
+            slot,
+            props,
+            labels: residue,
+        })
     }
 
     fn bind_rel(
@@ -2068,11 +2190,13 @@ mod tests {
                     id: 0,
                     name: "Person".into(),
                     node_count: 9000,
+                    labels: Vec::new(),
                 },
                 NodeDef {
                     id: 1,
                     name: "Place".into(),
                     node_count: 1400,
+                    labels: Vec::new(),
                 },
             ],
             vec![
@@ -2484,9 +2608,75 @@ mod tests {
         assert!(bind_err("MATCH p = (a) MATCH p = (b) RETURN p").contains("already defined"));
     }
 
+    /// The same two tables over a graph that declares labels: a person
+    /// may be an Employee or a Manager, a place may be an Employee,
+    /// and nothing may be both a Person and a Place.
+    fn labeled_schema() -> Schema {
+        Schema::with_labels(
+            vec![
+                NodeDef {
+                    id: 0,
+                    name: "Person".into(),
+                    node_count: 9000,
+                    labels: vec![0, 2, 3],
+                },
+                NodeDef {
+                    id: 1,
+                    name: "Place".into(),
+                    node_count: 1400,
+                    labels: vec![1, 2],
+                },
+            ],
+            vec![RelDef {
+                id: 2,
+                name: "KNOWS".into(),
+                from: 0,
+                to: 0,
+                edge_count: 180_000,
+            }],
+            vec![
+                "Person".into(),
+                "Place".into(),
+                "Employee".into(),
+                "Manager".into(),
+            ],
+        )
+        .expect("schema")
+    }
+
+    fn start_node(q: &BoundQuery) -> &BoundNode {
+        let BoundClause::Match { patterns, .. } = &q.clauses[0] else {
+            panic!("a MATCH");
+        };
+        &patterns[0].start
+    }
+
     #[test]
-    fn two_labels_are_rejected_in_v0() {
-        assert!(bind_err("MATCH (n:Person:Place) RETURN n").contains("exactly one table"));
+    fn a_label_set_narrows_the_tables_and_leaves_the_rest_to_the_bitset() {
+        let schema = labeled_schema();
+        let bound = |s: &str| bind(&parse(s).expect("parse"), &schema).expect("bind");
+        // A table's own label is what every one of its rows carries, so
+        // narrowing to that table answers the whole pattern.
+        let q = bound("MATCH (n:Person) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0]);
+        assert_eq!(start_node(&q).labels, 0);
+        // A declared label is one some rows of the table carry, so the
+        // tables narrow to the ones that declare it and the bit stays
+        // as a test.
+        let q = bound("MATCH (n:Employee) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0, 1]);
+        assert_eq!(start_node(&q).labels, 1 << 2);
+        // Both at once: Place does not declare Manager and drops out,
+        // and Person's own label needs no test.
+        let q = bound("MATCH (n:Person:Manager:Employee) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0]);
+        assert_eq!(start_node(&q).labels, 1 << 3 | 1 << 2);
+        // A label the graph does not have, and a set no table declares.
+        assert!(bind_err("MATCH (n:Nope) RETURN n").contains("unknown label 'Nope'"));
+        let err = bind(&parse("MATCH (n:Person:Place) RETURN n").unwrap(), &schema)
+            .expect_err("no table is both")
+            .to_string();
+        assert!(err.contains("no node table declares every label"), "{err}");
     }
 
     #[test]

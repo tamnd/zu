@@ -56,6 +56,11 @@ not_expr        = { "NOT" } , comparison ;
 comparison      = additive , { comparison_op , additive
                              | "IS" , [ "NOT" ] , "NULL"
                              | "IS" , [ "NOT" ] , "TYPED" , value_type } ;
+(* ISO 12 and feature GA04. Two values of different types compare
+   rather than answer unknown, and the order between the types is
+   booleans, numbers, strings, temporals, nodes, edges, lists, records,
+   paths, which is impdef IV010. It is the order ORDER BY uses, so a
+   predicate and a sort key never disagree about which value is first. *)
 comparison_op   = "=" | "<>" | "<" | "<=" | ">" | ">=" | "IN"
                 | "STARTS" , "WITH" | "ENDS" , "WITH" | "CONTAINS" ;
 additive        = multiplicative , { ( "+" | "-" ) , multiplicative } ;

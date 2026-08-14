@@ -753,12 +753,36 @@ pub fn store_props_nullable(
         .node_by_name(node_table)
         .ok_or_else(|| ZuError::InvalidArgument(format!("no node table '{node_table}'")))?;
     let (table_id, node_count) = (table.id, table.node_count);
-    let words = (node_count as usize).div_ceil(64);
+    check_columns(node_count, columns)?;
+    let mut index = TableIndex::load(db)?;
+    if let Some(root) = index.get(table_id) {
+        free_props(db, root)?;
+        index.remove(table_id);
+    }
+    let (root, directory, col_stats) = write_props(db, node_count, columns)?;
+    index.set(table_id, root);
+    crate::graph::free_chain(db, db.db_header().table_index_root)?;
+    let index_root = meta::write_chain(db, &index.encode())?;
+    db.db_header_mut().table_index_root = index_root;
+
+    let mut all = stats::Stats::load(db)?;
+    all.cols.insert(table_id, col_stats);
+    crate::graph::free_chain(db, db.db_header().stats_root)?;
+    all.store(db)?;
+
+    db.checkpoint()?;
+    Ok(directory)
+}
+
+/// Whether every column holds one value per row of a `rows` row domain,
+/// and a validity mask, where it has one, the words that domain wants.
+fn check_columns(rows: u64, columns: &[PropInput]) -> Result<()> {
+    let words = (rows as usize).div_ceil(64);
     for column in columns {
         let (name, values) = (column.name, &column.values);
-        if values.len() as u64 != node_count {
+        if values.len() as u64 != rows {
             return Err(ZuError::InvalidArgument(format!(
-                "column '{name}' holds {} values over {node_count} rows",
+                "column '{name}' holds {} values over {rows} rows",
                 values.len()
             )));
         }
@@ -766,16 +790,29 @@ pub fn store_props_nullable(
             && mask.len() != words
         {
             return Err(ZuError::InvalidArgument(format!(
-                "column '{name}' has {} validity words over {node_count} rows, which wants {words}",
+                "column '{name}' has {} validity words over {rows} rows, which wants {words}",
                 mask.len()
             )));
         }
     }
-    let mut index = TableIndex::load(db)?;
-    if let Some(root) = index.get(table_id) {
-        free_props(db, root)?;
-        index.remove(table_id);
-    }
+    Ok(())
+}
+
+/// Writes every column and then the directory chain over them, and
+/// returns the chain's root, the directory, and the statistics the
+/// values gave up on the way past.
+///
+/// Nothing here is published and nothing here knows what the rows are.
+/// A node table's rows are its nodes and a rel table's rows are its
+/// edges in load order; both store the same way, and which of the two
+/// it is decides only where the root gets written down, which is the
+/// caller's to do.
+fn write_props(
+    db: &mut Zu1File,
+    rows: u64,
+    columns: &[PropInput],
+) -> Result<(BlockPtr, PropsDirectory, BTreeMap<String, stats::ColStats>)> {
+    let node_count = rows;
     let mut cols = Vec::with_capacity(columns.len());
     let mut col_stats = BTreeMap::new();
     for column in columns {
@@ -854,18 +891,121 @@ pub fn store_props_nullable(
         columns: cols,
     };
     let root = meta::write_chain(db, &directory.encode())?;
-    index.set(table_id, root);
+    Ok((root, directory, col_stats))
+}
+
+/// Stores the property columns of the rel table `rel_table`, replacing
+/// any earlier set whole. Every column holds one value per edge, in the
+/// order the edges were loaded in, which is sorted by source and then by
+/// destination: value `i` belongs to edge `i` of that order, and that is
+/// the only thing tying a column to an edge, so a caller that hands over
+/// a column in another order has silently mislabeled its graph.
+///
+/// Edges must be unique. The ordinal of an edge is found by searching
+/// the forward list for its destination, which two edges with the same
+/// endpoints would answer the same way, so a table that stores
+/// properties may not hold a pair twice and a load that would make one
+/// is refused here rather than answered wrongly later.
+pub fn store_rel_props(
+    db: &mut Zu1File,
+    rel_table: &str,
+    columns: &[(&str, PropValues)],
+) -> Result<PropsDirectory> {
+    let inputs: Vec<PropInput> = columns
+        .iter()
+        .map(|(name, values)| PropInput::dense(name, *values))
+        .collect();
+    store_rel_props_nullable(db, rel_table, &inputs)
+}
+
+/// The same store, for columns some edges of which hold no value.
+pub fn store_rel_props_nullable(
+    db: &mut Zu1File,
+    rel_table: &str,
+    columns: &[PropInput],
+) -> Result<PropsDirectory> {
+    let catalog = Catalog::load(db)?;
+    let rel = catalog
+        .rel_by_name(rel_table)
+        .ok_or_else(|| ZuError::InvalidArgument(format!("no rel table '{rel_table}'")))?;
+    let (rel_id, edge_count) = (rel.id, rel.edge_count);
+    check_columns(edge_count, columns)?;
+    let mut index = TableIndex::load(db)?;
+    let root = index.get(rel_id).ok_or_else(|| ZuError::Corrupt {
+        what: "table index",
+        detail: format!("rel table '{rel_table}' has no directory entry"),
+    })?;
+    let mut directory = crate::graph::Directory::decode(&meta::read_chain(db, root)?)?;
+    reject_duplicate_edges(db, rel_table, &directory)?;
+    if directory.props != crate::file::NULL_BLOCK {
+        free_props(db, directory.props)?;
+    }
+    let (props_root, stored, col_stats) = write_props(db, edge_count, columns)?;
+    directory.props = props_root;
+    crate::graph::free_chain(db, root)?;
+    index.set(rel_id, meta::write_chain(db, &directory.encode())?);
     crate::graph::free_chain(db, db.db_header().table_index_root)?;
     let index_root = meta::write_chain(db, &index.encode())?;
     db.db_header_mut().table_index_root = index_root;
 
     let mut all = stats::Stats::load(db)?;
-    all.cols.insert(table_id, col_stats);
+    all.cols.insert(rel_id, col_stats);
     crate::graph::free_chain(db, db.db_header().stats_root)?;
     all.store(db)?;
 
     db.checkpoint()?;
-    Ok(directory)
+    Ok(stored)
+}
+
+/// Errors when any node lists a destination twice.
+///
+/// This walks the forward adjacency once, which is the cost of reading
+/// what is about to be written a column of anyway, and it runs before
+/// anything is written. A list is stored sorted, so a repeat is a
+/// neighbor equal to the one before it and the check is a comparison per
+/// edge with no state.
+fn reject_duplicate_edges(
+    db: &mut Zu1File,
+    name: &str,
+    directory: &crate::graph::Directory,
+) -> Result<()> {
+    let mut values = Vec::new();
+    for (g, group) in directory.groups.iter().enumerate() {
+        let mut offsets = Vec::new();
+        crate::segment::read_segment(db, &group.fwd.offsets, &mut offsets)?;
+        values.clear();
+        crate::segment::read_segment(db, &group.fwd.neighbors, &mut values)?;
+        for row in 0..group.row_count as usize {
+            let list = &values[offsets[row] as usize..offsets[row + 1] as usize];
+            if let Some(w) = list.windows(2).find(|w| w[0] == w[1]) {
+                let node = g as u64 * zu_common::GROUP_ROWS as u64 + row as u64;
+                return Err(ZuError::InvalidArgument(format!(
+                    "rel table '{name}' holds the edge ({node}, {}) twice, which an edge \
+                     property column cannot tell apart",
+                    w[0]
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Loads the props directory a chain root names.
+pub fn load_props_at(db: &mut Zu1File, root: BlockPtr) -> Result<PropsDirectory> {
+    PropsDirectory::decode(&meta::read_chain(db, root)?)
+}
+
+/// Loads the edge property directory of a rel table, `None` when the
+/// table stores no edge properties.
+pub fn load_rel_props(db: &mut Zu1File, rel_id: u32) -> Result<Option<PropsDirectory>> {
+    let Some(root) = TableIndex::load(db)?.get(rel_id) else {
+        return Ok(None);
+    };
+    let directory = crate::graph::Directory::decode(&meta::read_chain(db, root)?)?;
+    if directory.props == crate::file::NULL_BLOCK {
+        return Ok(None);
+    }
+    Ok(Some(load_props_at(db, directory.props)?))
 }
 
 /// Loads the props directory of a node table, `None` when the table
@@ -1390,6 +1530,121 @@ mod tests {
             before,
             db.db_header().block_count
         );
+    }
+
+    #[test]
+    fn edge_columns_are_read_by_the_ordinal_the_csr_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relprops.zu1");
+        let mut db = Zu1File::create(&path).unwrap();
+        // The load order is sorted by source and then by destination,
+        // and value `i` of a column belongs to edge `i` of that order.
+        let edges = vec![(0u32, 1u32), (0, 2), (0, 3), (1, 2), (2, 3), (3, 0)];
+        bulk_load_keyed(&mut db, "person", "knows", 4, &edges, None).unwrap();
+        let since: Vec<u64> = (0..edges.len() as u64).map(|i| 2000 + i).collect();
+        let tags: Vec<Vec<u8>> = edges
+            .iter()
+            .map(|(s, d)| format!("{s}->{d}").into_bytes())
+            .collect();
+        let tag_refs: Vec<&[u8]> = tags.iter().map(|v| v.as_slice()).collect();
+        store_rel_props(
+            &mut db,
+            "knows",
+            &[
+                ("since", PropValues::Int(&since)),
+                ("tag", PropValues::Str(&tag_refs)),
+            ],
+        )
+        .unwrap();
+
+        let rel = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut reader = PropsReader::new(load_rel_props(&mut db, rel).unwrap().unwrap());
+        let graph = crate::graph::GraphReader::load_table(&mut db, "knows").unwrap();
+        let (int_col, str_col) = (reader.col("since").unwrap(), reader.col("tag").unwrap());
+        let mut out = Vec::new();
+        for (i, &(s, d)) in edges.iter().enumerate() {
+            let row = graph
+                .edge_ordinal(&mut db, u64::from(s), u64::from(d))
+                .unwrap()
+                .expect("edge is in the graph");
+            assert_eq!(row, i as u64, "edge {s}->{d}");
+            assert_eq!(reader.read_int(&mut db, int_col, row).unwrap(), since[i]);
+            out.clear();
+            reader.read_str(&mut db, str_col, row, &mut out).unwrap();
+            assert_eq!(out, tags[i]);
+        }
+        // The columns are the rel table's own, so the node table still
+        // has none of its own and neither reads the other's.
+        let person = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        assert!(load_props(&mut db, person).unwrap().is_none());
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    #[test]
+    fn replacing_edge_columns_frees_the_old_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let two = [1u64, 2];
+        store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&two))]).unwrap();
+        let before = db.db_header().block_count;
+        for _ in 0..8 {
+            store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&two))]).unwrap();
+        }
+        assert!(
+            db.db_header().block_count <= before + 4,
+            "blocks grew {} -> {}",
+            before,
+            db.db_header().block_count
+        );
+    }
+
+    #[test]
+    fn edge_columns_reject_a_table_that_holds_a_pair_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("dup.zu1")).unwrap();
+        bulk_load_keyed(
+            &mut db,
+            "person",
+            "knows",
+            4,
+            &[(0, 1), (0, 1), (2, 3)],
+            None,
+        )
+        .unwrap();
+        let three = [1u64, 2, 3];
+        let err =
+            store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&three))]).unwrap_err();
+        assert!(
+            err.to_string().contains("holds the edge (0, 1) twice"),
+            "{err}"
+        );
+        // The refusal comes before anything is written, so the table is
+        // left as it was rather than half converted.
+        let rel = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        assert!(load_rel_props(&mut db, rel).unwrap().is_none());
+
+        // A column of the wrong length is counted against edges, not nodes.
+        let mut db = setup(dir.path());
+        let four = [1u64, 2, 3, 4];
+        let err =
+            store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&four))]).unwrap_err();
+        assert!(err.to_string().contains("4 values over 2 rows"), "{err}");
+        let err =
+            store_rel_props(&mut db, "nobody", &[("since", PropValues::Int(&four))]).unwrap_err();
+        assert!(err.to_string().contains("no rel table"), "{err}");
     }
 
     #[test]

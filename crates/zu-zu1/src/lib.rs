@@ -176,6 +176,46 @@ pub fn verify(path: &Path) -> Result<u64> {
                 live.extend(seg.blocks.iter().copied());
             }
         }
+        if directory.props != file::NULL_BLOCK {
+            let chain = meta::read_chain(&mut db, directory.props)?;
+            bytes += chain.len() as u64;
+            live.extend(meta::chain_blocks(&mut db, directory.props)?);
+            let props = props::PropsDirectory::decode(&chain)?;
+            // Edge columns are row-aligned with the edges the way node
+            // columns are with the rows, and the alignment is the whole
+            // of what ties a value to an edge, so a column that has
+            // drifted from the edge count is corruption and not a
+            // column with a gap in it.
+            if props.node_count != directory.edge_count {
+                return Err(corrupt(
+                    "props directory",
+                    format!(
+                        "rel table '{}' props span {} edges, directory holds {}",
+                        rel.name, props.node_count, directory.edge_count
+                    ),
+                ));
+            }
+            for col in &props.columns {
+                if col.meta.value_count != props.node_count {
+                    return Err(corrupt(
+                        "props directory",
+                        format!(
+                            "column '{}' holds {} values over {} edges",
+                            col.name, col.meta.value_count, props.node_count
+                        ),
+                    ));
+                }
+                if col.is_lane() {
+                    values.clear();
+                    segment::read_segment(&mut db, &col.meta, &mut values)?;
+                } else {
+                    let (mut blob, mut ends) = (Vec::new(), Vec::new());
+                    fullzip::read_blob_segment(&mut db, &col.meta, &mut blob, &mut ends)?;
+                }
+                bytes += col.meta.payload_len;
+                live.extend(col.meta.blocks.iter().copied());
+            }
+        }
         if let Some(keys) = &directory.keys {
             keys::verify_key_index(&mut db, keys, directory.node_count)?;
             for seg in [&keys.keys, &keys.rows] {

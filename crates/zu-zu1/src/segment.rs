@@ -397,6 +397,24 @@ pub fn probe(
     end: u64,
     value: u64,
 ) -> Result<bool> {
+    Ok(locate(db, meta, start, end, value)?.is_some())
+}
+
+/// Where `value` sits in `values[start..end)`, as a position in the
+/// whole segment, and `None` when the range does not hold it. Same
+/// search and same cost as [`probe`], which is written in terms of it.
+///
+/// The position is what an edge property column is indexed by: a
+/// neighbor list is one node's slice of the segment, so the slot a
+/// destination lands in is the edge's place in the load order, and the
+/// caller adds the group's base to get the ordinal.
+pub fn locate(
+    db: &mut Zu1File,
+    meta: &SegmentMeta,
+    start: u64,
+    end: u64,
+    value: u64,
+) -> Result<Option<u64>> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "segment",
         detail: detail.to_string(),
@@ -411,12 +429,12 @@ pub fn probe(
         return Err(corrupt("MiniBlock reader given a FullZip segment"));
     }
     if start == end {
-        return Ok(false);
+        return Ok(None);
     }
     // The zone covers the whole segment, so a value outside it is absent
     // from every row range.
     if value < meta.min || value > meta.max {
-        return Ok(false);
+        return Ok(None);
     }
     let chunks = meta.chunk_count();
     let fence_off = 4 + chunks * 4;
@@ -456,7 +474,10 @@ pub fn probe(
     }
     let lo = (start as usize).max(target * CHUNK_ROWS) - target * CHUNK_ROWS;
     let hi = (end as usize).min((target + 1) * CHUNK_ROWS) - target * CHUNK_ROWS;
-    Ok(scratch[lo..hi].binary_search(&value).is_ok())
+    Ok(scratch[lo..hi]
+        .binary_search(&value)
+        .ok()
+        .map(|at| (target * CHUNK_ROWS + lo + at) as u64))
 }
 
 /// The chunk index and fence array of one segment, held in memory so

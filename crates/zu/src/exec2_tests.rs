@@ -850,6 +850,65 @@ fn public_run_uses_the_pipeline_executor_transparently() {
     assert_eq!(r.rows, [[Value::Int(N as i64)]]);
 }
 
+/// An edge property is read off a rel variable, and the pipeline
+/// executor binds slots for node variables only, so the shape falls
+/// back and the row engine answers it. The point of the test is that
+/// the fallback happens rather than the new engine answering null, and
+/// that the answer the public entry point gives is the right one.
+#[test]
+fn an_edge_property_falls_back_and_still_answers() {
+    use crate::zu1::props::store_rel_props;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edgeprops.zu1");
+    let mut db = Zu1File::create(&path).unwrap();
+    let n = N as u32;
+    let mut edges: Vec<(u32, u32)> = (0..n).map(|i| (i, (i * 7 + 3) % n)).collect();
+    edges.extend((0..n).map(|i| ((i * 13 + 5) % n, i)));
+    edges.sort_unstable();
+    edges.dedup();
+    bulk_load_keyed(&mut db, "person", "knows", N, &edges, None).unwrap();
+    let age: Vec<u64> = (0..N).map(|i| (i * 37) % 100).collect();
+    store_props(&mut db, "person", &[("age", PropValues::Int(&age))]).unwrap();
+    let since: Vec<u64> = (0..edges.len() as u64).map(|i| 2000 + i % 25).collect();
+    store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&since))]).unwrap();
+    drop(db);
+
+    let mut db = Zu1File::open(&path).unwrap();
+    let (catalog, schema) = query::load_schema(&mut db).unwrap();
+    falls_back(
+        &mut db,
+        &catalog,
+        &schema,
+        "MATCH (a:person)-[e:knows]->(b) WHERE e.since > 2020 RETURN count(b) AS n",
+    );
+    falls_back(
+        &mut db,
+        &catalog,
+        &schema,
+        "MATCH (a:person)-[e:knows]->(b) RETURN e.since AS since ORDER BY since LIMIT 3",
+    );
+
+    let late = since.iter().filter(|&&v| v > 2020).count() as i64;
+    assert!(late > 0, "the bound has to keep some edges");
+    let r = query::run(
+        "MATCH (a:person)-[e:knows]->(b) WHERE e.since > 2020 RETURN count(b) AS n",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Int(late)]]);
+    // The same count reached backward: an edge is the edge its
+    // endpoints name, whichever side the walk started from.
+    let r = query::run(
+        "MATCH (b:person)<-[e:knows]-(a) WHERE e.since > 2020 RETURN count(a) AS n",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Int(late)]]);
+}
+
 #[test]
 #[ignore = "scratch"]
 fn dump_plans() {

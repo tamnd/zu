@@ -13,9 +13,9 @@ use zu_query::{optimizer, parser, plan};
 
 use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
-use crate::zu1::file::Zu1File;
+use crate::zu1::file::{NULL_BLOCK, Zu1File};
 use crate::zu1::graph::{Direction, GraphReader};
-use crate::zu1::props::{ListElement, PropsReader, list_elements, load_props};
+use crate::zu1::props::{ListElement, PropsReader, list_elements, load_props, load_props_at};
 use zu_common::{FloatBits, LogicalType, Temporal};
 
 /// The types [`run`] speaks, re-exported here so a caller that depends
@@ -242,6 +242,86 @@ impl<'a> Zu1Graph<'a> {
         self.props.insert(table, reader);
         Ok(())
     }
+
+    /// The same for a rel table's edge columns, which hang off its
+    /// group directory rather than off the table index. They share the
+    /// one map because a catalog id names a node table or a rel table
+    /// and never both.
+    fn ensure_rel_props(&mut self, rel: u32) -> Result<()> {
+        if self.props.contains_key(&rel) {
+            return Ok(());
+        }
+        self.ensure_reader(rel)?;
+        let root = self.readers[&rel].directory().props;
+        let reader = match root {
+            NULL_BLOCK => None,
+            root => Some(PropsReader::new(load_props_at(&mut self.db, root)?)),
+        };
+        self.props.insert(rel, reader);
+        Ok(())
+    }
+}
+
+/// One value out of one row of one column, whatever the column holds.
+///
+/// Nodes and edges store their properties the same way and differ only
+/// in what a row is, so they read them the same way too: this is the
+/// whole of it, and the two callers are left with finding the row.
+fn column_value(
+    db: &mut Zu1File,
+    reader: &mut PropsReader,
+    col: usize,
+    row: u64,
+    key: &str,
+) -> Result<Value> {
+    // A column that holds a null holds a placeholder in the row
+    // that is null, so the mask is asked before the value is
+    // read and the placeholder never leaves storage.
+    if reader.is_nullable(col) && !reader.is_valid(db, col, row)? {
+        return Ok(Value::Null);
+    }
+    let ty = reader.columns()[col].ty.clone();
+    if reader.columns()[col].is_lane() {
+        let word = reader.read_int(db, col, row)?;
+        return word_value(&ty, word, key);
+    }
+    match ty {
+        LogicalType::Str { .. } => {
+            let mut bytes = Vec::new();
+            reader.read_str(db, col, row, &mut bytes)?;
+            let text = String::from_utf8(bytes).map_err(|_| ZuError::Corrupt {
+                what: "props column",
+                detail: format!("'{key}' row {row} is not UTF-8"),
+            })?;
+            Ok(Value::Str(text))
+        }
+        // A stored list comes back as the list value the rest of the
+        // engine already has, element by element through the same
+        // reading a scalar column of that type gets, so `b.xs` and a
+        // list literal are the same value and CARDINALITY cannot tell
+        // them apart.
+        LogicalType::List { ref elem, .. } => {
+            let mut bytes = Vec::new();
+            reader.read_str(db, col, row, &mut bytes)?;
+            let items = list_elements(elem, &bytes)?;
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(match item {
+                    ListElement::Word(word) => word_value(elem, word, key)?,
+                    ListElement::Blob(bytes) => Value::Str(
+                        std::str::from_utf8(bytes)
+                            .map_err(|_| ZuError::Corrupt {
+                                what: "props column",
+                                detail: format!("'{key}' row {row} is not UTF-8"),
+                            })?
+                            .to_string(),
+                    ),
+                });
+            }
+            Ok(Value::List(out))
+        }
+        other => Err(unreadable(&other, key)),
+    }
 }
 
 impl Graph for Zu1Graph<'_> {
@@ -316,54 +396,7 @@ impl Graph for Zu1Graph<'_> {
         if let Some(reader) = props.get_mut(&table).expect("just loaded")
             && let Some(col) = reader.col(key)
         {
-            // A column that holds a null holds a placeholder in the row
-            // that is null, so the mask is asked before the value is
-            // read and the placeholder never leaves storage.
-            if reader.is_nullable(col) && !reader.is_valid(db, col, offset)? {
-                return Ok(Value::Null);
-            }
-            let ty = reader.columns()[col].ty.clone();
-            if reader.columns()[col].is_lane() {
-                let word = reader.read_int(db, col, offset)?;
-                return word_value(&ty, word, key);
-            }
-            return match ty {
-                LogicalType::Str { .. } => {
-                    let mut bytes = Vec::new();
-                    reader.read_str(db, col, offset, &mut bytes)?;
-                    let text = String::from_utf8(bytes).map_err(|_| ZuError::Corrupt {
-                        what: "props column",
-                        detail: format!("'{key}' row {offset} is not UTF-8"),
-                    })?;
-                    Ok(Value::Str(text))
-                }
-                // A stored list comes back as the list value the rest
-                // of the engine already has, element by element through
-                // the same reading a scalar column of that type gets,
-                // so `b.xs` and a list literal are the same value and
-                // CARDINALITY cannot tell them apart.
-                LogicalType::List { ref elem, .. } => {
-                    let mut bytes = Vec::new();
-                    reader.read_str(db, col, offset, &mut bytes)?;
-                    let items = list_elements(elem, &bytes)?;
-                    let mut out = Vec::with_capacity(items.len());
-                    for item in items {
-                        out.push(match item {
-                            ListElement::Word(word) => word_value(elem, word, key)?,
-                            ListElement::Blob(bytes) => Value::Str(
-                                std::str::from_utf8(bytes)
-                                    .map_err(|_| ZuError::Corrupt {
-                                        what: "props column",
-                                        detail: format!("'{key}' row {offset} is not UTF-8"),
-                                    })?
-                                    .to_string(),
-                            ),
-                        });
-                    }
-                    Ok(Value::List(out))
-                }
-                other => Err(unreadable(&other, key)),
-            };
+            return column_value(db, reader, col, offset, key);
         }
         // Without a stored `id` column the id is the offset, the dense
         // contract every load without REORDER keeps.
@@ -373,6 +406,28 @@ impl Graph for Zu1Graph<'_> {
                 "unknown property '{other}' on table {table}"
             ))),
         }
+    }
+
+    fn rel_property(&mut self, rel: u32, src: u64, dst: u64, key: &str) -> Result<Value> {
+        self.ensure_rel_props(rel)?;
+        let Self {
+            db, props, readers, ..
+        } = self;
+        let Some(reader) = props.get_mut(&rel).expect("just loaded") else {
+            return Ok(Value::Null);
+        };
+        let Some(col) = reader.col(key) else {
+            return Ok(Value::Null);
+        };
+        // The value's row is the edge's place in the load order, which
+        // the forward CSR is what knows. An edge the caller holds and
+        // the graph does not have no row and no value, which is the
+        // answer rather than an error: a pattern can be matched over
+        // one rel table and a property read off another.
+        let Some(row) = readers[&rel].edge_ordinal(db, src, dst)? else {
+            return Ok(Value::Null);
+        };
+        column_value(db, reader, col, row, key)
     }
 
     fn lookup_key(&mut self, table: u32, key: u64) -> Result<Option<u64>> {
@@ -1048,6 +1103,81 @@ mod tests {
         )
         .expect("optional count");
         assert_eq!(r.rows, [[Value::Int(people), Value::Int(matched)]]);
+    }
+
+    /// A property read off a rel variable finds the edge by its
+    /// endpoints, which the pattern names the same way whichever
+    /// direction it was walked in.
+    #[test]
+    fn reads_an_edge_property_walking_either_way() {
+        use crate::zu1::props::{PropValues, store_rel_props};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edgeprops.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let edges = [(0u32, 1u32), (0, 2), (1, 2), (2, 3), (3, 0)];
+        graph::bulk_load_as(&mut db, "person", "knows", 4, &edges).expect("load");
+        let since: Vec<u64> = (0..edges.len() as u64).map(|i| 2001 + i).collect();
+        store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&since))]).expect("store");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let expected: Vec<Vec<Value>> = edges
+            .iter()
+            .zip(&since)
+            .map(|(&(s, d), &v)| {
+                vec![
+                    Value::Int(i64::from(s)),
+                    Value::Int(i64::from(d)),
+                    Value::Int(v as i64),
+                ]
+            })
+            .collect();
+        let r = run(
+            "MATCH (a:person)-[e:knows]->(b) \
+             RETURN a.id AS a, b.id AS b, e.since AS since ORDER BY a, b",
+            &mut db,
+            &[],
+        )
+        .expect("forward");
+        assert_eq!(r.columns, ["a", "b", "since"]);
+        assert_eq!(r.rows, expected);
+
+        // Reached backward the edge is the same edge, so it answers
+        // the same value: the ordinal comes from the endpoints, not
+        // from the direction the expand ran in.
+        let r = run(
+            "MATCH (b:person)<-[e:knows]-(a) \
+             RETURN a.id AS a, b.id AS b, e.since AS since ORDER BY a, b",
+            &mut db,
+            &[],
+        )
+        .expect("backward");
+        assert_eq!(r.rows, expected);
+
+        // An undirected walk reaches every edge once from each end and
+        // reads the same value both times.
+        let r = run(
+            "MATCH (a:person {id: 2})-[e:knows]-(b) RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("undirected");
+        assert_eq!(
+            r.rows,
+            [[Value::Int(2002)], [Value::Int(2003)], [Value::Int(2004)],]
+        );
+
+        // A property the table does not store is null, not an error:
+        // an edge carries whatever its table wrote down and nothing
+        // says every rel table writes the same keys.
+        let r = run(
+            "MATCH (a:person {id: 0})-[e:knows]->(b) RETURN e.weight AS w",
+            &mut db,
+            &[],
+        )
+        .expect("missing key");
+        assert_eq!(r.rows, [[Value::Null], [Value::Null]]);
     }
 
     #[test]

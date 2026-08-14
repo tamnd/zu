@@ -21,7 +21,7 @@ use zu_common::Result;
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 use zu_query::exec::{Options, Sip, Value, Wcoj};
-use zu_query::plan::LogicalPlan;
+use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
 use zu_query::snapshot::{ColId, ColType, Dir, FuncCol, RelId, Snapshot, TableId, ZonePred};
 use zu_vector::{BinOp, CmpOp, ExprOp, MorselArena, OwnedValue, PhysType, Program, Reg};
 
@@ -200,18 +200,42 @@ pub(crate) enum Op {
         /// The level holding the end that stays fixed for the vector.
         probe_level: usize,
     },
-    /// Top of an OPTIONAL MATCH bracket (docs/07): the `len` ops above
-    /// this one are the group, the last of them being `OptionalHit`,
-    /// and everything past that is the pipeline the group feeds. The
-    /// group runs once per row of the level below it, with that row
-    /// pinned, which is what makes a miss a per-row fact. A row the
-    /// group matched nothing for still goes on, with `level` bound to
-    /// one null row.
-    Optional { len: usize, level: usize },
+    /// Top of a bracket (docs/07): the `len` ops above this one are the
+    /// group, the last of them being `BracketHit`, and everything past
+    /// that is the pipeline the group feeds. The group runs once per
+    /// row of the level below it, with that row pinned, which is what
+    /// makes a match a per-row fact.
+    ///
+    /// What the outer row gets out of that depends on the kind. An
+    /// OPTIONAL MATCH hands every match down and a row that matched
+    /// nothing goes on once with `level` bound to a null row. An
+    /// EXISTS block hands nothing down: the group stops at its first
+    /// match and the outer row goes on once, on a match for a semi
+    /// bracket and on a miss for an anti one, carrying the same null
+    /// row since nothing above the block is allowed to read what it
+    /// bound.
+    Bracket {
+        len: usize,
+        level: usize,
+        kind: BracketKind,
+    },
+    /// An EXISTS block over a bare pattern (docs/07): whether the row
+    /// has an edge of this kind at all, which the CSR offsets answer
+    /// on their own. No group runs and no level is built, so this is a
+    /// filter over the level the block was written on and a hub costs
+    /// what a leaf costs. `negated` is the anti bracket, where having
+    /// one is what drops the row.
+    HasEdge {
+        rel: RelId,
+        dirs: Dirs,
+        negated: bool,
+    },
     /// Bottom of the bracket, reached only when the group produced a
-    /// row. Setting the flag is all it does; the pipeline below runs
-    /// off it either way.
-    OptionalHit,
+    /// row. Recording the match is all it does. Under an OPTIONAL the
+    /// pipeline below runs off it as well, since that match is a row;
+    /// under an EXISTS block it is the end of the group's work for
+    /// this outer row.
+    BracketHit { kind: BracketKind },
     /// Terminal fusion of expands feeding a bare count: each active row
     /// of level `from` contributes the product of its per-step degrees,
     /// read off the CSR offsets alone. One step is the plain
@@ -390,11 +414,11 @@ fn names_level(op: &Op, level: usize) -> bool {
             probe_level, to, ..
         } => *probe_level == level || *to == level,
         Op::Semi { probe_level, .. } => *probe_level == level,
-        Op::Optional { level: opt, .. } => *opt == level,
+        Op::Bracket { level: opt, .. } => *opt == level,
         Op::DegreeProduct { from, .. } => *from == level,
         Op::Join { key, to, .. } => key.level() == level || *to == level,
         Op::Sip { key, .. } => key.level() == level,
-        Op::Filter { .. } | Op::OptionalHit => false,
+        Op::Filter { .. } | Op::BracketHit { .. } | Op::HasEdge { .. } => false,
     }
 }
 
@@ -408,12 +432,17 @@ fn reads_newest(above: &[Op]) -> bool {
     for op in above {
         match op {
             // A filter refines the newest level and so does the
-            // sideways one, which is the same read of the same rows.
-            Op::Filter { .. } | Op::Sip { .. } | Op::Semi { .. } | Op::Intersect { .. } => {
+            // sideways one, and so does the degree an EXISTS block
+            // asks for, which are all the same read of the same rows.
+            Op::Filter { .. }
+            | Op::Sip { .. }
+            | Op::Semi { .. }
+            | Op::Intersect { .. }
+            | Op::HasEdge { .. } => {
                 return true;
             }
             Op::Expand { .. } | Op::Branch { .. } | Op::Join { .. } => return false,
-            Op::Optional { .. } | Op::OptionalHit | Op::DegreeProduct { .. } => {}
+            Op::Bracket { .. } | Op::BracketHit { .. } | Op::DegreeProduct { .. } => {}
         }
     }
     false
@@ -562,6 +591,7 @@ pub(crate) fn compile(
         sips: Vec::new(),
         sip_at: HashMap::new(),
         optional_level: None,
+        exists_level: None,
         unwind_slot: None,
         func_slot: None,
         func: None,
@@ -624,6 +654,12 @@ struct Compiler<'a> {
     /// to what it can answer with a null there, and nothing else
     /// compiles after the group closes.
     optional_level: Option<usize>,
+    /// The level an EXISTS block introduced, once one is open. The
+    /// block's own variables are out of scope above it, so nothing
+    /// reads this one and the sink is free of it; it is still a level
+    /// the pipeline holds a chunk for, which is what the rules
+    /// [`Compiler::bracketed`] gathers are about.
+    exists_level: Option<usize>,
     /// The variable a leading UNWIND bound, once its list has become
     /// the batch of seeks that drives the plan. Reading it is reading
     /// the key that found the row, which is level 0's key column.
@@ -636,6 +672,16 @@ struct Compiler<'a> {
 }
 
 impl Compiler<'_> {
+    /// Whether a bracket is open. A group answers per outer row and the
+    /// runner drives it off the pinned row of the level below, so the
+    /// rules that hold for one hold for all three kinds: the pipeline
+    /// ends where the group starts, nothing inside it batches, no walk
+    /// inside it is fused into a degree read, and every expand still
+    /// walks off the newest level rather than becoming a branch.
+    fn bracketed(&self) -> bool {
+        self.optional_level.is_some() || self.exists_level.is_some()
+    }
+
     fn compile(&mut self, plan: &LogicalPlan) -> Result<Option<ExecPlan>> {
         let mut chain = Vec::new();
         let mut cur = plan;
@@ -837,7 +883,7 @@ impl Compiler<'_> {
             // sink match below, which takes a projection or an
             // aggregate and sends anything else back to the old
             // engine.
-            if self.optional_level.is_some() {
+            if self.bracketed() {
                 break;
             }
             match it.peek() {
@@ -954,9 +1000,10 @@ impl Compiler<'_> {
                     });
                     self.slot_level.insert(slot, to_level);
                     let head = ops.len();
-                    ops.push(Op::Optional {
+                    ops.push(Op::Bracket {
                         len: 0,
                         level: to_level,
+                        kind: BracketKind::Optional,
                     });
                     ops.push(Op::Join {
                         table,
@@ -969,9 +1016,11 @@ impl Compiler<'_> {
                         };
                         ops.push(Op::Filter { prog });
                     }
-                    ops.push(Op::OptionalHit);
+                    ops.push(Op::BracketHit {
+                        kind: BracketKind::Optional,
+                    });
                     let len = ops.len() - head - 1;
-                    let Op::Optional { len: slot, .. } = &mut ops[head] else {
+                    let Op::Bracket { len: slot, .. } = &mut ops[head] else {
                         unreachable!("just pushed the bracket");
                     };
                     *slot = len;
@@ -1019,11 +1068,12 @@ impl Compiler<'_> {
                         close: None,
                     });
                 }
-                // OPTIONAL MATCH, in the one shape the bracket covers:
+                // A bracketed hop, in the one shape the bracket covers:
                 // a single hop introducing the far node, with the
                 // group's own filters over it. That is what an
                 // OPTIONAL MATCH is in nearly every query that has
-                // one, and it is where the whole query used to go
+                // one, and it is the whole of an EXISTS block over a
+                // pattern, and it is where those queries used to go
                 // back to the old executor.
                 Some(LogicalPlan::Expand {
                     rel,
@@ -1034,7 +1084,9 @@ impl Compiler<'_> {
                     into: false,
                     bracket: Some(group),
                     ..
-                }) if group.nulls_on_miss() => {
+                }) => {
+                    let kind = group.kind;
+                    let group_id = *group;
                     it.next();
                     let Some(&src) = self.slot_level.get(from) else {
                         return Ok(None);
@@ -1050,6 +1102,42 @@ impl Compiler<'_> {
                     else {
                         return Ok(None);
                     };
+                    // An EXISTS block over a bare pattern asks whether
+                    // the row has an edge, and the CSR offsets answer
+                    // that: nothing inside the block reads the far
+                    // node, so there is no level to build and no group
+                    // to run per outer row. The block is a filter over
+                    // the level it was written on, which is the whole
+                    // of it on a hub, where the walk it replaces would
+                    // have read a list to look at its first entry.
+                    //
+                    // Bare means the group ends at this hop: another
+                    // operator inside it, a second step or a predicate
+                    // on the far node, is a group and goes below. The
+                    // block also has to be written on the level the
+                    // pipeline is standing on, since a filter refines
+                    // the newest one and a block on a level below is a
+                    // question about a row that is pinned rather than
+                    // about the rows in hand.
+                    let alone = it.peek().and_then(|p| node_bracket(p)) != Some(group_id)
+                        && src + 1 == self.levels.len();
+                    let def = self.schema.rel_by_id(rel_id);
+                    let far = def.and_then(|d| match dirs {
+                        Dirs::One(Dir::Fwd) => Some(d.to),
+                        Dirs::One(Dir::Bwd) => Some(d.from),
+                        // Both ends are walked, so the block is only
+                        // this simple where the rel has the same table
+                        // at each of them.
+                        Dirs::Both => (d.to == d.from).then_some(d.to),
+                    });
+                    if kind != BracketKind::Optional && alone && far == Some(to_table) {
+                        ops.push(Op::HasEdge {
+                            rel: rel_id,
+                            dirs,
+                            negated: kind == BracketKind::Anti,
+                        });
+                        continue;
+                    }
                     let to_level = self.levels.len();
                     self.levels.push(LevelBuild {
                         table: to_table,
@@ -1057,9 +1145,10 @@ impl Compiler<'_> {
                     });
                     self.slot_level.insert(*to, to_level);
                     let head = ops.len();
-                    ops.push(Op::Optional {
+                    ops.push(Op::Bracket {
                         len: 0,
                         level: to_level,
+                        kind,
                     });
                     ops.push(Op::Expand {
                         rel: rel_id,
@@ -1088,13 +1177,22 @@ impl Compiler<'_> {
                         };
                         ops.push(Op::Filter { prog });
                     }
-                    ops.push(Op::OptionalHit);
+                    ops.push(Op::BracketHit { kind });
                     let len = ops.len() - head - 1;
-                    let Op::Optional { len: slot, .. } = &mut ops[head] else {
+                    let Op::Bracket { len: slot, .. } = &mut ops[head] else {
                         unreachable!("just pushed the bracket");
                     };
                     *slot = len;
-                    self.optional_level = Some(to_level);
+                    // Only an OPTIONAL leaves a level the rest of the
+                    // query can read, so only it holds the sink to what
+                    // a null in that level answers. What an EXISTS
+                    // block bound is out of scope above it, which is
+                    // why the two are tracked apart.
+                    if kind == BracketKind::Optional {
+                        self.optional_level = Some(to_level);
+                    } else {
+                        self.exists_level = Some(to_level);
+                    }
                 }
                 Some(LogicalPlan::Expand {
                     rel,
@@ -1404,7 +1502,7 @@ impl Compiler<'_> {
             // A bracket's level binds one invalid row on a miss, and a
             // degree read off it would be row zero's degree rather than
             // nothing, so a bracket keeps its walk.
-            SinkSpec::Agg { .. } => self.optional_level.is_none(),
+            SinkSpec::Agg { .. } => !self.bracketed(),
             SinkSpec::CountDistinct { .. } | SinkSpec::Rows { .. } => false,
         };
         if fusable {
@@ -1441,7 +1539,7 @@ impl Compiler<'_> {
             // down one and the level indices the plan is written in are
             // renumbered before the plan is handed over.
             let mut dropped = Vec::new();
-            if self.optional_level.is_none() {
+            if !self.bracketed() {
                 for i in (0..ops.len()).rev() {
                     let Op::Expand {
                         rel,
@@ -1486,7 +1584,7 @@ impl Compiler<'_> {
                 // does not: its level binds an invalid row on a miss and
                 // a degree read off that would answer row zero's, so the
                 // bracket puts the expands back and walks them.
-                if from != newest_after && self.optional_level.is_some() {
+                if from != newest_after && self.bracketed() {
                     steps.clear();
                     while let Some(op) = taken.pop() {
                         ops.push(op);
@@ -1509,7 +1607,7 @@ impl Compiler<'_> {
         // runs as one. The bracket is the exception: a branch under it
         // would walk off a level whose pin the miss path rewrites, so
         // a bracket keeps the old rule and falls back.
-        let bracketed = self.optional_level.is_some();
+        let bracketed = self.bracketed();
         let mut newest = 0;
         for op in &mut ops {
             match op {
@@ -1566,7 +1664,7 @@ impl Compiler<'_> {
         // batched descent drops the pin and concatenates neighbors
         // across source rows, which loses exactly that, so nothing
         // inside the bracket batches.
-        if let Some(head) = ops.iter().position(|op| matches!(op, Op::Optional { .. })) {
+        if let Some(head) = ops.iter().position(|op| matches!(op, Op::Bracket { .. })) {
             for op in &mut ops[head..] {
                 if let Op::Expand { batch, .. } = op {
                     *batch = false;
@@ -1649,7 +1747,7 @@ impl Compiler<'_> {
                     *to = map[*to];
                 }
                 Op::Semi { probe_level, .. } => *probe_level = map[*probe_level],
-                Op::Optional { level, .. } => *level = map[*level],
+                Op::Bracket { level, .. } => *level = map[*level],
                 Op::DegreeProduct { from, .. } => *from = map[*from],
                 Op::Join { key, to, .. } => {
                     match key {
@@ -1664,7 +1762,7 @@ impl Compiler<'_> {
                     | ScalarRef::RowId { level }
                     | ScalarRef::Col { level, .. } => *level = map[*level],
                 },
-                Op::Filter { .. } | Op::OptionalHit => {}
+                Op::Filter { .. } | Op::BracketHit { .. } | Op::HasEdge { .. } => {}
             }
         }
         let fix = |r: &mut ScalarRef| match r {
@@ -2831,6 +2929,17 @@ fn conjuncts<'e>(expr: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
     out.push(expr);
 }
 
+/// The bracket a plan node was written inside, for the three kinds of
+/// node that can carry one.
+fn node_bracket(plan: &LogicalPlan) -> Option<Bracket> {
+    match plan {
+        LogicalPlan::ScanNodes { bracket, .. }
+        | LogicalPlan::Expand { bracket, .. }
+        | LogicalPlan::Filter { bracket, .. } => *bracket,
+        _ => None,
+    }
+}
+
 fn expand_dirs(
     schema: &Schema,
     rel: RelId,
@@ -2898,6 +3007,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A bare EXISTS block reads the rows of the level it sits on, the
+    /// same as a filter, so the walk that built them cannot be fused
+    /// into a degree read and taken away underneath it.
+    #[test]
+    fn a_bare_block_reads_the_level_under_it() {
+        let block = Op::HasEdge {
+            rel: 0,
+            dirs: Dirs::One(Dir::Fwd),
+            negated: false,
+        };
+        assert!(reads_newest(std::slice::from_ref(&block)));
+        assert!(reads_newest(&[
+            Op::BracketHit {
+                kind: BracketKind::Optional
+            },
+            block
+        ]));
     }
 
     #[test]

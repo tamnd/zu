@@ -693,6 +693,40 @@ exec_project_mrows_s_core = 25.0
 # this floor, never lower it.
 exec_optional_mrows_s_core = 8.0
 
+# The EXISTS block at one worker, M outer rows/s (docs/07): a million
+# people, every fourth isolated so a quarter of the rows can only be a
+# miss, and one in eight of the rest a hub with thirty three friends
+# against two for the others. The hubs are the shape of the thing. A
+# block over a bare pattern is a question about degree, and a degree is
+# two offsets whatever the node's list holds, so a hub has to answer as
+# fast as a leaf or the fast path is not one. The counted semi is what
+# the floor sits on, since it has nothing built above the block and so
+# is the degree read and the count and nothing else.
+#
+# The bench prints five shapes and each one twice, once through the
+# pipeline and once with ZU_EXEC2=0, which is where the four block
+# shapes ran before, an EXISTS block having had no compiled shape at
+# all. Measured at 2c94be7, one worker, in ms for the pipeline against
+# the old engine: the counted semi 2.8 against 169.8 on gamingpc and 8.9
+# against 445.3 on server1; the counted anti 2.9 against 144.8 and 8.5
+# against 492.5; the rows shape 20.3 against 246.7 and 69.8 against
+# 698.0; the block that keeps its own WHERE, which is the bracket rather
+# than the degree read, 179.6 against 604.2 and 902.3 against 2428.1. So
+# 61x and 50x on the counted semi, 50x and 58x on the anti, 12x and 10x
+# on the rows, and 3.4x and 2.7x on the filtered one, which is the walk
+# and the predicate over a vector of two and not the block.
+#
+# The fifth shape is the same pattern written as a plain required walk,
+# a row per edge rather than a row per person: 1.6 ms on gamingpc and
+# 4.8 on server1. It is here because it is the other shape that reads
+# degrees alone, and the counted semi being in the same range is the
+# claim that the block costs what a degree read costs.
+#
+# The floor is set off server1, the slowest host and the one that gates
+# with no free page cache, at about two thirds of its worse run. Raise
+# this floor, never lower it.
+exec_exists_mrows_s_core = 70.0
+
 # The batch point read at one worker, M keys/s (docs/07): a leading
 # UNWIND over fifty thousand ids strided across a two million row table
 # so no two lookups land near each other, which is the serving shape of

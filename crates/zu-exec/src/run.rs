@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
+use zu_query::plan::BracketKind;
 use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{
     Bitmap, ChunkSet, DataChunk, MorselArena, PhysType, SelVector, StrView, ValueVector,
@@ -118,6 +119,38 @@ struct Hop {
     to: usize,
     batch: bool,
     close: Option<Close>,
+}
+
+/// The parts of an `Op::Bracket` the operator under it reads: the
+/// level the group introduces, the pipeline waiting past the group,
+/// and what the group is being asked.
+#[derive(Clone, Copy)]
+struct Bracket<'a> {
+    level: usize,
+    cont: &'a [Op],
+    kind: BracketKind,
+}
+
+impl Bracket<'_> {
+    /// Whether the group is done with an outer row as soon as it has
+    /// matched once. An OPTIONAL hands every match down, so it wants
+    /// all of them. An EXISTS block asked whether there is a match at
+    /// all, and the second one says nothing the first did not.
+    fn stops_at_first(&self) -> bool {
+        self.kind != BracketKind::Optional
+    }
+
+    /// Whether an outer row the group answered `hit` for carries on
+    /// through the rest of the pipeline.
+    fn carries(&self, hit: bool) -> bool {
+        match self.kind {
+            // A match is a row of its own under an OPTIONAL, and the
+            // pipeline below has already run on it; this is the outer
+            // row that had none.
+            BracketKind::Optional | BracketKind::Anti => !hit,
+            BracketKind::Semi => hit,
+        }
+    }
 }
 
 /// One node's neighbor list, however storage handed it over: borrowed
@@ -681,17 +714,17 @@ struct Worker<'a> {
     sip_keys: Vec<u64>,
     sip_rows: Vec<u16>,
     sip_out: Vec<u32>,
-    /// Whether the OPTIONAL MATCH group in flight produced a row for
-    /// the outer row it is running on. Cleared before the group and
-    /// set by `Op::OptionalHit`, which is the only thing under the
-    /// group that can say so.
-    opt_hit: bool,
-    /// The null level a missed OPTIONAL MATCH binds, kept across the
-    /// misses of one morsel. It is the same one row every time, so
-    /// building it per miss would be a handful of arena bytes per
-    /// outer row that matched nothing, which on a selective group is
-    /// most of them. Dropped whenever the arena resets, since that is
-    /// where its buffers live.
+    /// Whether the bracketed group in flight produced a row for the
+    /// outer row it is running on. Cleared before the group and set by
+    /// `Op::BracketHit`, which is the only thing under the group that
+    /// can say so.
+    bracket_hit: bool,
+    /// The null level a bracket binds on the way past the group, kept
+    /// across the outer rows of one morsel. It is the same one row
+    /// every time, so building it per row would be a handful of arena
+    /// bytes per outer row the group decided, which on a selective
+    /// group is most of them. Dropped whenever the arena resets, since
+    /// that is where its buffers live.
     null: Option<DataChunk>,
 }
 
@@ -749,7 +782,7 @@ impl<'a> Worker<'a> {
             sip_rows: Vec::new(),
             sip_out: Vec::new(),
             decisions: Decisions::with_sips(sip_count(plan)),
-            opt_hit: false,
+            bracket_hit: false,
             null: None,
         }
     }
@@ -1063,20 +1096,18 @@ impl<'a> Worker<'a> {
             // its scratch across outer rows, the same as any other
             // expand; a bracket that drove the group itself paid for
             // all of that once per outer row.
-            Op::Optional { len, level } => {
+            Op::Bracket { len, level, kind } => {
+                let br = Bracket {
+                    level: *level,
+                    cont: &rest[*len..],
+                    kind: *kind,
+                };
                 // A left join wears the same bracket: the probe is what
                 // decides the row rather than the walk, and a probe
                 // that lands on nothing is the miss.
                 if let Op::Join { table, key, to } = &rest[0] {
                     let table = table.clone();
-                    return self.join(
-                        &table,
-                        *key,
-                        *to,
-                        &rest[1..],
-                        set,
-                        Some((*level, &rest[*len..])),
-                    );
+                    return self.join(&table, *key, *to, &rest[1..], set, Some(br));
                 }
                 let &Op::Expand {
                     rel,
@@ -1095,11 +1126,25 @@ impl<'a> Worker<'a> {
                     batch: false,
                     close,
                 };
-                self.expand(hop, &rest[1..], set, Some((*level, &rest[*len..])))
+                self.expand(hop, &rest[1..], set, Some(br))
             }
-            Op::OptionalHit => {
-                self.opt_hit = true;
+            Op::HasEdge { rel, dirs, negated } => {
+                if !self.has_edge(*rel, *dirs, *negated, set)? {
+                    return Ok(());
+                }
                 self.run_ops(rest, set)
+            }
+            Op::BracketHit { kind } => {
+                self.bracket_hit = true;
+                // A match under an OPTIONAL is a row of the answer and
+                // goes on down. A match inside an EXISTS block is only
+                // the answer to the question the block asked: the row
+                // that goes on is the outer one, and the bracket is
+                // where it is sent from.
+                match kind {
+                    BracketKind::Optional => self.run_ops(rest, set),
+                    BracketKind::Semi | BracketKind::Anti => Ok(()),
+                }
             }
             Op::DegreeProduct { steps, from } => {
                 if *from != set.chunks.len() - 1 {
@@ -1118,11 +1163,11 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// The single row an OPTIONAL MATCH binds on a miss: every vector
-    /// the level has, present and invalid, so a read off any of them
+    /// The single row a bracket binds past its group: every vector the
+    /// level has, present and invalid, so a read off any of them
     /// answers null and the level still counts once. Built out of the
-    /// morsel arena per miss, which is where it has to come from since
-    /// the arena resets between morsels.
+    /// morsel arena, which is where it has to come from since the
+    /// arena resets between morsels.
     fn null_level(&mut self, level: usize) -> DataChunk {
         let n = 1 + self.plan.levels[level].cols.len();
         let mut vecs = Vec::with_capacity(n);
@@ -1134,16 +1179,127 @@ impl<'a> Worker<'a> {
         DataChunk::new(vecs, 1)
     }
 
-    /// Walks one hop. `opt` turns the walk into an OPTIONAL MATCH
-    /// bracket: the level the group introduces and the pipeline to run
-    /// for a source row the group found nothing for, which gets one
-    /// null row of that level instead of dropping out.
+    /// Answers an EXISTS block over a bare pattern for a whole vector
+    /// at once, by keeping the rows of the newest level whose degree
+    /// says what the block asked. Nothing is walked and nothing is
+    /// built: a degree is two offsets, so the cost is per row rather
+    /// than per edge, and a node with a thousand friends is read the
+    /// same way as one with a single friend.
+    ///
+    /// Returns whether any row survived, so the caller can drop the
+    /// vector rather than run the rest of the pipeline over nothing.
+    fn has_edge(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        negated: bool,
+        set: &mut ChunkSet,
+    ) -> Result<bool> {
+        let last = set.chunks.last().expect("a level under every block");
+        let mut rows = std::mem::take(&mut self.scratch);
+        let mut poss = std::mem::take(&mut self.keep);
+        rows.clear();
+        poss.clear();
+        for pos in active_positions(last) {
+            rows.push(row_at(last, pos));
+            poss.push(pos as u16);
+        }
+        // The degree read walks the storage groups in order, and a
+        // level a hop built arrives in its source rows' order rather
+        // than its own, so those rows are read through an ascending
+        // permutation and answered back in the positions they sit at.
+        let ascending = rows.is_sorted();
+        if !ascending {
+            self.order.clear();
+            self.order.extend(0..rows.len() as u32);
+            self.order.sort_unstable_by_key(|&i| rows[i as usize]);
+            self.sorted.clear();
+            self.sorted
+                .extend(self.order.iter().map(|&i| rows[i as usize]));
+        }
+        self.deg.clear();
+        self.deg.resize(rows.len(), 0);
+        let mut res = Ok(());
+        for dir in sides(dirs) {
+            let read = if ascending { &rows } else { &self.sorted };
+            if let Err(e) = self.snap.get().degrees(rel, read, dir, &mut self.deg) {
+                res = Err(e);
+                break;
+            }
+        }
+        let mut kept = 0;
+        if res.is_ok() {
+            let mut sel = SelVector::with_capacity(&mut self.arena, rows.len());
+            if ascending {
+                for (&p, &d) in poss.iter().zip(&self.deg) {
+                    if (d > 0) != negated {
+                        sel.push(p);
+                    }
+                }
+            } else {
+                // The permutation is ascending in row id, not in
+                // position, and a selection has to be the other way
+                // round, so the degrees go back where their rows are
+                // before anything is kept.
+                self.prod.clear();
+                self.prod.resize(rows.len(), 0);
+                for (&i, &d) in self.order.iter().zip(&self.deg) {
+                    self.prod[i as usize] = d;
+                }
+                for (&p, &d) in poss.iter().zip(&self.prod) {
+                    if (d > 0) != negated {
+                        sel.push(p);
+                    }
+                }
+            }
+            kept = sel.len();
+            // A block every row answered leaves the vector as it was,
+            // which is one less indirection for everything above.
+            if kept > 0 && kept < rows.len() {
+                set.chunks
+                    .last_mut()
+                    .expect("a level under every block")
+                    .sel = Some(sel);
+            }
+        }
+        self.scratch = rows;
+        self.keep = poss;
+        res.map(|()| kept > 0)
+    }
+
+    /// Runs what is past a bracket for one outer row, with the group's
+    /// level bound to a single null row. Under an OPTIONAL that row is
+    /// the answer's own: the outer row matched nothing and the null is
+    /// what it carries. Under an EXISTS block nothing above is allowed
+    /// to read the level at all, and the null is there to keep the
+    /// levels the ops above are numbered in lined up with the chunks
+    /// the runner holds.
+    fn bracket_row(&mut self, br: Bracket<'_>, set: &mut ChunkSet) -> Result<()> {
+        let chunk = match self.null.take() {
+            Some(c) => c,
+            None => self.null_level(br.level),
+        };
+        set.chunks.push(chunk);
+        let res = self.run_ops(br.cont, set);
+        // Back into the worker for the next outer row, with anything
+        // the pipeline below did to its selection undone.
+        let mut chunk = set.chunks.pop().expect("just pushed the null level");
+        chunk.sel = None;
+        chunk.cur = None;
+        self.null = Some(chunk);
+        res
+    }
+
+    /// Walks one hop. `brk` turns the walk into a bracket: the group is
+    /// the ops up to its hit, and every source row the group decides
+    /// for runs the rest of the pipeline once with the group's level
+    /// bound to a null row, instead of the walk's own rows carrying it.
     fn expand(
         &mut self,
         hop: Hop,
         rest: &[Op],
         set: &mut ChunkSet,
-        opt: Option<(usize, &[Op])>,
+        brk: Option<Bracket<'_>>,
     ) -> Result<()> {
         let Hop {
             rel,
@@ -1172,6 +1328,7 @@ impl<'a> Worker<'a> {
             None => None,
         };
         let close_lists: Vec<&[u64]> = probe.as_ref().map(RowLists::slices).unwrap_or_default();
+        let stop_early = brk.is_some_and(|b| b.stops_at_first());
         // Copy the active rows out first: pinning mutates the chunk the
         // selection and values are read from.
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -1253,9 +1410,9 @@ impl<'a> Worker<'a> {
             if !batch {
                 set.chunks[src].cur = Some(phys);
             }
-            self.opt_hit = false;
+            self.bracket_hit = false;
             let group = (row / u64::from(GROUP_ROWS)) as u32;
-            for (slot, dir) in sides(dirs).enumerate() {
+            'sides: for (slot, dir) in sides(dirs).enumerate() {
                 if held[slot].as_ref().is_none_or(|(g, _)| *g != group) {
                     match self.hold(rel, dir, row, self.wanted(rows.len())) {
                         Ok(p) => held[slot] = Some((group, p)),
@@ -1323,33 +1480,31 @@ impl<'a> Worker<'a> {
                         result = Err(e);
                         break 'srcs;
                     }
+                    // An EXISTS block has its answer at the first
+                    // match, and the neighbors after that one would
+                    // only say the same thing again, so the rest of
+                    // this source row's walk is never made. On a node
+                    // with a hundred neighbors and a block that most
+                    // of them answer, that is the difference between
+                    // reading a list and reading its first entry.
+                    if stop_early && self.bracket_hit {
+                        break 'sides;
+                    }
                 }
             }
-            // Both sides of the hop are walked by here, so nothing
-            // else can turn this row into a match. `opt_hit` is what
-            // the group's own filters have to say about it too: they
-            // sit between the descent and the flag, so a row whose
-            // only neighbors they rejected is a miss.
-            if let Some((level, cont)) = opt
-                && !self.opt_hit
+            // Both sides of the hop are walked by here, or the walk
+            // stopped early because the block had its answer, so
+            // nothing else can change what the group says about this
+            // row. `bracket_hit` is what the group's own filters have
+            // to say about it too: they sit between the descent and
+            // the flag, so a row whose only neighbors they rejected is
+            // a miss.
+            if let Some(br) = brk
+                && br.carries(self.bracket_hit)
+                && let Err(e) = self.bracket_row(br, set)
             {
-                let chunk = match self.null.take() {
-                    Some(c) => c,
-                    None => self.null_level(level),
-                };
-                set.chunks.push(chunk);
-                let res = self.run_ops(cont, set);
-                // Back into the worker for the next miss, with
-                // anything the pipeline below did to its selection
-                // undone, since the next miss is a fresh row.
-                let mut chunk = set.chunks.pop().expect("just pushed the null level");
-                chunk.sel = None;
-                chunk.cur = None;
-                self.null = Some(chunk);
-                if let Err(e) = res {
-                    result = Err(e);
-                    break 'srcs;
-                }
+                result = Err(e);
+                break 'srcs;
             }
             if self.stop.stopped() {
                 break;
@@ -1535,7 +1690,7 @@ impl<'a> Worker<'a> {
         to: usize,
         rest: &[Op],
         set: &mut ChunkSet,
-        opt: Option<(usize, &[Op])>,
+        brk: Option<Bracket<'_>>,
     ) -> Result<()> {
         let src = set.chunks.len() - 1;
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -1550,7 +1705,7 @@ impl<'a> Worker<'a> {
         let mut result = Ok(());
         'srcs: for &phys in &idxs {
             set.chunks[src].cur = Some(phys);
-            self.opt_hit = false;
+            self.bracket_hit = false;
             // A null key matches nothing on either engine, so it walks
             // no rows. Under a bracket it is still a source row, and a
             // source row that matched nothing is a miss.
@@ -1564,23 +1719,12 @@ impl<'a> Worker<'a> {
             }
             // The probe is done by here, and so are the group's own
             // predicates, which sit between the descent and the flag.
-            if let Some((level, cont)) = opt
-                && !self.opt_hit
+            if let Some(br) = brk
+                && br.carries(self.bracket_hit)
+                && let Err(e) = self.bracket_row(br, set)
             {
-                let chunk = match self.null.take() {
-                    Some(c) => c,
-                    None => self.null_level(level),
-                };
-                set.chunks.push(chunk);
-                let res = self.run_ops(cont, set);
-                let mut chunk = set.chunks.pop().expect("just pushed the null level");
-                chunk.sel = None;
-                chunk.cur = None;
-                self.null = Some(chunk);
-                if let Err(e) = res {
-                    result = Err(e);
-                    break 'srcs;
-                }
+                result = Err(e);
+                break 'srcs;
             }
             if self.stop.stopped() {
                 break;

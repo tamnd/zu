@@ -379,6 +379,46 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b) RETURN a.age AS age, count(*) AS n",
         "MATCH (a:person) WHERE a.age = 13 OPTIONAL MATCH (a)-[:knows]->(b) \
          RETURN a.id AS a, b.id AS b LIMIT 4",
+        // EXISTS blocks, which are the same bracket asked a yes or no
+        // question: the outer row comes out once on a match for a semi
+        // bracket and once on a miss for an anti one, and the block's
+        // own slots are never read above it. Once bare, once with the
+        // block's WHERE deciding the match, once with an inline
+        // property doing the same, once negated, once where the block
+        // matches nothing at all and once where it matches everything,
+        // once beside an ordinary predicate, once counted, once
+        // grouped, once ordered and cut, and once off an expanded
+        // level rather than the scan.
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b {age: 7}) } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 500 } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 500 } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 20 AND EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN a.id AS id ORDER BY id",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } RETURN count(a) AS n",
+        "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(b) } RETURN count(a) AS n",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN a.age AS age, count(*) AS n",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN a.id AS a ORDER BY a LIMIT 4",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN DISTINCT a.age AS age ORDER BY age",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 AND EXISTS { MATCH (b)-[:knows]->(c) } \
+         RETURN a.id AS a, b.id AS b ORDER BY b",
+        // Two blocks stacked, the bare one first: it is a filter and
+        // leaves the pipeline where it found it, so the bracketed one
+        // compiles on top of it.
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
+         AND NOT EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } RETURN count(a) AS n",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
+         AND NOT EXISTS { MATCH (a)-[:knows]->(c) } RETURN count(a) AS n",
         // A leading UNWIND whose values are what the scan seeks on:
         // the list is the batch of point reads and the keys drive the
         // plan. Once bare, once with the key itself returned beside
@@ -625,16 +665,22 @@ fn unclaimed_shapes_fall_back() {
          RETURN count(*) AS n",
         "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.name = a.name \
          RETURN count(*) AS n",
-        // An existence block is a bracket the pipeline has no operator
-        // for yet: its group answers once per outer row and hands
-        // nothing up, which is neither the left join nor the walk the
-        // optional bracket compiles into.
-        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+        // Two blocks stacked with the bracketed one written first:
+        // what follows a bracket runs inside it, off a level the group
+        // holds, and the pipeline has no shape for that yet.
+        "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } \
+         AND EXISTS { MATCH (a)-[:knows]->(b) } RETURN count(a) AS n",
+        // A block written on a level the pipeline has already walked
+        // off asks about a row that is pinned rather than about the
+        // rows in hand, which neither the degree read nor the bracket
+        // is.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 AND EXISTS { MATCH (a)-[:knows]->(c) } \
+         RETURN a.id AS a, b.id AS b",
+        // A block over a pattern tied to the outer row by a predicate
+        // rather than an edge is a semi join, and the bracket the
+        // pipeline compiles is a walk.
+        "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.score = a.age } \
          RETURN count(a) AS n",
-        "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
-         RETURN count(a) AS n",
-        "MATCH (a:person) WHERE a.id < 20 AND EXISTS { MATCH (a)-[:knows]->(b) } \
-         RETURN a.id AS id ORDER BY id",
     ];
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);

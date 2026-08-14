@@ -30,6 +30,7 @@ use zu_vector::{
 use crate::compile::{
     AggSpec, Close, ColSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source,
 };
+use crate::decide::{Decisions, Split};
 use crate::group::{GroupTable, KeyBatch, PartKind};
 use crate::join::JoinTable;
 use crate::pool;
@@ -40,20 +41,22 @@ fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
 }
 
-/// Runs a compiled pipeline to completion.
+/// Runs a compiled pipeline to completion, handing back the answer and
+/// every decision the run made on the way (`decide`).
 pub(crate) fn run(
     plan: &ExecPlan,
     snap: &mut dyn Snapshot,
     options: &Options,
-) -> Result<QueryResult> {
+) -> Result<(QueryResult, Decisions)> {
     let sched = match &plan.source {
         Source::Seek(key) => seek_work(plan, snap, options, *key)?,
         Source::Seeks(keys) => seeks_work(keys, options),
         Source::Scan(_) => scan_work(plan, snap, options)?,
     };
-    let partials = drive(plan, snap, &sched)?;
+    let (partials, mut decisions) = drive(plan, snap, &sched)?;
+    decisions.split = sched.split.clone();
 
-    match &plan.sink {
+    let rows = match &plan.sink {
         SinkSpec::Count => {
             let total: i64 = partials.iter().map(|p| p.count).sum();
             Ok(QueryResult::new(
@@ -79,7 +82,8 @@ pub(crate) fn run(
             keys.is_empty(),
         ),
         SinkSpec::Rows { post, .. } => Ok(sink::finish_rows(plan.columns.clone(), post, partials)),
-    }
+    }?;
+    Ok((rows, decisions))
 }
 
 /// What a worker does with a morsel. Both kinds split the same way,
@@ -122,6 +126,8 @@ struct Schedule {
     work: Work,
     morsels: Vec<(u64, u64)>,
     threads: usize,
+    /// The same three numbers, in the shape EXPLAIN ANALYZE prints.
+    split: Split,
 }
 
 /// The driving scan, split into morsels, with the worker count the
@@ -140,9 +146,16 @@ fn scan_work(plan: &ExecPlan, snap: &mut dyn Snapshot, options: &Options) -> Res
         0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
         n => n,
     };
+    let morsels = make_morsels(total_rows, threads.max(1));
     Ok(Schedule {
         work: Work::Scan,
-        morsels: make_morsels(total_rows, threads.max(1)),
+        split: Split {
+            of: "scan",
+            morsels: morsels.len(),
+            threads,
+            weighted: false,
+        },
+        morsels,
         threads,
     })
 }
@@ -199,6 +212,12 @@ fn seek_work(
             work,
             morsels: vec![(0, 0)],
             threads: 1,
+            split: Split {
+                of: "seed",
+                morsels: 1,
+                threads: 1,
+                weighted: false,
+            },
         })
     };
     let Some(seed) = snap.seek_key(plan.table, key)? else {
@@ -265,6 +284,12 @@ fn seek_work(
     morsels.push((lo, list.len() as u64));
     Ok(Schedule {
         work: Work::Frontier { seed, rel, dir, to },
+        split: Split {
+            of: "seed frontier",
+            morsels: morsels.len(),
+            threads,
+            weighted: true,
+        },
         morsels,
         threads,
     })
@@ -283,9 +308,16 @@ fn seeks_work(keys: &[u64], options: &Options) -> Schedule {
         0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
         n => n,
     };
+    let morsels = make_morsels(keys.len() as u64, threads.max(1));
     Schedule {
         work: Work::Seeks,
-        morsels: make_morsels(keys.len() as u64, threads.max(1)),
+        split: Split {
+            of: "seek keys",
+            morsels: morsels.len(),
+            threads,
+            weighted: false,
+        },
+        morsels,
         threads,
     }
 }
@@ -294,13 +326,21 @@ fn group_of(row: u64) -> GroupId {
     (row / u64::from(GROUP_ROWS)) as GroupId
 }
 
+/// Where one worker leaves what it finished with, empty until it does.
+type Slot = Mutex<Option<Result<(SinkState, Decisions)>>>;
+
 /// Runs the morsels across workers and returns each worker's partial
-/// sink.
-fn drive(plan: &ExecPlan, snap: &mut dyn Snapshot, sched: &Schedule) -> Result<Vec<SinkState>> {
+/// sink, with every worker's decisions folded into one record.
+fn drive(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    sched: &Schedule,
+) -> Result<(Vec<SinkState>, Decisions)> {
     let Schedule {
         work,
         morsels,
         threads,
+        split: _,
     } = sched;
     let (work, threads) = (*work, *threads);
     let quota = match &plan.sink {
@@ -314,7 +354,10 @@ fn drive(plan: &ExecPlan, snap: &mut dyn Snapshot, sched: &Schedule) -> Result<V
     // read is short enough that setting it up shows in the latency.
     if threads <= 1 || morsels.len() <= 1 {
         let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
-        return w.work(morsels, &claim).map(|()| vec![w.sink]);
+        w.work(morsels, &claim)?;
+        let mut all = Decisions::with_sips(w.decisions.sip.len());
+        all.merge(&w.decisions);
+        return Ok((vec![w.sink], all));
     }
 
     // Fork one handle per extra worker; a backend that cannot fork
@@ -335,8 +378,7 @@ fn drive(plan: &ExecPlan, snap: &mut dyn Snapshot, sched: &Schedule) -> Result<V
     // Extra workers run on the persistent pool; worker 0 is this
     // thread. Result slots start empty, and a slot still empty after
     // the latch means that worker panicked.
-    let slots: Vec<Mutex<Option<Result<SinkState>>>> =
-        forks.iter().map(|_| Mutex::new(None)).collect();
+    let slots: Vec<Slot> = forks.iter().map(|_| Mutex::new(None)).collect();
     let main = {
         let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = forks
             .into_iter()
@@ -345,18 +387,19 @@ fn drive(plan: &ExecPlan, snap: &mut dyn Snapshot, sched: &Schedule) -> Result<V
                 let (stop, claim) = (&stop, &claim);
                 Box::new(move || {
                     let mut w = Worker::new(plan, SnapHandle::Fork(f), stop, work);
-                    let res = w.work(morsels, claim).map(|()| w.sink);
+                    let res = w.work(morsels, claim).map(|()| (w.sink, w.decisions));
                     *slot.lock().unwrap() = Some(res);
                 }) as Box<dyn FnOnce() + Send + '_>
             })
             .collect();
         let pending = pool::submit(jobs);
         let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
-        let main = w.work(morsels, &claim).map(|()| w.sink);
+        let main = w.work(morsels, &claim).map(|()| (w.sink, w.decisions));
         pending.wait();
         main
     };
     let mut out = Vec::with_capacity(slots.len() + 1);
+    let mut all = Decisions::with_sips(sip_count(plan));
     let mut first_err = None;
     for res in std::iter::once(main).chain(slots.into_iter().map(|slot| {
         slot.into_inner()
@@ -364,14 +407,26 @@ fn drive(plan: &ExecPlan, snap: &mut dyn Snapshot, sched: &Schedule) -> Result<V
             .unwrap_or_else(|| Err(invalid("executor worker panicked".into())))
     })) {
         match res {
-            Ok(p) => out.push(p),
+            Ok((p, d)) => {
+                all.merge(&d);
+                out.push(p);
+            }
             Err(e) => first_err = first_err.or(Some(e)),
         }
     }
     match first_err {
         Some(e) => Err(e),
-        None => Ok(out),
+        None => Ok((out, all)),
     }
+}
+
+/// Sideways filters in a plan, which is how many slots a worker's
+/// decisions need before it starts recording against them by position.
+fn sip_count(plan: &ExecPlan) -> usize {
+    plan.ops
+        .iter()
+        .filter(|op| matches!(op, Op::Sip { .. }))
+        .count()
 }
 
 /// Whether the pipeline closes a cycle, the one shape whose cost is
@@ -587,6 +642,9 @@ struct Worker<'a> {
     /// asked and what it let through, which is how the operator knows
     /// whether it is earning the pass it costs.
     sips: Vec<SipState>,
+    /// What this worker decided while it ran, folded into the run's
+    /// record once it is done.
+    decisions: Decisions,
     /// One vector's keys and the positions they came off, and the
     /// survivors the filter picked out of them. Reused down the run,
     /// so a filter that runs on every chunk allocates once.
@@ -660,17 +718,21 @@ impl<'a> Worker<'a> {
             sip_keys: Vec::new(),
             sip_rows: Vec::new(),
             sip_out: Vec::new(),
+            decisions: Decisions::with_sips(sip_count(plan)),
             opt_hit: false,
             null: None,
         }
     }
 
     fn work(&mut self, morsels: &[(u64, u64)], claim: &AtomicUsize) -> Result<()> {
+        let mut claimed = 0;
         loop {
             let m = claim.fetch_add(1, Ordering::Relaxed);
             if m >= morsels.len() || self.stop.stopped() {
+                self.decisions.claims.push(claimed);
                 return Ok(());
             }
+            claimed += 1;
             if let Err(e) = self.run_morsel(m, morsels[m]) {
                 self.stop.abort();
                 return Err(e);
@@ -745,6 +807,7 @@ impl<'a> Worker<'a> {
             let mut set = ChunkSet::new(vec![level0]);
             self.run_ops(&plan.ops, &mut set)?;
             if rows_sink && self.stop.quota_met(idx, self.local_rows) {
+                self.decisions.quota_stop += 1;
                 break;
             }
         }
@@ -810,8 +873,16 @@ impl<'a> Worker<'a> {
             )?
             else {
                 // A zone-excluded chunk; nothing survives it.
+                self.decisions.zone_skipped += 1;
                 continue;
             };
+            // A chunk the pushdown could not skip whole but still took
+            // rows out of: the zone map said maybe and the values said
+            // no, which is the half of the decision that costs a decode
+            // and saves everything above it.
+            if sc.sel.is_some() {
+                self.decisions.zone_thinned += 1;
+            }
             let mut vecs = Vec::with_capacity(1 + sc.columns.len());
             let mut ids =
                 ValueVector::flat_uninit(&mut self.arena, PhysType::Int64, sc.rows as usize);
@@ -860,6 +931,7 @@ impl<'a> Worker<'a> {
             let mut set = ChunkSet::new(vec![level0]);
             self.run_ops(&plan.ops, &mut set)?;
             if rows_sink && self.stop.quota_met(idx, self.local_rows) {
+                self.decisions.quota_stop += 1;
                 break;
             }
         }
@@ -1053,6 +1125,7 @@ impl<'a> Worker<'a> {
                 close_pins.push(self.pin(c.rel, dir, prow)?);
             }
             if close_pins.iter().all(|p| p.list(close_at).is_empty()) {
+                self.decisions.empty_close += 1;
                 return Ok(());
             }
         }
@@ -1316,6 +1389,9 @@ impl<'a> Worker<'a> {
     /// pays nothing for it: the rows were going to reach the join
     /// either way, and the join tests them itself.
     fn sip(&mut self, filter: &SipFilter, key: ScalarRef, slot: usize, set: &mut ChunkSet) -> bool {
+        if self.decisions.sip[slot].workers == 0 {
+            self.decisions.sip[slot].workers = 1;
+        }
         if !self.sips[slot].on {
             return true;
         }
@@ -1353,7 +1429,11 @@ impl<'a> Worker<'a> {
         // for that to be the filter and not the first chunk's luck.
         if state.probes >= SIP_TRIAL && state.kept * 10 > state.probes * 9 {
             state.on = false;
+            self.decisions.sip[slot].dropped += 1;
         }
+        let seen = &mut self.decisions.sip[slot];
+        seen.probes += keys.len() as u64;
+        seen.kept += n as u64;
         let all = n == rows.len();
         if n > 0 && !all {
             let mut sel = SelVector::with_capacity(&mut self.arena, n);
@@ -1602,6 +1682,7 @@ impl<'a> Worker<'a> {
         let at = (prow % u64::from(GROUP_ROWS)) as usize;
         let lists: Vec<&[u64]> = pins.iter().map(|p| p.list(at)).collect();
         if lists.iter().all(|l| l.is_empty()) {
+            self.decisions.empty_close += 1;
             return Ok(());
         }
         let last = set.chunks.len() - 1;
@@ -2937,7 +3018,7 @@ mod tests {
     fn counts_every_row() {
         let mut snap = Mock::new(10, |i| i as i64, false);
         let p = plan(vec![bare_level()], Vec::new(), SinkSpec::Count, &["n"]);
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         assert_eq!(r.rows, vec![vec![Value::Int(10)]]);
     }
 
@@ -2950,7 +3031,7 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         // Ages 8, 10, 12, 14, 16, 18 pass.
         assert_eq!(r.rows, vec![vec![Value::Int(6)]]);
     }
@@ -2964,7 +3045,7 @@ mod tests {
             lo: 1000,
             hi: u64::MAX,
         }));
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         assert_eq!(r.rows, vec![vec![Value::Int(0)]], "every chunk zoned out");
     }
 
@@ -2991,8 +3072,45 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         assert_eq!(r.rows, vec![vec![Value::Int(500)]], "one row in four");
+    }
+
+    #[test]
+    fn the_run_reports_what_it_decided_on_the_way_through() {
+        let mut snap = Mock::new(10, |i| i as i64, false);
+        let mut p = plan(vec![age_level()], Vec::new(), SinkSpec::Count, &["n"]);
+        p.source = Source::Scan(Some(ZonePred {
+            col: 0,
+            lo: 1000,
+            hi: u64::MAX,
+        }));
+        let (_, d) = run(&p, &mut snap, &seq()).unwrap();
+        assert!(d.zone_skipped > 0, "the chunks the pred emptied");
+        assert!(
+            d.render().contains("zone pushdown skipped"),
+            "got:\n{}",
+            d.render()
+        );
+
+        let mut snap = Mock::new(2000, |i| i as i64, false);
+        let keys: Vec<u64> = (0..2000).step_by(4).collect();
+        let p = plan(
+            vec![age_level()],
+            vec![sip_op(&keys, 0)],
+            SinkSpec::Count,
+            &["n"],
+        );
+        let (_, d) = run(&p, &mut snap, &seq()).unwrap();
+        assert_eq!(d.sip.len(), 1, "one entry per filter in the plan");
+        assert_eq!(d.sip[0].probes, 2000);
+        assert_eq!(d.sip[0].kept, 500);
+        assert_eq!(d.sip[0].dropped, 0, "it is rejecting three rows in four");
+        assert!(
+            d.render().contains("rejected 1500 of 2000 probe(s), 75.0%"),
+            "got:\n{}",
+            d.render()
+        );
     }
 
     #[test]
@@ -3004,7 +3122,7 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         assert_eq!(r.rows, vec![vec![Value::Int(0)]]);
     }
 
@@ -3024,7 +3142,7 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         assert_eq!(
             r.rows,
             vec![vec![Value::Int(rows as i64)]],
@@ -3045,7 +3163,7 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         assert_eq!(r.rows, vec![vec![Value::Int(rows as i64 / 2)]]);
     }
 
@@ -3062,7 +3180,7 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         // Multiples of four above 999: 1000, 1004, ... 1996.
         assert_eq!(r.rows, vec![vec![Value::Int(250)]]);
     }
@@ -3092,8 +3210,8 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let a = run(&expanded, &mut snap, &seq()).unwrap();
-        let b = run(&fused, &mut snap, &seq()).unwrap();
+        let a = run(&expanded, &mut snap, &seq()).unwrap().0;
+        let b = run(&fused, &mut snap, &seq()).unwrap().0;
         assert_eq!(a.rows, vec![vec![Value::Int(9)]], "everyone but the last");
         assert_eq!(a.rows, b.rows);
     }
@@ -3120,7 +3238,7 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         // 0..8 reach a neighbor; of those neighbors 1..8 step again.
         assert_eq!(r.rows, vec![vec![Value::Int(8)]]);
     }
@@ -3140,7 +3258,7 @@ mod tests {
             SinkSpec::Count,
             &["n"],
         );
-        let a = run(&fused, &mut snap, &seq()).unwrap();
+        let a = run(&fused, &mut snap, &seq()).unwrap().0;
         assert_eq!(a.rows, vec![vec![Value::Int(8)]]);
     }
 
@@ -3163,7 +3281,7 @@ mod tests {
             },
             &["m"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         let got: Vec<Value> = r.rows.into_iter().map(|mut v| v.remove(0)).collect();
         // Row 0 sees 1; row 1 sees 2 then 0; row 2 sees 1.
         assert_eq!(
@@ -3203,8 +3321,8 @@ mod tests {
             )
         };
         let mut snap = Mock::new(64, |i| i as i64, false);
-        let one = run(&shape(false), &mut snap, &seq()).unwrap();
-        let packed = run(&shape(true), &mut snap, &seq()).unwrap();
+        let one = run(&shape(false), &mut snap, &seq()).unwrap().0;
+        let packed = run(&shape(true), &mut snap, &seq()).unwrap().0;
         // 43 forward neighbors over 20 and 42 backward ones.
         assert_eq!(one.rows.len(), 85, "the filter kept the wrong rows");
         assert_eq!(packed.rows, one.rows, "batching reordered or dropped rows");
@@ -3234,8 +3352,8 @@ mod tests {
             )
         };
         let mut snap = Mock::new(64, |i| i as i64, false);
-        let one = run(&shape(false), &mut snap, &seq()).unwrap();
-        let packed = run(&shape(true), &mut snap, &seq()).unwrap();
+        let one = run(&shape(false), &mut snap, &seq()).unwrap().0;
+        let packed = run(&shape(true), &mut snap, &seq()).unwrap().0;
         assert_eq!(
             one.rows,
             vec![vec![Value::Int(126)]],
@@ -3261,12 +3379,12 @@ mod tests {
             threads: 4,
             ..Options::default()
         };
-        let r = run(&p, &mut snap.clone(), &opts).unwrap();
+        let r = run(&p, &mut snap.clone(), &opts).unwrap().0;
         assert_eq!(r.rows.len(), rows as usize);
         for (i, row) in r.rows.iter().enumerate() {
             assert_eq!(row[0], Value::Int(i as i64), "stitching keeps scan order");
         }
-        let flat = run(&p, &mut snap.clone(), &seq()).unwrap();
+        let flat = run(&p, &mut snap.clone(), &seq()).unwrap().0;
         assert_eq!(flat.rows, r.rows, "sequential and parallel agree");
     }
 
@@ -3287,7 +3405,7 @@ mod tests {
                 threads,
                 ..Options::default()
             };
-            let r = run(&p, &mut snap.clone(), &opts).unwrap();
+            let r = run(&p, &mut snap.clone(), &opts).unwrap().0;
             let got: Vec<Value> = r.rows.into_iter().map(|mut v| v.remove(0)).collect();
             assert_eq!(got, [3, 4, 5, 6].map(Value::Int).to_vec());
         }
@@ -3316,7 +3434,7 @@ mod tests {
                 threads,
                 ..Options::default()
             };
-            let r = run(&p, &mut snap.clone(), &opts).unwrap();
+            let r = run(&p, &mut snap.clone(), &opts).unwrap().0;
             assert_eq!(
                 r.rows,
                 vec![
@@ -3353,7 +3471,7 @@ mod tests {
             },
             &["s", "m"],
         );
-        let r = run(&p, &mut snap, &seq()).unwrap();
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
         // The old engine emits sum() of nothing as 0 and min() as null.
         assert_eq!(r.rows, vec![vec![Value::Int(0), Value::Null]]);
     }
@@ -3366,7 +3484,7 @@ mod tests {
             threads: 4,
             ..Options::default()
         };
-        let r = run(&p, &mut snap, &opts).unwrap();
+        let r = run(&p, &mut snap, &opts).unwrap().0;
         assert_eq!(r.rows, vec![vec![Value::Int(3000)]]);
     }
 }

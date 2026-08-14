@@ -18,13 +18,32 @@
 
 use std::path::Path;
 
-use zu_common::{DurationKind, FloatBits, LogicalType, Result, ZuError};
+use crate::list_text::{self, Kind};
+use zu_common::{DurationKind, FloatBits, IntBits, LogicalType, Result, ZuError};
 use zu_sqlite::{ColumnType, SqliteStore, TableDef, Value};
 use zu_storage::Direction;
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{Direction as Zu1Direction, GraphReader, bulk_load_as};
-use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
+use zu_zu1::props::{ListElement, PropValues, PropsReader, list_elements, load_props, store_props};
+
+/// The staged element kind a stored list's element type names, `None`
+/// for a type no staging column declares.
+///
+/// A stored list is written with its nullability wrapper off, so this
+/// only meets whole types. It is narrower than the set a lane holds on
+/// purpose: a list of dates has no JSON spelling that says it is dates
+/// rather than counts, and inventing one here would be a second place
+/// that decides what a count means.
+fn list_kind(elem: &LogicalType) -> Option<Kind> {
+    Some(match elem {
+        LogicalType::Int { .. } => Kind::Int,
+        LogicalType::Float { .. } => Kind::Real,
+        LogicalType::Str { .. } => Kind::Text,
+        LogicalType::Bool => Kind::Bool,
+        _ => return None,
+    })
+}
 
 /// The sqlite storage class a zu1 property column converts to. sqlite
 /// has four and zu1 columns are typed finer than that, so the mapping
@@ -52,6 +71,21 @@ fn sqlite_type(ty: &LogicalType, name: &str) -> Result<ColumnType> {
         LogicalType::LocalDatetime => ColumnType::LocalDatetime,
         LogicalType::Duration(DurationKind::DayTime) => ColumnType::Duration,
         LogicalType::Duration(DurationKind::YearMonth) => ColumnType::YearMonthDuration,
+        // A list column crosses as a JSON array in a text column, and
+        // the declaration is what says what the array holds. Only the
+        // four element types a list column can be stored with have a
+        // declaration, which is the same set going in and coming out.
+        LogicalType::List { elem, .. } => match list_kind(elem) {
+            Some(Kind::Int) => ColumnType::IntegerList,
+            Some(Kind::Real) => ColumnType::RealList,
+            Some(Kind::Text) => ColumnType::TextList,
+            Some(Kind::Bool) => ColumnType::BooleanList,
+            None => {
+                return Err(ZuError::InvalidArgument(format!(
+                    "column '{name}' holds {ty}, which has no sqlite staging form"
+                )));
+            }
+        },
         other => {
             return Err(ZuError::InvalidArgument(format!(
                 "column '{name}' holds {other}, which has no sqlite storage class"
@@ -106,6 +140,11 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
                         LogicalType::Bool => {
                             Value::Int(i64::from(reader.read_int(&mut zu, ci, row)? != 0))
                         }
+                        LogicalType::List { elem, .. } => {
+                            buf.clear();
+                            reader.read_str(&mut zu, ci, row, &mut buf)?;
+                            Value::Text(list_text::write(&staged_items(elem, &buf, name)?))
+                        }
                         LogicalType::Float { bits, .. } => {
                             let word = reader.read_int(&mut zu, ci, row)?;
                             Value::Real(match bits {
@@ -153,6 +192,43 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One stored list read back as the staged items it goes out as.
+///
+/// The word arms undo exactly what the lane put there: a float is IEEE
+/// bits, everything else is a count, and the element type is what says
+/// which, the same reading `word_value` gives a scalar column.
+fn staged_items(elem: &LogicalType, bytes: &[u8], name: &str) -> Result<Vec<list_text::Item>> {
+    let kind = list_kind(elem).ok_or_else(|| {
+        ZuError::InvalidArgument(format!(
+            "column '{name}' holds a list of {elem}, which has no sqlite staging form"
+        ))
+    })?;
+    list_elements(elem, bytes)?
+        .into_iter()
+        .map(|item| match (item, kind) {
+            (ListElement::Word(w), Kind::Int) => Ok(list_text::Item::Int(w as i64)),
+            (ListElement::Word(w), Kind::Bool) => Ok(list_text::Item::Bool(w != 0)),
+            (ListElement::Word(w), Kind::Real) => Ok(list_text::Item::Real(match elem {
+                LogicalType::Float {
+                    bits: FloatBits::B32,
+                    ..
+                } => f64::from(f32::from_bits(w as u32)),
+                _ => f64::from_bits(w),
+            })),
+            (ListElement::Blob(b), Kind::Text) => Ok(list_text::Item::Text(
+                String::from_utf8(b.to_vec()).map_err(|_| ZuError::Corrupt {
+                    what: "props column",
+                    detail: format!("an element of '{name}' is not UTF-8"),
+                })?,
+            )),
+            (item, _) => Err(ZuError::Corrupt {
+                what: "props column",
+                detail: format!("'{name}' holds a list of {elem} and an element is {item:?}"),
+            }),
+        })
+        .collect()
+}
+
 /// One node property column read whole, uniformly typed.
 enum ColumnData {
     Int(Vec<u64>),
@@ -164,6 +240,58 @@ enum ColumnData {
     /// A count of nanoseconds or of months, whichever the declared type
     /// asked for, kept together because the lane is the same.
     Counts(Vec<i64>),
+    /// Lists, in the element type the declaration named and the row
+    /// format's own shape, with the bytes of a text element owned here
+    /// so the borrowed view can be built beside the other columns.
+    List(LogicalType, Vec<Vec<OwnedElement>>),
+}
+
+/// A [`ListElement`] that owns what it points at.
+enum OwnedElement {
+    Word(u64),
+    Blob(Vec<u8>),
+}
+
+/// The element type and staged element kind a list declaration names,
+/// `None` for a declaration that is not a list at all.
+fn staged_list(ty: ColumnType) -> Option<(LogicalType, Kind)> {
+    Some(match ty {
+        ColumnType::IntegerList => (
+            LogicalType::Int {
+                signed: true,
+                bits: IntBits::B64,
+                precision: None,
+            },
+            Kind::Int,
+        ),
+        ColumnType::RealList => (
+            LogicalType::Float {
+                bits: FloatBits::B64,
+                precision: None,
+            },
+            Kind::Real,
+        ),
+        ColumnType::TextList => (
+            LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false,
+            },
+            Kind::Text,
+        ),
+        ColumnType::BooleanList => (LogicalType::Bool, Kind::Bool),
+        _ => return None,
+    })
+}
+
+/// What a list declaration is called, for the error that has to name it.
+fn list_name(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::IntegerList => "INTEGERLIST",
+        ColumnType::RealList => "REALLIST",
+        ColumnType::TextList => "TEXTLIST",
+        _ => "BOOLEANLIST",
+    }
 }
 
 /// What a temporal declaration is called, for the one error that has to
@@ -330,6 +458,66 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                 .collect::<Result<Vec<bool>>>()?;
             *column = ColumnData::Bool(bits);
         }
+        // A list arrives as the JSON array text sqlite had to hold it
+        // as, and like a boolean it is the declaration and nothing else
+        // that says so. The elements are reduced here to the words and
+        // bytes the row format keeps, which is also where a text that
+        // is not the array its column promised is refused.
+        for ((name, ty), column) in declared.iter().zip(&mut data) {
+            let Some((elem, kind)) = staged_list(*ty) else {
+                continue;
+            };
+            let ColumnData::Str(vals) = column else {
+                return Err(ZuError::InvalidArgument(format!(
+                    "'{}' column '{name}' is declared {} and does not hold text",
+                    node.name,
+                    list_name(*ty)
+                )));
+            };
+            let mut rows = Vec::with_capacity(vals.len());
+            for raw in vals.iter() {
+                let text = std::str::from_utf8(raw).map_err(|_| {
+                    ZuError::InvalidArgument(format!(
+                        "'{}' column '{name}' holds text that is not UTF-8",
+                        node.name
+                    ))
+                })?;
+                rows.push(
+                    list_text::parse(kind, text)?
+                        .into_iter()
+                        .map(|item| match item {
+                            list_text::Item::Int(v) => OwnedElement::Word(v as u64),
+                            list_text::Item::Bool(v) => OwnedElement::Word(u64::from(v)),
+                            list_text::Item::Real(v) => OwnedElement::Word(v.to_bits()),
+                            list_text::Item::Text(v) => OwnedElement::Blob(v.into_bytes()),
+                        })
+                        .collect(),
+                );
+            }
+            *column = ColumnData::List(elem, rows);
+        }
+
+        let list_items: Vec<Vec<Vec<ListElement>>> = data
+            .iter()
+            .map(|c| match c {
+                ColumnData::List(_, rows) => rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|e| match e {
+                                OwnedElement::Word(w) => ListElement::Word(*w),
+                                OwnedElement::Blob(b) => ListElement::Blob(b),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let list_rows: Vec<Vec<&[ListElement]>> = list_items
+            .iter()
+            .map(|rows| rows.iter().map(|r| r.as_slice()).collect())
+            .collect();
         let str_refs: Vec<Vec<&[u8]>> = data
             .iter()
             .map(|c| match c {
@@ -344,7 +532,8 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             .zip(&data)
             .zip(&str_refs)
             .zip(&declared)
-            .map(|(((name, c), refs), (_, ty))| {
+            .zip(&list_rows)
+            .map(|((((name, c), refs), (_, ty)), lists)| {
                 let values = match c {
                     ColumnData::Int(vals) => PropValues::Int(vals),
                     ColumnData::Bool(vals) => PropValues::Bool(vals),
@@ -352,6 +541,7 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                     ColumnData::Str(_) => PropValues::Str(refs),
                     ColumnData::Bytes(_) => PropValues::Bytes(refs),
                     ColumnData::Date(vals) => PropValues::Date(vals),
+                    ColumnData::List(elem, _) => PropValues::List { elem, rows: lists },
                     ColumnData::Counts(vals) => match ty {
                         ColumnType::LocalTime => PropValues::LocalTime(vals),
                         ColumnType::LocalDatetime => PropValues::LocalDatetime(vals),

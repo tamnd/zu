@@ -15,6 +15,7 @@ pub use zu_zu1 as zu1;
 pub mod convert;
 #[cfg(test)]
 mod exec2_tests;
+pub mod list_text;
 pub mod query;
 pub mod session;
 pub mod snapshot;

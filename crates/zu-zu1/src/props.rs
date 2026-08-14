@@ -14,8 +14,8 @@
 //!
 //! Directory layout: `version: u16`, `node_count: u64`,
 //! `column_count: u32`, then per column `name_len: u16` + UTF-8 bytes,
-//! `type: u8` (a code from [`TYPE_CODES`]), and the column's
-//! `SegmentMeta`.
+//! `type: u8` (a code from [`TYPE_CODES`], or the list code and then
+//! the element's code), and the column's `SegmentMeta`.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -37,11 +37,17 @@ use crate::stats;
 
 /// Version 1 held a one byte type that could say string or integer and
 /// nothing else. Version 2 holds a code from [`TYPE_CODES`], which is
-/// the storable part of the logical lattice. Version 1 directories are
-/// still read, because a file written before this is not wrong, it is
-/// just narrow.
-const PROPS_VERSION: u16 = 2;
+/// the storable part of the logical lattice. Version 3 adds the one
+/// type that needs a second byte, a list, whose code is followed by the
+/// code of its element type. Older directories are still read, because
+/// a file written before this is not wrong, it is just narrow.
+const PROPS_VERSION: u16 = 3;
 const MAX_NAME_LEN: usize = 256;
+
+/// The code a list column is written under, followed on disk by the
+/// code of its element type. It sits outside [`TYPE_CODES`] because it
+/// is the one type whose code does not stand on its own.
+const LIST_CODE: u8 = 18;
 
 /// The property types a column can be declared as, and the byte that
 /// stands for each one on disk.
@@ -160,6 +166,45 @@ fn type_code(ty: &LogicalType) -> Option<u8> {
     TYPE_CODES.iter().find(|(_, t)| t == ty).map(|(c, _)| *c)
 }
 
+/// The bytes a column's type is written as: one code, and for a list
+/// the element's code behind it. `None` when the type is not storable.
+///
+/// A list of lists is not storable. The row format below is one count
+/// and then fixed width words or length prefixed bytes, which a nested
+/// list has no room in, and a directory entry holds one element code.
+/// Refusing here is what keeps a file from being written that no
+/// reader can take apart again.
+fn type_bytes(ty: &LogicalType) -> Option<Vec<u8>> {
+    match ty {
+        LogicalType::List { elem, max: None } => {
+            Some(vec![LIST_CODE, type_code(list_elem(elem)?)?])
+        }
+        other => Some(vec![type_code(other)?]),
+    }
+}
+
+/// The element type a list column stores, which is the declared element
+/// type with its nullability wrapper taken off.
+///
+/// A stored list holds a value in every position. `LIST<INT>` and
+/// `LIST<INT NOT NULL>` therefore store the same way, and the column
+/// comes back as the second of the two, because that is the one a read
+/// can promise.
+fn list_elem(elem: &LogicalType) -> Option<&LogicalType> {
+    match elem {
+        LogicalType::Nullable(inner) => list_elem(inner),
+        other => Some(other),
+    }
+}
+
+/// The type a list column of this element type is declared as.
+fn list_of(elem: LogicalType) -> LogicalType {
+    LogicalType::List {
+        elem: Box::new(elem),
+        max: None,
+    }
+}
+
 fn code_type(code: u8) -> Option<LogicalType> {
     TYPE_CODES
         .iter()
@@ -239,6 +284,104 @@ pub enum PropValues<'a> {
     LocalDatetime(&'a [i64]),
     /// Months for a year-month duration, nanoseconds for a day-time one.
     Duration(DurationKind, &'a [i64]),
+    /// One list per row, every list holding elements of `elem`.
+    ///
+    /// The elements arrive already reduced to what the row format
+    /// keeps, a word or a run of bytes, so this one arm carries every
+    /// element type rather than growing a variant per type the way the
+    /// scalar arms do. Which of the two an element must be is settled
+    /// by `elem`, and an element that is the other one is refused at
+    /// store time.
+    List {
+        elem: &'a LogicalType,
+        rows: &'a [&'a [ListElement<'a>]],
+    },
+}
+
+/// One element of a stored list, in the shape the row format keeps it.
+///
+/// A lane type is a word, the same 64 bit word the scalar lane holds
+/// for that type, so a list of dates and a date column agree about what
+/// a day is. Everything else is a run of bytes with its length in front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListElement<'a> {
+    Word(u64),
+    Blob(&'a [u8]),
+}
+
+/// Encodes one row of a list column: `count: u32`, then the elements,
+/// each a little endian word for a lane element type or a `len: u32`
+/// and its bytes otherwise.
+fn encode_list_row(elem: &LogicalType, items: &[ListElement<'_>]) -> Result<Vec<u8>> {
+    let lane = lane_type(elem);
+    let mut out = Vec::with_capacity(4 + items.len() * 8);
+    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for item in items {
+        match (item, lane) {
+            (ListElement::Word(w), true) => out.extend_from_slice(&w.to_le_bytes()),
+            (ListElement::Blob(b), false) => {
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+            }
+            _ => {
+                return Err(ZuError::InvalidArgument(format!(
+                    "a list of {elem} does not hold {item:?}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reads back a row written by `encode_list_row`.
+///
+/// The elements borrow the buffer they came out of, so a read of a list
+/// column is the blob read and a walk over it, with no allocation per
+/// element.
+pub fn list_elements<'a>(elem: &LogicalType, bytes: &'a [u8]) -> Result<Vec<ListElement<'a>>> {
+    let head = bytes
+        .get(..4)
+        .ok_or_else(|| corrupt("truncated list length".into()))?;
+    let count = u32::from_le_bytes(head.try_into().unwrap()) as usize;
+    let lane = lane_type(elem);
+    // A count is four bytes of header away from its smallest possible
+    // payload, so a count the row cannot hold is caught before it sizes
+    // an allocation.
+    let least = if lane { 8 } else { 4 };
+    if count > (bytes.len() - 4) / least {
+        return Err(corrupt(format!(
+            "a list of {count} does not fit {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 4usize;
+    for _ in 0..count {
+        if lane {
+            let raw = bytes
+                .get(pos..pos + 8)
+                .ok_or_else(|| corrupt("truncated list element".into()))?;
+            out.push(ListElement::Word(u64::from_le_bytes(
+                raw.try_into().unwrap(),
+            )));
+            pos += 8;
+        } else {
+            let raw = bytes
+                .get(pos..pos + 4)
+                .ok_or_else(|| corrupt("truncated list element length".into()))?;
+            let len = u32::from_le_bytes(raw.try_into().unwrap()) as usize;
+            pos += 4;
+            let body = bytes
+                .get(pos..pos + len)
+                .ok_or_else(|| corrupt("truncated list element".into()))?;
+            out.push(ListElement::Blob(body));
+            pos += len;
+        }
+    }
+    if pos != bytes.len() {
+        return Err(corrupt("trailing bytes in a list".into()));
+    }
+    Ok(out)
 }
 
 impl PropValues<'_> {
@@ -252,6 +395,7 @@ impl PropValues<'_> {
             PropValues::Date(v) => v.len(),
             PropValues::LocalTime(v) | PropValues::LocalDatetime(v) => v.len(),
             PropValues::Duration(_, v) => v.len(),
+            PropValues::List { rows, .. } => rows.len(),
         }
     }
 
@@ -286,6 +430,7 @@ impl PropValues<'_> {
             PropValues::LocalTime(_) => LogicalType::LocalTime,
             PropValues::LocalDatetime(_) => LogicalType::LocalDatetime,
             PropValues::Duration(kind, _) => LogicalType::Duration(*kind),
+            PropValues::List { elem, .. } => list_of((*elem).clone()),
         }
     }
 
@@ -300,7 +445,7 @@ impl PropValues<'_> {
     /// every load for the sake of the arms that need one.
     pub(crate) fn lane(&self) -> Option<Cow<'_, [u64]>> {
         Some(match self {
-            PropValues::Str(_) | PropValues::Bytes(_) => return None,
+            PropValues::Str(_) | PropValues::Bytes(_) | PropValues::List { .. } => return None,
             PropValues::Int(v) => Cow::Borrowed(*v),
             PropValues::Bool(v) => v.iter().map(|&b| u64::from(b)).collect(),
             PropValues::Float(v) => v.iter().map(|&f| f.to_bits()).collect(),
@@ -334,6 +479,18 @@ fn float_key(bits: u64) -> i64 {
         !signed
     } else {
         signed ^ i64::MIN
+    }
+}
+
+/// Whether a directory written under `version` was allowed to carry
+/// this type code. Version 1 wrote two codes and version 2 wrote every
+/// code but the list one, so a file claiming an older version and
+/// carrying a newer code is a file that has been edited.
+fn code_allowed(code: u8, version: u16) -> bool {
+    match version {
+        1 => code <= 1,
+        2 => code != LIST_CODE,
+        _ => true,
     }
 }
 
@@ -371,7 +528,7 @@ impl PropsDirectory {
             out.extend_from_slice(col.name.as_bytes());
             // Unstorable types are refused at store time, so a column
             // that reached the directory has a code.
-            out.push(type_code(&col.ty).expect("column type is storable"));
+            out.extend_from_slice(&type_bytes(&col.ty).expect("column type is storable"));
             col.meta.encode(&mut out);
         }
         out
@@ -382,11 +539,12 @@ impl PropsDirectory {
             .get(..14)
             .ok_or_else(|| corrupt("truncated header".into()))?;
         let version = u16::from_le_bytes(head[..2].try_into().unwrap());
-        // Version 1 is still read. It only ever wrote codes 0 and 1,
-        // and those two codes mean in version 2 what they meant then,
-        // so the difference between the versions is which codes may
-        // appear rather than how any of them decodes.
-        if version != PROPS_VERSION && version != 1 {
+        // Older versions are still read. Version 1 only ever wrote
+        // codes 0 and 1 and version 2 never wrote the list code, and
+        // every code means in this version what it meant then, so the
+        // difference between the versions is which codes may appear
+        // rather than how any of them decodes.
+        if version > PROPS_VERSION || version == 0 {
             return Err(ZuError::Unsupported {
                 what: "props directory version",
                 id: u32::from(version),
@@ -420,13 +578,22 @@ impl PropsDirectory {
                 String::from_utf8(raw.to_vec()).map_err(|_| corrupt("name is not UTF-8".into()))?;
             pos += len;
             let ty = match bytes.get(pos) {
-                Some(&code) if version >= PROPS_VERSION || code <= 1 => {
-                    code_type(code).ok_or_else(|| corrupt(format!("unknown column type {code}")))?
-                }
-                Some(code) => {
+                Some(&code) if !code_allowed(code, version) => {
                     return Err(corrupt(format!(
                         "column type {code} in a version {version} directory"
                     )));
+                }
+                Some(&LIST_CODE) => {
+                    pos += 1;
+                    let elem = bytes
+                        .get(pos)
+                        .ok_or_else(|| corrupt("truncated list element type".into()))?;
+                    let elem = code_type(*elem)
+                        .ok_or_else(|| corrupt(format!("unknown element type {elem}")))?;
+                    list_of(elem)
+                }
+                Some(&code) => {
+                    code_type(code).ok_or_else(|| corrupt(format!("unknown column type {code}")))?
                 }
                 None => return Err(corrupt("truncated column type".into())),
             };
@@ -493,18 +660,34 @@ pub fn store_props(
         // brings properties leaves the optimizer able to reason about
         // them, without anyone remembering to ANALYZE (perf/12 §1).
         let ty = values.ty();
-        if type_code(&ty).is_none() {
+        if type_bytes(&ty).is_none() {
             return Err(ZuError::InvalidArgument(format!(
                 "column '{name}' has type {ty}, which is not storable as a property"
             )));
         }
+        // A list column is encoded here rather than by its caller, so
+        // the row format has one writer and one reader and they sit
+        // next to each other.
+        let encoded: Vec<Vec<u8>> = match values {
+            PropValues::List { elem, rows } => rows
+                .iter()
+                .map(|items| encode_list_row(list_elem(elem).expect("storable"), items))
+                .collect::<Result<_>>()?,
+            _ => Vec::new(),
+        };
+        let blobs: Vec<&[u8]> = encoded.iter().map(|b| &b[..]).collect();
         let stat = match values.keys() {
             Some(keys) => {
-                let refs: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
-                stats::column_stats(&refs)
+                let keys: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
+                stats::column_stats(&keys)
             }
+            // A list column's statistics are built over its encoded
+            // rows, which counts distinct lists correctly and gives a
+            // range no comparison asks about, since a list column is
+            // not a column anything ranges over.
             None => match values {
                 PropValues::Str(v) | PropValues::Bytes(v) => stats::column_stats(v),
+                PropValues::List { .. } => stats::column_stats(&blobs),
                 _ => unreachable!("every fixed width column has lane keys"),
             },
         };
@@ -512,6 +695,7 @@ pub fn store_props(
         let meta = match (values.lane(), values) {
             (Some(words), _) => write_segment(db, &words)?,
             (None, PropValues::Str(v) | PropValues::Bytes(v)) => write_blob_segment(db, v)?,
+            (None, PropValues::List { .. }) => write_blob_segment(db, &blobs)?,
             (None, _) => unreachable!("every variable width column is a blob"),
         };
         cols.push(PropColumn {
@@ -1183,7 +1367,10 @@ mod tests {
         // any bytes of the two columns' meaning.
         let again = PropsDirectory::decode(&dir.encode()).unwrap();
         assert_eq!(again, dir);
-        assert_eq!(u16::from_le_bytes(dir.encode()[..2].try_into().unwrap()), 2);
+        assert_eq!(
+            u16::from_le_bytes(dir.encode()[..2].try_into().unwrap()),
+            PROPS_VERSION
+        );
     }
 
     /// Encoded length of a segment meta, so the version 1 test can find
@@ -1192,6 +1379,194 @@ mod tests {
         let mut out = Vec::new();
         meta.encode(&mut out);
         out.len()
+    }
+
+    /// A list column is stored, read back, and its element type comes
+    /// back with it. The element type is the whole point of the second
+    /// code: without it a reader has a run of bytes and no way to say
+    /// whether it is words or lengths.
+    #[test]
+    fn a_list_column_round_trips_with_its_element_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let int = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B64,
+            precision: None,
+        };
+        let text = LogicalType::Str {
+            min: None,
+            max: None,
+            fixed: false,
+        };
+        let words: Vec<Vec<ListElement>> = vec![
+            vec![ListElement::Word(1), ListElement::Word(u64::MAX)],
+            vec![],
+            vec![ListElement::Word(0)],
+            vec![ListElement::Word(9); 300],
+        ];
+        let blobs: Vec<Vec<ListElement>> = vec![
+            vec![ListElement::Blob(b"")],
+            vec![ListElement::Blob(b"one"), ListElement::Blob(b"two")],
+            vec![],
+            vec![ListElement::Blob(&[0xff; 4096])],
+        ];
+        let word_rows: Vec<&[ListElement]> = words.iter().map(|r| r.as_slice()).collect();
+        let blob_rows: Vec<&[ListElement]> = blobs.iter().map(|r| r.as_slice()).collect();
+        let directory = store_props(
+            &mut db,
+            "person",
+            &[
+                (
+                    "xs",
+                    PropValues::List {
+                        elem: &int,
+                        rows: &word_rows,
+                    },
+                ),
+                (
+                    "tags",
+                    PropValues::List {
+                        elem: &text,
+                        rows: &blob_rows,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(directory.columns[0].ty, list_of(int.clone()));
+        assert_eq!(directory.columns[1].ty, list_of(text.clone()));
+        assert!(!directory.columns[0].is_lane());
+        assert_eq!(
+            PropsDirectory::decode(&directory.encode()).unwrap(),
+            directory
+        );
+
+        let mut reader = PropsReader::new(directory);
+        let mut buf = Vec::new();
+        for (col, elem, want) in [(0usize, &int, &words), (1, &text, &blobs)] {
+            for (row, items) in want.iter().enumerate() {
+                buf.clear();
+                reader.read_str(&mut db, col, row as u64, &mut buf).unwrap();
+                assert_eq!(&list_elements(elem, &buf).unwrap(), items, "row {row}");
+            }
+        }
+    }
+
+    /// The element type says what a row's bytes are, so an element of
+    /// the other shape is refused at store time rather than written as
+    /// something no read takes apart the same way.
+    #[test]
+    fn an_element_of_the_wrong_shape_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let int = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B64,
+            precision: None,
+        };
+        let rows: Vec<&[ListElement]> = vec![&[ListElement::Blob(b"x")], &[], &[], &[]];
+        assert!(
+            store_props(
+                &mut db,
+                "person",
+                &[(
+                    "xs",
+                    PropValues::List {
+                        elem: &int,
+                        rows: &rows,
+                    },
+                )],
+            )
+            .is_err()
+        );
+        // A list of lists has no row format and no second element code,
+        // so it is refused as a column type outright.
+        let nested = list_of(int);
+        let rows: Vec<&[ListElement]> = vec![&[], &[], &[], &[]];
+        assert!(
+            store_props(
+                &mut db,
+                "person",
+                &[(
+                    "xs",
+                    PropValues::List {
+                        elem: &nested,
+                        rows: &rows,
+                    },
+                )],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_overlong_list_row_is_refused() {
+        let int = LogicalType::Int {
+            signed: true,
+            bits: IntBits::B64,
+            precision: None,
+        };
+        let text = LogicalType::Str {
+            min: None,
+            max: None,
+            fixed: false,
+        };
+        let good = encode_list_row(&int, &[ListElement::Word(3), ListElement::Word(4)]).unwrap();
+        assert_eq!(
+            list_elements(&int, &good).unwrap(),
+            vec![ListElement::Word(3), ListElement::Word(4)]
+        );
+        for len in 0..good.len() {
+            assert!(list_elements(&int, &good[..len]).is_err(), "prefix {len}");
+        }
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(list_elements(&int, &trailing).is_err());
+        // A count no payload can hold must not size an allocation, and
+        // reading a list of words as a list of strings must not read a
+        // length out of a value.
+        let mut hostile = good.clone();
+        hostile[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(list_elements(&int, &hostile).is_err());
+        assert!(list_elements(&text, &good).is_err());
+    }
+
+    /// A version 2 directory holds every code but the list one, and a
+    /// list code in one is a file that neither version wrote.
+    #[test]
+    fn a_list_code_in_a_version_2_directory_is_refused() {
+        let meta = SegmentMeta {
+            value_count: 1,
+            payload_len: 8,
+            uncompressed_bytes: 8,
+            min: 0,
+            max: 0,
+            crc: 0,
+            structural: crate::segment::Structural::MiniBlock,
+            sorted: false,
+            blocks: vec![7],
+        };
+        let mut old = Vec::new();
+        old.extend_from_slice(&2u16.to_le_bytes());
+        old.extend_from_slice(&1u64.to_le_bytes());
+        old.extend_from_slice(&1u32.to_le_bytes());
+        old.extend_from_slice(&1u16.to_le_bytes());
+        old.extend_from_slice(b"x");
+        old.push(LIST_CODE);
+        old.push(1);
+        meta.encode(&mut old);
+        assert!(PropsDirectory::decode(&old).is_err());
+        old[0] = 3;
+        let dir = PropsDirectory::decode(&old).unwrap();
+        assert_eq!(
+            dir.columns[0].ty,
+            list_of(LogicalType::Int {
+                signed: true,
+                bits: IntBits::B64,
+                precision: None
+            })
+        );
     }
 
     #[test]

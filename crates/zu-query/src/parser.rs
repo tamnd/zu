@@ -922,6 +922,10 @@ impl Parser<'_> {
         if self.eat_kw("RECORD") {
             return Ok(LogicalType::Record(self.parse_record_type()?));
         }
+        // GV50, written in front of its element type.
+        if self.at_list_name() {
+            return self.parse_list_type(None);
+        }
         let mut name = match self.peek() {
             Some(Token {
                 kind: TokenKind::Ident(s),
@@ -967,7 +971,68 @@ impl Parser<'_> {
                 ),
             )
         })?;
+        // GV50 again, written after its element type. `INT LIST` and
+        // `LIST<INT>` are one type asked for two ways, so the postfix
+        // spelling is read here rather than given a branch of its own.
+        if self.at_list_name() {
+            return self.parse_list_type(Some(ty));
+        }
         Ok(ty)
+    }
+
+    /// Whether a list type name starts here.
+    ///
+    /// `LIST` and `ARRAY` are the same type spelled twice, and `GROUP`
+    /// in front of either is the spelling an aggregation uses, which
+    /// names the same type as well.
+    fn at_list_name(&self) -> bool {
+        let named = |offset: usize| {
+            matches!(
+                self.tokens.get(self.pos + offset),
+                Some(Token {
+                    kind: TokenKind::Ident(s),
+                    ..
+                }) if s.eq_ignore_ascii_case("LIST") || s.eq_ignore_ascii_case("ARRAY")
+            )
+        };
+        named(0) || (self.at_kw("GROUP") && named(1))
+    }
+
+    /// A list type, GV50, from either of its two spellings.
+    ///
+    /// `elem` is the element type when it was written in front, as in
+    /// `INT LIST`, and `None` when the name came first and the element
+    /// type is either inside the angle brackets or not written at all.
+    /// A list type with no element type admits a list of anything, and
+    /// an element type is nullable unless it says otherwise, which is
+    /// why `[1, null] IS TYPED LIST<INT>` is true and the question a
+    /// query usually means to ask is `LIST<INT NOT NULL>`.
+    fn parse_list_type(&mut self, elem: Option<LogicalType>) -> Result<LogicalType> {
+        self.eat_kw("GROUP");
+        self.pos += 1;
+        let elem = match elem {
+            Some(ty) => LogicalType::Nullable(Box::new(ty)),
+            None if self.eat(&TokenKind::Lt) => {
+                let ty = self.parse_value_type()?;
+                self.expect(&TokenKind::Gt)?;
+                ty
+            }
+            None => LogicalType::Any,
+        };
+        // The one constraint a list type carries is a maximum length,
+        // and it is a count rather than an expression for the same
+        // reason a string's length is.
+        let max = if self.eat(&TokenKind::LParen) {
+            let n = self.parse_type_argument()?;
+            self.expect(&TokenKind::RParen)?;
+            Some(n)
+        } else {
+            None
+        };
+        Ok(LogicalType::List {
+            elem: Box::new(elem),
+            max,
+        })
     }
 
     /// The fields of a record type, GV46, or no fields at all.

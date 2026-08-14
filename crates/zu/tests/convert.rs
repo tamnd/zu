@@ -388,3 +388,146 @@ fn a_boolean_column_survives_the_sqlite_hop_on_its_declaration() {
         );
     }
 }
+
+/// A list column crosses sqlite as a JSON array in a text column, so
+/// the declaration carries the element type and the text carries the
+/// elements. Both have to survive, in both directions, or a fixture
+/// staged with a list loads as a column of strings that happen to look
+/// like arrays.
+#[test]
+fn a_list_column_survives_both_hops_with_its_element_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    // The empty list, one holding a quote and a backslash, and one
+    // holding a float whose shortest spelling is not its literal, are
+    // the three the encoding is most likely to be wrong about.
+    let xs = [
+        "[1,2,3]",
+        "[]",
+        "[-9223372036854775808]",
+        "[0]",
+        "[7,7]",
+        "[42]",
+    ];
+    let tags = [
+        r#"["a","b"]"#,
+        r#"[]"#,
+        r#"["say \"hi\"","back\\slash"]"#,
+        r#"["héllo"]"#,
+        r#"[""]"#,
+        r#"["z"]"#,
+    ];
+    let scores = ["[0.1]", "[]", "[1.5,-0.25]", "[1e300]", "[0.0]", "[-0.0]"];
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table(
+        "person",
+        &[
+            ("xs", ColumnType::IntegerList),
+            ("tags", ColumnType::TextList),
+            ("scores", ColumnType::RealList),
+        ],
+    )
+    .unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
+    sq.begin().unwrap();
+    for row in 0..6usize {
+        sq.insert_node_at(
+            "person",
+            row as i64,
+            &[
+                SqlValue::Text(xs[row].to_string()),
+                SqlValue::Text(tags[row].to_string()),
+                SqlValue::Text(scores[row].to_string()),
+            ],
+        )
+        .unwrap();
+    }
+    for &(src, dst) in &EDGES {
+        sq.insert_rel("knows", i64::from(src), i64::from(dst), &[])
+            .unwrap();
+    }
+    sq.commit().unwrap();
+    drop(sq);
+
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut zu = Zu1File::open(&b).unwrap();
+    let got = run_zu1(
+        "MATCH (p:person) RETURN CARDINALITY(p.xs) + CARDINALITY(p.tags) AS n ORDER BY n",
+        &mut zu,
+        &[],
+    )
+    .unwrap();
+    let read: Vec<i64> = got
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            zu::query::Value::Int(v) => v,
+            ref other => panic!("expected a count, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(read, vec![0, 2, 2, 3, 3, 5]);
+    let got = run_zu1(
+        "MATCH (p:person) WHERE p.id = 2 RETURN p.tags AS v",
+        &mut zu,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        got.rows[0][0],
+        zu::query::Value::List(vec![
+            zu::query::Value::Str("say \"hi\"".into()),
+            zu::query::Value::Str("back\\slash".into()),
+        ])
+    );
+
+    // Back out again the declarations have to come back as they went
+    // in, and the arrays have to be the arrays that were staged rather
+    // than a reformatting of them.
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    assert_eq!(
+        back.node_column_types("person").unwrap(),
+        vec![
+            ("xs".to_string(), ColumnType::IntegerList),
+            ("tags".to_string(), ColumnType::TextList),
+            ("scores".to_string(), ColumnType::RealList),
+        ]
+    );
+    for row in 0..6i64 {
+        let SqlValue::Text(got) = back.read_node_prop("person", row, "scores").unwrap() else {
+            panic!("a list column comes back as text");
+        };
+        // The float column is compared by value rather than by spelling,
+        // because a shortest round trip spelling is not the spelling the
+        // fixture happened to write.
+        let want: Vec<f64> = scores[row as usize]
+            .trim_matches(['[', ']'])
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let read: Vec<f64> = got
+            .trim_matches(['[', ']'])
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(read.len(), want.len(), "row {row}: {got}");
+        for (r, w) in read.iter().zip(&want) {
+            assert_eq!(r.to_bits(), w.to_bits(), "row {row}: {got}");
+        }
+        assert_eq!(
+            back.read_node_prop("person", row, "xs").unwrap(),
+            SqlValue::Text(xs[row as usize].to_string())
+        );
+        assert_eq!(
+            back.read_node_prop("person", row, "tags").unwrap(),
+            SqlValue::Text(tags[row as usize].to_string())
+        );
+    }
+}

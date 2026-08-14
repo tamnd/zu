@@ -38,11 +38,43 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
         LogicalType::Float { bits, .. } => to_float(v, *bits),
         LogicalType::Decimal { precision, scale } => to_decimal(v, *precision, *scale),
         LogicalType::Str { min, max, .. } => to_str(v, *min, *max),
+        LogicalType::List { elem, max } => to_list(v, elem, *max),
         other => Err(ZuError::gql(
             codes::C22G03,
             format!("casting to '{other}' is not implemented"),
         )),
     }
+}
+
+/// A cast to a list type is the elementwise cast, GV50.
+///
+/// The two conditions ISO names for it are the two ways it fails, and
+/// they are different failures worth telling apart: `22G0B` is the
+/// list being longer than the target's maximum, which is a fact about
+/// the list, and `22G0C` is one element not casting, which is a fact
+/// about that element and carries the element's own condition in its
+/// message. Only a list casts to a list; nothing here wraps a single
+/// value into a list of one, because that would make a typo into a
+/// silent success.
+fn to_list(v: Value, elem: &LogicalType, max: Option<u32>) -> Result<Value> {
+    let Value::List(items) = v else {
+        return Err(not_castable(&v, "a list"));
+    };
+    if let Some(limit) = max
+        && items.len() > limit as usize
+    {
+        return Err(ZuError::gql(
+            codes::C22G0B,
+            format!("a list of {} does not fit a list of {limit}", items.len()),
+        ));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (at, item) in items.into_iter().enumerate() {
+        let cast = cast(item, elem)
+            .map_err(|e| ZuError::gql(codes::C22G0C, format!("element {at} of the list: {e}")))?;
+        out.push(cast);
+    }
+    Ok(Value::List(out))
 }
 
 /// `22018 invalid character value for cast`, the condition for a value

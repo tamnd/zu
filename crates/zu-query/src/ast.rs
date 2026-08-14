@@ -148,6 +148,14 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// `expr IS TYPED type`, ISO's GA06. The answer is a boolean and
+    /// never a null, including when the value is one, because asking
+    /// whether a null is of a nullable type has an answer.
+    IsTyped {
+        expr: Box<Expr>,
+        ty: LogicalType,
+        negated: bool,
+    },
     /// `count(*)` is `star` with empty `args`.
     Call {
         name: String,

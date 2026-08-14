@@ -22,4 +22,5 @@ pub mod parser;
 pub mod plan;
 pub mod recursive;
 pub mod snapshot;
+pub mod typed;
 pub mod value_type;

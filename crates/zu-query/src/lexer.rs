@@ -56,6 +56,10 @@ pub enum TokenKind {
     Gt,
     Ge,
     Pipe,
+    /// `&`, the label expression conjunction.
+    Amp,
+    /// `!`, the label expression negation.
+    Bang,
 }
 
 impl TokenKind {
@@ -91,6 +95,8 @@ impl TokenKind {
             TokenKind::Gt => "'>'".into(),
             TokenKind::Ge => "'>='".into(),
             TokenKind::Pipe => "'|'".into(),
+            TokenKind::Amp => "'&'".into(),
+            TokenKind::Bang => "'!'".into(),
         }
     }
 }
@@ -180,6 +186,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
             b'^' => tokens.push(single(TokenKind::Caret)),
             b'=' => tokens.push(single(TokenKind::Eq)),
             b'|' => tokens.push(single(TokenKind::Pipe)),
+            b'&' => tokens.push(single(TokenKind::Amp)),
+            b'!' => tokens.push(single(TokenKind::Bang)),
             b'<' => {
                 let (kind, len) = match bytes.get(ix + 1) {
                     Some(b'=') => (TokenKind::Le, 2),

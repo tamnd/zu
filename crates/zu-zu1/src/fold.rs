@@ -238,6 +238,19 @@ fn fold_props(
     };
     let mut columns = Vec::with_capacity(dir.columns.len());
     for (ci, col) in dir.columns.iter().enumerate() {
+        // A fold rewrites a column out of its old values and the cells
+        // the overlay holds, and an overlay cell is a word or a byte
+        // string and never an absence. There is no way to say here
+        // whether an appended row of a nullable column holds a value,
+        // so the fold refuses rather than deciding for it. Nothing
+        // writes a property yet, so nothing reaches this; the write
+        // statements of G3 are what has to answer it.
+        if col.validity.is_some() {
+            return Err(ZuError::Unsupported {
+                what: "folding an overlay into a column that holds a null",
+                id: table,
+            });
+        }
         // The fold splits the way storage does, on the lane against
         // the blob, because that is what it rewrites. Cells the overlay
         // holds are words or byte strings and the column's type says
@@ -280,6 +293,7 @@ fn fold_props(
             name: col.name.clone(),
             ty: col.ty.clone(),
             meta,
+            validity: None,
         });
     }
     free_props(db, root)?;

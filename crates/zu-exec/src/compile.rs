@@ -3,13 +3,13 @@
 //! the old executor.
 //!
 //! The supported shape today is the linear read pipeline: a single
-//! non-optional node scan, filters, single-hop expands that walk off
-//! the newest level or off a level below it, and one final Project or
+//! plain node scan, filters, single-hop expands that walk off the
+//! newest level or off a level below it, and one final Project or
 //! Aggregate with its absorbed Distinct, Sort, Skip, and Limit. A hop
 //! off a lower level is the second pattern branch, the shape two
 //! patterns sharing a variable compile to, and it pairs every row of
 //! the newest level with the whole of the pinned one. Everything the old
-//! executor also covers, variable-length expands, optional groups,
+//! executor also covers, variable-length expands, bracketed groups,
 //! closing joins, unwind, table functions, and rel values, falls back.
 //! The bar for anything compiled here is exact old-engine output:
 //! same rows, same order, same errors on overflow.
@@ -292,7 +292,7 @@ impl ScalarRef {
 pub(crate) enum AggSpec {
     CountStar,
     /// count(x) for x that cannot be null here: dense property columns
-    /// and non-optional nodes. Counts exactly like star.
+    /// and unbracketed nodes. Counts exactly like star.
     CountRef(ScalarRef),
     Sum(ScalarRef),
     Min(ScalarRef),
@@ -615,9 +615,9 @@ struct Compiler<'a> {
     /// it. A key on a level a walk made is a shape the compiler does
     /// not reach: the plan puts that walk under the tie, hanging off a
     /// pattern still held, and the pipeline declines before any of this
-    /// runs. Levels made inside an optional bracket are left out on
-    /// purpose, since dropping a row of one of those is dropping a
-    /// match the bracket has to keep as a miss.
+    /// runs. Levels made inside a bracket are left out on purpose,
+    /// since dropping a row of one of those is dropping a match the
+    /// bracket has to keep as a miss.
     sip_at: HashMap<usize, usize>,
     /// The level an OPTIONAL MATCH group introduced, once one is open.
     /// It is the level that binds null on a miss, so the sink is held
@@ -739,7 +739,7 @@ impl Compiler<'_> {
         let (table, scan_slot) = match it.next() {
             Some(LogicalPlan::ScanNodes {
                 slot,
-                optional: None,
+                bracket: None,
                 ..
             }) => {
                 let tables = &self.query.variables[*slot].node_tables;
@@ -767,7 +767,7 @@ impl Compiler<'_> {
             // table once per element.
             let Some(LogicalPlan::Filter {
                 expr,
-                optional: None,
+                bracket: None,
                 ..
             }) = it.peek()
             else {
@@ -784,7 +784,7 @@ impl Compiler<'_> {
             seeks = Some(keys);
         } else if let Some(LogicalPlan::Filter {
             expr,
-            optional: None,
+            bracket: None,
             ..
         }) = it.peek()
             && let Some(key) = id_point(expr, scan_slot)
@@ -843,7 +843,7 @@ impl Compiler<'_> {
             match it.peek() {
                 Some(LogicalPlan::Filter {
                     expr,
-                    optional: None,
+                    bracket: None,
                     ..
                 }) => {
                     it.next();
@@ -880,7 +880,7 @@ impl Compiler<'_> {
                 // a cross product this pipeline has no shape for.
                 Some(LogicalPlan::ScanNodes {
                     slot,
-                    optional: None,
+                    bracket: None,
                     ..
                 }) => {
                     it.next();
@@ -902,9 +902,9 @@ impl Compiler<'_> {
                 // a dropped row.
                 Some(LogicalPlan::ScanNodes {
                     slot,
-                    optional: Some(group),
+                    bracket: Some(group),
                     ..
-                }) => {
+                }) if group.nulls_on_miss() => {
                     let group = *group;
                     let slot = *slot;
                     it.next();
@@ -917,7 +917,7 @@ impl Compiler<'_> {
                     let mut group_filters: Vec<&BoundExpr> = Vec::new();
                     while let Some(LogicalPlan::Filter {
                         expr,
-                        optional: Some(g),
+                        bracket: Some(g),
                         ..
                     }) = it.peek()
                     {
@@ -986,7 +986,7 @@ impl Compiler<'_> {
                     into: false,
                     asp: false,
                     wcoj: false,
-                    optional: None,
+                    bracket: None,
                     ..
                 }) => {
                     it.next();
@@ -1032,9 +1032,9 @@ impl Compiler<'_> {
                     direction,
                     range: None,
                     into: false,
-                    optional: Some(group),
+                    bracket: Some(group),
                     ..
-                }) => {
+                }) if group.nulls_on_miss() => {
                     it.next();
                     let Some(&src) = self.slot_level.get(from) else {
                         return Ok(None);
@@ -1075,7 +1075,7 @@ impl Compiler<'_> {
                     // to sit above the expand and below the bracket.
                     while let Some(LogicalPlan::Filter {
                         expr,
-                        optional: Some(g),
+                        bracket: Some(g),
                         ..
                     }) = it.peek()
                     {
@@ -1104,7 +1104,7 @@ impl Compiler<'_> {
                     range: None,
                     into: true,
                     wcoj: true,
-                    optional: None,
+                    bracket: None,
                     ..
                 }) => {
                     // Filters the optimizer pushed onto the closing
@@ -1144,7 +1144,7 @@ impl Compiler<'_> {
                     range: None,
                     into: true,
                     wcoj: false,
-                    optional: None,
+                    bracket: None,
                     ..
                 }) => {
                     let Some(op) = self.close_semi(*rel, *from, *to, *direction) else {
@@ -1403,7 +1403,7 @@ impl Compiler<'_> {
             SinkSpec::Count => true,
             // A bracket's level binds one invalid row on a miss, and a
             // degree read off it would be row zero's degree rather than
-            // nothing, so an optional keeps its walk.
+            // nothing, so a bracket keeps its walk.
             SinkSpec::Agg { .. } => self.optional_level.is_none(),
             SinkSpec::CountDistinct { .. } | SinkSpec::Rows { .. } => false,
         };
@@ -1484,8 +1484,8 @@ impl Compiler<'_> {
                 // on are read at that level's pin instead of over a
                 // vector of rows, which the runner does and a bracket
                 // does not: its level binds an invalid row on a miss and
-                // a degree read off that would answer row zero's. So an
-                // optional puts the expands back and walks them.
+                // a degree read off that would answer row zero's, so the
+                // bracket puts the expands back and walks them.
                 if from != newest_after && self.optional_level.is_some() {
                     steps.clear();
                     while let Some(op) = taken.pop() {
@@ -1508,7 +1508,7 @@ impl Compiler<'_> {
         // is built on, or off a level below it, which is a branch and
         // runs as one. The bracket is the exception: a branch under it
         // would walk off a level whose pin the miss path rewrites, so
-        // an optional keeps the old rule and falls back.
+        // a bracket keeps the old rule and falls back.
         let bracketed = self.optional_level.is_some();
         let mut newest = 0;
         for op in &mut ops {

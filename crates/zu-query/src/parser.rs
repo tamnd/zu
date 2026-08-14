@@ -816,6 +816,13 @@ impl Parser<'_> {
             self.expect(&TokenKind::RBracket)?;
             return Ok(Expr::Path(elements));
         }
+        // EXISTS carries a match rather than an expression, so it is
+        // taken here for the same reason CAST is below: no expression
+        // grammar produces a pattern. A brace has to follow, which
+        // leaves `exists` free to be an ordinary variable name.
+        if name.eq_ignore_ascii_case("EXISTS") && self.at(&TokenKind::LBrace) {
+            return self.parse_exists();
+        }
         if !self.at(&TokenKind::LParen) {
             return Ok(Expr::Variable(name));
         }
@@ -828,6 +835,27 @@ impl Parser<'_> {
         } else {
             self.parse_call(name)
         }
+    }
+
+    /// `EXISTS { MATCH (a)-[:knows]->(b) WHERE b.id > 10 }`, the brace
+    /// unconsumed and EXISTS already read.
+    ///
+    /// The MATCH is optional because the block holds one and can hold
+    /// nothing else, so writing it is a courtesy to the reader rather
+    /// than something the parser needs. Everything a full MATCH may say
+    /// after the patterns is refused here: an ORDER BY or a LIMIT
+    /// inside a predicate would be sorting and cutting a set whose only
+    /// use is whether it is empty.
+    fn parse_exists(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LBrace)?;
+        self.eat_kw("MATCH");
+        let mut patterns = vec![self.parse_path()?];
+        while self.eat(&TokenKind::Comma) {
+            patterns.push(self.parse_path()?);
+        }
+        let filter = self.parse_where()?.map(Box::new);
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Expr::Exists { patterns, filter })
     }
 
     /// `DATE '2024-01-15'` and the rest, the type name already read.
@@ -1515,6 +1543,66 @@ mod tests {
         parse(&format!("MATCH (n) WHERE {nots}true RETURN n")).expect("NOT chain parses");
         let minuses = "-".repeat(5000);
         parse(&format!("RETURN {minuses}1")).expect("minus chain parses");
+    }
+
+    #[test]
+    fn exists_blocks_parse() {
+        let q = parsed(
+            "MATCH (a:Person) \
+             WHERE EXISTS { MATCH (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c) WHERE c.id > 3 } \
+             RETURN a.id AS id",
+        );
+        let Clause::Match { filter, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        let Some(Expr::Exists { patterns, filter }) = filter else {
+            panic!("the WHERE is the block itself, got {filter:?}");
+        };
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[1].start.var.as_deref(), Some("b"));
+        assert!(filter.is_some(), "the block's own WHERE came with it");
+    }
+
+    #[test]
+    fn exists_takes_a_bare_pattern_and_a_not() {
+        // MATCH inside the braces is a courtesy to the reader, and NOT
+        // in front is an ordinary unary over the block.
+        let q = parsed("MATCH (a) WHERE NOT EXISTS { (a)-[:KNOWS]->(b) } RETURN a");
+        let Clause::Match { filter, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        let Some(Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        }) = filter
+        else {
+            panic!("NOT over the block, got {filter:?}");
+        };
+        let Expr::Exists { patterns, filter } = expr.as_ref() else {
+            panic!("EXISTS under the NOT");
+        };
+        assert_eq!(patterns.len(), 1);
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn exists_is_still_a_name_without_a_block() {
+        // Only a brace makes it the predicate, so a variable or a
+        // function of that name reads the way it always did.
+        let q = parsed("MATCH (exists:Person) RETURN exists.id AS id");
+        let Clause::Match { patterns, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        assert_eq!(patterns[0].start.var.as_deref(), Some("exists"));
+    }
+
+    #[test]
+    fn exists_refuses_what_a_predicate_cannot_use() {
+        assert!(parse_err("MATCH (a) WHERE EXISTS { RETURN 1 } RETURN a").contains("expected"));
+        assert!(
+            parse_err("MATCH (a) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) RETURN b } RETURN a")
+                .contains("expected")
+        );
     }
 
     #[test]

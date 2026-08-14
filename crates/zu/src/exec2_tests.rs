@@ -625,6 +625,16 @@ fn unclaimed_shapes_fall_back() {
          RETURN count(*) AS n",
         "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.name = a.name \
          RETURN count(*) AS n",
+        // An existence block is a bracket the pipeline has no operator
+        // for yet: its group answers once per outer row and hands
+        // nothing up, which is neither the left join nor the walk the
+        // optional bracket compiles into.
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 20 AND EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN a.id AS id ORDER BY id",
     ];
     for q in fallback_queries {
         falls_back(&mut db, &catalog, &schema, q);

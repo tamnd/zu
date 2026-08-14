@@ -123,8 +123,11 @@ fn casting_to_a_list_casts_the_elements_and_names_the_element_that_fails() {
         "22G0C"
     );
     // A scalar does not become a list of one. A cast that invented the
-    // brackets would turn a mistyped query into a quiet success.
-    assert_eq!(code(&mut db, "RETURN CAST(1 AS LIST<INT>) AS v"), "22018");
+    // brackets would turn a mistyped query into a quiet success. The
+    // condition is the one for a value of the wrong type and not the
+    // one for a string that spells its type badly, because an integer
+    // is not a list however it is written.
+    assert_eq!(code(&mut db, "RETURN CAST(1 AS LIST<INT>) AS v"), "22G03");
 }
 
 /// GF12 and GF13 are one count and two names, and the names are not

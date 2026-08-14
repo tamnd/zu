@@ -146,8 +146,24 @@ pub struct PathPattern {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodePattern {
     pub var: Option<String>,
-    pub labels: Vec<String>,
+    /// The label expression after the colon, `None` for a pattern that
+    /// names no label and therefore matches whatever it reaches.
+    pub label: Option<LabelExpr>,
     pub props: Vec<(String, Expr)>,
+}
+
+/// A label expression: names joined by `&` and `|`, negated with `!`,
+/// `%` for any label at all, and parentheses to group them. A second
+/// colon is the conjunction Cypher writes it as, so `(n:A:B)` and
+/// `(n:A&B)` are the same pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelExpr {
+    Label(String),
+    /// `%`, which every element satisfies: an element has a label.
+    Wildcard,
+    Not(Box<LabelExpr>),
+    And(Box<LabelExpr>, Box<LabelExpr>),
+    Or(Box<LabelExpr>, Box<LabelExpr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

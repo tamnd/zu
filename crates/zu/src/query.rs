@@ -1260,6 +1260,75 @@ mod tests {
     }
 
     #[test]
+    fn matches_a_node_by_a_label_expression() {
+        use crate::zu1::props::store_labels;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("label-exprs.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let edges = [(0u32, 1u32), (1, 2), (2, 3), (3, 0)];
+        graph::bulk_load_as(&mut db, "person", "knows", 4, &edges).expect("load");
+        store_labels(
+            &mut db,
+            "person",
+            &[
+                vec!["Employee"],
+                vec![],
+                vec!["Employee", "Manager"],
+                vec!["Manager"],
+            ],
+        )
+        .expect("labels");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let mut ids = |source: &str| {
+            run(source, &mut db, &[])
+                .expect("run")
+                .rows
+                .into_iter()
+                .map(|r| r[0].clone())
+                .collect::<Vec<Value>>()
+        };
+        // The conjunction the colon writes, written the other way.
+        assert_eq!(
+            ids("MATCH (n:Employee&Manager) RETURN n.id AS id"),
+            [Value::Int(2)]
+        );
+        assert_eq!(
+            ids("MATCH (n:Employee|Manager) RETURN n.id AS id ORDER BY id"),
+            [Value::Int(0), Value::Int(2), Value::Int(3)]
+        );
+        assert_eq!(
+            ids("MATCH (n:!Employee) RETURN n.id AS id ORDER BY id"),
+            [Value::Int(1), Value::Int(3)]
+        );
+        // Precedence: this is Employee or (Manager and not Employee),
+        // which is everything with either.
+        assert_eq!(
+            ids("MATCH (n:Employee|Manager&!Employee) RETURN n.id AS id ORDER BY id"),
+            [Value::Int(0), Value::Int(2), Value::Int(3)]
+        );
+        // And the parentheses say the other thing.
+        assert_eq!(
+            ids("MATCH (n:(Employee|Manager)&!Employee) RETURN n.id AS id"),
+            [Value::Int(3)]
+        );
+        // Every node carries its table's label, so `%` holds of all
+        // four and its negation of none.
+        assert_eq!(
+            ids("MATCH (n:%) RETURN n.id AS id ORDER BY id"),
+            [Value::Int(0), Value::Int(1), Value::Int(2), Value::Int(3)]
+        );
+        // The row with no secondary label at all is the one node that
+        // is a person and nothing else.
+        assert_eq!(
+            ids("MATCH (n:person&!Employee&!Manager) RETURN n.id AS id"),
+            [Value::Int(1)]
+        );
+    }
+
+    #[test]
     fn explain_analyze_profiles_a_real_zu1_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("analyze.zu1");

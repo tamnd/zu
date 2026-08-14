@@ -18,12 +18,23 @@ use zu_common::gqlstatus::codes;
 use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
-    self, BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, Projection, RelDirection,
-    RelPattern, Selector, SortKey, UnaryOp,
+    self, BinaryOp, Clause, Expr, LabelExpr, Literal, NodePattern, PathMode, Projection,
+    RelDirection, RelPattern, Selector, SortKey, UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
+}
+
+/// The label bits every row of every one of these node tables carries,
+/// which is what a label test may take as read. A table's own name is
+/// one such bit and is usually the only one, so this is empty as soon
+/// as two tables are in play.
+fn guaranteed(schema: &Schema, tables: &[u32]) -> u64 {
+    tables
+        .iter()
+        .filter_map(|id| schema.node_by_id(*id))
+        .fold(u64::MAX, |mask, n| mask & 1 << n.primary_label())
 }
 
 /// `42002 syntax error or access rule violation, invalid reference`: a
@@ -758,10 +769,157 @@ pub struct BoundNode {
     pub slot: usize,
     /// Inline `{key: expr}` equality predicates.
     pub props: Vec<(String, BoundExpr)>,
-    /// The label bits this occurrence asks for that the candidate
-    /// tables do not already guarantee, zero when the narrowing
-    /// answered the whole pattern.
-    pub labels: u64,
+    /// What is left of the occurrence's label expression once the
+    /// candidate tables have answered what they can, `None` when the
+    /// narrowing answered the whole of it.
+    pub label: Option<LabelTest>,
+}
+
+/// A compiled label expression: bit tests over the one word a row
+/// carries (docs/03 §1). The bits are dictionary ids, which are a
+/// property of the graph and not of any one table, so a test reads the
+/// same whichever table the row came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelTest {
+    /// Every bit of the mask is set. This is the conjunction the
+    /// common pattern compiles to, `(n:A)` and `(n:A:B)` alike, and
+    /// an empty mask is the test nothing fails.
+    All(u64),
+    /// GQL's `%`: the row carries a label, any label.
+    Any,
+    Not(Box<LabelTest>),
+    And(Box<LabelTest>, Box<LabelTest>),
+    Or(Box<LabelTest>, Box<LabelTest>),
+}
+
+impl LabelTest {
+    /// The answer the type alone gives for a table that declares
+    /// `declared` and gives every row bit `primary`, or `None` when the
+    /// answer is in the row and the type cannot reach it.
+    ///
+    /// This is three valued logic over the two masks: `AND` is false as
+    /// soon as one side is, `OR` is true as soon as one side is, and
+    /// everything else that touches an unknown is unknown.
+    pub fn constant(&self, declared: u64, primary: u64) -> Option<bool> {
+        match self {
+            // A bit the table never declares can never be set, and a
+            // bit every row carries is always set.
+            LabelTest::All(mask) if mask & !declared != 0 => Some(false),
+            LabelTest::All(mask) if mask & !primary == 0 => Some(true),
+            LabelTest::All(_) => None,
+            // Every row carries its own table's label.
+            LabelTest::Any => Some(true),
+            LabelTest::Not(inner) => inner.constant(declared, primary).map(|b| !b),
+            LabelTest::And(lhs, rhs) => {
+                match (
+                    lhs.constant(declared, primary),
+                    rhs.constant(declared, primary),
+                ) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            LabelTest::Or(lhs, rhs) => {
+                match (
+                    lhs.constant(declared, primary),
+                    rhs.constant(declared, primary),
+                ) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// The conjunction of two tests, merging masks so the common
+    /// pattern stays a single AND against the row's word.
+    pub fn and(lhs: LabelTest, rhs: LabelTest) -> LabelTest {
+        match (lhs, rhs) {
+            (LabelTest::All(a), LabelTest::All(b)) => LabelTest::All(a | b),
+            // An empty mask asks nothing, which is what a conjunct
+            // pruning has emptied out has become.
+            (LabelTest::All(0), other) | (other, LabelTest::All(0)) => other,
+            (lhs, rhs) => LabelTest::And(Box::new(lhs), Box::new(rhs)),
+        }
+    }
+
+    /// The test with the bits every candidate row is known to carry
+    /// taken out of it. Dropping a bit that is always set leaves the
+    /// same answer on every row those tables hold, which is what turns
+    /// `(n:Person&Employee)` over the Person table into a test for
+    /// Employee alone, and `(n:Person)` into no test at all.
+    pub fn prune(&self, guaranteed: u64) -> LabelTest {
+        match self {
+            LabelTest::All(mask) => LabelTest::All(mask & !guaranteed),
+            // Every node carries its own table's label, so asking
+            // whether it carries one is asking nothing.
+            LabelTest::Any => LabelTest::All(0),
+            LabelTest::Not(inner) => LabelTest::Not(Box::new(inner.prune(guaranteed))),
+            LabelTest::And(lhs, rhs) => {
+                LabelTest::and(lhs.prune(guaranteed), rhs.prune(guaranteed))
+            }
+            LabelTest::Or(lhs, rhs) => LabelTest::Or(
+                Box::new(lhs.prune(guaranteed)),
+                Box::new(rhs.prune(guaranteed)),
+            ),
+        }
+    }
+
+    /// Whether a row whose label word is `word` satisfies the test.
+    pub fn matches(&self, word: u64) -> bool {
+        match self {
+            LabelTest::All(mask) => word & mask == *mask,
+            LabelTest::Any => word != 0,
+            LabelTest::Not(inner) => !inner.matches(word),
+            LabelTest::And(lhs, rhs) => lhs.matches(word) && rhs.matches(word),
+            LabelTest::Or(lhs, rhs) => lhs.matches(word) || rhs.matches(word),
+        }
+    }
+
+    /// The test written the way a query would write it, for plan text
+    /// and error messages. `names` is the graph's label dictionary.
+    pub fn text(&self, names: &[String]) -> String {
+        self.text_at(names, 0)
+    }
+
+    /// `level` is the precedence of the position this sits in, so a
+    /// looser operator inside a tighter one gets its parentheses and
+    /// nothing else does: 0 is the top, 1 is inside an `|`, 2 is inside
+    /// an `&`, and 3 is under a `!`.
+    fn text_at(&self, names: &[String], level: u8) -> String {
+        let wrap = |text: String, own: u8| {
+            if level > own {
+                format!("({text})")
+            } else {
+                text
+            }
+        };
+        match self {
+            LabelTest::All(mask) => {
+                let parts: Vec<&str> = (0..u64::BITS as u16)
+                    .filter(|bit| mask & 1 << bit != 0)
+                    .map(|bit| names.get(usize::from(bit)).map_or("?", String::as_str))
+                    .collect();
+                if parts.is_empty() {
+                    "%".into()
+                } else {
+                    wrap(parts.join("&"), if parts.len() > 1 { 2 } else { 3 })
+                }
+            }
+            LabelTest::Any => "%".into(),
+            LabelTest::Not(inner) => format!("!{}", inner.text_at(names, 3)),
+            LabelTest::And(lhs, rhs) => wrap(
+                format!("{}&{}", lhs.text_at(names, 2), rhs.text_at(names, 2)),
+                2,
+            ),
+            LabelTest::Or(lhs, rhs) => wrap(
+                format!("{}|{}", lhs.text_at(names, 1), rhs.text_at(names, 1)),
+                1,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -919,13 +1077,13 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         ty: LogicalType,
     },
-    /// Whether the node in `slot` carries every label in `mask`, the
-    /// runtime half of a label set. The binder only plants one for the
-    /// bits a candidate table does not already guarantee, so a pattern
-    /// naming a table's own label compiles to no predicate at all.
+    /// Whether the node in `slot` satisfies a label expression, the
+    /// runtime half of a label set. The binder only plants one where
+    /// the candidate tables leave the answer open, so a pattern naming
+    /// a table's own label compiles to no predicate at all.
     HasLabels {
         slot: usize,
-        mask: u64,
+        test: LabelTest,
     },
 }
 
@@ -1039,6 +1197,9 @@ impl Binder<'_> {
                 for path in &bound {
                     self.narrow_path(path)?;
                 }
+                for path in &mut bound {
+                    self.settle_labels(path);
+                }
                 let filter = self.bind_where(filter)?;
                 Ok(BoundClause::Match {
                     kind: match optional {
@@ -1111,6 +1272,9 @@ impl Binder<'_> {
         }
         for path in &bound {
             self.narrow_path(path)?;
+        }
+        for path in &mut bound {
+            self.settle_labels(path);
         }
         let filter = match &block.filter {
             Some(expr) => Some(self.bind_bool(expr, "WHERE")?),
@@ -1396,40 +1560,42 @@ impl Binder<'_> {
     }
 
     fn bind_node(&mut self, pat: &NodePattern) -> Result<BoundNode> {
-        // A label set is a bitset: the pattern names bits, a table
-        // whose declared set is missing one of them can hold no row
-        // that satisfies the pattern and is dropped here, and what is
-        // left over after the table's own label is the runtime test.
-        let mut wanted = 0u64;
-        for label in &pat.labels {
-            let id = self
-                .schema
-                .label_id(label)
-                .ok_or_else(|| bad_reference(format!("unknown label '{label}'")))?;
-            wanted |= 1 << id;
+        // A label expression is bit tests over the word a row carries.
+        // Folding it against a table's declared set answers it outright
+        // for most tables: a table that cannot satisfy it is dropped
+        // here and a table that always satisfies it needs no test, so
+        // the runtime only sees what the schema left open.
+        let test = pat
+            .label
+            .as_ref()
+            .map(|expr| self.compile_label(expr))
+            .transpose()?;
+        let mut candidates = Vec::new();
+        let mut settled = true;
+        for node in &self.schema.nodes {
+            let answer = match &test {
+                None => Some(true),
+                Some(test) => test.constant(node.label_mask(), 1 << node.primary_label()),
+            };
+            if answer == Some(false) {
+                continue;
+            }
+            settled &= answer == Some(true);
+            candidates.push(node.id);
         }
-        let candidates: Vec<u32> = self
-            .schema
-            .nodes
-            .iter()
-            .filter(|n| n.label_mask() & wanted == wanted)
-            .map(|n| n.id)
-            .collect();
         if candidates.is_empty() {
+            let written = test
+                .as_ref()
+                .map_or(String::new(), |t| t.text(&self.schema.labels));
             return Err(invalid(format!(
-                "no node table declares every label on '{}'",
+                "no node table can satisfy the labels on '{}:{written}'",
                 pat.var.as_deref().unwrap_or("")
             )));
         }
-        // Every candidate carries its own label on every row, so the
-        // bits all of them guarantee need no test. With one candidate
-        // that is the whole of a single label pattern, which is why
-        // the common shape plans as a bare scan.
-        let guaranteed = candidates
-            .iter()
-            .filter_map(|id| self.schema.node_by_id(*id))
-            .fold(u64::MAX, |mask, n| mask & 1 << n.primary_label());
-        let residue = wanted & !guaranteed;
+        let residue = match settled {
+            true => None,
+            false => test.map(|test| test.prune(guaranteed(self.schema, &candidates))),
+        };
         let slot = match &pat.var {
             Some(name) => match self.scope.get(name).copied() {
                 Some(slot) => {
@@ -1471,8 +1637,60 @@ impl Binder<'_> {
         Ok(BoundNode {
             slot,
             props,
-            labels: residue,
+            label: residue,
         })
+    }
+
+    /// Resolves the names in a label expression to dictionary bits.
+    /// A conjunction of plain names collapses to one mask, which is the
+    /// shape almost every pattern has and the one the runtime answers
+    /// with a single AND.
+    fn compile_label(&self, expr: &LabelExpr) -> Result<LabelTest> {
+        Ok(match expr {
+            LabelExpr::Label(name) => {
+                let id = self
+                    .schema
+                    .label_id(name)
+                    .ok_or_else(|| bad_reference(format!("unknown label '{name}'")))?;
+                LabelTest::All(1 << id)
+            }
+            LabelExpr::Wildcard => LabelTest::Any,
+            LabelExpr::Not(inner) => LabelTest::Not(Box::new(self.compile_label(inner)?)),
+            LabelExpr::And(lhs, rhs) => {
+                match (self.compile_label(lhs)?, self.compile_label(rhs)?) {
+                    (LabelTest::All(a), LabelTest::All(b)) => LabelTest::All(a | b),
+                    (lhs, rhs) => LabelTest::And(Box::new(lhs), Box::new(rhs)),
+                }
+            }
+            LabelExpr::Or(lhs, rhs) => LabelTest::Or(
+                Box::new(self.compile_label(lhs)?),
+                Box::new(self.compile_label(rhs)?),
+            ),
+        })
+    }
+
+    /// Drops a label test the endpoint narrowing has since answered.
+    /// `bind_node` folds against every table in the graph, but a rel
+    /// type cuts the candidates down further, and a test every table
+    /// still standing satisfies is no test at all.
+    fn settle_labels(&self, path: &mut BoundPath) {
+        self.settle_node(&mut path.start);
+        for (_, node) in &mut path.steps {
+            self.settle_node(node);
+        }
+    }
+
+    fn settle_node(&self, node: &mut BoundNode) {
+        let Some(test) = &node.label else { return };
+        let tables = &self.variables[node.slot].node_tables;
+        let settled = tables
+            .iter()
+            .filter_map(|id| self.schema.node_by_id(*id))
+            .all(|n| test.constant(n.label_mask(), 1 << n.primary_label()) == Some(true));
+        node.label = match settled {
+            true => None,
+            false => Some(test.prune(guaranteed(self.schema, tables))),
+        };
     }
 
     fn bind_rel(
@@ -2659,24 +2877,103 @@ mod tests {
         // narrowing to that table answers the whole pattern.
         let q = bound("MATCH (n:Person) RETURN n");
         assert_eq!(var(&q, "n").node_tables, [0]);
-        assert_eq!(start_node(&q).labels, 0);
+        assert_eq!(start_node(&q).label, None);
         // A declared label is one some rows of the table carry, so the
         // tables narrow to the ones that declare it and the bit stays
         // as a test.
         let q = bound("MATCH (n:Employee) RETURN n");
         assert_eq!(var(&q, "n").node_tables, [0, 1]);
-        assert_eq!(start_node(&q).labels, 1 << 2);
+        assert_eq!(start_node(&q).label, Some(LabelTest::All(1 << 2)));
         // Both at once: Place does not declare Manager and drops out,
         // and Person's own label needs no test.
         let q = bound("MATCH (n:Person:Manager:Employee) RETURN n");
         assert_eq!(var(&q, "n").node_tables, [0]);
-        assert_eq!(start_node(&q).labels, 1 << 3 | 1 << 2);
+        assert_eq!(start_node(&q).label, Some(LabelTest::All(1 << 3 | 1 << 2)));
         // A label the graph does not have, and a set no table declares.
         assert!(bind_err("MATCH (n:Nope) RETURN n").contains("unknown label 'Nope'"));
         let err = bind(&parse("MATCH (n:Person:Place) RETURN n").unwrap(), &schema)
             .expect_err("no table is both")
             .to_string();
-        assert!(err.contains("no node table declares every label"), "{err}");
+        assert!(
+            err.contains("no node table can satisfy the labels"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_label_expression_folds_against_what_each_table_declares() {
+        let schema = labeled_schema();
+        let bound = |s: &str| bind(&parse(s).expect("parse"), &schema).expect("bind");
+        let all = |bits: u64| Some(LabelTest::All(bits));
+        // Neither table settles a negated secondary label, so both
+        // stay and the row answers.
+        let q = bound("MATCH (n:!Employee) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0, 1]);
+        assert_eq!(
+            start_node(&q).label,
+            Some(LabelTest::Not(Box::new(LabelTest::All(1 << 2))))
+        );
+        // A table's own label answers one side of the negation
+        // outright: Place declares no Person so every row of it is a
+        // non-Person, and Person's rows are all Person.
+        let q = bound("MATCH (n:!Person) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [1]);
+        assert_eq!(start_node(&q).label, None);
+        // A disjunction one table always satisfies and the other only
+        // sometimes keeps both tables and the test.
+        let q = bound("MATCH (n:Person|Employee) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0, 1]);
+        assert_eq!(
+            start_node(&q).label,
+            Some(LabelTest::Or(
+                Box::new(LabelTest::All(1)),
+                Box::new(LabelTest::All(1 << 2))
+            ))
+        );
+        // Every table satisfies one side or the other, so nothing is
+        // left to ask.
+        let q = bound("MATCH (n:Person|Place) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0, 1]);
+        assert_eq!(start_node(&q).label, None);
+        // A node has a label by construction, so `%` is no test, and
+        // it drops out of a conjunction the same way.
+        let q = bound("MATCH (n:%) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0, 1]);
+        assert_eq!(start_node(&q).label, None);
+        let q = bound("MATCH (n:%&Employee) RETURN n");
+        assert_eq!(start_node(&q).label, all(1 << 2));
+        // The table's own bit comes out of the mask because every row
+        // of the one table left carries it.
+        let q = bound("MATCH (n:Person&!Manager) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0]);
+        assert_eq!(
+            start_node(&q).label,
+            Some(LabelTest::Not(Box::new(LabelTest::All(1 << 3))))
+        );
+        // Nothing satisfies a negated wildcard, and the message says
+        // what was asked for.
+        let err = bind(&parse("MATCH (n:!%) RETURN n").unwrap(), &schema)
+            .expect_err("no table has no label")
+            .to_string();
+        assert!(
+            err.contains("no node table can satisfy the labels on 'n:!%'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rel_type_settles_a_label_the_pattern_alone_left_open() {
+        let schema = labeled_schema();
+        let bound = |s: &str| bind(&parse(s).expect("parse"), &schema).expect("bind");
+        // On its own this keeps both tables and a runtime test.
+        let q = bound("MATCH (n:Person|Employee) RETURN n");
+        assert!(start_node(&q).label.is_some());
+        // KNOWS runs Person to Person, so once the endpoint narrowing
+        // has dropped Place the disjunction is true on every row left
+        // and the test goes with it.
+        let q = bound("MATCH (n:Person|Employee)-[:KNOWS]->(m) RETURN n");
+        assert_eq!(var(&q, "n").node_tables, [0]);
+        assert_eq!(start_node(&q).label, None);
     }
 
     #[test]

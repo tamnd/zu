@@ -4316,10 +4316,10 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
         BoundExpr::Var(slot) => value_of(ctx, *slot),
-        BoundExpr::HasLabels { slot, mask } => match value_of(ctx, *slot)? {
+        BoundExpr::HasLabels { slot, test } => match value_of(ctx, *slot)? {
             Value::Node { table, offset } => {
                 let word = ctx.graph.labels(table, offset)?;
-                Ok(Value::Bool(word & mask == *mask))
+                Ok(Value::Bool(test.matches(word)))
             }
             // An unmatched optional row has no labels to test, and a
             // null predicate is what keeps its row.

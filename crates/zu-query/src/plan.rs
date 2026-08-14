@@ -355,13 +355,13 @@ fn label_filter(
     node: &crate::binder::BoundNode,
     bracket: Option<Bracket>,
 ) -> LogicalPlan {
-    match node.labels {
-        0 => plan,
-        mask => LogicalPlan::Filter {
+    match &node.label {
+        None => plan,
+        Some(test) => LogicalPlan::Filter {
             input: plan.boxed(),
             expr: BoundExpr::HasLabels {
                 slot: node.slot,
-                mask,
+                test: test.clone(),
             },
             bracket,
         },
@@ -611,17 +611,8 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::Literal(Literal::Temporal(t)) => t.to_string(),
         BoundExpr::Param(ix) => format!("${}", query.params[*ix]),
         BoundExpr::Var(slot) => slot_name(query, *slot).to_string(),
-        BoundExpr::HasLabels { slot, mask } => {
-            let names: Vec<&str> = (0..u64::BITS as u16)
-                .filter(|bit| mask & 1 << bit != 0)
-                .map(|bit| {
-                    query
-                        .labels
-                        .get(usize::from(bit))
-                        .map_or("?", String::as_str)
-                })
-                .collect();
-            format!("{}:{}", slot_name(query, *slot), names.join("&"))
+        BoundExpr::HasLabels { slot, test } => {
+            format!("{}:{}", slot_name(query, *slot), test.text(&query.labels))
         }
         BoundExpr::Property { base, key } => format!("{}.{key}", expr_text(base, query)),
         BoundExpr::Unary { op, expr } => match op {
@@ -921,10 +912,10 @@ mod tests {
                 id: 0,
                 name: "Person".into(),
                 node_count: 9000,
-                labels: vec![0, 1],
+                labels: vec![0, 1, 2],
             }],
             Vec::new(),
-            vec!["Person".into(), "Employee".into()],
+            vec!["Person".into(), "Employee".into(), "Manager".into()],
         )
         .expect("schema");
         let explained = |source: &str| {
@@ -940,6 +931,30 @@ mod tests {
             lines,
             ["Project n", "Filter n:Employee", "ScanNodes n: Person"],
             "got:\n{text}"
+        );
+        // An expression reads back the way it was written, with the
+        // parentheses the precedence needs and no others.
+        let filter = |source: &str| {
+            explained(source)
+                .lines()
+                .find(|l| l.trim_start().starts_with("Filter"))
+                .map(|l| l.trim_start().to_string())
+                .expect("a filter")
+        };
+        assert_eq!(filter("MATCH (n:!Employee) RETURN n"), "Filter n:!Employee");
+        assert_eq!(
+            filter("MATCH (n:!(Employee&Manager)) RETURN n"),
+            "Filter n:!(Employee&Manager)"
+        );
+        assert_eq!(
+            filter("MATCH (n:Employee|Manager&Person) RETURN n"),
+            "Filter n:Employee|Manager"
+        );
+        // The label every row carries comes out of the test wherever
+        // it sits, so this asks about Employee and nothing else.
+        assert_eq!(
+            filter("MATCH (n:!(Employee&Person)) RETURN n"),
+            "Filter n:!Employee"
         );
     }
 

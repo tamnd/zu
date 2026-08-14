@@ -19,7 +19,7 @@ use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
     self, BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, Projection, RelDirection,
-    RelPattern, Selector, UnaryOp,
+    RelPattern, Selector, SortKey, UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
@@ -547,7 +547,7 @@ pub enum BoundClause {
     Project {
         distinct: bool,
         items: Vec<BoundItem>,
-        order_by: Vec<(BoundExpr, bool)>,
+        order_by: Vec<SortKey<BoundExpr>>,
         skip: Option<BoundExpr>,
         limit: Option<BoundExpr>,
         filter: Option<BoundExpr>,
@@ -1062,10 +1062,10 @@ impl Binder<'_> {
 
         self.scope = order_scope;
         let mut order_by = Vec::new();
-        for (expr, ascending) in &projection.order_by {
+        for key in &projection.order_by {
             let mut ctx = ExprCtx::new(true);
-            let (bound, _) = self.bind_expr(expr, &mut ctx)?;
-            order_by.push((bound, *ascending));
+            let (bound, _) = self.bind_expr(&key.expr, &mut ctx)?;
+            order_by.push(key.with_expr(bound));
         }
         let skip = self.bind_count_limit(&projection.skip, "SKIP")?;
         let limit = self.bind_count_limit(&projection.limit, "LIMIT")?;

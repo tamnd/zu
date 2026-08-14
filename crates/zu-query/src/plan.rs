@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use zu_common::Result;
 
-use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, UnaryOp};
+use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 
 /// The hop range of a variable-length expand together with the path
@@ -108,7 +108,7 @@ pub enum LogicalPlan {
     },
     Sort {
         input: Box<LogicalPlan>,
-        keys: Vec<(BoundExpr, bool)>,
+        keys: Vec<SortKey<BoundExpr>>,
     },
     Skip {
         input: Box<LogicalPlan>,
@@ -484,11 +484,16 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
         LogicalPlan::Sort { input, keys } => {
             let rendered: Vec<String> = keys
                 .iter()
-                .map(|(expr, asc)| {
+                .map(|key| {
                     format!(
-                        "{} {}",
-                        expr_text(expr, query),
-                        if *asc { "ASC" } else { "DESC" }
+                        "{} {}{}",
+                        expr_text(&key.expr, query),
+                        if key.ascending { "ASC" } else { "DESC" },
+                        if key.nulls_first() {
+                            " NULLS FIRST"
+                        } else {
+                            ""
+                        }
                     )
                 })
                 .collect();

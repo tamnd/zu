@@ -13,8 +13,8 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, Clause, Expr, Literal, NodePattern, PathMode, PathPattern, Projection,
-    ProjectionItem, Query, RelDirection, RelPattern, Selector, UnaryOp,
+    BinaryOp, Clause, Expr, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection,
+    ProjectionItem, Query, RelDirection, RelPattern, Selector, SortKey, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -259,7 +259,25 @@ impl Parser<'_> {
                     self.eat_kw("ASCENDING");
                     true
                 };
-                order_by.push((expr, ascending));
+                // GA03. The direction and the null ordering are two
+                // independent halves of a sort specification, so DESC
+                // NULLS FIRST is a key sorted downwards whose nulls are
+                // still at the head.
+                let nulls = if self.eat_kw("NULLS") {
+                    if self.eat_kw("FIRST") {
+                        NullOrder::First
+                    } else {
+                        self.expect_kw("LAST")?;
+                        NullOrder::Last
+                    }
+                } else {
+                    NullOrder::default()
+                };
+                order_by.push(SortKey {
+                    expr,
+                    ascending,
+                    nulls,
+                });
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -1282,10 +1300,53 @@ mod tests {
         };
         assert!(projection.distinct);
         assert_eq!(projection.order_by.len(), 2);
-        assert!(!projection.order_by[0].1, "DESC");
-        assert!(projection.order_by[1].1, "implicit ASC");
+        assert!(!projection.order_by[0].ascending, "DESC");
+        assert!(projection.order_by[1].ascending, "implicit ASC");
+        // A key that says nothing about its nulls gets the implicit
+        // ordering, which zu documents as last.
+        assert!(
+            projection
+                .order_by
+                .iter()
+                .all(|key| key.nulls == NullOrder::Last)
+        );
         assert_eq!(projection.skip, Some(Expr::Literal(Literal::Int(2))));
         assert_eq!(projection.limit, Some(Expr::Literal(Literal::Int(10))));
+    }
+
+    #[test]
+    fn a_sort_key_says_where_its_nulls_go() {
+        let keys = |tail: &str| {
+            let q = parsed(&format!("MATCH (a) RETURN a.x AS x ORDER BY {tail}"));
+            let Clause::Return { projection } = q.clauses.last().expect("RETURN") else {
+                panic!("RETURN");
+            };
+            projection.order_by.clone()
+        };
+        // The two halves are independent, so all four pairings parse
+        // and neither half reads the other.
+        for (tail, ascending, nulls) in [
+            ("x", true, NullOrder::Last),
+            ("x NULLS FIRST", true, NullOrder::First),
+            ("x NULLS LAST", true, NullOrder::Last),
+            ("x DESC NULLS FIRST", false, NullOrder::First),
+            ("x DESCENDING NULLS LAST", false, NullOrder::Last),
+            ("x ASC NULLS FIRST", true, NullOrder::First),
+        ] {
+            let got = keys(tail);
+            assert_eq!(got.len(), 1, "{tail}");
+            assert_eq!(got[0].ascending, ascending, "{tail}");
+            assert_eq!(got[0].nulls, nulls, "{tail}");
+        }
+        // Each key in a list answers for itself.
+        let two = keys("x NULLS FIRST, a.y DESC");
+        assert_eq!(two[0].nulls, NullOrder::First);
+        assert_eq!(two[1].nulls, NullOrder::Last);
+        assert!(!two[1].ascending);
+        // NULLS is only a keyword in front of FIRST or LAST, and the
+        // word it wants is the one the error names.
+        let err = parse_err("MATCH (a) RETURN a.x AS x ORDER BY x NULLS SOMEWHERE");
+        assert!(err.contains("LAST"), "unexpected error: {err}");
     }
 
     #[test]

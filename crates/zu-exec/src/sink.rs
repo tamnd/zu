@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use zu_common::{Result, ZuError};
+use zu_query::ast::SortKey;
 use zu_query::exec::{OrdValue, QueryResult, Value};
 
 use crate::compile::{AggSpec, PostSpec};
@@ -247,7 +248,7 @@ const TOPN_FLOOR: usize = 64;
 /// The sort has to be the first step above the sink, because a dedup
 /// under it changes which rows the limit lands on, and the limit has
 /// to be one a worker can hold.
-pub(crate) fn topn_of(post: &[PostSpec]) -> Option<(&[(usize, bool)], usize)> {
+pub(crate) fn topn_of(post: &[PostSpec]) -> Option<(&[SortKey<usize>], usize)> {
     let PostSpec::Sort(keys) = post.first()? else {
         return None;
     };
@@ -281,7 +282,7 @@ pub(crate) struct Kept {
 /// that matters here; the buffer gets to reuse the comparator the full
 /// sort already uses rather than carry a second one.
 pub(crate) struct TopN {
-    keys: Vec<(usize, bool)>,
+    keys: Vec<SortKey<usize>>,
     need: usize,
     kept: Vec<Kept>,
     /// The key of the k-th best row so far, once k rows are in hand. A
@@ -291,7 +292,7 @@ pub(crate) struct TopN {
 }
 
 impl TopN {
-    pub(crate) fn new(keys: &[(usize, bool)], need: usize) -> TopN {
+    pub(crate) fn new(keys: &[SortKey<usize>], need: usize) -> TopN {
         TopN {
             keys: keys.to_vec(),
             need,
@@ -302,7 +303,7 @@ impl TopN {
 
     /// The columns a row has to produce before the buffer can judge it,
     /// in the order the key is built.
-    pub(crate) fn keys(&self) -> &[(usize, bool)] {
+    pub(crate) fn keys(&self) -> &[SortKey<usize>] {
         &self.keys
     }
 
@@ -358,7 +359,7 @@ impl TopN {
 /// key order and then in scan order, cut to k. The tie break is the
 /// order the materializing path would have stitched, so both paths
 /// return the same rows the same way round.
-pub(crate) fn merge_topn(keys: &[(usize, bool)], need: usize, tops: Vec<TopN>) -> Vec<Vec<Value>> {
+pub(crate) fn merge_topn(keys: &[SortKey<usize>], need: usize, tops: Vec<TopN>) -> Vec<Vec<Value>> {
     let mut kept: Vec<Kept> = tops
         .into_iter()
         .flat_map(|mut t| {
@@ -373,16 +374,44 @@ pub(crate) fn merge_topn(keys: &[(usize, bool)], need: usize, tops: Vec<TopN>) -
 
 /// Two sort keys compared the way the ORDER BY reads them. The values
 /// are already in key order, so the column each one came from is spent
-/// and only the direction is left.
-fn key_order(keys: &[(usize, bool)], a: &[Value], b: &[Value]) -> Ordering {
-    for (at, &(_, asc)) in keys.iter().enumerate() {
-        let ord = val_cmp(&a[at], &b[at]);
-        let ord = if asc { ord } else { ord.reverse() };
+/// and the direction and the null placement are what is left.
+fn key_order(keys: &[SortKey<usize>], a: &[Value], b: &[Value]) -> Ordering {
+    for (at, key) in keys.iter().enumerate() {
+        let ord = one_key(key, &a[at], &b[at]);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
+}
+
+/// Two values compared the way one ORDER BY key reads them.
+///
+/// A null sits outside the direction: NULLS FIRST is the head of the
+/// result and not the small end of the order, so a descending key with
+/// NULLS FIRST still leads with its nulls. The direction covers only
+/// what is left, which is every pair of values that are both there.
+fn one_key(key: &SortKey<usize>, a: &Value, b: &Value) -> Ordering {
+    match (matches!(a, Value::Null), matches!(b, Value::Null)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => {
+            return if key.nulls_first() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        (false, true) => {
+            return if key.nulls_first() {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        (false, false) => {}
+    }
+    let ord = val_cmp(a, b);
+    if key.ascending { ord } else { ord.reverse() }
 }
 
 /// The longest string a normalized key encodes. Every row pays the
@@ -427,6 +456,15 @@ enum NormKind {
 struct NormField {
     col: usize,
     asc: bool,
+    /// One when the column holds a null somewhere, in which case every
+    /// row carries a byte in front of its value saying whether the
+    /// value is there, and zero when the column holds none.
+    pad: usize,
+    /// The leading byte a row holding nothing gets. A row holding a
+    /// value gets the other one, so the byte orders the two groups the
+    /// way the key's null ordering asks and the direction never enters
+    /// into it.
+    null_byte: u8,
     at: usize,
     width: usize,
 }
@@ -448,43 +486,58 @@ fn norm_kind(v: &Value) -> Option<NormKind> {
 /// the columns together run past what a key is worth carrying.
 /// The type has to hold for every row because a column of integers and
 /// floats mixed compares through f64, which no fixed byte form gives.
-fn norm_plan(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<Vec<NormField>> {
+fn norm_plan(rows: &[Vec<Value>], keys: &[SortKey<usize>]) -> Option<Vec<NormField>> {
     if keys.is_empty() {
         return None;
     }
-    let first = rows.first()?;
+    if rows.is_empty() {
+        return None;
+    }
     let mut fields = Vec::with_capacity(keys.len());
     let mut at = 0;
-    for &(col, asc) in keys {
-        let kind = norm_kind(first.get(col)?)?;
-        let width = match kind {
-            NormKind::Int | NormKind::Float => 8,
-            NormKind::Bool => 1,
-            NormKind::Node => 12,
-            NormKind::Str => {
-                let mut longest = 0;
-                for row in rows {
-                    let Some(Value::Str(s)) = row.get(col) else {
+    for key in keys {
+        let col = key.expr;
+        // One pass over the column settles all three questions: what
+        // kind it is, whether it holds a null, and how long its longest
+        // string is. The kind comes from the rows holding a value,
+        // since a null has no byte form of its own, and a column of
+        // nothing but nulls has no layout at all and goes to the
+        // comparator.
+        let mut kind: Option<NormKind> = None;
+        let mut nullable = false;
+        let mut longest = 0;
+        for row in rows {
+            match row.get(col)? {
+                Value::Null => nullable = true,
+                value => {
+                    let k = norm_kind(value)?;
+                    if *kind.get_or_insert(k) != k {
                         return None;
-                    };
-                    longest = longest.max(s.len());
+                    }
+                    if let Value::Str(text) = value {
+                        longest = longest.max(text.len());
+                    }
                 }
-                if longest > NORM_STR_MAX {
-                    return None;
-                }
-                longest + 1
             }
-        };
-        if kind != NormKind::Str
-            && rows
-                .iter()
-                .any(|r| r.get(col).and_then(norm_kind) != Some(kind))
-        {
-            return None;
         }
+        let pad = usize::from(nullable);
+        let width = pad
+            + match kind? {
+                NormKind::Int | NormKind::Float => 8,
+                NormKind::Bool => 1,
+                NormKind::Node => 12,
+                NormKind::Str => {
+                    if longest > NORM_STR_MAX {
+                        return None;
+                    }
+                    longest + 1
+                }
+            };
         fields.push(NormField {
             col,
-            asc,
+            asc: key.ascending,
+            pad,
+            null_byte: u8::from(!key.nulls_first()),
             at,
             width,
         });
@@ -507,6 +560,21 @@ fn norm_keys(rows: &[Vec<Value>], fields: &[NormField], width: usize) -> Vec<u8>
     for (row, key) in rows.iter().zip(out.chunks_exact_mut(width)) {
         for f in fields {
             let cell = &mut key[f.at..][..f.width];
+            if f.pad == 1 {
+                let missing = matches!(row[f.col], Value::Null);
+                cell[0] = if missing {
+                    f.null_byte
+                } else {
+                    1 - f.null_byte
+                };
+                // The rest of the cell stays zero, which is what makes
+                // two nulls tie and leaves the position to break them.
+                if missing {
+                    continue;
+                }
+            }
+            let cell = &mut cell[f.pad..];
+            let last = cell.len() - 1;
             match &row[f.col] {
                 Value::Int(n) => cell.copy_from_slice(&((*n as u64) ^ (1 << 63)).to_be_bytes()),
                 Value::Float(x) => {
@@ -525,7 +593,7 @@ fn norm_keys(rows: &[Vec<Value>], fields: &[NormField], width: usize) -> Vec<u8>
                 }
                 Value::Str(s) => {
                     cell[..s.len()].copy_from_slice(s.as_bytes());
-                    cell[f.width - 1] = s.len() as u8;
+                    cell[last] = s.len() as u8;
                 }
                 other => unreachable!("the layout matched every row, not {other:?}"),
             }
@@ -582,7 +650,7 @@ fn order_by_bytes(norm: &[u8], width: usize, need: usize) -> Vec<u32> {
 /// O(n) plus O(k log k) instead of O(n log n). The comparator breaks
 /// ties on the row's position so the answer is the stable sort's, the
 /// order the old engine's sort_by produces.
-fn sort_rows(rows: &mut Vec<Vec<Value>>, keys: &[(usize, bool)], need: usize) {
+fn sort_rows(rows: &mut Vec<Vec<Value>>, keys: &[SortKey<usize>], need: usize) {
     if let Some(fields) = norm_plan(rows, keys) {
         let width = fields.iter().map(|f| f.width).sum();
         let norm = norm_keys(rows, &fields, width);
@@ -599,9 +667,8 @@ fn sort_rows(rows: &mut Vec<Vec<Value>>, keys: &[(usize, bool)], need: usize) {
         return;
     }
     let by_keys = |a: &Vec<Value>, b: &Vec<Value>| {
-        for &(col, asc) in keys {
-            let ord = val_cmp(&a[col], &b[col]);
-            let ord = if asc { ord } else { ord.reverse() };
+        for key in keys {
+            let ord = one_key(key, &a[key.expr], &b[key.expr]);
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -802,6 +869,20 @@ pub(crate) fn finish_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zu_query::ast::NullOrder;
+
+    /// The sort keys a `(column, ascending)` list names, with the null
+    /// ordering left at its default, which is what every test here that
+    /// does not mention a null wants.
+    fn keys(spec: &[(usize, bool)]) -> Vec<SortKey<usize>> {
+        spec.iter()
+            .map(|&(expr, ascending)| SortKey {
+                expr,
+                ascending,
+                nulls: NullOrder::default(),
+            })
+            .collect()
+    }
 
     fn rows(vals: &[(i64, &str)]) -> Vec<Vec<Value>> {
         vals.iter()
@@ -821,9 +902,9 @@ mod tests {
 
     #[test]
     fn a_limited_sort_returns_the_full_sorts_prefix() {
-        let full = apply_post(&[PostSpec::Sort(vec![(0, true)])], rows(&DATA));
+        let full = apply_post(&[PostSpec::Sort(keys(&[(0, true)]))], rows(&DATA));
         let top = apply_post(
-            &[PostSpec::Sort(vec![(0, true)]), PostSpec::Limit(3)],
+            &[PostSpec::Sort(keys(&[(0, true)])), PostSpec::Limit(3)],
             rows(&DATA),
         );
         assert_eq!(top, full[..3].to_vec(), "ties keep their input order");
@@ -833,13 +914,13 @@ mod tests {
     fn skip_widens_what_the_selection_has_to_order() {
         let want = apply_post(
             &[
-                PostSpec::Sort(vec![(0, false)]),
+                PostSpec::Sort(keys(&[(0, false)])),
                 PostSpec::Skip(2),
                 PostSpec::Limit(3),
             ],
             rows(&DATA),
         );
-        let mut full = apply_post(&[PostSpec::Sort(vec![(0, false)])], rows(&DATA));
+        let mut full = apply_post(&[PostSpec::Sort(keys(&[(0, false)]))], rows(&DATA));
         full.drain(..2);
         full.truncate(3);
         assert_eq!(want, full);
@@ -847,7 +928,10 @@ mod tests {
 
     #[test]
     fn later_keys_break_the_first_keys_ties() {
-        let got = apply_post(&[PostSpec::Sort(vec![(0, true), (1, false)])], rows(&DATA));
+        let got = apply_post(
+            &[PostSpec::Sort(keys(&[(0, true), (1, false)]))],
+            rows(&DATA),
+        );
         let names: Vec<&str> = got
             .iter()
             .map(|r| match &r[1] {
@@ -861,12 +945,11 @@ mod tests {
     /// The order the row comparator gives. Its sort is stable, so ties
     /// keep their input order, which is what the normalized key has to
     /// reproduce whatever shape the key takes.
-    fn by_comparator(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Vec<Vec<Value>> {
+    fn by_comparator(rows: &[Vec<Value>], keys: &[SortKey<usize>]) -> Vec<Vec<Value>> {
         let mut out = rows.to_vec();
         out.sort_by(|a, b| {
-            for &(col, asc) in keys {
-                let ord = val_cmp(&a[col], &b[col]);
-                let ord = if asc { ord } else { ord.reverse() };
+            for key in keys {
+                let ord = one_key(key, &a[key.expr], &b[key.expr]);
                 if ord != Ordering::Equal {
                     return ord;
                 }
@@ -878,7 +961,7 @@ mod tests {
 
     /// The bytes the key takes, or None when the set has no normalized
     /// form at all.
-    fn key_width(rows: &[Vec<Value>], keys: &[(usize, bool)]) -> Option<usize> {
+    fn key_width(rows: &[Vec<Value>], keys: &[SortKey<usize>]) -> Option<usize> {
         norm_plan(rows, keys).map(|f| f.iter().map(|x| x.width).sum())
     }
 
@@ -899,7 +982,7 @@ mod tests {
     #[test]
     fn three_integer_columns_sort_the_way_the_comparator_does() {
         let rows = wide_rows();
-        let keys = vec![(0usize, true), (1usize, false), (2usize, true)];
+        let keys = keys(&[(0usize, true), (1usize, false), (2usize, true)]);
         assert_eq!(key_width(&rows, &keys), Some(24), "past one word");
         assert_eq!(
             apply_post(&[PostSpec::Sort(keys.clone())], rows.clone()),
@@ -910,7 +993,7 @@ mod tests {
     #[test]
     fn a_limited_wide_sort_returns_the_full_sorts_prefix() {
         let rows = wide_rows();
-        let keys = vec![(2usize, false), (0usize, true), (1usize, true)];
+        let keys = keys(&[(2usize, false), (0usize, true), (1usize, true)]);
         let full = by_comparator(&rows, &keys);
         for need in [1, 17, 499, 500, 501] {
             let got = apply_post(
@@ -930,8 +1013,8 @@ mod tests {
             .map(|(s, i)| vec![Value::Str((*s).into()), Value::Int(i)])
             .collect();
         for keys in [
-            vec![(0usize, true), (1usize, true)],
-            vec![(0usize, false), (1usize, true)],
+            keys(&[(0usize, true), (1usize, true)]),
+            keys(&[(0usize, false), (1usize, true)]),
         ] {
             assert_eq!(
                 key_width(&rows, &keys),
@@ -961,9 +1044,9 @@ mod tests {
             })
             .collect();
         for keys in [
-            vec![(0usize, true), (2usize, false)],
-            vec![(1usize, false), (0usize, false)],
-            vec![(2usize, true), (1usize, true), (0usize, true)],
+            keys(&[(0usize, true), (2usize, false)]),
+            keys(&[(1usize, false), (0usize, false)]),
+            keys(&[(2usize, true), (1usize, true), (0usize, true)]),
         ] {
             assert!(key_width(&rows, &keys).is_some(), "keys {keys:?}");
             assert_eq!(
@@ -996,7 +1079,7 @@ mod tests {
                 vec![Value::Null, Value::Int(1)],
             ],
         ];
-        let keys = vec![(0usize, true), (1usize, true)];
+        let keys = keys(&[(0usize, true), (1usize, true)]);
         for rows in sets {
             assert_eq!(key_width(&rows, &keys), None, "{rows:?}");
             assert_eq!(
@@ -1012,8 +1095,9 @@ mod tests {
         let rows: Vec<Vec<Value>> = (0..40i64)
             .map(|i| (0..cols as i64).map(|c| Value::Int((i * c) % 6)).collect())
             .collect();
-        let fits: Vec<(usize, bool)> = (0..cols - 1).map(|c| (c, c % 2 == 0)).collect();
-        let over: Vec<(usize, bool)> = (0..cols).map(|c| (c, c % 2 == 0)).collect();
+        let spec: Vec<(usize, bool)> = (0..cols).map(|c| (c, c % 2 == 0)).collect();
+        let fits = keys(&spec[..cols - 1]);
+        let over = keys(&spec);
         assert_eq!(
             key_width(&rows, &fits),
             Some(NORM_MAX),
@@ -1029,9 +1113,131 @@ mod tests {
     #[test]
     fn an_empty_set_has_no_key_and_sorts_to_nothing() {
         let rows: Vec<Vec<Value>> = Vec::new();
-        let keys = vec![(0usize, true)];
+        let keys = keys(&[(0usize, true)]);
         assert_eq!(key_width(&rows, &keys), None);
         assert!(apply_post(&[PostSpec::Sort(keys)], rows).is_empty());
+    }
+
+    /// The sort keys a `(column, ascending, nulls first)` list names,
+    /// for the tests that do care where the null goes.
+    fn null_keys(spec: &[(usize, bool, bool)]) -> Vec<SortKey<usize>> {
+        spec.iter()
+            .map(|&(expr, ascending, first)| SortKey {
+                expr,
+                ascending,
+                nulls: if first {
+                    NullOrder::First
+                } else {
+                    NullOrder::Last
+                },
+            })
+            .collect()
+    }
+
+    /// Nine rows whose first column holds nothing on three of them, and
+    /// whose second column is the row's own position so a tie is always
+    /// broken by something the comparator and the key both read.
+    fn null_rows() -> Vec<Vec<Value>> {
+        [
+            None,
+            Some(3),
+            Some(1),
+            None,
+            Some(2),
+            Some(3),
+            None,
+            Some(1),
+            Some(2),
+        ]
+        .into_iter()
+        .zip(0i64..)
+        .map(|(v, at)| {
+            let first = v.map_or(Value::Null, Value::Int);
+            vec![first, Value::Int(at)]
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_null_costs_one_byte_in_front_of_the_value() {
+        let rows = null_rows();
+        for first in [false, true] {
+            for asc in [false, true] {
+                let one = null_keys(&[(0, asc, first)]);
+                assert_eq!(key_width(&rows, &one), Some(9), "the byte and the value");
+                let two = null_keys(&[(0, asc, first), (1, true, false)]);
+                assert_eq!(key_width(&rows, &two), Some(17), "past one word");
+                // Nine bytes sort as a word and seventeen sort as bytes,
+                // so this asks both encoders the same question.
+                for keys in [one, two] {
+                    assert_eq!(
+                        apply_post(&[PostSpec::Sort(keys.clone())], rows.clone()),
+                        by_comparator(&rows, &keys),
+                        "keys {keys:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_null_ordering_is_not_the_directions_to_reverse() {
+        let rows = null_rows();
+        let at = |keys: &[SortKey<usize>]| -> Vec<i64> {
+            apply_post(&[PostSpec::Sort(keys.to_vec())], rows.clone())
+                .iter()
+                .map(|r| match r[1] {
+                    Value::Int(n) => n,
+                    ref other => panic!("expected a position, got {other:?}"),
+                })
+                .collect()
+        };
+        // Rows 0, 3 and 6 hold nothing. They lead a NULLS FIRST key and
+        // trail a NULLS LAST one whichever way the values run, and the
+        // three of them keep their input order in every case.
+        assert_eq!(at(&null_keys(&[(0, true, true)]))[..3], [0, 3, 6]);
+        assert_eq!(at(&null_keys(&[(0, false, true)]))[..3], [0, 3, 6]);
+        assert_eq!(at(&null_keys(&[(0, true, false)]))[6..], [0, 3, 6]);
+        assert_eq!(at(&null_keys(&[(0, false, false)]))[6..], [0, 3, 6]);
+        // What is left is the values, upwards or downwards.
+        assert_eq!(at(&null_keys(&[(0, true, true)]))[3..], [2, 7, 4, 8, 1, 5]);
+        assert_eq!(
+            at(&null_keys(&[(0, false, false)]))[..6],
+            [1, 5, 4, 8, 2, 7]
+        );
+    }
+
+    #[test]
+    fn a_bounded_sort_over_a_column_with_nulls_agrees_with_the_full_one() {
+        let rows = null_rows();
+        for keys in [
+            null_keys(&[(0, true, true)]),
+            null_keys(&[(0, false, true)]),
+            null_keys(&[(0, true, false), (1, false, false)]),
+        ] {
+            for need in 1..=rows.len() + 1 {
+                let want = apply_post(
+                    &[PostSpec::Sort(keys.clone()), PostSpec::Limit(need as u64)],
+                    rows.clone(),
+                );
+                for workers in 1..=3 {
+                    let mut tops: Vec<TopN> =
+                        (0..workers).map(|_| TopN::new(&keys, need)).collect();
+                    for (at, row) in rows.iter().enumerate() {
+                        let top = &mut tops[at % workers];
+                        let key: Vec<Value> = keys.iter().map(|k| row[k.expr].clone()).collect();
+                        if top.wants(&key) {
+                            top.keep(&key, (at as u32, 0), row.clone());
+                        }
+                    }
+                    assert_eq!(
+                        merge_topn(&keys, need, tops),
+                        want,
+                        "keys {keys:?}, need {need}, {workers} workers"
+                    );
+                }
+            }
+        }
     }
 
     /// The workers' side of a bounded run: rows are dealt to `workers`
@@ -1039,14 +1245,14 @@ mod tests {
     /// claiming morsels sees them.
     fn bounded(
         data: &[(i64, &str)],
-        keys: &[(usize, bool)],
+        keys: &[SortKey<usize>],
         need: usize,
         workers: usize,
     ) -> Vec<Vec<Value>> {
         let mut tops: Vec<TopN> = (0..workers).map(|_| TopN::new(keys, need)).collect();
         for (at, row) in rows(data).into_iter().enumerate() {
             let top = &mut tops[at % workers];
-            let key: Vec<Value> = keys.iter().map(|&(c, _)| row[c].clone()).collect();
+            let key: Vec<Value> = keys.iter().map(|k| row[k.expr].clone()).collect();
             if top.wants(&key) {
                 top.keep(&key, (at as u32, 0), row);
             }
@@ -1057,10 +1263,10 @@ mod tests {
     #[test]
     fn the_bounded_buffer_answers_what_the_full_sort_answers() {
         for keys in [
-            vec![(0usize, true)],
-            vec![(0usize, false)],
-            vec![(0usize, true), (1usize, false)],
-            vec![(1usize, true), (0usize, false)],
+            keys(&[(0usize, true)]),
+            keys(&[(0usize, false)]),
+            keys(&[(0usize, true), (1usize, false)]),
+            keys(&[(1usize, true), (0usize, false)]),
         ] {
             for need in 1..=DATA.len() + 2 {
                 let want = apply_post(
@@ -1080,7 +1286,7 @@ mod tests {
 
     #[test]
     fn a_row_that_ties_the_worst_kept_key_loses() {
-        let mut top = TopN::new(&[(0, true)], 2);
+        let mut top = TopN::new(&keys(&[(0, true)]), 2);
         for (at, row) in rows(&[(1, "a"), (2, "b")]).into_iter().enumerate() {
             let key = vec![row[0].clone()];
             assert!(top.wants(&key));
@@ -1095,7 +1301,7 @@ mod tests {
 
     #[test]
     fn only_a_sort_a_worker_can_bound_takes_the_buffer() {
-        let keys = vec![(0usize, true)];
+        let keys = keys(&[(0usize, true)]);
         let sort = || PostSpec::Sort(keys.clone());
         assert!(topn_of(&[]).is_none(), "no sort, nothing to bound");
         assert!(topn_of(&[sort()]).is_none(), "no limit, nothing to bound");

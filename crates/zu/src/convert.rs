@@ -21,15 +21,14 @@ use std::path::Path;
 use crate::list_text::{self, Kind};
 use zu_common::{DurationKind, FloatBits, IntBits, LogicalType, Result, ZuError};
 use zu_sqlite::{ColumnType, SqliteStore, TableDef, Value};
-use zu_storage::Direction;
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{
     Direction as Zu1Direction, GraphReader, bulk_load_as, bulk_load_undirected_as,
 };
 use zu_zu1::props::{
-    ListElement, PropInput, PropValues, PropsReader, list_elements, load_props,
-    store_props_nullable,
+    ListElement, PropInput, PropValues, PropsReader, list_elements, load_props, load_rel_props,
+    store_props_nullable, store_rel_props_nullable,
 };
 
 /// The staged element kind a stored list's element type names, `None`
@@ -99,6 +98,63 @@ fn sqlite_type(ty: &LogicalType, name: &str) -> Result<ColumnType> {
     })
 }
 
+/// One stored value read back as the sqlite value it stages as, `Null`
+/// for a row of a nullable column that holds nothing.
+///
+/// A row holding nothing holds a placeholder underneath, and writing
+/// that out would turn a null into a zero or an empty string on the way
+/// back. `owner` names the table for the one error that has to say
+/// where a value came from, and `row` is a node id or an edge ordinal
+/// depending on which kind of table that is.
+#[allow(clippy::too_many_arguments)]
+fn staged_value(
+    zu: &mut Zu1File,
+    reader: &mut PropsReader,
+    ci: usize,
+    row: u64,
+    name: &str,
+    ty: &LogicalType,
+    owner: &str,
+    buf: &mut Vec<u8>,
+) -> Result<Value> {
+    if reader.is_nullable(ci) && !reader.is_valid(zu, ci, row)? {
+        return Ok(Value::Null);
+    }
+    Ok(match ty {
+        LogicalType::Str { .. } => {
+            buf.clear();
+            reader.read_str(zu, ci, row, buf)?;
+            Value::Text(String::from_utf8(buf.clone()).map_err(|_| {
+                ZuError::InvalidArgument(format!(
+                    "'{owner}' column '{name}' row {row} is not utf-8; sqlite stores text"
+                ))
+            })?)
+        }
+        LogicalType::Bytes { .. } => {
+            buf.clear();
+            reader.read_str(zu, ci, row, buf)?;
+            Value::Blob(buf.clone())
+        }
+        LogicalType::Bool => Value::Int(i64::from(reader.read_int(zu, ci, row)? != 0)),
+        LogicalType::List { elem, .. } => {
+            buf.clear();
+            reader.read_str(zu, ci, row, buf)?;
+            Value::Text(list_text::write(&staged_items(elem, buf, name)?))
+        }
+        LogicalType::Float { bits, .. } => {
+            let word = reader.read_int(zu, ci, row)?;
+            Value::Real(match bits {
+                FloatBits::B32 => f64::from(f32::from_bits(word as u32)),
+                _ => f64::from_bits(word),
+            })
+        }
+        // Everything else the lane holds is a count of something: an
+        // integer, a day, a nanosecond or a month, and sqlite stores
+        // all four the same.
+        _ => Value::Int(reader.read_int(zu, ci, row)? as i64),
+    })
+}
+
 /// Converts a zu1 file into a fresh sqlite store at `db_path`.
 pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
     let mut zu = Zu1File::open(zu1_path)?;
@@ -125,50 +181,9 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
             let mut values = Vec::with_capacity(cols.len());
             if let Some(reader) = reader.as_mut() {
                 for (ci, (name, ty)) in cols.iter().enumerate() {
-                    // A row holding nothing holds a placeholder underneath,
-                    // and writing that out would turn a null into a zero or
-                    // an empty string on the way back.
-                    if reader.is_nullable(ci) && !reader.is_valid(&mut zu, ci, row)? {
-                        values.push(Value::Null);
-                        continue;
-                    }
-                    values.push(match ty {
-                        LogicalType::Str { .. } => {
-                            buf.clear();
-                            reader.read_str(&mut zu, ci, row, &mut buf)?;
-                            Value::Text(String::from_utf8(buf.clone()).map_err(|_| {
-                                ZuError::InvalidArgument(format!(
-                                    "'{}' column '{name}' row {row} is not utf-8; \
-                                     sqlite stores text",
-                                    node.name
-                                ))
-                            })?)
-                        }
-                        LogicalType::Bytes { .. } => {
-                            buf.clear();
-                            reader.read_str(&mut zu, ci, row, &mut buf)?;
-                            Value::Blob(buf.clone())
-                        }
-                        LogicalType::Bool => {
-                            Value::Int(i64::from(reader.read_int(&mut zu, ci, row)? != 0))
-                        }
-                        LogicalType::List { elem, .. } => {
-                            buf.clear();
-                            reader.read_str(&mut zu, ci, row, &mut buf)?;
-                            Value::Text(list_text::write(&staged_items(elem, &buf, name)?))
-                        }
-                        LogicalType::Float { bits, .. } => {
-                            let word = reader.read_int(&mut zu, ci, row)?;
-                            Value::Real(match bits {
-                                FloatBits::B32 => f64::from(f32::from_bits(word as u32)),
-                                _ => f64::from_bits(word),
-                            })
-                        }
-                        // Everything else the lane holds is a count of
-                        // something: an integer, a day, a nanosecond or
-                        // a month, and sqlite stores all four the same.
-                        _ => Value::Int(reader.read_int(&mut zu, ci, row)? as i64),
-                    });
+                    values.push(staged_value(
+                        &mut zu, reader, ci, row, name, ty, &node.name, &mut buf,
+                    )?);
                 }
             }
             sq.insert_node_at(&node.name, row as i64, &values)?;
@@ -187,16 +202,45 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
                 })
         };
         let (from, to) = (name_of(rel.from)?, name_of(rel.to)?);
-        sq.create_rel_table_as(&rel.name, &from, &to, &[], rel.undirected)?;
+        let props = load_rel_props(&mut zu, rel.id)?;
+        let cols: Vec<(String, LogicalType)> = props
+            .iter()
+            .flat_map(|p| p.columns.iter())
+            .map(|c| (c.name.clone(), c.ty.clone()))
+            .collect();
+        let col_refs: Vec<(&str, ColumnType)> = cols
+            .iter()
+            .map(|(n, t)| Ok((n.as_str(), sqlite_type(t, n)?)))
+            .collect::<Result<_>>()?;
+        sq.create_rel_table_as(&rel.name, &from, &to, &col_refs, rel.undirected)?;
         let src_count = catalog
             .node_by_id(rel.from)
             .expect("resolved above")
             .node_count;
-        let mut g = GraphReader::load_table(&mut zu, &rel.name)?;
+        let g = GraphReader::load_table(&mut zu, &rel.name)?;
+        let mut reader = props.map(PropsReader::new);
+        let mut buf = Vec::new();
+        let mut neighbors = Vec::new();
+        // The edge ordinal is the place an edge takes when the forward
+        // lists are read source after source, which is this walk, so a
+        // counter along it is the row of the value without anything
+        // being looked up to find it.
+        let mut ordinal = 0u64;
         sq.begin()?;
         for src in 0..src_count {
-            for &dst in g.neighbors_dir(&mut zu, src, Zu1Direction::Fwd)? {
-                sq.insert_rel(&rel.name, src as i64, dst as i64, &[])?;
+            neighbors.clear();
+            g.neighbors_dir_into(&mut zu, src, Zu1Direction::Fwd, &mut neighbors)?;
+            for &dst in &neighbors {
+                let mut values = Vec::with_capacity(cols.len());
+                if let Some(reader) = reader.as_mut() {
+                    for (ci, (name, ty)) in cols.iter().enumerate() {
+                        values.push(staged_value(
+                            &mut zu, reader, ci, ordinal, name, ty, &rel.name, &mut buf,
+                        )?);
+                    }
+                }
+                sq.insert_rel(&rel.name, src as i64, dst as i64, &values)?;
+                ordinal += 1;
             }
         }
         sq.commit()?;
@@ -357,67 +401,32 @@ fn temporal_name(ty: ColumnType) -> &'static str {
     }
 }
 
-/// Converts a sqlite store into a fresh zu1 file at `zu1_path`.
-pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
-    let sq = SqliteStore::open(db_path)?;
-    let tables = sq.tables()?;
-    let nodes: Vec<&TableDef> = tables.iter().filter(|t| t.kind == "node").collect();
-    let rels: Vec<&TableDef> = tables.iter().filter(|t| t.kind == "rel").collect();
-    for node in &nodes {
-        if !rels.iter().any(|r| {
-            r.src_table.as_deref() == Some(&node.name) || r.dst_table.as_deref() == Some(&node.name)
-        }) {
-            return Err(ZuError::Unsupported {
-                what: "converting a node table no rel table touches; the zu1 bulk \
-                       loader gives a node table its row domain through a load",
-                id: node.id,
-            });
-        }
-    }
+/// One table's property columns, read whole out of sqlite and narrowed
+/// to what the zu1 row format holds, with one validity bit per row.
+///
+/// Nodes and edges stage the same way. What differs is where the values
+/// come from and what the row number means: a node's row is its dense
+/// id, an edge's row is its edge ordinal, its place in a load sorted by
+/// source and then destination. Both are dense counts from zero, which
+/// is the whole of what this needs to know about either.
+struct Staged<'a> {
+    declared: &'a [(String, ColumnType)],
+    data: Vec<ColumnData>,
+    masks: Vec<Vec<u64>>,
+}
 
-    let mut zu = Zu1File::create(zu1_path)?;
-    for rel in &rels {
-        let (src, dst) = match (&rel.src_table, &rel.dst_table) {
-            (Some(s), Some(d)) => (s, d),
-            _ => {
-                return Err(ZuError::InvalidArgument(format!(
-                    "rel table '{}' has no recorded endpoints; recreate it",
-                    rel.name
-                )));
-            }
-        };
-        if src != dst {
-            return Err(ZuError::Unsupported {
-                what: "converting a rel table with two distinct endpoint tables; \
-                       the zu1 bulk loader binds a rel to one node table",
-                id: rel.id,
-            });
-        }
-        let count = sq.node_count(src)?;
-        let mut edges: Vec<(u32, u32)> = Vec::new();
-        for s in 0..count {
-            for d in sq.neighbors(&rel.name, s, Direction::Fwd)? {
-                edges.push((s as u32, d as u32));
-            }
-        }
-        edges.sort_unstable();
-        if rel.undirected {
-            bulk_load_undirected_as(&mut zu, src, &rel.name, count as u64, &edges)?;
-        } else {
-            bulk_load_as(&mut zu, src, &rel.name, count as u64, &edges)?;
-        }
-    }
-
-    for node in &nodes {
-        let declared = sq.node_column_types(&node.name)?;
-        if declared.is_empty() {
-            continue;
-        }
-        let cols: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
-        let count = sq.node_count(&node.name)?;
-        let mut data = Vec::with_capacity(cols.len());
-        let mut masks = Vec::with_capacity(cols.len());
-        for (col, declared_ty) in &declared {
+impl<'a> Staged<'a> {
+    /// Reads `count` rows of every declared column through `get`, which
+    /// answers with one row of one column by its index in `declared`.
+    fn read(
+        owner: &'a str,
+        declared: &'a [(String, ColumnType)],
+        count: u64,
+        mut get: impl FnMut(u64, usize) -> Result<Value>,
+    ) -> Result<Self> {
+        let mut data = Vec::with_capacity(declared.len());
+        let mut masks = Vec::with_capacity(declared.len());
+        for (ci, (col, declared_ty)) in declared.iter().enumerate() {
             let listed = staged_list(*declared_ty).is_some();
             let mut column: Option<ColumnData> = None;
             // One bit per row, set where the row holds a value. A null
@@ -430,12 +439,11 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             for row in 0..count {
                 let bad = |what: &str| {
                     ZuError::InvalidArgument(format!(
-                        "'{}' column '{col}' row {row} {what}; zu1 property columns \
-                         are dense and uniformly typed",
-                        node.name
+                        "'{owner}' column '{col}' row {row} {what}; zu1 property columns \
+                         are dense and uniformly typed"
                     ))
                 };
-                let value = sq.read_node_prop(&node.name, row, col)?;
+                let value = get(row, ci)?;
                 if matches!(value, Value::Null) {
                     match &mut column {
                         Some(data) => data.push_placeholder(listed),
@@ -492,8 +500,7 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             };
             let ColumnData::Int(vals) = column else {
                 return Err(ZuError::InvalidArgument(format!(
-                    "'{}' column '{name}' is declared {} and does not hold integers",
-                    node.name,
+                    "'{owner}' column '{name}' is declared {} and does not hold integers",
                     temporal_name(want)
                 )));
             };
@@ -505,8 +512,8 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                         .map(|&v| {
                             i32::try_from(v).map_err(|_| {
                                 ZuError::InvalidArgument(format!(
-                                    "'{}' column '{name}' holds {v}, which is no day of any date",
-                                    node.name
+                                    "'{owner}' column '{name}' holds {v}, which is no day \
+                                     of any date"
                                 ))
                             })
                         })
@@ -528,8 +535,7 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             }
             let ColumnData::Int(vals) = column else {
                 return Err(ZuError::InvalidArgument(format!(
-                    "'{}' column '{name}' is declared BOOLEAN and does not hold integers",
-                    node.name
+                    "'{owner}' column '{name}' is declared BOOLEAN and does not hold integers"
                 )));
             };
             let bits = vals
@@ -538,13 +544,14 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                     0 => Ok(false),
                     1 => Ok(true),
                     other => Err(ZuError::InvalidArgument(format!(
-                        "'{}' column '{name}' is declared BOOLEAN and holds {}",
-                        node.name, other as i64
+                        "'{owner}' column '{name}' is declared BOOLEAN and holds {}",
+                        other as i64
                     ))),
                 })
                 .collect::<Result<Vec<bool>>>()?;
             *column = ColumnData::Bool(bits);
         }
+
         // A list arrives as the JSON array text sqlite had to hold it
         // as, and like a boolean it is the declaration and nothing else
         // that says so. The elements are reduced here to the words and
@@ -556,8 +563,7 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             };
             let ColumnData::Str(vals) = column else {
                 return Err(ZuError::InvalidArgument(format!(
-                    "'{}' column '{name}' is declared {} and does not hold text",
-                    node.name,
+                    "'{owner}' column '{name}' is declared {} and does not hold text",
                     list_name(*ty)
                 )));
             };
@@ -565,8 +571,7 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             for raw in vals.iter() {
                 let text = std::str::from_utf8(raw).map_err(|_| {
                     ZuError::InvalidArgument(format!(
-                        "'{}' column '{name}' holds text that is not UTF-8",
-                        node.name
+                        "'{owner}' column '{name}' holds text that is not UTF-8"
                     ))
                 })?;
                 rows.push(
@@ -584,7 +589,20 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             *column = ColumnData::List(elem, rows);
         }
 
-        let list_items: Vec<Vec<Vec<ListElement>>> = data
+        Ok(Staged {
+            declared,
+            data,
+            masks,
+        })
+    }
+
+    /// Hands the columns to `store` as the borrowed view a store call
+    /// takes. The borrowed elements of a list column and the bytes of a
+    /// text one are built here and live only as long as the call, which
+    /// is why this passes them to a closure rather than returning them.
+    fn with_inputs<T>(&self, store: impl FnOnce(&[PropInput]) -> Result<T>) -> Result<T> {
+        let list_items: Vec<Vec<Vec<ListElement>>> = self
+            .data
             .iter()
             .map(|c| match c {
                 ColumnData::List(_, rows) => rows
@@ -605,7 +623,8 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             .iter()
             .map(|rows| rows.iter().map(|r| r.as_slice()).collect())
             .collect();
-        let str_refs: Vec<Vec<&[u8]>> = data
+        let str_refs: Vec<Vec<&[u8]>> = self
+            .data
             .iter()
             .map(|c| match c {
                 ColumnData::Str(vals) | ColumnData::Bytes(vals) => {
@@ -614,14 +633,14 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                 _ => Vec::new(),
             })
             .collect();
-        let columns: Vec<PropInput> = cols
+        let columns: Vec<PropInput> = self
+            .declared
             .iter()
-            .zip(&data)
+            .zip(&self.data)
             .zip(&str_refs)
-            .zip(&declared)
             .zip(&list_rows)
-            .zip(&masks)
-            .map(|(((((name, c), refs), (_, ty)), lists), mask)| {
+            .zip(&self.masks)
+            .map(|(((((name, ty), c), refs), lists), mask)| {
                 let values = match c {
                     ColumnData::Int(vals) => PropValues::Int(vals),
                     ColumnData::Bool(vals) => PropValues::Bool(vals),
@@ -645,11 +664,103 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                 PropInput {
                     name: name.as_str(),
                     values,
-                    validity: Some(mask),
+                    validity: Some(mask.as_slice()),
                 }
             })
             .collect();
-        store_props_nullable(&mut zu, &node.name, &columns)?;
+        store(&columns)
+    }
+}
+
+/// Converts a sqlite store into a fresh zu1 file at `zu1_path`.
+pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
+    let sq = SqliteStore::open(db_path)?;
+    let tables = sq.tables()?;
+    let nodes: Vec<&TableDef> = tables.iter().filter(|t| t.kind == "node").collect();
+    let rels: Vec<&TableDef> = tables.iter().filter(|t| t.kind == "rel").collect();
+    for node in &nodes {
+        if !rels.iter().any(|r| {
+            r.src_table.as_deref() == Some(&node.name) || r.dst_table.as_deref() == Some(&node.name)
+        }) {
+            return Err(ZuError::Unsupported {
+                what: "converting a node table no rel table touches; the zu1 bulk \
+                       loader gives a node table its row domain through a load",
+                id: node.id,
+            });
+        }
+    }
+
+    let mut zu = Zu1File::create(zu1_path)?;
+    for rel in &rels {
+        let (src, dst) = match (&rel.src_table, &rel.dst_table) {
+            (Some(s), Some(d)) => (s, d),
+            _ => {
+                return Err(ZuError::InvalidArgument(format!(
+                    "rel table '{}' has no recorded endpoints; recreate it",
+                    rel.name
+                )));
+            }
+        };
+        if src != dst {
+            return Err(ZuError::Unsupported {
+                what: "converting a rel table with two distinct endpoint tables; \
+                       the zu1 bulk loader binds a rel to one node table",
+                id: rel.id,
+            });
+        }
+        let count = sq.node_count(src)?;
+        let declared = sq.rel_column_types(&rel.name)?;
+        let names: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
+        // The scan comes back sorted by source and then destination,
+        // which is the order the bulk loader wants an edge list in and
+        // the order an edge ordinal counts, so one read answers both
+        // and neither can drift from the other.
+        let rows = sq.rel_rows(&rel.name, &names)?;
+        let mut edges: Vec<(u32, u32)> = Vec::with_capacity(rows.len());
+        for (s, d, _) in &rows {
+            for (end, id) in [("source", *s), ("destination", *d)] {
+                if id < 0 || id >= count {
+                    return Err(ZuError::InvalidArgument(format!(
+                        "rel table '{}' has an edge whose {end} is row {id}, and \
+                         '{src}' holds {count} rows",
+                        rel.name
+                    )));
+                }
+            }
+            edges.push((*s as u32, *d as u32));
+        }
+        if rel.undirected {
+            bulk_load_undirected_as(&mut zu, src, &rel.name, count as u64, &edges)?;
+        } else {
+            bulk_load_as(&mut zu, src, &rel.name, count as u64, &edges)?;
+        }
+        if !declared.is_empty() {
+            // After the load and not before: a load writes the group
+            // directory whole, and the edge property root hangs off it.
+            let staged = Staged::read(&rel.name, &declared, rows.len() as u64, |row, ci| {
+                Ok(rows[row as usize].2[ci].clone())
+            })?;
+            staged.with_inputs(|columns| {
+                store_rel_props_nullable(&mut zu, &rel.name, columns)?;
+                Ok(())
+            })?;
+        }
+    }
+
+    for node in &nodes {
+        let declared = sq.node_column_types(&node.name)?;
+        if declared.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
+        let count = sq.node_count(&node.name)? as u64;
+        let staged = Staged::read(&node.name, &declared, count, |row, ci| {
+            sq.read_node_prop(&node.name, row as i64, &names[ci])
+        })?;
+        staged.with_inputs(|columns| {
+            store_props_nullable(&mut zu, &node.name, columns)?;
+            Ok(())
+        })?;
     }
     Ok(())
 }

@@ -7,6 +7,7 @@
 use zu::convert::{sqlite_to_zu1, zu1_to_sqlite};
 use zu::query::run as run_zu1;
 use zu::sqlite::run as run_sqlite;
+use zu_query::exec::Value as QValue;
 use zu_sqlite::{ColumnType, SqliteStore, Value as SqlValue};
 use zu_storage::Direction;
 use zu_zu1::catalog::Catalog;
@@ -696,4 +697,150 @@ fn the_undirected_flag_survives_both_hops() {
         .find(|t| t.name == "friend")
         .expect("friend survives the way back");
     assert!(table.undirected, "the flag crosses back into sqlite");
+}
+
+/// Edge properties cross both hops, and the value that comes back is
+/// the one that edge was written with rather than the one belonging to
+/// whatever edge shares its place in the file.
+///
+/// The order is the whole risk here. An edge property column has no
+/// per edge label in it: value `i` belongs to edge `i` of a load sorted
+/// by source and then destination, so a converter that reads the rows
+/// out of sqlite in insert order instead of that order writes a graph
+/// where every value is on the wrong edge and nothing complains. The
+/// fixture inserts its edges in an order that is not the sorted one and
+/// gives every edge a weight only it has, so a mislabeling shows up as
+/// a wrong number rather than as a crash.
+#[test]
+fn edge_properties_survive_both_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    // Inserted out of order on purpose, and the weight of an edge is
+    // the two endpoints spelled as one number so the value says which
+    // edge it belongs on.
+    let edges: [(i64, i64); 5] = [(2, 0), (0, 3), (1, 2), (0, 1), (2, 1)];
+    let weight = |src: i64, dst: i64| src * 10 + dst;
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table("person", &[]).unwrap();
+    sq.create_rel_table(
+        "knows",
+        "person",
+        "person",
+        &[("weight", ColumnType::Integer), ("since", ColumnType::Text)],
+    )
+    .unwrap();
+    sq.begin().unwrap();
+    for row in 0..4i64 {
+        sq.insert_node_at("person", row, &[]).unwrap();
+    }
+    for &(src, dst) in &edges {
+        sq.insert_rel(
+            "knows",
+            src,
+            dst,
+            &[
+                SqlValue::Int(weight(src, dst)),
+                SqlValue::Text(format!("y{src}{dst}")),
+            ],
+        )
+        .unwrap();
+    }
+    sq.commit().unwrap();
+    drop(sq);
+
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut zu = Zu1File::open(&b).unwrap();
+    let rows = run_zu1(
+        "MATCH (a:person)-[e:knows]->(b:person) RETURN a.id AS src, b.id AS dst, \
+         e.weight AS weight, e.since AS since",
+        &mut zu,
+        &[],
+    )
+    .unwrap()
+    .rows;
+    assert_eq!(rows.len(), edges.len(), "every edge answers: {rows:?}");
+    for row in &rows {
+        let (src, dst) = match (&row[0], &row[1]) {
+            (QValue::Int(s), QValue::Int(d)) => (*s, *d),
+            other => panic!("endpoints came back as {other:?}"),
+        };
+        assert_eq!(
+            row[2],
+            QValue::Int(weight(src, dst)),
+            "the weight of ({src}, {dst})"
+        );
+        assert_eq!(
+            row[3],
+            QValue::Str(format!("y{src}{dst}")),
+            "the since of ({src}, {dst})"
+        );
+    }
+    drop(zu);
+
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    assert_eq!(
+        back.rel_column_types("knows").unwrap(),
+        [
+            ("weight".to_owned(), ColumnType::Integer),
+            ("since".to_owned(), ColumnType::Text),
+        ],
+        "the columns come back declared the way they went in"
+    );
+    let mut want: Vec<(i64, i64, i64, String)> = edges
+        .iter()
+        .map(|&(s, d)| (s, d, weight(s, d), format!("y{s}{d}")))
+        .collect();
+    want.sort_unstable();
+    let got: Vec<(i64, i64, i64, String)> = back
+        .rel_rows("knows", &["weight".to_owned(), "since".to_owned()])
+        .unwrap()
+        .into_iter()
+        .map(|(s, d, values)| {
+            let SqlValue::Int(w) = values[0] else {
+                panic!("weight came back as {:?}", values[0])
+            };
+            let SqlValue::Text(since) = values[1].clone() else {
+                panic!("since came back as {:?}", values[1])
+            };
+            (s, d, w, since)
+        })
+        .collect();
+    assert_eq!(got, want, "every edge keeps its own values on the way back");
+}
+
+/// An edge property column cannot say which of two edges with the same
+/// endpoints it belongs to, so a store holding a pair twice is refused
+/// at the conversion rather than answered wrongly later.
+#[test]
+fn a_duplicated_edge_with_properties_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a.db"), dir.path().join("b.zu1"));
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table("person", &[]).unwrap();
+    sq.create_rel_table(
+        "knows",
+        "person",
+        "person",
+        &[("weight", ColumnType::Integer)],
+    )
+    .unwrap();
+    sq.begin().unwrap();
+    for row in 0..2i64 {
+        sq.insert_node_at("person", row, &[]).unwrap();
+    }
+    sq.insert_rel("knows", 0, 1, &[SqlValue::Int(1)]).unwrap();
+    sq.insert_rel("knows", 0, 1, &[SqlValue::Int(2)]).unwrap();
+    sq.commit().unwrap();
+    drop(sq);
+
+    let err = sqlite_to_zu1(&a, &b).unwrap_err().to_string();
+    assert!(
+        err.contains("twice"),
+        "the error says what is wrong with the store: {err}"
+    );
 }

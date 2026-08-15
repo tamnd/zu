@@ -313,38 +313,245 @@ pub fn read_edge_list(path: &Path) -> Result<Vec<(u32, u32)>> {
 /// `1, 2` and CRLF endings both work, and columns past the second are
 /// ignored the way the SNAP reader ignores trailing fields.
 pub fn read_edge_csv(path: &Path) -> Result<Vec<(u32, u32)>> {
+    Ok(read_edge_csv_with_props(path, false)?.0)
+}
+
+/// What one header cell says its column is. `Skip` is a column a loader
+/// reads nothing from, which is what the structural cells of a rel file
+/// are once the endpoints are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsvRole {
+    Src,
+    Dst,
+    Prop(usize),
+    Skip,
+}
+
+/// [`read_edge_csv`] with the columns that are neither endpoint read as
+/// edge property columns, which is what the header is for.
+///
+/// The header is the schema. Every cell is `name:TYPE`, the form LDBC
+/// writes and every bulk loader in this space parses: `:START_ID` and
+/// `:END_ID` are the two endpoints, `:TYPE`, `:LABEL` and `:ID` carry
+/// load-time structure and are read from no further, and a named cell
+/// of `INT64`, `FLOAT64`, `BOOL` or `STRING` is a property column of
+/// that name. A cell with no type token is a string column, except that
+/// `src` and `dst` name the endpoints, which is how a hand written file
+/// with no LDBC in it says the same thing. A file whose header names
+/// neither endpoint uses its first two columns, the way the parquet
+/// reader falls back to the first two fields.
+///
+/// A column is dense: every row owes it a value, and an empty field is
+/// an error rather than a null, because an edge column is addressed by
+/// the ordinal and a row that skipped one would shift every value after
+/// it. A row with a different field count than the header is an error
+/// for the same reason, which is also what a comma inside an unquoted
+/// value reads as, since fields are split on commas and nothing else.
+///
+/// With `props` false, or on a file with no header, this is the reader
+/// above and no column is built.
+pub fn read_edge_csv_with_props(path: &Path, props: bool) -> Result<crate::props::EdgesWithProps> {
+    use crate::props::OwnedColumn;
+
     let bad = |line_no: usize| {
         ZuError::InvalidArgument(format!("line {line_no}: expected 'src,dst' integers"))
     };
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
     let mut edges = Vec::new();
+    let mut columns: Vec<OwnedColumn> = Vec::new();
+    let mut roles: Vec<CsvRole> = Vec::new();
     let mut line = String::new();
     let mut line_no = 0usize;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
-            return Ok(edges);
+            return Ok((edges, columns));
         }
         line_no += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let mut parts = trimmed.split(',');
-        let src = parts
-            .next()
-            .map(str::trim)
-            .and_then(|t| t.parse::<u32>().ok());
-        let dst = parts
-            .next()
-            .map(str::trim)
-            .and_then(|t| t.parse::<u32>().ok());
+        if roles.is_empty() {
+            let mut parts = trimmed.split(',');
+            let src = parts
+                .next()
+                .map(str::trim)
+                .and_then(|t| t.parse::<u32>().ok());
+            let dst = parts
+                .next()
+                .map(str::trim)
+                .and_then(|t| t.parse::<u32>().ok());
+            match (src, dst) {
+                (Some(src), Some(dst)) => edges.push((src, dst)),
+                _ if line_no == 1 => {
+                    if props {
+                        let cells: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+                        (roles, columns) = parse_edge_header(&cells)?;
+                    }
+                }
+                _ => return Err(bad(line_no)),
+            }
+            continue;
+        }
+        let wrong_width = |got: usize| {
+            ZuError::InvalidArgument(format!(
+                "line {line_no}: {got} fields where the header names {}",
+                roles.len()
+            ))
+        };
+        let (mut src, mut dst) = (None, None);
+        let mut fields = 0usize;
+        for (i, cell) in trimmed.split(',').map(str::trim).enumerate() {
+            let role = roles.get(i).ok_or_else(|| wrong_width(i + 1))?;
+            fields += 1;
+            match role {
+                CsvRole::Src => src = cell.parse::<u32>().ok(),
+                CsvRole::Dst => dst = cell.parse::<u32>().ok(),
+                CsvRole::Skip => {}
+                CsvRole::Prop(col) => {
+                    let column = &mut columns[*col];
+                    push_csv_value(&mut column.values, cell).ok_or_else(|| {
+                        ZuError::InvalidArgument(format!(
+                            "line {line_no}, column '{}': '{cell}' is not a {}",
+                            column.name,
+                            csv_type_name(&column.values)
+                        ))
+                    })?;
+                }
+            }
+        }
+        if fields != roles.len() {
+            return Err(wrong_width(fields));
+        }
         match (src, dst) {
             (Some(src), Some(dst)) => edges.push((src, dst)),
-            _ if line_no == 1 => {}
             _ => return Err(bad(line_no)),
         }
+    }
+}
+
+/// Reads the header cells into a role per column and an empty column
+/// per property. See [`read_edge_csv_with_props`] for the form.
+fn parse_edge_header(cells: &[&str]) -> Result<(Vec<CsvRole>, Vec<crate::props::OwnedColumn>)> {
+    use crate::props::{OwnedColumn, OwnedValues};
+
+    let mut roles = vec![CsvRole::Skip; cells.len()];
+    let mut columns: Vec<OwnedColumn> = Vec::new();
+    let mut named_ends = false;
+    for (i, cell) in cells.iter().enumerate() {
+        let (name, ty) = match cell.split_once(':') {
+            Some((name, ty)) => (name.trim(), ty.trim().to_ascii_uppercase()),
+            None => (*cell, String::new()),
+        };
+        let values = match ty.as_str() {
+            "START_ID" => {
+                roles[i] = CsvRole::Src;
+                named_ends = true;
+                continue;
+            }
+            "END_ID" => {
+                roles[i] = CsvRole::Dst;
+                named_ends = true;
+                continue;
+            }
+            "TYPE" | "LABEL" | "ID" => continue,
+            "" if name.eq_ignore_ascii_case("src") => {
+                roles[i] = CsvRole::Src;
+                named_ends = true;
+                continue;
+            }
+            "" if name.eq_ignore_ascii_case("dst") => {
+                roles[i] = CsvRole::Dst;
+                named_ends = true;
+                continue;
+            }
+            "INT64" => OwnedValues::Int(Vec::new()),
+            "FLOAT64" => OwnedValues::Float(Vec::new()),
+            "BOOL" => OwnedValues::Bool(Vec::new()),
+            "STRING" | "" => OwnedValues::Str(Vec::new()),
+            other => {
+                return Err(ZuError::InvalidArgument(format!(
+                    "header column '{cell}': no edge property column is a {other}"
+                )));
+            }
+        };
+        if name.is_empty() {
+            return Err(ZuError::InvalidArgument(format!(
+                "header column {i}: a property column needs a name, '{cell}' has none"
+            )));
+        }
+        if columns.iter().any(|c| c.name == name) {
+            return Err(ZuError::InvalidArgument(format!(
+                "header names the column '{name}' twice"
+            )));
+        }
+        roles[i] = CsvRole::Prop(columns.len());
+        columns.push(OwnedColumn {
+            name: name.to_string(),
+            values,
+        });
+    }
+    if !named_ends {
+        // Nothing said which columns the endpoints are, so they are the
+        // first two, and whatever the header called them is not a
+        // property of the edge they describe.
+        if cells.len() < 2 {
+            return Err(ZuError::InvalidArgument(
+                "header names fewer than two columns, so it names no edge".into(),
+            ));
+        }
+        for i in [0, 1] {
+            if let CsvRole::Prop(col) = roles[i] {
+                columns.remove(col);
+                for role in &mut roles {
+                    if let CsvRole::Prop(other) = role
+                        && *other > col
+                    {
+                        *other -= 1;
+                    }
+                }
+            }
+        }
+        roles[0] = CsvRole::Src;
+        roles[1] = CsvRole::Dst;
+    }
+    Ok((roles, columns))
+}
+
+/// Parses one field into the column's own type and appends it, or says
+/// the field is not of that type. An empty field is not a value of any
+/// of them: an edge column is dense.
+fn push_csv_value(values: &mut crate::props::OwnedValues, cell: &str) -> Option<()> {
+    use crate::props::OwnedValues;
+
+    if cell.is_empty() && !matches!(values, OwnedValues::Str(_)) {
+        return None;
+    }
+    match values {
+        OwnedValues::Int(v) => v.push(cell.parse::<i64>().ok()? as u64),
+        OwnedValues::Float(v) => v.push(cell.parse::<f64>().ok()?),
+        OwnedValues::Bool(v) => v.push(match cell {
+            _ if cell.eq_ignore_ascii_case("true") => true,
+            _ if cell.eq_ignore_ascii_case("false") => false,
+            _ => return None,
+        }),
+        OwnedValues::Str(v) => v.push(cell.as_bytes().to_vec()),
+    }
+    Some(())
+}
+
+/// The header token a column of this type is written with, for the
+/// error that says a field is not one.
+fn csv_type_name(values: &crate::props::OwnedValues) -> &'static str {
+    use crate::props::OwnedValues;
+
+    match values {
+        OwnedValues::Int(_) => "INT64",
+        OwnedValues::Float(_) => "FLOAT64",
+        OwnedValues::Bool(_) => "BOOL",
+        OwnedValues::Str(_) => "STRING",
     }
 }
 
@@ -1238,6 +1445,107 @@ mod tests {
         let csv = dir.path().join("edges.csv");
         std::fs::write(&csv, "src,dst,weight\n1,2,0.5\n").unwrap();
         assert_eq!(read_edge_csv(&csv).unwrap(), vec![(1, 2)]);
+    }
+
+    /// The LDBC header a rel file is written with: the endpoints are
+    /// named, the type column is structure rather than a value, and the
+    /// three that are left are the edge's properties in their declared
+    /// types.
+    #[test]
+    fn a_typed_csv_header_loads_the_edge_property_columns() {
+        use crate::props::OwnedValues;
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("link.csv");
+        std::fs::write(
+            &csv,
+            ":START_ID,:END_ID,:TYPE,ltype:INT64,weight:FLOAT64,payload:STRING\n\
+             0,1,LINK,7,0.5,ada\n\
+             1,2,LINK,-8,1.5,kay\n",
+        )
+        .unwrap();
+        let (edges, columns) = read_edge_csv_with_props(&csv, true).unwrap();
+        assert_eq!(edges, vec![(0, 1), (1, 2)]);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "ltype");
+        assert_eq!(
+            columns[0].values,
+            OwnedValues::Int(vec![7, (-8i64) as u64]),
+            "a signed value keeps its bits"
+        );
+        assert_eq!(columns[1].values, OwnedValues::Float(vec![0.5, 1.5]));
+        assert_eq!(
+            columns[2].values,
+            OwnedValues::Str(vec![b"ada".to_vec(), b"kay".to_vec()])
+        );
+        // The same file read the way every caller before this one read
+        // it: two columns and nothing else.
+        assert_eq!(read_edge_csv(&csv).unwrap(), edges);
+    }
+
+    /// A header that names no endpoint still describes an edge list, so
+    /// the first two columns are the endpoints and neither is a
+    /// property of the edge they name.
+    #[test]
+    fn an_untyped_csv_header_takes_its_endpoints_by_position() {
+        use crate::props::OwnedValues;
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&csv, "from,to,since:INT64\n1,2,10\n2,3,20\n").unwrap();
+        let (edges, columns) = read_edge_csv_with_props(&csv, true).unwrap();
+        assert_eq!(edges, vec![(1, 2), (2, 3)]);
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "since");
+        assert_eq!(columns[0].values, OwnedValues::Int(vec![10, 20]));
+    }
+
+    /// A file with no header names no column, so there is nothing to
+    /// load a property out of and the reader says so by loading none.
+    #[test]
+    fn a_headerless_csv_carries_no_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&csv, "5,6\n7,8\n").unwrap();
+        let (edges, columns) = read_edge_csv_with_props(&csv, true).unwrap();
+        assert_eq!(edges, vec![(5, 6), (7, 8)]);
+        assert!(columns.is_empty());
+    }
+
+    /// Every row owes every column a value. A row that is short one,
+    /// which is also what a comma inside a value reads as, is an error
+    /// naming the line rather than a column that shifted under the
+    /// ordinals of every edge after it.
+    #[test]
+    fn a_row_that_does_not_match_the_header_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&csv, "src,dst,since:INT64\n1,2,10\n2,3\n").unwrap();
+        let err = read_edge_csv_with_props(&csv, true).unwrap_err();
+        assert!(
+            err.to_string().contains("line 3") && err.to_string().contains("2 fields"),
+            "unexpected error: {err}"
+        );
+        std::fs::write(&csv, "src,dst,since:INT64\n1,2,\n").unwrap();
+        let err = read_edge_csv_with_props(&csv, true).unwrap_err();
+        assert!(
+            err.to_string().contains("line 2") && err.to_string().contains("'since'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A type the reader has no column for is refused at the header,
+    /// before a value of it has been read as something else.
+    #[test]
+    fn a_header_type_with_no_column_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("edges.csv");
+        std::fs::write(&csv, "src,dst,born:DATETIME\n1,2,2026-01-01\n").unwrap();
+        let err = read_edge_csv_with_props(&csv, true).unwrap_err();
+        assert!(
+            err.to_string().contains("DATETIME"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

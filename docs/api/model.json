@@ -4177,6 +4177,13 @@
       "doc": "Reads a comma separated `src,dst` edge list. The first line may be a\nheader and is skipped when its first two fields do not parse as\nintegers; a row that fails to parse anywhere else is an error naming\nthe line, same contract as the SNAP reader. Fields are trimmed, so\n`1, 2` and CRLF endings both work, and columns past the second are\nignored the way the SNAP reader ignores trailing fields."
     },
     {
+      "id": "zu::zu1::graph::read_edge_csv_with_props",
+      "kind": "function",
+      "name": "read_edge_csv_with_props",
+      "signature": "fn read_edge_csv_with_props(path: &std::path::Path, props: bool) -> zu_common::Result<zu_zu1::props::EdgesWithProps>",
+      "doc": "[`read_edge_csv`] with the columns that are neither endpoint read as\nedge property columns, which is what the header is for.\n\nThe header is the schema. Every cell is `name:TYPE`, the form LDBC\nwrites and every bulk loader in this space parses: `:START_ID` and\n`:END_ID` are the two endpoints, `:TYPE`, `:LABEL` and `:ID` carry\nload-time structure and are read from no further, and a named cell\nof `INT64`, `FLOAT64`, `BOOL` or `STRING` is a property column of\nthat name. A cell with no type token is a string column, except that\n`src` and `dst` name the endpoints, which is how a hand written file\nwith no LDBC in it says the same thing. A file whose header names\nneither endpoint uses its first two columns, the way the parquet\nreader falls back to the first two fields.\n\nA column is dense: every row owes it a value, and an empty field is\nan error rather than a null, because an edge column is addressed by\nthe ordinal and a row that skipped one would shift every value after\nit. A row with a different field count than the header is an error\nfor the same reason, which is also what a comma inside an unquoted\nvalue reads as, since fields are split on commas and nothing else.\n\nWith `props` false, or on a file with no header, this is the reader\nabove and no column is built."
+    },
+    {
       "id": "zu::zu1::graph::read_edge_list",
       "kind": "function",
       "name": "read_edge_list",

@@ -1483,6 +1483,36 @@ impl<'a> Worker<'a> {
         };
         let close_lists: Vec<&[u64]> = probe.as_ref().map(RowLists::slices).unwrap_or_default();
         let stop_early = brk.is_some_and(|b| b.stops_at_first());
+        // The sideways filter over the level this walk builds, taken
+        // into the walk instead of run as the operator after it. A
+        // neighbor no build side can match is dropped while it is
+        // still a value in a list, so no row is made for it and the
+        // gather that would have read its columns never sees it, which
+        // is the half the operator after the walk cannot save. Only a
+        // filter on the node itself folds in this way: one on a
+        // property reads a column that does not exist until the row is
+        // built, and that one stays where it was.
+        //
+        // A filter a worker has given up on is left as the operator,
+        // where it costs a test on a flag per vector and nothing else.
+        let (sift, rest) = match rest.first() {
+            Some(Op::Sip {
+                filter,
+                key: ScalarRef::RowId { level },
+                slot,
+            }) if *level == to && self.sips[*slot].on => {
+                let slot = *slot;
+                if self.decisions.sip[slot].workers == 0 {
+                    self.decisions.sip[slot].workers = 1;
+                }
+                (Some((&**filter, slot)), &rest[1..])
+            }
+            _ => (None, rest),
+        };
+        let mut sifted = self.row_pool.pop().unwrap_or_default();
+        let mut keep = self.idx_pool.pop().unwrap_or_default();
+        let mut probes = 0u64;
+        let mut kept = 0u64;
         // Copy the active rows out first: pinning mutates the chunk the
         // selection and values are read from.
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -1606,6 +1636,23 @@ impl<'a> Worker<'a> {
                 } else {
                     list
                 };
+                // Same idea one step further out: the close asks
+                // whether the neighbor closes the cycle, this asks
+                // whether anything on the join's build side could
+                // match it, and both answer before a row exists.
+                let list = match sift {
+                    Some((filter, _)) => {
+                        keep.clear();
+                        keep.resize(list.len(), 0);
+                        let n = filter.select(list, &mut keep);
+                        probes += list.len() as u64;
+                        kept += n as u64;
+                        sifted.clear();
+                        sifted.extend(keep[..n].iter().map(|&i| list[i as usize]));
+                        &sifted[..]
+                    }
+                    None => list,
+                };
                 if batch {
                     let mut tail = list;
                     while !tail.is_empty() {
@@ -1675,14 +1722,32 @@ impl<'a> Worker<'a> {
             self.bwts = fillw;
         }
         set.chunks[src].cur = None;
+        // What the filter did over this vector, and whether it is worth
+        // asking again. The rule is the operator's: a filter rejecting
+        // under a tenth of what it sees is not paying for the test, and
+        // the rows it would have dropped reach the join either way.
+        if let Some((_, slot)) = sift {
+            let state = &mut self.sips[slot];
+            state.probes += probes;
+            state.kept += kept;
+            if state.probes >= SIP_TRIAL && state.kept * 10 > state.probes * 9 {
+                state.on = false;
+                self.decisions.sip[slot].dropped += 1;
+            }
+            let seen = &mut self.decisions.sip[slot];
+            seen.probes += probes;
+            seen.kept += kept;
+        }
         drop(close_lists);
         if let Some(lists) = probe {
             self.recycle(lists);
         }
         self.idx_pool.push(idxs);
+        self.idx_pool.push(keep);
         self.row_pool.push(rows);
         self.row_pool.push(fill);
         self.row_pool.push(masked);
+        self.row_pool.push(sifted);
         result
     }
 

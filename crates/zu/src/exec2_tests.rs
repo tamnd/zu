@@ -642,6 +642,32 @@ fn covered_shapes_match_the_old_engine() {
         // first one's rows.
         "MATCH (a:person), (b:person), (c:person) WHERE a.id < 5 AND a.age = b.score \
          AND b.age = c.score RETURN count(*) AS n",
+        // The filter over a level a walk made rather than the scan,
+        // which is a block tied by an equality: the block is a semi
+        // join and a row of the walk that no build key can match is a
+        // row the block was going to drop. On the node itself the
+        // filter goes into the walk, so those rows are never built:
+        // once counted, once with a property of the walked level read,
+        // which is the gather they stop paying for, and once under a
+        // limit. On a property of that level it stays an operator
+        // after the walk, since the column it reads is only there once
+        // the row is built.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 \
+         AND EXISTS { MATCH (c:person) WHERE c.score = b.id } RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 \
+         AND EXISTS { MATCH (c:person) WHERE c.score = b.id } RETURN sum(b.age) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 \
+         AND EXISTS { MATCH (c:person) WHERE c.score = b.id } RETURN a.id AS a, b.id AS b LIMIT 7",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 \
+         AND EXISTS { MATCH (c:person) WHERE c.age = b.age } RETURN count(*) AS n",
+        // The other two kinds of the same bracket publish nothing. A
+        // row the build side cannot match is a match for the anti and
+        // an outer row with a null bound to it for the left join, so
+        // dropping it there would be the filter answering the query.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 \
+         AND NOT EXISTS { MATCH (c:person) WHERE c.score = b.id } RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 OPTIONAL MATCH (c:person) \
+         WHERE c.score = b.id RETURN count(*) AS n",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -686,6 +712,11 @@ fn unclaimed_shapes_fall_back() {
         "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
          RETURN count(a) AS n",
         "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b)-[:knows]->(c) } \
+         RETURN count(a) AS n",
+        // A mark over a pattern that shares no variable is the probe
+        // the join wears a bracket for, and the answer there is per
+        // outer row as well, so it goes back with the rest of them.
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (c:person) WHERE c.score = a.age } \
          RETURN count(a) AS n",
         // An OPTIONAL MATCH with no required match under it has no
         // driving scan the bracket can hang off.

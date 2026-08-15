@@ -46,16 +46,56 @@ fn corrupt(detail: &str) -> ZuError {
     }
 }
 
+/// Roughly how many bytes of a column an FSST table is trained on. The
+/// encoder samples again inside this, in evenly spaced fragments, so the
+/// figure only has to be enough of the column to be representative of it
+/// and being generous costs one memcpy.
+const TRAIN_SAMPLE: usize = 256 << 10;
+
+/// One symbol table for the whole column, trained on values drawn at an
+/// even stride so a column whose tail looks nothing like its head is
+/// still represented. Training is 96% of what encoding a chunk costs, so
+/// training per chunk is what made writing a string column slow: 2M urls
+/// took 23.3s to encode, of which all but a second was 1953 tables. The
+/// sample is zipped the way a chunk is, lengths and all, because that is
+/// what the table will be asked to encode.
+///
+/// The stride comes from the column's bytes rather than its row count,
+/// which matters: a stride that counts rows stops at the budget partway
+/// down a column of long values, and a table that never saw the second
+/// half leaves those chunks falling back to plain.
+///
+/// The table comes back with what it was worth on the sample, because
+/// that is the yardstick for a chunk that does not fit it: a column of
+/// two dialects trains on both and serves each of them worse than a
+/// table of its own would, so a chunk that lands well off the column's
+/// own ratio buys a table rather than shipping uncompressed.
+fn column_table(values: &[&[u8]]) -> (fsst::Table, u64, u64) {
+    let total: usize = values.iter().map(|v| v.len() + 4).sum();
+    let stride = total.div_ceil(TRAIN_SAMPLE).max(1);
+    let mut sample = Vec::with_capacity(total.min(TRAIN_SAMPLE + BLOCK_SIZE as usize));
+    for v in values.iter().step_by(stride) {
+        sample.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        sample.extend_from_slice(v);
+    }
+    let table = fsst::Table::train(&sample);
+    let mut probe = Vec::new();
+    let packed = table.encode(&sample, &mut probe) - table.header_len();
+    (table, packed as u64, sample.len().max(1) as u64)
+}
+
 /// Encodes `values` into the FullZip payload, appending to `out`, and
 /// returns the total value bytes. Public so the fuzz seeds can build a
 /// payload without a file around it.
 pub fn encode_payload(values: &[&[u8]], out: &mut Vec<u8>) -> Result<u64> {
     let chunk_count = values.len().div_ceil(CHUNK_ROWS);
+    let (table, fit_packed, fit_raw) = column_table(values);
     let mut body = Vec::new();
     let mut comp_ends = Vec::with_capacity(chunk_count);
     let mut raw_ends = Vec::with_capacity(chunk_count);
     let mut zipped = Vec::new();
     let mut packed = Vec::new();
+    let mut own = Vec::new();
     let mut raw_total = 0u64;
     let mut value_bytes = 0u64;
     for chunk in values.chunks(CHUNK_ROWS) {
@@ -71,7 +111,25 @@ pub fn encode_payload(values: &[&[u8]], out: &mut Vec<u8>) -> Result<u64> {
             value_bytes += v.len() as u64;
         }
         packed.clear();
-        let packed_len = fsst::encode(&zipped, &mut packed);
+        let mut packed_len = table.encode(&zipped, &mut packed);
+        // Half again the bytes the column's own sample cost is the line
+        // between a chunk of the column and a chunk of something else,
+        // and only the second kind pays to be trained for. It is a loose
+        // line on purpose: a chunk that would gain a few percent from its
+        // own table is not worth the 3.4ms, and one that would halve is.
+        // Both sides are the code stream without the table, since a table
+        // is a seventh of a chunk this size and a fraction of a percent
+        // of the sample, and comparing the two with it in would retrain
+        // every chunk of every column.
+        let codes = (packed_len - table.header_len()) as u64;
+        if codes * 2 * fit_raw > fit_packed * 3 * zipped.len() as u64 {
+            own.clear();
+            let own_len = fsst::Table::train(&zipped).encode(&zipped, &mut own);
+            if own_len < packed_len {
+                std::mem::swap(&mut packed, &mut own);
+                packed_len = own_len;
+            }
+        }
         if packed_len < zipped.len() {
             body.push(EncodingId::Fsst as u8);
             body.extend_from_slice(&packed);
@@ -460,6 +518,39 @@ mod tests {
         for (i, v) in values.iter().enumerate() {
             assert_eq!(value(&bytes, &ends, i), v.as_slice(), "row {i}");
         }
+    }
+
+    #[test]
+    fn one_table_serves_a_column_whose_halves_differ() {
+        // The column's table is trained once on a stride across the whole
+        // column, so a column that changes shape halfway is the case that
+        // would suffer from it. Both halves must read back, and the
+        // second half must still compress: a table that only saw urls
+        // would leave those rows escaping byte by byte.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("fz.zu1")).unwrap();
+        let mut values = urls(5000);
+        values
+            .extend((0..5000usize).map(|i| {
+                format!("/var/log/service-{}/rotated.{}.log", i % 40, i % 7).into_bytes()
+            }));
+        let meta = write_blob_segment(&mut db, &refs(&values)).unwrap();
+        let (mut bytes, mut ends) = (Vec::new(), Vec::new());
+        read_blob_segment(&mut db, &meta, &mut bytes, &mut ends).unwrap();
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(value(&bytes, &ends, i), v.as_slice(), "row {i}");
+        }
+        let head = write_blob_segment(&mut db, &refs(&values[..5000])).unwrap();
+        let tail = write_blob_segment(&mut db, &refs(&values[5000..])).unwrap();
+        let apart = head.payload_len + tail.payload_len;
+        // Within a tenth of a column each, which is what the retrain
+        // buys: without it the mixed column is half again the size,
+        // because a table trained on both dialects serves neither.
+        assert!(
+            meta.payload_len * 10 < apart * 11,
+            "one table for both halves cost more than a tenth over a table each, {} against {apart}",
+            meta.payload_len
+        );
     }
 
     #[test]

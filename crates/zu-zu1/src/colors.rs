@@ -146,7 +146,7 @@ pub fn analyze(db: &mut Zu1File) -> Result<()> {
     let epoch = db.db_header().epoch;
     for rel in catalog.rel_tables() {
         let mut reader = GraphReader::load_table(db, &rel.name)?;
-        let n = reader.directory().node_count;
+        let n = reader.directory().one_domain()?;
         if n > u32::MAX as u64 {
             continue;
         }

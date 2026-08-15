@@ -54,7 +54,7 @@ fn state(db: &mut Zu1File, mvcc: &Mvcc, person: u32, knows: u32) -> State {
     let props = load_props(db, person).unwrap().unwrap();
     let mut reader = PropsReader::new(props);
     let mut graph = GraphReader::load_table(db, "knows").unwrap();
-    let graph_rows = graph.directory().node_count;
+    let graph_rows = graph.directory().from_count;
     let mut ages = Vec::new();
     let mut names = Vec::new();
     let mut deleted = Vec::new();

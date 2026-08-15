@@ -509,14 +509,14 @@ fn copy(
             println!(
                 "copied {} edges, {} nodes, {} groups",
                 d.edge_count,
-                d.node_count,
+                d.from_count,
                 d.groups.len()
             );
             if key_bytes > 0 {
                 println!(
                     "key index: {} bytes, {:.1} bits/key",
                     key_bytes,
-                    key_bytes as f64 * 8.0 / d.node_count as f64
+                    key_bytes as f64 * 8.0 / d.from_count as f64
                 );
             }
             println!(

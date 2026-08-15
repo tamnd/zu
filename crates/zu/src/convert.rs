@@ -23,9 +23,7 @@ use zu_common::{DurationKind, FloatBits, IntBits, LogicalType, Result, ZuError};
 use zu_sqlite::{ColumnType, SqliteStore, TableDef, Value};
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
-use zu_zu1::graph::{
-    Direction as Zu1Direction, GraphReader, bulk_load_as, bulk_load_undirected_as,
-};
+use zu_zu1::graph::{Direction as Zu1Direction, Ends, GraphReader, bulk_load_between};
 use zu_zu1::props::{
     ListElement, PropInput, PropValues, PropsReader, list_elements, load_props, load_rel_props,
     store_props_nullable, store_rel_props_nullable,
@@ -213,11 +211,12 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
             .map(|(n, t)| Ok((n.as_str(), sqlite_type(t, n)?)))
             .collect::<Result<_>>()?;
         sq.create_rel_table_as(&rel.name, &from, &to, &col_refs, rel.undirected)?;
-        let src_count = catalog
-            .node_by_id(rel.from)
-            .expect("resolved above")
-            .node_count;
         let g = GraphReader::load_table(&mut zu, &rel.name)?;
+        // The rows of the FROM table this table's edges leave, which is
+        // the directory's own domain rather than the node table's: a
+        // node table grows to the widest load that touched it, and a
+        // source past this table's own domain has no list here to read.
+        let src_count = g.directory().from_count;
         let mut reader = props.map(PropsReader::new);
         let mut buf = Vec::new();
         let mut neighbors = Vec::new();
@@ -701,14 +700,7 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
                 )));
             }
         };
-        if src != dst {
-            return Err(ZuError::Unsupported {
-                what: "converting a rel table with two distinct endpoint tables; \
-                       the zu1 bulk loader binds a rel to one node table",
-                id: rel.id,
-            });
-        }
-        let count = sq.node_count(src)?;
+        let (src_count, dst_count) = (sq.node_count(src)?, sq.node_count(dst)?);
         let declared = sq.rel_column_types(&rel.name)?;
         let names: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
         // The scan comes back sorted by source and then destination,
@@ -718,22 +710,30 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
         let rows = sq.rel_rows(&rel.name, &names)?;
         let mut edges: Vec<(u32, u32)> = Vec::with_capacity(rows.len());
         for (s, d, _) in &rows {
-            for (end, id) in [("source", *s), ("destination", *d)] {
+            // Each end is checked against its own table, which are two
+            // tables when the edges run between labels, so a row id
+            // that belongs to neither is named rather than loaded.
+            for (end, id, table, count) in [
+                ("source", *s, src, src_count),
+                ("destination", *d, dst, dst_count),
+            ] {
                 if id < 0 || id >= count {
                     return Err(ZuError::InvalidArgument(format!(
                         "rel table '{}' has an edge whose {end} is row {id}, and \
-                         '{src}' holds {count} rows",
+                         '{table}' holds {count} rows",
                         rel.name
                     )));
                 }
             }
             edges.push((*s as u32, *d as u32));
         }
-        if rel.undirected {
-            bulk_load_undirected_as(&mut zu, src, &rel.name, count as u64, &edges)?;
-        } else {
-            bulk_load_as(&mut zu, src, &rel.name, count as u64, &edges)?;
-        }
+        bulk_load_between(
+            &mut zu,
+            Ends::between((src, src_count as u64), (dst, dst_count as u64)),
+            &rel.name,
+            &edges,
+            rel.undirected,
+        )?;
         if !declared.is_empty() {
             // After the load and not before: a load writes the group
             // directory whole, and the edge property root hangs off it.

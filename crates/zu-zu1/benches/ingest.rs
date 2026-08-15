@@ -279,21 +279,21 @@ fn run_load(
         "{label}: {:.2} M edges/s, {bits_fwd:.2} bits/edge fwd, {bits_bwd:.2} bits/edge bwd ({} edges, {} nodes, {} groups, {:.2}s, {file_bytes} bytes)",
         medges_s,
         directory.edge_count,
-        directory.node_count,
+        directory.from_count,
         directory.groups.len(),
         secs
     );
     if key_bytes > 0 {
         println!(
             "{label} key index: {key_bytes} bytes, {:.1} bits/key",
-            key_bytes as f64 * 8.0 / directory.node_count as f64
+            key_bytes as f64 * 8.0 / directory.from_count as f64
         );
     }
     let verified = zu_zu1::verify(&path).expect("verify");
     println!("{label} verify: ok, {verified} payload bytes checked");
-    let k_out = run_point_lookups(label, &path, directory.node_count, Direction::Fwd);
-    let k_in = run_point_lookups(label, &path, directory.node_count, Direction::Bwd);
-    let k_probe = run_edge_probes(label, &path, directory.node_count);
+    let k_out = run_point_lookups(label, &path, directory.from_count, Direction::Fwd);
+    let k_in = run_point_lookups(label, &path, directory.from_count, Direction::Bwd);
+    let k_probe = run_edge_probes(label, &path, directory.from_count);
     let k_key = key_by_row
         .as_deref()
         .map(|keys| run_key_lookups(label, &path, keys));

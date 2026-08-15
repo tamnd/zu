@@ -194,15 +194,23 @@ pub fn verify(path: &Path) -> Result<u64> {
                 ),
             ));
         }
-        let from = catalog.node_by_id(rel.from).expect("validated on decode");
-        if directory.node_count > from.node_count {
-            return Err(corrupt(
-                "catalog",
-                format!(
-                    "rel table '{}' spans {} nodes, node table '{}' holds {}",
-                    rel.name, directory.node_count, from.name, from.node_count
-                ),
-            ));
+        // Each end of the rel table is checked against the node table it
+        // names, which are two different tables when the edges run
+        // between labels and the same one twice when they do not.
+        for (end, id, spans) in [
+            ("source", rel.from, directory.from_count),
+            ("destination", rel.to, directory.to_count),
+        ] {
+            let table = catalog.node_by_id(id).expect("validated on decode");
+            if spans > table.node_count {
+                return Err(corrupt(
+                    "catalog",
+                    format!(
+                        "rel table '{}' spans {spans} nodes at its {end} end, node table '{}' holds {}",
+                        rel.name, table.name, table.node_count
+                    ),
+                ));
+            }
         }
         for group in &directory.groups {
             for seg in [
@@ -264,7 +272,7 @@ pub fn verify(path: &Path) -> Result<u64> {
             }
         }
         if let Some(keys) = &directory.keys {
-            keys::verify_key_index(&mut db, keys, directory.node_count)?;
+            keys::verify_key_index(&mut db, keys, directory.from_count)?;
             for seg in [&keys.keys, &keys.rows] {
                 bytes += seg.payload_len;
                 live.extend(seg.blocks.iter().copied());

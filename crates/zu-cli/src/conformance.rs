@@ -73,8 +73,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "multiple-node-labels",
-        supported: false,
-        why: "a rel table binds to one node table at each end",
+        supported: true,
+        why: "a rel table names the node table at each of its ends, and the two need not be the same one",
     },
     Declared {
         key: "temporal-values",

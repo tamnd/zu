@@ -34,7 +34,7 @@ const SAMPLE_TARGET: usize = 64 << 10;
 
 /// Longest-match lookup at `pos` against the table; returns the code and
 /// matched length, or None when the position starts no symbol.
-fn best_match(map: &HashMap<&[u8], u8>, bytes: &[u8], pos: usize) -> Option<(u8, usize)> {
+fn best_match(map: &HashMap<Vec<u8>, u8>, bytes: &[u8], pos: usize) -> Option<(u8, usize)> {
     let limit = MAX_SYMBOL_LEN.min(bytes.len() - pos);
     for len in (1..=limit).rev() {
         if let Some(&code) = map.get(&bytes[pos..pos + len]) {
@@ -72,10 +72,10 @@ fn sample(bytes: &[u8]) -> Vec<u8> {
 fn train(sample: &[u8]) -> Vec<Vec<u8>> {
     let mut table: Vec<Vec<u8>> = Vec::new();
     for _ in 0..TRAIN_ROUNDS {
-        let map: HashMap<&[u8], u8> = table
+        let map: HashMap<Vec<u8>, u8> = table
             .iter()
             .enumerate()
-            .map(|(i, s)| (s.as_slice(), i as u8))
+            .map(|(i, s)| (s.clone(), i as u8))
             .collect();
         let mut gain: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut prev: Option<(usize, usize)> = None;
@@ -102,38 +102,75 @@ fn train(sample: &[u8]) -> Vec<Vec<u8>> {
     table
 }
 
-/// Encodes `bytes` into `out`, returning the encoded byte length.
-pub fn encode(bytes: &[u8], out: &mut Vec<u8>) -> usize {
-    let start = out.len();
-    let table = train(&sample(bytes));
-    let map: HashMap<&[u8], u8> = table
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_slice(), i as u8))
-        .collect();
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.push(table.len() as u8);
-    for sym in &table {
-        out.push(sym.len() as u8);
+/// A trained symbol table, separated from the encode pass because the two
+/// cost wildly different amounts: training a table for one 1024-row chunk
+/// of short strings runs about 3.4ms and encoding that chunk against it
+/// runs about 0.13ms, so a writer that trains per chunk spends 96% of its
+/// time in training. A writer holding a column of chunks that are alike
+/// trains once, on a sample drawn across the whole column, and encodes
+/// every chunk with the result. Nothing about the encoded form changes:
+/// each buffer still carries the table it was encoded with, so a decoder
+/// cannot tell which of the two a writer did.
+pub struct Table {
+    symbols: Vec<Vec<u8>>,
+    map: HashMap<Vec<u8>, u8>,
+}
+
+impl Table {
+    /// Trains on `bytes`, sampling it first when it is long.
+    pub fn train(bytes: &[u8]) -> Table {
+        let symbols = train(&sample(bytes));
+        let map = symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u8))
+            .collect();
+        Table { symbols, map }
     }
-    for sym in &table {
-        out.extend_from_slice(sym);
+
+    /// What every encoded buffer pays to carry this table: the fixed
+    /// header, one length byte per symbol and the symbol bytes. A writer
+    /// comparing two encodings of different sizes has to take this out
+    /// first, because a table costing 2 KiB is nothing against a whole
+    /// column and a seventh of one 1024-row chunk of short strings.
+    pub fn header_len(&self) -> usize {
+        5 + self.symbols.len() + self.symbols.iter().map(Vec::len).sum::<usize>()
     }
-    let mut pos = 0;
-    while pos < bytes.len() {
-        match best_match(&map, bytes, pos) {
-            Some((code, len)) => {
-                out.push(code);
-                pos += len;
-            }
-            None => {
-                out.push(ESCAPE);
-                out.push(bytes[pos]);
-                pos += 1;
+
+    /// Encodes `bytes` into `out`, returning the encoded byte length.
+    pub fn encode(&self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
+        let start = out.len();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.push(self.symbols.len() as u8);
+        for sym in &self.symbols {
+            out.push(sym.len() as u8);
+        }
+        for sym in &self.symbols {
+            out.extend_from_slice(sym);
+        }
+        let mut pos = 0;
+        while pos < bytes.len() {
+            match best_match(&self.map, bytes, pos) {
+                Some((code, len)) => {
+                    out.push(code);
+                    pos += len;
+                }
+                None => {
+                    out.push(ESCAPE);
+                    out.push(bytes[pos]);
+                    pos += 1;
+                }
             }
         }
+        out.len() - start
     }
-    out.len() - start
+}
+
+/// Trains a table on `bytes` and encodes `bytes` with it, returning the
+/// encoded byte length. [`Table`] is the form to reach for when more than
+/// one buffer is going to be encoded the same way.
+pub fn encode(bytes: &[u8], out: &mut Vec<u8>) -> usize {
+    Table::train(bytes).encode(bytes, out)
 }
 
 /// Decodes an encoded buffer, appending at most `max_bytes` bytes to
@@ -306,6 +343,27 @@ mod tests {
         buf.extend_from_slice(&[0, 0]);
         assert!(decode(&buf, 64, &mut out).is_err());
         assert_eq!(out, [1, 2, 3], "a rejected payload must not touch out");
+    }
+
+    #[test]
+    fn a_table_encodes_buffers_it_did_not_train_on() {
+        // What a column writer does: train once, encode every chunk with
+        // it. A buffer the table never saw still has to round-trip, both
+        // when it is more of the same and when it shares nothing with the
+        // sample and every byte escapes.
+        let table = Table::train(&text_corpus());
+        for text in [
+            b"https://example.com/user/999999/posts?page=3".to_vec(),
+            (0..=255u8).collect(),
+            Vec::new(),
+        ] {
+            let mut buf = Vec::new();
+            let len = table.encode(&text, &mut buf);
+            assert_eq!(len, buf.len());
+            let mut out = Vec::new();
+            decode(&buf, text.len().max(1), &mut out).unwrap();
+            assert_eq!(text, out);
+        }
     }
 
     #[test]

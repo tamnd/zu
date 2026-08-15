@@ -5,7 +5,7 @@
 //! Neighbor lists are sorted and deduplicated, which is what gives the
 //! WCOJ intersection its tries for free and keeps binary search valid
 //! inside `Expand`. The builder buffers raw edges and performs a single
-//! global sort at build time, never a per-vertex sort.
+//! global sort at build time, never a per-node sort.
 
 /// Compressed sparse row adjacency over `u32` node ids.
 ///

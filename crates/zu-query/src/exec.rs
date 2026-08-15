@@ -75,7 +75,7 @@ use crate::plan::{Bracket, BracketKind, LogicalPlan, expr_text};
 pub const VECTOR_SIZE: usize = 2048;
 
 /// An engine-internal failure: a slot that is not bound, a multiplicity
-/// that overflowed, a shape the planner should never have produced.
+/// that overflowed, a shape the optimizer should never have produced.
 /// These are bugs in zu, not conditions the standard has a code for, so
 /// they stay uncoded rather than borrowing one that nearly fits.
 fn invalid(detail: String) -> ZuError {
@@ -1172,7 +1172,7 @@ struct AggSpec {
     distinct: bool,
     star: bool,
     arg: Option<BoundExpr>,
-    /// The one unflat chunk the argument reads, if any; the planner
+    /// The one unflat chunk the argument reads, if any; the optimizer
     /// flattens the rest.
     arg_chunk: Option<usize>,
 }
@@ -2419,7 +2419,7 @@ fn value_of(ctx: &mut StageCtx, slot: usize) -> Result<Value> {
         let chunk = &ctx.chunks[c];
         let Some(pos) = chunk.cur else {
             return Err(invalid(
-                "read of an unflattened vector, the planner missed a flatten".into(),
+                "read of an unflattened vector, the optimizer missed a flatten".into(),
             ));
         };
         return Ok(chunk.cols[col][pos].clone());

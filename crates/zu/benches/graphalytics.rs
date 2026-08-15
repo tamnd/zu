@@ -1,5 +1,12 @@
 //! LDBC Graphalytics reference validation on kgs (docs/12 M4).
 //!
+//! <!-- terms: allow vertex, vertices -->
+//!
+//! This bench is checked against a published dataset, and it names
+//! things the way that dataset's documentation names them, because a
+//! reference file's own vocabulary is the one to quote when disagreeing
+//! with it is the failure being reported.
+//!
 //! The ldbc bench proves the kernels against references this repo
 //! computes for itself. This bench removes that self-dependency: it
 //! runs pagerank, wcc, and sssp over the real KGS go graph, 832 K

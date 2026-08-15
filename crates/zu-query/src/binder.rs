@@ -657,7 +657,7 @@ impl fmt::Display for Type {
 }
 
 /// One bound variable. Pattern elements without a name in the query get
-/// a slot too, named `#slot`, so the planner addresses everything the
+/// a slot too, named `#slot`, so the optimizer addresses everything the
 /// same way.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarDef {

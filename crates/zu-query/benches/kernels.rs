@@ -3,7 +3,7 @@
 //! Uses real data when available: edges from soc-LiveJournal1 (set
 //! ZU_DATA to the directory holding soc-LiveJournal1.txt, capped at 8 M
 //! edges), otherwise a synthetic power-law-ish graph. Reports CSR build
-//! edges/s, BFS MTEPS from the max-degree vertex, triangle counting
+//! edges/s, BFS MTEPS from the max-degree node, triangle counting
 //! throughput on a 2 M edge prefix, and pagerank iterations/s.
 //! No gate floors yet: the numbers are informational.
 //!

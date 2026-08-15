@@ -28,6 +28,10 @@ harness = false
 name = "corpus"
 harness = false
 
+[[bench]]
+name = "terms"
+harness = false
+
 [dependencies]
 crc32c.workspace = true
 zstd.workspace = true

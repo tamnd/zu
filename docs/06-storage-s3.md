@@ -66,7 +66,7 @@ Three tiers, managed by **foyer** (hybrid memory+disk cache, Rust; used by Risin
 - Admission: S3-FIFO (foyer default); **inflight request deduplication** (one GET per missing range, concurrent readers coalesce), foyer built-in.
 - **Write-through on checkpoint**: freshly folded packs are inserted into NVMe cache before the manifest swap (SlateDB active maintenance), post-compaction reads never storm S3.
 - **Pinned tier**: manifests, footers, CSR offset segments, pk-index buckets, and (if `vector`) HNSW upper layers are `pin=true`, the "hot topology never leaves cache" BG3 rule. Rule of thumb: topology ≈ 4–8 bits/edge ⇒ a 10 B-edge graph's full adjacency ≈ 5–10 GiB, pinnable on one NVMe.
-- Cold-query discipline (turbopuffer lesson): planner annotates each pipeline with max S3 round trips; multi-hop expansion against uncached groups executes as **batched frontier prefetch** (gather all needed ranges per BFS level → parallel ranged GETs), never pointer-chase per node against S3.
+- Cold-query discipline (turbopuffer lesson): optimizer annotates each pipeline with max S3 round trips; multi-hop expansion against uncached groups executes as **batched frontier prefetch** (gather all needed ranges per BFS level → parallel ranged GETs), never pointer-chase per node against S3.
 
 ## 5. Cost model (T9 verification, us-east-1 Standard, 2026 prices)
 

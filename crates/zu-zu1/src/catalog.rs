@@ -998,6 +998,74 @@ impl Catalog {
         nodes.chain(rels).collect()
     }
 
+    /// Copies the table definitions of one graph into another, which is
+    /// the catalog half of `CREATE GRAPH ... AS COPY OF` (GC04).
+    ///
+    /// Each copy keeps the name it had, which is what makes the copy a
+    /// copy: a query written against the source runs against the copy
+    /// once `USE` names it. A name belongs to a graph rather than to
+    /// the file, so both graphs holding a `person` is two tables and
+    /// not a clash. What the copies do not keep is their ids, because
+    /// an id is what the table index addresses storage by and the copy
+    /// gets storage of its own.
+    ///
+    /// Answers the source id, the copy's id and the kind of each table,
+    /// which is what [`crate::graph::copy_graph_storage`] needs to copy
+    /// the blocks those ids stand for.
+    pub fn copy_graph_tables(
+        &mut self,
+        source: u32,
+        target: u32,
+    ) -> Result<Vec<(u32, u32, ElementKind)>> {
+        let mut copied = Vec::new();
+        // Node tables first, because a rel table names the two node
+        // tables it runs between and wants the copies' ids, not the
+        // source's, or its edges would land back in the source graph.
+        for table in self.nodes.clone() {
+            if table.graph != source {
+                continue;
+            }
+            let id = self.next_id()?;
+            self.nodes.push(NodeTable {
+                id,
+                graph: target,
+                ..table.clone()
+            });
+            copied.push((table.id, id, ElementKind::Node));
+        }
+        let nodes: Vec<(u32, u32)> = copied.iter().map(|&(from, to, _)| (from, to)).collect();
+        let mapped = |id: u32| {
+            nodes
+                .iter()
+                .find(|&&(from, _)| from == id)
+                .map(|&(_, to)| to)
+        };
+        for table in self.rels.clone() {
+            if table.graph != source {
+                continue;
+            }
+            // Both ends are in the graph being copied, which `validate`
+            // holds every catalog to, so a missing one is a file that
+            // should never have opened.
+            let (Some(from), Some(to)) = (mapped(table.from), mapped(table.to)) else {
+                return Err(corrupt(
+                    "catalog",
+                    format!("rel table '{}' ends outside graph {source}", table.name),
+                ));
+            };
+            let id = self.next_id()?;
+            self.rels.push(RelTable {
+                id,
+                graph: target,
+                from,
+                to,
+                ..table.clone()
+            });
+            copied.push((table.id, id, ElementKind::Edge));
+        }
+        Ok(copied)
+    }
+
     /// Drops a graph and every table in it, answering whether there was
     /// one. The storage those tables held is the caller's to free; this
     /// is the catalog half of `DROP GRAPH`.

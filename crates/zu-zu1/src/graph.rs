@@ -1046,6 +1046,115 @@ pub fn free_graph_storage(db: &mut Zu1File, catalog: &Catalog, graph: u32) -> Re
     stats.store(db)
 }
 
+/// Copies everything the tables of one graph hold into blocks of their
+/// own, which is the storage half of `CREATE GRAPH ... AS COPY OF`
+/// (GC04).
+///
+/// `tables` pairs each source table id with the id the catalog gave its
+/// copy, which the caller has already put in the new graph. The copy is
+/// block for block: every segment block of the source is read whole and
+/// written into a freshly allocated one, and the directories are
+/// re-encoded only because a directory names the blocks its segments
+/// live in and those are now different blocks. The bytes of a column,
+/// a CSR array and a key index are the source's byte for byte, so the
+/// copy costs a read and a write per block and no decode, and it does
+/// not matter to it what the columns hold.
+///
+/// Nothing is shared with the source. A copy that pointed at the same
+/// segments would be a second name for one graph, and the first write
+/// to either would show up in both; `COPY OF` is a graph that starts
+/// out equal and goes its own way.
+///
+/// Nothing is published here either, as in [`free_graph_storage`]: the
+/// table index and the statistics are staged and the checkpoint that
+/// stores the catalog makes all three visible at once.
+pub fn copy_graph_storage(db: &mut Zu1File, tables: &[(u32, u32, ElementKind)]) -> Result<()> {
+    let mut index = TableIndex::load(db)?;
+    let mut stats = crate::stats::Stats::load(db)?;
+    for &(source, copy, kind) in tables {
+        if let Some(root) = index.get(source) {
+            let copied = match kind {
+                ElementKind::Node => crate::props::copy_props(db, root)?,
+                ElementKind::Edge => copy_directory(db, root)?,
+            };
+            index.set(copy, copied);
+        }
+        // A node table's deleted rows are part of what it holds: a copy
+        // that left them behind would answer a scan with rows the
+        // source no longer has.
+        if kind == ElementKind::Node
+            && let Some(root) = index.get(source | crate::fold::TOMBSTONE_KEY)
+        {
+            let copied = copy_chain(db, root)?;
+            index.set(copy | crate::fold::TOMBSTONE_KEY, copied);
+        }
+        // The copy holds the same rows, so it plans the same way.
+        // Gathering the statistics again would read every column of it
+        // for numbers the file already has.
+        if let Some(rels) = stats.rels.get(&source).cloned() {
+            stats.rels.insert(copy, rels);
+        }
+        if let Some(cols) = stats.cols.get(&source).cloned() {
+            stats.cols.insert(copy, cols);
+        }
+    }
+    free_chain(db, db.db_header().table_index_root)?;
+    free_chain(db, db.db_header().stats_root)?;
+    let index_root = meta::write_chain(db, &index.encode())?;
+    db.db_header_mut().table_index_root = index_root;
+    stats.store(db)
+}
+
+/// Copies a group directory and everything it points at, answering the
+/// root of the copy. The mirror of [`free_directory`], and it walks the
+/// same pointers: a block either free walks past or copy walks past is
+/// a block the other one leaks.
+fn copy_directory(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
+    let mut directory = Directory::decode(&meta::read_chain(db, root)?)?;
+    if directory.props != NULL_BLOCK {
+        directory.props = crate::props::copy_props(db, directory.props)?;
+    }
+    if let Some(keys) = &mut directory.keys {
+        for seg in [&mut keys.keys, &mut keys.rows] {
+            seg.blocks = copy_blocks(db, &seg.blocks)?;
+        }
+    }
+    for group in &mut directory.groups {
+        for seg in [
+            &mut group.fwd.offsets,
+            &mut group.fwd.neighbors,
+            &mut group.bwd.offsets,
+            &mut group.bwd.neighbors,
+        ] {
+            seg.blocks = copy_blocks(db, &seg.blocks)?;
+        }
+    }
+    meta::write_chain(db, &directory.encode())
+}
+
+/// Copies a meta chain, answering the root of the copy. The payload is
+/// what carries over rather than the blocks, because a chain block
+/// holds the pointer to the next one and those are the caller's to
+/// hand out.
+fn copy_chain(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
+    let payload = meta::read_chain(db, root)?;
+    meta::write_chain(db, &payload)
+}
+
+/// Copies a segment's blocks into fresh ones, answering where they
+/// landed. A block is read and written whole: what a segment block
+/// holds is the encoder's business and none of this function's.
+pub(crate) fn copy_blocks(db: &mut Zu1File, blocks: &[BlockPtr]) -> Result<Vec<BlockPtr>> {
+    let mut out = Vec::with_capacity(blocks.len());
+    for &ptr in blocks {
+        let data = db.read_block(ptr)?;
+        let copy = db.allocate_block();
+        db.write_block(copy, &data)?;
+        out.push(copy);
+    }
+    Ok(out)
+}
+
 /// Read access to a bulk-loaded graph, caching the most recently decoded
 /// group per direction so sequential scans decode each group once. The
 /// two directions cache independently because a plan often walks both
@@ -2310,5 +2419,103 @@ mod tests {
         let mut db3 = Zu1File::create(&dir.path().join("g3.zu1")).unwrap();
         let err = bulk_load_keyed(&mut db3, "node", "edge", n, edges, Some(&[1, 2])).unwrap_err();
         assert!(format!("{err}").contains("2 keys"));
+    }
+
+    /// The property and CSR blocks a table's storage names, in the
+    /// order the copy walks them, so two tables' lists line up entry
+    /// for entry when one is a copy of the other. The meta chain is not
+    /// in here: a chain block holds the pointers to the segments and to
+    /// the next chain block, and those are what a copy has of its own.
+    fn segment_blocks(db: &mut Zu1File, root: BlockPtr, kind: ElementKind) -> Vec<BlockPtr> {
+        let mut out = Vec::new();
+        match kind {
+            ElementKind::Node => props_segment_blocks(db, root, &mut out),
+            ElementKind::Edge => {
+                let directory = Directory::decode(&meta::read_chain(db, root).unwrap()).unwrap();
+                if directory.props != NULL_BLOCK {
+                    props_segment_blocks(db, directory.props, &mut out);
+                }
+                if let Some(keys) = &directory.keys {
+                    out.extend(&keys.keys.blocks);
+                    out.extend(&keys.rows.blocks);
+                }
+                for group in &directory.groups {
+                    for seg in [
+                        &group.fwd.offsets,
+                        &group.fwd.neighbors,
+                        &group.bwd.offsets,
+                        &group.bwd.neighbors,
+                    ] {
+                        out.extend(&seg.blocks);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn props_segment_blocks(db: &mut Zu1File, root: BlockPtr, out: &mut Vec<BlockPtr>) {
+        let directory =
+            crate::props::PropsDirectory::decode(&meta::read_chain(db, root).unwrap()).unwrap();
+        out.extend(directory.labels.iter().flat_map(|m| &m.blocks));
+        for col in &directory.columns {
+            out.extend(&col.meta.blocks);
+            out.extend(col.validity.iter().flat_map(|m| &m.blocks));
+        }
+    }
+
+    #[test]
+    fn a_graph_copy_holds_the_same_bytes_in_blocks_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.zu1");
+        let mut db = Zu1File::create(&path).unwrap();
+        let mut edges = vec![(0, 1), (0, 3), (1, 2), (3, 0)];
+        let edges = sorted_edges(&mut edges).to_vec();
+        bulk_load_keyed(
+            &mut db,
+            "person",
+            "follows",
+            4,
+            &edges,
+            Some(&[10, 20, 30, 40]),
+        )
+        .unwrap();
+        crate::props::store_props(
+            &mut db,
+            "person",
+            &[("age", crate::props::PropValues::Int(&[31, 32, 33, 34]))],
+        )
+        .unwrap();
+        db.checkpoint().unwrap();
+
+        let mut catalog = Catalog::load(&mut db).unwrap();
+        let source = catalog.home_graph_id();
+        let target = catalog
+            .add_graph(
+                "twin",
+                crate::catalog::ROOT_SCHEMA,
+                crate::catalog::GraphTypeOf::Open,
+            )
+            .unwrap();
+        let tables = catalog.copy_graph_tables(source, target).unwrap();
+        copy_graph_storage(&mut db, &tables).unwrap();
+        catalog.store(&mut db).unwrap();
+        // The catalog validates on store, so a copy that got its table
+        // names or its endpoints wrong never gets this far.
+        assert_eq!(tables.len(), 2);
+
+        let index = TableIndex::load(&mut db).unwrap();
+        for (from, to, kind) in tables {
+            let (from, to) = (index.get(from).unwrap(), index.get(to).unwrap());
+            let source = segment_blocks(&mut db, from, kind);
+            let copy = segment_blocks(&mut db, to, kind);
+            assert_eq!(source.len(), copy.len(), "{kind:?}");
+            assert!(!source.is_empty(), "{kind:?} stores something");
+            for (&a, &b) in source.iter().zip(&copy) {
+                assert_ne!(a, b, "a copied block is a block of its own");
+                assert_eq!(db.read_block(a).unwrap(), db.read_block(b).unwrap());
+            }
+        }
+        crate::verify(&path).unwrap();
     }
 }

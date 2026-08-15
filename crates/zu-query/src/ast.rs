@@ -56,8 +56,9 @@ pub enum CatalogStmt {
         if_not_exists: bool,
         or_replace: bool,
         of: GraphTypeRef,
-        /// GG05: the graph whose contents the new one starts with.
-        copy_of: Option<String>,
+        /// GG05: the graph whose contents the new one starts with,
+        /// which may be the graph the statement is against.
+        copy_of: Option<GraphRef>,
     },
     DropGraph {
         name: GraphName,

@@ -20,7 +20,8 @@
 
 use zu_common::{Result, ZuError};
 use zu_query::ast::{
-    CatalogStmt, ElementDefKind, ElementTypeDef, Endpoint, GraphName, GraphTypeRef, GraphTypeSource,
+    CatalogStmt, ElementDefKind, ElementTypeDef, Endpoint, GraphName, GraphRef, GraphTypeRef,
+    GraphTypeSource,
 };
 
 use crate::zu1::catalog::{Catalog, ElementKind, ElementType, GraphType, GraphTypeOf, ROOT_SCHEMA};
@@ -146,20 +147,31 @@ pub fn apply(db: &mut Zu1File, stmt: &CatalogStmt) -> Result<Effect> {
                 // that was there.
                 let id = existing.id;
                 let graph_type = graph_type_of(&mut catalog, &name, of)?;
-                copy(&catalog, copy_of.as_deref())?;
+                let source = copy_source(&catalog, copy_of.as_ref())?;
+                // A replacement frees what the old graph held before it
+                // writes the new one, so a graph asked to become a copy
+                // of itself is asked for a copy of what is about to be
+                // gone.
+                if source == Some(id) {
+                    return Err(ZuError::InvalidArgument(format!(
+                        "'{name}' cannot be replaced by a copy of itself"
+                    )));
+                }
                 // Everything the add below could refuse is asked here,
                 // because after the free there is no graph to leave
                 // standing.
                 catalog.check_graph(&schema, &graph_type)?;
                 graph::free_graph_storage(db, &catalog, id)?;
                 catalog.drop_graph(id);
-                catalog.add_graph(&name, &schema, graph_type)?;
+                let target = catalog.add_graph(&name, &schema, graph_type)?;
+                copy_into(db, &mut catalog, source, target)?;
                 catalog.store(db)?;
                 return Ok(Effect::Created);
             }
             let graph_type = graph_type_of(&mut catalog, &name, of)?;
-            copy(&catalog, copy_of.as_deref())?;
-            catalog.add_graph(&name, &schema, graph_type)?;
+            let source = copy_source(&catalog, copy_of.as_ref())?;
+            let target = catalog.add_graph(&name, &schema, graph_type)?;
+            copy_into(db, &mut catalog, source, target)?;
         }
         CatalogStmt::DropGraph { name, if_exists } => {
             let (schema, name) = split(name);
@@ -232,24 +244,44 @@ fn graph_type_of(catalog: &mut Catalog, name: &str, of: &GraphTypeRef) -> Result
     }
 }
 
-/// What `AS COPY OF` copies (GG05).
+/// The graph `AS COPY OF` names (GG05), resolved before anything is
+/// created so a statement naming a graph the file does not have leaves
+/// the file alone.
+fn copy_source(catalog: &Catalog, source: Option<&GraphRef>) -> Result<Option<u32>> {
+    match source {
+        None => Ok(None),
+        // The graph the statement is against, which is the home graph:
+        // that is the one a query with no `USE` reads and the one a
+        // loaded file put its tables in.
+        Some(GraphRef::Current) => Ok(Some(catalog.home_graph_id())),
+        Some(GraphRef::Named(name)) => {
+            let (schema, name) = split(name);
+            let graph = catalog.graph(&schema, &name).ok_or_else(|| {
+                ZuError::InvalidArgument(format!("'{name}' is no graph in '{schema}'"))
+            })?;
+            Ok(Some(graph.id))
+        }
+    }
+}
+
+/// Fills a created graph with a copy of another one (GG05).
 ///
-/// A graph that holds no tables copies as the empty graph it is. A
-/// graph that holds some is a block for block copy of its tables, which
-/// is not written yet, and saying so beats creating a graph that is
-/// empty where the statement asked for a copy.
-fn copy(catalog: &Catalog, source: Option<&str>) -> Result<()> {
+/// The copy is by value and not by reference: the new graph gets tables
+/// of its own holding the same names and blocks of its own holding the
+/// same bytes, so a write to either graph is nothing to the other. A
+/// graph that holds no tables copies as the empty graph it is, which
+/// falls out of there being nothing to walk.
+fn copy_into(
+    db: &mut Zu1File,
+    catalog: &mut Catalog,
+    source: Option<u32>,
+    target: u32,
+) -> Result<()> {
     let Some(source) = source else {
         return Ok(());
     };
-    let graph = graph_named(catalog, source)?;
-    if !catalog.graph_tables(graph.id).is_empty() {
-        return Err(ZuError::Unsupported {
-            what: "AS COPY OF a graph that holds tables",
-            id: graph.id,
-        });
-    }
-    Ok(())
+    let tables = catalog.copy_graph_tables(source, target)?;
+    graph::copy_graph_storage(db, &tables)
 }
 
 /// The graph a statement names, which is a graph in the root schema

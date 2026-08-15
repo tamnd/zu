@@ -2421,6 +2421,14 @@
       "doc": "Everything `add_graph` refuses a graph for other than a name its\nschema already holds.\n\n`CREATE OR REPLACE GRAPH` frees the blocks the old graph held\nbefore the new one is added, and a refusal after that point would\nleave a file holding neither, so the caller asks first and frees\nnothing when the answer is no."
     },
     {
+      "id": "zu::zu1::catalog::Catalog::copy_graph_tables",
+      "kind": "method",
+      "name": "copy_graph_tables",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn copy_graph_tables(&mut self, source: u32, target: u32) -> Result<Vec<(u32, u32, ElementKind)>>",
+      "doc": "Copies the table definitions of one graph into another, which is\nthe catalog half of `CREATE GRAPH ... AS COPY OF` (GC04).\n\nEach copy keeps the name it had, which is what makes the copy a\ncopy: a query written against the source runs against the copy\nonce `USE` names it. A name belongs to a graph rather than to\nthe file, so both graphs holding a `person` is two tables and\nnot a clash. What the copies do not keep is their ids, because\nan id is what the table index addresses storage by and the copy\ngets storage of its own.\n\nAnswers the source id, the copy's id and the kind of each table,\nwhich is what [`crate::graph::copy_graph_storage`] needs to copy\nthe blocks those ids stand for."
+    },
+    {
       "id": "zu::zu1::catalog::Catalog::declare_label",
       "kind": "method",
       "name": "declare_label",
@@ -4185,6 +4193,13 @@
       "name": "bulk_load_undirected_as",
       "signature": "fn bulk_load_undirected_as(db: &mut zu_zu1::file::Zu1File, node_table: &str, rel_table: &str, node_count: u64, edges: &[(u32, u32)]) -> zu_common::Result<Directory>",
       "doc": "[`bulk_load_as`] for edges with no direction (GH02).\n\nThe edge list is stored the way it is written and nothing is\nmirrored: the reverse CSR every load builds is what answers the\nother way round, and the rel table says the two ways are one edge.\nA pattern that asks for a direction is what tells them apart, so an\nundirected table costs a directed one nothing on disk."
+    },
+    {
+      "id": "zu::zu1::graph::copy_graph_storage",
+      "kind": "function",
+      "name": "copy_graph_storage",
+      "signature": "fn copy_graph_storage(db: &mut zu_zu1::file::Zu1File, tables: &[(u32, u32, zu_zu1::catalog::ElementKind)]) -> zu_common::Result<()>",
+      "doc": "Copies everything the tables of one graph hold into blocks of their\nown, which is the storage half of `CREATE GRAPH ... AS COPY OF`\n(GC04).\n\n`tables` pairs each source table id with the id the catalog gave its\ncopy, which the caller has already put in the new graph. The copy is\nblock for block: every segment block of the source is read whole and\nwritten into a freshly allocated one, and the directories are\nre-encoded only because a directory names the blocks its segments\nlive in and those are now different blocks. The bytes of a column,\na CSR array and a key index are the source's byte for byte, so the\ncopy costs a read and a write per block and no decode, and it does\nnot matter to it what the columns hold.\n\nNothing is shared with the source. A copy that pointed at the same\nsegments would be a second name for one graph, and the first write\nto either would show up in both; `COPY OF` is a graph that starts\nout equal and goes its own way.\n\nNothing is published here either, as in [`free_graph_storage`]: the\ntable index and the statistics are staged and the checkpoint that\nstores the catalog makes all three visible at once."
     },
     {
       "id": "zu::zu1::graph::densify_keyed",

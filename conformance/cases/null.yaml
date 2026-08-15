@@ -1,0 +1,244 @@
+schema: 1
+suite: null
+doc: Three-valued logic, which is the part of the standard a client is most likely to have replaced with its host language's two-valued one without noticing. Every case here has an answer that is neither true nor false, or an answer that is one of them where a two-valued reading gives the other.
+
+cases:
+  - name: literal
+    doc: A null is a value and not a missing column, and it arrives beside a value in the same row so that a client cannot answer by dropping the field.
+    query: RETURN null AS a, 1 AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: NULL
+          - type: INT64
+            value: "1"
+
+  - name: equality-is-unknown
+    doc: A null is not equal to a null, and it is not unequal either. The answer is a null, which is the single fact every other case in this file follows from.
+    query: RETURN null = null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: inequality-is-unknown
+    doc: The other operator, because a client implementing not-equal as the negation of equal has to have negated a null into a null and not into a true.
+    query: RETURN null <> null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: order-comparison-is-unknown
+    doc: An ordering against a null is unknown too, which is separate from equality because a client with a separate comparison path has a separate place to get it wrong.
+    query: RETURN null < 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: is-null
+    doc: The one operator that answers a boolean about a null, which is why it exists and why a client cannot express the question with an equality.
+    query: RETURN null IS NULL AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: is-null-on-a-value
+    doc: The same operator on something that is not null, so that a client answering true to everything fails here.
+    query: RETURN 1 IS NULL AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: is-not-null
+    doc: The negated form, which is a spelling of its own rather than a NOT applied to the case above, and therefore its own chance to be wrong.
+    query: RETURN 1 IS NOT NULL AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: and-with-unknown-is-unknown
+    doc: True and unknown is unknown, because whether the whole is true still depends on something nobody knows.
+    query: RETURN true AND null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: and-with-false-is-false
+    doc: False and unknown is false, and this is the case a two-valued client gets wrong in the other direction: it knows enough to answer here and must not return unknown.
+    query: RETURN false AND null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: or-with-true-is-true
+    doc: True or unknown is true, the mirror of the case above, and the other place a client that propagates nulls mechanically answers unknown where the answer is known.
+    query: RETURN true OR null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: or-with-false-is-unknown
+    doc: False or unknown is unknown, which completes the four combinations and is the one that looks most like it should be false.
+    query: RETURN false OR null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: not-unknown-is-unknown
+    doc: The negation of unknown is unknown. A client mapping null to false before negating answers true here.
+    query: RETURN NOT null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: xor-with-unknown-is-unknown
+    doc: Exclusive or with an unknown is unknown whatever the other side is, because the answer flips with the unknown and never settles.
+    query: RETURN true XOR null AS a, false XOR null AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: NULL
+          - type: NULL
+
+  - name: arithmetic-propagates
+    doc: A null in an addition gives a null and not the other operand. A client treating a missing value as zero answers 1 here and gets a plausible wrong number rather than an error.
+    query: RETURN null + 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: multiplication-propagates
+    doc: The same through a multiplication, where the plausible wrong answers are zero and the other operand depending on which identity the client reached for.
+    query: RETURN null * 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: division-by-null-does-not-raise
+    doc: A division whose divisor is unknown is unknown and not a division by zero, so this is the one case in the suite where a client raising an error is the failure.
+    query: RETURN 1 / null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: negation-propagates
+    doc: A unary minus on a null is a null, which a client folding the sign into the literal has to preserve.
+    query: RETURN -null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: size-propagates
+    doc: A function of a null is a null rather than an error or a zero, which is the rule for every function and is worth one case so nine clients agree what a null argument does.
+    query: RETURN size(null) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: cast-propagates
+    doc: A cast of a null is a null of the new type rather than a zero or a failure, which is where a client using the host language's own conversion produces a value out of nothing.
+    query: RETURN cast(null AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: in-a-list
+    doc: A null inside a list is an element and not a gap, so a client compacting its lists gives back two elements where the answer has three.
+    query: RETURN [1, null, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: NULL
+              - type: INT64
+                value: "2"
+
+  - name: list-equality-with-a-null-inside
+    doc: Two lists that differ nowhere and contain a null compare unknown rather than true, because the comparison of the elements is what the list comparison is made of.
+    query: RETURN [null] = [null] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: filtered-out-by-a-condition
+    doc: A row whose condition is unknown does not pass, which is where three-valued logic stops being an abstraction: unknown is not true, so the row is gone, and a client filtering on truthiness agrees here by accident and not by reasoning.
+    query: UNWIND [1, null, 3] AS n WITH n WHERE n > 1 RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: sorts-last
+    doc: Nulls sort after every value under an ascending order. A client sorting with the host language's comparator puts them wherever that comparator puts a missing value, which is first about as often as last.
+    query: UNWIND [1, null, 2] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: NULL
+
+  - name: counted-out-of-a-set-function
+    doc: A set function ignores nulls rather than propagating them, which is the one place in the language where a null does not spread, and it raises a warning saying so rather than doing it quietly.
+    query: UNWIND [1, 2, null] AS n RETURN count(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"

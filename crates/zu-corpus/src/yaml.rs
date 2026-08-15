@@ -165,7 +165,7 @@ fn lex(text: &str) -> Result<Vec<Line>, String> {
                 col + 1
             ));
         }
-        let content = strip_comment(raw, no)?.trim_end();
+        let content = strip_comment(raw).trim_end();
         let indent = content.len() - content.trim_start().len();
         let mut rest = content.trim_start();
         if rest.is_empty() {
@@ -225,33 +225,37 @@ fn lex(text: &str) -> Result<Vec<Line>, String> {
 
 /// Everything from an unquoted ` #` on is a comment.
 ///
-/// Two rules keep this from eating content. A `#` starts a comment
+/// Three rules keep this from eating content. A `#` starts a comment
 /// only with whitespace before it, because one inside a word is part
-/// of the word. And a quote opens a quoted run only with whitespace
+/// of the word. A quote opens a quoted run only with whitespace
 /// before it, because a quote inside a word is part of the word too,
 /// which is what lets a `doc:` say "it's" without opening a run that
-/// never closes.
-fn strip_comment(line: &str, no: usize) -> Result<&str, String> {
+/// never closes. And a quote that opens nothing that closes was not a
+/// run at all, which is what lets a `query:` hold `cast('  42  ' AS
+/// INT64)`: the second quote has a space before it and so looks like
+/// an opening one, and nothing after it closes.
+///
+/// That last rule is why this cannot fail. A value that really does
+/// open a quoted scalar and never close it is caught where the scalar
+/// is read, because that is the only place the value's own start is
+/// known, and it is the only place the difference matters.
+fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut i = 0;
     let opens = |i: usize| i == 0 || bytes[i - 1].is_ascii_whitespace();
     while i < bytes.len() {
         match bytes[i] {
-            b'#' if opens(i) => return Ok(&line[..i]),
-            q @ (b'"' | b'\'') if opens(i) => match closing_quote(&line[i + 1..], q) {
-                Some(end) => i += 1 + end,
-                None => {
-                    return Err(format!(
-                        "line {no}: a {} that opens and does not close on its line",
-                        q as char
-                    ));
+            b'#' if opens(i) => return &line[..i],
+            q @ (b'"' | b'\'') if opens(i) => {
+                if let Some(end) = closing_quote(&line[i + 1..], q) {
+                    i += 1 + end;
                 }
-            },
+            }
             _ => {}
         }
         i += 1;
     }
-    Ok(line)
+    line
 }
 
 /// The byte offset of the quote that closes a run whose opening quote
@@ -516,6 +520,23 @@ mod tests {
         assert_eq!(doc.get("name").and_then(Node::str), Some("a"));
         assert_eq!(doc.get("hash").and_then(Node::str), Some("a # b"));
         assert_eq!(doc.get("word").and_then(Node::str), Some("c#d"));
+    }
+
+    #[test]
+    fn a_quote_that_never_closes_is_an_ordinary_character_inside_a_plain_scalar() {
+        // The second quote has a space before it, so it looks like the
+        // start of a run, and there is nothing after it to close one.
+        let doc = ok("query: RETURN cast('  42  ' AS INT64) AS n  # a note\n");
+        assert_eq!(
+            doc.get("query").and_then(Node::str),
+            Some("RETURN cast('  42  ' AS INT64) AS n")
+        );
+    }
+
+    #[test]
+    fn a_quoted_scalar_that_never_closes_is_still_refused() {
+        let err = parse("doc: \"and then\n").expect_err("refused");
+        assert!(err.contains("does not close"), "{err}");
     }
 
     #[test]

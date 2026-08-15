@@ -423,7 +423,7 @@ fn read_edges_with_props(
                 ))
             }
         }
-        Some("csv") => Ok((zu::zu1::graph::read_edge_csv(path)?, Vec::new())),
+        Some("csv") => zu::zu1::graph::read_edge_csv_with_props(path, props),
         _ => Ok((zu::zu1::graph::read_edge_list(path)?, Vec::new())),
     }
 }
@@ -1399,6 +1399,52 @@ mod tests {
             copy(&plain, &plain_db, zu::zu1::reorder::Reorder::None),
             ExitCode::SUCCESS
         );
+    }
+
+    /// A csv rel file written the way a bulk loader is handed one, with
+    /// the LDBC header on top, loads its properties the same way the
+    /// parquet file above does, and a reorder still moves them with the
+    /// edges.
+    #[test]
+    fn a_csv_header_carries_edge_properties_through_a_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edges_path = dir.path().join("link.csv");
+        let db_path = dir.path().join("link.zu1");
+        let edges = [(13u32, 14u32), (10, 12), (11, 13), (10, 11), (12, 13)];
+        let mut text = String::from(":START_ID,:END_ID,:TYPE,since:INT64,note:STRING\n");
+        for (s, d) in edges {
+            text.push_str(&format!("{s},{d},LINK,{},{s}->{d}\n", u64::from(s) * 100));
+        }
+        std::fs::write(&edges_path, text).expect("write csv");
+        assert_eq!(
+            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::Degree),
+            ExitCode::SUCCESS
+        );
+
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let r = zu::query::run(
+            "MATCH (a:node)-[e:edge]->(b:node) RETURN a.id AS src, b.id AS dst, \
+             e.since AS since, e.note AS note ORDER BY src, dst",
+            &mut db,
+            &[],
+        )
+        .expect("read back");
+        let mut want: Vec<Vec<Value>> = edges
+            .iter()
+            .map(|&(s, d)| {
+                vec![
+                    Value::Int(i64::from(s)),
+                    Value::Int(i64::from(d)),
+                    Value::Int(i64::from(s) * 100),
+                    Value::Str(format!("{s}->{d}")),
+                ]
+            })
+            .collect();
+        want.sort_by_key(|row| match (&row[0], &row[1]) {
+            (Value::Int(s), Value::Int(d)) => (*s, *d),
+            _ => unreachable!("built as ints"),
+        });
+        assert_eq!(r.rows, want);
     }
 
     #[test]

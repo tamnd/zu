@@ -37,8 +37,10 @@ Design rules: `Database: Send + Sync` (one per process per graph), `Connection` 
 zu shell social.zu1                # REPL: readline, tables, timing, EXPLAIN
 zu query social.zu1 -c "MATCH ..." --format json|csv|table|arrow
 zu copy --from follows.parquet --to social.zu1 --table Follows --reorder degree
-                                   # a parquet column that is neither src nor
-                                   # dst loads as an edge property of that name
+                                   # a column that is neither src nor dst loads
+                                   # as an edge property of that name: from the
+                                   # parquet schema, or from an LDBC style csv
+                                   # header (:START_ID,:END_ID,name:INT64)
 zu convert social.db social.zu1    # engine ↔ engine
 zu verify social.zu1               # CRC/structure audit
 zu stat social.zu1 [--format json] # sizes, encodings, bits/edge, cache stats

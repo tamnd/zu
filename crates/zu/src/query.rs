@@ -442,7 +442,11 @@ impl Graph for Zu1Graph<'_> {
         // the graph does not have no row and no value, which is the
         // answer rather than an error: a pattern can be matched over
         // one rel table and a property read off another.
-        let Some(row) = readers[&rel].edge_ordinal(db, src, dst)? else {
+        let Some(row) = readers
+            .get_mut(&rel)
+            .expect("the ordinal's reader is loaded")
+            .edge_ordinal(db, src, dst)?
+        else {
             return Ok(Value::Null);
         };
         column_value(db, reader, col, row, key)

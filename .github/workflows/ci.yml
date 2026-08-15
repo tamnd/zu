@@ -201,6 +201,20 @@ jobs:
       # one machine, so a shared runner cannot move it.
       - run: ZU_GATE=1 cargo bench -p zu --bench tail
 
+  relprops:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The G2 edge property gate: a property read off every edge of a
+      # two million edge graph against the same walk reading a column
+      # off the node the edge lands on. Builds the graph itself in a
+      # second. Like the gates above it enforces a ratio between numbers
+      # timed in one run on one machine, so a shared runner cannot move
+      # it.
+      - run: ZU_GATE=1 cargo bench -p zu --bench relprops
+
   corpus:
     runs-on: ubuntu-latest
     steps:

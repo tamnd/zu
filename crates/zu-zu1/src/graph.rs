@@ -1366,31 +1366,40 @@ impl GraphReader {
     /// The ordinal is the edge's place in the load order, which the
     /// forward CSR lays out group after group and list after list, so
     /// it is the group's base plus the slot the destination sits in.
-    /// Finding that slot is the same search [`Self::has_edge`] runs, at
-    /// the same cost: two offset values and the one neighbor chunk the
-    /// fences admit, whatever the degree. An edge reached forward could
-    /// have its ordinal counted out as the expand walks the list, and
-    /// the vectorized read does exactly that; this is the answer for an
-    /// edge that arrived any other way, a backward expand above all,
-    /// where the slot in the backward array says nothing about the
-    /// forward one.
+    /// An edge reached forward could have its ordinal counted out as
+    /// the expand walks the list, and the vectorized read does exactly
+    /// that; this is the answer for an edge that arrived any other way,
+    /// a backward expand above all, where the slot in the backward
+    /// array says nothing about the forward one.
+    ///
+    /// This takes the cached-group path [`Self::neighbors_dir`] takes,
+    /// not the point path [`Self::has_edge`] takes, because an edge
+    /// property is read once per edge a pattern matched and those edges
+    /// arrive together: the point path decodes an offset chunk and a
+    /// neighbor chunk per call, which measured at about 5us per
+    /// property read, against a binary search over a slice the group
+    /// cache already holds. A caller reading one ordinal on its own
+    /// pays a group decode for it, which is the same bet the neighbor
+    /// list makes.
     ///
     /// Edges are unique in a table that stores properties, which
     /// [`crate::props::store_rel_props`] is what enforces, so the pair
     /// names one edge and the ordinal is that edge's.
-    pub fn edge_ordinal(&self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>> {
+    pub fn edge_ordinal(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>> {
         let (g, row) = self.locate(src, Direction::Fwd)?;
-        let group = &self.directory.groups[g];
-        let mut offs = Vec::with_capacity(2);
-        read_range(
-            db,
-            &group.fwd.offsets,
-            row as u64,
-            row as u64 + 2,
-            &mut offs,
-        )?;
-        let slot = crate::segment::locate(db, &group.fwd.neighbors, offs[0], offs[1], dst)?;
-        Ok(slot.map(|slot| group.edge_base + slot))
+        let base = self.directory.groups[g].edge_base;
+        let idx = Direction::Fwd as usize;
+        if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
+            let (offsets, nbrs) = self.csr_group(db, g, Direction::Fwd)?;
+            self.cached_groups[idx] = Some((g, offsets, nbrs));
+        }
+        let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().expect("just cached");
+        let lo = offsets[row] as usize;
+        let hi = offsets[row + 1] as usize;
+        Ok(nbrs[lo..hi]
+            .binary_search(&dst)
+            .ok()
+            .map(|slot| base + (lo + slot) as u64))
     }
 
     /// Point access to the in-neighbor list.
@@ -2035,7 +2044,7 @@ mod tests {
             bulk_load(&mut db, node_count, sorted_edges(&mut edges)).unwrap();
         }
         let mut db = Zu1File::open(&path).unwrap();
-        let reader = GraphReader::load(&mut db).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
         // The load order is the sorted edge list, so an edge's ordinal
         // is its index in it, and every edge has to answer its own.
         for (want, &(s, d)) in edges.iter().enumerate() {
@@ -2057,6 +2066,70 @@ mod tests {
             );
         }
         assert!(reader.edge_ordinal(&mut db, node_count, 0).is_err());
+    }
+
+    /// The ordinal reads the same group cache the neighbor lists read,
+    /// so the two have to be interleavable: a walk that asks for a list
+    /// and then for an ordinal in another group, over and over, gets
+    /// the same answers as a walk that asks for one kind at a time.
+    #[test]
+    fn ordinals_and_neighbor_lists_share_a_cache_without_disturbing_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        // Enough nodes for several groups, and a source in the first
+        // group next to a source in the last one so consecutive calls
+        // land in different groups and the single slot has to reload.
+        let node_count = 300_000u64;
+        let rows = node_count / 4;
+        let mut edges: Vec<(u32, u32)> = (0..node_count)
+            .step_by(7)
+            .flat_map(|s| [(s as u32, (s % 991) as u32), (s as u32, (s % 97) as u32)])
+            .collect();
+        let edges = sorted_edges(&mut edges).to_vec();
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, node_count, &edges).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+
+        let apart: Vec<(Vec<u64>, Option<u64>)> = edges
+            .iter()
+            .step_by(97)
+            .map(|&(s, d)| {
+                (
+                    reader.neighbors(&mut db, u64::from(s)).unwrap().to_vec(),
+                    reader
+                        .edge_ordinal(&mut db, u64::from(s), u64::from(d))
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        // The same reads with a far-away group touched in between, which
+        // is what evicts the slot each time.
+        for (i, &(s, d)) in edges.iter().step_by(97).enumerate() {
+            let far = if s as u64 > rows { 0 } else { node_count - 7 };
+            let _ = reader.neighbors(&mut db, far).unwrap();
+            let ordinal = reader
+                .edge_ordinal(&mut db, u64::from(s), u64::from(d))
+                .unwrap();
+            let _ = reader.neighbors(&mut db, far).unwrap();
+            let list = reader.neighbors(&mut db, u64::from(s)).unwrap().to_vec();
+            assert_eq!((list, ordinal), apart[i], "edge {s}->{d}");
+        }
+
+        // Every ordinal is the edge's index in the load order, which is
+        // the sorted list, whatever order they were asked for in.
+        for (want, &(s, d)) in edges.iter().enumerate().step_by(391) {
+            assert_eq!(
+                reader
+                    .edge_ordinal(&mut db, u64::from(s), u64::from(d))
+                    .unwrap(),
+                Some(want as u64),
+                "edge {s}->{d}"
+            );
+        }
     }
 
     #[test]

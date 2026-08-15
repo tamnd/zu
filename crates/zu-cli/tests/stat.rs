@@ -56,6 +56,13 @@ fn the_text_form_splits_the_store_into_schema_free_and_data() {
     // block zero, and the two used to sit on adjacent lines under names
     // that said they were the same thing.
     assert!(text.contains("high water:"), "{text}");
+    // The catalog objects a file holds, which for a bulk loaded file is
+    // the root directory and the home graph its two tables are in.
+    assert!(text.contains("directory:       /"), "{text}");
+    assert!(
+        text.contains("graph:           home in / (any, 2 tables)"),
+        "{text}"
+    );
 }
 
 #[test]

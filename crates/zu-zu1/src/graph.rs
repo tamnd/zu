@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use zu_common::{GROUP_ROWS, Result, ZuError};
 
-use crate::catalog::{Catalog, TableIndex};
+use crate::catalog::{Catalog, ElementKind, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::keys::{KeyIndex, KeyReader, write_key_index};
 use crate::meta;
@@ -615,6 +615,51 @@ pub fn bulk_load_keyed(
     stats.store(db)?;
     db.checkpoint()?;
     Ok(directory)
+}
+
+/// Frees everything the tables of one graph hold, which is the storage
+/// half of `DROP GRAPH` (GC04).
+///
+/// A dropped graph hands its blocks back rather than merely losing its
+/// name: the free list grows by what its tables held and the next load
+/// writes into those blocks instead of past the end of the file. That
+/// is the whole point of the statement on a file of any size, and it is
+/// why this walks the tables while the catalog still says which ones
+/// were its.
+///
+/// Nothing is published here. The table index and the statistics are
+/// staged, the caller takes the tables out of the catalog it holds, and
+/// the checkpoint that stores that catalog makes all three visible at
+/// once, so a crash between them leaves the graph exactly as it was.
+pub fn free_graph_storage(db: &mut Zu1File, catalog: &Catalog, graph: u32) -> Result<()> {
+    let tables = catalog.graph_tables(graph);
+    let mut index = TableIndex::load(db)?;
+    let mut stats = crate::stats::Stats::load(db)?;
+    for (id, kind) in tables {
+        if let Some(root) = index.get(id) {
+            match kind {
+                ElementKind::Node => crate::props::free_props(db, root)?,
+                ElementKind::Edge => free_directory(db, root)?,
+            }
+            index.remove(id);
+        }
+        // A node table's deleted rows live under a reserved key of the
+        // same index, and nothing else names that chain.
+        let tombstones = id | crate::fold::TOMBSTONE_KEY;
+        if kind == ElementKind::Node
+            && let Some(root) = index.get(tombstones)
+        {
+            free_chain(db, root)?;
+            index.remove(tombstones);
+        }
+        stats.rels.remove(&id);
+        stats.cols.remove(&id);
+    }
+    free_chain(db, db.db_header().table_index_root)?;
+    free_chain(db, db.db_header().stats_root)?;
+    let index_root = meta::write_chain(db, &index.encode())?;
+    db.db_header_mut().table_index_root = index_root;
+    stats.store(db)
 }
 
 /// Read access to a bulk-loaded graph, caching the most recently decoded

@@ -49,7 +49,10 @@ use crate::{meta, props};
 /// graph it always was, one label per table carrying the table's name.
 /// Version 3 adds graph types, and a version 2 catalog reads as a file
 /// that declares none, which is the open graph it has always been.
-const CATALOG_VERSION: u16 = 3;
+/// Version 4 adds schemas and named graphs, and says which graph each
+/// table belongs to. A version 3 catalog reads as the file it always
+/// was: one schema, one graph called `home`, and every table in it.
+const CATALOG_VERSION: u16 = 4;
 const TABLE_INDEX_VERSION: u16 = 1;
 
 /// The label dictionary is bounded by the width of the bitset a node
@@ -63,12 +66,29 @@ pub const MAX_TABLE_ID: u32 = (1 << 14) - 1;
 
 const MAX_NAME_LEN: usize = 256;
 
+/// The schema every zu1 file has, and the parent of a graph nobody
+/// wrote a path for. ISO names catalog objects by an absolute directory
+/// path, and a file that never created a schema still has this one.
+pub const ROOT_SCHEMA: &str = "/";
+
+/// The graph a zu1 file has always held, and the one a load with no
+/// graph named writes into. ISO calls the graph a session works on
+/// without saying so its home graph, which is where the name comes from.
+pub const HOME_GRAPH: &str = "home";
+
+/// The id of that graph. Ids are handed out in order and never reused,
+/// so the first graph a file has is always this one.
+pub const HOME_GRAPH_ID: u32 = 0;
+
 /// A node table: the row domain `0..node_count` that rel tables index
 /// into. Property columns land with the column catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeTable {
     pub id: u32,
     pub name: String,
+    /// The graph this table belongs to (GC04). Dropping that graph is
+    /// what hands its blocks back.
+    pub graph: u32,
     pub node_count: u64,
     /// The labels rows of this table may carry, as dictionary ids.
     /// `labels[0]` is the table's own name, which every row carries;
@@ -96,6 +116,8 @@ impl NodeTable {
 pub struct RelTable {
     pub id: u32,
     pub name: String,
+    /// The graph this table belongs to, as on a node table.
+    pub graph: u32,
     pub from: u32,
     pub to: u32,
     pub edge_count: u64,
@@ -416,15 +438,85 @@ impl GraphType {
     }
 }
 
+/// The type a graph is of (GG01 to GG04).
+///
+/// ISO lets a graph be created with no type at all, with the name of a
+/// graph type the catalog holds, or with a type written inline in the
+/// statement. A type written inline has no name of its own and is no
+/// catalog object, so it lives here rather than in the file's list of
+/// graph types: `CREATE GRAPH g { (:Person) }` declares no graph type
+/// called anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphTypeOf {
+    /// GG01: any graph. Every element type is allowed, which is what a
+    /// zu1 file has always been.
+    Open,
+    /// The name of a graph type this file holds.
+    Named(String),
+    /// GG03: written inline, so it is anonymous and belongs to the one
+    /// graph created with it.
+    Inline(GraphType),
+}
+
+impl GraphTypeOf {
+    fn code(&self) -> u8 {
+        match self {
+            GraphTypeOf::Open => 0,
+            GraphTypeOf::Named(_) => 1,
+            GraphTypeOf::Inline(_) => 2,
+        }
+    }
+}
+
+/// A graph the catalog holds (GC04): a name in a schema, the type it is
+/// of, and the tables that are its contents.
+///
+/// The tables are not listed here. A table names the graph it belongs
+/// to instead, which makes the contents of a graph a filter over the
+/// tables and keeps one table from being in two graphs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphDef {
+    pub id: u32,
+    pub name: String,
+    /// The schema this graph lives in, an absolute directory path.
+    pub schema: String,
+    pub graph_type: GraphTypeOf,
+}
+
 /// The table definitions of one zu1 file. Names share a single
 /// namespace across both kinds, so a rel table cannot shadow a node
 /// table.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// A file always has the root schema and the home graph, whatever else
+/// it holds: they are what a load with nothing said about where writes
+/// into, and dropping the home graph empties it rather than leaving the
+/// file with nowhere to put the next table.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Catalog {
     nodes: Vec<NodeTable>,
     rels: Vec<RelTable>,
     labels: Vec<String>,
     graph_types: Vec<GraphType>,
+    schemas: Vec<String>,
+    graphs: Vec<GraphDef>,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Catalog {
+            nodes: Vec::new(),
+            rels: Vec::new(),
+            labels: Vec::new(),
+            graph_types: Vec::new(),
+            schemas: vec![ROOT_SCHEMA.to_string()],
+            graphs: vec![GraphDef {
+                id: HOME_GRAPH_ID,
+                name: HOME_GRAPH.to_string(),
+                schema: ROOT_SCHEMA.to_string(),
+                graph_type: GraphTypeOf::Open,
+            }],
+        }
+    }
 }
 
 fn corrupt(what: &'static str, detail: String) -> ZuError {
@@ -476,6 +568,39 @@ fn decode_labels(bytes: &[u8], pos: &mut usize) -> Result<Vec<u16>> {
         labels.push(read_u16(bytes, pos, WHAT)?);
     }
     Ok(labels)
+}
+
+fn encode_graph_type(out: &mut Vec<u8>, ty: &GraphType) {
+    encode_name(out, &ty.name);
+    out.push(u8::from(ty.closed));
+    out.extend_from_slice(&(ty.elements.len() as u32).to_le_bytes());
+    for element in &ty.elements {
+        encode_name(out, &element.name);
+        out.push(match element.kind {
+            ElementKind::Node => 0,
+            ElementKind::Edge => 1,
+        });
+        let flags = u8::from(element.open) | u8::from(element.undirected) << 1;
+        out.push(flags);
+        encode_labels(out, &element.labels);
+        out.push(element.key_labels.code());
+        encode_labels(out, element.key_labels.ids());
+        if element.kind == ElementKind::Edge {
+            encode_name(out, element.from.as_deref().unwrap_or_default());
+            encode_name(out, element.to.as_deref().unwrap_or_default());
+        }
+        out.extend_from_slice(&(element.properties.len() as u16).to_le_bytes());
+        for prop in &element.properties {
+            encode_name(out, &prop.name);
+            // A type nothing can be declared with never reaches the
+            // catalog: `GraphType::validate` refuses it when the type
+            // is added.
+            out.extend_from_slice(
+                &props::declared_type_bytes(&prop.ty).expect("property type is declarable"),
+            );
+            out.push(u8::from(prop.optional));
+        }
+    }
 }
 
 fn decode_graph_type(bytes: &[u8], pos: &mut usize) -> Result<GraphType> {
@@ -724,20 +849,188 @@ impl Catalog {
         self.graph_types.len() != before
     }
 
-    /// A closed graph type inferred from the tables this file holds
+    /// The schemas this file holds, the root schema always among them
+    /// unless it was dropped.
+    pub fn schemas(&self) -> &[String] {
+        &self.schemas
+    }
+
+    pub fn has_schema(&self, path: &str) -> bool {
+        self.schemas.iter().any(|s| s == path)
+    }
+
+    /// Adds a schema (GC01), refusing a path that is not absolute and
+    /// one the file already holds.
+    pub fn add_schema(&mut self, path: &str) -> Result<()> {
+        if !path.starts_with('/') || path.len() > MAX_NAME_LEN {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{path}' is no absolute directory path"
+            )));
+        }
+        if self.has_schema(path) {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{path}' is already a schema"
+            )));
+        }
+        self.schemas.push(path.to_string());
+        Ok(())
+    }
+
+    /// Drops a schema, answering whether there was one. A schema that
+    /// still holds graphs is refused by the caller: this is the
+    /// primitive and the statement is where RESTRICT lives.
+    pub fn drop_schema(&mut self, path: &str) -> bool {
+        let before = self.schemas.len();
+        self.schemas.retain(|s| s != path);
+        self.schemas.len() != before
+    }
+
+    /// The graphs this file holds.
+    pub fn graphs(&self) -> &[GraphDef] {
+        &self.graphs
+    }
+
+    pub fn graph(&self, schema: &str, name: &str) -> Option<&GraphDef> {
+        self.graphs
+            .iter()
+            .find(|g| g.schema == schema && g.name == name)
+    }
+
+    pub fn graph_by_id(&self, id: u32) -> Option<&GraphDef> {
+        self.graphs.iter().find(|g| g.id == id)
+    }
+
+    /// Everything `add_graph` refuses a graph for other than a name its
+    /// schema already holds.
+    ///
+    /// `CREATE OR REPLACE GRAPH` frees the blocks the old graph held
+    /// before the new one is added, and a refusal after that point would
+    /// leave a file holding neither, so the caller asks first and frees
+    /// nothing when the answer is no.
+    pub fn check_graph(&self, schema: &str, graph_type: &GraphTypeOf) -> Result<()> {
+        if !self.has_schema(schema) {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{schema}' is no schema here"
+            )));
+        }
+        if let GraphTypeOf::Named(ty) = graph_type
+            && self.graph_type(ty).is_none()
+        {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{ty}' is no graph type here"
+            )));
+        }
+        if let GraphTypeOf::Inline(ty) = graph_type {
+            ty.validate(self.labels.len())?;
+        }
+        self.next_graph_id()?;
+        Ok(())
+    }
+
+    /// Adds a graph (GC04) and answers its id, refusing a name its
+    /// schema already holds and a schema the file does not.
+    pub fn add_graph(&mut self, name: &str, schema: &str, graph_type: GraphTypeOf) -> Result<u32> {
+        if self.graph(schema, name).is_some() {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{name}' is already a graph in '{schema}'"
+            )));
+        }
+        self.check_graph(schema, &graph_type)?;
+        let id = self.next_graph_id()?;
+        self.graphs.push(GraphDef {
+            id,
+            name: name.to_string(),
+            schema: schema.to_string(),
+            graph_type,
+        });
+        Ok(id)
+    }
+
+    /// The tables a graph holds, node tables first. Dropping the graph
+    /// hands their blocks back, so the caller reads this before the
+    /// catalog forgets them.
+    pub fn graph_tables(&self, graph: u32) -> Vec<(u32, ElementKind)> {
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|t| t.graph == graph)
+            .map(|t| (t.id, ElementKind::Node));
+        let rels = self
+            .rels
+            .iter()
+            .filter(|t| t.graph == graph)
+            .map(|t| (t.id, ElementKind::Edge));
+        nodes.chain(rels).collect()
+    }
+
+    /// Drops a graph and every table in it, answering whether there was
+    /// one. The storage those tables held is the caller's to free; this
+    /// is the catalog half of `DROP GRAPH`.
+    pub fn drop_graph(&mut self, id: u32) -> bool {
+        let before = self.graphs.len();
+        self.graphs.retain(|g| g.id != id);
+        if self.graphs.len() == before {
+            return false;
+        }
+        self.nodes.retain(|t| t.graph != id);
+        self.rels.retain(|t| t.graph != id);
+        true
+    }
+
+    /// Graph ids are positions in the order graphs were created and are
+    /// never reused, so the id of a dropped graph names nothing rather
+    /// than naming the next graph created.
+    fn next_graph_id(&self) -> Result<u32> {
+        match self.graphs.iter().map(|g| g.id).max() {
+            None => Ok(HOME_GRAPH_ID),
+            Some(id) if id < u32::MAX => Ok(id + 1),
+            Some(_) => Err(ZuError::InvalidArgument(
+                "graph id space exhausted".to_string(),
+            )),
+        }
+    }
+
+    /// Puts the home graph back when a `DROP GRAPH home` took it away,
+    /// so a load always has somewhere to write. It keeps the id it had:
+    /// the tables that named it are gone with it.
+    fn ensure_home(&mut self) {
+        if self.graph(ROOT_SCHEMA, HOME_GRAPH).is_some() {
+            return;
+        }
+        if !self.has_schema(ROOT_SCHEMA) {
+            self.schemas.push(ROOT_SCHEMA.to_string());
+        }
+        let id = self.next_graph_id().unwrap_or(HOME_GRAPH_ID);
+        self.graphs.push(GraphDef {
+            id,
+            name: HOME_GRAPH.to_string(),
+            schema: ROOT_SCHEMA.to_string(),
+            graph_type: GraphTypeOf::Open,
+        });
+    }
+
+    /// The id a table gets when nothing said which graph it is for.
+    fn home_id(&mut self) -> u32 {
+        self.ensure_home();
+        self.graph(ROOT_SCHEMA, HOME_GRAPH)
+            .map(|g| g.id)
+            .unwrap_or(HOME_GRAPH_ID)
+    }
+
+    /// A closed graph type inferred from the tables a graph holds
     /// (GG04): one node element type per node table keyed on the
     /// table's own label, one edge element type per rel table between
     /// them. It reads the catalog and never the data, so it costs
     /// nothing on a large graph.
-    pub fn infer_graph_type(&self, name: &str) -> Result<GraphType> {
+    pub fn infer_graph_type(&self, name: &str, graph: u32) -> Result<GraphType> {
         let mut ty = GraphType::closed(name);
-        for table in &self.nodes {
+        for table in self.nodes.iter().filter(|t| t.graph == graph) {
             ty.elements.push(
                 ElementType::node(&table.name, table.labels.clone())
                     .with_key(vec![table.primary_label()]),
             );
         }
-        for rel in &self.rels {
+        for rel in self.rels.iter().filter(|t| t.graph == graph) {
             let from = self.node_by_id(rel.from).ok_or_else(|| {
                 ZuError::InvalidArgument(format!("rel table '{}' has no FROM node table", rel.name))
             })?;
@@ -810,9 +1103,11 @@ impl Catalog {
         // row carries, so it is interned before the table exists and
         // heads the declared set.
         let primary = self.intern_label(name)?;
+        let graph = self.home_id();
         self.nodes.push(NodeTable {
             id,
             name: name.to_string(),
+            graph,
             node_count,
             labels: vec![primary],
         });
@@ -833,9 +1128,17 @@ impl Catalog {
             return Ok(t.id);
         }
         let id = self.next_id()?;
+        // A rel table is in the graph its FROM table is in, which is
+        // the only answer that keeps an edge and the nodes it joins in
+        // one graph.
+        let graph = match self.node_by_id(from) {
+            Some(table) => table.graph,
+            None => self.home_id(),
+        };
         self.rels.push(RelTable {
             id,
             name: name.to_string(),
+            graph,
             from,
             to,
             edge_count,
@@ -852,6 +1155,7 @@ impl Catalog {
         for t in &self.nodes {
             out.extend_from_slice(&t.id.to_le_bytes());
             encode_name(&mut out, &t.name);
+            out.extend_from_slice(&t.graph.to_le_bytes());
             out.extend_from_slice(&t.node_count.to_le_bytes());
             out.extend_from_slice(&(t.labels.len() as u16).to_le_bytes());
             for &label in &t.labels {
@@ -861,6 +1165,7 @@ impl Catalog {
         for t in &self.rels {
             out.extend_from_slice(&t.id.to_le_bytes());
             encode_name(&mut out, &t.name);
+            out.extend_from_slice(&t.graph.to_le_bytes());
             out.extend_from_slice(&t.from.to_le_bytes());
             out.extend_from_slice(&t.to.to_le_bytes());
             out.extend_from_slice(&t.edge_count.to_le_bytes());
@@ -870,35 +1175,22 @@ impl Catalog {
         }
         out.extend_from_slice(&(self.graph_types.len() as u32).to_le_bytes());
         for ty in &self.graph_types {
-            encode_name(&mut out, &ty.name);
-            out.push(u8::from(ty.closed));
-            out.extend_from_slice(&(ty.elements.len() as u32).to_le_bytes());
-            for element in &ty.elements {
-                encode_name(&mut out, &element.name);
-                out.push(match element.kind {
-                    ElementKind::Node => 0,
-                    ElementKind::Edge => 1,
-                });
-                let flags = u8::from(element.open) | u8::from(element.undirected) << 1;
-                out.push(flags);
-                encode_labels(&mut out, &element.labels);
-                out.push(element.key_labels.code());
-                encode_labels(&mut out, element.key_labels.ids());
-                if element.kind == ElementKind::Edge {
-                    encode_name(&mut out, element.from.as_deref().unwrap_or_default());
-                    encode_name(&mut out, element.to.as_deref().unwrap_or_default());
-                }
-                out.extend_from_slice(&(element.properties.len() as u16).to_le_bytes());
-                for prop in &element.properties {
-                    encode_name(&mut out, &prop.name);
-                    // A type nothing can be declared with never reaches
-                    // the catalog: `GraphType::validate` refuses it
-                    // when the type is added.
-                    out.extend_from_slice(
-                        &props::declared_type_bytes(&prop.ty).expect("property type is declarable"),
-                    );
-                    out.push(u8::from(prop.optional));
-                }
+            encode_graph_type(&mut out, ty);
+        }
+        out.extend_from_slice(&(self.schemas.len() as u32).to_le_bytes());
+        for schema in &self.schemas {
+            encode_name(&mut out, schema);
+        }
+        out.extend_from_slice(&(self.graphs.len() as u32).to_le_bytes());
+        for graph in &self.graphs {
+            out.extend_from_slice(&graph.id.to_le_bytes());
+            encode_name(&mut out, &graph.name);
+            encode_name(&mut out, &graph.schema);
+            out.push(graph.graph_type.code());
+            match &graph.graph_type {
+                GraphTypeOf::Open => {}
+                GraphTypeOf::Named(name) => encode_name(&mut out, name),
+                GraphTypeOf::Inline(ty) => encode_graph_type(&mut out, ty),
             }
         }
         out
@@ -928,6 +1220,11 @@ impl Catalog {
         for _ in 0..node_count {
             let id = read_u32(bytes, &mut pos, WHAT)?;
             let name = decode_name(bytes, &mut pos, WHAT)?;
+            let graph = if version >= 4 {
+                read_u32(bytes, &mut pos, WHAT)?
+            } else {
+                HOME_GRAPH_ID
+            };
             let node_count = read_u64(bytes, &mut pos, WHAT)?;
             let mut labels = Vec::new();
             if version >= 2 {
@@ -945,6 +1242,7 @@ impl Catalog {
             catalog.nodes.push(NodeTable {
                 id,
                 name,
+                graph,
                 node_count,
                 labels,
             });
@@ -952,12 +1250,18 @@ impl Catalog {
         for _ in 0..rel_count {
             let id = read_u32(bytes, &mut pos, WHAT)?;
             let name = decode_name(bytes, &mut pos, WHAT)?;
+            let graph = if version >= 4 {
+                read_u32(bytes, &mut pos, WHAT)?
+            } else {
+                HOME_GRAPH_ID
+            };
             let from = read_u32(bytes, &mut pos, WHAT)?;
             let to = read_u32(bytes, &mut pos, WHAT)?;
             let edge_count = read_u64(bytes, &mut pos, WHAT)?;
             catalog.rels.push(RelTable {
                 id,
                 name,
+                graph,
                 from,
                 to,
                 edge_count,
@@ -972,6 +1276,42 @@ impl Catalog {
                 catalog
                     .graph_types
                     .push(decode_graph_type(bytes, &mut pos)?);
+            }
+        }
+        if version >= 4 {
+            // A version 4 file says what its schemas and graphs are, so
+            // the ones a default catalog starts with are replaced and
+            // not added to. Everything a file wrote comes back as it
+            // was written, including a file whose home graph was
+            // dropped and which holds no graph at all.
+            let count = read_u32(bytes, &mut pos, WHAT)? as usize;
+            catalog.schemas = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                catalog.schemas.push(decode_name(bytes, &mut pos, WHAT)?);
+            }
+            let count = read_u32(bytes, &mut pos, WHAT)? as usize;
+            catalog.graphs = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                let id = read_u32(bytes, &mut pos, WHAT)?;
+                let name = decode_name(bytes, &mut pos, WHAT)?;
+                let schema = decode_name(bytes, &mut pos, WHAT)?;
+                let code = bytes
+                    .get(pos)
+                    .copied()
+                    .ok_or_else(|| corrupt(WHAT, "truncated graph type kind".into()))?;
+                pos += 1;
+                let graph_type = match code {
+                    0 => GraphTypeOf::Open,
+                    1 => GraphTypeOf::Named(decode_name(bytes, &mut pos, WHAT)?),
+                    2 => GraphTypeOf::Inline(decode_graph_type(bytes, &mut pos)?),
+                    other => return Err(corrupt(WHAT, format!("graph type kind {other}"))),
+                };
+                catalog.graphs.push(GraphDef {
+                    id,
+                    name,
+                    schema,
+                    graph_type,
+                });
             }
         }
         if pos != bytes.len() {
@@ -1090,6 +1430,67 @@ impl Catalog {
         }
         for ty in &self.graph_types {
             ty.validate(self.labels.len())?;
+        }
+        let mut schemas: Vec<&str> = self.schemas.iter().map(String::as_str).collect();
+        schemas.sort_unstable();
+        if schemas.windows(2).any(|w| w[0] == w[1]) {
+            return Err(corrupt("catalog", "duplicate schema path".into()));
+        }
+        let mut graph_ids: Vec<u32> = self.graphs.iter().map(|g| g.id).collect();
+        let total = graph_ids.len();
+        graph_ids.sort_unstable();
+        graph_ids.dedup();
+        if graph_ids.len() != total {
+            return Err(corrupt("catalog", "duplicate graph id".into()));
+        }
+        let mut graph_names: Vec<(&str, &str)> = self
+            .graphs
+            .iter()
+            .map(|g| (g.schema.as_str(), g.name.as_str()))
+            .collect();
+        graph_names.sort_unstable();
+        if graph_names.windows(2).any(|w| w[0] == w[1]) {
+            return Err(corrupt("catalog", "duplicate graph name".into()));
+        }
+        for graph in &self.graphs {
+            if !self.has_schema(&graph.schema) {
+                return Err(corrupt(
+                    "catalog",
+                    format!(
+                        "graph '{}' is in schema '{}', which this file does not hold",
+                        graph.name, graph.schema
+                    ),
+                ));
+            }
+            match &graph.graph_type {
+                GraphTypeOf::Open => {}
+                GraphTypeOf::Named(name) if self.graph_type(name).is_some() => {}
+                GraphTypeOf::Named(name) => {
+                    return Err(corrupt(
+                        "catalog",
+                        format!(
+                            "graph '{}' is of graph type '{name}', which this file does not hold",
+                            graph.name
+                        ),
+                    ));
+                }
+                GraphTypeOf::Inline(ty) => ty.validate(self.labels.len())?,
+            }
+        }
+        // A table in no graph is a table nothing can drop, so it is a
+        // catalog nobody wrote rather than one to read past.
+        for (name, graph) in self
+            .nodes
+            .iter()
+            .map(|t| (&t.name, t.graph))
+            .chain(self.rels.iter().map(|t| (&t.name, t.graph)))
+        {
+            if self.graph_by_id(graph).is_none() {
+                return Err(corrupt(
+                    "catalog",
+                    format!("table '{name}' is in graph {graph}, which this file does not hold"),
+                ));
+            }
         }
         Ok(())
     }
@@ -1375,7 +1776,7 @@ mod tests {
     #[test]
     fn a_graph_type_is_inferred_from_the_tables_a_file_holds() {
         let c = sample();
-        let ty = c.infer_graph_type("like_this").unwrap();
+        let ty = c.infer_graph_type("like_this", HOME_GRAPH_ID).unwrap();
         assert!(ty.closed, "what the catalog says is all there is");
         let names: Vec<&str> = ty.elements.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["person", "org", "follows", "works_at"]);
@@ -1469,20 +1870,74 @@ mod tests {
         assert_eq!(db.db_header().block_count, settled);
     }
 
+    /// The catalog written the way an older version of the file wrote
+    /// it. Each version added a section to the end and version 4 added
+    /// a field to every table, so writing one out is the current
+    /// encoding with the later parts left off.
+    fn encode_at_version(c: &Catalog, version: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&(c.nodes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(c.rels.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(c.labels.len() as u32).to_le_bytes());
+        for t in &c.nodes {
+            out.extend_from_slice(&t.id.to_le_bytes());
+            encode_name(&mut out, &t.name);
+            out.extend_from_slice(&t.node_count.to_le_bytes());
+            out.extend_from_slice(&(t.labels.len() as u16).to_le_bytes());
+            for &label in &t.labels {
+                out.extend_from_slice(&label.to_le_bytes());
+            }
+        }
+        for t in &c.rels {
+            out.extend_from_slice(&t.id.to_le_bytes());
+            encode_name(&mut out, &t.name);
+            out.extend_from_slice(&t.from.to_le_bytes());
+            out.extend_from_slice(&t.to.to_le_bytes());
+            out.extend_from_slice(&t.edge_count.to_le_bytes());
+        }
+        for label in &c.labels {
+            encode_name(&mut out, label);
+        }
+        if version >= 3 {
+            out.extend_from_slice(&(c.graph_types.len() as u32).to_le_bytes());
+            for ty in &c.graph_types {
+                encode_graph_type(&mut out, ty);
+            }
+        }
+        out
+    }
+
     #[test]
     fn a_version_two_catalog_reads_as_a_file_with_no_graph_types() {
         let mut c = sample();
         c.add_graph_type(GraphType::open("t")).unwrap();
-        let raw = c.encode();
-        // The version 2 encoding is this one without the graph type
-        // section, which is everything the count and the type add.
-        let mut old = raw.clone();
-        old.truncate(raw.len() - (4 + 2 + 1 + 1 + 4));
-        old[0] = 2;
-        let read = Catalog::decode(&old).unwrap();
+        let read = Catalog::decode(&encode_at_version(&c, 2)).unwrap();
         assert!(read.graph_types().is_empty());
         assert_eq!(read.node_tables(), c.node_tables());
         assert_eq!(read.labels(), c.labels());
+    }
+
+    #[test]
+    fn a_version_three_catalog_reads_as_one_schema_and_one_graph() {
+        let mut c = sample();
+        c.add_graph_type(GraphType::open("t")).unwrap();
+        let read = Catalog::decode(&encode_at_version(&c, 3)).unwrap();
+        // The file it always was: the root schema, a graph called home
+        // with no type on it, and every table in that graph.
+        assert_eq!(read.schemas(), [ROOT_SCHEMA]);
+        assert_eq!(read.graphs().len(), 1);
+        let home = read.graph(ROOT_SCHEMA, HOME_GRAPH).expect("the home graph");
+        assert_eq!(home.id, HOME_GRAPH_ID);
+        assert_eq!(home.graph_type, GraphTypeOf::Open);
+        assert_eq!(read.graph_tables(HOME_GRAPH_ID).len(), 4);
+        assert!(read.node_tables().iter().all(|t| t.graph == HOME_GRAPH_ID));
+        assert!(read.rel_tables().iter().all(|t| t.graph == HOME_GRAPH_ID));
+        assert_eq!(read.graph_types().len(), 1);
+        // What a version 3 file holds is what the current encoding
+        // holds, so writing it back out and reading it again is the
+        // same catalog.
+        assert_eq!(Catalog::decode(&read.encode()).unwrap(), read);
     }
 
     #[test]

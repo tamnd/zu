@@ -273,6 +273,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zu1::catalog::GraphTypeOf;
     use crate::zu1::graph;
 
     fn seeded(path: &Path) -> Vec<(u32, u32)> {
@@ -481,9 +482,9 @@ mod tests {
             "the replacement is the type that is there now"
         );
 
-        // GG04, off the tables and not off the data.
+        // GG04, off the tables of the graph named and not off its data.
         session
-            .run("CREATE GRAPH TYPE mirror LIKE social", &[])
+            .run("CREATE GRAPH TYPE mirror LIKE home", &[])
             .expect("like the graph this file holds");
         let mirror = session
             .graph
@@ -509,6 +510,215 @@ mod tests {
         session
             .run("DROP GRAPH TYPE IF EXISTS mirror", &[])
             .expect("if exists");
+    }
+
+    #[test]
+    fn a_schema_is_a_directory_the_file_holds_and_a_graph_lives_in_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schemas.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        // GC01, GC02.
+        session.run("CREATE SCHEMA /app", &[]).expect("create");
+        let err = session
+            .run("CREATE SCHEMA /app", &[])
+            .expect_err("the path is taken")
+            .to_string();
+        assert!(err.contains("already a schema"), "{err}");
+        session
+            .run("CREATE SCHEMA IF NOT EXISTS /app", &[])
+            .expect("if not exists");
+        assert!(session.graph.catalog().has_schema("/app"));
+
+        // GC04: a graph in that schema, named by the path it is at.
+        session
+            .run("CREATE GRAPH /app/social ANY", &[])
+            .expect("create graph");
+        assert!(session.graph.catalog().graph("/app", "social").is_some());
+
+        // ISO's default is RESTRICT, so the schema holding it stays.
+        let err = session
+            .run("DROP SCHEMA /app", &[])
+            .expect_err("the schema still holds a graph")
+            .to_string();
+        assert!(err.contains("still holds the graph 'social'"), "{err}");
+        session
+            .run("DROP GRAPH /app/social", &[])
+            .expect("drop graph");
+        session.run("DROP SCHEMA /app", &[]).expect("drop schema");
+        assert!(!session.graph.catalog().has_schema("/app"));
+        let err = session
+            .run("DROP SCHEMA /", &[])
+            .expect_err("the root schema is not one to drop")
+            .to_string();
+        assert!(err.contains("every file has"), "{err}");
+    }
+
+    #[test]
+    fn a_graph_is_created_with_a_type_or_with_none_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("graphs.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        // GG01: any graph, which is what a zu1 file has always been.
+        session.run("CREATE GRAPH open_one ANY", &[]).expect("any");
+        assert_eq!(
+            session.graph.catalog().graph("/", "open_one"),
+            session
+                .graph
+                .catalog()
+                .graphs()
+                .iter()
+                .find(|g| g.name == "open_one")
+        );
+        // GC05.
+        let err = session
+            .run("CREATE GRAPH open_one ANY", &[])
+            .expect_err("the name is taken")
+            .to_string();
+        assert!(err.contains("already a graph"), "{err}");
+        session
+            .run("CREATE GRAPH IF NOT EXISTS open_one ANY", &[])
+            .expect("if not exists");
+
+        // GG03: a type written where the graph is created has no name
+        // of its own, so it is no graph type the file holds.
+        session
+            .run(
+                "CREATE PROPERTY GRAPH typed { (:Person {name :: STRING}) }",
+                &[],
+            )
+            .expect("inline type");
+        let typed = session
+            .graph
+            .catalog()
+            .graph("/", "typed")
+            .expect("typed")
+            .clone();
+        let GraphTypeOf::Inline(ty) = &typed.graph_type else {
+            panic!("a type written inline");
+        };
+        assert!(ty.closed);
+        assert_eq!(ty.elements.len(), 1);
+        assert!(session.graph.catalog().graph_types().is_empty());
+
+        // GG02, GG04: the name of a graph type the file holds, and the
+        // type of a graph that already has one.
+        session
+            .run("CREATE GRAPH TYPE social { (:person) }", &[])
+            .expect("graph type");
+        session
+            .run("CREATE GRAPH of_named :: social", &[])
+            .expect("of a named type");
+        assert_eq!(
+            session
+                .graph
+                .catalog()
+                .graph("/", "of_named")
+                .map(|g| &g.graph_type),
+            Some(&GraphTypeOf::Named("social".to_string()))
+        );
+        session
+            .run("CREATE PROPERTY GRAPH mirror LIKE typed", &[])
+            .expect("like a graph");
+        let GraphTypeOf::Inline(ty) = &session
+            .graph
+            .catalog()
+            .graph("/", "mirror")
+            .expect("mirror")
+            .graph_type
+        else {
+            panic!("the type of the graph it is like");
+        };
+        assert_eq!(ty.elements.len(), 1);
+
+        // GG05: an empty graph copies as the empty graph it is, and a
+        // graph with tables in it is the copy nobody has written yet.
+        session
+            .run("CREATE GRAPH copy_of_it ANY AS COPY OF open_one", &[])
+            .expect("copy of an empty graph");
+        let err = session
+            .run("CREATE GRAPH copy_of_home ANY AS COPY OF home", &[])
+            .expect_err("a copy of a graph that holds tables")
+            .to_string();
+        assert!(err.contains("AS COPY OF"), "{err}");
+
+        let err = session
+            .run("CREATE GRAPH lost ANY AS COPY OF nowhere", &[])
+            .expect_err("no such graph")
+            .to_string();
+        assert!(err.contains("is no graph in"), "{err}");
+        assert!(session.graph.catalog().graph("/", "lost").is_none());
+
+        // A replacement frees what the old graph held, so one that
+        // cannot be kept is refused before anything is freed and the
+        // graph that was there is still there, tables included.
+        let tables = session.graph.catalog().node_tables().len();
+        let err = session
+            .run("CREATE OR REPLACE GRAPH home :: nowhere", &[])
+            .expect_err("no such graph type")
+            .to_string();
+        assert!(err.contains("is no graph type here"), "{err}");
+        assert_eq!(session.graph.catalog().node_tables().len(), tables);
+        assert!(session.graph.catalog().graph("/", "home").is_some());
+    }
+
+    /// How many blocks the committed free list names, which is what a
+    /// drop that reclaims has to grow.
+    fn free_blocks(db: &mut Zu1File) -> u64 {
+        let root = db.db_header().free_list_root;
+        if root == crate::zu1::file::NULL_BLOCK {
+            return 0;
+        }
+        let count = db.db_header().block_count;
+        let bytes = crate::zu1::meta::read_chain(db, root).expect("the free list chain");
+        crate::zu1::file::decode_free_list(&bytes, count)
+            .expect("a free list")
+            .len() as u64
+    }
+
+    #[test]
+    fn dropping_a_graph_hands_the_blocks_its_tables_held_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reclaim.zu1");
+        let edges = seeded(&path);
+
+        let first_load = {
+            let mut db = Zu1File::open(&path).expect("open");
+            assert_eq!(free_blocks(&mut db), 0, "a fresh load frees nothing");
+            db.db_header().block_count
+        };
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("DROP GRAPH home", &[])
+            .expect("drop the graph this file holds");
+        assert!(session.graph.catalog().node_tables().is_empty());
+        assert!(session.graph.catalog().rel_tables().is_empty());
+        drop(session);
+
+        let mut db = Zu1File::open(&path).expect("reopen");
+        let freed = free_blocks(&mut db);
+        assert!(
+            freed >= first_load / 2,
+            "{freed} blocks back of the {first_load} the load took"
+        );
+        // The blocks are back rather than merely unnamed, so loading
+        // the same graph again writes into them: it costs the file a
+        // block or two where the first load cost it all of them.
+        let before = db.db_header().block_count;
+        graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load again");
+        let grew = db.db_header().block_count - before;
+        assert!(
+            grew < first_load / 2,
+            "the reload grew the file by {grew} blocks, the first load by {first_load}"
+        );
+        let mut session = Session::open(&path).expect("open again");
+        let rows = session
+            .run("MATCH (a:person) RETURN count(a) AS n", &[])
+            .expect("the reloaded graph answers");
+        assert_eq!(rows.rows.len(), 1);
     }
 
     #[test]

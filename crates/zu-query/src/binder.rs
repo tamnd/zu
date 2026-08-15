@@ -77,10 +77,11 @@ struct ExistsBlock<'a> {
 /// Takes the existence blocks off the top of a WHERE and returns the
 /// predicate that is left, `None` when the WHERE was nothing else.
 ///
-/// Only the top level of the AND chain is taken. A block under an OR,
-/// or anywhere a value is wanted, is left where it is and the binder
-/// refuses it there: turning one into a boolean column is a mark join
-/// and this is not one.
+/// Only the top level of the AND chain is taken, because that is where
+/// a block is a decision about the row and costs nothing to make one:
+/// the match runs and the row is kept or it is not. A block anywhere
+/// else in the predicate is left where it is and becomes a mark, which
+/// is the same match with the answer written down instead of acted on.
 fn peel_exists<'a>(expr: &'a Expr, out: &mut Vec<ExistsBlock<'a>>) -> Option<Expr> {
     match expr {
         Expr::Binary {
@@ -688,11 +689,12 @@ pub struct BoundQuery {
 
 /// What a match does with the rows underneath it.
 ///
-/// The first two are written as MATCH and OPTIONAL MATCH. The other
-/// two are what an existence predicate becomes: `EXISTS { ... }` is a
-/// match whose rows are never returned and whose only use is that
-/// there was one, and `NOT EXISTS { ... }` is the same match keeping
-/// the rows it found nothing for.
+/// The first two are written as MATCH and OPTIONAL MATCH. The rest are
+/// what an existence predicate becomes: `EXISTS { ... }` is a match
+/// whose rows are never returned and whose only use is that there was
+/// one, `NOT EXISTS { ... }` is the same match keeping the rows it
+/// found nothing for, and a block that has to answer with a value
+/// instead of a decision is the mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchKind {
     Required,
@@ -703,6 +705,16 @@ pub enum MatchKind {
     /// `NOT EXISTS { ... }`: the outer row survives if it finds
     /// nothing.
     Anti,
+    /// A block written where a decision about the row would be wrong,
+    /// which is under an OR: every outer row survives, once, carrying
+    /// whether the match found anything in the slot named here. The
+    /// predicate that was written around the block then reads that
+    /// slot like any other boolean. `negated` is a NOT in front of the
+    /// block, folded in so the predicate reads the slot as it stands.
+    Mark {
+        slot: usize,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1102,6 +1114,7 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         columns: Vec::new(),
         path_shapes: BTreeMap::new(),
         pending: Vec::new(),
+        marks: None,
     };
     let mut clauses = Vec::new();
     for (i, clause) in query.clauses.iter().enumerate() {
@@ -1140,6 +1153,11 @@ struct Binder<'a> {
     /// Drained by [`bind`] once the clause itself is bound, so an
     /// existence block lands where its predicate would have.
     pending: Vec<BoundClause>,
+    /// The mark matches the predicate being bound has asked for, and
+    /// whether it may ask at all. `None` is every place a mark cannot
+    /// go, which is anywhere the predicate is not a WHERE standing
+    /// straight over the pattern its block reads.
+    marks: Option<Vec<BoundClause>>,
 }
 
 /// Expression context: where aggregates are legal and whether one was
@@ -1205,7 +1223,13 @@ impl Binder<'_> {
                 for path in &mut bound {
                     self.settle_labels(path);
                 }
-                let filter = self.bind_where(filter)?;
+                // A mark is a match of its own that has to run before
+                // the predicate reading it, and an OPTIONAL MATCH is
+                // one bracket already: its WHERE decides the match
+                // rather than filtering behind it, so a mark there
+                // would have to run inside that bracket and refuses
+                // instead.
+                let filter = self.bind_where(filter, !optional)?;
                 Ok(BoundClause::Match {
                     kind: match optional {
                         true => MatchKind::Optional,
@@ -1243,33 +1267,92 @@ impl Binder<'_> {
     /// A block is a match and not a value, so it cannot be bound where
     /// it was written: what comes back here is the predicate that is
     /// left, and the blocks are queued in `pending` to run after the
-    /// clause. Only the top level of the AND chain is lifted, since a
-    /// block under an OR is asking for a boolean and this is not the
-    /// thing that produces one.
-    fn bind_where(&mut self, filter: &Option<Expr>) -> Result<Option<BoundExpr>> {
+    /// clause. A block at the top of the AND chain is lifted whole,
+    /// since keeping the row is all its answer is used for. One written
+    /// anywhere else in the predicate becomes a mark when `marks_ok`,
+    /// and the predicate around it then has to run after the mark
+    /// rather than with the clause, so it is queued too, as a filter of
+    /// its own straight behind the matches that answer it.
+    fn bind_where(&mut self, filter: &Option<Expr>, marks_ok: bool) -> Result<Option<BoundExpr>> {
         let Some(expr) = filter else {
             return Ok(None);
         };
         let mut blocks = Vec::new();
         let rest = peel_exists(expr, &mut blocks);
         for block in blocks {
-            let clause = self.bind_exists(block)?;
+            let clause = self.bind_exists(block, None)?;
             self.pending.push(clause);
         }
-        match rest {
-            Some(expr) => Ok(Some(self.bind_bool(&expr, "WHERE")?)),
-            None => Ok(None),
+        let Some(expr) = rest else {
+            return Ok(None);
+        };
+        let held = std::mem::replace(&mut self.marks, marks_ok.then(Vec::new));
+        let bound = self.bind_bool(&expr, "WHERE");
+        let marks = std::mem::replace(&mut self.marks, held);
+        let bound = bound?;
+        match marks {
+            Some(marks) if !marks.is_empty() => {
+                self.pending.extend(marks);
+                self.pending.push(BoundClause::Match {
+                    kind: MatchKind::Required,
+                    patterns: Vec::new(),
+                    filter: Some(bound),
+                });
+                Ok(None)
+            }
+            _ => Ok(Some(bound)),
         }
     }
 
-    /// Binds one existence block into the match it stands for.
+    /// Binds one existence block into a mark match and hands back the
+    /// variable that reads its answer.
+    ///
+    /// `negated` folds a NOT in front of the block into the match, the
+    /// same fold [`peel_exists`] does for a lifted one, so a predicate
+    /// never has to negate the mark it reads.
+    fn bind_mark(
+        &mut self,
+        patterns: &[ast::PathPattern],
+        filter: &Option<Box<Expr>>,
+        negated: bool,
+    ) -> Result<BoundExpr> {
+        if self.marks.is_none() {
+            return Err(invalid(
+                "EXISTS is a match and not a value: write it in the WHERE of a MATCH, as a \
+                 whole conjunct or under an OR there"
+                    .into(),
+            ));
+        }
+        let slot = self.anon_slot(Type::Bool);
+        let clause = self.bind_exists(
+            ExistsBlock {
+                negated,
+                patterns,
+                filter,
+            },
+            Some(slot),
+        )?;
+        self.marks
+            .as_mut()
+            .expect("the mark sink was there a moment ago")
+            .push(clause);
+        Ok(BoundExpr::Var(slot))
+    }
+
+    /// Binds one existence block into the match it stands for, as a
+    /// decision about the outer row or, with a slot, as the mark that
+    /// writes the same answer down instead.
     ///
     /// The block sees the scope around it, which is what ties it to the
     /// row being tested, and the names it writes itself are gone again
     /// when it ends: an EXISTS says whether a match was there and hands
     /// back nothing to read, so a variable of its own that outlived it
     /// would name a row nobody kept.
-    fn bind_exists(&mut self, block: ExistsBlock) -> Result<BoundClause> {
+    ///
+    /// The block's own WHERE takes no marks. One there would be a match
+    /// run per row of a match whose rows nothing keeps, so it refuses
+    /// where it stands.
+    fn bind_exists(&mut self, block: ExistsBlock, mark: Option<usize>) -> Result<BoundClause> {
         let outer = self.scope.clone();
         let mut bound = Vec::new();
         for path in block.patterns {
@@ -1281,15 +1364,18 @@ impl Binder<'_> {
         for path in &mut bound {
             self.settle_labels(path);
         }
+        let held = self.marks.take();
         let filter = match &block.filter {
             Some(expr) => Some(self.bind_bool(expr, "WHERE")?),
             None => None,
         };
+        self.marks = held;
         self.scope = outer;
         Ok(BoundClause::Match {
-            kind: match block.negated {
-                true => MatchKind::Anti,
-                false => MatchKind::Semi,
+            kind: match (mark, block.negated) {
+                (Some(slot), negated) => MatchKind::Mark { slot, negated },
+                (None, true) => MatchKind::Anti,
+                (None, false) => MatchKind::Semi,
             },
             patterns: bound,
             filter,
@@ -1491,7 +1577,11 @@ impl Binder<'_> {
         // block runs after the projection, so it reads the projected
         // names and nothing the projection dropped.
         self.scope = new_scope;
-        let filter = self.bind_where(filter)?;
+        // A WITH's WHERE runs over projected rows, and a mark there
+        // would be a match under a projection, which is a shape
+        // neither executor has. The block refuses rather than being
+        // lifted somewhere it would read different rows.
+        let filter = self.bind_where(filter, false)?;
         if is_return {
             self.columns = items.iter().map(|i| i.name.clone()).collect();
             for item in &mut items {
@@ -1926,6 +2016,19 @@ impl Binder<'_> {
                     Type::Any,
                 ))
             }
+            // A NOT over a block is the block asked the other way
+            // round, which is one flag on the match rather than a
+            // negation over the answer, so it is taken here before the
+            // general unary path binds the block on its own.
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } if matches!(expr.as_ref(), Expr::Exists { .. }) => {
+                let Expr::Exists { patterns, filter } = expr.as_ref() else {
+                    unreachable!("the guard just matched the block");
+                };
+                Ok((self.bind_mark(patterns, filter, true)?, Type::Bool))
+            }
             Expr::Unary { op, expr } => {
                 let (bound, ty) = self.bind_expr(expr, ctx)?;
                 let out = match op {
@@ -2057,12 +2160,11 @@ impl Binder<'_> {
             }
             // Everything that could be lifted was lifted before this
             // ran, so a block reaching here is one in a place that
-            // wants a value out of it.
-            Expr::Exists { .. } => Err(invalid(
-                "EXISTS is a match and not a value: write it as a whole conjunct of a WHERE, \
-                 on its own or under NOT"
-                    .into(),
-            )),
+            // wants a value out of it, which is the mark. Where a mark
+            // cannot go either, `bind_mark` is what says so.
+            Expr::Exists { patterns, filter } => {
+                Ok((self.bind_mark(patterns, filter, false)?, Type::Bool))
+            }
         }
     }
 
@@ -2674,12 +2776,108 @@ mod tests {
     fn a_block_is_not_a_value() {
         let e = bind_err("MATCH (a:Person) RETURN EXISTS { MATCH (a)-[:KNOWS]->(b) } AS friendly");
         assert!(e.contains("EXISTS is a match and not a value"), "got: {e}");
-        // Under an OR it is being asked for a boolean, which is a mark
-        // join and not this.
+        // A block inside another block is asked for a value the same
+        // way, and there is nowhere for the mark it would need to go.
         let e = bind_err(
-            "MATCH (a:Person) WHERE a.id = 0 OR EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN a",
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b)              WHERE b.id = 0 OR EXISTS { MATCH (b)-[:KNOWS]->(c) } } RETURN a",
         );
         assert!(e.contains("EXISTS is a match and not a value"), "got: {e}");
+        // An OPTIONAL MATCH's WHERE decides that match, so a mark there
+        // would have to be answered inside the bracket.
+        let e = bind_err(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b)              WHERE b.id = 0 OR EXISTS { MATCH (b)-[:KNOWS]->(c) } RETURN a",
+        );
+        assert!(e.contains("EXISTS is a match and not a value"), "got: {e}");
+        // So does a WHERE hanging off a projection: what it filters is
+        // the group, and the block reads a row that is gone by then.
+        let e = bind_err(
+            "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS deg              WHERE deg > 1 OR EXISTS { MATCH (a)-[:KNOWS]->(c) } RETURN a",
+        );
+        assert!(e.contains("EXISTS is a match and not a value"), "got: {e}");
+    }
+
+    #[test]
+    fn a_block_under_an_or_becomes_a_mark() {
+        let q =
+            bound("MATCH (a:Person) WHERE a.id = 0 OR EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN a");
+        let BoundClause::Match { kind, filter, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        assert_eq!(*kind, MatchKind::Required);
+        assert!(filter.is_none(), "the whole WHERE moved past the mark");
+        let BoundClause::Match { kind, patterns, .. } = &q.clauses[1] else {
+            panic!("the mark");
+        };
+        let MatchKind::Mark { slot, negated } = *kind else {
+            panic!("a block under an OR is a mark, got {kind:?}");
+        };
+        assert!(!negated);
+        assert_eq!(patterns[0].steps.len(), 1);
+        assert_eq!(q.variables[slot].ty, Type::Bool);
+        // The predicate runs after the mark is written, and it reads
+        // the slot where the block was.
+        let BoundClause::Match {
+            kind,
+            patterns,
+            filter: Some(filter),
+        } = &q.clauses[2]
+        else {
+            panic!("the predicate that reads the mark");
+        };
+        assert_eq!(*kind, MatchKind::Required);
+        assert!(patterns.is_empty(), "nothing left to match here");
+        let BoundExpr::Binary { op, rhs, .. } = filter else {
+            panic!("the OR");
+        };
+        assert_eq!(*op, BinaryOp::Or);
+        assert_eq!(**rhs, BoundExpr::Var(slot));
+    }
+
+    #[test]
+    fn a_negated_mark_folds_the_not_in() {
+        let q = bound(
+            "MATCH (a:Person) WHERE a.id = 0 OR NOT EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN a",
+        );
+        let BoundClause::Match { kind, .. } = &q.clauses[1] else {
+            panic!("the mark");
+        };
+        let MatchKind::Mark { slot, negated } = *kind else {
+            panic!("a mark, got {kind:?}");
+        };
+        assert!(negated, "the NOT went into what gets written down");
+        let BoundClause::Match {
+            filter: Some(BoundExpr::Binary { rhs, .. }),
+            ..
+        } = &q.clauses[2]
+        else {
+            panic!("the predicate");
+        };
+        // Not a NOT around the read: the column already holds it.
+        assert_eq!(**rhs, BoundExpr::Var(slot));
+    }
+
+    #[test]
+    fn two_marks_under_one_where_keep_their_order() {
+        let q = bound(
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) }              OR EXISTS { MATCH (a)-[:IS_LOCATED_IN]->(p) } RETURN a",
+        );
+        let kinds: Vec<MatchKind> = q
+            .clauses
+            .iter()
+            .filter_map(|c| match c {
+                BoundClause::Match { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds.len(), 4, "the pattern, two marks, the predicate");
+        assert!(matches!(kinds[1], MatchKind::Mark { .. }));
+        assert!(matches!(kinds[2], MatchKind::Mark { .. }));
+        let (MatchKind::Mark { slot: first, .. }, MatchKind::Mark { slot: second, .. }) =
+            (kinds[1], kinds[2])
+        else {
+            unreachable!("just matched");
+        };
+        assert!(first < second, "written order is the order they run in");
     }
 
     #[test]

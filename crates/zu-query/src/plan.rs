@@ -24,8 +24,9 @@ use crate::binder::{
 ///
 /// The operators of one bracket share the id and nothing else does, so
 /// a run of them is found by looking at the ids alone. The kinds are
-/// the three things a match can be other than plain: OPTIONAL MATCH,
-/// and the two halves of an existence predicate.
+/// the things a match can be other than plain: OPTIONAL MATCH, the two
+/// halves of an existence predicate, and the mark an existence
+/// predicate becomes where it has to answer with a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bracket {
     pub id: usize,
@@ -42,6 +43,14 @@ pub enum BracketKind {
     Semi,
     /// The outer row survives a miss, and a hit ends it.
     Anti,
+    /// The outer row survives either way, once, carrying whether there
+    /// was a hit in the slot named here. That is what a block written
+    /// under an OR asks for: the other side of the OR may still keep a
+    /// row this one found nothing for, so the answer is a value the
+    /// predicate reads rather than a decision about the row. `negated`
+    /// is a NOT in front of the block, folded into what gets written
+    /// down the way an anti bracket folds one into what it keeps.
+    Mark { slot: usize, negated: bool },
 }
 
 impl Bracket {
@@ -57,6 +66,7 @@ impl Bracket {
             BracketKind::Optional => "Optional",
             BracketKind::Semi => "Semi",
             BracketKind::Anti => "Anti",
+            BracketKind::Mark { .. } => "Mark",
         }
     }
 }
@@ -190,6 +200,10 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                     MatchKind::Optional => Some(BracketKind::Optional),
                     MatchKind::Semi => Some(BracketKind::Semi),
                     MatchKind::Anti => Some(BracketKind::Anti),
+                    MatchKind::Mark { slot, negated } => Some(BracketKind::Mark {
+                        slot: *slot,
+                        negated: *negated,
+                    }),
                 };
                 let group = kind.map(|kind| {
                     groups += 1;

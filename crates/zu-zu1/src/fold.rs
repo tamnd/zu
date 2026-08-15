@@ -26,14 +26,14 @@
 
 use std::collections::HashSet;
 
-use zu_common::{Epoch, GROUP_ROWS, Result, ZuError};
+use zu_common::{Epoch, Result, ZuError};
 
 use crate::catalog::{Catalog, RelTable, TableIndex};
 use crate::file::{NULL_BLOCK, Zu1File};
 use crate::fullzip::{read_blob_segment, write_blob_segment};
 use crate::graph::{
     Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain,
-    free_directory_keeping_props, group_bases,
+    free_directory_keeping_props, group_bases, group_rows, pad_direction,
 };
 use crate::keys::write_key_index;
 use crate::meta;
@@ -366,11 +366,17 @@ fn fold_rel(
         what: "table index",
         detail: format!("rel table '{}' has no directory entry", rel.name),
     })?;
-    let new_count = catalog
-        .node_by_id(rel.from)
-        .expect("validated on decode")
-        .node_count;
-    if new_count > u64::from(u32::MAX) {
+    // Both ends can have grown, and they are different tables when the
+    // rel table runs between two labels, so each end is asked for its
+    // own row count rather than one standing for the pair.
+    let end_rows = |id: u32| {
+        catalog
+            .node_by_id(id)
+            .expect("validated on decode")
+            .node_count
+    };
+    let (new_from, new_to) = (end_rows(rel.from), end_rows(rel.to));
+    if new_from.max(new_to) > u64::from(u32::MAX) {
         return Err(ZuError::Unsupported {
             what: "folding a rel table past the u32 row domain",
             id: rel.id,
@@ -393,15 +399,15 @@ fn fold_rel(
         });
     }
     let mut edges: Vec<(u32, u32)> = Vec::with_capacity(old.edge_count as usize + overlay.len());
-    for node in 0..old.node_count {
+    for node in 0..old.from_count {
         for &dst in reader.neighbors_dir(db, node, Direction::Fwd)? {
             edges.push((node as u32, dst as u32));
         }
     }
     for (src, dst) in overlay {
-        if src >= new_count || dst >= new_count {
+        if src >= new_from || dst >= new_to {
             return Err(ZuError::InvalidArgument(format!(
-                "overlay edge ({src}, {dst}) references a row outside 0..{new_count}"
+                "overlay edge ({src}, {dst}) references a row outside 0..{new_from} and 0..{new_to}"
             )));
         }
         edges.push((src as u32, dst as u32));
@@ -412,7 +418,7 @@ fn fold_rel(
     // brings, so appending to a keyed table is refused for now.
     let key_by_row = match &old.keys {
         None => None,
-        Some(_) if new_count != old.node_count => {
+        Some(_) if new_from != old.from_count => {
             return Err(ZuError::Unsupported {
                 what: "folding appended rows into a keyed table",
                 id: rel.id,
@@ -423,7 +429,7 @@ fn fold_rel(
             read_segment(db, &keys.keys, &mut key_list)?;
             let mut rows = Vec::with_capacity(keys.rows.value_count as usize);
             read_segment(db, &keys.rows, &mut rows)?;
-            let mut by_row = vec![0u64; new_count as usize];
+            let mut by_row = vec![0u64; new_from as usize];
             for (i, &row) in rows.iter().enumerate() {
                 by_row[row as usize] = key_list[i];
             }
@@ -431,25 +437,29 @@ fn fold_rel(
         }
     };
     free_directory_keeping_props(db, root)?;
-    let fwd = build_direction(db, new_count, &edges)?;
+    let mut fwd = build_direction(db, "source", new_from, &edges)?;
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
     rev.sort_unstable();
-    let bwd = build_direction(db, new_count, &rev)?;
+    let mut bwd = build_direction(db, "destination", new_to, &rev)?;
     drop(rev);
-    let bases = group_bases(new_count, &edges);
+    let group_count = fwd.len().max(bwd.len());
+    pad_direction(db, &mut fwd, group_count)?;
+    pad_direction(db, &mut bwd, group_count)?;
+    let bases = group_bases(new_from, &edges);
     let groups = fwd
         .into_iter()
         .zip(bwd)
         .enumerate()
         .map(|(g, (fwd, bwd))| GroupMeta {
-            row_count: (new_count - g as u64 * GROUP_ROWS as u64).min(GROUP_ROWS as u64) as u32,
-            edge_base: bases[g],
+            row_count: group_rows(new_from, g as u64),
+            edge_base: bases.get(g).copied().unwrap_or(edges.len() as u64),
             fwd,
             bwd,
         })
         .collect();
     let directory = Directory {
-        node_count: new_count,
+        from_count: new_from,
+        to_count: new_to,
         edge_count: edges.len() as u64,
         keys: key_by_row
             .map(|keys| write_key_index(db, &keys))

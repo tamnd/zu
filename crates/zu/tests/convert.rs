@@ -196,20 +196,91 @@ fn sqlite_round_trips_through_zu1() {
     assert_sqlite_matches(&c);
 }
 
+/// A rel table between two labels crosses the hop with both ends
+/// intact: the tables keep their own row domains, an edge lands on the
+/// row of the table it names, and a pattern that walks it either way
+/// answers with the label at that end.
 #[test]
-fn distinct_endpoint_rels_error_cleanly() {
+fn a_rel_between_two_labels_survives_both_hops() {
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("a.db");
-    let mut sq = SqliteStore::open(&db).unwrap();
-    sq.create_node_table("person", &[]).unwrap();
-    sq.create_node_table("city", &[]).unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table("person", &[("name", ColumnType::Text)])
+        .unwrap();
+    sq.create_node_table("city", &[("name", ColumnType::Text)])
+        .unwrap();
     sq.create_rel_table("lives_in", "person", "city", &[])
         .unwrap();
+    sq.begin().unwrap();
+    // Four people and two cities, so the two ends are different sizes
+    // and a row id means nothing without the table it belongs to.
+    for (row, name) in ["ada", "bob", "cat", "dan"].iter().enumerate() {
+        sq.insert_node_at("person", row as i64, &[SqlValue::Text((*name).to_owned())])
+            .unwrap();
+    }
+    for (row, name) in ["hanoi", "kyoto"].iter().enumerate() {
+        sq.insert_node_at("city", row as i64, &[SqlValue::Text((*name).to_owned())])
+            .unwrap();
+    }
+    for &(p, city) in &[(0i64, 1i64), (1, 0), (2, 1)] {
+        sq.insert_rel("lives_in", p, city, &[]).unwrap();
+    }
+    sq.commit().unwrap();
     drop(sq);
-    let err = sqlite_to_zu1(&db, &dir.path().join("b.zu1")).unwrap_err();
-    assert!(
-        format!("{err}").contains("one node table"),
-        "unexpected error: {err}"
+
+    sqlite_to_zu1(&a, &b).unwrap();
+    {
+        let mut zu = Zu1File::open(&b).unwrap();
+        let catalog = Catalog::load(&mut zu).unwrap();
+        let rel = catalog.rel_by_name("lives_in").unwrap();
+        assert_eq!(catalog.node_by_id(rel.from).unwrap().name, "person");
+        assert_eq!(catalog.node_by_id(rel.to).unwrap().name, "city");
+        assert_eq!(catalog.node_by_name("person").unwrap().node_count, 4);
+        assert_eq!(catalog.node_by_name("city").unwrap().node_count, 2);
+        let mut g = GraphReader::load_table(&mut zu, "lives_in").unwrap();
+        assert_eq!(g.directory().from_count, 4);
+        assert_eq!(g.directory().to_count, 2);
+        assert_eq!(
+            g.neighbors_dir(&mut zu, 1, Zu1Direction::Bwd)
+                .unwrap()
+                .to_vec(),
+            vec![0u64, 2]
+        );
+    }
+
+    let q = "MATCH (p:person)-[:lives_in]->(c:city) \
+             RETURN p.name AS who, c.name AS town ORDER BY who";
+    let mut zu = Zu1File::open(&b).unwrap();
+    let got = run_zu1(q, &mut zu, &[]).unwrap();
+    assert_eq!(
+        got.rows,
+        vec![
+            vec![QValue::Str("ada".into()), QValue::Str("kyoto".into())],
+            vec![QValue::Str("bob".into()), QValue::Str("hanoi".into())],
+            vec![QValue::Str("cat".into()), QValue::Str("kyoto".into())],
+        ]
+    );
+    drop(zu);
+
+    // And back: the sqlite the return hop writes holds the same edges
+    // against the same two tables.
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    let rel = back
+        .tables()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "lives_in")
+        .expect("lives_in survives");
+    assert_eq!(rel.src_table.as_deref(), Some("person"));
+    assert_eq!(rel.dst_table.as_deref(), Some("city"));
+    assert_eq!(
+        back.rel_rows("lives_in", &[]).unwrap(),
+        vec![(0, 1, vec![]), (1, 0, vec![]), (2, 1, vec![])]
     );
 }
 

@@ -1,0 +1,209 @@
+schema = 1
+doc = "The versions zu builds against, one table for nine repositories."
+audited = "2026-08-15"
+
+# One table, referenced rather than restated, so that "which version do
+# we build against" is never a question with two answers. A pinned
+# version is the exact release CI runs, not a range. The floor is the
+# oldest release a user may have, which is a promise and not a fact, and
+# the two differ on purpose: the conformance matrix runs the floor as
+# well as the pin, because a library that only ever builds against the
+# newest release finds out its floor is broken from a bug report.
+#
+# `repos` says which of the nine repositories build against a component.
+# A component this one builds against says where the version is written,
+# in a `[[site]]` below it, and `cargo xtask pins` holds the file to the
+# table. Bumping a version is a pull request that touches this table and
+# the sites together, which is the whole point of writing it down.
+
+[[component]]
+name = "rust"
+pinned = "1.97.1"
+floor = "1.97"
+repos = ["zu", "zu-python", "zu-node", "zu-c", "zu-dotnet"]
+doc = "The compiler. Every repository with Rust in it builds with this one, including the five that reach it through PyO3, napi-rs or cbindgen."
+
+[[site]]
+component = "rust"
+file = "rust-toolchain.toml"
+key = "channel"
+holds = "pinned"
+match = "exact"
+
+[[site]]
+component = "rust"
+file = "Cargo.toml"
+key = "rust-version"
+holds = "floor"
+match = "exact"
+
+[[component]]
+name = "rust-nightly"
+pinned = "nightly-2026-08-14"
+repos = ["zu"]
+doc = "The nightly that extracts rustdoc JSON for the API model. Its format is versioned and the generator refuses one it was not taught, so a floating nightly would turn a rustdoc format bump into a red main on somebody else's release schedule."
+
+[[site]]
+component = "rust-nightly"
+file = ".github/workflows/ci.yml"
+key = "toolchain"
+holds = "pinned"
+match = "exact"
+
+[[component]]
+name = "arrow-rs"
+pinned = "59.2.0"
+repos = ["zu", "zu-python"]
+doc = "The Arrow implementation, and the parquet reader that ships from the same repository under the same version. The C Data Interface is stable whatever this says; the pin is the crate the engine compiles against."
+
+[[site]]
+component = "arrow-rs"
+file = "Cargo.toml"
+key = "arrow-array"
+holds = "pinned"
+match = "series"
+
+[[site]]
+component = "arrow-rs"
+file = "Cargo.toml"
+key = "arrow-schema"
+holds = "pinned"
+match = "series"
+
+[[site]]
+component = "arrow-rs"
+file = "Cargo.toml"
+key = "parquet"
+holds = "pinned"
+match = "series"
+
+[[component]]
+name = "python"
+pinned = "3.14.7"
+floor = "3.11"
+repos = ["zu-python"]
+doc = "The interpreter, with 3.15 for the free-threaded abi3t build. The floor rises one minor a year and is announced a release ahead."
+
+[[component]]
+name = "pyo3"
+pinned = "0.29.2"
+repos = ["zu-python"]
+doc = "The binding generator. 0.29 dropped 3.13t, which is why 3.13t is not a supported interpreter."
+
+[[component]]
+name = "maturin"
+pinned = "1.14.1"
+repos = ["zu-python"]
+doc = "The wheel builder."
+
+[[component]]
+name = "pyarrow"
+pinned = "25.0.1"
+floor = "15"
+repos = ["zu-python"]
+doc = "What a Python caller usually receives an Arrow table as."
+
+[[component]]
+name = "pandas"
+pinned = "3.0.5"
+floor = "2.0"
+repos = ["zu-python"]
+doc = "3.0 made copy on write mandatory and strings Arrow backed, which is what the conversion path assumes."
+
+[[component]]
+name = "polars"
+pinned = "1.43.2"
+floor = "1.0"
+repos = ["zu-python"]
+doc = "The other dataframe a Python caller hands a result to."
+
+[[component]]
+name = "node"
+pinned = "26.7.0"
+floor = "24"
+repos = ["zu-node"]
+doc = "CI runs 24 and 26, the LTS and the line that becomes LTS on 2026-10-28."
+
+[[component]]
+name = "bun"
+pinned = "1.3.14"
+floor = "1.3"
+repos = ["zu-node"]
+doc = "A runtime the same package has to load in, which is a different loader and a different set of assumptions about native modules."
+
+[[component]]
+name = "deno"
+pinned = "2.9.5"
+floor = "2.5"
+repos = ["zu-node"]
+doc = "The third runtime, reached through the JSR re-export."
+
+[[component]]
+name = "typescript"
+pinned = "7.0.2"
+floor = "5.2"
+repos = ["zu-node", "zu-web"]
+doc = "The compiler the package builds with. The floor is what a consumer's compiler must be to read the emitted types, and 5.2 is where `await using` arrived."
+
+[[component]]
+name = "napi"
+pinned = "3.12.1"
+repos = ["zu-node"]
+doc = "The Rust side of the Node binding."
+
+[[component]]
+name = "napi-rs-cli"
+pinned = "3.8.6"
+repos = ["zu-node"]
+doc = "The build tool that produces the platform packages."
+
+[[component]]
+name = "wasm-bindgen"
+pinned = "0.2.127"
+repos = ["zu-node", "zu-web"]
+doc = "The WASM fallback build, which is what an install produces when no prebuilt binary fits the platform."
+
+[[component]]
+name = "go"
+pinned = "1.26.6"
+floor = "1.25"
+repos = ["zu-go"]
+doc = "CI runs both supported lines. The floor is what `go.mod` declares."
+
+[[component]]
+name = "jdk"
+pinned = "26.0.2"
+floor = "25"
+repos = ["zu-java"]
+doc = "The floor is the LTS the FFM artifact needs; the JNI artifact goes back to 17, and CI runs 17, 21, 25 and 26."
+
+[[component]]
+name = "dotnet"
+pinned = "10.0.11"
+floor = "10.0"
+repos = ["zu-dotnet"]
+doc = "The LTS. .NET 8 dies on 2026-11-10 and is not a target."
+
+[[component]]
+name = "adbc"
+pinned = "1.12.0"
+repos = ["zu-python", "zu-go", "zu-java"]
+doc = "The driver manager an ADBC caller loads the driver through."
+
+[[component]]
+name = "rustls"
+pinned = "0.23.43"
+repos = ["zu-web"]
+doc = "TLS for the optional server. Nothing in the engine links it today, which is why this repository has no site for it."
+
+[[component]]
+name = "astro"
+pinned = "7.2.2"
+repos = ["zu-web"]
+doc = "The site generator."
+
+[[component]]
+name = "starlight"
+pinned = "0.41.7"
+repos = ["zu-web"]
+doc = "The documentation theme the site is built on."

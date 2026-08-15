@@ -13,9 +13,10 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphTypeSource,
-    LabelExpr, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection, ProjectionItem,
-    PropertyDef, Query, RelDirection, RelPattern, Selector, SortKey, Statement, UnaryOp,
+    BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
+    GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
+    PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
+    Selector, SortKey, Statement, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -190,8 +191,9 @@ impl Parser<'_> {
 
     /// Whether this statement changes the catalog rather than reading
     /// the graph. `CREATE` opens statements that are not here yet, so
-    /// the words after it decide: `GRAPH`, and `PROPERTY GRAPH` and `OR
-    /// REPLACE` ahead of either, are all the same statement.
+    /// the words after it decide: `GRAPH`, `SCHEMA`, and `PROPERTY
+    /// GRAPH` and `OR REPLACE` ahead of either, are all catalog
+    /// statements.
     fn at_catalog_stmt(&self) -> bool {
         if !self.at_kw("CREATE") && !self.at_kw("DROP") {
             return false;
@@ -203,13 +205,14 @@ impl Parser<'_> {
         if self.kw_at(at, "PROPERTY") {
             at += 1;
         }
-        self.kw_at(at, "GRAPH")
+        self.kw_at(at, "GRAPH") || self.kw_at(at, "SCHEMA")
     }
 
-    /// `CREATE GRAPH TYPE` and `DROP GRAPH TYPE`, with the `IF EXISTS`
-    /// and `IF NOT EXISTS` modifiers GC03 asks for.
+    /// The five statements that change what a file declares: a schema
+    /// (GC01), a graph (GC04), and a graph type (GC03), each created or
+    /// dropped, with the `IF EXISTS` and `IF NOT EXISTS` modifiers.
     ///
-    /// `PROPERTY` is a word the statement may carry and none of the two
+    /// `PROPERTY` is a word the statement may carry and none of them
     /// mean anything different for it, so it is eaten and forgotten:
     /// every graph zu holds is a property graph.
     fn parse_catalog_stmt(&mut self) -> Result<CatalogStmt> {
@@ -225,38 +228,15 @@ impl Parser<'_> {
             false
         };
         self.eat_kw("PROPERTY");
-        self.expect_kw("GRAPH")?;
-        if !self.eat_kw("TYPE") {
-            let what = if creating {
-                "CREATE GRAPH"
-            } else {
-                "DROP GRAPH"
-            };
-            return Err(ZuError::gql(
-                codes::C42001,
-                format!("{what} is not implemented yet, a zu1 file holds one graph"),
-            ));
-        }
-        let stmt = if creating {
-            let if_not_exists = self.eat_if_exists(true)?;
-            if or_replace && if_not_exists {
-                return Err(ZuError::gql(
-                    codes::C42001,
-                    "OR REPLACE takes the name over and IF NOT EXISTS leaves it alone, so a statement saying both says nothing".to_string(),
-                ));
-            }
-            let name = self.expect_name("a graph type name")?;
-            let source = self.parse_graph_type_source()?;
-            CatalogStmt::CreateGraphType {
-                name,
-                if_not_exists,
-                or_replace,
-                source,
-            }
+        let stmt = if self.eat_kw("SCHEMA") {
+            self.parse_schema_stmt(creating, or_replace)?
         } else {
-            let if_exists = self.eat_if_exists(false)?;
-            let name = self.expect_name("a graph type name")?;
-            CatalogStmt::DropGraphType { name, if_exists }
+            self.expect_kw("GRAPH")?;
+            if self.eat_kw("TYPE") {
+                self.parse_graph_type_stmt(creating, or_replace)?
+            } else {
+                self.parse_graph_stmt(creating, or_replace)?
+            }
         };
         self.eat(&TokenKind::Semicolon);
         if let Some(token) = self.peek() {
@@ -270,6 +250,178 @@ impl Parser<'_> {
             ));
         }
         Ok(stmt)
+    }
+
+    /// `CREATE GRAPH TYPE` and `DROP GRAPH TYPE` (GC03), from the word
+    /// after `TYPE` on.
+    fn parse_graph_type_stmt(&mut self, creating: bool, or_replace: bool) -> Result<CatalogStmt> {
+        if !creating {
+            let if_exists = self.eat_if_exists(false)?;
+            let name = self.expect_name("a graph type name")?;
+            return Ok(CatalogStmt::DropGraphType { name, if_exists });
+        }
+        let if_not_exists = self.eat_if_exists(true)?;
+        self.check_modifiers(or_replace, if_not_exists)?;
+        let name = self.expect_name("a graph type name")?;
+        let source = self.parse_graph_type_source()?;
+        Ok(CatalogStmt::CreateGraphType {
+            name,
+            if_not_exists,
+            or_replace,
+            source,
+        })
+    }
+
+    /// `CREATE SCHEMA /path` and `DROP SCHEMA /path` (GC01, GC02).
+    fn parse_schema_stmt(&mut self, creating: bool, or_replace: bool) -> Result<CatalogStmt> {
+        if !creating {
+            let if_exists = self.eat_if_exists(false)?;
+            let path = self.parse_schema_path()?;
+            return Ok(CatalogStmt::DropSchema { path, if_exists });
+        }
+        let if_not_exists = self.eat_if_exists(true)?;
+        self.check_modifiers(or_replace, if_not_exists)?;
+        if or_replace {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "a schema is a directory and replacing one would take what it holds with it, so OR REPLACE is not written here".to_string(),
+            ));
+        }
+        let path = self.parse_schema_path()?;
+        Ok(CatalogStmt::CreateSchema {
+            path,
+            if_not_exists,
+        })
+    }
+
+    /// `CREATE GRAPH` and `DROP GRAPH` (GC04, GC05), from the word
+    /// after `GRAPH` on.
+    fn parse_graph_stmt(&mut self, creating: bool, or_replace: bool) -> Result<CatalogStmt> {
+        if !creating {
+            let if_exists = self.eat_if_exists(false)?;
+            let name = self.parse_graph_name()?;
+            return Ok(CatalogStmt::DropGraph { name, if_exists });
+        }
+        let if_not_exists = self.eat_if_exists(true)?;
+        self.check_modifiers(or_replace, if_not_exists)?;
+        let name = self.parse_graph_name()?;
+        let of = self.parse_graph_type_ref()?;
+        // `AS COPY OF` is what the new graph starts with rather than
+        // what it is, so it is read after the type and not instead of
+        // it (GG05).
+        let copy_of = if self.at_kw("AS") && self.kw_at(1, "COPY") {
+            self.expect_kw("AS")?;
+            self.expect_kw("COPY")?;
+            self.expect_kw("OF")?;
+            Some(self.expect_name("the graph a copy is taken from")?)
+        } else {
+            None
+        };
+        Ok(CatalogStmt::CreateGraph {
+            name,
+            if_not_exists,
+            or_replace,
+            of,
+            copy_of,
+        })
+    }
+
+    /// The type a graph is created with. Nothing written is `ANY`,
+    /// which is the open graph type every zu1 file has had (GG01).
+    fn parse_graph_type_ref(&mut self) -> Result<GraphTypeRef> {
+        if self.eat_kw("ANY") {
+            // `ANY`, `ANY GRAPH` and `ANY PROPERTY GRAPH` are one
+            // spelling of the same open type.
+            self.eat_kw("PROPERTY");
+            self.eat_kw("GRAPH");
+            return Ok(GraphTypeRef::Any);
+        }
+        if self.at(&TokenKind::Colon)
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|t| t.kind == TokenKind::Colon)
+        {
+            self.pos += 2;
+            return Ok(GraphTypeRef::Named(self.expect_name("a graph type name")?));
+        }
+        if self.at_kw("TYPED") {
+            self.pos += 1;
+            return Ok(GraphTypeRef::Named(self.expect_name("a graph type name")?));
+        }
+        if self.at(&TokenKind::LBrace) || self.at_kw("LIKE") {
+            return Ok(GraphTypeRef::Source(self.parse_graph_type_source()?));
+        }
+        Ok(GraphTypeRef::Any)
+    }
+
+    /// A graph's name, which may be written as a path saying which
+    /// schema it is in.
+    fn parse_graph_name(&mut self) -> Result<GraphName> {
+        if !self.at(&TokenKind::Slash) {
+            return Ok(GraphName {
+                schema: None,
+                name: self.expect_name("a graph name")?,
+            });
+        }
+        let mut segments = Vec::new();
+        while self.eat(&TokenKind::Slash) {
+            segments.push(self.expect_name("a name in a path")?);
+        }
+        let name = segments.pop().expect("a path has a last segment");
+        let schema = if segments.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", segments.join("/"))
+        };
+        Ok(GraphName {
+            schema: Some(schema),
+            name,
+        })
+    }
+
+    /// An absolute directory path, which is what a schema is named by.
+    /// The path that is one slash and nothing else is the root schema,
+    /// which every file has.
+    fn parse_schema_path(&mut self) -> Result<String> {
+        if !self.eat(&TokenKind::Slash) {
+            return Err(self.error("an absolute directory path"));
+        }
+        if !self.at_name() {
+            return Ok("/".to_string());
+        }
+        let mut path = String::new();
+        loop {
+            path.push('/');
+            path.push_str(&self.expect_name("a name in a path")?);
+            if !self.eat(&TokenKind::Slash) {
+                return Ok(path);
+            }
+        }
+    }
+
+    /// Whether a name stands where the parser is, which is what tells
+    /// the root path from a path with segments in it.
+    fn at_name(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(Token {
+                kind: TokenKind::Ident(_) | TokenKind::QuotedIdent(_),
+                ..
+            })
+        )
+    }
+
+    /// `OR REPLACE` takes a taken name over and `IF NOT EXISTS` leaves
+    /// it alone, so a statement saying both says nothing.
+    fn check_modifiers(&self, or_replace: bool, if_not_exists: bool) -> Result<()> {
+        if or_replace && if_not_exists {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "OR REPLACE takes the name over and IF NOT EXISTS leaves it alone, so a statement saying both says nothing".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// `IF NOT EXISTS` when creating, `IF EXISTS` when dropping. The
@@ -1809,6 +1961,112 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_and_a_graph_are_catalog_objects_of_their_own() {
+        assert_eq!(
+            catalog_stmt("CREATE SCHEMA /app"),
+            CatalogStmt::CreateSchema {
+                path: "/app".into(),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            catalog_stmt("CREATE SCHEMA IF NOT EXISTS /app/inner"),
+            CatalogStmt::CreateSchema {
+                path: "/app/inner".into(),
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            catalog_stmt("DROP SCHEMA IF EXISTS /"),
+            CatalogStmt::DropSchema {
+                path: "/".into(),
+                if_exists: true,
+            }
+        );
+        // GG01: the open graph type, whichever way it is spelled.
+        for source in [
+            "CREATE GRAPH g ANY",
+            "CREATE PROPERTY GRAPH g ANY GRAPH",
+            "CREATE GRAPH g ANY PROPERTY GRAPH",
+            "CREATE GRAPH g",
+        ] {
+            assert_eq!(
+                catalog_stmt(source),
+                CatalogStmt::CreateGraph {
+                    name: GraphName {
+                        schema: None,
+                        name: "g".into(),
+                    },
+                    if_not_exists: false,
+                    or_replace: false,
+                    of: GraphTypeRef::Any,
+                    copy_of: None,
+                },
+                "{source}"
+            );
+        }
+        assert_eq!(
+            catalog_stmt("CREATE GRAPH IF NOT EXISTS /app/social :: social_type"),
+            CatalogStmt::CreateGraph {
+                name: GraphName {
+                    schema: Some("/app".into()),
+                    name: "social".into(),
+                },
+                if_not_exists: true,
+                or_replace: false,
+                of: GraphTypeRef::Named("social_type".into()),
+                copy_of: None,
+            }
+        );
+        // GG05: what the graph starts with, read after what it is.
+        assert_eq!(
+            catalog_stmt("CREATE OR REPLACE GRAPH g ANY AS COPY OF h"),
+            CatalogStmt::CreateGraph {
+                name: GraphName {
+                    schema: None,
+                    name: "g".into(),
+                },
+                if_not_exists: false,
+                or_replace: true,
+                of: GraphTypeRef::Any,
+                copy_of: Some("h".into()),
+            }
+        );
+        // GG03 and GG04: a type written where the graph is created.
+        let CatalogStmt::CreateGraph { of, .. } = catalog_stmt("CREATE GRAPH g { (:Person) }")
+        else {
+            panic!("not a create graph");
+        };
+        let GraphTypeRef::Source(GraphTypeSource::Elements(elements)) = of else {
+            panic!("not a type written out");
+        };
+        assert_eq!(elements[0].labels, ["Person"]);
+        assert_eq!(
+            catalog_stmt("CREATE GRAPH g LIKE h"),
+            CatalogStmt::CreateGraph {
+                name: GraphName {
+                    schema: None,
+                    name: "g".into(),
+                },
+                if_not_exists: false,
+                or_replace: false,
+                of: GraphTypeRef::Source(GraphTypeSource::Like("h".into())),
+                copy_of: None,
+            }
+        );
+        assert_eq!(
+            catalog_stmt("DROP PROPERTY GRAPH IF EXISTS g"),
+            CatalogStmt::DropGraph {
+                name: GraphName {
+                    schema: None,
+                    name: "g".into(),
+                },
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
     fn a_catalog_statement_says_what_it_could_not_read() {
         assert!(
             catalog_err("DROP GRAPH TYPE IF NOT EXISTS t")
@@ -1820,7 +2078,13 @@ mod tests {
                 .contains("says nothing"),
             "taking the name over and leaving it alone are different answers"
         );
-        assert!(catalog_err("CREATE GRAPH g").contains("CREATE GRAPH is not implemented yet"));
+        assert!(
+            catalog_err("CREATE OR REPLACE SCHEMA /app").contains("OR REPLACE is not written here")
+        );
+        assert!(
+            catalog_err("CREATE SCHEMA app").contains("expected an absolute directory path"),
+            "a schema is named by a path and not by a word"
+        );
         assert!(catalog_err("CREATE GRAPH TYPE t { (: ) }").contains("expected a label"));
         assert!(catalog_err("CREATE GRAPH TYPE t { NODE (:A) }").contains("expected TYPE"));
         assert!(

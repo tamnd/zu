@@ -9,15 +9,15 @@ Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) c
 | | ladybug | neo4j | zu |
 |---|---|---|---|
 | version | Lbug 0.19.1 | Neo4j Kernel 2026.07.1 community, Cypher 5/25, default language CYPHER 25 | zu 0.0.1 |
-| measured | 2026-08-13 | 2026-08-14 | 2026-08-15 |
+| measured | 2026-08-15 | 2026-08-14 | 2026-08-15 |
 | on | darwin arm64, Apple M4 | darwin arm64, Apple M4 | darwin arm64, Apple M4 |
 | harness | gql-compat devel | gql-compat devel | gql-compat devel |
 | corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
-| cases | 377 | 377 | 385 |
-| judged (pass + fail) | 253 | 324 | 258 |
-| **passed** | **72** (28.5%) | **186** (57.4%) | **178** (69.0%) |
-| failed | 181 | 138 | 80 |
-| skipped, cannot hold the fixture | 72 | 39 | 117 |
+| cases | 385 | 377 | 385 |
+| judged (pass + fail) | 257 | 324 | 258 |
+| **passed** | **72** (28.0%) | **186** (57.4%) | **178** (69.0%) |
+| failed | 185 | 138 | 80 |
+| skipped, cannot hold the fixture | 76 | 39 | 117 |
 | never reached a verdict | 52 | 14 | 10 |
 | ISO features with a passing case | 22 of 189 | 69 of 189 | 95 of 189 |
 | distinct GQLSTATUS values produced | 0 | 9 | 21 |
@@ -31,10 +31,10 @@ Pass over judged, then the two exclusions. Read the exclusions first. An engine 
 | mandatory | ladybug | 70 | 30 | 14 | 5 | 21 | 68.2% |
 | mandatory | neo4j | 70 | 67 | 0 | 3 | 0 | 100.0% |
 | mandatory | zu | 70 | 20 | 10 | 40 | 0 | 66.7% |
-| optional | ladybug | 201 | 22 | 153 | 5 | 21 | 12.6% |
+| optional | ladybug | 208 | 22 | 157 | 8 | 21 | 12.3% |
 | optional | neo4j | 201 | 76 | 107 | 5 | 13 | 41.5% |
 | optional | zu | 208 | 101 | 48 | 50 | 9 | 67.8% |
-| condition | ladybug | 66 | 0 | 4 | 62 | 0 | 0.0% |
+| condition | ladybug | 67 | 0 | 4 | 63 | 0 | 0.0% |
 | condition | neo4j | 66 | 6 | 28 | 31 | 1 | 17.6% |
 | condition | zu | 67 | 26 | 13 | 27 | 1 | 66.7% |
 | grammar | ladybug | 17 | 11 | 4 | 0 | 2 | 73.3% |

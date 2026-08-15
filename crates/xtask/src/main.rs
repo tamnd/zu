@@ -17,7 +17,7 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, corpus, model, pins, rustdoc, terms};
+use xtask::{apimap, corpus, model, pins, platforms, rustdoc, terms};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -49,6 +49,13 @@ cargo xtask pins [--table PATH] [--list]
   --table PATH      the toolchain table (default toolchains.toml)
   --list            print `component<TAB>pinned<TAB>floor<TAB>repos` for every row, and check nothing
 
+cargo xtask platforms [--table PATH] [--list] [--measure DIR --target TARGET]
+
+  --table PATH      the platform table (default platforms.toml)
+  --list            print `tier<TAB>target<TAB>runner<TAB>lib` for every row, and check nothing
+  --measure DIR     weigh what a build put in DIR against the size budgets
+  --target TARGET   the target that build was for, which says what the files are called
+
 cargo xtask terms [--table PATH] [--list] [PATH ...]
 
   --table PATH      the terminology table (default zu-web/style/zu/terms.yml, here or one level up)
@@ -69,6 +76,7 @@ fn main() -> ExitCode {
         Some("api-map") => run(api_map_command(&args[1..])),
         Some("corpus-pack") => run(corpus_pack_command(&args[1..])),
         Some("pins") => run(pins_command(&args[1..])),
+        Some("platforms") => run(platforms_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
@@ -254,6 +262,104 @@ fn pins_command(args: &[String]) -> Result<ExitCode, String> {
     }
     eprintln!(
         "\n{} to fix. Bumping a version is a change to {} and to every site of it.",
+        notes.len(),
+        path.display()
+    );
+    Ok(ExitCode::FAILURE)
+}
+
+fn platforms_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut path = PathBuf::from(platforms::PATH);
+    let mut list = false;
+    let mut measure: Option<PathBuf> = None;
+    let mut target: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--table" => {
+                path = PathBuf::from(args.get(i + 1).ok_or("--table wants a path")?);
+                i += 1;
+            }
+            "--measure" => {
+                measure = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--measure wants a path")?,
+                ));
+                i += 1;
+            }
+            "--target" => {
+                target = Some(args.get(i + 1).ok_or("--target wants a target")?.clone());
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let table = platforms::Table::load(&path)?;
+
+    if let Some(dir) = measure {
+        // The files are named differently on every platform, so the
+        // target is what says which names to look for, and asking for
+        // one without the other is a question with no answer.
+        let target = target.ok_or("--measure wants the --target it was built for")?;
+        let weights = table.weigh(&target, &dir)?;
+        let mut over = 0;
+        for weight in &weights {
+            println!("{weight}");
+            if weight.over() {
+                over += 1;
+            }
+        }
+        if over == 0 {
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!(
+            "\n{over} of {} over budget on {target}. The ceilings are in {}, and they are \
+             ceilings because size only ever drifts upward.",
+            weights.len(),
+            path.display()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    if target.is_some() {
+        return Err("--target is what --measure is read with".to_string());
+    }
+
+    if list {
+        for platform in &table.platforms {
+            println!(
+                "{}\t{}\t{}\t{}",
+                platform.tier,
+                platform.target,
+                platform.runner.as_deref().unwrap_or(""),
+                platform.lib
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Same rule as the toolchain table above: the table sits at the root
+    // of the tree it describes.
+    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let notes = table.check(&root)?;
+    if notes.is_empty() {
+        let tier1 = table
+            .platforms
+            .iter()
+            .filter(|p| p.tier == platforms::TIER1)
+            .count();
+        println!(
+            "{} platforms, {tier1} of them tier 1 and every one of those built, audited {}",
+            table.platforms.len(),
+            table.audited
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    eprintln!(
+        "\n{} to fix. Adding a platform is a change to {} and to the matrix that builds it.",
         notes.len(),
         path.display()
     );

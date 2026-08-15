@@ -1,0 +1,178 @@
+schema = 1
+doc = "The platforms zu builds for, one table for nine repositories."
+audited = "2026-08-15"
+
+# The tiers of dx/14 section 2, as data rather than as a paragraph nine
+# repositories each read differently. Tier 1 is prebuilt for every SDK,
+# tested per release, and blocks the release when it fails. Tier 2 is
+# prebuilt where the SDK supports it, smoke tested, and does not block.
+# Tier 3 is everything else, which is a source build and a best effort,
+# and is therefore not a list.
+#
+# A row with a runner is one CI can build here today, and the libzu
+# workflow's matrix is held to those rows by `cargo xtask platforms`. A
+# row without one is a promise with nowhere yet to keep it: freebsd and
+# riscv64 have no hosted runner, and the wasm targets are built by the
+# repositories that host them rather than by this one.
+#
+# The glibc floor is 2.28, which is manylinux_2_28 and covers RHEL 8 and
+# everything newer, so the two gnu rows build inside that image rather
+# than on the runner's own glibc. A binary linked against a newer glibc
+# is the failure that gets reported as "works on my machine": it loads
+# on the machine that built it and dies on the user's. The musl rows are
+# what makes a container work, which is where the same bug otherwise
+# turns up as a segfault in Docker.
+#
+# The musl rows build inside Alpine, which is the same argument with a
+# harder edge on it: a musl shared library links musl's libc and the
+# unwinder beside it, and an Ubuntu runner has neither, so the link does
+# not fail on the user's machine, it fails on ours. Building where the
+# artifact runs also means the smoke test is the real one rather than a
+# second container started to hold it.
+#
+# The image carries its date tag for the reason toolchains.toml exists:
+# an image tagged latest is a build whose compiler changes underneath it
+# on somebody else's schedule. The tag is here rather than in that table
+# because a container is a property of a target and not a tool the
+# engine is built with, and one fact belongs in one place.
+
+[[platform]]
+target = "x86_64-unknown-linux-gnu"
+tier = 1
+runner = "ubuntu-latest"
+container = "quay.io/pypa/manylinux_2_28_x86_64:2026.08.15-1"
+lib = "libzu.so"
+exe = "zu"
+smoke = true
+doc = "The default Linux desktop and server, and what a CI container of somebody else's is nine times in ten."
+
+[[platform]]
+target = "aarch64-unknown-linux-gnu"
+tier = 1
+runner = "ubuntu-24.04-arm"
+container = "quay.io/pypa/manylinux_2_28_aarch64:2026.08.15-1"
+lib = "libzu.so"
+exe = "zu"
+smoke = true
+doc = "Graviton, Ampere and every arm64 cloud instance. Built on an arm runner rather than cross compiled, so the artifact is tested by the machine that made it."
+
+[[platform]]
+target = "x86_64-unknown-linux-musl"
+tier = 1
+runner = "ubuntu-latest"
+container = "alpine:3.24.1"
+lib = "libzu.so"
+exe = "zu"
+smoke = true
+doc = "Alpine, which is where container users live. A glibc only binding is the classic works locally, segfaults in Docker."
+
+[[platform]]
+target = "aarch64-unknown-linux-musl"
+tier = 1
+runner = "ubuntu-24.04-arm"
+container = "alpine:3.24.1"
+lib = "libzu.so"
+exe = "zu"
+smoke = true
+doc = "Alpine on arm64, which is the default container on an Apple laptop and on half the cloud."
+
+[[platform]]
+target = "aarch64-apple-darwin"
+tier = 1
+runner = "macos-latest"
+lib = "libzu.dylib"
+exe = "zu"
+smoke = true
+doc = "Every Mac sold since 2020, and the machine most of this is written on."
+
+[[platform]]
+target = "x86_64-apple-darwin"
+tier = 1
+runner = "macos-latest"
+lib = "libzu.dylib"
+exe = "zu"
+smoke = false
+doc = "Intel Macs, cross compiled from the arm runner because there is no Intel one left. Nothing here runs it, so this row is built and measured and not exercised."
+
+[[platform]]
+target = "x86_64-pc-windows-msvc"
+tier = 1
+runner = "windows-latest"
+lib = "zu.dll"
+exe = "zu.exe"
+smoke = true
+doc = "Windows on Intel. The import library beside the DLL is what a C caller links against, and it ships with it."
+
+[[platform]]
+target = "aarch64-pc-windows-msvc"
+tier = 2
+runner = "windows-11-arm"
+lib = "zu.dll"
+exe = "zu.exe"
+smoke = true
+doc = "Windows on arm64. A runner exists, so this is a row the matrix can take when the tier 2 half of the release is built."
+
+[[platform]]
+target = "x86_64-unknown-freebsd"
+tier = 2
+lib = "libzu.so"
+exe = "zu"
+doc = "FreeBSD. No hosted runner, so a release builds it in a VM or not at all, and the promise is a smoke test rather than a full matrix."
+
+[[platform]]
+target = "riscv64gc-unknown-linux-gnu"
+tier = 2
+lib = "libzu.so"
+exe = "zu"
+doc = "riscv64. No hosted runner either, and the interesting part is that it is the first target where the vector kernels have no hand written path at all."
+
+[[platform]]
+target = "wasm32-unknown-unknown"
+tier = 2
+lib = "zu.wasm"
+exe = "zu.wasm"
+doc = "The browser build, and the last step of the install fallback chain: slower, complete enough to run, and the difference between installation failed and installation succeeded with a warning. Built by zu-node and zu-web, which host it."
+
+[[platform]]
+target = "wasm32-wasip1"
+tier = 2
+lib = "zu.wasm"
+exe = "zu.wasm"
+doc = "WASI, for the runtimes that are not a browser. Built by the repositories that ship it, for the same reason as the row above."
+
+# The sizes of dx/14 section 4, gated per release. Binary size is a real
+# adoption factor for serverless and mobile, and it only ever drifts
+# upward, so it is a number with a ceiling rather than a graph somebody
+# looks at. The two artifacts this repository builds are gated by the
+# libzu workflow on every tier 1 platform; the others are recorded here
+# because there is one table and not four.
+
+[[budget]]
+artifact = "libzu"
+mib = 14
+repo = "zu"
+doc = "One shared library per platform, feature complete, with the optional paths compiled in and chosen at run time rather than split across build variants."
+
+[[budget]]
+artifact = "zu"
+mib = 15
+repo = "zu"
+doc = "The CLI, which is the same engine plus a shell and an argument parser."
+
+[[budget]]
+artifact = "wheel"
+mib = 12
+repo = "zu-python"
+doc = "The Python wheel, which is libzu plus the PyO3 glue."
+
+[[budget]]
+artifact = "npm"
+mib = 10
+repo = "zu-node"
+doc = "One npm platform package, which is libzu plus the napi glue."
+
+[[budget]]
+artifact = "wasm"
+mib = 6
+repo = "zu-node"
+doc = "The WASM build, gzipped, because that is how it arrives over a network."

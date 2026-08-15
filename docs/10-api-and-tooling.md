@@ -119,6 +119,18 @@ The whole table against the whole tree is under a millisecond, because a site is
 
 Bumping a version is therefore a pull request that touches this table and every site of it together, which is the entire point of writing it down.
 
-## 10. Documentation deliverables (v1.0 gate)
+## 10. The platform table and the libzu matrix
+
+Seven targets are tier 1: linux x86_64 and aarch64 against glibc, the same two against musl, both Macs, and Windows on x86_64. Tier 1 means a prebuilt binary for every SDK, a full matrix per release, and a release that stops when one of them fails, which is a promise worth exactly what CI proves of it. So all seven build on every pull request rather than for the first time on the day of a release.
+
+`platforms.toml` is the table, and it is the tiers of dx/14 §2 as data rather than as a paragraph nine repositories each read differently. A row is a target, its tier, the runner that is that machine, the image it builds in where that matters, what the library and the CLI are called there, and whether the runner can run what it built. `cargo xtask platforms` holds `.github/workflows/libzu.yml` to it in both directions: a tier-1 target the matrix does not build is a promise nothing keeps, and a matrix row for a target the table does not have is a platform being shipped by nobody's decision. The check runs as a test, so it fires on the machine of whoever edited one of the two files.
+
+The glibc floor is 2.28, which is manylinux_2_28 and covers RHEL 8 and everything newer, so the two gnu rows build inside that image rather than against the runner's own glibc. A library linked against a newer glibc loads on the machine that built it and dies on the user's, which arrives as a bug report saying the install is broken. The musl rows are what makes a container work, and they are built inside Alpine rather than on the runner: a musl shared library links musl's libc and the unwinder beside it, which an Ubuntu machine does not have, so the row would fail to link here long before it failed to load there. Building where the artifact runs also makes the smoke test the real one. Rows a hosted runner cannot run at all, freebsd and riscv64, are recorded as tier 2 with no runner rather than left out, since the table is the promise and the promise is smaller there.
+
+Every row that can run what it built runs a C program whose only knowledge of zu is `zu.h`, compiled by a compiler that is not rustc and linked against the shared library that job produced. The Rust test in `zu-capi` calls the same functions and proves something else, because it links the rlib the compiler had in hand: the artifact test is the one that fails when a symbol is not exported, when the header and the library disagree about a type, or when the build for a platform picked up the wrong libc. It opens a graph, counts its nodes, and takes a refusal and frees the message, so the failing path crosses the boundary too.
+
+The same table carries the size ceilings of dx/14 §4, and `cargo xtask platforms --measure` weighs what a build produced against them on every platform. Binary size is a real adoption factor for serverless and mobile targets and it only ever drifts upward, so it is a number with a limit rather than a graph somebody looks at once a quarter. Today `libzu` is 2.3 MiB against a ceiling of 14 and the CLI is 4.6 against 15. A file the build did not produce is an error rather than a zero, since a missing artifact is otherwise the cheapest way to pass a size gate.
+
+## 11. Documentation deliverables (v1.0 gate)
 
 Format spec (`docs/format-zu1.md`, byte-accurate, enough to write an independent reader), grammar EBNF, GQL conformance declaration, ops guide for s3 engine (cost tuning worked examples), migration guides (Neo4j/Kùzu → zu: data model mapping + Cypher dialect diffs).

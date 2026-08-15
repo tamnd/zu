@@ -75,6 +75,10 @@ jobs:
       # stays flat as the table grows, which is the difference between a
       # scan per site and a scan of everything per site.
       - run: cargo bench -p xtask --bench pins
+      # The other table with a workflow on the end of it: seven tier 1
+      # targets, and the matrix in libzu.yml held to them. This runs as
+      # a test too, and here for the same reason as the two above.
+      - run: cargo run -p xtask -- platforms
 
   deny:
     runs-on: ubuntu-latest

@@ -14,6 +14,11 @@ zu corpus conformance/cases                   # the same cases through the shipp
 zu corpus conformance/cases --strict          # and no case may be ahead of the engine
 ```
 
+```
+cargo run -p xtask -- corpus-pack           # target/conformance-<version>.tar.zst
+cargo run -p xtask -- corpus-pack --check   # pack and report, writing nothing
+```
+
 The Rust runner in `crates/zu-corpus` is the first of nine and the reference for the rest. When a runner in another language disagrees with it about a case, the Rust one is right by definition: the cases and the engine version together are the contract, and this runner is the one compiled against the engine that defines it.
 
 Every case gets a database of its own. Cases are written as if nothing came before them, and the cheapest way to keep that true is to make it true. A case that leaked a table into the next one would be a failure that moves when the file is reordered, which is the worst kind to be handed.
@@ -65,6 +70,22 @@ cases:
 | `aggregate` | The set functions, where a type changes on the way through and a null stops propagating. |
 
 A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. Cases that store a value and read it back wait on `CREATE`, which the v0 core does not implement yet.
+
+## The artifact
+
+`conformance-<version>.tar.zst` is how the other eight repositories get the cases. A client pins an engine version and needs the cases that shipped with it, not the cases on this repository's main branch, which are the cases for a version it has not adopted yet.
+
+```
+conformance-<version>/manifest.json
+conformance-<version>/README.md
+conformance-<version>/cases/<suite>.yaml
+```
+
+The case files are the bytes committed here, unchanged. `manifest.json` says the artifact's schema, the engine version, the case schema, the total number of cases, and per suite its path, its case count, its size and a CRC32C of it. The checksum catches a truncated download and a corrupted unpack; it is not a signature, and what a release is signed with is the release's business.
+
+Every language has a tar reader and a zstd reader, which is the whole reason for the format. Nothing in the artifact needs a zu client to open.
+
+The archive is reproducible. Every tar header field that could carry a timestamp, a user id or a permission bit from the machine that packed it is fixed instead, so the same cases produce the same bytes anywhere, and a mirror can be compared against a release rather than trusted. The packer parses every case before it ships one, which is why `--check` is worth running in CI on a branch that will never cut a release: an artifact eight repositories cannot load is not worth discovering on release day.
 
 ## The value encoding
 

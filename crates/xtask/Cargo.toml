@@ -24,7 +24,14 @@ harness = false
 name = "apimap"
 harness = false
 
+[[bench]]
+name = "corpus"
+harness = false
+
 [dependencies]
+crc32c.workspace = true
+zstd.workspace = true
+zu-corpus.workspace = true
 zu-json.workspace = true
 
 [lints]

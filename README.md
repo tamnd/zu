@@ -43,6 +43,23 @@ docs/                the specification, byte-level where it matters
 
 The crate is published as `zudb` because `zu` is taken on crates.io; the repo, binary, and file extension stay `zu`.
 
+## Clients
+
+This repository holds the engine, the Rust SDK, the CLI, the C ABI and its generated `zu.h`, and the conformance corpus. Everything that compiles against the frozen C ABI instead of against the engine's internals lives in its own repository, which is ADR 0005 and the reason the list below is not a directory listing.
+
+| Repository | What it is | Tier |
+|---|---|---|
+| [zu-c](https://github.com/tamnd/zu-c) | C and C++ developer kit: examples, the header-only C++ wrapper, CMake, vcpkg, Conan, the sanitizer suites. `zu.h` itself is generated here, in this repository | 1 |
+| [zu-python](https://github.com/tamnd/zu-python) | `zudb` on PyPI. PyO3, three wheels per platform | 1 |
+| [zu-node](https://github.com/tamnd/zu-node) | `zudb` on npm. napi-rs, plus the WASM build, for Node, Bun, Deno, and the browser | 1 |
+| [zu-go](https://github.com/tamnd/zu-go) | `github.com/tamnd/zu-go`. cgo, with a `purego` path | 1 |
+| [zu-java](https://github.com/tamnd/zu-java) | `dev.zudb` on Maven Central. Panama, with a JNI fallback, plus Kotlin and Scala layers | 1 |
+| [zu-dotnet](https://github.com/tamnd/zu-dotnet) | `ZuDb` on NuGet. Source-generated P/Invoke, NativeAOT-clean | 2 |
+| [zu-kit](https://github.com/tamnd/zu-kit) | The binding kit: generated FFI declarations, corpus runners, a reference binding, the scorecard tool | 3 |
+| [zu-web](https://github.com/tamnd/zu-web) | The documentation site. Two thirds of it is generated from this repository's release artifacts | |
+
+If a bug reproduces through the `zu` CLI it belongs here, whichever client you found it through. Every client repository's bug template asks that first, because engine bugs filed in client trackers are the standard way a multi-repository project loses track of them.
+
 ## Building
 
 ```

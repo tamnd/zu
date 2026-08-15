@@ -58,8 +58,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "edge-properties",
-        supported: false,
-        why: "the converter carries a rel's endpoints and drops its columns",
+        supported: true,
+        why: "a rel table carries property columns, addressed by the edge ordinal the load order gives every edge",
     },
     Declared {
         key: "edge-types",
@@ -115,6 +115,11 @@ const DATA: &[Declared] = &[
         key: "parallel-edges",
         supported: true,
         why: "a second edge over the same ordered pair survives",
+    },
+    Declared {
+        key: "parallel-edge-properties",
+        supported: false,
+        why: "an edge property is addressed by searching the forward list for the destination, and two edges over one pair answer that search the same way",
     },
 ];
 
@@ -512,6 +517,7 @@ mod tests {
             "undirected-edges",
             "self-loops",
             "parallel-edges",
+            "parallel-edge-properties",
         ];
         let declared: Vec<&str> = DATA.iter().map(|d| d.key).collect();
         assert_eq!(

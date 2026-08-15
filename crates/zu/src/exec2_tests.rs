@@ -669,6 +669,28 @@ fn covered_shapes_match_the_old_engine() {
          AND NOT EXISTS { MATCH (c:person) WHERE c.score = b.id } RETURN count(*) AS n",
         "MATCH (a:person)-[:knows]->(b) WHERE a.id < 20 OPTIONAL MATCH (c:person) \
          WHERE c.score = b.id RETURN count(*) AS n",
+        // The mark a join writes: the block shares no variable with the
+        // pipeline and is tied to it by an equality, so what it asks is
+        // whether the build side holds the row's key and the answer is
+        // a column. Once under an OR, once negated, once with the key a
+        // row id rather than a property, once on a level the pipeline
+        // has walked off, where the answer is the pinned row's, and
+        // once on the level it is standing on.
+        "MATCH (a:person) WHERE a.id < 40 \
+         AND (a.id < 20 OR EXISTS { MATCH (c:person) WHERE c.score = a.age }) \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 40 \
+         AND (a.id < 20 OR NOT EXISTS { MATCH (c:person) WHERE c.score = a.age }) \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 40 \
+         AND (a.age > 90 OR EXISTS { MATCH (c:person) WHERE c.score = a.id }) \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
+         AND (b.id < 100 OR EXISTS { MATCH (c:person) WHERE c.score = a.age }) \
+         RETURN count(*) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
+         AND (b.id < 100 OR EXISTS { MATCH (c:person) WHERE c.score = b.age }) \
+         RETURN count(*) AS n",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -714,10 +736,13 @@ fn unclaimed_shapes_fall_back() {
          RETURN count(a) AS n",
         "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b)-[:knows]->(c) } \
          RETURN count(a) AS n",
-        // A mark over a pattern that shares no variable is the probe
-        // the join wears a bracket for, and the answer there is per
-        // outer row as well, so it goes back with the rest of them.
-        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (c:person) WHERE c.score = a.age } \
+        // A mark over a pattern that shares no variable is a probe, and
+        // the block is answered as a column. A second predicate inside
+        // it is not: it says which build rows count, which is a group
+        // per outer row, and a mark may not drop the rows a group
+        // finds nothing for.
+        "MATCH (a:person) WHERE a.id < 40 \
+         AND (a.id < 20 OR EXISTS { MATCH (c:person) WHERE c.score = a.age AND c.id > 3 }) \
          RETURN count(a) AS n",
         // An OPTIONAL MATCH with no required match under it has no
         // driving scan the bracket can hang off.

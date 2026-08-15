@@ -3,11 +3,13 @@
 //! drive the normalizer directly, without nightly and without cargo.
 
 pub mod apimap;
+pub mod artifacts;
 pub mod corpus;
 pub mod fixture;
 pub mod model;
 pub mod pins;
 pub mod platforms;
 pub mod rustdoc;
+pub mod tarball;
 pub mod terms;
 pub mod toml;

@@ -1,0 +1,72 @@
+schema = 1
+doc = "What a release of zu publishes, one table for nine repositories."
+audited = "2026-08-16"
+
+# A release is a tag on this repository and a run that drives the eight
+# others (dx/14 section 6). Each of them builds against what this one
+# published, so the list of what gets published is a contract rather
+# than a step in a workflow: a binding that fetches `model.json` by
+# version and finds nothing has no way to tell a release that dropped
+# the artifact from a version that never had it.
+#
+# So the list lives here, once, and the release workflow has none of its
+# own. `cargo xtask artifacts --assemble` gathers exactly these rows and
+# `--verify` reads the directory back, which means an artifact that
+# stopped being produced fails the release that dropped it rather than
+# the eight repositories that wanted it.
+#
+# `made` says where a row comes from and there are four answers. `file`
+# is a path this tree already holds and the release copies. `corpus` is
+# packed by the corpus packer. `platform` is one row per tier 1 target
+# of platforms.toml, so the seven move with that table and not with this
+# one. `later` is an artifact the contract names and nothing makes yet,
+# with the milestone that makes it: writing it down early is the point,
+# since a consumer needs to know what a release will eventually carry
+# and the alternative is eight repositories each guessing.
+
+[[artifact]]
+name = "libzu-<target>.tar.zst"
+made = "platform"
+consumers = ["zu-c", "zu-go", "zu-java", "zu-dotnet", "zu-kit"]
+doc = "The shared library, the CLI and the header for one tier 1 target, as the platform's job built them. The five repositories here reach the engine through the C ABI rather than compiling against it, so this archive is the whole of what they link."
+
+[[artifact]]
+name = "zu.h"
+made = "file"
+from = "crates/zu-capi/include/zu.h"
+consumers = ["zu-c", "zu-go", "zu-java", "zu-dotnet", "zu-kit", "zu-web"]
+doc = "The C ABI, published beside the libraries as well as inside each of them, because a consumer generating bindings needs the header without downloading a platform it does not build for. tamnd/zu-c deliberately does not hold a copy (dx/18 section 2)."
+
+[[artifact]]
+name = "model.json"
+made = "file"
+from = "docs/api/model.json"
+consumers = ["zu-c", "zu-python", "zu-node", "zu-go", "zu-java", "zu-dotnet", "zu-kit", "zu-web"]
+doc = "The public Rust surface as data. Every binding checks its api-map.toml against the model of the version it builds against, and the site renders the reference pages from it, so it is fetched by version rather than read from this repository's main branch."
+
+[[artifact]]
+name = "conformance-<version>.tar.zst"
+made = "corpus"
+consumers = ["zu-c", "zu-python", "zu-node", "zu-go", "zu-java", "zu-dotnet", "zu-kit"]
+doc = "The cross-client conformance corpus for this exact version. A client pins an engine version and needs the cases that shipped with it, not the cases on this branch, which are the cases for a version it has not adopted (dx/15 section 2)."
+
+[[artifact]]
+name = "cli.json"
+made = "later"
+milestone = "D1"
+consumers = ["zu-web"]
+doc = "Every command, flag and exit code of the CLI, which D1 renders twelve reference pages from. It arrives with the `--format json` surface of DX1, since the generator reads the CLI's own description of itself rather than its help text."
+
+[[artifact]]
+name = "gql.json"
+made = "later"
+milestone = "D2"
+consumers = ["zu-web"]
+doc = "Statements, functions, types and signatures, which the language reference is generated from and which an agent reads directly (dx/16 section 2). D2 is where it can first exist, because it is the shipped grammar and registry rather than a hand-written list."
+
+[[artifact]]
+name = "errors.json"
+made = "later"
+milestone = "D2"
+consumers = ["zu-python", "zu-node", "zu-web"]
+doc = "Every condition with its GQLSTATUS, its meaning, its fix and whether retrying it is sensible. The bindings are consumers as well as the site: an SDK that maps a status to an exception class is the same list read a second way, and reading it from the artifact is what keeps the two spellings the same."

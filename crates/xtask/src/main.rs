@@ -17,7 +17,7 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, corpus, model, pins, platforms, rustdoc, terms};
+use xtask::{apimap, artifacts, corpus, model, pins, platforms, rustdoc, terms};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -56,6 +56,15 @@ cargo xtask platforms [--table PATH] [--list] [--measure DIR --target TARGET]
   --measure DIR     weigh what a build put in DIR against the size budgets
   --target TARGET   the target that build was for, which says what the files are called
 
+cargo xtask artifacts [--table PATH] [--list] [--assemble DIR] [--verify DIR] [--built DIR] [--version V]
+
+  --table PATH      the artifact contract (default artifacts.toml)
+  --list            print `made<TAB>name<TAB>consumers` for every row, and check nothing
+  --assemble DIR    gather a release into DIR, from this tree and the platform builds
+  --verify DIR      read a release directory back against the contract
+  --built DIR       where the platform jobs' artifacts were downloaded (default built)
+  --version V       the version being released (default this workspace's)
+
 cargo xtask terms [--table PATH] [--list] [PATH ...]
 
   --table PATH      the terminology table (default zu-web/style/zu/terms.yml, here or one level up)
@@ -77,6 +86,7 @@ fn main() -> ExitCode {
         Some("corpus-pack") => run(corpus_pack_command(&args[1..])),
         Some("pins") => run(pins_command(&args[1..])),
         Some("platforms") => run(platforms_command(&args[1..])),
+        Some("artifacts") => run(artifacts_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
@@ -364,6 +374,140 @@ fn platforms_command(args: &[String]) -> Result<ExitCode, String> {
         path.display()
     );
     Ok(ExitCode::FAILURE)
+}
+
+fn artifacts_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut path = PathBuf::from(artifacts::PATH);
+    let mut list = false;
+    let mut assemble: Option<PathBuf> = None;
+    let mut verify: Option<PathBuf> = None;
+    let mut built = PathBuf::from("built");
+    // Same rule the corpus packer follows: the version comes from the
+    // build rather than from a habit, so an artifact cannot be named
+    // for a version it does not hold.
+    let mut version = env!("CARGO_PKG_VERSION").to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--table" => {
+                path = PathBuf::from(args.get(i + 1).ok_or("--table wants a path")?);
+                i += 1;
+            }
+            "--assemble" => {
+                assemble = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--assemble wants a path")?,
+                ));
+                i += 1;
+            }
+            "--verify" => {
+                verify = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--verify wants a path")?,
+                ));
+                i += 1;
+            }
+            "--built" => {
+                built = PathBuf::from(args.get(i + 1).ok_or("--built wants a path")?);
+                i += 1;
+            }
+            "--version" => {
+                version = args.get(i + 1).ok_or("--version wants a version")?.clone();
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let table = artifacts::Table::load(&path)?;
+
+    if list {
+        for artifact in &table.artifacts {
+            println!(
+                "{}\t{}\t{}",
+                artifact.made.kind(),
+                artifact.name,
+                artifact.consumers.join(" ")
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // The table sits at the root of the tree it describes, the same as
+    // the two tables beside it.
+    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let targets = artifacts::tier1(&root)?;
+
+    if let Some(out) = &assemble {
+        let made = table.assemble(&root, &built, out, &version, &targets)?;
+        for one in &made {
+            println!("{one}");
+        }
+        let later: Vec<&str> = table
+            .artifacts
+            .iter()
+            .filter(|a| !a.published())
+            .map(|a| a.name.as_str())
+            .collect();
+        // A release of six files against a contract of seven rows is a
+        // sentence worth printing, because the alternative is a reader
+        // counting and wondering.
+        println!(
+            "{}: {} files for {version}, and {} the contract names that nothing makes yet ({})",
+            out.display(),
+            made.len(),
+            later.len(),
+            later.join(", ")
+        );
+    }
+
+    if let Some(dir) = &verify {
+        let (shipped, faults) = table.verify(dir, &version, &targets)?;
+        for one in &shipped {
+            println!("{one}");
+        }
+        if !faults.is_empty() {
+            for fault in &faults {
+                eprintln!("{fault}");
+            }
+            eprintln!(
+                "\n{} to fix in {}. What a release publishes is {}, in both directions.",
+                faults.len(),
+                dir.display(),
+                path.display()
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+        println!(
+            "{}: {} artifacts for {version}, every one of them in {}",
+            dir.display(),
+            shipped.len(),
+            path.display()
+        );
+    }
+
+    if assemble.is_none() && verify.is_none() {
+        let notes = table.check(&root)?;
+        if !notes.is_empty() {
+            for note in &notes {
+                eprintln!("{note}");
+            }
+            eprintln!(
+                "\n{} to fix. What a release publishes is {}, and the release workflow assembles \
+                 from it rather than from a list of its own.",
+                notes.len(),
+                path.display()
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+        let published = table.artifacts.iter().filter(|a| a.published()).count();
+        println!(
+            "{} artifacts, {published} of them published today across {} platforms, audited {}",
+            table.artifacts.len(),
+            targets.len(),
+            table.audited
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The prose this repository publishes: the documentation, and the doc

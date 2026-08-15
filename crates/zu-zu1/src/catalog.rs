@@ -52,7 +52,9 @@ use crate::{meta, props};
 /// Version 4 adds schemas and named graphs, and says which graph each
 /// table belongs to. A version 3 catalog reads as the file it always
 /// was: one schema, one graph called `home`, and every table in it.
-const CATALOG_VERSION: u16 = 4;
+/// Version 5 says whether a rel table's edges have a direction, and a
+/// version 4 catalog reads as the file it was, every edge directed.
+const CATALOG_VERSION: u16 = 5;
 const TABLE_INDEX_VERSION: u16 = 1;
 
 /// The label dictionary is bounded by the width of the bitset a node
@@ -121,6 +123,11 @@ pub struct RelTable {
     pub from: u32,
     pub to: u32,
     pub edge_count: u64,
+    /// Whether the edges here have no direction (GH02). An undirected
+    /// edge is stored once, the way it was written, and read as
+    /// standing for both ways round: it is the pattern that asks which
+    /// of the two it wants, not the store.
+    pub undirected: bool,
 }
 
 /// Whether an element type describes nodes or edges.
@@ -1114,8 +1121,29 @@ impl Catalog {
         Ok(id)
     }
 
-    /// Creates or updates a rel table and returns its id.
+    /// Creates or updates a rel table and returns its id. The edges are
+    /// directed, which is what a rel table has always held; the
+    /// undirected form is `upsert_rel_as`.
     pub fn upsert_rel(&mut self, name: &str, from: u32, to: u32, edge_count: u64) -> Result<u32> {
+        self.upsert_rel_as(name, from, to, edge_count, false)
+    }
+
+    /// Creates or updates a rel table, saying whether its edges have a
+    /// direction (GH02).
+    ///
+    /// Whether the edges are directed belongs to the table rather than
+    /// to each edge, because it is a statement about the element type:
+    /// a graph type says `(:Peer)-[:FRIEND]-(:Peer)` once and every
+    /// edge of that type is the same way round, or is not one way round
+    /// at all.
+    pub fn upsert_rel_as(
+        &mut self,
+        name: &str,
+        from: u32,
+        to: u32,
+        edge_count: u64,
+        undirected: bool,
+    ) -> Result<u32> {
         if self.name_taken_by_other_kind(name, false) {
             return Err(ZuError::InvalidArgument(format!(
                 "'{name}' is already a node table"
@@ -1125,6 +1153,7 @@ impl Catalog {
             t.from = from;
             t.to = to;
             t.edge_count = edge_count;
+            t.undirected = undirected;
             return Ok(t.id);
         }
         let id = self.next_id()?;
@@ -1142,6 +1171,7 @@ impl Catalog {
             from,
             to,
             edge_count,
+            undirected,
         });
         Ok(id)
     }
@@ -1169,6 +1199,7 @@ impl Catalog {
             out.extend_from_slice(&t.from.to_le_bytes());
             out.extend_from_slice(&t.to.to_le_bytes());
             out.extend_from_slice(&t.edge_count.to_le_bytes());
+            out.push(u8::from(t.undirected));
         }
         for label in &self.labels {
             encode_name(&mut out, label);
@@ -1258,6 +1289,22 @@ impl Catalog {
             let from = read_u32(bytes, &mut pos, WHAT)?;
             let to = read_u32(bytes, &mut pos, WHAT)?;
             let edge_count = read_u64(bytes, &mut pos, WHAT)?;
+            let undirected = if version >= 5 {
+                let byte = bytes
+                    .get(pos)
+                    .copied()
+                    .ok_or_else(|| corrupt(WHAT, "truncated edge direction".into()))?;
+                pos += 1;
+                match byte {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(corrupt(WHAT, format!("edge direction byte {other}")));
+                    }
+                }
+            } else {
+                false
+            };
             catalog.rels.push(RelTable {
                 id,
                 name,
@@ -1265,6 +1312,7 @@ impl Catalog {
                 from,
                 to,
                 edge_count,
+                undirected,
             });
         }
         for _ in 0..label_count {
@@ -1883,6 +1931,9 @@ mod tests {
         for t in &c.nodes {
             out.extend_from_slice(&t.id.to_le_bytes());
             encode_name(&mut out, &t.name);
+            if version >= 4 {
+                out.extend_from_slice(&t.graph.to_le_bytes());
+            }
             out.extend_from_slice(&t.node_count.to_le_bytes());
             out.extend_from_slice(&(t.labels.len() as u16).to_le_bytes());
             for &label in &t.labels {
@@ -1892,6 +1943,9 @@ mod tests {
         for t in &c.rels {
             out.extend_from_slice(&t.id.to_le_bytes());
             encode_name(&mut out, &t.name);
+            if version >= 4 {
+                out.extend_from_slice(&t.graph.to_le_bytes());
+            }
             out.extend_from_slice(&t.from.to_le_bytes());
             out.extend_from_slice(&t.to.to_le_bytes());
             out.extend_from_slice(&t.edge_count.to_le_bytes());
@@ -1905,6 +1959,24 @@ mod tests {
                 encode_graph_type(&mut out, ty);
             }
         }
+        if version >= 4 {
+            out.extend_from_slice(&(c.schemas.len() as u32).to_le_bytes());
+            for schema in &c.schemas {
+                encode_name(&mut out, schema);
+            }
+            out.extend_from_slice(&(c.graphs.len() as u32).to_le_bytes());
+            for graph in &c.graphs {
+                out.extend_from_slice(&graph.id.to_le_bytes());
+                encode_name(&mut out, &graph.name);
+                encode_name(&mut out, &graph.schema);
+                out.push(graph.graph_type.code());
+                match &graph.graph_type {
+                    GraphTypeOf::Open => {}
+                    GraphTypeOf::Named(name) => encode_name(&mut out, name),
+                    GraphTypeOf::Inline(ty) => encode_graph_type(&mut out, ty),
+                }
+            }
+        }
         out
     }
 
@@ -1916,6 +1988,21 @@ mod tests {
         assert!(read.graph_types().is_empty());
         assert_eq!(read.node_tables(), c.node_tables());
         assert_eq!(read.labels(), c.labels());
+    }
+
+    /// A file written before the direction byte existed holds edges
+    /// that all point, which is what every rel table was until GH02.
+    #[test]
+    fn a_version_four_catalog_reads_as_a_file_of_directed_edges() {
+        let mut c = sample();
+        c.upsert_rel_as("mixed", 0, 0, 3, true).unwrap();
+        let read = Catalog::decode(&encode_at_version(&c, 4)).unwrap();
+        assert_eq!(read.rel_tables().len(), c.rel_tables().len());
+        assert!(read.rel_tables().iter().all(|t| !t.undirected));
+        // And the flag survives a round trip at the current version.
+        let now = Catalog::decode(&c.encode()).unwrap();
+        assert_eq!(now, c);
+        assert!(now.rel_by_name("mixed").expect("the table").undirected);
     }
 
     #[test]

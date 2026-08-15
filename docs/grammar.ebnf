@@ -59,9 +59,12 @@ element_type    = [ ( "NODE" | "EDGE" | "RELATIONSHIP" ) , "TYPE" , name ] ,
    the name written before the first belongs to the edge. *)
 node_type_pattern = "(" , type_body , ")" ;
 arc             = "-" , "[" , type_body , "]" , "-" , [ ">" ]
-                | "<" , "-" , "[" , type_body , "]" , "-" ;
-(* An arc with no arrowhead is an undirected edge type, which is GH02
-   and a property of the type rather than of the pattern. *)
+                | "<" , "-" , "[" , type_body , "]" , "-"
+                | "~" , "[" , type_body , "]" , "~" ;
+(* A tilde arc, or an arc with no arrowhead, is an undirected edge type,
+   which is GH02 and a property of the type rather than of the pattern.
+   The tilde is the spelling a pattern uses for the same thing and the
+   arrowless dash is what this grammar had before it. *)
 type_body       = [ name ] , [ ":" , label_set ] ,
                   [ "=>" , ":" , label_set ] , [ property_types ] ;
 (* The labels before the arrow are the key label set (GG21) and the ones
@@ -118,8 +121,19 @@ label_atom      = name | "%" | "(" , label_expr , ")" ;
    the same pattern, and `%` holds of every element because an element
    always carries the label of the table it lives in. *)
 
-relationship    = "<" , "-" , [ rel_detail ] , "-"
-                | "-" , [ rel_detail ] , "-" , [ ">" ] ;
+relationship    = [ "<" ] , bar , [ rel_detail ] , bar , [ ">" ]
+                | [ "<" ] , bar , [ ">" ] ;
+bar             = "-" | "~" ;
+(* The seven edge patterns of ISO 18.9, written as one production with
+   two rules the parser applies: both bars are the same character, and
+   a tilde takes no arrowhead. That leaves `-[]->`, `<-[]-`, `<-[]->`,
+   `~[]~`, `<~[]~`, `~[]~>` and `-[]-`. The second alternative is the
+   abbreviated form of each, which drops the bracket and the second bar
+   with it, so `->` is `-[]->` and `~` is `~[]~`. A dash says the edge
+   has a direction and the arrowheads say which way the pattern walks
+   it; a tilde says the edge has none, which is GH02 and a property of
+   the edge type rather than of the pattern. `-[]-` walks either kind
+   either way round. *)
 rel_detail      = "[" , [ name ] , [ ":" , name , { "|" , name } ] ,
                   [ "*" , [ hop_range ] ] , [ property_map ] , "]" ;
 hop_range       = integer , [ ".." , [ integer ] ]

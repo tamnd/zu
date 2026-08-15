@@ -60,6 +60,9 @@ pub enum TokenKind {
     Amp,
     /// `!`, the label expression negation.
     Bang,
+    /// `~`, which an edge pattern writes where a direction would go to
+    /// say the edge has none (GH02).
+    Tilde,
 }
 
 impl TokenKind {
@@ -97,6 +100,7 @@ impl TokenKind {
             TokenKind::Pipe => "'|'".into(),
             TokenKind::Amp => "'&'".into(),
             TokenKind::Bang => "'!'".into(),
+            TokenKind::Tilde => "'~'".into(),
         }
     }
 }
@@ -180,6 +184,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
             b';' => tokens.push(single(TokenKind::Semicolon)),
             b'+' => tokens.push(single(TokenKind::Plus)),
             b'-' => tokens.push(single(TokenKind::Minus)),
+            b'~' => tokens.push(single(TokenKind::Tilde)),
             b'*' => tokens.push(single(TokenKind::Star)),
             b'/' => tokens.push(single(TokenKind::Slash)),
             b'%' => tokens.push(single(TokenKind::Percent)),

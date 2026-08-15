@@ -3048,11 +3048,7 @@ fn far_table(schema: &Schema, rel: RelId, dir: Dir) -> Option<TableId> {
 
 /// The same pattern edge read from its other end.
 fn flip(direction: RelDirection) -> RelDirection {
-    match direction {
-        RelDirection::Out => RelDirection::In,
-        RelDirection::In => RelDirection::Out,
-        RelDirection::Undirected => RelDirection::Undirected,
-    }
+    direction.flip()
 }
 
 /// The traversal sides of one expand step, matching the old engine's
@@ -3111,10 +3107,11 @@ fn expand_dirs(
     direction: RelDirection,
 ) -> Option<Dirs> {
     let def = schema.rel_by_id(rel)?;
-    let fwd =
-        src_table == def.from && matches!(direction, RelDirection::Out | RelDirection::Undirected);
-    let bwd =
-        src_table == def.to && matches!(direction, RelDirection::In | RelDirection::Undirected);
+    // An undirected table answers both ways round, and a pattern that
+    // does not admit it walks nothing here at all (GH02).
+    let direction = direction.resolve(def.undirected)?;
+    let fwd = src_table == def.from && direction.walks_out();
+    let bwd = src_table == def.to && direction.walks_in();
     match (fwd, bwd) {
         (true, true) => Some(Dirs::Both),
         (true, false) => Some(Dirs::One(Dir::Fwd)),

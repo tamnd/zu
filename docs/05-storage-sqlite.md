@@ -30,6 +30,8 @@ CREATE INDEX r_follows_fwd ON r_follows(src, dst);
 CREATE INDEX r_follows_bwd ON r_follows(dst, src);
 ```
 
+The catalogue itself is one table, `zu_catalog (id, kind, name, sql, src_table, dst_table, undirected)`, one row per node or rel table. `id` is a rowid alias because it is the table id the query layer binds against and a VACUUM must not renumber it, the endpoint columns name the node tables a rel table runs between, and `undirected` says whether its edges have a direction (GH02). `user_version` is 3 and older files migrate on open: a version 1 file is rebuilt with its rowids kept as ids, and a version 2 file gains the direction column, defaulted to directed, which is what every rel table was before it.
+
 Type mapping: INT*/DATE/TIMESTAMP→INTEGER, DOUBLE→REAL, STRING→TEXT, BLOB/UUID/VECTOR→BLOB, DECIMAL→TEXT (lossless), LIST/MAP/STRUCT→BLOB (zu-encoded, documented), nested types are opaque in this engine (v1).
 
 ## 3. Configuration (set at open, non-negotiable defaults)

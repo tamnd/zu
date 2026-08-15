@@ -2849,7 +2849,7 @@
       "name": "closed",
       "of": "zu::zu1::catalog::GraphType",
       "signature": "bool",
-      "doc": "GG02. A closed type is a guarantee rather than a description:\nevery element matches a declared element type, so the planner\nmay resolve a property to a column without asking the row."
+      "doc": "GG02. A closed type is a guarantee rather than a description:\nevery element matches a declared element type, so the optimizer\nmay resolve a property to a column without asking the row."
     },
     {
       "id": "zu::zu1::catalog::GraphType::element",

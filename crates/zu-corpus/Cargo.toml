@@ -1,28 +1,23 @@
 [package]
-name = "zu-cli"
-description = "Command-line interface for zu"
-publish = false
+name = "zu-corpus"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "The cross-client conformance corpus and its Rust runner"
 
-[[bin]]
-name = "zu"
-path = "src/main.rs"
+[[bench]]
+name = "corpus"
+harness = false
 
 [dependencies]
 zu.workspace = true
-zu-corpus.workspace = true
-zu-json.workspace = true
+zu-common.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
-[features]
-arrow = ["zu/arrow"]
 
 [lints]
 workspace = true

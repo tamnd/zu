@@ -53,6 +53,16 @@ jobs:
       # identifiers that were added and removed, not just that the
       # file differs.
       - run: cargo xtask model --check --toolchain nightly-2026-08-14
+      # The map says what a binding owes every entity in the model, and
+      # this fails on a public symbol nothing classifies. The same
+      # check runs as a test, on stable, in every job of the matrix
+      # below, because that is what makes it fire on the machine of
+      # whoever added the symbol. It runs here as well because a
+      # command nothing exercises is a command that rots, and because
+      # the two failures belong together: a new symbol makes the model
+      # stale and then makes the map incomplete, and seeing both at
+      # once is one round trip rather than two.
+      - run: cargo xtask api-map
 
   deny:
     runs-on: ubuntu-latest

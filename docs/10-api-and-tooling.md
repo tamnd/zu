@@ -72,6 +72,8 @@ Python first (PyO3, Arrow-native `.to_arrow()/.to_pandas()`), then Node (napi-rs
 
 Every generated description of the API is built from one file, `docs/api/model.json`, extracted from rustdoc's JSON by `cargo xtask model` and committed to the tree: the reference pages, the SDK feature matrix, the `zu.h` header, and the `api-map.toml` completeness check. `docs/api/README.md` documents its schema and what the generator does that rustdoc does not. CI runs `cargo xtask model --check` on a pinned nightly, so a pull request that changes the public API and does not regenerate the model fails, and one that does regenerate it shows the change in its own diff.
 
+`docs/api/api-map.toml` is the other half: the model says what the API is, the map says what a binding owes it. Every entity is classified tier 1 (every tier-1 SDK exposes it), tier 2 (a binding may) or tier 3 (none does, and a reason is required). `cargo xtask api-map` joins the two and fails on a public symbol nothing classifies, on a classification for code that is gone, and, run against a binding repository's own map, on a tier-1 entity that binding stopped naming. The first of those runs as a test, so it fires on the machine of whoever added the symbol and not only in CI.
+
 ## 7. Documentation deliverables (v1.0 gate)
 
 Format spec (`docs/format-zu1.md`, byte-accurate, enough to write an independent reader), grammar EBNF, GQL conformance declaration, ops guide for s3 engine (cost tuning worked examples), migration guides (Neo4j/Kùzu → zu: data model mapping + Cypher dialect diffs).

@@ -20,6 +20,10 @@ path = "src/lib.rs"
 name = "model"
 harness = false
 
+[[bench]]
+name = "apimap"
+harness = false
+
 [dependencies]
 zu-json.workspace = true
 

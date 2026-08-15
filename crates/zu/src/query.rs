@@ -44,6 +44,7 @@ pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
             from: r.from,
             to: r.to,
             edge_count: r.edge_count,
+            undirected: r.undirected,
         })
         .collect();
     let mut schema = Schema::with_labels(nodes, rels, catalog.labels().to_vec())?;

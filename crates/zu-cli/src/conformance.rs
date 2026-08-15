@@ -103,8 +103,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "undirected-edges",
-        supported: false,
-        why: "every rel table is directed",
+        supported: true,
+        why: "a rel table says whether its edges have a direction, and both stored lists answer for one that has none",
     },
     Declared {
         key: "self-loops",

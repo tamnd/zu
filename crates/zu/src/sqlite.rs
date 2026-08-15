@@ -60,6 +60,7 @@ pub fn schema_of(store: &SqliteStore) -> Result<Schema> {
                     from: endpoint(&table.src_table)?,
                     to: endpoint(&table.dst_table)?,
                     edge_count: store.rel_count(&table.name)? as u64,
+                    undirected: table.undirected,
                 });
             }
             other => {

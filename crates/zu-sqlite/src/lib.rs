@@ -19,8 +19,11 @@ pub use zu_storage::Direction;
 pub const APPLICATION_ID: i32 = 0x005A_5531;
 
 /// Schema version written to `user_version`. Version 2 added the rel
-/// endpoint columns to `zu_catalog`; version 1 files migrate on open.
-pub const SCHEMA_VERSION: i32 = 2;
+/// endpoint columns to `zu_catalog` and version 3 the column saying
+/// whether a rel table's edges have a direction; older files migrate on
+/// open, and a migrated file's edges are directed, which is what every
+/// file that predates the column holds.
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// SQLite column affinity for a property column.
 /// The zu type mapping is specified in `docs/05-storage-sqlite.md` §2.
@@ -155,6 +158,10 @@ pub struct TableDef {
     pub name: String,
     pub src_table: Option<String>,
     pub dst_table: Option<String>,
+    /// Whether a rel table's edges have no direction (GH02). Always
+    /// false for a node table, and false for a rel table in a file
+    /// written before the column existed.
+    pub undirected: bool,
 }
 
 /// One node group's adjacency in CSR form, built lazily from a rel
@@ -237,23 +244,36 @@ impl SqliteStore {
                     // endpoint columns. The rebuild keeps each entry's
                     // old rowid as its id; endpoints stay null until
                     // the table is recreated, and null reads back as
-                    // unknown rather than wrong.
+                    // unknown rather than wrong. Version 2 predates the
+                    // direction column, and a file that never had one
+                    // holds directed edges, which is the default the
+                    // column is added with.
                     1 => conn
                         .execute_batch(
                             "BEGIN;\
-                             CREATE TABLE zu_catalog_v2 (\
+                             CREATE TABLE zu_catalog_v3 (\
                                id INTEGER PRIMARY KEY, \
                                kind TEXT NOT NULL, \
                                name TEXT NOT NULL, \
                                sql TEXT NOT NULL, \
                                src_table TEXT, \
                                dst_table TEXT, \
+                               undirected INTEGER NOT NULL DEFAULT 0, \
                                UNIQUE (kind, name));\
-                             INSERT INTO zu_catalog_v2 (id, kind, name, sql) \
+                             INSERT INTO zu_catalog_v3 (id, kind, name, sql) \
                                SELECT rowid, kind, name, sql FROM zu_catalog;\
                              DROP TABLE zu_catalog;\
-                             ALTER TABLE zu_catalog_v2 RENAME TO zu_catalog;\
-                             PRAGMA user_version = 2;\
+                             ALTER TABLE zu_catalog_v3 RENAME TO zu_catalog;\
+                             PRAGMA user_version = 3;\
+                             COMMIT;",
+                        )
+                        .map_err(sql_err)?,
+                    2 => conn
+                        .execute_batch(
+                            "BEGIN;\
+                             ALTER TABLE zu_catalog \
+                               ADD COLUMN undirected INTEGER NOT NULL DEFAULT 0;\
+                             PRAGMA user_version = 3;\
                              COMMIT;",
                         )
                         .map_err(sql_err)?,
@@ -306,6 +326,7 @@ impl SqliteStore {
                sql TEXT NOT NULL, \
                src_table TEXT, \
                dst_table TEXT, \
+               undirected INTEGER NOT NULL DEFAULT 0, \
                UNIQUE (kind, name))",
         )
         .map_err(sql_err)?;
@@ -324,7 +345,7 @@ impl SqliteStore {
             sql.push_str(&format!(", p_{} {}", ident(col)?, ty.sql()));
         }
         sql.push_str(");");
-        self.create("node", name, &sql, None)
+        self.create("node", name, &sql, None, false)
     }
 
     /// Creates rel table `r_<name>` from node table `from` to node
@@ -337,6 +358,21 @@ impl SqliteStore {
         from: &str,
         to: &str,
         columns: &[(&str, ColumnType)],
+    ) -> Result<()> {
+        self.create_rel_table_as(name, from, to, columns, false)
+    }
+
+    /// [`create_rel_table`](Self::create_rel_table), saying whether the
+    /// edges have a direction (GH02). An undirected table stores each
+    /// edge once, the way it was inserted, and both adjacency indexes
+    /// answer for it, which is what the query layer walks.
+    pub fn create_rel_table_as(
+        &mut self,
+        name: &str,
+        from: &str,
+        to: &str,
+        columns: &[(&str, ColumnType)],
+        undirected: bool,
     ) -> Result<()> {
         let name = ident(name)?;
         for endpoint in [from, to] {
@@ -365,7 +401,7 @@ impl SqliteStore {
             ");\nCREATE INDEX r_{name}_fwd ON r_{name} (src, dst);\
              \nCREATE INDEX r_{name}_bwd ON r_{name} (dst, src);"
         ));
-        self.create("rel", name, &sql, Some((from, to)))
+        self.create("rel", name, &sql, Some((from, to)), undirected)
     }
 
     /// Inserts one node row; `values` bind the property columns in declared order.
@@ -680,7 +716,10 @@ impl SqliteStore {
     pub fn tables(&self) -> Result<Vec<TableDef>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, kind, name, src_table, dst_table FROM zu_catalog ORDER BY id")
+            .prepare(
+                "SELECT id, kind, name, src_table, dst_table, undirected \
+                 FROM zu_catalog ORDER BY id",
+            )
             .map_err(sql_err)?;
         let rows = stmt
             .query_map([], |row| {
@@ -690,6 +729,7 @@ impl SqliteStore {
                     name: row.get(2)?,
                     src_table: row.get(3)?,
                     dst_table: row.get(4)?,
+                    undirected: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(sql_err)?;
@@ -728,6 +768,7 @@ impl SqliteStore {
         name: &str,
         sql: &str,
         endpoints: Option<(&str, &str)>,
+        undirected: bool,
     ) -> Result<()> {
         let tx = self.conn.transaction().map_err(sql_err)?;
         tx.execute_batch(sql).map_err(sql_err)?;
@@ -736,9 +777,9 @@ impl SqliteStore {
             None => (None, None),
         };
         tx.execute(
-            "INSERT INTO zu_catalog (kind, name, sql, src_table, dst_table) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (kind, name, sql, src, dst),
+            "INSERT INTO zu_catalog (kind, name, sql, src_table, dst_table, undirected) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (kind, name, sql, src, dst, i64::from(undirected)),
         )
         .map_err(sql_err)?;
         tx.commit().map_err(sql_err)

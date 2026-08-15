@@ -25,7 +25,7 @@ list-values = true  # a list column holds one element type, staged as a JSON arr
 null-properties = true  # a column is dense either way and carries validity words saying which of its rows hold a value
 float-values = true  # float columns ride the fixed width lane as their IEEE bits
 boolean-values = true  # boolean columns ride the lane, declared BOOLEAN across the sqlite staging hop
-undirected-edges = false  # every rel table is directed
+undirected-edges = true  # a rel table says whether its edges have a direction, and both stored lists answer for one that has none
 self-loops = true  # the converter reads endpoints through, so an edge to itself survives
 parallel-edges = true  # a second edge over the same ordered pair survives
 

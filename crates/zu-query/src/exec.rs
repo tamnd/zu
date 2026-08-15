@@ -647,11 +647,8 @@ fn rel_text(
         .map(|r| schema.rel_by_id(r.id).map_or("?", |d| d.name.as_str()))
         .collect::<Vec<_>>()
         .join("|");
-    match direction {
-        RelDirection::Out => format!("({from})-[:{names}]->({to})"),
-        RelDirection::In => format!("({from})<-[:{names}]-({to})"),
-        RelDirection::Undirected => format!("({from})-[:{names}]-({to})"),
-    }
+    let (left, right) = direction.spelling();
+    format!("({from}){left}[:{names}]{right}({to})")
 }
 
 fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema) -> String {
@@ -980,6 +977,10 @@ struct RelStep {
     id: u32,
     from_table: u32,
     to_table: u32,
+    /// Whether this table's edges have no direction (GH02), which is
+    /// what [`RelDirection::resolve`] reads to turn the pattern's
+    /// direction into the stored lists this step walks.
+    undirected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1409,6 +1410,7 @@ fn rel_steps(rel_slot: usize, query: &BoundQuery, schema: &Schema) -> Result<Vec
             id,
             from_table: rd.from,
             to_table: rd.to,
+            undirected: rd.undirected,
         });
     }
     if steps.is_empty() {
@@ -1478,12 +1480,7 @@ fn wcoj_fusion(
     let (probe, probe_dir) = if *to2 == to && b.slot_loc.contains_key(from) {
         (*from, *direction)
     } else if *from == to && b.slot_loc.contains_key(to2) {
-        let flipped = match direction {
-            RelDirection::Out => RelDirection::In,
-            RelDirection::In => RelDirection::Out,
-            RelDirection::Undirected => RelDirection::Undirected,
-        };
-        (*to2, flipped)
+        (*to2, direction.flip())
     } else {
         return Ok(None);
     };
@@ -2483,14 +2480,13 @@ fn degree_sum(
 ) -> Result<u64> {
     let mut total = 0;
     for step in rels {
-        if matches!(direction, RelDirection::Out | RelDirection::Undirected)
-            && table == step.from_table
-        {
+        let Some(direction) = direction.resolve(step.undirected) else {
+            continue;
+        };
+        if direction.walks_out() && table == step.from_table {
             total += graph.degree(step.id, offset, false)?;
         }
-        if matches!(direction, RelDirection::In | RelDirection::Undirected)
-            && table == step.to_table
-        {
+        if direction.walks_in() && table == step.to_table {
             total += graph.degree(step.id, offset, true)?;
         }
     }
@@ -2638,9 +2634,10 @@ fn hop_edges(
     let mut hops: Vec<(Value, u32, u64)> = Vec::new();
     let mut nbrs = Vec::new();
     for step in rels {
-        if matches!(direction, RelDirection::Out | RelDirection::Undirected)
-            && table == step.from_table
-        {
+        let Some(direction) = direction.resolve(step.undirected) else {
+            continue;
+        };
+        if direction.walks_out() && table == step.from_table {
             ctx.graph.neighbors(step.id, offset, false, &mut nbrs)?;
             for &dst in &nbrs {
                 hops.push((
@@ -2654,9 +2651,7 @@ fn hop_edges(
                 ));
             }
         }
-        if matches!(direction, RelDirection::In | RelDirection::Undirected)
-            && table == step.to_table
-        {
+        if direction.walks_in() && table == step.to_table {
             ctx.graph.neighbors(step.id, offset, true, &mut nbrs)?;
             for &src in &nbrs {
                 hops.push((
@@ -2803,7 +2798,10 @@ fn asp_hit(
     to_off: u64,
 ) -> Option<Value> {
     for (step, set) in rels.iter().zip(sets) {
-        if matches!(direction, RelDirection::Out | RelDirection::Undirected)
+        let Some(direction) = direction.resolve(step.undirected) else {
+            continue;
+        };
+        if direction.walks_out()
             && ft == step.from_table
             && tt == step.to_table
             && set.contains(&(fo, to_off))
@@ -2814,7 +2812,7 @@ fn asp_hit(
                 dst: to_off,
             });
         }
-        if matches!(direction, RelDirection::In | RelDirection::Undirected)
+        if direction.walks_in()
             && ft == step.to_table
             && tt == step.from_table
             && set.contains(&(to_off, fo))
@@ -2834,7 +2832,10 @@ fn asp_hit(
 /// undirected end reads both, which only lines up when the rel is self
 /// referencing and the two lists hold the same node table.
 fn usable_side(step: &RelStep, direction: RelDirection) -> bool {
-    !matches!(direction, RelDirection::Undirected) || step.from_table == step.to_table
+    match direction.resolve(step.undirected) {
+        Some(direction) => !direction.both_ways() || step.from_table == step.to_table,
+        None => false,
+    }
 }
 
 /// The stored lists one end of the intersection reads, and the table
@@ -2847,12 +2848,10 @@ fn near_sides(
     direction: RelDirection,
     table: u32,
 ) -> Option<(&'static [bool], u32)> {
-    match direction {
+    match direction.resolve(step.undirected)? {
         RelDirection::Out if table == step.from_table => Some((&[false], step.to_table)),
         RelDirection::In if table == step.to_table => Some((&[true], step.from_table)),
-        RelDirection::Undirected
-            if step.from_table == step.to_table && table == step.from_table =>
-        {
+        RelDirection::Any if step.from_table == step.to_table && table == step.from_table => {
             Some((&[false, true], step.to_table))
         }
         _ => None,
@@ -3125,9 +3124,10 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let mut far = Vec::new();
             let mut rel_vals = Vec::new();
             for step in rels {
-                if matches!(direction, RelDirection::Out | RelDirection::Undirected)
-                    && table == step.from_table
-                {
+                let Some(direction) = direction.resolve(step.undirected) else {
+                    continue;
+                };
+                if direction.walks_out() && table == step.from_table {
                     ctx.scratch.clear();
                     let mut scratch = std::mem::take(&mut ctx.scratch);
                     ctx.graph.neighbors(step.id, offset, false, &mut scratch)?;
@@ -3146,9 +3146,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     }
                     ctx.scratch = scratch;
                 }
-                if matches!(direction, RelDirection::In | RelDirection::Undirected)
-                    && table == step.to_table
-                {
+                if direction.walks_in() && table == step.to_table {
                     ctx.scratch.clear();
                     let mut scratch = std::mem::take(&mut ctx.scratch);
                     ctx.graph.neighbors(step.id, offset, true, &mut scratch)?;
@@ -3220,17 +3218,12 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     } = ctx;
                     let source = &chunks[*f];
                     for step in rels {
+                        let Some(direction) = direction.resolve(step.undirected) else {
+                            continue;
+                        };
                         let sides = [
-                            (
-                                matches!(direction, RelDirection::Out | RelDirection::Undirected),
-                                step.from_table,
-                                false,
-                            ),
-                            (
-                                matches!(direction, RelDirection::In | RelDirection::Undirected),
-                                step.to_table,
-                                true,
-                            ),
+                            (direction.walks_out(), step.from_table, false),
+                            (direction.walks_in(), step.to_table, true),
                         ];
                         for (applies, step_table, reversed) in sides {
                             if !applies {
@@ -3381,7 +3374,10 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let (tt, to_off) = node_value(tv, "expand into")?;
             let mut hit = None;
             for step in rels {
-                if matches!(direction, RelDirection::Out | RelDirection::Undirected)
+                let Some(direction) = direction.resolve(step.undirected) else {
+                    continue;
+                };
+                if direction.walks_out()
                     && ft == step.from_table
                     && tt == step.to_table
                     && ctx.graph.has_edge(step.id, fo, to_off)?
@@ -3393,7 +3389,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     });
                     break;
                 }
-                if matches!(direction, RelDirection::In | RelDirection::Undirected)
+                if direction.walks_in()
                     && ft == step.to_table
                     && tt == step.from_table
                     && ctx.graph.has_edge(step.id, to_off, fo)?
@@ -5531,6 +5527,7 @@ mod tests {
                     from: 0,
                     to: 0,
                     edge_count: 8,
+                    undirected: false,
                 },
                 RelDef {
                     id: 3,
@@ -5538,6 +5535,7 @@ mod tests {
                     from: 0,
                     to: 1,
                     edge_count: 6,
+                    undirected: false,
                 },
             ],
         )
@@ -5884,6 +5882,7 @@ mod tests {
                 from: 0,
                 to: 0,
                 edge_count: 6,
+                undirected: false,
             }],
         )
         .expect("schema");
@@ -6934,6 +6933,7 @@ mod tests {
             id: 2,
             from_table: 0,
             to_table: 0,
+            undirected: false,
         }];
         let spec = VarSpec {
             rels: &rels,

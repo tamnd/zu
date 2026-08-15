@@ -82,7 +82,7 @@ Writes compile to the same pipelines producing a `CommitBatch`: node inserts app
 
 ## 9. Catalog statements
 
-`CREATE GRAPH TYPE` and `DROP GRAPH TYPE` change what a file declares rather than reading what it holds (GC03, grammar in `docs/grammar.ebnf`). They share the parser with queries and nothing after it: a catalog statement has no binding table, so it never reaches the binder or the planner, and it answers no columns, which the standard has a condition for (`00001 successful completion, omitted result`).
+A catalog statement changes what a file declares rather than reading what it holds. There are six: `CREATE SCHEMA` and `DROP SCHEMA` (GC01, GC02), `CREATE GRAPH` and `DROP GRAPH` (GC04, GC05), and `CREATE GRAPH TYPE` and `DROP GRAPH TYPE` (GC03). The grammar is in `docs/grammar.ebnf`. They share the parser with queries and nothing after it: a catalog statement has no binding table, so it never reaches the binder or the planner, and it answers no columns, which the standard has a condition for (`00001 successful completion, omitted result`).
 
 ISO writes an element type as the pattern an element of it matches, and almost every part of that pattern is optional. A statement lists them:
 
@@ -98,13 +98,27 @@ The labels before the `=>` are the key label set, the ones after it are the rest
 
 A property whose type admits null is one an element may leave out, so `NOT NULL` is what makes a property mandatory: one rule about null rather than two, and the value type grammar already had it.
 
-A graph type written out in braces is closed, because a list nobody qualified is the whole list (GG02). Open graph types are spelled on the graph rather than on the type, which is `CREATE GRAPH g ANY` and the next statement to land.
+A graph type written out in braces is closed, because a list nobody qualified is the whole list (GG02). Open graph types are spelled on the graph rather than on the type, which is `CREATE GRAPH g ANY` (GG01).
 
 The catalog holds one name per element type, since a name is what an endpoint points at, and ISO's element types are anonymous. A pattern that carries no name gets one made of its labels, `KNOWS&Close` for the edge type above, with a number after it when that name is taken: GG24 is two node types over one label in one graph type, and the number is what keeps the second one from being the first one written twice. An endpoint written out is folded into a node type the graph type already has when it declares nothing of its own, so the three `(:Person)` patterns of a two edge type graph type name one node type between them.
 
 One number in all of this is zu's rather than the standard's, impdef IL003: a written key label set names between 1 and 63 labels. Empty is a type nothing selects and 64 leaves no room in the 64 bit mask a label set is for the label the arrow adds, so the four conditions ISO reserves for the two ends of that range are raised here (`42012` to `42015`).
 
-`CREATE GRAPH TYPE t LIKE g` is GG04: the closed type the file's tables already describe, read off the catalog and not off the data, so it costs a catalog walk on a graph of any size. A zu1 file holds one graph, so the reference names it whatever it is called. The tables stay the storage unit either way; a graph type describes them, it does not replace them (§03 §6).
+`CREATE GRAPH TYPE t LIKE g` is GG04: the closed type the tables of the graph named already describe, read off the catalog and not off the data, so it costs a catalog walk on a graph of any size. The tables stay the storage unit either way; a graph type describes them, it does not replace them (§03 §6).
+
+### 9.1 Schemas and graphs
+
+A schema is a directory the file holds and a graph lives in one. Both are names in the catalog and neither is a block on disk: `CREATE SCHEMA /app` adds a path, `CREATE GRAPH /app/social ANY` adds a graph in it, and a graph written as a bare name is a graph in the root schema. Every file has the root schema `/`, which is the one directory that is not one to drop, and every file starts with one graph in it called `home`. That home graph is what a file that was written before any of this said existed all along: a version 3 catalog reads as the root schema, the home graph, and every table in it, so an old file gains the vocabulary without gaining a rewrite.
+
+Which graph a table belongs to is a field on the table rather than a list on the graph, so a table cannot be in two graphs and dropping a graph is a filter over the tables the catalog holds. A node table joins the graph a session is loading into and an edge table joins the graph of the table it comes from, which is what keeps an edge and its endpoints together.
+
+A graph is created with the open type, with a graph type the file already holds (`CREATE GRAPH g :: social`), or with one written where the graph is created (`CREATE GRAPH g { (:Person {name :: STRING}) }`, which is GG03, and `CREATE GRAPH g LIKE h`, which is GG04 read at the graph). An inline type is kept on the graph and not added to the file's graph types, since nobody wrote a name for it.
+
+`AS COPY OF` (GG05) says what the new graph starts with rather than what it is, so it is read after the type. A copy of an empty graph is a graph with no tables, which is exact. A copy of a graph that holds tables is refused today rather than approximated, because a props directory holds pointers inside block payloads and a copy that walked them wrong would be a copy that read as data.
+
+`DROP GRAPH` is the one statement in zu that hands blocks back. It frees the props directory of every node table in the graph, the group directory of every edge table, the tombstone chain of every node table that has one, and the table index and stats chains it rewrites, then takes the graph and its tables out of the catalog. Nothing is published along the way: the checkpoint that stores the catalog makes the catalog, the table index and the stats visible together, so a drop that fails halfway leaves the file exactly as it was. Freed blocks become allocatable at the checkpoint after the one that published the free, and `block_count` is a high-water mark that never shrinks, so what a drop returns is measured in the free list and not in the size of the file. Dropping the home graph is allowed and is the reclamation path a file with one graph has; the next load puts an empty home graph back.
+
+`DROP SCHEMA` is `RESTRICT` in the sense the standard gives it: a schema that still holds a graph is not one to drop, and the error says which graph is in the way.
 
 `CREATE OR REPLACE` and `CREATE ... IF NOT EXISTS` are the two answers to a name that is taken, and a statement saying both says nothing, so it is refused. The replacement is built before the old type goes, which is why a replacement that cannot be kept leaves the type that was there.
 

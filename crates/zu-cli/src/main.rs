@@ -331,6 +331,28 @@ fn stat(path: &std::path::Path) -> ExitCode {
             let stats = zu::zu1::stats::Stats::load(&mut db).unwrap_or_default();
             match zu::zu1::catalog::Catalog::load(&mut db) {
                 Ok(catalog) => {
+                    // A schema is named for what it is here, a
+                    // directory, because the size breakdown above
+                    // already spends the word "schema" on the bytes the
+                    // catalog and its neighbours take.
+                    for schema in catalog.schemas() {
+                        println!("directory:       {schema}");
+                    }
+                    for g in catalog.graphs() {
+                        let of = match &g.graph_type {
+                            zu::zu1::catalog::GraphTypeOf::Open => "any".to_string(),
+                            zu::zu1::catalog::GraphTypeOf::Named(name) => format!(":: {name}"),
+                            zu::zu1::catalog::GraphTypeOf::Inline(ty) => {
+                                format!("typed here, {} element types", ty.elements.len())
+                            }
+                        };
+                        println!(
+                            "graph:           {} in {} ({of}, {} tables)",
+                            g.name,
+                            g.schema,
+                            catalog.graph_tables(g.id).len()
+                        );
+                    }
                     for t in catalog.node_tables() {
                         println!("node table:      {} ({} rows)", t.name, t.node_count);
                     }

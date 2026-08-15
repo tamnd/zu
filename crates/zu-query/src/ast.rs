@@ -37,6 +37,54 @@ pub enum CatalogStmt {
         name: String,
         if_exists: bool,
     },
+    /// GC01: a schema, which is the directory a graph and a graph type
+    /// are named in.
+    CreateSchema {
+        path: String,
+        /// GC02, the same modifier `CREATE GRAPH TYPE` takes.
+        if_not_exists: bool,
+    },
+    DropSchema {
+        path: String,
+        if_exists: bool,
+    },
+    /// GC04: a graph, which is a name, the type it is of, and what it
+    /// holds.
+    CreateGraph {
+        name: GraphName,
+        /// GC05.
+        if_not_exists: bool,
+        or_replace: bool,
+        of: GraphTypeRef,
+        /// GG05: the graph whose contents the new one starts with.
+        copy_of: Option<String>,
+    },
+    DropGraph {
+        name: GraphName,
+        if_exists: bool,
+    },
+}
+
+/// A catalog object's name and the schema it is in. ISO names one by an
+/// absolute directory path, so a name with no path in it is a name in
+/// the schema the session is working in, which is the root schema until
+/// a session may say otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphName {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+/// The type a graph is created with (GG01 to GG04).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphTypeRef {
+    /// GG01: `ANY GRAPH`, or nothing written at all.
+    Any,
+    /// `::` and the name of a graph type the catalog holds.
+    Named(String),
+    /// A type written where the graph is created: in braces (GG03) or
+    /// as `LIKE` another graph (GG04).
+    Source(GraphTypeSource),
 }
 
 /// Where a graph type's element types come from (GG03, GG04).

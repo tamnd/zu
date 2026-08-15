@@ -1,5 +1,6 @@
-//! Running the statements that change what a file declares: `CREATE
-//! GRAPH TYPE` and `DROP GRAPH TYPE` (docs/07 §9, GC03).
+//! Running the statements that change what a file declares: schemas
+//! (GC01, GC02), graphs (GC04, GC05) and graph types (GC03), each
+//! created or dropped (docs/07 §9).
 //!
 //! The parser hands over names, because the label dictionary belongs to
 //! the catalog and the parser has never seen one. Resolving them is
@@ -18,10 +19,13 @@
 //! to, so an anonymous type gets one made out of its labels here.
 
 use zu_common::{Result, ZuError};
-use zu_query::ast::{CatalogStmt, ElementDefKind, ElementTypeDef, Endpoint, GraphTypeSource};
+use zu_query::ast::{
+    CatalogStmt, ElementDefKind, ElementTypeDef, Endpoint, GraphName, GraphTypeRef, GraphTypeSource,
+};
 
-use crate::zu1::catalog::{Catalog, ElementKind, ElementType, GraphType};
+use crate::zu1::catalog::{Catalog, ElementKind, ElementType, GraphType, GraphTypeOf, ROOT_SCHEMA};
 use crate::zu1::file::Zu1File;
+use crate::zu1::graph;
 
 /// What running a catalog statement did. `IF EXISTS` and `IF NOT
 /// EXISTS` both turn a refusal into a statement that did nothing, and
@@ -79,9 +83,186 @@ pub fn apply(db: &mut Zu1File, stmt: &CatalogStmt) -> Result<Effect> {
             catalog.store(db)?;
             return Ok(Effect::Dropped);
         }
+        CatalogStmt::CreateSchema {
+            path,
+            if_not_exists,
+        } => {
+            if catalog.has_schema(path) {
+                if *if_not_exists {
+                    return Ok(Effect::Nothing);
+                }
+                return Err(ZuError::InvalidArgument(format!(
+                    "'{path}' is already a schema"
+                )));
+            }
+            catalog.add_schema(path)?;
+        }
+        CatalogStmt::DropSchema { path, if_exists } => {
+            if path == ROOT_SCHEMA {
+                return Err(ZuError::InvalidArgument(
+                    "the root schema is the one every file has, so it is not one to drop".into(),
+                ));
+            }
+            if !catalog.has_schema(path) {
+                if *if_exists {
+                    return Ok(Effect::Nothing);
+                }
+                return Err(ZuError::InvalidArgument(format!(
+                    "'{path}' is no schema here"
+                )));
+            }
+            // ISO's default is RESTRICT, and it is the right default:
+            // dropping a directory takes what is in it, and a statement
+            // that would take a graph with it says so.
+            if let Some(graph) = catalog.graphs().iter().find(|g| g.schema == *path) {
+                return Err(ZuError::InvalidArgument(format!(
+                    "'{path}' still holds the graph '{}'",
+                    graph.name
+                )));
+            }
+            catalog.drop_schema(path);
+            catalog.store(db)?;
+            return Ok(Effect::Dropped);
+        }
+        CatalogStmt::CreateGraph {
+            name,
+            if_not_exists,
+            or_replace,
+            of,
+            copy_of,
+        } => {
+            let (schema, name) = split(name);
+            if let Some(existing) = catalog.graph(&schema, &name) {
+                if *if_not_exists {
+                    return Ok(Effect::Nothing);
+                }
+                if !*or_replace {
+                    return Err(ZuError::InvalidArgument(format!(
+                        "'{name}' is already a graph in '{schema}'"
+                    )));
+                }
+                // The type is built before the old graph goes, so a
+                // replacement that cannot be kept leaves the graph
+                // that was there.
+                let id = existing.id;
+                let graph_type = graph_type_of(&mut catalog, &name, of)?;
+                copy(&catalog, copy_of.as_deref())?;
+                // Everything the add below could refuse is asked here,
+                // because after the free there is no graph to leave
+                // standing.
+                catalog.check_graph(&schema, &graph_type)?;
+                graph::free_graph_storage(db, &catalog, id)?;
+                catalog.drop_graph(id);
+                catalog.add_graph(&name, &schema, graph_type)?;
+                catalog.store(db)?;
+                return Ok(Effect::Created);
+            }
+            let graph_type = graph_type_of(&mut catalog, &name, of)?;
+            copy(&catalog, copy_of.as_deref())?;
+            catalog.add_graph(&name, &schema, graph_type)?;
+        }
+        CatalogStmt::DropGraph { name, if_exists } => {
+            let (schema, name) = split(name);
+            let Some(graph) = catalog.graph(&schema, &name) else {
+                if *if_exists {
+                    return Ok(Effect::Nothing);
+                }
+                return Err(ZuError::InvalidArgument(format!(
+                    "'{name}' is no graph in '{schema}'"
+                )));
+            };
+            let id = graph.id;
+            // The blocks come back here and the catalog forgets the
+            // tables below; one checkpoint publishes both.
+            graph::free_graph_storage(db, &catalog, id)?;
+            catalog.drop_graph(id);
+            catalog.store(db)?;
+            return Ok(Effect::Dropped);
+        }
     }
     catalog.store(db)?;
     Ok(Effect::Created)
+}
+
+/// A written name as a schema and a name in it. A name with no path in
+/// it is a name in the root schema, which is the schema a session works
+/// in until there is a statement that says otherwise.
+fn split(name: &GraphName) -> (String, String) {
+    (
+        name.schema
+            .clone()
+            .unwrap_or_else(|| ROOT_SCHEMA.to_string()),
+        name.name.clone(),
+    )
+}
+
+/// The type a created graph is of (GG01 to GG04).
+///
+/// A type written inline has no name of its own, so it is held by the
+/// graph rather than added to the file's graph types. `LIKE` takes the
+/// type of an existing graph, which is the type it was created with, or
+/// the type its tables describe when it was created with none.
+fn graph_type_of(catalog: &mut Catalog, name: &str, of: &GraphTypeRef) -> Result<GraphTypeOf> {
+    match of {
+        GraphTypeRef::Any => Ok(GraphTypeOf::Open),
+        GraphTypeRef::Named(ty) => Ok(GraphTypeOf::Named(ty.clone())),
+        GraphTypeRef::Source(source @ GraphTypeSource::Elements(_)) => {
+            Ok(GraphTypeOf::Inline(build(catalog, name, source)?))
+        }
+        GraphTypeRef::Source(GraphTypeSource::Like(source)) => {
+            let graph = graph_named(catalog, source)?;
+            match &graph.graph_type {
+                GraphTypeOf::Named(ty) => Ok(GraphTypeOf::Named(ty.clone())),
+                GraphTypeOf::Inline(ty) => Ok(GraphTypeOf::Inline(GraphType {
+                    name: name.to_string(),
+                    ..ty.clone()
+                })),
+                // An open graph that holds tables has the type its
+                // tables describe, and one that holds none is open and
+                // nothing more.
+                GraphTypeOf::Open if catalog.graph_tables(graph.id).is_empty() => {
+                    Ok(GraphTypeOf::Open)
+                }
+                GraphTypeOf::Open => {
+                    let id = graph.id;
+                    Ok(GraphTypeOf::Inline(catalog.infer_graph_type(name, id)?))
+                }
+            }
+        }
+    }
+}
+
+/// What `AS COPY OF` copies (GG05).
+///
+/// A graph that holds no tables copies as the empty graph it is. A
+/// graph that holds some is a block for block copy of its tables, which
+/// is not written yet, and saying so beats creating a graph that is
+/// empty where the statement asked for a copy.
+fn copy(catalog: &Catalog, source: Option<&str>) -> Result<()> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let graph = graph_named(catalog, source)?;
+    if !catalog.graph_tables(graph.id).is_empty() {
+        return Err(ZuError::Unsupported {
+            what: "AS COPY OF a graph that holds tables",
+            id: graph.id,
+        });
+    }
+    Ok(())
+}
+
+/// The graph a statement names, which is a graph in the root schema
+/// unless the name is a path.
+fn graph_named<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a crate::zu1::catalog::GraphDef> {
+    let (schema, name) = match name.rsplit_once('/') {
+        Some(("", name)) => (ROOT_SCHEMA.to_string(), name.to_string()),
+        Some((parent, name)) => (parent.to_string(), name.to_string()),
+        None => (ROOT_SCHEMA.to_string(), name.to_string()),
+    };
+    catalog
+        .graph(&schema, &name)
+        .ok_or_else(|| ZuError::InvalidArgument(format!("'{name}' is no graph in '{schema}'")))
 }
 
 /// The catalog object a `CREATE GRAPH TYPE` describes.
@@ -92,7 +273,10 @@ pub fn apply(db: &mut Zu1File, stmt: &CatalogStmt) -> Result<Effect> {
 /// the whole list.
 fn build(catalog: &mut Catalog, name: &str, source: &GraphTypeSource) -> Result<GraphType> {
     let defs = match source {
-        GraphTypeSource::Like(_) => return catalog.infer_graph_type(name),
+        GraphTypeSource::Like(graph) => {
+            let id = graph_named(catalog, graph)?.id;
+            return catalog.infer_graph_type(name, id);
+        }
         GraphTypeSource::Elements(defs) => defs,
     };
     let mut ty = GraphType::closed(name);

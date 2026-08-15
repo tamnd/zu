@@ -13,7 +13,17 @@ query           = { reading_clause } , return_clause , [ ";" ] ;
    and answer no rows, so they are told apart from a query by their
    first two words and never reach the binder. *)
 
-catalog_statement = create_graph_type | drop_graph_type ;
+catalog_statement = create_schema | drop_schema | create_graph | drop_graph
+                  | create_graph_type | drop_graph_type ;
+create_schema   = "CREATE" , "SCHEMA" , [ "IF" , "NOT" , "EXISTS" ] ,
+                  schema_path , [ ";" ] ;
+drop_schema     = "DROP" , "SCHEMA" , [ "IF" , "EXISTS" ] , schema_path ,
+                  [ ";" ] ;
+create_graph    = "CREATE" , [ "OR" , "REPLACE" ] , [ "PROPERTY" ] , "GRAPH" ,
+                  [ "IF" , "NOT" , "EXISTS" ] , graph_name , graph_type_ref ,
+                  [ "AS" , "COPY" , "OF" , name ] , [ ";" ] ;
+drop_graph      = "DROP" , [ "PROPERTY" ] , "GRAPH" , [ "IF" , "EXISTS" ] ,
+                  graph_name , [ ";" ] ;
 create_graph_type = "CREATE" , [ "OR" , "REPLACE" ] , [ "PROPERTY" ] , "GRAPH" ,
                     "TYPE" , [ "IF" , "NOT" , "EXISTS" ] , name , [ "AS" ] ,
                     graph_type_source , [ ";" ] ;
@@ -22,11 +32,25 @@ drop_graph_type = "DROP" , [ "PROPERTY" ] , "GRAPH" , "TYPE" ,
 (* PROPERTY is a word the statement may carry and neither reading needs:
    every graph zu holds is a property graph. OR REPLACE takes a taken
    name over and IF NOT EXISTS leaves it alone, so a statement saying
-   both says nothing and is refused. *)
+   both says nothing and is refused. A schema is a directory, so
+   replacing one would take every graph in it along, and OR REPLACE is
+   refused there rather than given that meaning. *)
+schema_path     = "/" , [ name , { "/" , name } ] ;
+(* One slash and nothing after it is the root schema, which every file
+   has and which is not one to drop. *)
+graph_name      = name | "/" , { name , "/" } , name ;
+(* A graph written as a path says which schema it is in and a bare name
+   is a graph in the root schema. *)
+graph_type_ref  = [ "ANY" , [ "PROPERTY" ] , [ "GRAPH" ]
+                  | ( "::" | "TYPED" ) , name
+                  | graph_type_source ] ;
+(* What the new graph is: the open type, a graph type the file already
+   holds, or one written where the graph is created. Nothing written is
+   ANY, which is what every zu1 file has held so far. *)
 graph_type_source = element_type_list | "LIKE" , name ;
 (* A graph type written out in braces is closed: a list nobody qualified
-   is the whole list. LIKE reads the tables of the one graph a zu1 file
-   holds, not the data. *)
+   is the whole list. LIKE reads the tables of the graph named, not the
+   data. *)
 element_type_list = "{" , [ element_type , { "," , element_type } ] , "}" ;
 element_type    = [ ( "NODE" | "EDGE" | "RELATIONSHIP" ) , "TYPE" , name ] ,
                   node_type_pattern , [ arc , node_type_pattern ] ;

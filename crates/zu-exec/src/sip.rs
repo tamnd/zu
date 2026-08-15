@@ -82,7 +82,7 @@
 //! join probes from, right where that level is made. Everything between
 //! there and the join then runs on the rows that can still match: the
 //! predicates over that level and the probe itself today, and the walks
-//! off it once the planner puts one there. The range goes further down
+//! off it once the optimizer puts one there. The range goes further down
 //! still, into the scan's zone pushdown, where it skips whole chunks
 //! without decoding them.
 //!

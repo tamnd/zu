@@ -299,7 +299,7 @@ pub(crate) enum Op {
     /// the position that level is made. Everything between here and the
     /// join then runs on the rows that can still match, which today is
     /// the predicates over the level and the probe itself, and is a
-    /// walk off it as soon as the planner puts one there.
+    /// walk off it as soon as the optimizer puts one there.
     ///
     /// `slot` is this operator's place in the plan's filters, which is
     /// where the runner keeps the count of what it has rejected so far.

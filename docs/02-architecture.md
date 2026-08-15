@@ -90,7 +90,7 @@ pub trait Snapshot: Send + Sync {
 ## 5. Catalog
 
 - Stored as ordinary (system) tables inside whichever engine backs the database → moves with the file; no sidecar metadata.
-- Contents: node/edge table defs, columns+types, primary keys, secondary labels, indexes (pk hash, vector, fts), stats (degree histograms, color summaries), format/feature versions.
+- Contents: node and rel table defs, columns+types, primary keys, secondary labels, indexes (pk hash, vector, fts), stats (degree histograms, color summaries), format/feature versions.
 - In-memory: immutable `Arc<Catalog>` swapped atomically on DDL commit (copy-on-write; DDL is rare).
 
 ## 6. Error handling & safety

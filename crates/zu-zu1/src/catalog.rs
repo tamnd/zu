@@ -288,7 +288,7 @@ impl ElementType {
 pub struct GraphType {
     pub name: String,
     /// GG02. A closed type is a guarantee rather than a description:
-    /// every element matches a declared element type, so the planner
+    /// every element matches a declared element type, so the optimizer
     /// may resolve a property to a column without asking the row.
     pub closed: bool,
     pub elements: Vec<ElementType>,
@@ -341,7 +341,7 @@ impl GraphType {
 
     /// Checks the type against the graph's label dictionary and its own
     /// rules. A closed type has to be self-contained, which is what
-    /// makes it worth anything to the planner.
+    /// makes it worth anything to the optimizer.
     fn validate(&self, labels: usize) -> Result<()> {
         let mut names: Vec<&str> = self.elements.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();

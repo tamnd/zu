@@ -1,4 +1,7 @@
 /target
+# CI clones the terminology table's repository here, and a person may
+# well do the same rather than keeping it beside this one.
+/zu-web
 Cargo.lock
 *.zu1
 *.zu1.wal

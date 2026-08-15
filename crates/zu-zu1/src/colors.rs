@@ -243,7 +243,7 @@ mod tests {
 
     /// The point of the stamp: edges committed after an ANALYZE move
     /// the catalog and leave the summary where it was, and the two
-    /// counts read side by side are how a planner finds that out.
+    /// counts read side by side are how an optimizer finds that out.
     #[test]
     fn edges_committed_after_analyze_leave_the_summary_behind() {
         use crate::txn::Mvcc;

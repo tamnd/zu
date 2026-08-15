@@ -3,7 +3,7 @@
 //! A bound expression compiles once at plan time into a short register
 //! program over vectorized kernels; evaluation walks the ops, never the
 //! expression tree, and column loads resolve to flat indices, not name
-//! probes. The planner integration lands with the perf/03 executor;
+//! probes. The optimizer integration lands with the perf/03 executor;
 //! this module owns the program shape and the evaluator.
 
 use zu_common::{Result, ZuError};

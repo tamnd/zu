@@ -33,6 +33,12 @@ const PLAN_CAP: usize = 1024;
 /// One compiled query: everything that depends on the text and the
 /// schema alone, shared between the cache and prepared statements.
 struct CachedPlan {
+    /// The graph this text is against and the tables of it, which is
+    /// the working graph unless a `USE` named another one. It rides
+    /// with the plan because the executor needs the same schema the
+    /// plan was built against and the next query may name a different
+    /// graph.
+    schema: Arc<zu_query::binder::Schema>,
     query: BoundQuery,
     plan: LogicalPlan,
     /// What the optimizer wants EXPLAIN to say that the tree does not.
@@ -41,7 +47,13 @@ struct CachedPlan {
 
 pub struct Session {
     graph: Zu1Graph<'static>,
-    schema: zu_query::binder::Schema,
+    /// The graph a statement is against when it does not say, which is
+    /// the home graph for the life of the session so far: there is no
+    /// statement yet that moves it.
+    working: u32,
+    /// One schema per graph a statement has named, built on the first
+    /// naming and dropped when the epoch moves.
+    schemas: HashMap<u32, Arc<zu_query::binder::Schema>>,
     epoch: u64,
     /// What the pipeline executor's snapshot read last time. A
     /// snapshot lives for one execution, so without this every query
@@ -58,9 +70,11 @@ impl Session {
         let mut db = Zu1File::open(path)?;
         let (catalog, schema) = query::load_schema(&mut db)?;
         let epoch = db.db_header().epoch;
+        let working = catalog.home_graph_id();
         Ok(Session {
             graph: Zu1Graph::owned(db, catalog),
-            schema,
+            working,
+            schemas: HashMap::from([(working, Arc::new(schema))]),
             epoch,
             snap: crate::snapshot::SnapshotCache::default(),
             plans: HashMap::new(),
@@ -93,7 +107,7 @@ impl Session {
             let out = zu_exec::try_execute(
                 &cached.plan,
                 &cached.query,
-                &self.schema,
+                &cached.schema,
                 &mut snap,
                 &args,
                 &options,
@@ -106,7 +120,7 @@ impl Session {
         exec::execute(
             &cached.plan,
             &cached.query,
-            &self.schema,
+            &cached.schema,
             &mut self.graph,
             &args,
             &options,
@@ -174,7 +188,7 @@ impl Session {
     pub fn explain(&mut self, source: &str) -> Result<String> {
         self.refresh()?;
         let cached = self.plan_for(source)?;
-        let listing = zu_query::plan::explain(&cached.plan, &cached.query, &self.schema);
+        let listing = zu_query::plan::explain(&cached.plan, &cached.query, &cached.schema);
         Ok(query::noted(cached.notes.clone(), listing))
     }
 
@@ -213,7 +227,7 @@ impl Session {
         let out = zu_exec::try_execute_profiled(
             &cached.plan,
             &cached.query,
-            &self.schema,
+            &cached.schema,
             &mut snap,
             &args,
             &query::env_options(),
@@ -232,7 +246,7 @@ impl Session {
         let (_, profile) = exec::execute_profiled(
             &cached.plan,
             &cached.query,
-            &self.schema,
+            &cached.schema,
             &mut self.graph,
             &args,
             &query::env_options(),
@@ -244,13 +258,40 @@ impl Session {
         if let Some(cached) = self.plans.get(source) {
             return Ok(cached.clone());
         }
-        let (query, plan, notes) = query::compile(source, &self.schema)?;
-        let cached = Arc::new(CachedPlan { query, plan, notes });
+        // The text is parsed before anything is compiled because the
+        // `USE` clause in front of it says which graph's tables the
+        // names below it are names of.
+        let parsed = zu_query::parser::parse(source)?;
+        let graph = query::graph_of(self.graph.catalog(), self.working, &parsed)?;
+        let schema = self.schema_for(graph)?;
+        let (query, plan, notes) = query::compile_parsed(&parsed, &schema)?;
+        let cached = Arc::new(CachedPlan {
+            schema,
+            query,
+            plan,
+            notes,
+        });
         if self.plans.len() >= PLAN_CAP {
             self.plans.clear();
         }
         self.plans.insert(source.to_string(), cached.clone());
         Ok(cached)
+    }
+
+    /// The schema of one graph, built on the first statement that names
+    /// it. A session that never leaves its working graph builds one.
+    fn schema_for(&mut self, graph: u32) -> Result<Arc<zu_query::binder::Schema>> {
+        if let Some(schema) = self.schemas.get(&graph) {
+            return Ok(schema.clone());
+        }
+        let catalog = self.graph.catalog().clone();
+        let schema = Arc::new(query::schema_with_stats(
+            self.graph.file_mut(),
+            &catalog,
+            graph,
+        )?);
+        self.schemas.insert(graph, schema.clone());
+        Ok(schema)
     }
 
     fn refresh(&mut self) -> Result<()> {
@@ -259,8 +300,10 @@ impl Session {
             return Ok(());
         }
         let (catalog, schema) = query::load_schema(self.graph.file_mut())?;
+        self.working = catalog.home_graph_id();
         self.graph.set_catalog(catalog);
-        self.schema = schema;
+        self.schemas.clear();
+        self.schemas.insert(self.working, Arc::new(schema));
         self.plans.clear();
         // The readers the last epoch's snapshots loaded describe a
         // layout that has moved, so they go with the plans.
@@ -317,6 +360,55 @@ mod tests {
         // The second and later runs hit the plan cache; same text, one
         // compiled entry.
         assert_eq!(session.plans.len(), 1);
+    }
+
+    #[test]
+    fn a_use_clause_picks_the_graph_the_query_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("use.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        let source = "MATCH (a:person) RETURN count(a) AS n";
+        let plain = session.run(source, &[]).expect("plain");
+        let used = session
+            .run(&format!("USE CURRENT_PROPERTY_GRAPH {source}"), &[])
+            .expect("use current");
+        assert_eq!(plain.rows, used.rows);
+
+        // The home graph by its name is the same graph again, and a
+        // name the catalog does not hold is a reference to nothing.
+        let named = session
+            .run(&format!("USE home {source}"), &[])
+            .expect("use home");
+        assert_eq!(plain.rows, named.rows);
+        let err = session
+            .run(&format!("USE nowhere {source}"), &[])
+            .expect_err("no such graph");
+        assert!(err.to_string().contains("is no graph in '/'"), "{err}");
+    }
+
+    #[test]
+    fn a_second_graph_holds_no_tables_of_the_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("two.zu1");
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("CREATE PROPERTY GRAPH empty ANY", &[])
+            .expect("create");
+
+        // The tables are the home graph's, so a query against the new
+        // graph does not find them: a name is a name in a graph.
+        let err = session
+            .run("USE empty MATCH (a:person) RETURN count(a) AS n", &[])
+            .expect_err("no person there");
+        assert!(err.to_string().contains("person"), "{err}");
+        assert!(
+            session
+                .run("MATCH (a:person) RETURN count(a) AS n", &[])
+                .is_ok()
+        );
     }
 
     #[test]

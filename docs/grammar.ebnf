@@ -7,7 +7,17 @@
    spec change to docs/07 first. *)
 
 statement       = query | catalog_statement ;
-query           = { reading_clause } , return_clause , [ ";" ] ;
+query           = [ use_clause ] , { reading_clause } , return_clause ,
+                  [ ";" ] ;
+
+(* GQ01, ISO 16.2. The graph the clauses after it are against. ISO
+   writes it as a graph expression; a name and CURRENT_PROPERTY_GRAPH
+   are the two spellings that name a graph without running one, and a
+   graph an expression computes is not a graph this file holds. A query
+   with no USE is against the graph the session is working in, which is
+   the home graph. *)
+use_clause      = "USE" , ( "CURRENT_PROPERTY_GRAPH" | "CURRENT_GRAPH"
+                  | [ [ "PROPERTY" ] , "GRAPH" ] , graph_name ) ;
 
 (* Catalog statements (docs/07 §9). They change what the file declares
    and answer no rows, so they are told apart from a query by their

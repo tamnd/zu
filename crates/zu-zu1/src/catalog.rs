@@ -755,12 +755,40 @@ impl Catalog {
         &self.rels
     }
 
+    /// The node table of that name in the home graph, which is the
+    /// graph every load writes into and the one a statement means when
+    /// nothing says otherwise. A name is a name in a graph and not in a
+    /// file, so a name two graphs both use is two tables and this
+    /// answers the home one.
     pub fn node_by_name(&self, name: &str) -> Option<&NodeTable> {
-        self.nodes.iter().find(|t| t.name == name)
+        self.node_in(self.home_graph_id(), name)
     }
 
     pub fn rel_by_name(&self, name: &str) -> Option<&RelTable> {
-        self.rels.iter().find(|t| t.name == name)
+        self.rel_in(self.home_graph_id(), name)
+    }
+
+    /// The node table a graph calls that name.
+    pub fn node_in(&self, graph: u32, name: &str) -> Option<&NodeTable> {
+        self.nodes
+            .iter()
+            .find(|t| t.graph == graph && t.name == name)
+    }
+
+    pub fn rel_in(&self, graph: u32, name: &str) -> Option<&RelTable> {
+        self.rels
+            .iter()
+            .find(|t| t.graph == graph && t.name == name)
+    }
+
+    /// The id of the home graph, which is the first graph a file has
+    /// and keeps its id for the file's life. A file whose home graph
+    /// was dropped and not yet put back reads as the id the first one
+    /// had, which is the id `ensure_home` gives it back.
+    pub fn home_graph_id(&self) -> u32 {
+        self.graph(ROOT_SCHEMA, HOME_GRAPH)
+            .map(|g| g.id)
+            .unwrap_or(HOME_GRAPH_ID)
     }
 
     pub fn node_by_id(&self, id: u32) -> Option<&NodeTable> {
@@ -1019,9 +1047,7 @@ impl Catalog {
     /// The id a table gets when nothing said which graph it is for.
     fn home_id(&mut self) -> u32 {
         self.ensure_home();
-        self.graph(ROOT_SCHEMA, HOME_GRAPH)
-            .map(|g| g.id)
-            .unwrap_or(HOME_GRAPH_ID)
+        self.home_graph_id()
     }
 
     /// A closed graph type inferred from the tables a graph holds
@@ -1101,7 +1127,15 @@ impl Catalog {
                 "'{name}' is already a rel table"
             )));
         }
-        if let Some(t) = self.nodes.iter_mut().find(|t| t.name == name) {
+        // A load writes into the home graph, so the table it means by a
+        // name is the home graph's, and a graph copied from another one
+        // holding the same name is a different table.
+        let home = self.home_id();
+        if let Some(t) = self
+            .nodes
+            .iter_mut()
+            .find(|t| t.graph == home && t.name == name)
+        {
             t.node_count = t.node_count.max(node_count);
             return Ok(t.id);
         }
@@ -1110,7 +1144,7 @@ impl Catalog {
         // row carries, so it is interned before the table exists and
         // heads the declared set.
         let primary = self.intern_label(name)?;
-        let graph = self.home_id();
+        let graph = home;
         self.nodes.push(NodeTable {
             id,
             name: name.to_string(),
@@ -1149,7 +1183,18 @@ impl Catalog {
                 "'{name}' is already a node table"
             )));
         }
-        if let Some(t) = self.rels.iter_mut().find(|t| t.name == name) {
+        // A rel table is in the graph its FROM table is in, which is
+        // the only answer that keeps an edge and the nodes it joins in
+        // one graph, and that graph is where the name is looked up.
+        let graph = match self.node_by_id(from) {
+            Some(table) => table.graph,
+            None => self.home_id(),
+        };
+        if let Some(t) = self
+            .rels
+            .iter_mut()
+            .find(|t| t.graph == graph && t.name == name)
+        {
             t.from = from;
             t.to = to;
             t.edge_count = edge_count;
@@ -1157,13 +1202,6 @@ impl Catalog {
             return Ok(t.id);
         }
         let id = self.next_id()?;
-        // A rel table is in the graph its FROM table is in, which is
-        // the only answer that keeps an edge and the nodes it joins in
-        // one graph.
-        let graph = match self.node_by_id(from) {
-            Some(table) => table.graph,
-            None => self.home_id(),
-        };
         self.rels.push(RelTable {
             id,
             name: name.to_string(),
@@ -1401,15 +1439,21 @@ impl Catalog {
         if ids.len() != total {
             return Err(corrupt("catalog", "duplicate table id".into()));
         }
-        let mut names: Vec<&str> = self
+        // A table's name is a name in its graph, so the pair is what
+        // has to be unique. Two graphs may both hold a `person`, which
+        // is what a graph copied from another one is made of.
+        let mut names: Vec<(u32, &str)> = self
             .nodes
             .iter()
-            .map(|t| t.name.as_str())
-            .chain(self.rels.iter().map(|t| t.name.as_str()))
+            .map(|t| (t.graph, t.name.as_str()))
+            .chain(self.rels.iter().map(|t| (t.graph, t.name.as_str())))
             .collect();
         names.sort_unstable();
-        if names.windows(2).any(|w| w[0] == w[1]) {
-            return Err(corrupt("catalog", "duplicate table name".into()));
+        if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(corrupt(
+                "catalog",
+                format!("graph {} holds two tables called '{}'", w[0].0, w[0].1),
+            ));
         }
         if self.labels.len() > MAX_LABELS {
             return Err(corrupt(
@@ -1460,12 +1504,25 @@ impl Catalog {
         }
         for rel in &self.rels {
             for end in [rel.from, rel.to] {
-                if self.node_by_id(end).is_none() {
+                let Some(node) = self.node_by_id(end) else {
                     return Err(corrupt(
                         "catalog",
                         format!(
                             "rel table '{}' references missing node table id {end}",
                             rel.name
+                        ),
+                    ));
+                };
+                // An edge joins two nodes of the graph it is in. A rel
+                // table reaching out of its graph would put rows of
+                // another graph in reach of a pattern that never
+                // named it.
+                if node.graph != rel.graph {
+                    return Err(corrupt(
+                        "catalog",
+                        format!(
+                            "rel table '{}' is in graph {} and ends on '{}' in graph {}",
+                            rel.name, rel.graph, node.name, node.graph
                         ),
                     ));
                 }
@@ -2209,5 +2266,75 @@ mod tests {
         let mut hostile = TABLE_INDEX_VERSION.to_le_bytes().to_vec();
         hostile.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(TableIndex::decode(&hostile).is_err());
+    }
+
+    /// A table's name is a name in its graph, so the same name in two
+    /// graphs is two tables and the file holds both.
+    #[test]
+    fn two_graphs_may_both_call_a_table_person() {
+        let mut c = sample();
+        let other = c
+            .add_graph("mirror", ROOT_SCHEMA, GraphTypeOf::Open)
+            .unwrap();
+        let primary = c.intern_label("person").unwrap();
+        let id = c.next_id().unwrap();
+        c.nodes.push(NodeTable {
+            id,
+            name: "person".to_string(),
+            graph: other,
+            node_count: 3,
+            labels: vec![primary],
+        });
+
+        let read = Catalog::decode(&c.encode()).unwrap();
+        assert_eq!(read.node_in(other, "person").map(|t| t.id), Some(id));
+        // The home graph still answers with its own, which is the one
+        // every load has been writing into.
+        assert_eq!(read.node_by_name("person").map(|t| t.node_count), Some(500));
+        assert_eq!(read.graph_tables(other).len(), 1);
+    }
+
+    /// The same name twice in one graph is the one thing the pair rule
+    /// still refuses.
+    #[test]
+    fn one_graph_may_not_hold_a_table_name_twice() {
+        let mut c = sample();
+        let home = c.home_graph_id();
+        let primary = c.intern_label("person").unwrap();
+        let id = c.next_id().unwrap();
+        c.nodes.push(NodeTable {
+            id,
+            name: "person".to_string(),
+            graph: home,
+            node_count: 3,
+            labels: vec![primary],
+        });
+        let err = Catalog::decode(&c.encode()).expect_err("two of one name");
+        assert!(
+            err.to_string().contains("two tables called 'person'"),
+            "{err}"
+        );
+    }
+
+    /// An edge joins two nodes of the graph it is in, and a rel table
+    /// reaching out of its graph is a catalog nobody can have written.
+    #[test]
+    fn a_rel_table_may_not_end_outside_its_graph() {
+        let mut c = sample();
+        let other = c
+            .add_graph("mirror", ROOT_SCHEMA, GraphTypeOf::Open)
+            .unwrap();
+        let id = c.next_id().unwrap();
+        c.rels.push(RelTable {
+            id,
+            name: "reaches".to_string(),
+            graph: other,
+            from: 0,
+            to: 0,
+            edge_count: 1,
+            undirected: false,
+        });
+        let err = Catalog::decode(&c.encode()).expect_err("out of its graph");
+        assert!(err.to_string().contains("in graph"), "{err}");
     }
 }

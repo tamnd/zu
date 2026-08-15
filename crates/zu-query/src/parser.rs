@@ -14,7 +14,7 @@ use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
     BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
-    GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
+    GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
     PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
     Selector, SortKey, Statement, UnaryOp,
 };
@@ -686,6 +686,7 @@ impl Parser<'_> {
     }
 
     fn parse_query(&mut self) -> Result<Query> {
+        let use_graph = self.parse_use_graph()?;
         let mut clauses = Vec::new();
         loop {
             if self.at_kw("MATCH") || self.at_kw("OPTIONAL") {
@@ -750,7 +751,7 @@ impl Parser<'_> {
                         ),
                     ));
                 }
-                return Ok(Query { clauses });
+                return Ok(Query { use_graph, clauses });
             } else if let Some(kw) = UNIMPLEMENTED.iter().find(|kw| self.at_kw(kw)) {
                 return Err(ZuError::gql(
                     codes::C42001,
@@ -765,6 +766,28 @@ impl Parser<'_> {
                 return Err(self.error("MATCH, OPTIONAL MATCH, CALL, UNWIND, WITH, or RETURN"));
             }
         }
+    }
+
+    /// A `USE` clause in front of a query, which says which graph the
+    /// clauses after it are against (GQ01). ISO writes the graph as a
+    /// graph expression; a name and `CURRENT_PROPERTY_GRAPH` are the
+    /// two spellings that name a graph without running one, and a
+    /// graph an expression computes is not one this file holds.
+    fn parse_use_graph(&mut self) -> Result<Option<GraphRef>> {
+        if !self.eat_kw("USE") {
+            return Ok(None);
+        }
+        if self.eat_kw("CURRENT_PROPERTY_GRAPH") || self.eat_kw("CURRENT_GRAPH") {
+            return Ok(Some(GraphRef::Current));
+        }
+        // `PROPERTY GRAPH` before the name is the long spelling of the
+        // same clause and says nothing the name does not.
+        if self.eat_kw("PROPERTY") {
+            self.expect_kw("GRAPH")?;
+        } else {
+            self.eat_kw("GRAPH");
+        }
+        Ok(Some(GraphRef::Named(self.parse_graph_name()?)))
     }
 
     fn parse_where(&mut self) -> Result<Option<Expr>> {
@@ -2686,6 +2709,40 @@ mod tests {
             parse_err("MATCH (a) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) RETURN b } RETURN a")
                 .contains("expected")
         );
+    }
+
+    #[test]
+    fn a_use_clause_says_which_graph_the_clauses_are_against() {
+        let q = parsed("USE CURRENT_PROPERTY_GRAPH MATCH (n:Person) RETURN n");
+        assert_eq!(q.use_graph, Some(GraphRef::Current));
+        assert_eq!(q.clauses.len(), 2);
+
+        let q = parsed("USE social MATCH (n) RETURN n");
+        assert_eq!(
+            q.use_graph,
+            Some(GraphRef::Named(GraphName {
+                schema: None,
+                name: "social".to_string(),
+            }))
+        );
+
+        // The long spelling and a path say the same as the short one.
+        let q = parsed("USE PROPERTY GRAPH /app/social MATCH (n) RETURN n");
+        assert_eq!(
+            q.use_graph,
+            Some(GraphRef::Named(GraphName {
+                schema: Some("/app".to_string()),
+                name: "social".to_string(),
+            }))
+        );
+
+        assert_eq!(parsed("MATCH (n) RETURN n").use_graph, None);
+    }
+
+    #[test]
+    fn a_use_clause_still_wants_a_query_after_it() {
+        assert!(parse_err("USE social").contains("empty query"));
+        assert!(parse_err("USE").contains("a graph name"));
     }
 
     #[test]

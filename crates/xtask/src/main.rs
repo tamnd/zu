@@ -17,7 +17,7 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, model, rustdoc};
+use xtask::{apimap, corpus, model, rustdoc};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -35,6 +35,14 @@ cargo xtask api-map [--map PATH] [--model PATH] [--ledger PATH] [--list]
   --model PATH      the API model to check it against (default docs/api/model.json)
   --ledger PATH     the rust map a binding map is checked against
   --list            print `tier<TAB>id` for every entity, and check nothing
+
+cargo xtask corpus-pack [--cases DIR] [--readme PATH] [--out PATH] [--version V] [--check]
+
+  --cases DIR       the case files (default conformance/cases)
+  --readme PATH     the README to ship beside them (default conformance/README.md)
+  --out PATH        where to write the archive (default target/conformance-<version>.tar.zst)
+  --version V       the version the artifact is named for (default this workspace's)
+  --check           pack and report, writing nothing
 ";
 
 /// The crates whose public items reach the surface of `zu` through a
@@ -48,6 +56,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("model") => run(model_command(&args[1..])),
         Some("api-map") => run(api_map_command(&args[1..])),
+        Some("corpus-pack") => run(corpus_pack_command(&args[1..])),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -121,6 +130,66 @@ fn model_command(args: &[String]) -> Result<ExitCode, String> {
     }
     std::fs::write(&out, &text).map_err(|e| format!("writing {}: {e}", out.display()))?;
     println!("{}: {} entities", out.display(), model.entities.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn corpus_pack_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut cases = PathBuf::from("conformance/cases");
+    let mut readme = PathBuf::from("conformance/README.md");
+    let mut out: Option<PathBuf> = None;
+    // The workspace version, which is the engine version the cases are
+    // the contract for. Taking it from the build rather than from an
+    // argument is what keeps an artifact from being named for a
+    // version it does not hold.
+    let mut version = env!("CARGO_PKG_VERSION").to_string();
+    let mut check = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--check" => check = true,
+            "--cases" => {
+                cases = PathBuf::from(args.get(i + 1).ok_or("--cases wants a path")?);
+                i += 1;
+            }
+            "--readme" => {
+                readme = PathBuf::from(args.get(i + 1).ok_or("--readme wants a path")?);
+                i += 1;
+            }
+            "--out" => {
+                out = Some(PathBuf::from(args.get(i + 1).ok_or("--out wants a path")?));
+                i += 1;
+            }
+            "--version" => {
+                version = args.get(i + 1).ok_or("--version wants a version")?.clone();
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+
+    let readme = readme.exists().then_some(readme);
+    let packed = corpus::pack(&cases, readme.as_deref(), &version)?;
+    let ratio = packed.tar.len() as f64 / packed.archive.len() as f64;
+    let summary = format!(
+        "{}.tar.zst: {} suites, {} cases, {} KiB packed from {} KiB ({ratio:.1}x)",
+        packed.prefix,
+        packed.entries.len(),
+        packed.cases(),
+        packed.archive.len().div_ceil(1024),
+        packed.tar.len().div_ceil(1024),
+    );
+    if check {
+        println!("{summary}, written nowhere");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let out = out.unwrap_or_else(|| PathBuf::from(format!("target/{}.tar.zst", packed.prefix)));
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    std::fs::write(&out, &packed.archive).map_err(|e| format!("writing {}: {e}", out.display()))?;
+    println!("{}: {summary}", out.display());
     Ok(ExitCode::SUCCESS)
 }
 

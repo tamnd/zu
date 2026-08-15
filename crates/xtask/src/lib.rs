@@ -3,6 +3,7 @@
 //! drive the normalizer directly, without nightly and without cargo.
 
 pub mod apimap;
+pub mod corpus;
 pub mod fixture;
 pub mod model;
 pub mod rustdoc;

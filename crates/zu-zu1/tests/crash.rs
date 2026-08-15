@@ -1,8 +1,10 @@
 //! Deterministic crash injection at every syscall boundary.
 //!
-//! A recorded workload runs two committed txns, a checkpoint fold, and
-//! two ingest commits whose payload travels outside the WAL, against
-//! recording files that log every write, length change, and sync. The harness then builds the file image a crash could leave at
+//! A recorded workload stores a set of edge property columns, runs two
+//! committed txns, a checkpoint fold, and two ingest commits whose
+//! payload travels outside the WAL, against recording files that log
+//! every write, length change, and sync. The harness then builds the
+//! file image a crash could leave at
 //! every boundary: the full prefix at each cut, the prefix with each
 //! unsynced write dropped (reordering loss), and the prefix with the
 //! final write torn at several lengths. Every image is recovered and
@@ -21,16 +23,36 @@
 //! their sealed segments are synced before the WAL reference is, so an
 //! acknowledged ingest has both the frame and the payload out of every
 //! drop window.
+//!
+//! The edge property store has no WAL frame at all: it rewrites columns
+//! and republishes the table index, and the checkpoint at the end of it
+//! is what makes it visible. The same argument still floors it. Once
+//! that checkpoint's second sync has returned, every write the store
+//! issued sits before the data file's last sync, so no drop window
+//! reaches one and no tear can shorten one, and every later cut has to
+//! recover to the new columns.
 
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
 use zu_zu1::fold::{checkpoint_fold, recover};
 use zu_zu1::graph::{Direction, GraphReader, bulk_load_as};
 use zu_zu1::ingest::{ingest_edges, ingest_nodes};
-use zu_zu1::props::{PropValues, PropsReader, load_props, store_props};
+use zu_zu1::props::{
+    PropValues, PropsReader, load_props, load_rel_props, store_props, store_rel_props,
+};
 use zu_zu1::txn::{Cell, Mvcc};
 use zu_zu1::vfs::{IoEvent, IoFile, IoLog, RealFile, RecordingFile};
 use zu_zu1::wal::Wal;
+
+/// The fixture's table ids. A crash image is opened from bytes, so
+/// nothing carries over from the recording and every reader is handed
+/// them.
+#[derive(Debug, Clone, Copy)]
+struct Tables {
+    person: u32,
+    knows: u32,
+    likes: u32,
+}
 
 /// Everything a reader can observe about the fixture's tables at the
 /// store's current epoch, base file and overlays merged.
@@ -41,9 +63,17 @@ struct State {
     names: Vec<Vec<u8>>,
     deleted: Vec<bool>,
     out: Vec<Vec<u64>>,
+    /// One entry per edge of the `likes` table, source and destination
+    /// first and then the two property values that edge carries. The
+    /// endpoints are in there because an edge column is addressed by an
+    /// ordinal and nothing else, so a recovered file that kept the
+    /// values and renumbered the edges reads as a different state here
+    /// rather than as the same one.
+    likes: Vec<(u64, u64, u64, Vec<u8>)>,
 }
 
-fn state(db: &mut Zu1File, mvcc: &Mvcc, person: u32, knows: u32) -> State {
+fn state(db: &mut Zu1File, mvcc: &Mvcc, tables: Tables) -> State {
+    let (person, knows) = (tables.person, tables.knows);
     let epoch = mvcc.epoch();
     let base_count = Catalog::load(db)
         .unwrap()
@@ -93,7 +123,32 @@ fn state(db: &mut Zu1File, mvcc: &Mvcc, person: u32, knows: u32) -> State {
         names,
         deleted,
         out,
+        likes: edge_props(db, tables.likes),
     }
+}
+
+/// Reads every edge of the `likes` table back with the property values
+/// it carries, going through the ordinal lookup rather than counting
+/// rows, because the lookup is what a query does.
+fn edge_props(db: &mut Zu1File, likes: u32) -> Vec<(u64, u64, u64, Vec<u8>)> {
+    let mut graph = GraphReader::load_table(db, "likes").unwrap();
+    let mut reader = PropsReader::new(load_rel_props(db, likes).unwrap().unwrap());
+    let since = reader.col("since").unwrap();
+    let tag = reader.col("tag").unwrap();
+    let mut edges = Vec::new();
+    for src in 0..graph.directory().from_count {
+        for dst in graph
+            .neighbors_dir(db, src, Direction::Fwd)
+            .unwrap()
+            .to_vec()
+        {
+            let ordinal = graph.edge_ordinal(db, src, dst).unwrap().unwrap();
+            let mut buf = Vec::new();
+            reader.read_str(db, tag, ordinal, &mut buf).unwrap();
+            edges.push((src, dst, reader.read_int(db, since, ordinal).unwrap(), buf));
+        }
+    }
+    edges
 }
 
 /// Applies an event prefix to in-memory images of both files.
@@ -134,7 +189,7 @@ fn materialize(initial_db: &[u8], events: &[&IoEvent]) -> (Vec<u8>, Vec<u8>) {
 
 /// Opens a crash image, recovers it, and returns its logical state; a
 /// second fold on the recovered image must leave the state alone.
-fn recovered_state(dir: &std::path::Path, db: &[u8], wal: &[u8], person: u32, knows: u32) -> State {
+fn recovered_state(dir: &std::path::Path, db: &[u8], wal: &[u8], tables: Tables) -> State {
     let db_path = dir.join("image.zu1");
     let wal_path = dir.join("image.wal");
     std::fs::write(&db_path, db).unwrap();
@@ -142,9 +197,9 @@ fn recovered_state(dir: &std::path::Path, db: &[u8], wal: &[u8], person: u32, kn
     let mut db = Zu1File::open(&db_path).unwrap();
     let mut wal = Wal::open(&wal_path).unwrap();
     let mut mvcc = recover(&mut db, &wal).unwrap();
-    let before = state(&mut db, &mvcc, person, knows);
+    let before = state(&mut db, &mvcc, tables);
     checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
-    let after = state(&mut db, &mvcc, person, knows);
+    let after = state(&mut db, &mvcc, tables);
     assert_eq!(before, after, "a fold must not change the logical state");
     std::fs::remove_file(&db_path).unwrap();
     std::fs::remove_file(&wal_path).unwrap();
@@ -161,6 +216,12 @@ fn every_cut_recovers_to_a_committed_prefix() {
     {
         let mut db = Zu1File::create(&db_path).unwrap();
         bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        // A second rel table over the same people, which is the one that
+        // carries edge properties. It has to be a table of its own: an
+        // overlay edge arrives with no value for a column that holds one
+        // per edge, so a table that stores edge properties refuses the
+        // fold, and `knows` takes overlay edges in every txn below.
+        bulk_load_as(&mut db, "person", "likes", 4, &[(0, 2), (1, 3), (3, 0)]).unwrap();
         let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe", b"amy"];
         store_props(
             &mut db,
@@ -171,10 +232,20 @@ fn every_cut_recovers_to_a_committed_prefix() {
             ],
         )
         .unwrap();
+        let tags: Vec<&[u8]> = vec![b"blue", b"green", b"red"];
+        store_rel_props(
+            &mut db,
+            "likes",
+            &[
+                ("since", PropValues::Int(&[7, 8, 9])),
+                ("tag", PropValues::Str(&tags)),
+            ],
+        )
+        .unwrap();
     }
     let initial_db = std::fs::read(&db_path).unwrap();
     let log: IoLog = Default::default();
-    let (person, knows, allowed, acks) = {
+    let (tables, allowed, acks) = {
         let mut db = Zu1File::open_on(
             Box::new(RecordingFile::new(
                 RealFile::open_rw(&db_path).unwrap(),
@@ -194,10 +265,33 @@ fn every_cut_recovers_to_a_committed_prefix() {
         )
         .unwrap();
         let catalog = Catalog::load(&mut db).unwrap();
-        let person = catalog.node_by_name("person").unwrap().id;
-        let knows = catalog.rel_by_name("knows").unwrap().id;
+        let tables = Tables {
+            person: catalog.node_by_name("person").unwrap().id,
+            knows: catalog.rel_by_name("knows").unwrap().id,
+            likes: catalog.rel_by_name("likes").unwrap().id,
+        };
+        let person = tables.person;
+        let knows = tables.knows;
         let mut mvcc = recover(&mut db, &wal).unwrap();
-        let s0 = state(&mut db, &mvcc, person, knows);
+        let s0 = state(&mut db, &mvcc, tables);
+        // The edge property write path, inside the recording: it frees
+        // the old columns, writes the new ones, republishes the table
+        // index and checkpoints, all of it in the data file with no WAL
+        // frame behind it, so every cut through it has to land on one
+        // set of columns or the other.
+        let tags: Vec<&[u8]> = vec![b"amber", b"violet", b"grey"];
+        store_rel_props(
+            &mut db,
+            "likes",
+            &[
+                ("since", PropValues::Int(&[70, 80, 90])),
+                ("tag", PropValues::Str(&tags)),
+            ],
+        )
+        .unwrap();
+        let ack_props = log.lock().unwrap().len();
+        let s_props = state(&mut db, &mvcc, tables);
+        assert_ne!(s0, s_props, "the store must change what a reader sees");
         let mut txn = mvcc.begin();
         txn.insert_nodes(
             person,
@@ -216,17 +310,17 @@ fn every_cut_recovers_to_a_committed_prefix() {
         txn.delete(person, 2);
         txn.commit(&mut wal).unwrap();
         let ack1 = log.lock().unwrap().len();
-        let s1 = state(&mut db, &mvcc, person, knows);
+        let s1 = state(&mut db, &mvcc, tables);
         let mut txn = mvcc.begin();
         txn.update(person, 0, 0, Cell::Int(11));
         txn.insert_rel(knows, 3, 4);
         txn.delete(person, 4);
         txn.commit(&mut wal).unwrap();
         let ack2 = log.lock().unwrap().len();
-        let s2 = state(&mut db, &mvcc, person, knows);
+        let s2 = state(&mut db, &mvcc, tables);
         checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
         assert_eq!(
-            state(&mut db, &mvcc, person, knows),
+            state(&mut db, &mvcc, tables),
             s2,
             "the fold must seal exactly the committed state"
         );
@@ -240,34 +334,51 @@ fn every_cut_recovers_to_a_committed_prefix() {
         )
         .unwrap();
         let ack3 = log.lock().unwrap().len();
-        let s3 = state(&mut db, &mvcc, person, knows);
+        let s3 = state(&mut db, &mvcc, tables);
         ingest_edges(&mut db, &mut wal, &mut mvcc, knows, &[6, 0], &[0, 6]).unwrap();
         let ack4 = log.lock().unwrap().len();
-        let s4 = state(&mut db, &mvcc, person, knows);
+        let s4 = state(&mut db, &mvcc, tables);
+        // Every acknowledgment carries the state it floors at rather
+        // than being counted, because the workload now passes through a
+        // state no commit acknowledged and the number of
+        // acknowledgments behind a cut is no longer its index.
         (
-            person,
-            knows,
-            vec![s0, s1, s2, s3, s4],
-            [ack1, ack2, ack3, ack4],
+            tables,
+            vec![s0, s_props, s1, s2, s3, s4],
+            [(ack_props, 1), (ack1, 2), (ack2, 3), (ack3, 4), (ack4, 5)],
         )
     };
     let events = log.lock().unwrap().clone();
     assert!(events.len() > 20, "the workload records real syscalls");
+    // Which of the workload's states some image actually recovered to,
+    // so that a harness that stopped reaching a state, because a state
+    // stopped being distinguishable or because the writes it sits
+    // between went away, says so instead of passing on the ones left.
+    let reached = std::cell::RefCell::new(std::collections::BTreeSet::new());
     let check = |image_db: &[u8], image_wal: &[u8], what: String, floor: usize| {
-        let got = recovered_state(dir.path(), image_db, image_wal, person, knows);
+        let got = recovered_state(dir.path(), image_db, image_wal, tables);
+        let at = allowed[floor..].iter().position(|s| *s == got);
         assert!(
-            allowed[floor..].contains(&got),
+            at.is_some(),
             "{what} recovered to {got:?}, outside the committed prefixes at or after \
              the last acknowledged commit (floor {floor})"
         );
+        reached.borrow_mut().insert(floor + at.unwrap());
     };
     let mut images = 0usize;
     for cut in 0..=events.len() {
         // Every commit acknowledged before this cut must survive it:
         // its frames sit before a WAL sync that the prefix keeps, the
         // drops start after that sync, and tears only shorten the
-        // newest write, which postdates the sync as well.
-        let floor = acks.iter().filter(|&&ack| cut >= ack).count();
+        // newest write, which postdates the sync as well. The edge
+        // property store floors the same way off the data file's own
+        // sync.
+        let floor = acks
+            .iter()
+            .filter(|&&(ack, _)| cut >= ack)
+            .map(|&(_, state)| state)
+            .max()
+            .unwrap_or(0);
         let prefix: Vec<&IoEvent> = events[..cut].iter().collect();
         // The crash with everything issued so far persisted.
         let (db, wal) = materialize(&initial_db, &prefix);
@@ -325,6 +436,13 @@ fn every_cut_recovers_to_a_committed_prefix() {
             }
         }
     }
+    assert_eq!(
+        reached.borrow().len(),
+        allowed.len(),
+        "every state the workload passed through must be where some crash image landed, \
+         and only {:?} were reached",
+        reached.borrow()
+    );
     println!(
         "{images} crash images checked over {} syscalls",
         events.len()

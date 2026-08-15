@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
 use rusqlite::types::{ToSqlOutput, ValueRef};
+use rusqlite::{Connection, OptionalExtension};
 pub use zu_common::GROUP_ROWS;
 use zu_common::{Result, ZuError};
 pub use zu_storage::Direction;
@@ -19,11 +19,13 @@ pub use zu_storage::Direction;
 pub const APPLICATION_ID: i32 = 0x005A_5531;
 
 /// Schema version written to `user_version`. Version 2 added the rel
-/// endpoint columns to `zu_catalog` and version 3 the column saying
-/// whether a rel table's edges have a direction; older files migrate on
-/// open, and a migrated file's edges are directed, which is what every
-/// file that predates the column holds.
-pub const SCHEMA_VERSION: i32 = 3;
+/// endpoint columns to `zu_catalog`, version 3 the column saying
+/// whether a rel table's edges have a direction, and version 4 the
+/// `zu_labels` table that holds the labels a node row carries beyond
+/// the one its table is called; older files migrate on open, and a
+/// migrated file's edges are directed and its nodes carry one label
+/// each, which is what every file that predates those columns holds.
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// SQLite column affinity for a property column.
 /// The zu type mapping is specified in `docs/05-storage-sqlite.md` §2.
@@ -247,7 +249,10 @@ impl SqliteStore {
                     // unknown rather than wrong. Version 2 predates the
                     // direction column, and a file that never had one
                     // holds directed edges, which is the default the
-                    // column is added with.
+                    // column is added with. Version 3 predates
+                    // `zu_labels`, and a file that never had one holds
+                    // no extra labels, which is the empty table the
+                    // create below leaves it with.
                     1 => conn
                         .execute_batch(
                             "BEGIN;\
@@ -264,7 +269,7 @@ impl SqliteStore {
                                SELECT rowid, kind, name, sql FROM zu_catalog;\
                              DROP TABLE zu_catalog;\
                              ALTER TABLE zu_catalog_v3 RENAME TO zu_catalog;\
-                             PRAGMA user_version = 3;\
+                             PRAGMA user_version = 4;\
                              COMMIT;",
                         )
                         .map_err(sql_err)?,
@@ -273,9 +278,12 @@ impl SqliteStore {
                             "BEGIN;\
                              ALTER TABLE zu_catalog \
                                ADD COLUMN undirected INTEGER NOT NULL DEFAULT 0;\
-                             PRAGMA user_version = 3;\
+                             PRAGMA user_version = 4;\
                              COMMIT;",
                         )
+                        .map_err(sql_err)?,
+                    3 => conn
+                        .pragma_update(None, "user_version", 4)
                         .map_err(sql_err)?,
                     other => {
                         return Err(ZuError::Unsupported {
@@ -328,6 +336,21 @@ impl SqliteStore {
                dst_table TEXT, \
                undirected INTEGER NOT NULL DEFAULT 0, \
                UNIQUE (kind, name))",
+        )
+        .map_err(sql_err)?;
+        // A label a row carries beyond its table's name, one row per
+        // pair. Sparse rather than a column on the node table: most
+        // rows carry none, the set is open ended, and a property
+        // column named after a label would collide with a property.
+        // The primary key is the pair, so writing the same label twice
+        // is not two labels, and the index it comes with is what reads
+        // a whole table's labels in table order.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS zu_labels (\
+               tbl TEXT NOT NULL, \
+               zrow INTEGER NOT NULL, \
+               label TEXT NOT NULL, \
+               PRIMARY KEY (tbl, zrow, label)) WITHOUT ROWID",
         )
         .map_err(sql_err)?;
         Ok(Self {
@@ -487,14 +510,133 @@ impl SqliteStore {
     /// Deletes one node row. Fails when the row does not exist. Edges
     /// pointing at the row stay in their rel tables; integrity rules
     /// live above the engine, matching zu1's tombstone semantics.
+    ///
+    /// The row's labels go with it. That is not an integrity rule, it
+    /// is what the row is: a label says what the row is called, and a
+    /// label left behind would be read by the next row to take the
+    /// number.
     pub fn delete_node(&self, table: &str, row: i64) -> Result<()> {
-        let sql = format!("DELETE FROM n_{} WHERE zrow = ?", ident(table)?);
+        let name = ident(table)?;
+        let sql = format!("DELETE FROM n_{name} WHERE zrow = ?");
         match self.conn.execute(&sql, [row]).map_err(sql_err)? {
-            1 => Ok(()),
+            1 => {
+                self.conn
+                    .execute(
+                        "DELETE FROM zu_labels WHERE tbl = ? AND zrow = ?",
+                        rusqlite::params![name, row],
+                    )
+                    .map_err(sql_err)?;
+                Ok(())
+            }
             _ => Err(ZuError::InvalidArgument(format!(
                 "node table '{table}' has no row {row}"
             ))),
         }
+    }
+
+    /// Replaces the labels row `row` of `table` carries beyond the one
+    /// the table is called, which every row carries and none of these
+    /// repeats.
+    ///
+    /// Naming the table's own name here is accepted and dropped: it is
+    /// true of the row, it is just not news, and a caller copying a
+    /// label set out of a fixture should not have to strip it.
+    pub fn set_node_labels(&self, table: &str, row: i64, labels: &[&str]) -> Result<()> {
+        let name = ident(table)?;
+        if self
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM n_{name} WHERE zrow = ?"),
+                [row],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(sql_err)?
+            == 0
+        {
+            return Err(ZuError::InvalidArgument(format!(
+                "node table '{table}' has no row {row}"
+            )));
+        }
+        self.conn
+            .execute(
+                "DELETE FROM zu_labels WHERE tbl = ? AND zrow = ?",
+                rusqlite::params![name, row],
+            )
+            .map_err(sql_err)?;
+        let mut stmt = self
+            .conn
+            .prepare("INSERT OR IGNORE INTO zu_labels (tbl, zrow, label) VALUES (?, ?, ?)")
+            .map_err(sql_err)?;
+        for label in labels {
+            if *label == name {
+                continue;
+            }
+            // A label is a name in the zu1 dictionary, so it is held to
+            // the same shape a table name is held to.
+            let label = ident(label)?;
+            stmt.execute(rusqlite::params![name, row, label])
+                .map_err(sql_err)?;
+        }
+        Ok(())
+    }
+
+    /// The extra labels of every row of `table`, indexed by row, and an
+    /// empty vector when no row of the table carries any.
+    ///
+    /// Dense because the caller writing these into a zu1 file writes
+    /// one word per row whatever it holds, so a sparse answer would
+    /// only be expanded again; empty rather than a run of empties
+    /// because a table nobody labelled should cost nothing to load.
+    pub fn node_labels(&self, table: &str) -> Result<Vec<Vec<String>>> {
+        let name = ident(table)?;
+        // One anti-join rather than a lookup per label: the setter is
+        // what keeps a label on a row that exists, so this catches
+        // only a file written behind the API's back, which is what
+        // corrupt means.
+        let orphan: Option<i64> = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT zrow FROM zu_labels WHERE tbl = ? \
+                     AND zrow NOT IN (SELECT zrow FROM n_{name}) LIMIT 1"
+                ),
+                [&name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if let Some(zrow) = orphan {
+            return Err(ZuError::Corrupt {
+                what: "zu_labels row",
+                detail: format!("node table '{table}' has no row {zrow} and a label sits on it"),
+            });
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT zrow, label FROM zu_labels WHERE tbl = ? ORDER BY zrow, label")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([&name], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(sql_err)?;
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for row in rows {
+            let (zrow, label) = row.map_err(sql_err)?;
+            let want = zrow as usize + 1;
+            if out.len() < want {
+                out.resize(want, Vec::new());
+            }
+            out[zrow as usize].push(label);
+        }
+        // A file the converter wrote numbers its rows from zero and
+        // the zu1 side wants a word for each, so the answer runs to
+        // the end of the table whenever the table is that shape.
+        let count = self.node_count(name)? as usize;
+        if !out.is_empty() && out.len() < count {
+            out.resize(count, Vec::new());
+        }
+        Ok(out)
     }
 
     /// The CSR adjacency of one node group in one direction, built on

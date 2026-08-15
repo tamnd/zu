@@ -397,3 +397,104 @@ fn rel_table_rejects_unknown_endpoints() {
     assert!(matches!(err, ZuError::InvalidArgument(_)));
     assert_eq!(store.tables().unwrap().len(), 1);
 }
+
+/// The labels a node carries beyond its table's name are written per
+/// row and read back per table, dense so the loader on the other side
+/// has a word to write for every row.
+#[test]
+fn extra_labels_are_written_per_row_and_read_per_table() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.create_node_table("person", &[]).unwrap();
+    let rows: Vec<i64> = (0..4)
+        .map(|_| store.insert_node("person", &[]).unwrap())
+        .collect();
+    // A table nobody labelled costs nothing to read.
+    assert!(store.node_labels("person").unwrap().is_empty());
+
+    store
+        .set_node_labels("person", rows[0], &["Employee"])
+        .unwrap();
+    store
+        .set_node_labels("person", rows[2], &["Manager", "Employee"])
+        .unwrap();
+    // The table's own name is true of the row and is not news, so it
+    // is accepted and dropped rather than refused.
+    store
+        .set_node_labels("person", rows[3], &["person"])
+        .unwrap();
+    // Row zero is the one no insert took, because a sqlite rowid
+    // starts at one; the vector is indexed by row all the same.
+    assert_eq!(
+        store.node_labels("person").unwrap(),
+        [
+            vec![],
+            vec!["Employee".to_string()],
+            vec![],
+            vec!["Employee".to_string(), "Manager".to_string()],
+        ]
+    );
+
+    // Setting replaces rather than adds, and writing the same label
+    // twice is one label.
+    store
+        .set_node_labels("person", rows[0], &["Manager", "Manager"])
+        .unwrap();
+    assert_eq!(
+        store.node_labels("person").unwrap()[rows[0] as usize],
+        ["Manager".to_string()]
+    );
+
+    // A label sits on a row, so deleting the row takes it with it: the
+    // next row to take the number must not read it.
+    store.delete_node("person", rows[0]).unwrap();
+    assert!(store.node_labels("person").unwrap()[rows[0] as usize].is_empty());
+}
+
+/// Labels are held to the shape a name has, and to a row that exists.
+#[test]
+fn labels_are_checked_against_the_row_and_the_name() {
+    let (_dir, path) = temp_db();
+    let mut store = SqliteStore::open(&path).unwrap();
+    store.create_node_table("person", &[]).unwrap();
+    let row = store.insert_node("person", &[]).unwrap();
+    assert!(matches!(
+        store
+            .set_node_labels("person", 7, &["Employee"])
+            .unwrap_err(),
+        ZuError::InvalidArgument(_)
+    ));
+    assert!(matches!(
+        store
+            .set_node_labels("person", row, &["drop table"])
+            .unwrap_err(),
+        ZuError::InvalidArgument(_)
+    ));
+    assert!(store.node_labels("person").unwrap().is_empty());
+}
+
+/// A version 3 file has no label table, and reads as the file it is:
+/// every node carrying the one label its table is called.
+#[test]
+fn version_three_files_gain_the_label_table() {
+    let (_dir, path) = temp_db();
+    {
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.create_node_table("peer", &[]).unwrap();
+        store.insert_node("peer", &[]).unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE zu_labels; PRAGMA user_version = 3;")
+        .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let version: i32 = store
+        .raw()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    assert!(store.node_labels("peer").unwrap().is_empty());
+    store.set_node_labels("peer", 1, &["Admin"]).unwrap();
+    assert_eq!(store.node_labels("peer").unwrap()[1], ["Admin".to_string()]);
+}

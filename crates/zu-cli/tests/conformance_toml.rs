@@ -150,7 +150,7 @@ fn verify_accepts_a_report_that_agrees_and_rejects_one_that_does_not() {
     // `--verify` reads. The harness writes far more than this and none
     // of the rest is any of zu's business.
     let agreeing = r#"{"engine":{"adapter":"zu","capabilities":{
-        "Data":{"labels":true,"multi-label":false,"node-properties":true,
+        "Data":{"labels":true,"multi-label":true,"node-properties":true,
         "edge-properties":true,"edge-types":true,"multiple-edge-types":true,
         "multiple-node-labels":true,"temporal-values":true,"list-values":true,
         "null-properties":true,"float-values":true,"boolean-values":true,

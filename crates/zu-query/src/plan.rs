@@ -475,11 +475,7 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                     s
                 }
             };
-            let (open, close) = match direction {
-                RelDirection::Out => ("-", "->"),
-                RelDirection::In => ("<-", "-"),
-                RelDirection::Undirected => ("-", "-"),
-            };
+            let (open, close) = direction.spelling();
             let opt = bracket.map_or("", |b| b.prefix());
             let kind = if *asp {
                 "AspJoin"
@@ -735,6 +731,7 @@ mod tests {
                     from: 0,
                     to: 0,
                     edge_count: 180_000,
+                    undirected: false,
                 },
                 RelDef {
                     id: 3,
@@ -742,6 +739,7 @@ mod tests {
                     from: 0,
                     to: 1,
                     edge_count: 9000,
+                    undirected: false,
                 },
             ],
         )

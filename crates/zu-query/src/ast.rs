@@ -323,14 +323,123 @@ pub struct RelPattern {
     pub props: Vec<(String, Expr)>,
 }
 
+/// Which edges a pattern walks, and which way round.
+///
+/// ISO writes seven edge patterns and they split along two axes: which
+/// of the stored lists a step reads, and whether the edge itself has a
+/// direction (GH02). `-[]->` is a directed edge followed the way it
+/// points, `~[]~` is an undirected edge and says nothing about the way
+/// round, and `-[]-` is every edge either way, which is what a query
+/// that does not care writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelDirection {
-    /// `-[]->`
+    /// `-[]->`, a directed edge followed forwards.
     Out,
-    /// `<-[]-`
+    /// `<-[]-`, a directed edge followed backwards.
     In,
-    /// `-[]-`
+    /// `<-[]->`, a directed edge either way round.
+    AnyDirected,
+    /// `~[]~`, an undirected edge.
     Undirected,
+    /// `<~[]~`, an undirected edge or a directed one followed
+    /// backwards.
+    InOrUndirected,
+    /// `~[]~>`, an undirected edge or a directed one followed forwards.
+    OutOrUndirected,
+    /// `-[]-`, any edge at all, either way round.
+    Any,
+}
+
+impl RelDirection {
+    /// Whether a step reads the forward stored list, which holds the
+    /// edges written from the near end.
+    pub fn walks_out(self) -> bool {
+        !matches!(self, RelDirection::In)
+    }
+
+    /// Whether a step reads the backward stored list. An undirected
+    /// edge is stored once, so reading it from the far end is what
+    /// answers the other way round.
+    pub fn walks_in(self) -> bool {
+        !matches!(self, RelDirection::Out)
+    }
+
+    /// Whether this pattern walks a rel table whose edges are directed
+    /// (or undirected, for `undirected`). The two are asked separately
+    /// because four of the seven spellings admit both.
+    pub fn admits_directed(self) -> bool {
+        !matches!(self, RelDirection::Undirected)
+    }
+
+    pub fn admits_undirected(self) -> bool {
+        matches!(
+            self,
+            RelDirection::Undirected
+                | RelDirection::InOrUndirected
+                | RelDirection::OutOrUndirected
+                | RelDirection::Any
+        )
+    }
+
+    /// Whether a table of this kind is one this pattern may walk.
+    pub fn admits(self, undirected: bool) -> bool {
+        if undirected {
+            self.admits_undirected()
+        } else {
+            self.admits_directed()
+        }
+    }
+
+    /// Whether the pattern reads both stored lists, which is what makes
+    /// a step emit a row per direction rather than one.
+    pub fn both_ways(self) -> bool {
+        self.walks_out() && self.walks_in()
+    }
+
+    /// This pattern against one rel table, as one of the three
+    /// directions storage knows: forward list, backward list, or both.
+    /// `None` says the table is not one this pattern may walk at all.
+    ///
+    /// An undirected edge is stored once, from whichever end it was
+    /// written, so every pattern that admits it reads both lists.
+    pub fn resolve(self, undirected: bool) -> Option<RelDirection> {
+        if !self.admits(undirected) {
+            return None;
+        }
+        if undirected {
+            return Some(RelDirection::Any);
+        }
+        Some(match self {
+            RelDirection::Out | RelDirection::OutOrUndirected => RelDirection::Out,
+            RelDirection::In | RelDirection::InOrUndirected => RelDirection::In,
+            _ => RelDirection::Any,
+        })
+    }
+
+    /// The same pattern read from the other end, which is what a plan
+    /// writes when it walks a step backwards.
+    pub fn flip(self) -> RelDirection {
+        match self {
+            RelDirection::Out => RelDirection::In,
+            RelDirection::In => RelDirection::Out,
+            RelDirection::InOrUndirected => RelDirection::OutOrUndirected,
+            RelDirection::OutOrUndirected => RelDirection::InOrUndirected,
+            other => other,
+        }
+    }
+
+    /// How the pattern is written, for a plan line or an error.
+    pub fn spelling(self) -> (&'static str, &'static str) {
+        match self {
+            RelDirection::Out => ("-", "->"),
+            RelDirection::In => ("<-", "-"),
+            RelDirection::AnyDirected => ("<-", "->"),
+            RelDirection::Undirected => ("~", "~"),
+            RelDirection::InOrUndirected => ("<~", "~"),
+            RelDirection::OutOrUndirected => ("~", "~>"),
+            RelDirection::Any => ("-", "-"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

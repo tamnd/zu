@@ -24,7 +24,9 @@ use zu_sqlite::{ColumnType, SqliteStore, TableDef, Value};
 use zu_storage::Direction;
 use zu_zu1::catalog::Catalog;
 use zu_zu1::file::Zu1File;
-use zu_zu1::graph::{Direction as Zu1Direction, GraphReader, bulk_load_as};
+use zu_zu1::graph::{
+    Direction as Zu1Direction, GraphReader, bulk_load_as, bulk_load_undirected_as,
+};
 use zu_zu1::props::{
     ListElement, PropInput, PropValues, PropsReader, list_elements, load_props,
     store_props_nullable,
@@ -185,7 +187,7 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
                 })
         };
         let (from, to) = (name_of(rel.from)?, name_of(rel.to)?);
-        sq.create_rel_table(&rel.name, &from, &to, &[])?;
+        sq.create_rel_table_as(&rel.name, &from, &to, &[], rel.undirected)?;
         let src_count = catalog
             .node_by_id(rel.from)
             .expect("resolved above")
@@ -399,7 +401,11 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
             }
         }
         edges.sort_unstable();
-        bulk_load_as(&mut zu, src, &rel.name, count as u64, &edges)?;
+        if rel.undirected {
+            bulk_load_undirected_as(&mut zu, src, &rel.name, count as u64, &edges)?;
+        } else {
+            bulk_load_as(&mut zu, src, &rel.name, count as u64, &edges)?;
+        }
     }
 
     for node in &nodes {

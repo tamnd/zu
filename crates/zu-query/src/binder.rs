@@ -155,13 +155,18 @@ impl NodeDef {
 }
 
 /// One rel table: a typed CSR pair between two node tables.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelDef {
     pub id: u32,
     pub name: String,
     pub from: u32,
     pub to: u32,
     pub edge_count: u64,
+    /// Whether the edges here have no direction (GH02). An undirected
+    /// edge is still stored once, from one end to the other, so both
+    /// stored lists answer for it and only the patterns that admit an
+    /// undirected edge may walk it.
+    pub undirected: bool,
 }
 
 /// One rel table's COLOR summary (docs/07 §6): `counts[c]` nodes hold
@@ -1796,13 +1801,18 @@ impl Binder<'_> {
     }
 
     fn narrow_step(&mut self, left: usize, rel: &BoundRel, right: usize) -> Result<()> {
-        let fits = |r: &RelDef, from: &[u32], to: &[u32]| match rel.direction {
-            RelDirection::Out => from.contains(&r.from) && to.contains(&r.to),
-            RelDirection::In => from.contains(&r.to) && to.contains(&r.from),
-            RelDirection::Undirected => {
+        // Which way a step reads a table depends on the table: an
+        // undirected one answers both ways round and only the patterns
+        // that admit an undirected edge may read it at all (GH02).
+        let step_dir = |r: &RelDef| rel.direction.resolve(r.undirected);
+        let fits = |r: &RelDef, from: &[u32], to: &[u32]| match step_dir(r) {
+            Some(RelDirection::Out) => from.contains(&r.from) && to.contains(&r.to),
+            Some(RelDirection::In) => from.contains(&r.to) && to.contains(&r.from),
+            Some(_) => {
                 (from.contains(&r.from) && to.contains(&r.to))
                     || (from.contains(&r.to) && to.contains(&r.from))
             }
+            None => false,
         };
         let left_tables = self.variables[left].node_tables.clone();
         let right_tables = self.variables[right].node_tables.clone();
@@ -1820,10 +1830,14 @@ impl Binder<'_> {
         }
         let reaches = |node: u32, end: fn(&RelDef, RelDirection) -> (u32, u32)| {
             rels.iter().any(|r| {
-                let (a, b) = end(r, rel.direction);
-                match rel.direction {
-                    RelDirection::Undirected => node == a || node == b,
-                    _ => node == a,
+                let Some(d) = step_dir(r) else {
+                    return false;
+                };
+                let (a, b) = end(r, d);
+                if d.both_ways() {
+                    node == a || node == b
+                } else {
+                    node == a
                 }
             })
         };
@@ -2424,6 +2438,7 @@ mod tests {
                     from: 0,
                     to: 0,
                     edge_count: 180_000,
+                    undirected: false,
                 },
                 RelDef {
                     id: 3,
@@ -2431,6 +2446,7 @@ mod tests {
                     from: 0,
                     to: 1,
                     edge_count: 9000,
+                    undirected: false,
                 },
                 RelDef {
                     id: 4,
@@ -2438,6 +2454,7 @@ mod tests {
                     from: 1,
                     to: 1,
                     edge_count: 1400,
+                    undirected: false,
                 },
             ],
         )
@@ -2851,6 +2868,7 @@ mod tests {
                 from: 0,
                 to: 0,
                 edge_count: 180_000,
+                undirected: false,
             }],
             vec![
                 "Person".into(),

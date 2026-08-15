@@ -484,7 +484,7 @@ impl Parser<'_> {
             name = Some(self.expect_name("an element type name")?);
         }
         let mut def = self.parse_node_type_pattern()?;
-        if !self.at(&TokenKind::Minus) && !self.at(&TokenKind::Lt) {
+        if !self.at(&TokenKind::Minus) && !self.at(&TokenKind::Lt) && !self.at(&TokenKind::Tilde) {
             if def.name.is_none() {
                 def.name = name;
             }
@@ -620,22 +620,33 @@ impl Parser<'_> {
         Ok(labels)
     }
 
-    /// The arc of an edge type pattern, from `-[` through `]-` and the
-    /// arrowhead at whichever end has one. Answers the edge type the
-    /// bracket describes, whether it is undirected (GH02), and whether
-    /// the arrow points back at the endpoint already read.
+    /// The arc of an edge type pattern, from `-[` or `~[` through the
+    /// closing bar and the arrowhead at whichever end has one. Answers
+    /// the edge type the bracket describes, whether it is undirected
+    /// (GH02), and whether the arrow points back at the endpoint
+    /// already read.
+    ///
+    /// A tilde says the edges of the type have no direction, which is
+    /// how a pattern says it too. An arc with no arrowhead says the
+    /// same thing, and is the spelling this grammar had before the
+    /// tilde arrived.
     fn parse_arc(&mut self) -> Result<(ElementTypeDef, bool, bool)> {
         let reversed = self.eat(&TokenKind::Lt);
-        self.expect(&TokenKind::Minus)?;
+        let tilde = self.parse_rel_bar()?;
         self.expect(&TokenKind::LBracket)?;
         let def = self.parse_type_body(false)?;
         self.expect(&TokenKind::RBracket)?;
-        self.expect(&TokenKind::Minus)?;
+        if self.parse_rel_bar()? != tilde {
+            return Err(self.error("an arc undirected at both ends or at neither"));
+        }
         let forward = self.eat(&TokenKind::Gt);
         if reversed && forward {
             return Err(self.error("an arc with one arrowhead"));
         }
-        Ok((def, !reversed && !forward, reversed))
+        if tilde && (reversed || forward) {
+            return Err(self.error("an undirected arc with no arrowhead"));
+        }
+        Ok((def, tilde || !reversed && !forward, reversed))
     }
 
     /// `{ name :: TYPE, ... }`, `NO PROPERTIES`, or nothing written at
@@ -888,7 +899,7 @@ impl Parser<'_> {
         };
         let start = self.parse_node()?;
         let mut steps = Vec::new();
-        while self.at(&TokenKind::Minus) || self.at(&TokenKind::Lt) {
+        while self.at(&TokenKind::Minus) || self.at(&TokenKind::Lt) || self.at(&TokenKind::Tilde) {
             let rel = self.parse_rel()?;
             let node = self.parse_node()?;
             steps.push((rel, node));
@@ -967,9 +978,16 @@ impl Parser<'_> {
     /// Parses the relationship between two nodes. `<-` and `->` are not
     /// lexer tokens, so the arrows are assembled here from `<`, `-`,
     /// and `>`.
+    ///
+    /// The bar on each side is a dash for an edge that has a direction
+    /// and a tilde for one that has none (GH02), which together with
+    /// the arrows spell the seven edge patterns of ISO 39075 18.9. The
+    /// closing bar may be dropped when no bracket was written, which is
+    /// what makes `(a)->(b)` and `(a)~(b)` patterns of their own.
     fn parse_rel(&mut self) -> Result<RelPattern> {
         let inbound = self.eat(&TokenKind::Lt);
-        self.expect(&TokenKind::Minus)?;
+        let left_tilde = self.parse_rel_bar()?;
+        let bracketed = self.at(&TokenKind::LBracket);
         let (var, types, range, props) = if self.eat(&TokenKind::LBracket) {
             let var = match self.peek().map(|t| &t.kind) {
                 Some(TokenKind::Ident(_)) | Some(TokenKind::QuotedIdent(_)) => {
@@ -999,21 +1017,38 @@ impl Parser<'_> {
         } else {
             (None, Vec::new(), None, Vec::new())
         };
-        self.expect(&TokenKind::Minus)?;
+        let right_tilde = if bracketed || self.at(&TokenKind::Minus) || self.at(&TokenKind::Tilde) {
+            self.parse_rel_bar()?
+        } else {
+            left_tilde
+        };
+        if left_tilde != right_tilde {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{}: a relationship is undirected at both ends or at neither",
+                    position(self.source, self.tokens[self.pos - 1].start)
+                ),
+            ));
+        }
         let outbound = self.eat(&TokenKind::Gt);
-        let direction = match (inbound, outbound) {
-            (true, true) => {
+        let direction = match (inbound, left_tilde, outbound) {
+            (true, true, true) => {
                 return Err(ZuError::gql(
                     codes::C42001,
                     format!(
-                        "{}: a relationship cannot point both ways",
+                        "{}: an undirected relationship cannot point both ways",
                         position(self.source, self.tokens[self.pos - 1].start)
                     ),
                 ));
             }
-            (true, false) => RelDirection::In,
-            (false, true) => RelDirection::Out,
-            (false, false) => RelDirection::Undirected,
+            (true, false, false) => RelDirection::In,
+            (false, false, true) => RelDirection::Out,
+            (true, false, true) => RelDirection::AnyDirected,
+            (false, true, false) => RelDirection::Undirected,
+            (true, true, false) => RelDirection::InOrUndirected,
+            (false, true, true) => RelDirection::OutOrUndirected,
+            (false, false, false) => RelDirection::Any,
         };
         Ok(RelPattern {
             var,
@@ -1022,6 +1057,16 @@ impl Parser<'_> {
             range,
             props,
         })
+    }
+
+    /// One side's bar, `true` for the tilde that says the edges have no
+    /// direction of their own.
+    fn parse_rel_bar(&mut self) -> Result<bool> {
+        if self.eat(&TokenKind::Tilde) {
+            return Ok(true);
+        }
+        self.expect(&TokenKind::Minus)?;
+        Ok(false)
     }
 
     /// The hop range after `*`: nothing, `2`, `1..3`, `..3`, or `2..`.
@@ -1821,7 +1866,8 @@ mod tests {
                (:Org),
                (:Person)-[:KNOWS => :Close]->(:Org),
                (:Person)<-[:EMPLOYS]-(:Org),
-               (:Person)-[:MEETS]-(:Person)
+               (:Person)-[:MEETS]-(:Person),
+               (:Person)~[:SITS_WITH]~(:Person)
              }",
         );
         let CatalogStmt::CreateGraphType {
@@ -1839,7 +1885,7 @@ mod tests {
         let GraphTypeSource::Elements(elements) = source else {
             panic!("not written out");
         };
-        assert_eq!(elements.len(), 5);
+        assert_eq!(elements.len(), 6);
         assert_eq!(elements[0].name.as_deref(), Some("PersonType"));
         assert_eq!(elements[0].key_labels, ["Person"]);
         // The key labels are labels the element carries as well, so the
@@ -1889,6 +1935,22 @@ mod tests {
             panic!("not an edge");
         };
         assert!(undirected, "an arc with no arrowhead is undirected");
+        // And the tilde says the same thing, which is how a pattern
+        // says it (GH02).
+        let ElementDefKind::Edge { undirected, .. } = &elements[5].kind else {
+            panic!("not an edge");
+        };
+        assert!(undirected, "a tilde arc is undirected");
+        assert_eq!(elements[5].labels, ["SITS_WITH"]);
+        // The two spellings do not mix, and neither takes an arrowhead.
+        assert!(
+            parse_err("CREATE GRAPH TYPE t { (:A)~[:R]-(:A) }")
+                .contains("an arc undirected at both ends or at neither")
+        );
+        assert!(
+            parse_err("CREATE GRAPH TYPE t { (:A)~[:R]~>(:A) }")
+                .contains("an undirected arc with no arrowhead")
+        );
     }
 
     #[test]
@@ -2205,12 +2267,74 @@ mod tests {
         assert_eq!(likes.var.as_deref(), Some("r"));
         assert_eq!(likes.types, ["LIKES", "FOLLOWS"]);
         let (bare, _) = &patterns[2].steps[0];
-        assert_eq!(bare.direction, RelDirection::Undirected);
+        assert_eq!(bare.direction, RelDirection::Any);
         assert!(bare.range.is_none());
         let Clause::Return { projection } = &q.clauses[1] else {
             panic!("RETURN");
         };
         assert!(projection.star);
+    }
+
+    /// The seven edge patterns of ISO 39075 18.9, in full and in the
+    /// abbreviated spellings that drop the bracket (GH02).
+    #[test]
+    fn seven_edge_patterns_and_their_abbreviations() {
+        let full = [
+            ("(a)-[r]->(b)", RelDirection::Out),
+            ("(a)<-[r]-(b)", RelDirection::In),
+            ("(a)<-[r]->(b)", RelDirection::AnyDirected),
+            ("(a)~[r]~(b)", RelDirection::Undirected),
+            ("(a)<~[r]~(b)", RelDirection::InOrUndirected),
+            ("(a)~[r]~>(b)", RelDirection::OutOrUndirected),
+            ("(a)-[r]-(b)", RelDirection::Any),
+        ];
+        let short = [
+            ("(a)->(b)", RelDirection::Out),
+            ("(a)<-(b)", RelDirection::In),
+            ("(a)<->(b)", RelDirection::AnyDirected),
+            ("(a)~(b)", RelDirection::Undirected),
+            ("(a)<~(b)", RelDirection::InOrUndirected),
+            ("(a)~>(b)", RelDirection::OutOrUndirected),
+            ("(a)-(b)", RelDirection::Any),
+            ("(a)--(b)", RelDirection::Any),
+        ];
+        for (pattern, want) in full.into_iter().chain(short) {
+            let q = parsed(&format!("MATCH {pattern} RETURN a"));
+            let Clause::Match { patterns, .. } = &q.clauses[0] else {
+                panic!("MATCH");
+            };
+            let (rel, _) = &patterns[0].steps[0];
+            assert_eq!(rel.direction, want, "{pattern}");
+        }
+    }
+
+    /// Which stored lists each pattern reads, and which tables it may
+    /// read at all, is what the binder and the engine ask of a
+    /// direction rather than matching on the variants themselves.
+    #[test]
+    fn a_pattern_resolves_against_the_table_it_walks() {
+        use RelDirection::*;
+        // A directed table keeps the arrows and refuses the tilde.
+        assert_eq!(Out.resolve(false), Some(Out));
+        assert_eq!(OutOrUndirected.resolve(false), Some(Out));
+        assert_eq!(InOrUndirected.resolve(false), Some(In));
+        assert_eq!(AnyDirected.resolve(false), Some(Any));
+        assert_eq!(Undirected.resolve(false), None);
+        // Either way round is still a direction, so it refuses an edge
+        // that has none.
+        assert_eq!(AnyDirected.resolve(true), None);
+        // An undirected edge is stored once, so every pattern that
+        // admits it reads both lists, and the arrow-only ones do not.
+        assert_eq!(Undirected.resolve(true), Some(Any));
+        assert_eq!(OutOrUndirected.resolve(true), Some(Any));
+        assert_eq!(Any.resolve(true), Some(Any));
+        assert_eq!(Out.resolve(true), None);
+        assert_eq!(In.resolve(true), None);
+        // And a flipped pattern is the same pattern read backwards.
+        assert_eq!(OutOrUndirected.flip(), InOrUndirected);
+        assert_eq!(Undirected.flip(), Undirected);
+        assert_eq!(AnyDirected.flip(), AnyDirected);
+        assert_eq!(Out.flip(), In);
     }
 
     #[test]
@@ -2466,7 +2590,14 @@ mod tests {
         assert!(parse_err("RETURN 1 RETURN 2").contains("nothing may follow RETURN"));
         assert!(parse_err("").contains("empty query"));
         assert!(parse_err("CREATE (n) RETURN n").contains("CREATE is not implemented yet"));
-        assert!(parse_err("MATCH (a)<-[r]->(b) RETURN a").contains("cannot point both ways"));
+        assert!(
+            parse_err("MATCH (a)<~[r]~>(b) RETURN a")
+                .contains("an undirected relationship cannot point both ways")
+        );
+        assert!(
+            parse_err("MATCH (a)<-[r]~(b) RETURN a")
+                .contains("undirected at both ends or at neither")
+        );
         let e = parse_err("MATCH (n)\nWHERE n.x =\nRETURN n");
         assert!(
             e.contains("line 3"),

@@ -641,3 +641,59 @@ fn a_list_column_survives_both_hops_with_its_element_type() {
         );
     }
 }
+
+/// GH02. Whether a rel table's edges have a direction is part of what
+/// the table is, so it crosses both hops: the sqlite catalogue records
+/// it, the zu1 catalog records it, and a round trip through either
+/// engine leaves it saying the same thing.
+#[test]
+fn the_undirected_flag_survives_both_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table("peer", &[]).unwrap();
+    sq.create_rel_table_as("friend", "peer", "peer", &[], true)
+        .unwrap();
+    sq.begin().unwrap();
+    for row in 0..2i64 {
+        sq.insert_node_at("peer", row, &[]).unwrap();
+    }
+    sq.insert_rel("friend", 0, 1, &[]).unwrap();
+    sq.commit().unwrap();
+    drop(sq);
+
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut zu = Zu1File::open(&b).unwrap();
+    let catalog = Catalog::load(&mut zu).unwrap();
+    let friend = catalog.rel_by_name("friend").expect("friend survives");
+    assert!(friend.undirected, "the flag crosses into zu1");
+    assert_eq!(friend.edge_count, 1, "an undirected edge is stored once");
+    drop(zu);
+
+    // And the pattern that admits it finds it from either end, which is
+    // the storage half doing its job on a converted file.
+    let mut zu = Zu1File::open(&b).unwrap();
+    let rows = run_zu1(
+        "MATCH (a:peer)~[:friend]~(b:peer) RETURN b.id AS id",
+        &mut zu,
+        &[],
+    )
+    .unwrap()
+    .rows;
+    assert_eq!(rows.len(), 2, "once from each end: {rows:?}");
+    drop(zu);
+
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    let table = back
+        .tables()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "friend")
+        .expect("friend survives the way back");
+    assert!(table.undirected, "the flag crosses back into sqlite");
+}

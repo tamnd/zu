@@ -154,7 +154,7 @@ fn verify_accepts_a_report_that_agrees_and_rejects_one_that_does_not() {
         "edge-properties":false,"edge-types":true,"multiple-edge-types":true,
         "multiple-node-labels":false,"temporal-values":true,"list-values":true,
         "null-properties":true,"float-values":true,"boolean-values":true,
-        "undirected-edges":false,"self-loops":true,"parallel-edges":true},
+        "undirected-edges":true,"self-loops":true,"parallel-edges":true},
         "GQLStatus":true,"Parameters":true,"Transactions":false,
         "MultipleStatements":true,"Isolated":true}},
         "cases":[{"id":"a","got_gqlstatus":"22012"}]}"#;

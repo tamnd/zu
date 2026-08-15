@@ -515,6 +515,23 @@ pub fn bulk_load_as(
     bulk_load_keyed(db, node_table, rel_table, node_count, edges, None)
 }
 
+/// [`bulk_load_as`] for edges with no direction (GH02).
+///
+/// The edge list is stored the way it is written and nothing is
+/// mirrored: the reverse CSR every load builds is what answers the
+/// other way round, and the rel table says the two ways are one edge.
+/// A pattern that asks for a direction is what tells them apart, so an
+/// undirected table costs a directed one nothing on disk.
+pub fn bulk_load_undirected_as(
+    db: &mut Zu1File,
+    node_table: &str,
+    rel_table: &str,
+    node_count: u64,
+    edges: &[(u32, u32)],
+) -> Result<Directory> {
+    bulk_load_inner(db, node_table, rel_table, node_count, edges, None, true)
+}
+
 /// Bulk-loads both CSR directions from an edge list into `db` as the rel
 /// table `rel_table` over the node table `node_table`, then publishes
 /// the catalog, table index, and directory with a checkpoint. `edges`
@@ -534,6 +551,20 @@ pub fn bulk_load_keyed(
     node_count: u64,
     edges: &[(u32, u32)],
     key_by_row: Option<&[u64]>,
+) -> Result<Directory> {
+    bulk_load_inner(
+        db, node_table, rel_table, node_count, edges, key_by_row, false,
+    )
+}
+
+fn bulk_load_inner(
+    db: &mut Zu1File,
+    node_table: &str,
+    rel_table: &str,
+    node_count: u64,
+    edges: &[(u32, u32)],
+    key_by_row: Option<&[u64]>,
+    undirected: bool,
 ) -> Result<Directory> {
     if let Some(keys) = key_by_row
         && keys.len() as u64 != node_count
@@ -591,7 +622,7 @@ pub fn bulk_load_keyed(
     };
     let root = meta::write_chain(db, &directory.encode())?;
     let from = catalog.upsert_node(node_table, node_count)?;
-    let rel_id = catalog.upsert_rel(rel_table, from, from, edges.len() as u64)?;
+    let rel_id = catalog.upsert_rel_as(rel_table, from, from, edges.len() as u64, undirected)?;
     index.set(rel_id, root);
     // The catalog, index, and stats chains are rewritten whole,
     // freeing the committed copies first.

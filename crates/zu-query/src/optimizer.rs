@@ -541,14 +541,17 @@ fn mark_asp_node(
                 // its lists hold the same node table. Optional closes
                 // are marked as well: the compiler only fuses within
                 // one group, which keeps left-outer semantics exact.
-                let self_ref = query.variables[rel]
+                let lone = query.variables[rel]
                     .rel_tables
                     .first()
-                    .and_then(|id| schema.rel_by_id(*id))
-                    .is_some_and(|rd| rd.from == rd.to);
+                    .and_then(|id| schema.rel_by_id(*id));
+                let self_ref = lone.is_some_and(|rd| rd.from == rd.to);
+                let one_list = lone
+                    .and_then(|rd| direction.resolve(rd.undirected))
+                    .is_some_and(|d| !d.both_ways());
                 let wcoj = range.is_none()
                     && query.variables[rel].rel_tables.len() == 1
-                    && (self_ref || !matches!(direction, RelDirection::Undirected));
+                    && (self_ref || one_list);
                 // A close keeps or drops rows, never adds, so the
                 // ceiling under it stands and only the spread moves.
                 ceil.walked(&e, from, to, query);
@@ -1071,11 +1074,7 @@ fn rebuild(ops: Vec<RunOp>, below: LogicalPlan) -> LogicalPlan {
 }
 
 fn flip(direction: RelDirection) -> RelDirection {
-    match direction {
-        RelDirection::Out => RelDirection::In,
-        RelDirection::In => RelDirection::Out,
-        RelDirection::Undirected => RelDirection::Undirected,
-    }
+    direction.flip()
 }
 
 /// Groups the run's node slots into connected components. Slots bound
@@ -1605,13 +1604,18 @@ fn degree(e: &ExpandOp, source: usize, spread: Spread, query: &BoundQuery, schem
 }
 
 /// The degree sides an expand from `source` reads: out-degree is 0,
-/// in-degree is 1, and an undirected step reads both.
+/// in-degree is 1, and a step that reads both lists reads both.
+///
+/// The pattern is asked here rather than the table, so a step that
+/// reads one list of a directed table and both of an undirected one
+/// (GH02) counts as both. That is a ceiling either way, which is what
+/// this estimate wants when it cannot see which table a row landed in.
 fn walk_sides(e: &ExpandOp, source: usize) -> &'static [usize] {
     let reversed = source == e.to && source != e.from;
-    match (e.direction, reversed) {
-        (RelDirection::Out, false) | (RelDirection::In, true) => &[0],
-        (RelDirection::Out, true) | (RelDirection::In, false) => &[1],
-        (RelDirection::Undirected, _) => &[0, 1],
+    match (e.direction.walks_out(), e.direction.walks_in(), reversed) {
+        (true, false, false) | (false, true, true) => &[0],
+        (true, false, true) | (false, true, false) => &[1],
+        _ => &[0, 1],
     }
 }
 
@@ -1712,15 +1716,23 @@ fn lone_rel(e: &ExpandOp, query: &BoundQuery) -> Option<u32> {
 /// stands: exactly one candidate, a fixed direction, and a stored COLOR
 /// summary the table has not walked away from since it was built.
 fn colored_rel(e: &ExpandOp, query: &BoundQuery, schema: &Schema) -> Option<(u32, f64)> {
-    if matches!(e.direction, RelDirection::Undirected) {
-        return None;
-    }
     let [rid] = query.variables[e.rel].rel_tables[..] else {
         return None;
     };
+    colored_dir(e, rid, schema)?;
     let sum = schema.color_summary(rid)?;
     let edges = schema.rel_by_id(rid).map_or(0, |r| r.edge_count);
     sum.fresh_enough(edges).then(|| (rid, sum.scale(edges)))
+}
+
+/// The one way an expand reads `rid`, when the pattern and the table
+/// between them leave exactly one. A step that reads both stored lists
+/// walks two colors at once, which the color arithmetic below has no
+/// shape for, so it is left to the plain estimate.
+fn colored_dir(e: &ExpandOp, rid: u32, schema: &Schema) -> Option<RelDirection> {
+    let rd = schema.rel_by_id(rid)?;
+    let dir = e.direction.resolve(rd.undirected)?;
+    (!dir.both_ways()).then_some(dir)
 }
 
 /// A frontier spread evenly over the summarized nodes, the walk's
@@ -1805,10 +1817,9 @@ fn expand_estimate(
     };
     let sum = schema.color_summary(rid).expect("colored_rel checked");
     let reversed = source == e.to && source != e.from;
-    let reversed = match e.direction {
-        RelDirection::Out => reversed,
+    let reversed = match colored_dir(e, rid, schema).expect("colored_rel checked") {
         RelDirection::In => !reversed,
-        RelDirection::Undirected => unreachable!("colored_rel rejects undirected"),
+        _ => reversed,
     };
     let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8));
     // Every fan-out the summary itself produces carries the scale, which
@@ -2111,6 +2122,7 @@ mod tests {
                     from: 0,
                     to: 0,
                     edge_count: 180_000,
+                    undirected: false,
                 },
                 RelDef {
                     id: 3,
@@ -2118,6 +2130,7 @@ mod tests {
                     from: 0,
                     to: 1,
                     edge_count: 9000,
+                    undirected: false,
                 },
             ],
         )

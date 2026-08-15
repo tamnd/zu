@@ -332,6 +332,57 @@ fn version_one_files_migrate_on_open() {
         .unwrap();
     assert_eq!(likes.src_table.as_deref(), Some("person"));
     assert_eq!(likes.dst_table.as_deref(), Some("person"));
+    // A file written before the column existed holds directed edges,
+    // which is the default the column arrives with (GH02).
+    assert!(tables.iter().all(|t| !t.undirected));
+    assert!(!likes.undirected);
+}
+
+/// A schema version 2 file predates the direction column alone, so it
+/// migrates with an ALTER and keeps everything else where it was.
+#[test]
+fn version_two_files_gain_the_direction_column() {
+    let (_dir, path) = temp_db();
+    {
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.create_node_table("peer", &[]).unwrap();
+        store
+            .create_rel_table("friend", "peer", "peer", &[])
+            .unwrap();
+    }
+    // Back to what version 2 left behind: the same catalogue without
+    // the column, and the pragma that says so.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE zu_catalog DROP COLUMN undirected;         PRAGMA user_version = 2;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = SqliteStore::open(&path).unwrap();
+    let version: i32 = store
+        .raw()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let tables = store.tables().unwrap();
+    assert_eq!(tables.len(), 2);
+    assert!(tables.iter().all(|t| !t.undirected));
+    let friend = tables.iter().find(|t| t.name == "friend").unwrap();
+    assert_eq!(friend.src_table.as_deref(), Some("peer"));
+
+    // And a table created after the migration can say it has no
+    // direction, which is what the column is for.
+    store
+        .create_rel_table_as("near", "peer", "peer", &[], true)
+        .unwrap();
+    let near = store
+        .tables()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "near")
+        .unwrap();
+    assert!(near.undirected);
 }
 
 /// Rel endpoints must name existing node tables.

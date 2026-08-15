@@ -9,11 +9,12 @@
 //! completeness check exists to prevent.
 //!
 //! So this reads top-level `key = value` pairs and `[[array]]` tables
-//! of them, with string, integer and boolean values, and it errors
-//! with a line number on everything else: inline tables, arrays,
-//! floats, dates, dotted keys, `[table]` headers, multi-line strings,
-//! literal strings. Widening it is a change to this file, which is
-//! where a reader would look for what the format allows.
+//! of them, with string, integer, boolean and list-of-string values,
+//! and it errors with a line number on everything else: inline tables,
+//! lists of anything but strings, lists that span lines, floats, dates,
+//! dotted keys, `[table]` headers, multi-line strings, literal strings.
+//! Widening it is a change to this file, which is where a reader would
+//! look for what the format allows.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +25,10 @@ pub enum Value {
     Str(String),
     Int(i64),
     Bool(bool),
+    /// A list of strings on one line. The toolchain table names the
+    /// repositories a component belongs to, and that is a list of
+    /// names rather than a sentence to split later.
+    List(Vec<String>),
 }
 
 /// A set of key/value pairs: the top of the file, or one `[[array]]`
@@ -52,6 +57,13 @@ impl Table {
     pub fn int(&self, key: &str) -> Option<i64> {
         match self.get(key) {
             Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        }
+    }
+
+    pub fn list(&self, key: &str) -> Option<&[String]> {
+        match self.get(key) {
+            Some(Value::List(items)) => Some(items),
             _ => None,
         }
     }
@@ -196,6 +208,37 @@ fn parse_value(text: &str, line: usize) -> Result<Value, String> {
         }
         return unescape(&rest[..end], line).map(Value::Str);
     }
+    if let Some(rest) = text.strip_prefix('[') {
+        // One line, because a list that spans lines is a list whose
+        // items are hard to see, and every list either file holds is
+        // short enough to read at once.
+        let body = rest
+            .strip_suffix(']')
+            .ok_or_else(|| format!("line {line}: a list that does not end on its line"))?;
+        let mut items = Vec::new();
+        if body.trim().is_empty() {
+            return Ok(Value::List(items));
+        }
+        for item in body.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                // A trailing comma is how a list is written when it is
+                // going to grow, and the empty tail it leaves is not an
+                // item. An empty one anywhere else is a missing item.
+                if items.is_empty() || !body.trim_end().ends_with(',') {
+                    return Err(format!(
+                        "line {line}: a list with nothing between two commas"
+                    ));
+                }
+                continue;
+            }
+            match parse_value(item, line)? {
+                Value::Str(s) => items.push(s),
+                _ => return Err(format!("line {line}: {item:?} in a list is not a string")),
+            }
+        }
+        return Ok(Value::List(items));
+    }
     // Integers only, and no underscores or signs, because the one
     // integer in the map is a tier between 1 and 3.
     if text.chars().all(|c| c.is_ascii_digit()) {
@@ -205,7 +248,7 @@ fn parse_value(text: &str, line: usize) -> Result<Value, String> {
             .map_err(|e| format!("line {line}: {text} is not an integer: {e}"));
     }
     Err(format!(
-        "line {line}: {text:?} is not a string, an integer, or a boolean"
+        "line {line}: {text:?} is not a string, an integer, a boolean, or a list"
     ))
 }
 
@@ -289,6 +332,34 @@ mod tests {
     fn an_escaped_quote_stays_inside_its_string() {
         let doc = Doc::parse("reason = \"the \\\"why\\\" of it\"\n").expect("parses");
         assert_eq!(doc.root.str("reason"), Some("the \"why\" of it"));
+    }
+
+    #[test]
+    fn a_list_of_strings_is_read_as_its_items() {
+        let doc = Doc::parse("repos = [\"zu\", \"zu-python\"]\n").expect("parses");
+        assert_eq!(
+            doc.root.list("repos"),
+            Some(&["zu".to_string(), "zu-python".to_string()][..])
+        );
+        assert_eq!(doc.root.str("repos"), None);
+    }
+
+    #[test]
+    fn an_empty_list_is_a_list_of_nothing() {
+        let doc = Doc::parse("repos = []\n").expect("parses");
+        assert_eq!(doc.root.list("repos"), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_list_that_lost_an_item_is_refused() {
+        let error = Doc::parse("repos = [\"zu\", , \"zu-c\"]\n").expect_err("a hole in a list");
+        assert!(error.contains("nothing between two commas"), "{error}");
+    }
+
+    #[test]
+    fn a_list_of_anything_but_strings_is_refused() {
+        let error = Doc::parse("repos = [1, 2]\n").expect_err("a list of integers");
+        assert!(error.contains("in a list is not a string"), "{error}");
     }
 
     #[test]

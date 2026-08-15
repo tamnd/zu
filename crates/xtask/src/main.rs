@@ -17,7 +17,7 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, corpus, model, rustdoc, terms};
+use xtask::{apimap, corpus, model, pins, rustdoc, terms};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -44,6 +44,11 @@ cargo xtask corpus-pack [--cases DIR] [--readme PATH] [--out PATH] [--version V]
   --version V       the version the artifact is named for (default this workspace's)
   --check           pack and report, writing nothing
 
+cargo xtask pins [--table PATH] [--list]
+
+  --table PATH      the toolchain table (default toolchains.toml)
+  --list            print `component<TAB>pinned<TAB>floor<TAB>repos` for every row, and check nothing
+
 cargo xtask terms [--table PATH] [--list] [PATH ...]
 
   --table PATH      the terminology table (default zu-web/style/zu/terms.yml, here or one level up)
@@ -63,6 +68,7 @@ fn main() -> ExitCode {
         Some("model") => run(model_command(&args[1..])),
         Some("api-map") => run(api_map_command(&args[1..])),
         Some("corpus-pack") => run(corpus_pack_command(&args[1..])),
+        Some("pins") => run(pins_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
@@ -198,6 +204,60 @@ fn corpus_pack_command(args: &[String]) -> Result<ExitCode, String> {
     std::fs::write(&out, &packed.archive).map_err(|e| format!("writing {}: {e}", out.display()))?;
     println!("{}: {summary}", out.display());
     Ok(ExitCode::SUCCESS)
+}
+
+fn pins_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut path = PathBuf::from(pins::PATH);
+    let mut list = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--table" => {
+                path = PathBuf::from(args.get(i + 1).ok_or("--table wants a path")?);
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let table = pins::Table::load(&path)?;
+
+    if list {
+        for component in &table.components {
+            println!(
+                "{}\t{}\t{}\t{}",
+                component.name,
+                component.pinned,
+                component.floor.as_deref().unwrap_or(""),
+                component.repos.join(" ")
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // The table is at the root of the tree it describes, so the tree is
+    // wherever the table was found and not wherever this was run.
+    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let notes = table.check(&root)?;
+    if notes.is_empty() {
+        println!(
+            "{} components, {} sites, audited {}, nothing has drifted",
+            table.components.len(),
+            table.sites.len(),
+            table.audited
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    eprintln!(
+        "\n{} to fix. Bumping a version is a change to {} and to every site of it.",
+        notes.len(),
+        path.display()
+    );
+    Ok(ExitCode::FAILURE)
 }
 
 /// The prose this repository publishes: the documentation, and the doc

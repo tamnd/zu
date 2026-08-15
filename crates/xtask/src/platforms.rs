@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::matrix::{self, Row};
 use crate::toml::Doc;
 
 /// The table's schema version, which moves when the shape of the file
@@ -110,22 +111,6 @@ pub struct Table {
     pub audited: String,
     pub platforms: Vec<Platform>,
     pub budgets: Vec<Budget>,
-}
-
-/// One row of the workflow's matrix, as written.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Row {
-    line: usize,
-    pairs: Vec<(String, String)>,
-}
-
-impl Row {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.pairs
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
 }
 
 /// What the check found.
@@ -463,79 +448,9 @@ impl Table {
     }
 }
 
-/// The rows of the workflow's `include:` matrix.
-///
-/// Reading the block by its indentation rather than parsing YAML: what
-/// is wanted is a list of `key: value` under one key, the file is
-/// written here, and a YAML library to read six keys out of it would be
-/// a dependency in the build tooling of nine repositories. A structure
-/// this does not understand is an error with a line number rather than
-/// a row silently dropped, which is the same rule the TOML reader
-/// beside this one follows.
+/// The rows of the build workflow's matrix, read by the one reader.
 fn rows(text: &str) -> Result<Vec<Row>, String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let Some(at) = lines
-        .iter()
-        .position(|line| line.trim() == "include:" && line.starts_with(' '))
-    else {
-        return Err(format!("{WORKFLOW} has no matrix `include:`"));
-    };
-    let outer = indent(lines[at]);
-    let mut out: Vec<Row> = Vec::new();
-    for (n, raw) in lines.iter().enumerate().skip(at + 1) {
-        let line = n + 1;
-        let content = raw.trim();
-        if content.is_empty() || content.starts_with('#') {
-            continue;
-        }
-        if indent(raw) <= outer {
-            break;
-        }
-        let (content, opens) = match content.strip_prefix("- ") {
-            Some(rest) => (rest.trim(), true),
-            None => (content, false),
-        };
-        let (key, value) = content
-            .split_once(':')
-            .ok_or_else(|| format!("{WORKFLOW}:{line}: no `:` in a matrix row"))?;
-        let key = key.trim().to_string();
-        let value = unquote(value.trim()).to_string();
-        if opens {
-            out.push(Row {
-                line,
-                pairs: Vec::new(),
-            });
-        }
-        let row = out
-            .last_mut()
-            .ok_or_else(|| format!("{WORKFLOW}:{line}: a matrix key before any `- `"))?;
-        if row.pairs.iter().any(|(k, _)| *k == key) {
-            return Err(format!("{WORKFLOW}:{line}: {key} is set twice in one row"));
-        }
-        row.pairs.push((key, value));
-    }
-    if out.is_empty() {
-        return Err(format!("{WORKFLOW} builds nothing"));
-    }
-    Ok(out)
-}
-
-/// The number of leading spaces, which is what YAML nests by.
-fn indent(line: &str) -> usize {
-    line.len() - line.trim_start_matches(' ').len()
-}
-
-/// A scalar with its quotes off. YAML lets a value be bare, and the
-/// values here are targets and image names, so both spellings turn up.
-fn unquote(value: &str) -> &str {
-    for quote in ['"', '\''] {
-        if let Some(rest) = value.strip_prefix(quote)
-            && let Some(inner) = rest.strip_suffix(quote)
-        {
-            return inner;
-        }
-    }
-    value
+    matrix::rows(text, WORKFLOW)
 }
 
 #[cfg(test)]

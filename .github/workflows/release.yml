@@ -75,8 +75,19 @@ jobs:
           if-no-files-found: error
           path: dist
 
-  publish:
+  # The eight repositories, driven rather than releasing on their own
+  # schedule, which is what keeps one version number meaning one thing.
+  # It runs after the artifacts exist because every one of them builds
+  # against those artifacts, and before the registries because a binding
+  # that fails its gates stops the release rather than following it.
+  conductor:
     needs: assemble
+    uses: ./.github/workflows/conductor.yml
+    with:
+      version: ${{ inputs.version || github.ref_name }}
+
+  publish:
+    needs: [assemble, conductor]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -92,22 +103,30 @@ jobs:
       # loop because the run's own step list is then the ordering, which
       # is what a person reads when a release stops half way through.
       - name: GitHub release
-        run: echo "no-op: upload dist/ to the release for ${{ github.ref_name }}, signed and attested (dx/14 section 8, DX5)"
+        run: |
+          echo "no-op: upload dist/ to the release for ${{ github.ref_name }}, signed and attested (dx/14 section 8, DX5)"
       - name: crates.io
-        run: echo "no-op: publish zudb, zudb-async and zu-cli, first because everything else builds against them"
+        run: |
+          echo "no-op: publish zudb, zudb-async and zu-cli, first because everything else builds against them"
       - name: PyPI
-        run: echo "no-op: publish the wheels zu-python built against these artifacts"
+        run: |
+          echo "no-op: publish the wheels zu-python built against these artifacts"
       - name: npm
-        run: echo "no-op: publish zudb and its platform packages, then the JSR re-export"
+        run: |
+          echo "no-op: publish zudb and its platform packages, then the JSR re-export"
       - name: Maven Central
-        run: echo "no-op: publish dev.zudb, which is a staging repository that has to be closed and released"
+        run: |
+          echo "no-op: publish dev.zudb, which is a staging repository that has to be closed and released"
       - name: NuGet
-        run: echo "no-op: publish ZuDb"
+        run: |
+          echo "no-op: publish ZuDb"
       - name: Go module tag
-        run: echo "no-op: push the tag on zu-go, last of the registries because a Go module cannot be unpublished"
+        run: |
+          echo "no-op: push the tag on zu-go, last of the registries because a Go module cannot be unpublished"
       - name: Docs and release notes
-        run: echo "no-op: deploy zu-web against this version, publish the notes, bump Homebrew, Scoop and AUR"
+        run: |
+          echo "no-op: deploy zu-web against this version, publish the notes, bump Homebrew, Scoop and AUR"
       - name: What this run did not do
         run: |
-          echo "The dispatches to the eight repositories are the conductor's, which is the next item of DX0."
+          echo "The dispatches to the eight repositories ran and did nothing, because none of them has a release workflow yet."
           echo "Every publish above is idempotent when it is real, so a partial release is resumed and not restarted."

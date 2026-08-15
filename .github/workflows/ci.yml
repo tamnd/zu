@@ -90,6 +90,16 @@ jobs:
       # per-artifact cost has to stay flat as the contract grows past
       # the seven platforms it has today.
       - run: cargo bench -p xtask --bench artifacts
+      # And the table under all of it: the nine repositories the split
+      # created. The conductor dispatches to that list, the README
+      # publishes it, and the contract above names its consumers from
+      # it, so a repository joining or leaving the project is one row
+      # here and a failure everywhere it was not changed.
+      - run: cargo run -p xtask -- repos
+      # Nine rows will not be nine forever, and the tier 3 bindings
+      # arrive one repository at a time. What this measures is that
+      # holding three files to the table stays flat per repository.
+      - run: cargo bench -p xtask --bench repos
 
   deny:
     runs-on: ubuntu-latest

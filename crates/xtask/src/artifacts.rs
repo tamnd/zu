@@ -40,23 +40,6 @@ pub const PATH: &str = "artifacts.toml";
 /// The workflow that has to assemble from it.
 pub const WORKFLOW: &str = ".github/workflows/release.yml";
 
-/// The nine repositories of dx/18 section 2.
-pub const REPOS: [&str; 9] = [
-    "zu",
-    "zu-c",
-    "zu-python",
-    "zu-node",
-    "zu-go",
-    "zu-java",
-    "zu-dotnet",
-    "zu-kit",
-    "zu-web",
-];
-
-/// The one that makes the artifacts, and therefore the one that cannot
-/// be listed as consuming them.
-pub const MAKER: &str = "zu";
-
 /// The cases the corpus row is packed from, and the README that ships
 /// beside them so an unpacked artifact explains itself.
 pub const CASES: &str = "conformance/cases";
@@ -146,9 +129,6 @@ pub enum Note {
         from: String,
         line: usize,
     },
-    /// A repository the split created that fetches nothing. Either the
-    /// contract forgot it or it should not have been split out.
-    Idle { repo: String },
     /// The release workflow does not run the table, which makes the
     /// table a document rather than a contract.
     Unheld { command: String },
@@ -160,10 +140,6 @@ impl std::fmt::Display for Note {
             Note::Absent { name, from, line } => write!(
                 f,
                 "{PATH}:{line}: {name} is published from {from}, which is not in this tree"
-            ),
-            Note::Idle { repo } => write!(
-                f,
-                "{PATH}: {repo} is one of the nine repositories and consumes nothing a release publishes"
             ),
             Note::Unheld { command } => write!(
                 f,
@@ -323,19 +299,9 @@ impl Table {
             if consumers.is_empty() {
                 return Err(format!("line {line}: {name} is fetched by nobody"));
             }
-            for consumer in &consumers {
-                if consumer == MAKER {
-                    return Err(format!(
-                        "line {line}: {MAKER} makes {name} and is not a consumer of it"
-                    ));
-                }
-                if !REPOS.contains(&consumer.as_str()) {
-                    return Err(format!(
-                        "line {line}: {name} is fetched by {consumer:?}, which is not one of the \
-                         nine repositories"
-                    ));
-                }
-            }
+            // Which repositories those are is `repos.toml`'s business
+            // and checked there, because the list of repositories is
+            // one list and this is not where it lives.
             let doc = table
                 .str("doc")
                 .ok_or_else(|| format!("line {line}: {name} has no doc"))?
@@ -393,17 +359,6 @@ impl Table {
                     name: artifact.name.clone(),
                     from: from.clone(),
                     line: artifact.line,
-                });
-            }
-        }
-        for repo in REPOS.iter().filter(|r| **r != MAKER) {
-            if !self
-                .artifacts
-                .iter()
-                .any(|a| a.consumers.iter().any(|c| c == repo))
-            {
-                notes.push(Note::Idle {
-                    repo: (*repo).to_string(),
                 });
             }
         }
@@ -541,8 +496,9 @@ pub fn tier1(root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// Whether this is a milestone of the two programs, which is what a row
-/// nothing makes yet has to wait for.
-fn is_milestone(name: &str) -> bool {
+/// nothing makes yet has to wait for, and what a repository that does
+/// not exist yet is created at.
+pub fn is_milestone(name: &str) -> bool {
     let digit = |rest: &str| matches!(rest.parse::<u8>(), Ok(0..=6));
     match name.strip_prefix("DX") {
         Some(rest) => digit(rest),
@@ -719,17 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn an_artifact_the_maker_consumes_is_refused() {
-        let text = TABLE.replace("consumers = [\"zu-web\"]", "consumers = [\"zu\"]");
-        let error = Table::parse(&text).expect_err("zu consuming its own release");
-        assert!(error.contains("is not a consumer"), "{error}");
-    }
-
-    #[test]
-    fn a_consumer_that_is_not_a_repository_is_refused() {
-        let text = TABLE.replace("consumers = [\"zu-web\"]", "consumers = [\"zu-perl\"]");
-        let error = Table::parse(&text).expect_err("a tenth repository");
-        assert!(error.contains("nine repositories"), "{error}");
+    fn an_artifact_nobody_fetches_is_refused() {
+        let text = TABLE.replace("consumers = [\"zu-web\"]", "consumers = []");
+        let error = Table::parse(&text).expect_err("a row for nobody");
+        assert!(error.contains("fetched by nobody"), "{error}");
     }
 
     #[test]

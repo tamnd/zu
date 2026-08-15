@@ -1051,12 +1051,31 @@ exec_semi_mprobes_s_core = 1.8
 #
 # refuse_p50_us is the absolute backstop on the same worst refusal, so
 # a run where both paths got slower together still fails. It sits at
-# twice what the slowest measured machine reads rather than near it,
+# twice what the machine it was written on reads rather than near it,
 # because the number it exists to catch is a refusal that started doing
 # real work, and that lands far past 4. Lower these ceilings, never
 # raise them.
+#
+# The backstop is a number of microseconds, which is a statement about
+# a machine, and the gate job runs on whatever the provider hands it. A
+# runner slower than the reference machine reads the undefined
+# reference refusal at 3.40, 3.94, 4.01 and 4.04 us on four consecutive
+# runs of the same code, which is a coin flip against a ceiling of 4
+# and cost main a red run on 2026-08-14 with nothing wrong with it. So
+# the bench measures the host with a loop that touches nothing in zu
+# and reads the backstop at what that says, clamped to between one and
+# four times the written number. The loop is the work a refusal is,
+# which is a short string walked into a few small allocations and a
+# lookup, because a pointer chase was tried first and read 0.99x on the
+# runner: its memory is as fast as the reference machine's and its core
+# is not. refuse_calibration_ns is the reference reading, 498 ns per
+# round on the local M series over three runs that read 496, 498 and
+# 504. A host that reads the same is held to exactly 4 us. Only the backstop
+# scales; refuse_over_answer is a ratio between two paths timed in one
+# run and needs no help from any of this.
 refuse_over_answer = 0.6
 refuse_p50_us = 4.0
+refuse_calibration_ns = 498
 
 # Tail latency of a served read (perf/05, zu#76), benches/tail.rs: the
 # p99 of a point seeded one hop over the p50 of the same stream, on a

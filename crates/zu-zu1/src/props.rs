@@ -801,6 +801,23 @@ impl PropsDirectory {
     }
 }
 
+/// Copies a props directory and every segment it points at, answering
+/// the root of the copy. The mirror of [`free_props`], walking the same
+/// pointers in the same order.
+pub(crate) fn copy_props(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
+    let mut directory = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
+    if let Some(labels) = &mut directory.labels {
+        labels.blocks = crate::graph::copy_blocks(db, &labels.blocks)?;
+    }
+    for col in &mut directory.columns {
+        col.meta.blocks = crate::graph::copy_blocks(db, &col.meta.blocks)?;
+        if let Some(validity) = &mut col.validity {
+            validity.blocks = crate::graph::copy_blocks(db, &validity.blocks)?;
+        }
+    }
+    meta::write_chain(db, &directory.encode())
+}
+
 pub(crate) fn free_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
     free_props_parts(db, root, true)
 }

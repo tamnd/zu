@@ -313,7 +313,7 @@ impl Parser<'_> {
             self.expect_kw("AS")?;
             self.expect_kw("COPY")?;
             self.expect_kw("OF")?;
-            Some(self.expect_name("the graph a copy is taken from")?)
+            Some(self.parse_graph_ref()?)
         } else {
             None
         };
@@ -777,17 +777,23 @@ impl Parser<'_> {
         if !self.eat_kw("USE") {
             return Ok(None);
         }
+        Ok(Some(self.parse_graph_ref()?))
+    }
+
+    /// The graph a clause names, which is the same thing written in a
+    /// `USE` clause and after `AS COPY OF`.
+    fn parse_graph_ref(&mut self) -> Result<GraphRef> {
         if self.eat_kw("CURRENT_PROPERTY_GRAPH") || self.eat_kw("CURRENT_GRAPH") {
-            return Ok(Some(GraphRef::Current));
+            return Ok(GraphRef::Current);
         }
-        // `PROPERTY GRAPH` before the name is the long spelling of the
-        // same clause and says nothing the name does not.
+        // `PROPERTY GRAPH` before the name is the long spelling and
+        // says nothing the name does not.
         if self.eat_kw("PROPERTY") {
             self.expect_kw("GRAPH")?;
         } else {
             self.eat_kw("GRAPH");
         }
-        Ok(Some(GraphRef::Named(self.parse_graph_name()?)))
+        Ok(GraphRef::Named(self.parse_graph_name()?))
     }
 
     fn parse_where(&mut self) -> Result<Option<Expr>> {
@@ -2114,7 +2120,25 @@ mod tests {
                 if_not_exists: false,
                 or_replace: true,
                 of: GraphTypeRef::Any,
-                copy_of: Some("h".into()),
+                copy_of: Some(GraphRef::Named(GraphName {
+                    schema: None,
+                    name: "h".into(),
+                })),
+            }
+        );
+        // The graph the statement is against is a graph to copy like
+        // any other, and the one a copy of a loaded file means.
+        assert_eq!(
+            catalog_stmt("CREATE GRAPH g ANY AS COPY OF CURRENT_PROPERTY_GRAPH"),
+            CatalogStmt::CreateGraph {
+                name: GraphName {
+                    schema: None,
+                    name: "g".into(),
+                },
+                if_not_exists: false,
+                or_replace: false,
+                of: GraphTypeRef::Any,
+                copy_of: Some(GraphRef::Current),
             }
         );
         // GG03 and GG04: a type written where the graph is created.

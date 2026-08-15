@@ -726,16 +726,24 @@ mod tests {
         };
         assert_eq!(ty.elements.len(), 1);
 
-        // GG05: an empty graph copies as the empty graph it is, and a
-        // graph with tables in it is the copy nobody has written yet.
+        // GG05: an empty graph copies as the empty graph it is.
         session
             .run("CREATE GRAPH copy_of_it ANY AS COPY OF open_one", &[])
             .expect("copy of an empty graph");
-        let err = session
-            .run("CREATE GRAPH copy_of_home ANY AS COPY OF home", &[])
-            .expect_err("a copy of a graph that holds tables")
-            .to_string();
-        assert!(err.contains("AS COPY OF"), "{err}");
+        assert!(
+            session
+                .graph
+                .catalog()
+                .graph_tables(
+                    session
+                        .graph
+                        .catalog()
+                        .graph("/", "copy_of_it")
+                        .expect("the copy")
+                        .id
+                )
+                .is_empty()
+        );
 
         let err = session
             .run("CREATE GRAPH lost ANY AS COPY OF nowhere", &[])
@@ -755,6 +763,67 @@ mod tests {
         assert!(err.contains("is no graph type here"), "{err}");
         assert_eq!(session.graph.catalog().node_tables().len(), tables);
         assert!(session.graph.catalog().graph("/", "home").is_some());
+    }
+
+    #[test]
+    fn a_copy_of_a_graph_holds_the_rows_of_the_one_it_copied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("copy.zu1");
+        let edges = seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("CREATE GRAPH twin ANY AS COPY OF home", &[])
+            .expect("copy of a graph that holds tables");
+
+        let pattern = "MATCH (a:person {id: $src})-[:follows]->(b) \
+                       RETURN b.id AS friend ORDER BY friend";
+        let mut want: Vec<i64> = edges
+            .iter()
+            .filter(|(s, _)| *s == 3)
+            .map(|(_, d)| i64::from(*d))
+            .collect();
+        want.sort_unstable();
+        let friends = |session: &mut Session, source: &str| -> Vec<i64> {
+            session
+                .run(source, &[("src", Value::Int(3))])
+                .expect("query")
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Int(i) => *i,
+                    other => panic!("expected int, got {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(friends(&mut session, pattern), want);
+        assert_eq!(friends(&mut session, &format!("USE twin {pattern}")), want);
+
+        // The graph the statement is against is a graph to copy like
+        // any other, and the one a file loaded from outside has its
+        // tables in.
+        session
+            .run(
+                "CREATE GRAPH twin_of_here ANY AS COPY OF CURRENT_PROPERTY_GRAPH",
+                &[],
+            )
+            .expect("copy of the graph the statement is against");
+        assert_eq!(
+            friends(&mut session, &format!("USE twin_of_here {pattern}")),
+            want
+        );
+
+        // The copy holds blocks of its own, which dropping it is what
+        // proves: a copy that had merely pointed at the source's
+        // segments would have handed the source's blocks back here and
+        // the query below would read a graph that is no longer there.
+        session.run("DROP GRAPH twin", &[]).expect("drop the copy");
+        assert_eq!(friends(&mut session, pattern), want);
+        let err = session
+            .run(&format!("USE twin {pattern}"), &[])
+            .expect_err("the copy is gone")
+            .to_string();
+        assert!(err.contains("which is no graph in"), "{err}");
     }
 
     /// How many blocks the committed free list names, which is what a

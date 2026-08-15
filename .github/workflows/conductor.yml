@@ -1,0 +1,166 @@
+name: conductor
+
+# The dispatching half of the release train (dx/14 section 6). The tag
+# on this repository builds and publishes the artifacts; this drives the
+# eight repositories that build against them, collects what each reports
+# back, and fails the release if any of them fails a gate.
+#
+# Every dispatch here is a no-op, because none of the eight has a
+# release workflow to dispatch to yet: they are created and configured,
+# and what goes in them arrives on DX1 to DX5. What is real is the
+# shape, and the shape is the part that is expensive to get wrong late.
+# A repository dispatched in the wrong stage, or one nobody remembered
+# to dispatch to at all, is a release that publishes an SDK built
+# against a version nobody else has.
+#
+# The matrix is `repos.toml`, checked in both directions by
+# `cargo xtask repos`, so a repository joining the train is one row in
+# one table and a row here, and neither can arrive without the other.
+#
+# Two stages, and the order is the reason: the bindings build and report
+# first, then the site is built from the version they all agreed on. A
+# site deployed against a release whose Python wheels failed their
+# corpus run documents something nobody can install.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version being released
+        required: true
+        type: string
+  # A rehearsal on its own, which is how the dispatch list is exercised
+  # without tagging anything.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to rehearse as
+        required: false
+        default: 0.0.0
+
+concurrency:
+  # One conductor per version. Two runs of one version dispatching to
+  # eight repositories is eight repositories building the same tag twice
+  # and reporting back in whichever order they finish.
+  group: conductor-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  bindings:
+    name: dispatch ${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    strategy:
+      # One repository failing is a thing the release wants to know
+      # about along with everything else that failed, and not instead of
+      # it.
+      fail-fast: false
+      matrix:
+        include:
+          - repo: zu-python
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-node
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-go
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-java
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-c
+            workflow: release.yml
+            reports: scorecard corpus sizes
+          - repo: zu-dotnet
+            workflow: release.yml
+            reports: scorecard api-map corpus perf sizes
+          - repo: zu-kit
+            workflow: release.yml
+            reports: scorecard corpus
+    steps:
+      - name: Dispatch
+        shell: bash
+        run: |
+          echo "no-op: gh workflow run ${{ matrix.workflow }} --repo tamnd/${{ matrix.repo }} \
+            --field version=${{ inputs.version }} --field digests=<the release's attestation>"
+          echo "no-op: wait for that run, and fail this job with its URL if it fails"
+      # What comes back is a directory per repository, so the collect
+      # step reads results and not eight differently shaped outputs. It
+      # is empty here, and the name of what is missing is in it, which
+      # is what makes the empty result checkable rather than silent.
+      - name: Collect what it reported
+        shell: bash
+        env:
+          repo: ${{ matrix.repo }}
+          reports: ${{ matrix.reports }}
+        run: |
+          set -eu
+          mkdir -p results
+          for report in $reports; do
+            echo "$repo $report pending: nothing is dispatched to yet" > "results/$repo.$report"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reported-${{ matrix.repo }}
+          if-no-files-found: error
+          path: results
+
+  site:
+    name: dispatch ${{ matrix.repo }}
+    needs: bindings
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - repo: zu-web
+            workflow: release.yml
+            reports: site
+    steps:
+      - name: Dispatch
+        shell: bash
+        run: |
+          echo "no-op: gh workflow run ${{ matrix.workflow }} --repo tamnd/${{ matrix.repo }} \
+            --field version=${{ inputs.version }}"
+          echo "no-op: the site is built against this version's artifacts, snippet matrix and all"
+      - name: Collect what it reported
+        shell: bash
+        env:
+          repo: ${{ matrix.repo }}
+          reports: ${{ matrix.reports }}
+        run: |
+          set -eu
+          mkdir -p results
+          for report in $reports; do
+            echo "$repo $report pending: nothing is dispatched to yet" > "results/$repo.$report"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reported-${{ matrix.repo }}
+          if-no-files-found: error
+          path: results
+
+  collect:
+    needs: [bindings, site]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reported-*
+          merge-multiple: true
+          path: results
+      # The gate this becomes: every report the table says a repository
+      # owes is here, and every one of them passed. Today it prints them
+      # and passes, because every one of them is the word `pending`.
+      - name: What the eight reported
+        shell: bash
+        run: |
+          set -eu
+          find results -type f | sort
+          reports=$(find results -type f | wc -l | tr -d ' ')
+          repos=$(find results -type f | sed 's|.*/||; s|\..*||' | sort -u | wc -l | tr -d ' ')
+          echo "$reports reports from $repos repositories, every one of them pending"
+      - name: What this run did not do
+        run: |
+          echo "Nothing was dispatched: the eight have no release workflow until DX1 to DX5."
+          echo "The list dispatched to is repos.toml, held to this matrix by cargo xtask repos."

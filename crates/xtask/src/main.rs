@@ -17,7 +17,7 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, artifacts, corpus, model, pins, platforms, rustdoc, terms};
+use xtask::{apimap, artifacts, corpus, model, pins, platforms, repos, rustdoc, terms};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -65,6 +65,11 @@ cargo xtask artifacts [--table PATH] [--list] [--assemble DIR] [--verify DIR] [-
   --built DIR       where the platform jobs' artifacts were downloaded (default built)
   --version V       the version being released (default this workspace's)
 
+cargo xtask repos [--table PATH] [--list]
+
+  --table PATH      the repository table (default repos.toml)
+  --list            print `role<TAB>name<TAB>tier<TAB>reports` for every row, and check nothing
+
 cargo xtask terms [--table PATH] [--list] [PATH ...]
 
   --table PATH      the terminology table (default zu-web/style/zu/terms.yml, here or one level up)
@@ -87,6 +92,7 @@ fn main() -> ExitCode {
         Some("pins") => run(pins_command(&args[1..])),
         Some("platforms") => run(platforms_command(&args[1..])),
         Some("artifacts") => run(artifacts_command(&args[1..])),
+        Some("repos") => run(repos_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
@@ -508,6 +514,63 @@ fn artifacts_command(args: &[String]) -> Result<ExitCode, String> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn repos_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut path = PathBuf::from(repos::PATH);
+    let mut list = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--table" => {
+                path = PathBuf::from(args.get(i + 1).ok_or("--table wants a path")?);
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let table = repos::Table::load(&path)?;
+
+    if list {
+        for repo in &table.repos {
+            println!(
+                "{}\t{}\t{}\t{}",
+                repo.role.name(),
+                repo.name,
+                repo.tier.map(|t| t.to_string()).unwrap_or_default(),
+                repo.reports.join(" ")
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // The table sits at the root of the tree it describes, the same as
+    // the three tables beside it.
+    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let notes = table.check(&root)?;
+    if notes.is_empty() {
+        let reports: usize = table.dispatched().map(|r| r.reports.len()).sum();
+        println!(
+            "{} repositories, {} of them driven by the train and reporting {reports} things back, \
+             audited {}",
+            table.repos.len(),
+            table.dispatched().count(),
+            table.audited
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    eprintln!(
+        "\n{} to fix. The repositories of this project are {}, and the conductor, the README and \
+         the artifact contract all read that list.",
+        notes.len(),
+        path.display()
+    );
+    Ok(ExitCode::FAILURE)
 }
 
 /// The prose this repository publishes: the documentation, and the doc

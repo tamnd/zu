@@ -40,6 +40,10 @@ harness = false
 name = "artifacts"
 harness = false
 
+[[bench]]
+name = "repos"
+harness = false
+
 [dependencies]
 crc32c.workspace = true
 zstd.workspace = true

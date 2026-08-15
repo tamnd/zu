@@ -1,0 +1,99 @@
+schema = 1
+doc = "The nine repositories of the split, and what the release train asks of each."
+audited = "2026-08-16"
+
+# One row per repository of dx/18 section 2. The engine is the first row
+# and the only one the train does not dispatch to, because the train is
+# its own tag. Every other row is a repository the conductor drives:
+# `workflow` is the workflow dispatched there, and `reports` is what it
+# sends back for the collect step to gate on.
+#
+# `created` is the milestone the repository appears at, which is why a
+# row can exist here before there is anything in it: the eight were
+# created and configured together in DX0, and what each one holds
+# arrives on its own milestone.
+#
+# What a repository can report:
+#   scorecard   the SDK scorecard of dx/01
+#   api-map     its api-map.toml, checked for completeness both ways
+#   corpus      the conformance corpus, fetched from the release and run
+#   perf        the benchmark numbers for the version being released
+#   sizes       the artifact sizes, against the budgets in platforms.toml
+#   site        a built documentation site for this version
+
+[[repo]]
+name = "zu"
+role = "engine"
+created = "exists"
+doc = "The engine, the Rust SDK, the CLI, zu-capi and its generated zu.h, and the conformance corpus. A release is a tag here, and everything below is driven by it."
+
+[[repo]]
+name = "zu-python"
+role = "binding"
+tier = 1
+created = "DX2"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "zudb on PyPI, PyO3, three wheels per platform."
+
+[[repo]]
+name = "zu-node"
+role = "binding"
+tier = 1
+created = "DX3"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "zudb on npm, napi-rs, and the WASM build that is the browser and fallback path."
+
+[[repo]]
+name = "zu-go"
+role = "binding"
+tier = 1
+created = "DX4"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "github.com/tamnd/zu-go, cgo with a purego path. Its publish is a git tag, which is the one that cannot be taken back."
+
+[[repo]]
+name = "zu-java"
+role = "binding"
+tier = 1
+created = "DX4"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "dev.zudb on Maven Central, Panama with a JNI fallback, plus the Kotlin and Scala layers."
+
+[[repo]]
+name = "zu-c"
+role = "binding"
+tier = 1
+created = "DX1"
+workflow = "release.yml"
+reports = ["scorecard", "corpus", "sizes"]
+doc = "The C and C++ developer kit: examples, the header-only wrapper, the packaging, the sanitizer suites. No api-map of its own, because the C names are zu.h and zu.h is generated here."
+
+[[repo]]
+name = "zu-dotnet"
+role = "binding"
+tier = 2
+created = "DX5"
+workflow = "release.yml"
+reports = ["scorecard", "api-map", "corpus", "perf", "sizes"]
+doc = "ZuDb on NuGet, source-generated P/Invoke, NativeAOT-clean."
+
+[[repo]]
+name = "zu-kit"
+role = "kit"
+tier = 3
+created = "DX5"
+workflow = "release.yml"
+reports = ["scorecard", "corpus"]
+doc = "The binding kit: generated FFI declarations, corpus runners, the reference binding, the scorecard tool. The kit is on the train because the tools are; the tier 3 bindings built with it are not."
+
+[[repo]]
+name = "zu-web"
+role = "site"
+created = "DX0"
+workflow = "release.yml"
+reports = ["site"]
+doc = "The documentation site, two thirds of it generated from this release's artifacts. Dispatched after the bindings report, because a page that documents a binding gate that failed is a page nobody wants published."

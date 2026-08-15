@@ -1,0 +1,142 @@
+name: libzu
+
+# The tier 1 promise of dx/14 section 2: a prebuilt binary for every
+# SDK on seven platforms, a full matrix per release, and a release that
+# stops when one of them fails. A promise like that is worth what CI
+# proves of it, so every one of the seven builds on every pull request
+# rather than for the first time on the day of a release.
+#
+# The matrix is not written twice. platforms.toml is the table nine
+# repositories read, `cargo xtask platforms` holds the rows below to it,
+# and that check runs as a test, so a target added to one and not the
+# other fails on the machine of whoever added it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The release conductor calls this rather than repeating it, which is
+  # what keeps the artifacts of a release the artifacts CI has been
+  # building all along.
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      # Seven platforms, and the interesting run is the one that says
+      # which of them broke rather than the first one to.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64:2026.08.15-1
+            lib: libzu.so
+            exe: zu
+            smoke: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64:2026.08.15-1
+            lib: libzu.so
+            exe: zu
+            smoke: true
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            container: alpine:3.24.1
+            lib: libzu.so
+            exe: zu
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            container: alpine:3.24.1
+            lib: libzu.so
+            exe: zu
+            smoke: true
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            lib: libzu.dylib
+            exe: zu
+            smoke: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            lib: libzu.dylib
+            exe: zu
+            smoke: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            lib: zu.dll
+            exe: zu.exe
+            smoke: true
+    runs-on: ${{ matrix.runner }}
+    # The image for every row that builds in one, except the musl rows.
+    # GitHub runs the JavaScript half of an action inside the job's
+    # container and has no Alpine build of it for arm64, so a job
+    # container of Alpine is a checkout that fails on the arm runner and
+    # passes on the other. Those two rows check out and cache on the
+    # runner and build inside the same image through docker instead,
+    # which is one mechanism for both of them rather than one each.
+    container: ${{ !contains(matrix.container, 'alpine') && matrix.container || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      # The rows that build on the runner get the pinned compiler and a
+      # cache here. The Alpine rows get both inside the image, where the
+      # cache would be a directory this action cannot prune afterwards.
+      - uses: dtolnay/rust-toolchain@master
+        if: "!contains(matrix.container, 'alpine')"
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: "!contains(matrix.container, 'alpine')"
+        with:
+          key: ${{ matrix.target }}
+      - name: Build, measure and smoke
+        if: "!contains(matrix.container, 'alpine')"
+        shell: bash
+        run: scripts/libzu-build.sh ${{ matrix.target }} ${{ matrix.smoke }}
+      # The same script, on the system the artifact ships to. A musl
+      # shared library links musl's libc and the unwinder beside it,
+      # which the runner does not have, so the row would fail to link
+      # here long before it failed to load there. rustup's own installer
+      # goes in rather than the action above, because that one decides it
+      # is on glibc from the operating system alone and fetches a binary
+      # Alpine cannot run. Both write the pinned version, in the syntax
+      # `cargo xtask pins` reads, and it reads both.
+      - name: Build, measure and smoke inside Alpine
+        if: contains(matrix.container, 'alpine')
+        shell: bash
+        env:
+          toolchain: 1.97.1
+        run: |
+          set -eux
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e CARGO_HOME=/w/.cargo -e RUSTUP_HOME=/w/.rustup \
+            -e RUSTFLAGS='-C target-feature=-crt-static' \
+            "${{ matrix.container }}" sh -eux -c "
+              apk add --no-cache build-base curl
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --no-modify-path --profile minimal \
+                  --default-toolchain $toolchain
+              export PATH=/w/.cargo/bin:\$PATH
+              scripts/libzu-build.sh ${{ matrix.target }} ${{ matrix.smoke }}"
+      # One artifact per platform, named for the target, so that a
+      # release assembles what CI built rather than building it again
+      # somewhere else. The import library goes with the DLL because a C
+      # caller on Windows links against that and not against the DLL.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libzu-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.lib }}
+            target/${{ matrix.target }}/release/${{ matrix.exe }}
+            target/${{ matrix.target }}/release/zu.dll.lib
+            crates/zu-capi/include/zu.h

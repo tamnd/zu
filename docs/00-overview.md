@@ -45,7 +45,7 @@ These were numbered G1–G12 until the GQL conformance milestones arrived, which
 - **No Gremlin, no SPARQL/RDF.** Property graph + Cypher-flavored GQL only.
 - **No multi-statement interactive server as the primary mode.** Embedded-first; a thin server (HTTP/Arrow IPC + MCP) is an optional feature, not the product.
 - **No learned components** (no GNN cardinality estimators, no ML tuning). Deterministic, explainable behavior.
-- **No triple-store semantics, no schema-less free-for-all.** Typed node/edge tables (with multi-label support, the #1 complaint against Kùzu's model).
+- **No triple-store semantics, no schema-less free-for-all.** Typed node and rel tables (with multi-label support, the #1 complaint against Kùzu's model).
 
 ## 5. Engine selection matrix
 
@@ -70,7 +70,7 @@ One database = one engine at a time; `COPY TO / ATTACH` moves graphs between eng
 | `04-storage-zu1-format.md` | Native single-file format, byte-level |
 | `05-storage-sqlite.md` | SQLite engine mapping |
 | `06-storage-s3.md` | S3-native engine, CAS protocol, caching, cost model |
-| `07-query-engine.md` | Language, planner, vectorized/factorized execution |
+| `07-query-engine.md` | Language, optimizer, vectorized/factorized execution |
 | `08-transactions-mvcc.md` | MVCC, WAL, checkpointing, recovery |
 | `09-memory-io-caching.md` | Buffer manager, I/O backends, resource budgets |
 | `10-api-and-tooling.md` | Rust API, CLI, server, bindings |

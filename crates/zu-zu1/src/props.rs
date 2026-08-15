@@ -2560,7 +2560,7 @@ mod tests {
         assert_eq!(reader.read_int(&mut db, id, 2).unwrap(), 30);
 
         // The statistics a scan reads count only the rows holding a
-        // value, so a null cannot pass for one the planner then counts.
+        // value, so a null cannot pass for one the optimizer then counts.
         let stats = stats::Stats::load(&mut db).unwrap();
         let col = &stats.cols[&table]["id"];
         assert_eq!(col.rows, 2);

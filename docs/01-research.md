@@ -1,5 +1,9 @@
 # 01. Research: State of the Art (as of 2026-08)
 
+<!-- terms: allow row group, vertex -->
+
+This page describes other people's systems in the words those systems use, which is why it exempts the two terms it would otherwise break: a Parquet row group and a Sortledton vertex are theirs to name and not ours.
+
 Findings from a four-track survey (systems, storage formats, S3-native design, query processing). Every design decision in later documents cites back here.
 
 ## 1. Systems landscape

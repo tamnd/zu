@@ -222,6 +222,32 @@ jobs:
       - run: cargo run -p xtask -- corpus-pack --check
       - run: cargo bench -p xtask --bench corpus
 
+  terms:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The terminology table lives in tamnd/zu-web, because the site is
+      # where this program's prose is published from, and the reader
+      # lives here, because the prose with the most readers is here.
+      # That makes this the one job that needs two checkouts. It tracks
+      # zu-web's main rather than a pin: the table is prose about what
+      # words mean, a word that changed meaning has changed for this
+      # repository the moment it changed for the site, and a pin would
+      # mean the two agreed on paper while disagreeing in fact.
+      - uses: actions/checkout@v7
+        with:
+          repository: tamnd/zu-web
+          path: zu-web
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p xtask -- terms
+      # A prose check that costs seconds is a check that runs here and
+      # on nobody's machine, and a check nobody runs locally only ever
+      # reports things at review time. The bench asserts the cost stays
+      # linear in the prose and flat in the size of the table, so that
+      # adding a term stays a decision about the word.
+      - run: cargo bench -p xtask --bench terms
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

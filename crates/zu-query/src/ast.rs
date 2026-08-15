@@ -13,7 +13,7 @@ use zu_common::{LogicalType, Temporal};
 /// The two are parsed by the same entry point and told apart by their
 /// first word, because a caller with a string in its hand does not know
 /// which it has. They share nothing after that: a catalog statement has
-/// no binding table, so it never reaches the binder or the planner.
+/// no binding table, so it never reaches the binder or the optimizer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Query(Query),

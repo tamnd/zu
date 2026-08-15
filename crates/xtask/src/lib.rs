@@ -7,4 +7,5 @@ pub mod corpus;
 pub mod fixture;
 pub mod model;
 pub mod rustdoc;
+pub mod terms;
 pub mod toml;

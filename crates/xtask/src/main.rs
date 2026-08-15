@@ -17,7 +17,7 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, corpus, model, rustdoc};
+use xtask::{apimap, corpus, model, rustdoc, terms};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,6 +43,12 @@ cargo xtask corpus-pack [--cases DIR] [--readme PATH] [--out PATH] [--version V]
   --out PATH        where to write the archive (default target/conformance-<version>.tar.zst)
   --version V       the version the artifact is named for (default this workspace's)
   --check           pack and report, writing nothing
+
+cargo xtask terms [--table PATH] [--list] [PATH ...]
+
+  --table PATH      the terminology table (default zu-web/style/zu/terms.yml, here or one level up)
+  --list            print `group<TAB>term<TAB>definition` for every term, and check nothing
+  PATH ...          what to check (default docs, crates, README.md, conformance/README.md)
 ";
 
 /// The crates whose public items reach the surface of `zu` through a
@@ -57,6 +63,7 @@ fn main() -> ExitCode {
         Some("model") => run(model_command(&args[1..])),
         Some("api-map") => run(api_map_command(&args[1..])),
         Some("corpus-pack") => run(corpus_pack_command(&args[1..])),
+        Some("terms") => run(terms_command(&args[1..])),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -191,6 +198,121 @@ fn corpus_pack_command(args: &[String]) -> Result<ExitCode, String> {
     std::fs::write(&out, &packed.archive).map_err(|e| format!("writing {}: {e}", out.display()))?;
     println!("{}: {summary}", out.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// The prose this repository publishes: the documentation, and the doc
+/// comments that become reference pages. The engine's own source is in
+/// here because a doc comment is a reference page, not because a
+/// comment is prose; nothing outside `//!` and `///` is read.
+const PROSE: [&str; 4] = ["docs", "crates", "README.md", "conformance/README.md"];
+
+fn terms_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut table: Option<PathBuf> = None;
+    let mut list = false;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--table" => {
+                table = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--table wants a path")?,
+                ));
+                i += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("no option {other:?}\n\n{USAGE}"));
+            }
+            path => roots.push(PathBuf::from(path)),
+        }
+        i += 1;
+    }
+
+    let path = match table {
+        Some(path) => path,
+        None => terms::beside().ok_or_else(|| {
+            format!(
+                "no {} here or one level up. Clone tamnd/zu-web, or pass --table",
+                terms::PATH
+            )
+        })?,
+    };
+    let table = terms::Table::load(&path)?;
+
+    if list {
+        for term in &table.terms {
+            println!("{}\t{}\t{}", term.group, term.term, term.doc);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if roots.is_empty() {
+        roots = PROSE.iter().map(PathBuf::from).collect();
+    }
+    let mut files = Vec::new();
+    for root in &roots {
+        walk(root, &mut files)?;
+    }
+    files.sort();
+
+    let mut notes = Vec::new();
+    let mut checked = 0;
+    for file in &files {
+        let Some(kind) = terms::Kind::of(file) else {
+            continue;
+        };
+        checked += 1;
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| format!("reading {}: {e}", file.display()))?;
+        notes.extend(table.check(&file.display().to_string(), &text, kind));
+    }
+
+    if notes.is_empty() {
+        println!(
+            "{checked} files, {} terms, {} forms, nothing to fix",
+            table.terms.len(),
+            table.forms()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    let mut files: Vec<&str> = notes.iter().map(|n| n.file()).collect();
+    files.sort_unstable();
+    files.dedup();
+    eprintln!(
+        "\n{} to fix in {} of {checked} files. The table is {}.",
+        notes.len(),
+        files.len(),
+        path.display()
+    );
+    Ok(ExitCode::FAILURE)
+}
+
+/// Every file under `root`, or `root` itself if it is one.
+fn walk(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if root.is_file() {
+        out.push(root.to_path_buf());
+        return Ok(());
+    }
+    let entries =
+        std::fs::read_dir(root).map_err(|e| format!("reading {}: {e}", root.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("reading {}: {e}", root.display()))?
+            .path();
+        // `target` is a build, not a source, and it holds a copy of
+        // every dependency's documentation.
+        if path.file_name().is_some_and(|n| n == "target") {
+            continue;
+        }
+        match path.is_dir() {
+            true => walk(&path, out)?,
+            false => out.push(path),
+        }
+    }
+    Ok(())
 }
 
 fn api_map_command(args: &[String]) -> Result<ExitCode, String> {

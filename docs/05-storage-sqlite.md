@@ -9,7 +9,7 @@
 
 ## 2. Schema mapping
 
-One SQLite database per zu database. `application_id = 0x5A5531` ("ZU1"), `user_version` = zu schema version. All zu catalog data in `_zu_catalog`.
+One SQLite database per zu database. `application_id = 0x5A5531`, the bytes `ZU1`, `user_version` = zu schema version. All zu catalog data in `_zu_catalog`.
 
 ```sql
 -- node table Person(id INT64 PK, name STRING, born DATE) →

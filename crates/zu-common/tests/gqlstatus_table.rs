@@ -48,9 +48,12 @@ fn severity_for(category: &str) -> &'static str {
     }
 }
 
-/// Pulls `key="value"` out of the inside of a tag. Attribute values in
-/// this artifact never contain a quote, and the DTD forbids one, so a
-/// scan to the next `"` is enough.
+/// <!-- terms: allow attribute -->
+///
+/// Pulls `key="value"` out of the inside of a tag. An attribute here is
+/// XML's and not a graph element's, which is what the exemption above
+/// says. Attribute values in this artifact never contain a quote, and
+/// the DTD forbids one, so a scan to the next `"` is enough.
 fn attr(tag: &str, key: &str) -> Option<String> {
     let mut rest = tag;
     while let Some(at) = rest.find(key) {

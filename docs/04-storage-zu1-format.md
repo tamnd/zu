@@ -19,7 +19,7 @@ sidecar         <db>.zu1.wal                    redo WAL (§08)
 ### FileHeader (write-once)
 | off | size | field |
 |---|---|---|
-| 0 | 8 | magic: `0xE5 0x9B 0xB3 'Z' 'U' '1' 0x00 0x0A` (UTF-8 図 + "ZU1\0\n") |
+| 0 | 8 | magic: `0xE5 0x9B 0xB3 'Z' 'U' '1' 0x00 0x0A` (UTF-8 図 + `ZU1\0\n`) |
 | 8 | 2 | format_version = 1 |
 | 10 | 2 | min_reader_version |
 | 12 | 4 | block_size = 262144 |
@@ -67,6 +67,8 @@ SegmentMeta {
   uncompressed_bytes: u64, crc32c: u32,
 }
 ```
+
+<!-- terms: allow row group -->
 
 ### Structural encodings (random access without row groups)
 - **MiniBlock** (types ≤ 16 B): values packed in chunks of 1024 values (FastLanes transposed layout inside); chunk index = one u32 cumulative end offset per chunk, followed by one u64 fence per chunk holding the chunk's last value (~12 B/chunk metadata; the width byte travels inside the chunk because every chunk is a self-describing cascade). Point read = 1 chunk decode (≤ 4 KiB touch). Matches Lance mini-block ~24–41 B/chunk finding. The fences double as zone maps for sorted row ranges: within a CSR neighbor list, a binary search over the fences names the single chunk that can hold a value, so an edge probe decodes one chunk regardless of degree, and the full-scan path cross-checks every fence against its chunk's decoded tail.

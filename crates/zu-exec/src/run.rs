@@ -799,7 +799,8 @@ impl<'a> Worker<'a> {
                     | ColSpec::Outer { .. }
                     | ColSpec::Key
                     | ColSpec::Func
-                    | ColSpec::Mark { .. } => None,
+                    | ColSpec::Mark { .. }
+                    | ColSpec::JoinMark { .. } => None,
                 })
                 .collect(),
             scratch: Vec::new(),
@@ -1062,6 +1063,11 @@ impl<'a> Worker<'a> {
                             (sc.row_base..sc.row_base + u64::from(sc.rows)).collect();
                         self.mark_vec(rel, dirs, negated, &rows)?
                     }
+                    ColSpec::JoinMark {
+                        table,
+                        key,
+                        negated,
+                    } => self.join_mark_vec(table, *key, *negated, &level0),
                 };
                 level0.vecs.push(v);
             }
@@ -1307,6 +1313,50 @@ impl<'a> Worker<'a> {
             }
         }
         Ok(v)
+    }
+
+    /// The join's answer about every row of the chunk being built, as
+    /// the column an EXISTS block under an OR is read back through.
+    ///
+    /// The key is a column of this same chunk, registered ahead of this
+    /// one, so the chunk so far is all this needs. Nothing is dropped
+    /// and nothing is looked up: the question is whether the build side
+    /// holds the key, which the directory answers without touching a
+    /// payload, and a row the answer is no for carries a zero and goes
+    /// on like any other.
+    fn join_mark_vec(
+        &mut self,
+        table: &JoinTable,
+        key: ScalarRef,
+        negated: bool,
+        chunk: &DataChunk,
+    ) -> ValueVector {
+        let rows = chunk.count as usize;
+        let mut v = ValueVector::flat_uninit(&mut self.arena, PhysType::Int64, rows);
+        let out = v.values_mut::<i64>();
+        match key {
+            ScalarRef::RowId { .. } => {
+                let ids = chunk.vecs[0].values::<u64>();
+                for (slot, &id) in out.iter_mut().zip(&ids[..rows]) {
+                    *slot = i64::from(table.contains(id) != negated);
+                }
+            }
+            ScalarRef::Col { vec, .. } => {
+                let col = &chunk.vecs[vec];
+                let vals = col.values::<i64>();
+                for (i, slot) in out.iter_mut().enumerate() {
+                    // A null key matches nothing, the same as it does
+                    // where the probe is the operator, so the block
+                    // answered no about that row and the mark says so.
+                    let hit = col.is_valid(i) && table.contains(vals[i] as u64);
+                    *slot = i64::from(hit != negated);
+                }
+            }
+            // The compiler only ties a join on an integer column or a
+            // row id, so the key is never a node here.
+            ScalarRef::Node { .. } => unreachable!("a node is not a join key"),
+        }
+        v
     }
 
     fn has_edge(
@@ -2297,6 +2347,11 @@ impl<'a> Worker<'a> {
                 // which the compiler never puts under a call.
                 ColSpec::Func => unreachable!("a func column is scanned, not gathered"),
                 &ColSpec::Mark { rel, dirs, negated } => self.mark_vec(rel, dirs, negated, part)?,
+                ColSpec::JoinMark {
+                    table,
+                    key,
+                    negated,
+                } => self.join_mark_vec(table, *key, *negated, &chunk),
             };
             chunk.vecs.push(v);
         }

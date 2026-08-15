@@ -68,6 +68,10 @@ Python first (PyO3, Arrow-native `.to_arrow()/.to_pandas()`), then Node (napi-rs
 - `zu stat --live`: cache hit rates, S3 request rates vs budget, WAL depth, checkpoint lag.
 - Every error carries a stable code (`ZU####`) documented in `docs/errors.md`.
 
-## 6. Documentation deliverables (v1.0 gate)
+## 6. The API model
+
+Every generated description of the API is built from one file, `docs/api/model.json`, extracted from rustdoc's JSON by `cargo xtask model` and committed to the tree: the reference pages, the SDK feature matrix, the `zu.h` header, and the `api-map.toml` completeness check. `docs/api/README.md` documents its schema and what the generator does that rustdoc does not. CI runs `cargo xtask model --check` on a pinned nightly, so a pull request that changes the public API and does not regenerate the model fails, and one that does regenerate it shows the change in its own diff.
+
+## 7. Documentation deliverables (v1.0 gate)
 
 Format spec (`docs/format-zu1.md`, byte-accurate, enough to write an independent reader), grammar EBNF, GQL conformance declaration, ops guide for s3 engine (cost tuning worked examples), migration guides (Neo4j/Kùzu → zu: data model mapping + Cypher dialect diffs).

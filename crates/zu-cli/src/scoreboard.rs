@@ -19,10 +19,10 @@
 //!
 //! Both halves read JSON, the full report and the tally alike, because
 //! zu-cli carries one hand written parser and no room for a second
-//! format. See `json.rs` for why there is no serde here.
+//! format. See the `zu-json` crate for why there is no serde here.
 
-use crate::json::{self, Json};
 use std::process::ExitCode;
+use zu_json::{self as json, Json};
 
 /// The five kinds a case can have, in the order the scoreboard prints
 /// them. Fixed here rather than taken from the report so a new kind

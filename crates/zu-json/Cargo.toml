@@ -1,0 +1,17 @@
+[package]
+name = "zu-json"
+description = "A small JSON reader and writer, shared by the CLI and the codegen tools"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bench]]
+name = "json"
+harness = false
+
+[lints]
+workspace = true

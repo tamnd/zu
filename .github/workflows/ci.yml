@@ -32,6 +32,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  api-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # rustdoc JSON is nightly only and its format is versioned, so
+      # the nightly is pinned to an exact date rather than floating.
+      # A floating one would turn every rustdoc format bump into a red
+      # main on somebody else's release schedule, and the generator
+      # refuses a format it was not taught precisely so that a bump is
+      # a deliberate change to model.rs and not a silent partial read.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-14
+      - uses: Swatinem/rust-cache@v2
+      # docs/api/model.json is what the reference pages, the SDK
+      # feature matrix, zu.h and the api-map.toml completeness check
+      # are all generated from, so it is committed and this job holds
+      # it to the source. On a mismatch the command prints the
+      # identifiers that were added and removed, not just that the
+      # file differs.
+      - run: cargo xtask model --check --toolchain nightly-2026-08-14
+
   deny:
     runs-on: ubuntu-latest
     steps:

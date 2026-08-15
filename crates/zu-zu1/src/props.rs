@@ -2048,7 +2048,7 @@ mod tests {
             .unwrap()
             .id;
         let mut reader = PropsReader::new(load_rel_props(&mut db, rel).unwrap().unwrap());
-        let graph = crate::graph::GraphReader::load_table(&mut db, "knows").unwrap();
+        let mut graph = crate::graph::GraphReader::load_table(&mut db, "knows").unwrap();
         let (int_col, str_col) = (reader.col("since").unwrap(), reader.col("tag").unwrap());
         let mut out = Vec::new();
         for (i, &(s, d)) in edges.iter().enumerate() {

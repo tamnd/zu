@@ -819,7 +819,7 @@ mod tests {
                 .unwrap(),
         );
         let col = reader.col("since").unwrap();
-        let graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        let mut graph = GraphReader::load_table(&mut db, "knows").unwrap();
         for (i, (src, dst)) in [(0u64, 1u64), (1, 2), (2, 3)].into_iter().enumerate() {
             let row = graph.edge_ordinal(&mut db, src, dst).unwrap().unwrap();
             assert_eq!(row, i as u64);

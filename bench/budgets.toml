@@ -1146,3 +1146,33 @@ tail_p99_p50_power_x = 10.0
 # and that lands orders of magnitude past 2000 on any host. Lower this
 # ceiling, never raise it.
 json_frame_parse_ns = 2000.0
+
+# Edge property reads, as a multiple of the same walk reading a column
+# off the node the edge lands on (benches/relprops.rs). The graph is two
+# hundred thousand people and two million knows edges with one int
+# column on the edge and one on the person. The gated shape sums the
+# edge column over every edge and the shape it is measured against sums
+# the person column over the same walk, so the two differ in one thing:
+# a node's row is the offset already in hand and an edge's has to be
+# found.
+#
+# A property row is addressed by the edge's ordinal, its place in the
+# load order, and an edge that did not arrive from a forward walk has to
+# have that ordinal found. Writing this bench found what that cost. The
+# lookup took the point path, which decodes one chunk of the offset
+# array and one chunk of the neighbor array per call, so a scan reading
+# a property off every edge decoded two chunks per edge: 4498.4 ms
+# against 54.3 ms for the node column, 82.8x, 0.44 M reads/s. Reading
+# the ordinal out of the group cache the neighbor lists already keep,
+# which is a binary search over a slice when the group is warm, put it
+# at 341.4 ms, 8.5x, 5.86 M/s on the local M series. The point shape,
+# one node's ten links, did not move: it pays for the group either way,
+# once.
+#
+# Like the gates above this is a ratio between numbers timed in one run
+# on one machine, so a shared runner cannot move it. What is left in the
+# ratio is the ordinal lookup itself, which a forward expand could count
+# out as it walks and hand to the read; until it does, the ceiling sits
+# where a slower box has room and the per call decode, an order of
+# magnitude past it, does not. Lower this ceiling, never raise it.
+rel_prop_over_walk_x = 20.0

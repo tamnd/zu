@@ -101,3 +101,7 @@ arrow = ["zu-zu1/arrow"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "relprops"
+harness = false

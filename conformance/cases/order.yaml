@@ -1,0 +1,286 @@
+schema: 1
+suite: order
+doc: The order values sort in, which is a property of the type system rather than of any one type: values of different types compare, and what they compare to is fixed. A client sorting rows itself, or checking a result against an expectation it sorted itself, has to sort them the same way, and no host language's default comparator does.
+
+cases:
+  - name: ascending
+    doc: The plain case, so that a client failing the whole suite fails on something with one type in it and the report says whether the problem is sorting at all.
+    query: UNWIND [3, 1, 2] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: descending
+    doc: The other direction, spelled out, because a client implementing it as a reversal of the ascending result has to give the same answer as one implementing it as a comparator.
+    query: UNWIND [3, 1, 2] AS n RETURN n ORDER BY n DESC
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: ascending-is-the-default
+    doc: The keyword written out gives what leaving it off gives, which is a parser question rather than a sorting one and is cheap to pin.
+    query: UNWIND [2, 1] AS n RETURN n ORDER BY n ASC
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: nulls-sort-last-ascending
+    doc: A null is greater than every value under an ascending order, which is a choice the standard makes and half the host comparators make the other way.
+    query: UNWIND [1, null, 2] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: NULL
+
+  - name: nulls-sort-last-descending-too
+    doc: Reversing the order does not move the nulls, which is the case that says they are placed by a rule and not by being the largest value. A client implementing DESC as a reversal of ASC puts them first.
+    query: UNWIND [1, null, 2] AS n RETURN n ORDER BY n DESC
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: NULL
+
+  - name: booleans
+    doc: False before true, which is the only order two booleans can have and is still a decision somebody made.
+    query: UNWIND [true, false] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: booleans-compare
+    doc: The same fact as an operator rather than as a sort, because a client with a comparison path separate from its sort has both to get right.
+    query: RETURN false < true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: integers-and-floats-interleave
+    doc: The two numeric types sort against each other by value and not in two blocks, which is what a client sorting by type first and value second produces.
+    query: UNWIND [2, 1.5, 1] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: FLOAT64
+            value: "1.5"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-boolean-sorts-before-a-number
+    doc: The first step of the order across types. It is not derived from anything about booleans or numbers, it is a list the standard gives, and this case and the three below are that list.
+    query: RETURN true < 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-number-sorts-before-a-string
+    doc: The second step, which is where a client comparing by the printed form puts the digits among the letters instead.
+    query: RETURN 1 < 'a' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-string-sorts-before-a-list
+    doc: The third step, and the one a client that renders a list as text before comparing gets wrong in whichever direction its rendering happens to fall.
+    query: RETURN 'a' < [1] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-whole-order-across-types
+    doc: All five kinds in one sort: boolean, then number, then string, then list, then null. A client that has to write this order down anywhere writes it down from here.
+    query: UNWIND [1, 'a', true, null, [1]] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: a
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+      - values:
+          - type: NULL
+
+  - name: two-keys
+    doc: A sort on two columns settles ties with the second, which is where a client using a comparator that is not stable and does not look at the second key gives an order that changes between runs.
+    query: UNWIND ['b', 'a'] AS a UNWIND [2, 1] AS b RETURN a, b ORDER BY a, b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: a
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: a
+          - type: INT64
+            value: "2"
+      - values:
+          - type: STRING
+            value: b
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: b
+          - type: INT64
+            value: "2"
+
+  - name: an-expression-as-the-key
+    doc: The sort key does not have to be a returned column, so the rows come back in an order nothing in them explains, which is the case a client re-sorting what it received cannot reproduce and must not attempt.
+    query: UNWIND [1, 2, 3] AS n RETURN n ORDER BY -n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: skip-and-limit
+    doc: A window over the sorted rows, counted in rows and from zero, which is where a client whose paging is one-based returns the wrong row and not an error.
+    query: UNWIND [1, 2, 3] AS n RETURN n ORDER BY n SKIP 1 LIMIT 1
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: limit-after-a-descending-sort
+    doc: The limit applies to the ordered rows and not to the rows on the way in, so this is the two largest and not the first two unwound.
+    query: UNWIND [1, 2, 3] AS n RETURN n ORDER BY n DESC LIMIT 2
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: distinct-keeps-one-of-each
+    doc: DISTINCT compares with the same equality the operator uses, which is the connection between this suite and every other one.
+    query: UNWIND [1, 1, 2] AS n RETURN DISTINCT n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: distinct-treats-nulls-as-one-value
+    doc: Two nulls collapse into one under DISTINCT even though they do not compare equal, because grouping is not the equality operator and this is the place the two rules visibly differ.
+    query: UNWIND [null, null] AS n RETURN DISTINCT n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: distinct-across-numeric-types
+    doc: An integer and the float of the same value are one value under DISTINCT, and the one that survives is the first seen, which is why the row here is an integer and not a float.
+    query: UNWIND [1, 1.0] AS n RETURN DISTINCT n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: rows-keep-their-order-without-a-sort
+    doc: UNWIND without an ORDER BY gives the elements in the order they were written. Nothing promises this in general, and it is asserted here for the one operator whose whole job is to produce an ordered sequence, because a client that reorders rows on the way through would pass every sorted case in the corpus and still be wrong.
+    query: UNWIND [3, 1, 2] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"

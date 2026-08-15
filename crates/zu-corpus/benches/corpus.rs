@@ -3,13 +3,13 @@
 //! Nothing here is on a query path, so there is no latency budget to
 //! defend. Two things are worth measuring anyway.
 //!
-//! The first is the shape of the reader's curve. The corpus is a few
-//! dozen cases today and the plan is a few hundred, in nine
+//! The first is the shape of the reader's curve. The corpus is a couple
+//! of hundred cases today and will be a few thousand, in nine
 //! repositories, read on every CI run of every one of them. A reader
 //! that is quadratic in the number of cases is not a problem at thirty
 //! and is one at three thousand, and the cheapest moment to find that
-//! out is before the cases exist. So the fixture goes to sizes the real
-//! corpus will not reach, and the assertion is on the per-case cost
+//! out is before the cases exist. So the fixture goes past the size the
+//! real corpus is heading for, and the assertion is on the per-case cost
 //! rather than on any absolute number.
 //!
 //! The second is the split between reading and running. Every case gets
@@ -17,10 +17,10 @@
 //! out of the next case and is also the most expensive thing the runner
 //! does. Knowing what that costs per case is what says whether the rule
 //! survives the corpus growing tenfold, and the number below says it
-//! does: about 4 ms a case against about 4 us to read one, three orders
+//! does: about 4 ms a case against about 3 us to read one, three orders
 //! of magnitude apart. So the reader is not worth optimizing and the
 //! database-per-case rule is the only thing that would ever need
-//! revisiting, at around a second for a thousand cases.
+//! revisiting, at around four seconds for a thousand cases.
 //!
 //! Run: cargo bench -p zu-corpus --bench corpus
 

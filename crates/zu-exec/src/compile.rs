@@ -1048,6 +1048,17 @@ impl Compiler<'_> {
                         cols: Vec::new(),
                     });
                     self.slot_level.insert(slot, to_level);
+                    // Only the semi passes its keys sideways. What the
+                    // filter says about an outer row is that no build
+                    // key can match it, and only under a semi is that
+                    // the same as dropping the row: the anti keeps
+                    // exactly those rows and the left join carries them
+                    // on with a null bound to the level, so a filter
+                    // there would be answering the query rather than
+                    // narrowing it.
+                    if self.sip == Sip::On && group.kind == BracketKind::Semi {
+                        self.sips.push((table.clone(), key));
+                    }
                     let head = ops.len();
                     ops.push(Op::Bracket {
                         len: 0,
@@ -1118,6 +1129,10 @@ impl Compiler<'_> {
                         batch: false,
                         close: None,
                     });
+                    // A join probing off this level wants its filter
+                    // here, where the level is made, and the walk is
+                    // what makes it.
+                    self.sip_at.insert(to_level, ops.len());
                 }
                 // A bracketed hop, in the one shape the bracket covers:
                 // a single hop introducing the far node, with the

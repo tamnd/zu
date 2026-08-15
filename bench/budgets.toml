@@ -640,6 +640,21 @@ exec_sip_range_x = 1.10
 exec_sip_mask_x = 0.85
 exec_sip_best_x = 1.15
 
+# The third shape is the same membership test over a level a walk made
+# rather than the scan, and it is where the pass stops being one probe
+# saved and starts being a row never built. The filter goes into the
+# walk, so a neighbor no build key can match is dropped while it is
+# still a value in a neighbor list, and the row that would have carried
+# it, and the gather that would have read its columns, never happen.
+# The two shapes above cannot save that half, because by the time the
+# operator sees a row the row is already there.
+#
+# So this floor is a different kind of number from the other two. It is
+# not a wash anywhere, and it grows with what the query reads off the
+# walked level: the case sums a property of it, which is the gather the
+# rejected neighbors stop paying for.
+exec_sip_walk_x = 1.50
+
 # The summed arithmetic projection at one worker, M rows/s (perf/05
 # section 5): two million people and `sum(p.score * 2 + p.bucket)`,
 # which returns one row, so nothing is built and the number is the

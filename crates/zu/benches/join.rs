@@ -21,7 +21,7 @@
 //! table order, and that is what makes the answer match the old engine
 //! row for row rather than just as a set.
 //!
-//! Eleven shapes. A unique build key, where every probe finds exactly
+//! Twelve shapes. A unique build key, where every probe finds exactly
 //! one row and the table is at its widest. A key with a thousand rows
 //! under it, where the probe side is small and the cost is streaming
 //! payload. A probe that misses everything, which is the tag doing its
@@ -39,26 +39,32 @@
 //! is there for every other outer row, so it is the one that would
 //! double its own answer if a hit failed to drop the row.
 //!
-//! The last two are the sideways pass of perf/13 section 1, and each
+//! The last three are the sideways pass of perf/13 section 1, and each
 //! is timed twice, once with the join publishing what it knows about
 //! its keys to the level it probes and once with ZU_SIP=0 holding it
 //! back. One is the membership test: the build keys are eight apart,
 //! which is dense enough for the exact filter, so seven probe rows in
-//! eight are dropped before the probe reads them. The other is the
+//! eight are dropped before the probe reads them. The next is the
 //! range going down into the scan: the build side's keys are city
 //! numbers and the probe's climb with the row, so every chunk but the
 //! first sits outside the range and is skipped without being decoded.
 //!
-//! What those two ratios do not show yet is the pass at its best. The
+//! The third is the same membership test over a level a walk made
+//! rather than the scan, which is an EXISTS block tied to the walked
+//! node by an equality. There the filter goes into the walk itself:
+//! the neighbors it rejects are dropped while they are still values in
+//! a list, so no row is built for them and the property the query
+//! reads off that level is never gathered for them. That is the shape
+//! where the pass stops being worth one probe a row and starts being
+//! worth the row.
+//!
+//! What the first two ratios do not show is the pass at its best. The
 //! join builds the side the optimizer estimated dearer and drives the
 //! cheaper one, so the filter is published from the big side onto the
 //! small one, which is the direction with the least to gain, and the
 //! build of the big side is what is left in the number either way.
 //! Turning that around is the join side choice, not this, and it is
-//! the next thing on zu#76. The other half of it is the scan taking
-//! the filter rather than an operator reading rows the scan has
-//! already decoded, which is what would make an inexact filter worth
-//! running at all.
+//! the next thing on zu#76.
 //!
 //! Every case is crosschecked against the generators, so a join that
 //! loses rows, repeats them or lands them on the wrong key fails here.
@@ -79,7 +85,9 @@
 //! every host and those two only have to catch a filter that started
 //! costing. exec_sip_best_x is the one above one: the better of the
 //! two shapes on the host in front of it, which is the claim that the
-//! pass is worth running at all.
+//! pass is worth running at all. exec_sip_walk_x floors the filter
+//! that goes into the walk, and that one sits above one on every host,
+//! because a row it rejects is a row nothing builds.
 //!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench join
 
@@ -278,6 +286,12 @@ enum Sip {
     No,
     Mask,
     Range,
+    /// The same membership test, over a level a walk made rather than
+    /// the scan. There the filter goes into the walk itself, so a
+    /// neighbor it rejects is dropped while it is still a value in a
+    /// list and no row is ever built for it, which is a whole gather
+    /// the rejected rows stop paying for rather than one probe.
+    Walk,
 }
 
 fn main() {
@@ -342,6 +356,24 @@ fn main() {
     // probe row survives exactly when its pair is a multiple of the
     // spread.
     let sparse_hit = |i: u64| pair(i).is_multiple_of(SPREAD);
+    // The same key read off the far end of a hop. A neighbor survives
+    // when its own id is one of the sparse keys, which is one in eight
+    // of them, and the query sums a property of the ones that do, so
+    // the rows the filter rejects are rows nothing gathers for.
+    let walk_rows = edges
+        .iter()
+        .filter(|&&(_, d)| u64::from(d).is_multiple_of(SPREAD))
+        .count() as u64;
+    let walk_total: i64 = edges
+        .iter()
+        .filter(|&&(_, d)| u64::from(d).is_multiple_of(SPREAD))
+        .map(|&(_, d)| city(u64::from(d)) as i64)
+        .sum();
+    let old_walk_total: i64 = edges
+        .iter()
+        .filter(|&&(s, d)| u64::from(s) < OLD_PROBES && u64::from(d).is_multiple_of(SPREAD))
+        .map(|&(_, d)| city(u64::from(d)) as i64)
+        .sum();
     let sparse_out = (0..NODES).filter(|&i| sparse_hit(i)).count() as u64;
     let old_sparse_out = (0..OLD_PROBES).filter(|&i| sparse_hit(i)).count() as u64;
     // The sparse key against the city key: a probe row matches when its
@@ -592,12 +624,36 @@ fn main() {
             out: zone_out,
             sip: Sip::Range,
         },
+        Case {
+            what: "one neighbor in eight survives",
+            new: "MATCH (a:person)-[:knows]->(b) \
+                  WHERE EXISTS { MATCH (c:person) WHERE c.sparse = b.id } \
+                  RETURN sum(b.city) AS n"
+                .into(),
+            old: format!(
+                "MATCH (a:person)-[:knows]->(b) WHERE a.id < {OLD_PROBES} \
+                 AND EXISTS {{ MATCH (c:person) WHERE c.sparse = b.id }} \
+                 RETURN sum(b.city) AS n"
+            ),
+            want: Want {
+                rows: 1,
+                total: walk_total,
+            },
+            old_want: Want {
+                rows: 1,
+                total: old_walk_total,
+            },
+            probes: NODES,
+            out: walk_rows,
+            sip: Sip::Walk,
+        },
     ];
 
     let mut unique = 0.0;
     let mut semi = 0.0;
     let mut worst_mask = f64::MAX;
     let mut worst_range = f64::MAX;
+    let mut worst_walk = f64::MAX;
     for case in cases {
         // The sideways shapes are timed against the same plan with the
         // join's filter withheld, which is the only baseline worth
@@ -621,6 +677,7 @@ fn main() {
                 match case.sip {
                     Sip::Mask => worst_mask = worst_mask.min(x),
                     Sip::Range => worst_range = worst_range.min(x),
+                    Sip::Walk => worst_walk = worst_walk.min(x),
                     Sip::No => unreachable!("only a sip case times twice"),
                 }
                 format!(", filter off {off:.1} ms {x:.1}x")
@@ -678,6 +735,17 @@ fn main() {
              under the {floor}x floor"
         );
         println!("gate: sip mask floor met");
+    }
+    // The filter that goes into the walk is the one shape here where a
+    // rejected row costs nothing at all after the test, so this floor
+    // is above one on every host rather than a no regression gate.
+    if let Some(floor) = budget("exec_sip_walk_x") {
+        assert!(
+            worst_walk >= floor,
+            "the filter taken into the walk leaves the query {worst_walk:.2}x, \
+             under the {floor}x floor"
+        );
+        println!("gate: sip walk floor met");
     }
     // Neither half wins on every host, but one of them always does, and
     // that is the claim worth gating. Which one it is says where the

@@ -37,6 +37,13 @@ key = "rust-version"
 holds = "floor"
 match = "exact"
 
+[[site]]
+component = "rust"
+file = ".github/workflows/libzu.yml"
+key = "toolchain"
+holds = "pinned"
+match = "exact"
+
 [[component]]
 name = "rust-nightly"
 pinned = "nightly-2026-08-14"

@@ -61,6 +61,13 @@ impl Table {
         }
     }
 
+    pub fn bool(&self, key: &str) -> Option<bool> {
+        match self.get(key) {
+            Some(Value::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
     pub fn list(&self, key: &str) -> Option<&[String]> {
         match self.get(key) {
             Some(Value::List(items)) => Some(items),
@@ -360,6 +367,15 @@ mod tests {
     fn a_list_of_anything_but_strings_is_refused() {
         let error = Doc::parse("repos = [1, 2]\n").expect_err("a list of integers");
         assert!(error.contains("in a list is not a string"), "{error}");
+    }
+
+    #[test]
+    fn a_flag_is_read_as_itself_and_not_as_a_word() {
+        let doc = Doc::parse("smoke = true\ncross = false\n").expect("parses");
+        assert_eq!(doc.root.bool("smoke"), Some(true));
+        assert_eq!(doc.root.bool("cross"), Some(false));
+        assert_eq!(doc.root.str("smoke"), None);
+        assert_eq!(doc.root.bool("missing"), None);
     }
 
     #[test]

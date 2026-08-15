@@ -12,7 +12,6 @@ use zu::query::{QueryResult, Value};
 use zu::{DiagnosticRecord, Severity};
 
 mod conformance;
-mod json;
 mod scoreboard;
 mod shell;
 

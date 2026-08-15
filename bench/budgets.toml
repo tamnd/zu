@@ -1106,3 +1106,28 @@ refuse_calibration_ns = 498
 # that defect to come back.
 tail_p99_p50_uniform_x = 5.0
 tail_p99_p50_power_x = 10.0
+
+# One shell frame through the JSON reader, ns (benches/json.rs in
+# zu-json). This is the transport in front of every statement a client
+# sends over the pipe, so it is gated against the warm point read it
+# precedes: session_point_us above is 10 us, and a frame that took a
+# meaningful fraction of that would mean the wire costs more than the
+# database. The frame is an execute with six bound parameters, 119
+# bytes, which is what `zu shell` actually reads.
+#
+# Writing this bench found a defect. The reader copied string contents
+# one scalar at a time and validated UTF-8 by calling from_utf8 on the
+# entire remaining input per character, which is linear per character
+# and quadratic per document. A frame is short enough to hide it at 701
+# ns; a 523 KiB rustdoc document read at 1.24 MB/s against a writer
+# doing 506. Copying each unescaped run whole put the frame at 381 ns
+# and the document at 434 MB/s, flat from 32 KiB to 523 KiB. The bench
+# now measures three document sizes and fails if the rate halves
+# between them, because that is the shape of the defect and a single
+# measurement cannot see it.
+#
+# Measured on the local M series at 381 ns. The ceiling is not set near
+# that: what it exists to catch is a reader that went quadratic again,
+# and that lands orders of magnitude past 2000 on any host. Lower this
+# ceiling, never raise it.
+json_frame_parse_ns = 2000.0

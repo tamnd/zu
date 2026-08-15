@@ -31,7 +31,7 @@ use std::process::ExitCode;
 use zu::query::Value;
 use zu::session::Session;
 
-use crate::json::{self, Json};
+use zu_json::{self as json, Json};
 
 const SHELL_USAGE: &str = "zu shell <file.zu1> [--format jsonl]";
 

@@ -13,7 +13,7 @@
 //! a leaf; a block with a predicate in it has to walk until one friend
 //! passes, and there the hubs are where the walk stops early.
 //!
-//! Six queries run over it. The counted semi is the bare block with
+//! Seven queries run over it. The counted semi is the bare block with
 //! nothing built above it, so it is the degree read and nothing else,
 //! and that is the shape the floor sits on. The counted anti is the
 //! same read with the answer taken the other way round. The third puts
@@ -24,10 +24,14 @@
 //! reading a level the block never touched. The fifth writes the block
 //! on a level the pipeline has already walked off, asking about the
 //! near end of a hop rather than about the rows in hand, which is one
-//! degree read for a whole vector instead of one per row. The sixth is
-//! the same pattern written as a plain required walk, which answers a
-//! different question, one row per edge, and is here because it is the
-//! other shape that reads degrees alone.
+//! degree read for a whole vector instead of one per row. The sixth
+//! writes the block under an OR, which is the mark: the row survives
+//! whatever the block answered and carries the answer as a column the
+//! predicate reads, so the degree read is the same one the counted
+//! semi makes and what changes is that nothing is dropped by it. The
+//! seventh is the same pattern written as a plain required walk, which
+//! answers a different question, one row per edge, and is here because
+//! it is the other shape that reads degrees alone.
 //!
 //! Each one runs twice, once through the pipeline and once with
 //! ZU_EXEC2=0, which is where the five block shapes ran before: an
@@ -227,11 +231,25 @@ fn main() {
         id_total: 0,
     };
 
+    // The mark keeps a row when either side of the OR takes it, so the
+    // block's answer is one column of the decision rather than the
+    // whole of it.
+    let mark = Want {
+        rows: (0..NODES)
+            .filter(|&i| score_of(i) > CUT || any[i as usize])
+            .count() as u64,
+        id_total: 0,
+    };
+
+    let mark_src = format!(
+        "MATCH (p:person) WHERE p.score > {CUT} \
+         OR EXISTS {{ MATCH (p)-[:knows]->(f) }} RETURN count(p) AS n"
+    );
     let filtered_src = format!(
         "MATCH (p:person) WHERE EXISTS {{ MATCH (p)-[:knows]->(f) WHERE f.score > {CUT} }} \
          RETURN count(p) AS n"
     );
-    let cases: [(&str, &str, &Want, usize); 6] = [
+    let cases: [(&str, &str, &Want, usize); 7] = [
         (
             "semi count",
             "MATCH (p:person) WHERE EXISTS { MATCH (p)-[:knows]->(f) } RETURN count(p) AS n",
@@ -258,6 +276,7 @@ fn main() {
             &walked,
             5,
         ),
+        ("mark under an or", &mark_src, &mark, 9),
         (
             "required count",
             "MATCH (p:person)-[:knows]->(f) RETURN count(p) AS n",

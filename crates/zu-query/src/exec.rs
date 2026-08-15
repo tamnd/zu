@@ -803,6 +803,17 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
                 BracketKind::Optional => "Optional",
                 BracketKind::Semi => "Semi",
                 BracketKind::Anti => "Anti",
+                // The mark is the one kind that names something above
+                // it, the variable it writes its answer into, so the
+                // listing says which one that is.
+                BracketKind::Mark { slot, negated } => {
+                    let not = if *negated { "not " } else { "" };
+                    return format!(
+                        "Mark {not}{} into {}",
+                        slot_names(&slots, query),
+                        var(*slot)
+                    );
+                }
             };
             format!("{name} {}", slot_names(&slots, query))
         }
@@ -1137,6 +1148,11 @@ enum OpDesc {
         /// Chunks introduced inside the group.
         chunks: Vec<usize>,
         kind: BracketKind,
+        /// The one-column chunk a mark writes its answer into, made
+        /// below the group so it outlives the rearm and read above the
+        /// group like any other column. `None` for the other kinds,
+        /// which answer by keeping the row or dropping it.
+        mark: Option<usize>,
     },
 }
 
@@ -1705,6 +1721,13 @@ fn compile_bracket(
             b.ensure_flat(c);
         }
     }
+    // The mark's column is made before the boundary: the group's own
+    // chunks are rebound to a null row every time the group is rearmed,
+    // and the answer has to survive that to be read above.
+    let mark = match group.map(|g| g.kind) {
+        Some(BracketKind::Mark { slot, .. }) => Some(b.new_chunk(vec![slot], true)),
+        _ => None,
+    };
     let begin = b.descs.len();
     // The brackets belong to no logical operator, so they carry no
     // estimate and the profile leaves their column blank.
@@ -1737,6 +1760,7 @@ fn compile_bracket(
         begin,
         chunks: (first_chunk..b.chunk_slots.len()).collect(),
         kind: group.expect("a bracket group has a kind").kind,
+        mark,
     });
     b.compactable = None;
     Ok(end)
@@ -3726,8 +3750,9 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             begin,
             chunks,
             kind,
+            mark,
         } => loop {
-            // A semi or an anti bracket is a question about the outer
+            // Every kind but the optional is a question about the outer
             // row and one match answers it, so once it has answered,
             // the group is rearmed on the spot and the rest of its
             // matches are never drawn. An optional wants them all.
@@ -3747,6 +3772,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         null_chunks(ctx, chunks);
                         return Ok(true);
                     }
+                    // The mark keeps the row either way and writes the
+                    // answer down, so a hit is one row carrying true.
+                    BracketKind::Mark { negated, .. } => {
+                        null_chunks(ctx, chunks);
+                        write_mark(ctx, *mark, !negated);
+                        return Ok(true);
+                    }
                     // A hit is what an anti bracket rejects, and the
                     // group's remaining matches would say the same.
                     BracketKind::Anti => continue,
@@ -3761,6 +3793,9 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             rearm_bracket(ctx, *begin, i);
             if missed && *kind != BracketKind::Semi {
                 null_chunks(ctx, chunks);
+                if let BracketKind::Mark { negated, .. } = kind {
+                    write_mark(ctx, *mark, *negated);
+                }
                 return Ok(true);
             }
         },
@@ -3774,6 +3809,19 @@ fn rearm_bracket(ctx: &mut StageCtx, begin: usize, end: usize) {
         *s = OpState::default();
     }
     ctx.states[end].pos = 0;
+}
+
+/// Writes a mark bracket's answer into the column made for it, which is
+/// what the predicate around the block reads instead of the block.
+fn write_mark(ctx: &mut StageCtx, chunk: Option<usize>, hit: bool) {
+    let Some(c) = chunk else {
+        debug_assert!(false, "a mark bracket without a column to write into");
+        return;
+    };
+    let chunk = &mut ctx.chunks[c];
+    chunk.cols[0] = vec![Value::Bool(hit)];
+    chunk.size = 1;
+    chunk.cur = Some(0);
 }
 
 /// Binds a bracket's chunks to a single null row, which is both what an

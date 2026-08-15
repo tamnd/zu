@@ -105,6 +105,20 @@ Two consumers are named in the checklist and are not covered yet, deliberately a
 
 CI runs it with zu-web cloned beside this tree, tracking that repository's main rather than a pin, because a word that changed meaning has changed for this repository the moment it changed for the site. The whole tree is 3.7 MiB of source and the check is about 14 ms, because forms are indexed by their first word: a line costs one hash lookup per word no matter how large the table gets, which is what makes adding a term a decision about the word and not about the budget. `cargo bench -p xtask --bench terms` asserts both, the cost staying linear in the prose and flat in the size of the table.
 
-## 9. Documentation deliverables (v1.0 gate)
+## 9. The pinned toolchain table
+
+Nine repositories build one release out of one set of versions, and the question "which Rust do we build against" stops having one answer the moment it is written in nine workflows: one is bumped, the others are not, and the bug that follows is found by a user on the platform nobody bumped.
+
+`toolchains.toml` at the root of this repository is that table. A row is a component, the version it is pinned to, the oldest version still promised, the repositories that build against it, and a sentence saying why the numbers are what they are. A pin is exact, because "the newest 1.97" is a range and a range is how two machines end up building different things. A floor is a promise rather than a fact, and the conformance matrix runs the floor as well as the pin, because a library that only ever builds against the newest release finds out its floor is broken from a bug report. The table records the date it was audited against the registries.
+
+A component this repository builds against says where its version is written, in a `[[site]]` naming the file, the key, whether the site holds the pin or the floor, and whether it has to say the version exactly or name the series it is in. Exact is what `rust-toolchain.toml` and a workflow say, since those name a release to install. A series is what a cargo requirement of `59` says against `59.2.0`, since writing the patch level in a manifest is a lockfile in the wrong file.
+
+`cargo xtask pins` checks it in both directions, which is the shape the API map already has. Forward: every site exists, holds the key it claims, and agrees with the version. Backward: every `toolchain:` a workflow pins is one the table names, so a job added next month cannot quietly introduce a tenth answer, and a component this repository builds against with no site is reported, since a row nothing holds is a row nobody maintains. It runs as a test on all three platforms of the matrix and as a command in CI, the second because a command nothing exercises is a command that rots.
+
+The whole table against the whole tree is under a millisecond, because a site is one scan of the file it names and there are as many scans as sites. `cargo bench -p xtask --bench pins` asserts that shape rather than the number, the per-site cost staying flat as the table grows, since the way a check like this dies is the accidental square that costs nothing at six sites and is unaffordable at two hundred.
+
+Bumping a version is therefore a pull request that touches this table and every site of it together, which is the entire point of writing it down.
+
+## 10. Documentation deliverables (v1.0 gate)
 
 Format spec (`docs/format-zu1.md`, byte-accurate, enough to write an independent reader), grammar EBNF, GQL conformance declaration, ops guide for s3 engine (cost tuning worked examples), migration guides (Neo4j/Kùzu → zu: data model mapping + Cypher dialect diffs).

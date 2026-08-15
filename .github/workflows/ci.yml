@@ -63,6 +63,18 @@ jobs:
       # stale and then makes the map incomplete, and seeing both at
       # once is one round trip rather than two.
       - run: cargo xtask api-map
+      # The nightly two lines above is one of the versions this checks,
+      # which is the shape of the whole thing: one table says what every
+      # repository builds against, and every place that would otherwise
+      # hold its own answer has to agree with it. It runs as a test as
+      # well, on stable, in every job of the matrix below, so a bump
+      # that misses a site fails on the machine of whoever made it.
+      - run: cargo run -p xtask -- pins
+      # Nine repositories will run this on every push, so what the bench
+      # asserts is the shape rather than the number: the cost per site
+      # stays flat as the table grows, which is the difference between a
+      # scan per site and a scan of everything per site.
+      - run: cargo bench -p xtask --bench pins
 
   deny:
     runs-on: ubuntu-latest

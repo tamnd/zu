@@ -32,6 +32,10 @@ harness = false
 name = "terms"
 harness = false
 
+[[bench]]
+name = "pins"
+harness = false
+
 [dependencies]
 crc32c.workspace = true
 zstd.workspace = true

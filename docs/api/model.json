@@ -1575,7 +1575,14 @@
       "kind": "function",
       "name": "schema_of",
       "signature": "fn schema_of(catalog: &zu::zu1::catalog::Catalog) -> zu_common::Result<zu_query::binder::Schema>",
-      "doc": "Builds the binder schema from a zu1 catalog."
+      "doc": "Builds the binder schema for the home graph, which is the graph a\nstatement is against when nothing said otherwise."
+    },
+    {
+      "id": "zu::query::schema_of_graph",
+      "kind": "function",
+      "name": "schema_of_graph",
+      "signature": "fn schema_of_graph(catalog: &zu::zu1::catalog::Catalog, graph: u32) -> zu_common::Result<zu_query::binder::Schema>",
+      "doc": "Builds the binder schema from one graph of a zu1 catalog. A query\nsees the tables of the graph it runs against and no others, which\nis what lets two graphs in one file both hold a `person`."
     },
     {
       "id": "zu::session",
@@ -2512,6 +2519,14 @@
       "signature": "fn has_schema(&self, path: &str) -> bool"
     },
     {
+      "id": "zu::zu1::catalog::Catalog::home_graph_id",
+      "kind": "method",
+      "name": "home_graph_id",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn home_graph_id(&self) -> u32",
+      "doc": "The id of the home graph, which is the first graph a file has\nand keeps its id for the file's life. A file whose home graph\nwas dropped and not yet put back reads as the id the first one\nhad, which is the id `ensure_home` gives it back."
+    },
+    {
       "id": "zu::zu1::catalog::Catalog::infer_graph_type",
       "kind": "method",
       "name": "infer_graph_type",
@@ -2569,7 +2584,16 @@
       "kind": "method",
       "name": "node_by_name",
       "of": "zu::zu1::catalog::Catalog",
-      "signature": "fn node_by_name(&self, name: &str) -> Option<&NodeTable>"
+      "signature": "fn node_by_name(&self, name: &str) -> Option<&NodeTable>",
+      "doc": "The node table of that name in the home graph, which is the\ngraph every load writes into and the one a statement means when\nnothing says otherwise. A name is a name in a graph and not in a\nfile, so a name two graphs both use is two tables and this\nanswers the home one."
+    },
+    {
+      "id": "zu::zu1::catalog::Catalog::node_in",
+      "kind": "method",
+      "name": "node_in",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn node_in(&self, graph: u32, name: &str) -> Option<&NodeTable>",
+      "doc": "The node table a graph calls that name."
     },
     {
       "id": "zu::zu1::catalog::Catalog::node_tables",
@@ -2591,6 +2615,13 @@
       "name": "rel_by_name",
       "of": "zu::zu1::catalog::Catalog",
       "signature": "fn rel_by_name(&self, name: &str) -> Option<&RelTable>"
+    },
+    {
+      "id": "zu::zu1::catalog::Catalog::rel_in",
+      "kind": "method",
+      "name": "rel_in",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn rel_in(&self, graph: u32, name: &str) -> Option<&RelTable>"
     },
     {
       "id": "zu::zu1::catalog::Catalog::rel_tables",

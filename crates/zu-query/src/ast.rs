@@ -155,7 +155,22 @@ pub struct PropertyDef {
 /// A whole query: clauses in source order, ending in `RETURN`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    /// GQ01: the graph the clauses below run against, written as a
+    /// `USE` clause in front of them. `None` is a query with no `USE`,
+    /// which runs against whatever graph the session is working in.
+    pub use_graph: Option<GraphRef>,
     pub clauses: Vec<Clause>,
+}
+
+/// What a `USE` clause names (ISO 16.2, `use graph clause`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphRef {
+    /// `USE CURRENT_PROPERTY_GRAPH`, the graph the session is already
+    /// working in, which is what the clause names when it names no
+    /// name at all.
+    Current,
+    /// A graph in the catalog, by name and by the schema it is in.
+    Named(GraphName),
 }
 
 #[derive(Debug, Clone, PartialEq)]

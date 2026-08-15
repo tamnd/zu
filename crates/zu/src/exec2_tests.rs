@@ -74,7 +74,8 @@ fn run_both(
     threads: usize,
     sip: Sip,
 ) -> (Option<exec::QueryResult>, exec::QueryResult) {
-    let (query, plan, _) = query::compile(source, schema).unwrap();
+    let (query, plan, _) =
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
     assert!(query.params.is_empty(), "parity queries take no params");
     let options = Options {
         threads,
@@ -825,7 +826,8 @@ fn unclaimed_shapes_fall_back() {
 /// Chunks the scan never decoded, which is what the zone map bought
 /// this query.
 fn zone_skipped(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
-    let (query, plan, _) = query::compile(source, schema).unwrap();
+    let (query, plan, _) =
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
     let options = Options {
         threads: 1,
         ..Options::default()
@@ -871,7 +873,8 @@ fn a_float_bound_skips_the_chunks_its_integer_bound_skips() {
 
 /// Chunks the scan decoded and then took rows out of.
 fn zone_thinned(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) -> u64 {
-    let (query, plan, _) = query::compile(source, schema).unwrap();
+    let (query, plan, _) =
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
     let options = Options {
         threads: 1,
         ..Options::default()

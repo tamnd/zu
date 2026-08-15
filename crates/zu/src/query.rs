@@ -23,11 +23,20 @@ use zu_common::{FloatBits, LogicalType, Temporal};
 /// depending on `zu-query`.
 pub use zu_query::exec::{QueryResult, Value};
 
-/// Builds the binder schema from a zu1 catalog.
+/// Builds the binder schema for the home graph, which is the graph a
+/// statement is against when nothing said otherwise.
 pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
+    schema_of_graph(catalog, catalog.home_graph_id())
+}
+
+/// Builds the binder schema from one graph of a zu1 catalog. A query
+/// sees the tables of the graph it runs against and no others, which
+/// is what lets two graphs in one file both hold a `person`.
+pub fn schema_of_graph(catalog: &Catalog, graph: u32) -> Result<Schema> {
     let nodes = catalog
         .node_tables()
         .iter()
+        .filter(|n| n.graph == graph)
         .map(|n| NodeDef {
             id: n.id,
             name: n.name.clone(),
@@ -38,6 +47,7 @@ pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
     let rels = catalog
         .rel_tables()
         .iter()
+        .filter(|r| r.graph == graph)
         .map(|r| RelDef {
             id: r.id,
             name: r.name.clone(),
@@ -63,14 +73,16 @@ pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
 /// Parses and binds one query against a zu1 catalog.
 pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
     let parsed = parser::parse(source)?;
-    binder::bind(&parsed, &schema_of(catalog)?)
+    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed)?;
+    binder::bind(&parsed, &schema_of_graph(catalog, graph)?)
 }
 
 /// Parses, binds, plans, and optimizes one query, returning the
 /// EXPLAIN listing of the plan that would execute.
 pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
-    let schema = schema_of(catalog)?;
     let parsed = parser::parse(source)?;
+    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed)?;
+    let schema = schema_of_graph(catalog, graph)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
     let (optimized, notes) = optimizer::optimize_noted(built, &query, &schema)?;
@@ -552,7 +564,16 @@ struct Prepared {
 /// [`Session`]: crate::session::Session
 pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
     let catalog = Catalog::load(db)?;
-    let mut schema = schema_of(&catalog)?;
+    let schema = schema_with_stats(db, &catalog, catalog.home_graph_id())?;
+    Ok((catalog, schema))
+}
+
+/// The same schema for one graph of an already loaded catalog, which
+/// is what a `USE` of a second graph needs. The statistics are keyed
+/// by table id and a graph's tables are a subset of the file's, so the
+/// ones this schema has no table for are simply never asked for.
+pub(crate) fn schema_with_stats(db: &mut Zu1File, catalog: &Catalog, graph: u32) -> Result<Schema> {
+    let mut schema = schema_of_graph(catalog, graph)?;
     // The stats chain feeds the optimizer's degree histograms; a file
     // written before stats existed simply attaches nothing and every
     // estimate falls back to the count ratios.
@@ -625,18 +646,43 @@ pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
             .map(|(id, r)| (id, [r.out_hist, r.in_hist]))
             .collect(),
     );
-    Ok((catalog, schema))
+    Ok(schema)
 }
 
-/// Parses, binds, plans, and optimizes one query against a schema.
-/// Everything here depends only on the query text and the schema, so
-/// the result is what a plan cache stores.
-pub(crate) fn compile(
-    source: &str,
+/// The graph a parsed query is against, given the graph the caller is
+/// working in. A `USE` naming a graph the catalog does not hold is a
+/// reference that resolves to nothing, which is what `42002` says.
+pub(crate) fn graph_of(
+    catalog: &Catalog,
+    working: u32,
+    query: &zu_query::ast::Query,
+) -> Result<u32> {
+    use zu_query::ast::GraphRef;
+    let Some(GraphRef::Named(name)) = &query.use_graph else {
+        return Ok(working);
+    };
+    let schema = name.schema.as_deref().unwrap_or("/");
+    catalog
+        .graph(schema, &name.name)
+        .map(|g| g.id)
+        .ok_or_else(|| {
+            ZuError::gql(
+                codes::C42002,
+                format!("USE names '{}', which is no graph in '{schema}'", name.name),
+            )
+        })
+}
+
+/// Binds, plans, and optimizes one parsed query against a schema.
+/// Everything here depends only on the query and the schema, so the
+/// result is what a plan cache stores. It takes the parse rather than
+/// the text because the caller had to read the `USE` clause to know
+/// which graph's schema to compile against.
+pub(crate) fn compile_parsed(
+    parsed: &zu_query::ast::Query,
     schema: &Schema,
 ) -> Result<(BoundQuery, plan::LogicalPlan, Vec<String>)> {
-    let parsed = parser::parse(source)?;
-    let query = binder::bind(&parsed, schema)?;
+    let query = binder::bind(parsed, schema)?;
     let built = plan::build(&query)?;
     let (plan, notes) = optimizer::optimize_noted(built, &query, schema)?;
     Ok((query, plan, notes))
@@ -679,8 +725,13 @@ pub(crate) fn catalog_statement(source: &str) -> Result<Option<zu_query::ast::Ca
 }
 
 fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Prepared> {
-    let (catalog, schema) = load_schema(db)?;
-    let (query, plan, notes) = compile(source, &schema)?;
+    let catalog = Catalog::load(db)?;
+    let parsed = parser::parse(source)?;
+    // A one-shot call has no session, so the graph it works in is the
+    // home graph and a `USE` is the only way to name another one.
+    let graph = graph_of(&catalog, catalog.home_graph_id(), &parsed)?;
+    let schema = schema_with_stats(db, &catalog, graph)?;
+    let (query, plan, notes) = compile_parsed(&parsed, &schema)?;
     let args = bind_args(&query.params, params)?;
     Ok(Prepared {
         catalog,

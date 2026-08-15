@@ -213,6 +213,14 @@ jobs:
       # corpus grows. The bench fails rather than reporting when it
       # does not.
       - run: cargo bench -p zu-corpus --bench corpus
+      # The artifact eight other repositories consume, built here on
+      # every pull request rather than for the first time on the day of
+      # a release. `--check` writes nothing: what is being gated is that
+      # the corpus still packs and that every case in it parses, which
+      # is the packer's own precondition and the cheapest place to find
+      # out it does not hold.
+      - run: cargo run -p xtask -- corpus-pack --check
+      - run: cargo bench -p xtask --bench corpus
 
   fuzz:
     runs-on: ubuntu-latest

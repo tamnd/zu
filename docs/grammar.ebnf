@@ -16,8 +16,9 @@ query           = [ use_clause ] , { reading_clause } , return_clause ,
    graph an expression computes is not a graph this file holds. A query
    with no USE is against the graph the session is working in, which is
    the home graph. *)
-use_clause      = "USE" , ( "CURRENT_PROPERTY_GRAPH" | "CURRENT_GRAPH"
-                  | [ [ "PROPERTY" ] , "GRAPH" ] , graph_name ) ;
+use_clause      = "USE" , graph_ref ;
+graph_ref       = "CURRENT_PROPERTY_GRAPH" | "CURRENT_GRAPH"
+                  | [ [ "PROPERTY" ] , "GRAPH" ] , graph_name ;
 
 (* Catalog statements (docs/07 §9). They change what the file declares
    and answer no rows, so they are told apart from a query by their
@@ -31,7 +32,7 @@ drop_schema     = "DROP" , "SCHEMA" , [ "IF" , "EXISTS" ] , schema_path ,
                   [ ";" ] ;
 create_graph    = "CREATE" , [ "OR" , "REPLACE" ] , [ "PROPERTY" ] , "GRAPH" ,
                   [ "IF" , "NOT" , "EXISTS" ] , graph_name , graph_type_ref ,
-                  [ "AS" , "COPY" , "OF" , name ] , [ ";" ] ;
+                  [ "AS" , "COPY" , "OF" , graph_ref ] , [ ";" ] ;
 drop_graph      = "DROP" , [ "PROPERTY" ] , "GRAPH" , [ "IF" , "EXISTS" ] ,
                   graph_name , [ ";" ] ;
 create_graph_type = "CREATE" , [ "OR" , "REPLACE" ] , [ "PROPERTY" ] , "GRAPH" ,

@@ -442,6 +442,29 @@ fn covered_shapes_match_the_old_engine() {
          AND NOT EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } RETURN count(a) AS n",
         "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
          AND NOT EXISTS { MATCH (a)-[:knows]->(c) } RETURN count(a) AS n",
+        // The same two the other way round, the bracketed one first.
+        // What follows a bracket runs inside it, where the newest level
+        // is the null the group bound, and a bare block is the one
+        // thing that does not mind: it reads the outer row off its pin
+        // and answers off the degrees. Once counted, once returning the
+        // rows, and once with the bare block negated.
+        "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } \
+         AND EXISTS { MATCH (a)-[:knows]->(b) } RETURN count(a) AS n",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } \
+         AND EXISTS { MATCH (a)-[:knows]->(b) } RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } \
+         AND NOT EXISTS { MATCH (a)-[:knows]->(b) } RETURN count(a) AS n",
+        // A block written on a level the pipeline has already walked
+        // off: the question is about the row that level's pin holds and
+        // every row in hand came off it, so one degree read decides for
+        // the whole vector. Once as a semi, once negated, and once two
+        // hops out where the level it names is two pins down.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 AND EXISTS { MATCH (a)-[:knows]->(c) } \
+         RETURN a.id AS a, b.id AS b ORDER BY b",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 \
+         AND NOT EXISTS { MATCH (a)-[:knows]->(c) } RETURN a.id AS a, b.id AS b ORDER BY b",
+        "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) WHERE a.age = 13 \
+         AND EXISTS { MATCH (a)-[:knows]->(d) } RETURN count(*) AS n",
         // A block over a pattern with no variable in common with the
         // outer row, tied to it by an equality: the walk a hop would do
         // is a probe into a table built off the other side, and the
@@ -712,17 +735,12 @@ fn unclaimed_shapes_fall_back() {
          RETURN count(*) AS n",
         "MATCH (a:person) WHERE a.id < 20 OPTIONAL MATCH (b:person) WHERE b.name = a.name \
          RETURN count(*) AS n",
-        // Two blocks stacked with the bracketed one written first:
-        // what follows a bracket runs inside it, off a level the group
-        // holds, and the pipeline has no shape for that yet.
+        // Two blocks stacked with the bracketed one written first and
+        // the second one a group as well: it would run inside the
+        // first, walking off the null level that one left as the
+        // newest.
         "MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 } \
-         AND EXISTS { MATCH (a)-[:knows]->(b) } RETURN count(a) AS n",
-        // A block written on a level the pipeline has already walked
-        // off asks about a row that is pinned rather than about the
-        // rows in hand, which neither the degree read nor the bracket
-        // is.
-        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 AND EXISTS { MATCH (a)-[:knows]->(c) } \
-         RETURN a.id AS a, b.id AS b",
+         AND EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } RETURN count(a) AS n",
         // A block over an untied pattern is a cross product against the
         // whole of the other side, which the probe has no key for.
         "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age > 90 } \

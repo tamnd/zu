@@ -21,7 +21,7 @@
 //! table order, and that is what makes the answer match the old engine
 //! row for row rather than just as a set.
 //!
-//! Twelve shapes. A unique build key, where every probe finds exactly
+//! Thirteen shapes. A unique build key, where every probe finds exactly
 //! one row and the table is at its widest. A key with a thousand rows
 //! under it, where the probe side is small and the cost is streaming
 //! payload. A probe that misses everything, which is the tag doing its
@@ -57,6 +57,17 @@
 //! reads off that level is never gathered for them. That is the shape
 //! where the pass stops being worth one probe a row and starts being
 //! worth the row.
+//!
+//! The last shape is the mark, which is the same probe once more with
+//! the answer written down rather than acted on. The block stands
+//! beside an OR, so it may not drop the row it was written about, and
+//! what it leaves is a column of the level it was written on. Nothing
+//! is built and no operator runs: the directory is asked once per row
+//! and the payload is never touched. Every row of the table is counted
+//! here and none is dropped, so the number to read it against is the
+//! membership case above, which asks the same table about the same
+//! keys and keeps one probe row in eight: a mark over the whole table
+//! lands near what that case pays for the eighth of it that lives.
 //!
 //! What the first two ratios do not show is the pass at its best. The
 //! join builds the side the optimizer estimated dearer and drives the
@@ -260,12 +271,18 @@ fn measure_sip(db: &mut Zu1File, source: &str, want: &Want, runs: usize) -> (f64
 
 /// One case: the query the pipeline runs, the cut down one the old
 /// engine runs, and what each has to answer.
+///
+/// The old engine's query is missing on one shape, and the reason is
+/// worth stating rather than hiding: the driving side is cut by a
+/// predicate, and a predicate cannot be pushed under a block the old
+/// engine answers per row, so the cut lands above it and every row of
+/// the table is asked anyway. A million rows each scanning a million is
+/// a week, so that shape reports the pipeline alone and says so.
 struct Case {
     what: &'static str,
     new: String,
-    old: String,
+    old: Option<(String, Want)>,
     want: Want,
-    old_want: Want,
     probes: u64,
     out: u64,
     /// Which half of the sideways pass this shape is here to measure,
@@ -374,6 +391,14 @@ fn main() {
         .filter(|&&(s, d)| u64::from(s) < OLD_PROBES && u64::from(d).is_multiple_of(SPREAD))
         .map(|&(_, d)| city(u64::from(d)) as i64)
         .sum();
+    // The same key asked about as a mark, which is the block standing
+    // beside an OR. A row is counted when its own id is one of the
+    // sparse keys, so one row in a spread, or when the other side of
+    // the OR wants it anyway, which the city key makes one row in a
+    // thousand. Nothing is dropped by the block, so what the answer
+    // measures is the column being written for every row of the scan.
+    let mark_hit = |i: u64| i.is_multiple_of(SPREAD) || city(i) == 0;
+    let mark_out = (0..NODES).filter(|&i| mark_hit(i)).count() as u64;
     let sparse_out = (0..NODES).filter(|&i| sparse_hit(i)).count() as u64;
     let old_sparse_out = (0..OLD_PROBES).filter(|&i| sparse_hit(i)).count() as u64;
     // The sparse key against the city key: a probe row matches when its
@@ -401,17 +426,19 @@ fn main() {
         Case {
             what: "unique key",
             new: "MATCH (a:person), (b:person) WHERE a.id = b.pair RETURN count(*) AS n".into(),
-            old: format!(
-                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.id = b.pair \
+            old: Some((
+                format!(
+                    "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.id = b.pair \
                  RETURN count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: OLD_PROBES as i64,
+                },
+            )),
             want: Want {
                 rows: 1,
                 total: unique_out as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: OLD_PROBES as i64,
             },
             probes: NODES,
             out: unique_out,
@@ -423,17 +450,19 @@ fn main() {
                 "MATCH (a:person), (b:person) WHERE a.id < {city_probes} AND a.city = b.city \
                  RETURN count(*) AS n"
             ),
-            old: format!(
-                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.city = b.city \
+            old: Some((
+                format!(
+                    "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.city = b.city \
                  RETURN count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: old_city_out as i64,
+                },
+            )),
             want: Want {
                 rows: 1,
                 total: city_out as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: old_city_out as i64,
             },
             probes: city_probes,
             out: city_out,
@@ -442,12 +471,14 @@ fn main() {
         Case {
             what: "every probe misses",
             new: "MATCH (a:person), (b:person) WHERE a.far = b.pair RETURN count(*) AS n".into(),
-            old: format!(
-                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.far = b.pair \
+            old: Some((
+                format!(
+                    "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.far = b.pair \
                  RETURN count(*) AS n"
-            ),
+                ),
+                Want { rows: 1, total: 0 },
+            )),
             want: Want { rows: 1, total: 0 },
-            old_want: Want { rows: 1, total: 0 },
             probes: NODES,
             out: 0,
             sip: Sip::No,
@@ -457,17 +488,19 @@ fn main() {
             new: "MATCH (a:person), (b:person) WHERE a.id = b.pair \
                   RETURN b.city AS town, count(*) AS n"
                 .into(),
-            old: format!(
-                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.id = b.pair \
+            old: Some((
+                format!(
+                    "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.id = b.pair \
                  RETURN b.city AS town, count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: old_towns,
+                    total: OLD_PROBES as i64,
+                },
+            )),
             want: Want {
                 rows: cities_hit,
                 total: unique_out as i64,
-            },
-            old_want: Want {
-                rows: old_towns,
-                total: OLD_PROBES as i64,
             },
             probes: NODES,
             out: unique_out,
@@ -478,17 +511,19 @@ fn main() {
             new: "MATCH (a:person), (b:person)-[:knows]->(c) WHERE a.id = b.pair \
                   RETURN count(*) AS n"
                 .into(),
-            old: format!(
-                "MATCH (a:person), (b:person)-[:knows]->(c) WHERE a.id < {OLD_PROBES} \
+            old: Some((
+                format!(
+                    "MATCH (a:person), (b:person)-[:knows]->(c) WHERE a.id < {OLD_PROBES} \
                  AND a.id = b.pair RETURN count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: old_hop_out as i64,
+                },
+            )),
             want: Want {
                 rows: 1,
                 total: hop_out as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: old_hop_out as i64,
             },
             probes: NODES,
             out: hop_out,
@@ -499,17 +534,19 @@ fn main() {
             new: "MATCH (a:person) OPTIONAL MATCH (b:person) WHERE b.pair = a.id \
                   RETURN count(*) AS n"
                 .into(),
-            old: format!(
-                "MATCH (a:person) WHERE a.id < {OLD_PROBES} OPTIONAL MATCH (b:person) \
+            old: Some((
+                format!(
+                    "MATCH (a:person) WHERE a.id < {OLD_PROBES} OPTIONAL MATCH (b:person) \
                  WHERE b.pair = a.id RETURN count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: OLD_PROBES as i64,
+                },
+            )),
             want: Want {
                 rows: 1,
                 total: NODES as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: OLD_PROBES as i64,
             },
             probes: NODES,
             out: NODES,
@@ -520,19 +557,21 @@ fn main() {
             new: "MATCH (a:person) OPTIONAL MATCH (b:person) WHERE b.pair = a.half \
                   RETURN count(*) AS n"
                 .into(),
-            old: format!(
-                "MATCH (a:person) WHERE a.id < {OLD_PROBES} OPTIONAL MATCH (b:person) \
+            old: Some((
+                format!(
+                    "MATCH (a:person) WHERE a.id < {OLD_PROBES} OPTIONAL MATCH (b:person) \
                  WHERE b.pair = a.half RETURN count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: OLD_PROBES as i64,
+                },
+            )),
             // The outer rows survive either way, so a miss that got
             // dropped would halve this.
             want: Want {
                 rows: 1,
                 total: NODES as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: OLD_PROBES as i64,
             },
             probes: NODES,
             out: NODES,
@@ -543,10 +582,16 @@ fn main() {
             new: "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.city = a.city } \
                   RETURN count(a) AS n"
                 .into(),
-            old: format!(
-                "MATCH (a:person) WHERE a.id < {OLD_PROBES} \
+            old: Some((
+                format!(
+                    "MATCH (a:person) WHERE a.id < {OLD_PROBES} \
                  AND EXISTS {{ MATCH (b:person) WHERE b.city = a.city }} RETURN count(a) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: OLD_PROBES as i64,
+                },
+            )),
             // One row a probe, not a thousand: every outer row has a
             // city and every city has a thousand rows under it, so a
             // semi that handed its matches up instead of the row that
@@ -554,10 +599,6 @@ fn main() {
             want: Want {
                 rows: 1,
                 total: NODES as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: OLD_PROBES as i64,
             },
             probes: NODES,
             out: NODES,
@@ -568,19 +609,21 @@ fn main() {
             new: "MATCH (a:person) WHERE NOT EXISTS { MATCH (b:person) WHERE b.pair = a.half } \
                   RETURN count(a) AS n"
                 .into(),
-            old: format!(
-                "MATCH (a:person) WHERE a.id < {OLD_PROBES} \
+            old: Some((
+                format!(
+                    "MATCH (a:person) WHERE a.id < {OLD_PROBES} \
                  AND NOT EXISTS {{ MATCH (b:person) WHERE b.pair = a.half }} RETURN count(a) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: (OLD_PROBES / 2) as i64,
+                },
+            )),
             // Half the outer rows carry a key nothing has, and those
             // are the ones an anti keeps.
             want: Want {
                 rows: 1,
                 total: (NODES / 2) as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: (OLD_PROBES / 2) as i64,
             },
             probes: NODES,
             out: NODES / 2,
@@ -589,17 +632,19 @@ fn main() {
         Case {
             what: "one probe row in eight survives",
             new: "MATCH (a:person), (b:person) WHERE a.pair = b.sparse RETURN count(*) AS n".into(),
-            old: format!(
-                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.pair = b.sparse \
+            old: Some((
+                format!(
+                    "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.pair = b.sparse \
                  RETURN count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: old_sparse_out as i64,
+                },
+            )),
             want: Want {
                 rows: 1,
                 total: sparse_out as i64,
-            },
-            old_want: Want {
-                rows: 1,
-                total: old_sparse_out as i64,
             },
             probes: NODES,
             out: sparse_out,
@@ -608,15 +653,17 @@ fn main() {
         Case {
             what: "the build side's keys fit in one chunk of the probe",
             new: "MATCH (a:person), (b:person) WHERE a.sparse = b.city RETURN count(*) AS n".into(),
-            old: format!(
-                "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.sparse = b.city \
+            old: Some((
+                format!(
+                    "MATCH (a:person), (b:person) WHERE a.id < {OLD_PROBES} AND a.sparse = b.city \
                  RETURN count(*) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: zone_out as i64,
+                },
+            )),
             want: Want {
-                rows: 1,
-                total: zone_out as i64,
-            },
-            old_want: Want {
                 rows: 1,
                 total: zone_out as i64,
             },
@@ -630,22 +677,39 @@ fn main() {
                   WHERE EXISTS { MATCH (c:person) WHERE c.sparse = b.id } \
                   RETURN sum(b.city) AS n"
                 .into(),
-            old: format!(
-                "MATCH (a:person)-[:knows]->(b) WHERE a.id < {OLD_PROBES} \
+            old: Some((
+                format!(
+                    "MATCH (a:person)-[:knows]->(b) WHERE a.id < {OLD_PROBES} \
                  AND EXISTS {{ MATCH (c:person) WHERE c.sparse = b.id }} \
                  RETURN sum(b.city) AS n"
-            ),
+                ),
+                Want {
+                    rows: 1,
+                    total: old_walk_total,
+                },
+            )),
             want: Want {
                 rows: 1,
                 total: walk_total,
             },
-            old_want: Want {
-                rows: 1,
-                total: old_walk_total,
-            },
             probes: NODES,
             out: walk_rows,
             sip: Sip::Walk,
+        },
+        Case {
+            what: "a mark instead of a probe",
+            new: "MATCH (a:person) \
+                  WHERE a.city = 0 OR EXISTS { MATCH (c:person) WHERE c.sparse = a.id } \
+                  RETURN count(a) AS n"
+                .into(),
+            old: None,
+            want: Want {
+                rows: 1,
+                total: mark_out as i64,
+            },
+            probes: NODES,
+            out: mark_out,
+            sip: Sip::No,
         },
     ];
 
@@ -664,13 +728,29 @@ fn main() {
             let (on, off) = measure_sip(&mut db, &case.new, &case.want, 5);
             (on, Some(off))
         };
-        // SAFETY: same as the worker count above.
-        unsafe { std::env::set_var("ZU_EXEC2", "0") };
-        let old = measure(&mut db, &case.old, &case.old_want, 1);
-        unsafe { std::env::remove_var("ZU_EXEC2") };
+        let old = case.old.as_ref().map(|(query, want)| {
+            // SAFETY: same as the worker count above.
+            unsafe { std::env::set_var("ZU_EXEC2", "0") };
+            let ms = measure(&mut db, query, want, 1);
+            unsafe { std::env::remove_var("ZU_EXEC2") };
+            ms
+        });
         let mprobes = case.probes as f64 / 1e3 / new;
         let new_us = new * 1e3 / case.probes as f64;
-        let old_us = old * 1e3 / OLD_PROBES as f64;
+        // The shape with no old engine query says that instead of a
+        // ratio, so a missing number is never read as a slow one.
+        let against = match old {
+            Some(old) => {
+                let old_us = old * 1e3 / OLD_PROBES as f64;
+                format!(
+                    "old engine {old_us:.1} us/probe over {OLD_PROBES} probes, {:.0}x per probe",
+                    old_us / new_us
+                )
+            }
+            None => "not timeable on the old engine, its plan asks the block per row of the \
+                     whole table"
+                .to_string(),
+        };
         let sip = match off {
             Some(off) => {
                 let x = off / new;
@@ -686,11 +766,9 @@ fn main() {
         };
         println!(
             "join {}: {new:.1} ms {mprobes:.2} M probes/s {:.1} M rows out, {new_us:.3} us/probe, \
-             old engine {old_us:.1} us/probe over {OLD_PROBES} probes, {:.0}x per probe{sip}, \
-             crosschecked",
+             {against}{sip}, crosschecked",
             case.what,
             case.out as f64 / 1e6,
-            old_us / new_us
         );
         if case.what == "unique key" {
             unique = mprobes;

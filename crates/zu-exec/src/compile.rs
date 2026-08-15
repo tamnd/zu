@@ -126,6 +126,17 @@ pub(crate) enum ColSpec {
         dirs: Dirs,
         negated: bool,
     },
+    /// The same answer where the block is tied to the pipeline by an
+    /// equality rather than by a shared variable: whether the join's
+    /// build side holds this row's key, one word of the directory per
+    /// row and no payload read at all. `key` reads the level this
+    /// column sits on, and it is registered after the column it reads,
+    /// so one pass over the list still builds the chunk.
+    JoinMark {
+        table: Arc<JoinTable>,
+        key: ScalarRef,
+        negated: bool,
+    },
 }
 
 /// Traversal sides of one expand: `Both` is an undirected step over a
@@ -326,6 +337,25 @@ pub(crate) enum ScalarRef {
         vec: usize,
         ty: ColType,
     },
+}
+
+/// Whether two refs read the same thing. A ref carries its column type
+/// along for the reader, and two refs at one position on one level are
+/// the same column whatever either of them says the type is.
+fn same_ref(a: ScalarRef, b: ScalarRef) -> bool {
+    match (a, b) {
+        (ScalarRef::Node { level: x }, ScalarRef::Node { level: y })
+        | (ScalarRef::RowId { level: x }, ScalarRef::RowId { level: y }) => x == y,
+        (
+            ScalarRef::Col {
+                level: x, vec: i, ..
+            },
+            ScalarRef::Col {
+                level: y, vec: j, ..
+            },
+        ) => x == y && i == j,
+        _ => false,
+    }
 }
 
 impl ScalarRef {
@@ -1042,6 +1072,33 @@ impl Compiler<'_> {
                     let Some((table, key)) = self.join_tie(tie, slot, build)? else {
                         unreachable!("the tie was just resolved");
                     };
+                    // The mark a join writes. A block under an OR cannot
+                    // decide the row it was written about, so the answer
+                    // is written down per row instead of acted on, and
+                    // here the answer is whether the build side holds
+                    // the row's key, which the table knows already. So
+                    // it is a column of the level the key is read off
+                    // and no operator at all, the same shape a bare
+                    // block's degree read takes and for the same reason.
+                    //
+                    // Only a block with nothing else in it is answered
+                    // this cheaply. Another predicate over the held
+                    // pattern decides which build rows count, and that
+                    // is a group run per outer row, which is not
+                    // something a mark may do to a row.
+                    if let BracketKind::Mark {
+                        slot: mark,
+                        negated,
+                    } = group.kind
+                    {
+                        if !group_filters.is_empty() {
+                            return Ok(None);
+                        }
+                        let level = key.level();
+                        let vec = self.register_join_mark(level, table, key, negated);
+                        self.marks.insert(mark, (level, vec));
+                        continue;
+                    }
                     let to_level = self.levels.len();
                     self.levels.push(LevelBuild {
                         table: build,
@@ -1806,8 +1863,14 @@ impl Compiler<'_> {
             .filter(|(old, _)| map[*old] != usize::MAX)
             .map(|(_, mut level)| {
                 for (_, col) in &mut level.cols {
-                    if let ColSpec::Outer { from, .. } = col {
-                        *from = map[*from];
+                    match col {
+                        ColSpec::Outer { from, .. } => *from = map[*from],
+                        ColSpec::JoinMark { key, .. } => match key {
+                            ScalarRef::Node { level }
+                            | ScalarRef::RowId { level }
+                            | ScalarRef::Col { level, .. } => *level = map[*level],
+                        },
+                        _ => {}
                     }
                 }
                 level
@@ -2217,6 +2280,36 @@ impl Compiler<'_> {
         self.levels[level]
             .cols
             .push((String::new(), ColSpec::Mark { rel, dirs, negated }));
+        self.levels[level].cols.len()
+    }
+
+    /// Registers a join's answer about each row of `level` as a column
+    /// on it, returning its chunk vector position. Two blocks probing
+    /// the same table on the same key share the column, and the table
+    /// itself is shared whatever happens, since the build reads it once
+    /// while the plan is compiled.
+    fn register_join_mark(
+        &mut self,
+        level: usize,
+        table: Arc<JoinTable>,
+        key: ScalarRef,
+        negated: bool,
+    ) -> usize {
+        let same = |c: &ColSpec| {
+            matches!(c, ColSpec::JoinMark { table: t, key: k, negated: n }
+                if Arc::ptr_eq(t, &table) && same_ref(*k, key) && *n == negated)
+        };
+        if let Some(ix) = self.levels[level].cols.iter().position(|(_, c)| same(c)) {
+            return ix + 1;
+        }
+        self.levels[level].cols.push((
+            String::new(),
+            ColSpec::JoinMark {
+                table,
+                key,
+                negated,
+            },
+        ));
         self.levels[level].cols.len()
     }
 

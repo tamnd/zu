@@ -394,22 +394,37 @@ fn stat(path: &std::path::Path) -> ExitCode {
 /// an optional header, `.parquet` needs the `arrow` feature, anything
 /// else is whitespace separated SNAP text with `#` comments.
 fn read_edges(path: &std::path::Path) -> zu::Result<Vec<(u32, u32)>> {
+    Ok(read_edges_with_props(path, false)?.0)
+}
+
+/// The same read, and with `props` set every parquet column that is
+/// neither src nor dst comes back as an edge property column.
+///
+/// Only parquet carries them. SNAP text and csv are two integers a line
+/// by definition, so they always answer with no columns rather than
+/// with an error, and a copy of one of those files stores no edge
+/// properties because the input holds none.
+fn read_edges_with_props(
+    path: &std::path::Path,
+    props: bool,
+) -> zu::Result<zu::zu1::props::EdgesWithProps> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("parquet") => {
             #[cfg(feature = "arrow")]
             {
-                zu::zu1::parquet::read_edge_parquet(path)
+                zu::zu1::parquet::read_edge_parquet_with_props(path, props)
             }
             #[cfg(not(feature = "arrow"))]
             {
+                let _ = props;
                 Err(zu::ZuError::InvalidArgument(
                     "this zu was built without parquet support, rebuild with --features arrow"
                         .into(),
                 ))
             }
         }
-        Some("csv") => zu::zu1::graph::read_edge_csv(path),
-        _ => zu::zu1::graph::read_edge_list(path),
+        Some("csv") => Ok((zu::zu1::graph::read_edge_csv(path)?, Vec::new())),
+        _ => Ok((zu::zu1::graph::read_edge_list(path)?, Vec::new())),
     }
 }
 
@@ -421,7 +436,7 @@ fn copy(
     reorder: zu::zu1::reorder::Reorder,
 ) -> ExitCode {
     let started = std::time::Instant::now();
-    let mut edges = match read_edges(edges_path) {
+    let (mut edges, columns) = match read_edges_with_props(edges_path, true) {
         Ok(e) => e,
         Err(e) => return command_error("copy", &e),
     };
@@ -448,9 +463,43 @@ fn copy(
         }
         keys
     });
+    // Load order is what numbers an edge ordinal, and a property column
+    // is addressed by nothing else, so the columns move by the same
+    // permutation the sort applies to the edges. Reorder is the case
+    // that makes this matter: relabeling the nodes changes where almost
+    // every edge lands, and a column left in file order would be read
+    // as some other edge's value.
+    //
+    // An edge list with no columns sorts its pairs directly, which is
+    // the ingest hot path and has no permutation to report, and drops a
+    // duplicate pair because there the second copy says nothing the
+    // first did not. With columns the duplicate is refused instead: one
+    // ordinal cannot answer with two values.
     let mut sorted = edges;
-    sorted.sort_unstable();
-    sorted.dedup();
+    let columns: Vec<zu::zu1::props::OwnedColumn> = if columns.is_empty() {
+        sorted.sort_unstable();
+        sorted.dedup();
+        Vec::new()
+    } else {
+        let order = zu::zu1::reorder::load_order(&mut sorted);
+        if let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]) {
+            return command_error(
+                "copy",
+                &zu::ZuError::InvalidArgument(format!(
+                    "edge ({}, {}) appears twice and the file carries edge property columns, \
+                     which are addressed by the pair",
+                    dup[0].0, dup[0].1
+                )),
+            );
+        }
+        columns
+            .into_iter()
+            .map(|c| zu::zu1::props::OwnedColumn {
+                values: c.values.permuted(&order),
+                name: c.name,
+            })
+            .collect()
+    };
     let load_started = std::time::Instant::now();
     let result = (|| {
         let mut db = zu::zu1::file::Zu1File::create(out_path)?;
@@ -462,6 +511,9 @@ fn copy(
             &sorted,
             key_by_row.as_deref(),
         )?;
+        if !columns.is_empty() {
+            zu::zu1::props::store_rel_props_owned(&mut db, "edge", &columns)?;
+        }
         // A reordered load also stores the original ids as a property
         // column. The key index alone only answers "which row is key k",
         // which is enough for `{id: $k}` and for `neighbors --key`, but
@@ -514,6 +566,14 @@ fn copy(
                 d.from_count,
                 d.groups.len()
             );
+            if !columns.is_empty() {
+                let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                println!(
+                    "edge properties: {} column(s), {}",
+                    columns.len(),
+                    names.join(", ")
+                );
+            }
             if key_bytes > 0 {
                 println!(
                     "key index: {} bytes, {:.1} bits/key",
@@ -1226,6 +1286,118 @@ mod tests {
         assert_eq!(
             r.rows,
             [[Value::Int(11)], [Value::Int(12)], [Value::Int(13)],]
+        );
+    }
+
+    /// Reorder renumbers the nodes, which resorts the edges, which
+    /// renumbers every edge ordinal a property column is addressed by.
+    /// A column left in the file's order would answer with some other
+    /// edge's value, and every value here is derived from its own
+    /// endpoints so a swap cannot pass unnoticed.
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn a_reordered_copy_permutes_edge_properties() {
+        use zu::zu1::props::{OwnedColumn, OwnedValues};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edges_path = dir.path().join("edges.parquet");
+        let db_path = dir.path().join("out.zu1");
+        // Not in load order, and node 13 is the hub, so degree ordering
+        // moves nearly every edge.
+        let edges = vec![
+            (13u32, 14u32),
+            (10, 12),
+            (11, 13),
+            (10, 11),
+            (12, 13),
+            (10, 13),
+        ];
+        let since: Vec<u64> = edges
+            .iter()
+            .map(|&(s, d)| u64::from(s) * 100 + u64::from(d))
+            .collect();
+        let note: Vec<Vec<u8>> = edges
+            .iter()
+            .map(|&(s, d)| format!("{s}->{d}").into_bytes())
+            .collect();
+        zu::zu1::parquet::write_edge_parquet_with_props(
+            &edges_path,
+            &edges,
+            &[
+                OwnedColumn {
+                    name: "since".into(),
+                    values: OwnedValues::Int(since),
+                },
+                OwnedColumn {
+                    name: "note".into(),
+                    values: OwnedValues::Str(note),
+                },
+            ],
+        )
+        .expect("write parquet");
+        assert_eq!(
+            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::Degree),
+            ExitCode::SUCCESS
+        );
+
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let r = zu::query::run(
+            "MATCH (a:node)-[e:edge]->(b:node) RETURN a.id AS src, b.id AS dst, \
+             e.since AS since, e.note AS note ORDER BY src, dst",
+            &mut db,
+            &[],
+        )
+        .expect("read back");
+        let mut want: Vec<Vec<Value>> = edges
+            .iter()
+            .map(|&(s, d)| {
+                vec![
+                    Value::Int(i64::from(s)),
+                    Value::Int(i64::from(d)),
+                    Value::Int(i64::from(s) * 100 + i64::from(d)),
+                    Value::Str(format!("{s}->{d}")),
+                ]
+            })
+            .collect();
+        want.sort_by_key(|row| match (&row[0], &row[1]) {
+            (Value::Int(s), Value::Int(d)) => (*s, *d),
+            _ => unreachable!("built as ints"),
+        });
+        assert_eq!(r.rows, want);
+    }
+
+    /// The pair is the address of an edge property, so a file that
+    /// names the same pair twice has two values for one ordinal. A bare
+    /// edge list still drops the duplicate, because there the second
+    /// copy says nothing the first did not.
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn a_duplicate_edge_with_properties_is_refused() {
+        use zu::zu1::props::{OwnedColumn, OwnedValues};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edges_path = dir.path().join("dup.parquet");
+        let db_path = dir.path().join("dup.zu1");
+        zu::zu1::parquet::write_edge_parquet_with_props(
+            &edges_path,
+            &[(1, 2), (1, 2)],
+            &[OwnedColumn {
+                name: "since".into(),
+                values: OwnedValues::Int(vec![7, 8]),
+            }],
+        )
+        .expect("write parquet");
+        assert_ne!(
+            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::None),
+            ExitCode::SUCCESS
+        );
+
+        let plain = dir.path().join("plain.parquet");
+        let plain_db = dir.path().join("plain.zu1");
+        zu::zu1::parquet::write_edge_parquet(&plain, &[(1, 2), (1, 2)]).expect("write parquet");
+        assert_eq!(
+            copy(&plain, &plain_db, zu::zu1::reorder::Reorder::None),
+            ExitCode::SUCCESS
         );
     }
 

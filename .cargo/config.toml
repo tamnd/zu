@@ -1,0 +1,3 @@
+[alias]
+# docs/12-implementation-plan.md section 3: codegen runs through xtask.
+xtask = "run --quiet --package xtask --"

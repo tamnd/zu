@@ -24,7 +24,7 @@
 
 use std::process::ExitCode;
 
-use crate::json::{self, Json};
+use zu_json::{self as json, Json};
 
 /// One capability zu declares, with the reason attached.
 ///

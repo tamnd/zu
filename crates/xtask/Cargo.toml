@@ -1,6 +1,6 @@
 [package]
-name = "zu-cli"
-description = "Command-line interface for zu"
+name = "xtask"
+description = "Repository automation for zu: codegen and the API model"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -10,18 +10,18 @@ repository.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "zu"
+name = "xtask"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "model"
+harness = false
+
 [dependencies]
-zu.workspace = true
 zu-json.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
-
-[features]
-arrow = ["zu/arrow"]
 
 [lints]
 workspace = true

@@ -34,6 +34,13 @@
 //! Every timed refusal asserts its GQLSTATUS, because a refusal that
 //! stopped being the refusal we meant to time is not a faster refusal.
 //!
+//! There is a second gate under the comparison, an absolute ceiling in
+//! microseconds, and it is there to catch the run where both paths got
+//! slower together and the ratio held. A number of microseconds is a
+//! statement about a machine, though, and this one runs on whatever the
+//! CI provider hands it, so the ceiling is scaled by a calibration loop
+//! that touches nothing in zu. See `calibrate`.
+//!
 //! Run: ZU_GATE=1 cargo bench -p zu --bench refuse
 
 use std::time::Instant;
@@ -63,6 +70,54 @@ fn xorshift(rng: &mut u64) -> u64 {
     *rng ^= *rng >> 7;
     *rng ^= *rng << 17;
     *rng
+}
+
+/// How fast this host is at the kind of work a refusal is, in
+/// nanoseconds per round, measured without touching the engine at all.
+///
+/// A refusal is a short string walked into a few small allocations and
+/// a lookup or two, and it is over before it touches any data. So the
+/// loop below is a short string walked into a small allocation and a
+/// lookup: it interns a word into a map, reads two back out and formats
+/// a number, which is the parser, the symbol table and the message in
+/// the shape they cost. A pointer chase was tried first and is not the
+/// right proxy, because the runner has memory as fast as the reference
+/// machine and a core that is not, so the chase reads 0.99x on a host
+/// that runs the refusal at 1.7x.
+fn calibrate() -> f64 {
+    const ROUNDS: usize = 20_000;
+    const WORDS: usize = 64;
+    let words: Vec<String> = (0..WORDS).map(|i| format!("identifier_{i:03}")).collect();
+    let mut rng = 0x2064u64;
+    let mut sink = 0usize;
+    let round = |rng: &mut u64, sink: &mut usize| {
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for _ in 0..8 {
+            let w = &words[(xorshift(rng) % WORDS as u64) as usize];
+            let n = seen.len();
+            seen.entry(w.clone()).or_insert(n);
+        }
+        for _ in 0..8 {
+            let w = &words[(xorshift(rng) % WORDS as u64) as usize];
+            *sink += seen.get(w.as_str()).copied().unwrap_or(0);
+        }
+        let msg = format!(
+            "undefined reference to {} at {}",
+            words[*sink % WORDS],
+            *sink
+        );
+        *sink += msg.len();
+    };
+    for _ in 0..ROUNDS / 10 {
+        round(&mut rng, &mut sink);
+    }
+    let start = Instant::now();
+    for _ in 0..ROUNDS {
+        round(&mut rng, &mut sink);
+    }
+    let ns = start.elapsed().as_nanos() as f64 / ROUNDS as f64;
+    std::hint::black_box(sink);
+    ns
 }
 
 const NODES: u32 = 10_000;
@@ -237,6 +292,23 @@ fn main() {
         us = worst.1
     );
 
+    // The scale the absolute ceiling is read at. Clamped below at 1, so
+    // a fast host is held to the written number and never to a tighter
+    // one, and above at 4, so a host slow enough to make the backstop
+    // meaningless says so rather than passing quietly.
+    let cal_ns = calibrate();
+    let reference = budget("refuse_calibration_ns").unwrap_or(cal_ns);
+    let raw = cal_ns / reference.max(0.001);
+    let scale = raw.clamp(1.0, 4.0);
+    println!(
+        "host calibration: {cal_ns:.0} ns per round, {raw:.2}x the reference {reference:.0} ns"
+    );
+    if raw > scale {
+        println!(
+            "host calibration: {raw:.2}x is past the 4x cap, the latency ceiling is read at 4x"
+        );
+    }
+
     let mut failed = false;
     if let Some(ceiling) = budget("refuse_over_answer")
         && ratio > ceiling
@@ -247,15 +319,17 @@ fn main() {
         );
         failed = true;
     }
-    if let Some(ceiling) = budget("refuse_p50_us")
-        && worst.1 > ceiling
-    {
-        println!(
-            "GATE FAIL refusal latency: {name} at p50 {us:.2} us > ceiling {ceiling}",
-            name = worst.0,
-            us = worst.1
-        );
-        failed = true;
+    if let Some(ceiling) = budget("refuse_p50_us") {
+        let scaled = ceiling * scale;
+        println!("latency ceiling: {ceiling:.2} us written, {scaled:.2} us on this host");
+        if worst.1 > scaled {
+            println!(
+                "GATE FAIL refusal latency: {name} at p50 {us:.2} us > ceiling {scaled:.2}",
+                name = worst.0,
+                us = worst.1
+            );
+            failed = true;
+        }
     }
     if gate && failed {
         std::process::exit(1);

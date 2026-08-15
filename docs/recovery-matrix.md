@@ -12,14 +12,24 @@ Any prefix of physical writes yields either the pre-txn or the
 post-txn state, never a hybrid.
 
 Proven by `crates/zu-zu1/tests/crash.rs::every_cut_recovers_to_a_committed_prefix`.
-A recorded workload of two committed transactions, a checkpoint fold,
-and two ingest commits runs against recording files, and the harness
-rebuilds the image a crash could leave at every syscall boundary: the
-full prefix at each cut, the prefix with each unsynced write dropped,
-and the prefix with the final write torn at several lengths. Every
-image must recover to a committed prefix of the workload, and once a
-commit's WAL sync has returned, every later cut must recover to that
-commit or newer.
+A recorded workload of an edge property store, two committed
+transactions, a checkpoint fold, and two ingest commits runs against
+recording files, and the harness rebuilds the image a crash could
+leave at every syscall boundary: the full prefix at each cut, the
+prefix with each unsynced write dropped, and the prefix with the final
+write torn at several lengths. Every image must recover to a committed
+prefix of the workload, and once a commit's WAL sync has returned,
+every later cut must recover to that commit or newer.
+
+The edge property store is the one step of that workload with no WAL
+frame behind it: it frees the old columns, writes the new ones,
+republishes the table index and checkpoints, all inside the data file,
+so what floors it is the data file's own sync rather than the log's.
+The harness reads every edge of the property carrying table back with
+its values at every image, through the ordinal lookup a query uses and
+with the endpoints in the recorded state, so a fold that kept the
+values and renumbered the edges fails here rather than answering a
+later query with another edge's property.
 
 ## zu1: pick valid max-epoch header, replay WAL tail, open
 

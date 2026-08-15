@@ -17,27 +17,23 @@
 //! open.
 //!
 //! Two properties are worth more than they cost. The archive is
-//! reproducible, because every field a tar header can carry a timestamp
-//! or a user id in is fixed, so the same cases produce the same bytes
-//! on any machine on any day and a mirror can be compared against a
-//! release rather than trusted. And the packer parses every case before
-//! it ships one, so a corpus that does not load cannot become an
-//! artifact that eight repositories fail on.
+//! reproducible, which is the shared tar writer's doing and the reason
+//! a mirror can be compared against a release rather than trusted. And
+//! the packer parses every case before it ships one, so a corpus that
+//! does not load cannot become an artifact that eight repositories fail
+//! on.
 
 use std::path::Path;
 
 use zu_json::Json;
+
+use crate::tarball;
 
 /// The manifest's schema version, which moves when the shape of the
 /// archive changes and not when the cases do. A client that unpacks an
 /// artifact it does not understand should say so rather than run half
 /// of it.
 pub const SCHEMA: i64 = 1;
-
-/// The compression level. The artifact is packed once per release and
-/// unpacked on every CI run of nine repositories, so the trade is
-/// entirely one way.
-const LEVEL: i32 = 19;
 
 /// One case file in the archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,17 +117,15 @@ pub fn pack(dir: &Path, readme: Option<&Path>, version: &str) -> Result<Packed, 
         files.insert(1, ("README.md".to_string(), bytes));
     }
 
-    let mut tar = Vec::new();
-    for (name, bytes) in &files {
-        append(&mut tar, &format!("{prefix}/{name}"), bytes)?;
-    }
-    // Two zero blocks end a tar, and readers that check for them are
-    // the reason a truncated archive is detected rather than silently
-    // short.
-    tar.extend_from_slice(&[0u8; 1024]);
-
-    let archive =
-        zstd::bulk::compress(&tar, LEVEL).map_err(|e| format!("compressing the archive: {e}"))?;
+    // Everything in the archive is under one directory, so that
+    // unpacking it in a directory that already has things in it puts the
+    // corpus somewhere rather than everywhere.
+    let under: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|(name, bytes)| (format!("{prefix}/{name}"), bytes))
+        .collect();
+    let tar = tarball::tar(&under)?;
+    let archive = tarball::compress(&tar)?;
     Ok(Packed {
         archive,
         tar,
@@ -171,58 +165,6 @@ fn manifest(version: &str, entries: &[Entry]) -> String {
     text
 }
 
-/// One ustar file header and its content, padded to the block size.
-///
-/// Every field that could carry a timestamp, a user, or a permission
-/// bit from the machine that ran the pack is fixed instead. That is
-/// what makes two packs of the same cases the same bytes, and it costs
-/// nothing here: an archive of text files nobody executes has no use
-/// for the mode, and a modification time that is the moment of the
-/// release is a difference between two mirrors of one release.
-fn append(out: &mut Vec<u8>, name: &str, body: &[u8]) -> Result<(), String> {
-    if name.len() > 99 {
-        return Err(format!(
-            "{name:?} is {} bytes and a ustar name holds 99",
-            name.len()
-        ));
-    }
-    let start = out.len();
-    let mut header = [0u8; 512];
-    header[..name.len()].copy_from_slice(name.as_bytes());
-    // mode, uid, gid, size, mtime: octal, NUL terminated, fixed.
-    write_octal(&mut header[100..108], 0o644);
-    write_octal(&mut header[108..116], 0);
-    write_octal(&mut header[116..124], 0);
-    write_octal(&mut header[124..136], body.len() as u64);
-    write_octal(&mut header[136..148], 0);
-    // The checksum is computed with its own field read as spaces,
-    // which is the one piece of tar that cannot be described without
-    // saying it out loud.
-    header[148..156].fill(b' ');
-    header[156] = b'0';
-    header[257..263].copy_from_slice(b"ustar\0");
-    header[263..265].copy_from_slice(b"00");
-    let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
-    write_octal(&mut header[148..155], u64::from(sum));
-    header[155] = b' ';
-
-    out.extend_from_slice(&header);
-    out.extend_from_slice(body);
-    let padding = (512 - body.len() % 512) % 512;
-    out.resize(out.len() + padding, 0);
-    debug_assert_eq!((out.len() - start) % 512, 0);
-    Ok(())
-}
-
-/// An octal number, right aligned in `field` with a trailing NUL,
-/// which is how every numeric field in a tar header is written.
-fn write_octal(field: &mut [u8], value: u64) {
-    let digits = field.len() - 1;
-    let text = format!("{value:0digits$o}");
-    field[..digits].copy_from_slice(&text.as_bytes()[text.len() - digits..]);
-    field[digits] = 0;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,28 +194,7 @@ mod tests {
         dir
     }
 
-    /// The files in a tar, which is what the archive promised and the
-    /// only way to check it kept the promise.
-    fn entries(tar: &[u8]) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i + 512 <= tar.len() {
-            let header = &tar[i..i + 512];
-            if header.iter().all(|&b| b == 0) {
-                break;
-            }
-            let end = header.iter().position(|&b| b == 0).unwrap_or(100);
-            let name = String::from_utf8(header[..end].to_vec()).expect("a name is text");
-            let size = std::str::from_utf8(&header[124..135])
-                .ok()
-                .and_then(|s| u64::from_str_radix(s.trim_end_matches([' ', '\0']), 8).ok())
-                .expect("a size is octal") as usize;
-            i += 512;
-            out.push((name, tar[i..i + size].to_vec()));
-            i += size.div_ceil(512) * 512;
-        }
-        out
-    }
+    use tarball::entries;
 
     #[test]
     fn the_archive_holds_the_cases_byte_for_byte() {

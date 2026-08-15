@@ -1,0 +1,113 @@
+name: release
+
+# The release train of dx/14 section 6: one version number, one day,
+# one orchestrated run across nine repositories. This is the skeleton of
+# it, and what is real here is deliberate. The build is the same matrix
+# every pull request runs, the assemble step gathers exactly the rows of
+# artifacts.toml, and the verify step reads the directory back against
+# the same table. Every publish step is a no-op that says what it would
+# do.
+#
+# The ordering is the part worth having this early, because it is the
+# part that is expensive to discover late: crates.io lands before the
+# repositories that build against it, and the Go tag is last of the
+# registries because pushing a tag is the one publish that cannot be
+# taken back. A skeleton that runs the real order on every rehearsal is
+# how the order stops being a paragraph in a specification.
+
+on:
+  push:
+    tags: ["v*"]
+  # A rehearsal, on a branch, with no tag. The train is the thing that
+  # must not be run for the first time on the day of a release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to rehearse as
+        required: false
+        default: 0.0.0
+
+concurrency:
+  # Two releases at once is two versions publishing to nine registries
+  # in an order neither of them chose, and cancelling the one already
+  # part way through is worse than queueing behind it.
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The seven tier 1 platforms, called rather than repeated, so a
+  # release ships the artifacts CI has been building all along.
+  libzu:
+    uses: ./.github/workflows/libzu.yml
+
+  assemble:
+    needs: libzu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      # One directory per platform, under the name that platform's job
+      # uploaded it as, which is the name the release publishes it as.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: libzu-*
+          path: built
+      # The tag is the version, with the `v` off it, because a git tag
+      # is written `v0.5.0` and a package is not. A rehearsal says which
+      # version it is rehearsing instead.
+      - name: Assemble the release
+        shell: bash
+        run: |
+          set -eux
+          tag="${{ inputs.version || github.ref_name }}"
+          version="${tag#v}"
+          cargo run -p xtask -- artifacts --assemble dist --built built --version "$version"
+          cargo run -p xtask -- artifacts --verify dist --version "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          if-no-files-found: error
+          path: dist
+
+  publish:
+    needs: assemble
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: What is being published
+        shell: bash
+        run: ls -l dist
+      # Each step below is the step that will exist, in the order it
+      # will run, doing nothing. They are separate steps rather than one
+      # loop because the run's own step list is then the ordering, which
+      # is what a person reads when a release stops half way through.
+      - name: GitHub release
+        run: echo "no-op: upload dist/ to the release for ${{ github.ref_name }}, signed and attested (dx/14 section 8, DX5)"
+      - name: crates.io
+        run: echo "no-op: publish zudb, zudb-async and zu-cli, first because everything else builds against them"
+      - name: PyPI
+        run: echo "no-op: publish the wheels zu-python built against these artifacts"
+      - name: npm
+        run: echo "no-op: publish zudb and its platform packages, then the JSR re-export"
+      - name: Maven Central
+        run: echo "no-op: publish dev.zudb, which is a staging repository that has to be closed and released"
+      - name: NuGet
+        run: echo "no-op: publish ZuDb"
+      - name: Go module tag
+        run: echo "no-op: push the tag on zu-go, last of the registries because a Go module cannot be unpublished"
+      - name: Docs and release notes
+        run: echo "no-op: deploy zu-web against this version, publish the notes, bump Homebrew, Scoop and AUR"
+      - name: What this run did not do
+        run: |
+          echo "The dispatches to the eight repositories are the conductor's, which is the next item of DX0."
+          echo "Every publish above is idempotent when it is real, so a partial release is resumed and not restarted."

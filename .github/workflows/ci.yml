@@ -79,6 +79,17 @@ jobs:
       # targets, and the matrix in libzu.yml held to them. This runs as
       # a test too, and here for the same reason as the two above.
       - run: cargo run -p xtask -- platforms
+      # And the table on the end of the release: what a tag publishes,
+      # which eight repositories fetch by version. release.yml assembles
+      # from it and verifies the directory back against it, so an
+      # artifact that stopped being produced fails the release that
+      # dropped it rather than the eight that wanted it.
+      - run: cargo run -p xtask -- artifacts
+      # A release is compression and copying and costs what those cost.
+      # What this measures is the bookkeeping either side of it, whose
+      # per-artifact cost has to stay flat as the contract grows past
+      # the seven platforms it has today.
+      - run: cargo bench -p xtask --bench artifacts
 
   deny:
     runs-on: ubuntu-latest

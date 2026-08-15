@@ -628,7 +628,26 @@ impl SqliteStore {
     /// of it lives, so a caller that has to reconstruct a column's type
     /// reads it here and checks the values against it.
     pub fn node_column_types(&self, table: &str) -> Result<Vec<(String, ColumnType)>> {
-        let sql = format!("PRAGMA table_info(n_{})", ident(table)?);
+        self.column_types("node", "n_", table)
+    }
+
+    /// The property columns of rel table `r_<table>` with the type each
+    /// was declared as, in declared order, the same reading
+    /// [`node_column_types`](Self::node_column_types) gives of a node
+    /// table. The `src` and `dst` endpoint columns carry no prefix and
+    /// are not properties, so they do not appear here.
+    pub fn rel_column_types(&self, table: &str) -> Result<Vec<(String, ColumnType)>> {
+        self.column_types("rel", "r_", table)
+    }
+
+    /// The declared property columns of one table, whichever kind it is.
+    fn column_types(
+        &self,
+        kind: &str,
+        prefix: &str,
+        table: &str,
+    ) -> Result<Vec<(String, ColumnType)>> {
+        let sql = format!("PRAGMA table_info({prefix}{})", ident(table)?);
         let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
         let rows = stmt
             .query_map([], |row| {
@@ -645,7 +664,7 @@ impl SqliteStore {
                     None => Err(ZuError::Corrupt {
                         what: "sqlite schema",
                         detail: format!(
-                            "column '{name}' of node table '{table}' is declared \
+                            "column '{name}' of {kind} table '{table}' is declared \
                              '{declared}', which this store does not write"
                         ),
                     }),
@@ -698,6 +717,46 @@ impl SqliteStore {
         };
         let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
         let rows = stmt.query_map([src], |row| row.get(0)).map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(sql_err)
+    }
+
+    /// Every row of rel table `r_<table>` in edge order, source and then
+    /// destination, as the endpoints followed by the values of
+    /// `columns`, dynamically typed the way SQLite stores them.
+    ///
+    /// The order is the point of this one. An edge property column in
+    /// zu1 is addressed by the edge ordinal, the place an edge takes in
+    /// a load sorted by source and then destination, so a reader that
+    /// hands the values over in that order hands them over already
+    /// lined up and nothing has to carry a per edge label to say which
+    /// value went where. The whole table comes back in one scan because
+    /// the caller wants all of it and a row at a time through the index
+    /// would pay a seek per edge.
+    pub fn rel_rows(&self, table: &str, columns: &[String]) -> Result<Vec<(i64, i64, Vec<Value>)>> {
+        let table = ident(table)?;
+        let mut sql = String::from("SELECT src, dst");
+        for col in columns {
+            sql.push_str(&format!(", p_{}", ident(col)?));
+        }
+        sql.push_str(&format!(" FROM r_{table} ORDER BY src, dst"));
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let src: i64 = row.get(0)?;
+                let dst: i64 = row.get(1)?;
+                let mut values = Vec::with_capacity(columns.len());
+                for i in 0..columns.len() {
+                    values.push(match row.get_ref(i + 2)? {
+                        ValueRef::Null => Value::Null,
+                        ValueRef::Integer(v) => Value::Int(v),
+                        ValueRef::Real(v) => Value::Real(v),
+                        ValueRef::Text(v) => Value::Text(String::from_utf8_lossy(v).into_owned()),
+                        ValueRef::Blob(v) => Value::Blob(v.to_vec()),
+                    });
+                }
+                Ok((src, dst, values))
+            })
+            .map_err(sql_err)?;
         rows.collect::<rusqlite::Result<_>>().map_err(sql_err)
     }
 

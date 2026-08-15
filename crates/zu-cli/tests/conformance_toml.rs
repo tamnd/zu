@@ -136,8 +136,8 @@ fn the_json_declaration_says_what_the_toml_says() {
         checked += 1;
     }
     assert_eq!(
-        checked, 20,
-        "expected 15 data capabilities and 5 engine flags"
+        checked, 21,
+        "expected 16 data capabilities and 5 engine flags"
     );
 }
 
@@ -151,10 +151,11 @@ fn verify_accepts_a_report_that_agrees_and_rejects_one_that_does_not() {
     // of the rest is any of zu's business.
     let agreeing = r#"{"engine":{"adapter":"zu","capabilities":{
         "Data":{"labels":true,"multi-label":false,"node-properties":true,
-        "edge-properties":false,"edge-types":true,"multiple-edge-types":true,
+        "edge-properties":true,"edge-types":true,"multiple-edge-types":true,
         "multiple-node-labels":false,"temporal-values":true,"list-values":true,
         "null-properties":true,"float-values":true,"boolean-values":true,
-        "undirected-edges":true,"self-loops":true,"parallel-edges":true},
+        "undirected-edges":true,"self-loops":true,"parallel-edges":true,
+        "parallel-edge-properties":false},
         "GQLStatus":true,"Parameters":true,"Transactions":false,
         "MultipleStatements":true,"Isolated":true}},
         "cases":[{"id":"a","got_gqlstatus":"22012"}]}"#;

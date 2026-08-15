@@ -48,8 +48,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "multi-label",
-        supported: false,
-        why: "a node lives in exactly one node table, so a second label has nowhere to go",
+        supported: true,
+        why: "a node row carries a word with a bit per label, and the table it lives in is the label every row of it carries",
     },
     Declared {
         key: "node-properties",

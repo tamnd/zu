@@ -14,7 +14,7 @@ version = "0.0.1"
 # What the storage can hold.
 [data]
 labels = true  # a node table is a label
-multi-label = false  # a node lives in exactly one node table, so a second label has nowhere to go
+multi-label = true  # a node row carries a word with a bit per label, and the table it lives in is the label every row of it carries
 node-properties = true  # node tables carry property columns
 edge-properties = true  # a rel table carries property columns, addressed by the edge ordinal the load order gives every edge
 edge-types = true  # a rel table is an edge type

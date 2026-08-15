@@ -9,16 +9,16 @@ Every column is a run of the [gql-compat](https://github.com/tamnd/gql-compat) c
 | | ladybug | neo4j | zu |
 |---|---|---|---|
 | version | Lbug 0.19.1 | Neo4j Kernel 2026.07.1 community, Cypher 5/25, default language CYPHER 25 | zu 0.0.1 |
-| measured | 2026-08-15 | 2026-08-14 | 2026-08-15 |
+| measured | 2026-08-15 | 2026-08-14 | 2026-08-16 |
 | on | darwin arm64, Apple M4 | darwin arm64, Apple M4 | darwin arm64, Apple M4 |
 | harness | gql-compat devel | gql-compat devel | gql-compat devel |
 | corpus | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures | the whole corpus apart from its large fixtures |
 | cases | 385 | 377 | 385 |
-| judged (pass + fail) | 257 | 324 | 345 |
-| **passed** | **72** (28.0%) | **186** (57.4%) | **221** (64.1%) |
+| judged (pass + fail) | 257 | 324 | 347 |
+| **passed** | **72** (28.0%) | **186** (57.4%) | **223** (64.3%) |
 | failed | 185 | 138 | 124 |
-| skipped, cannot hold the fixture | 76 | 39 | 28 |
-| never reached a verdict | 52 | 14 | 12 |
+| skipped, cannot hold the fixture | 76 | 39 | 25 |
+| never reached a verdict | 52 | 14 | 13 |
 | ISO features with a passing case | 22 of 189 | 69 of 189 | 103 of 189 |
 | distinct GQLSTATUS values produced | 0 | 9 | 22 |
 
@@ -30,10 +30,10 @@ Pass over judged, then the two exclusions. Read the exclusions first. An engine 
 |---|---|---|---|---|---|---|---|
 | mandatory | ladybug | 70 | 30 | 14 | 5 | 21 | 68.2% |
 | mandatory | neo4j | 70 | 67 | 0 | 3 | 0 | 100.0% |
-| mandatory | zu | 70 | 52 | 15 | 3 | 0 | 77.6% |
+| mandatory | zu | 70 | 54 | 15 | 1 | 0 | 78.3% |
 | optional | ladybug | 208 | 22 | 157 | 8 | 21 | 12.3% |
 | optional | neo4j | 201 | 76 | 107 | 5 | 13 | 41.5% |
-| optional | zu | 208 | 110 | 83 | 4 | 11 | 57.0% |
+| optional | zu | 208 | 110 | 83 | 3 | 12 | 57.0% |
 | condition | ladybug | 67 | 0 | 4 | 63 | 0 | 0.0% |
 | condition | neo4j | 66 | 6 | 28 | 31 | 1 | 17.6% |
 | condition | zu | 67 | 28 | 17 | 21 | 1 | 62.2% |

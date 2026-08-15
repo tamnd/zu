@@ -23,7 +23,7 @@ pub const PAGERANK_ITERATIONS: usize = 20;
 /// PageRank by power iteration over the forward CSR: fixed iteration
 /// count, dangling mass redistributed uniformly, ranks summing to one.
 pub fn pagerank(db: &mut Zu1File, reader: &mut GraphReader, iterations: usize) -> Result<Vec<f64>> {
-    let n = reader.directory().node_count as usize;
+    let n = reader.directory().one_domain()? as usize;
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -61,7 +61,7 @@ pub fn pagerank(db: &mut Zu1File, reader: &mut GraphReader, iterations: usize) -
 /// once. Each node's component id is the smallest row in it, the
 /// Graphalytics convention.
 pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
-    let n = reader.directory().node_count as usize;
+    let n = reader.directory().one_domain()? as usize;
     let mut parent: Vec<u64> = (0..n as u64).collect();
     fn find(parent: &mut [u64], mut x: u64) -> u64 {
         while parent[x as usize] != x {
@@ -92,7 +92,7 @@ pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
 /// the weighted variant arrives with rel properties. Unreachable
 /// nodes get `u64::MAX`.
 pub fn sssp(db: &mut Zu1File, reader: &mut GraphReader, source: u64) -> Result<Vec<u64>> {
-    let n = reader.directory().node_count;
+    let n = reader.directory().one_domain()?;
     let mut dist = vec![u64::MAX; n as usize];
     if source >= n {
         return Ok(dist);
@@ -126,7 +126,7 @@ pub fn sssp(db: &mut Zu1File, reader: &mut GraphReader, source: u64) -> Result<V
 /// merging. Communities are relabeled to the smallest member row so
 /// the output is deterministic.
 pub fn louvain(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
-    let n = reader.directory().node_count as usize;
+    let n = reader.directory().one_domain()? as usize;
     // Undirected weighted adjacency in memory: forward lists name each
     // stored edge once, both endpoints get it. A self loop sits on one
     // list with weight two, the standard convention that keeps degree

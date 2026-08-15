@@ -38,6 +38,27 @@ The epoch accounting recovery trusts is separately verified under
 loom in `crates/zu-zu1/tests/loom.rs`, which model-checks the
 snapshot pin against advance and horizon.
 
+## zu1: an older on disk format is refused, never misread
+
+Recovery is only as good as the decision to open. A directory written
+by an older build has a different header shape, so believing its
+fields would hand recovery a plausible but wrong node count rather
+than an error. Every container the zu1 file roots is version
+prefixed and the gate fires before any field is read.
+
+Proven by `crates/zu-zu1/src/graph.rs::an_older_directory_version_is_refused`,
+which hands the decoder a version 8 group directory, one node count
+where version 9 carries a from and a to domain, and requires
+`Unsupported { what: "group directory version", id: 8 }` rather than
+a decode that succeeds on the wrong offsets. The current bump is
+version 9, docs/04 §4; the version history lives in the comment above
+`DIRECTORY_VERSION`, one line per bump, and a new bump adds a line
+there and moves this row's test to the version it retires.
+
+`crates/zu-zu1/src/graph.rs::hostile_group_count_rejected` covers the
+neighbouring case, a header of the right version whose group count is
+a lie, which must die on the size check rather than in the allocator.
+
 ## sqlite: SQLite WAL recovery (theirs, proven)
 
 The row delegates to SQLite, so the test proves the delegation, not

@@ -11,11 +11,22 @@
 //! dense.
 //!
 //! Directory layout (version-prefixed, hand-rolled):
-//! `version: u16`, `node_count: u64`, `edge_count: u64`,
-//! `props: BlockPtr`, `group_count: u32`, `has_keys: u8`, then when
-//! `has_keys` is 1 the key and row `SegmentMeta` of the primary-key
-//! index, then per group `row_count: u32`, `edge_base: u64`, and the fwd
-//! offsets, fwd neighbors, bwd offsets, and bwd neighbors `SegmentMeta`.
+//! `version: u16`, `from_count: u64`, `to_count: u64`,
+//! `edge_count: u64`, `props: BlockPtr`, `group_count: u32`,
+//! `has_keys: u8`, then when `has_keys` is 1 the key and row
+//! `SegmentMeta` of the primary-key index, then per group
+//! `row_count: u32`, `edge_base: u64`, and the fwd offsets, fwd
+//! neighbors, bwd offsets, and bwd neighbors `SegmentMeta`.
+//!
+//! A rel table runs between two node tables, which need not be the same
+//! one and need not be the same size: `from_count` is the row domain
+//! the forward direction is keyed by and `to_count` the one the
+//! backward direction is. The two share a single group array, as long
+//! as the longer of them needs, because every reader reaches a group by
+//! row and a direction at once and the shorter end simply has nothing
+//! past its own domain. A group beyond an end's rows holds that end's
+//! empty CSR, the same one a table of no rows loads, which costs a
+//! segment of one offset and no neighbors.
 //!
 //! Each rel table's directory is its own meta chain, reached through the
 //! catalog and the table index of `crate::catalog`, so one file holds any
@@ -45,13 +56,15 @@ use crate::keys::{KeyIndex, KeyReader, write_key_index};
 use crate::meta;
 use crate::segment::{SegmentMeta, probe, read_range, read_segment_pooled, write_segment};
 
+// Version 9 split the one node count into the from and to row domains,
+// so a rel table can run between two node tables.
 // Version 8 added the edge property root and the per-group edge base.
 // Version 7 widened SegmentMeta with the structural layout byte for
 // FullZip, so version 6 files must fail as unsupported here rather than
 // misread downstream. Version 6 had added the has_keys byte and the
 // primary-key index segments to the header, version 5 the SegmentMeta
 // zone map, version 4 the per-chunk fence array.
-const DIRECTORY_VERSION: u16 = 8;
+const DIRECTORY_VERSION: u16 = 9;
 
 /// Traversal direction: Fwd follows edges source to destination, Bwd the
 /// reverse.
@@ -76,6 +89,11 @@ pub struct DirectionMeta {
 /// One node group's CSR pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMeta {
+    /// Rows of the FROM table this group covers, which is what the
+    /// forward direction is keyed by. The backward direction is keyed
+    /// by the TO table and carries its own row count in the length of
+    /// its offsets array, so a group past one end's domain holds an
+    /// empty CSR for that end and a full one for the other.
     pub row_count: u32,
     /// How many edges the groups before this one hold, which is the
     /// ordinal of this group's first forward edge. Stored rather than
@@ -99,7 +117,14 @@ impl GroupMeta {
 /// The per-table group directory, stored as one meta chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
-    pub node_count: u64,
+    /// Rows of the node table the edges leave, the domain a source id
+    /// and the forward CSR are numbered in.
+    pub from_count: u64,
+    /// Rows of the node table the edges arrive at, the domain a
+    /// destination id and the backward CSR are numbered in. Equal to
+    /// `from_count` when both ends are the same table, which is what a
+    /// load naming one node table produces.
+    pub to_count: u64,
     pub edge_count: u64,
     /// Primary-key index over original node ids, present when the load
     /// relabeled rows.
@@ -111,10 +136,37 @@ pub struct Directory {
 }
 
 impl Directory {
+    /// The row domain `dir` is keyed by: sources for Fwd, destinations
+    /// for Bwd. This is the range a node id must be in to have a list
+    /// in that direction at all.
+    pub fn rows(&self, dir: Direction) -> u64 {
+        match dir {
+            Direction::Fwd => self.from_count,
+            Direction::Bwd => self.to_count,
+        }
+    }
+
+    /// The one row domain of a rel table that runs inside a single node
+    /// table, for the algorithms whose answer is a value per node and
+    /// which therefore only mean anything on such a table. A table
+    /// between two ends of different sizes has no such domain and is
+    /// refused here; the binder refuses the cross table case ahead of
+    /// this, and this is what keeps a caller reaching past it honest.
+    pub fn one_domain(&self) -> Result<u64> {
+        if self.from_count != self.to_count {
+            return Err(ZuError::InvalidArgument(format!(
+                "this needs a rel table over one node table, and its ends hold {} and {} rows",
+                self.from_count, self.to_count
+            )));
+        }
+        Ok(self.from_count)
+    }
+
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&DIRECTORY_VERSION.to_le_bytes());
-        out.extend_from_slice(&self.node_count.to_le_bytes());
+        out.extend_from_slice(&self.from_count.to_le_bytes());
+        out.extend_from_slice(&self.to_count.to_le_bytes());
         out.extend_from_slice(&self.edge_count.to_le_bytes());
         out.extend_from_slice(&self.props.to_le_bytes());
         out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
@@ -142,20 +194,27 @@ impl Directory {
             what: "group directory",
             detail: detail.to_string(),
         };
-        let head = bytes.get(..31).ok_or_else(|| corrupt("truncated header"))?;
-        let version = u16::from_le_bytes(head[..2].try_into().unwrap());
+        // The version comes off first, on its own two bytes. Every
+        // other field's offset is a claim this version makes, and the
+        // header of an older one is a different length, so a length
+        // check ahead of the gate would report corruption where the
+        // truth is an older writer.
+        let tag = bytes.get(..2).ok_or_else(|| corrupt("truncated header"))?;
+        let version = u16::from_le_bytes(tag.try_into().unwrap());
         if version != DIRECTORY_VERSION {
             return Err(ZuError::Unsupported {
                 what: "group directory version",
                 id: u32::from(version),
             });
         }
-        let node_count = u64::from_le_bytes(head[2..10].try_into().unwrap());
-        let edge_count = u64::from_le_bytes(head[10..18].try_into().unwrap());
-        let props = u64::from_le_bytes(head[18..26].try_into().unwrap());
-        let group_count = u32::from_le_bytes(head[26..30].try_into().unwrap()) as usize;
-        let mut pos = 31usize;
-        let keys = match head[30] {
+        let head = bytes.get(..39).ok_or_else(|| corrupt("truncated header"))?;
+        let from_count = u64::from_le_bytes(head[2..10].try_into().unwrap());
+        let to_count = u64::from_le_bytes(head[10..18].try_into().unwrap());
+        let edge_count = u64::from_le_bytes(head[18..26].try_into().unwrap());
+        let props = u64::from_le_bytes(head[26..34].try_into().unwrap());
+        let group_count = u32::from_le_bytes(head[34..38].try_into().unwrap()) as usize;
+        let mut pos = 39usize;
+        let keys = match head[38] {
             0 => None,
             1 => {
                 let (keys, next) = SegmentMeta::decode(bytes, pos)?;
@@ -203,7 +262,8 @@ impl Directory {
             return Err(corrupt("trailing bytes"));
         }
         Ok(Self {
-            node_count,
+            from_count,
+            to_count,
             edge_count,
             keys,
             props,
@@ -381,9 +441,36 @@ pub fn densify_keyed(keys: &[u64], edges: &[(u64, u64)]) -> Result<Densified> {
     Ok((dense, by_row))
 }
 
+/// How many rows of a table of `count` rows group `g` covers, which is
+/// a full group everywhere but the last one and nothing at all past the
+/// end of the table.
+pub(crate) fn group_rows(count: u64, g: u64) -> u32 {
+    let first_row = g * GROUP_ROWS as u64;
+    count.saturating_sub(first_row).min(GROUP_ROWS as u64) as u32
+}
+
+/// Extends `dirs` with empty CSR groups until it has `want` of them, for
+/// the end of a rel table whose node table is the shorter of the two.
+/// An empty group is what a direction over no rows builds anyway, one
+/// offset and no neighbors, so nothing downstream has a second shape to
+/// read.
+pub(crate) fn pad_direction(
+    db: &mut Zu1File,
+    dirs: &mut Vec<DirectionMeta>,
+    want: usize,
+) -> Result<()> {
+    while dirs.len() < want {
+        dirs.extend(build_direction(db, "row", 0, &[])?);
+    }
+    Ok(())
+}
+
 /// Builds one direction's CSR groups from edges sorted by `(key, other)`.
+/// `end` names the endpoint the edges are keyed by, so an id outside
+/// the row domain is refused in the words of the end it came from.
 pub(crate) fn build_direction(
     db: &mut Zu1File,
+    end: &str,
     node_count: u64,
     edges: &[(u32, u32)],
 ) -> Result<Vec<DirectionMeta>> {
@@ -391,15 +478,14 @@ pub(crate) fn build_direction(
     for w in edges.windows(2) {
         debug_assert!(w[0] <= w[1], "edges must be sorted");
     }
-    let group_rows = GROUP_ROWS as u64;
-    let group_count = node_count.div_ceil(group_rows).max(1) as usize;
+    let group_count = node_count.div_ceil(GROUP_ROWS as u64).max(1) as usize;
     let mut dirs = Vec::with_capacity(group_count);
     let mut edge_ix = 0usize;
     let mut offsets = Vec::new();
     let mut neighbors: Vec<u64> = Vec::new();
     for g in 0..group_count as u64 {
-        let first_row = g * group_rows;
-        let row_count = (node_count - first_row).min(group_rows) as u32;
+        let first_row = g * GROUP_ROWS as u64;
+        let row_count = group_rows(node_count, g);
         offsets.clear();
         neighbors.clear();
         offsets.push(0);
@@ -418,7 +504,7 @@ pub(crate) fn build_direction(
     }
     if edge_ix != edges.len() {
         return Err(ZuError::InvalidArgument(format!(
-            "{} edges reference nodes at or above node_count {node_count}",
+            "{} edges name a {end} at or above the {node_count} rows of its node table",
             edges.len() - edge_ix
         )));
     }
@@ -529,7 +615,57 @@ pub fn bulk_load_undirected_as(
     node_count: u64,
     edges: &[(u32, u32)],
 ) -> Result<Directory> {
-    bulk_load_inner(db, node_table, rel_table, node_count, edges, None, true)
+    bulk_load_inner(
+        db,
+        Ends::within(node_table, node_count),
+        rel_table,
+        edges,
+        None,
+        true,
+    )
+}
+
+/// The two ends of a rel table: the node table each is, and how many
+/// rows that table holds. [`Ends::within`] is the common case where
+/// both ends are one table, which is what an edge list over a single
+/// node table loads as.
+#[derive(Debug, Clone, Copy)]
+pub struct Ends<'a> {
+    pub from: (&'a str, u64),
+    pub to: (&'a str, u64),
+}
+
+impl<'a> Ends<'a> {
+    /// Both ends in one node table of `count` rows.
+    pub fn within(table: &'a str, count: u64) -> Self {
+        Ends {
+            from: (table, count),
+            to: (table, count),
+        }
+    }
+
+    /// Ends in two node tables, which may still be the same one.
+    pub fn between(from: (&'a str, u64), to: (&'a str, u64)) -> Self {
+        Ends { from, to }
+    }
+}
+
+/// [`bulk_load_as`] for a rel table whose ends are different node
+/// tables, so a source id is a row of `ends.from` and a destination id
+/// a row of `ends.to`.
+///
+/// This is what a labelled graph needs: `(:Person)-[:LIVES_IN]->(:City)`
+/// is two node tables of unrelated sizes with one rel table between
+/// them, and reading it backward from a city has to land in the person
+/// table rather than in a row of its own.
+pub fn bulk_load_between(
+    db: &mut Zu1File,
+    ends: Ends<'_>,
+    rel_table: &str,
+    edges: &[(u32, u32)],
+    undirected: bool,
+) -> Result<Directory> {
+    bulk_load_inner(db, ends, rel_table, edges, None, undirected)
 }
 
 /// Bulk-loads both CSR directions from an edge list into `db` as the rel
@@ -553,24 +689,29 @@ pub fn bulk_load_keyed(
     key_by_row: Option<&[u64]>,
 ) -> Result<Directory> {
     bulk_load_inner(
-        db, node_table, rel_table, node_count, edges, key_by_row, false,
+        db,
+        Ends::within(node_table, node_count),
+        rel_table,
+        edges,
+        key_by_row,
+        false,
     )
 }
 
 fn bulk_load_inner(
     db: &mut Zu1File,
-    node_table: &str,
+    ends: Ends<'_>,
     rel_table: &str,
-    node_count: u64,
     edges: &[(u32, u32)],
     key_by_row: Option<&[u64]>,
     undirected: bool,
 ) -> Result<Directory> {
+    let ((from_table, from_count), (to_table, to_count)) = (ends.from, ends.to);
     if let Some(keys) = key_by_row
-        && keys.len() as u64 != node_count
+        && keys.len() as u64 != from_count
     {
         return Err(ZuError::InvalidArgument(format!(
-            "{} keys over {node_count} nodes",
+            "{} keys over {from_count} nodes",
             keys.len()
         )));
     }
@@ -583,11 +724,11 @@ fn bulk_load_inner(
             index.remove(id);
         }
     }
-    let fwd = build_direction(db, node_count, edges)?;
+    let mut fwd = build_direction(db, "source", from_count, edges)?;
     let out_hist = crate::stats::degree_histogram(edges);
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
     rev.sort_unstable();
-    let bwd = build_direction(db, node_count, &rev)?;
+    let mut bwd = build_direction(db, "destination", to_count, &rev)?;
     let in_hist = crate::stats::degree_histogram(&rev);
     let norms = crate::stats::DegreeStats {
         out: crate::stats::degree_norms(edges),
@@ -595,24 +736,24 @@ fn bulk_load_inner(
         cross: crate::stats::degree_cross(edges, &rev),
     };
     drop(rev);
-    let row_counts = |g: u64| {
-        let first_row = g * GROUP_ROWS as u64;
-        (node_count - first_row).min(GROUP_ROWS as u64) as u32
-    };
-    let bases = group_bases(node_count, edges);
+    let group_count = fwd.len().max(bwd.len());
+    pad_direction(db, &mut fwd, group_count)?;
+    pad_direction(db, &mut bwd, group_count)?;
+    let bases = group_bases(from_count, edges);
     let groups = fwd
         .into_iter()
         .zip(bwd)
         .enumerate()
         .map(|(g, (fwd, bwd))| GroupMeta {
-            row_count: row_counts(g as u64),
-            edge_base: bases[g],
+            row_count: group_rows(from_count, g as u64),
+            edge_base: bases.get(g).copied().unwrap_or(edges.len() as u64),
             fwd,
             bwd,
         })
         .collect();
     let directory = Directory {
-        node_count,
+        from_count,
+        to_count,
         edge_count: edges.len() as u64,
         keys: key_by_row
             .map(|keys| write_key_index(db, keys))
@@ -621,8 +762,13 @@ fn bulk_load_inner(
         groups,
     };
     let root = meta::write_chain(db, &directory.encode())?;
-    let from = catalog.upsert_node(node_table, node_count)?;
-    let rel_id = catalog.upsert_rel_as(rel_table, from, from, edges.len() as u64, undirected)?;
+    let from = catalog.upsert_node(from_table, from_count)?;
+    let to = if to_table == from_table {
+        from
+    } else {
+        catalog.upsert_node(to_table, to_count)?
+    };
+    let rel_id = catalog.upsert_rel_as(rel_table, from, to, edges.len() as u64, undirected)?;
     index.set(rel_id, root);
     // The catalog, index, and stats chains are rewritten whole,
     // freeing the committed copies first.
@@ -780,11 +926,16 @@ impl GraphReader {
         &self.directory
     }
 
-    fn locate(&self, node: u64) -> Result<(usize, usize)> {
-        if node >= self.directory.node_count {
+    /// The group and row a node sits at in the domain `dir` is keyed
+    /// by. A node id is a row of the FROM table when it is being read
+    /// forward and of the TO table when backward, and the two tables
+    /// need not be the same size, so which end is asking decides what
+    /// the id is allowed to be.
+    fn locate(&self, node: u64, dir: Direction) -> Result<(usize, usize)> {
+        let rows = self.directory.rows(dir);
+        if node >= rows {
             return Err(ZuError::InvalidArgument(format!(
-                "node {node} out of range 0..{}",
-                self.directory.node_count
+                "node {node} out of range 0..{rows}"
             )));
         }
         Ok((
@@ -796,7 +947,7 @@ impl GraphReader {
     /// Returns `node`'s sorted list in `dir`, decoding the node's group
     /// on a cache miss.
     pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
-        let (g, row) = self.locate(node)?;
+        let (g, row) = self.locate(node, dir)?;
         let idx = dir as usize;
         if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
             let (offsets, nbrs) = self.csr_group(db, g, dir)?;
@@ -853,7 +1004,7 @@ impl GraphReader {
     /// Degree of `node` in `dir` from the pooled offset array alone;
     /// the neighbor values never decode for a count.
     pub fn degree_of(&self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<u64> {
-        let (g, row) = self.locate(node)?;
+        let (g, row) = self.locate(node, dir)?;
         let meta = self.directory.groups[g].dir(dir);
         let pools = db.pools();
         let offs = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
@@ -923,9 +1074,9 @@ impl GraphReader {
     ) -> Result<()> {
         let mut at = 0;
         while at < nodes.len() {
-            let (group, _) = self.locate(nodes[at])?;
+            let (group, _) = self.locate(nodes[at], dir)?;
             let mut end = at + 1;
-            while end < nodes.len() && self.locate(nodes[end])?.0 == group {
+            while end < nodes.len() && self.locate(nodes[end], dir)?.0 == group {
                 end += 1;
             }
             let chunks = self.directory.groups[group]
@@ -936,14 +1087,14 @@ impl GraphReader {
             if end - at >= chunks {
                 let offs = Arc::clone(self.offsets(db, group, dir)?);
                 for (i, &node) in (at..end).zip(&nodes[at..end]) {
-                    let (_, row) = self.locate(node)?;
+                    let (_, row) = self.locate(node, dir)?;
                     sink(i, offs[row + 1] - offs[row]);
                 }
             } else {
                 let meta = &self.directory.groups[group].dir(dir).offsets;
                 let mut pair = Vec::with_capacity(2);
                 for (i, &node) in (at..end).zip(&nodes[at..end]) {
-                    let (_, row) = self.locate(node)?;
+                    let (_, row) = self.locate(node, dir)?;
                     pair.clear();
                     read_range(db, meta, row as u64, row as u64 + 2, &mut pair)?;
                     sink(i, pair[1] - pair[0]);
@@ -966,7 +1117,7 @@ impl GraphReader {
         dir: Direction,
         out: &mut Vec<u64>,
     ) -> Result<()> {
-        let (g, row) = self.locate(node)?;
+        let (g, row) = self.locate(node, dir)?;
         let meta = self.directory.groups[g].dir(dir);
         let mut offs = Vec::with_capacity(2);
         read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
@@ -990,7 +1141,7 @@ impl GraphReader {
         other: u64,
         dir: Direction,
     ) -> Result<bool> {
-        let (g, row) = self.locate(node)?;
+        let (g, row) = self.locate(node, dir)?;
         let meta = self.directory.groups[g].dir(dir);
         let mut offs = Vec::with_capacity(2);
         read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
@@ -1021,7 +1172,7 @@ impl GraphReader {
     /// [`crate::props::store_rel_props`] is what enforces, so the pair
     /// names one edge and the ordinal is that edge's.
     pub fn edge_ordinal(&self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>> {
-        let (g, row) = self.locate(src)?;
+        let (g, row) = self.locate(src, Direction::Fwd)?;
         let group = &self.directory.groups[g];
         let mut offs = Vec::with_capacity(2);
         read_range(
@@ -1601,10 +1752,99 @@ mod tests {
     }
 
     #[test]
+    fn a_rel_table_runs_between_two_node_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        // Four people, two cities, and one of each that the edges never
+        // name, so the row domains are visibly different sizes and the
+        // ends cannot be standing in for one another.
+        let edges = [(0u32, 1u32), (1, 0), (2, 1)];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load_between(
+                &mut db,
+                Ends::between(("person", 4), ("city", 2)),
+                "lives_in",
+                &edges,
+                false,
+            )
+            .unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let catalog = Catalog::load(&mut db).unwrap();
+        let rel = catalog.rel_by_name("lives_in").unwrap();
+        assert_ne!(rel.from, rel.to);
+        assert_eq!(catalog.node_by_id(rel.from).unwrap().name, "person");
+        assert_eq!(catalog.node_by_id(rel.to).unwrap().name, "city");
+        assert_eq!(catalog.node_by_name("person").unwrap().node_count, 4);
+        assert_eq!(catalog.node_by_name("city").unwrap().node_count, 2);
+
+        let mut reader = GraphReader::load_table(&mut db, "lives_in").unwrap();
+        assert_eq!(reader.directory().from_count, 4);
+        assert_eq!(reader.directory().to_count, 2);
+        assert_eq!(reader.neighbors(&mut db, 2).unwrap(), &[1]);
+        assert!(reader.neighbors(&mut db, 3).unwrap().is_empty());
+        assert_eq!(
+            reader
+                .neighbors_dir(&mut db, 1, Direction::Bwd)
+                .unwrap()
+                .to_vec(),
+            vec![0, 2]
+        );
+        // A person row is not a city row: 3 is a person and reading it
+        // as a destination is out of range, not an empty answer.
+        assert!(reader.neighbors_dir(&mut db, 3, Direction::Bwd).is_err());
+        assert!(reader.neighbors(&mut db, 4).is_err());
+        assert_eq!(reader.edge_ordinal(&mut db, 1, 0).unwrap(), Some(1));
+        assert!(reader.directory().one_domain().is_err());
+    }
+
+    #[test]
+    fn the_shorter_end_of_a_rel_table_pads_out_to_the_longer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        // The destination table spans two groups and the source table
+        // three rows, so the forward direction runs out of groups first
+        // and every reader still finds one to read.
+        let far = GROUP_ROWS + 3;
+        let edges = [(0u32, 5u32), (1, far), (2, 0)];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load_between(
+                &mut db,
+                Ends::between(("post", 3), ("tag", u64::from(far) + 1)),
+                "tagged",
+                &edges,
+                false,
+            )
+            .unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load_table(&mut db, "tagged").unwrap();
+        assert_eq!(reader.directory().groups.len(), 2);
+        assert_eq!(reader.directory().groups[1].row_count, 0);
+        assert_eq!(reader.neighbors(&mut db, 1).unwrap(), &[u64::from(far)]);
+        assert_eq!(
+            reader
+                .neighbors_dir(&mut db, u64::from(far), Direction::Bwd)
+                .unwrap(),
+            &[1]
+        );
+        assert!(reader.neighbors(&mut db, 3).is_err());
+        assert_eq!(
+            reader
+                .degree_of(&mut db, u64::from(far), Direction::Bwd)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn hostile_group_count_rejected() {
         // A header claiming u32::MAX groups must die on the size check,
         // not in the allocator.
         let mut bytes = DIRECTORY_VERSION.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&10u64.to_le_bytes());
         bytes.extend_from_slice(&10u64.to_le_bytes());
         bytes.extend_from_slice(&20u64.to_le_bytes());
         bytes.extend_from_slice(&NULL_BLOCK.to_le_bytes());
@@ -1618,6 +1858,32 @@ mod tests {
         bytes[flag_at] = 7;
         let err = Directory::decode(&bytes).unwrap_err();
         assert!(format!("{err}").contains("has_keys byte is 7"));
+    }
+
+    #[test]
+    fn an_older_directory_version_is_refused() {
+        // A version 8 header is a byte shorter and carries one node
+        // count where version 9 carries two. Reading it as version 9
+        // would take the edge count for the to domain and every row
+        // range check after that would be wrong, so the version gate
+        // has to fire before any field is believed.
+        let mut bytes = 8u16.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&10u64.to_le_bytes());
+        bytes.extend_from_slice(&20u64.to_le_bytes());
+        bytes.extend_from_slice(&NULL_BLOCK.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0);
+        let err = Directory::decode(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ZuError::Unsupported {
+                    what: "group directory version",
+                    id: 8
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]

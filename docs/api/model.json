@@ -3768,7 +3768,7 @@
       "id": "zu::zu1::graph",
       "kind": "module",
       "name": "graph",
-      "doc": "Bulk-loaded graph storage: node groups of 131,072 rows, per-group CSR\nin both directions, and the group directory meta chain.\n\nThis is the read-optimized COPY path of `docs/04-storage-zu1-format.md`\n§2 and §4. Each group stores two segments per direction: slot offsets\n(131,073 monotone values, so delta wins the cascade) and neighbor ids\nas dense row ids, sorted per list, which is what hits the bits per\nedge target. Fwd is keyed by source, Bwd by destination, so both\nout-neighbors and in-neighbors answer without scanning. Slack gaps and\nthe spill chain arrive with the updatable CSR; bulk-built groups are\ndense.\n\nDirectory layout (version-prefixed, hand-rolled):\n`version: u16`, `node_count: u64`, `edge_count: u64`,\n`props: BlockPtr`, `group_count: u32`, `has_keys: u8`, then when\n`has_keys` is 1 the key and row `SegmentMeta` of the primary-key\nindex, then per group `row_count: u32`, `edge_base: u64`, and the fwd\noffsets, fwd neighbors, bwd offsets, and bwd neighbors `SegmentMeta`.\n\nEach rel table's directory is its own meta chain, reached through the\ncatalog and the table index of `crate::catalog`, so one file holds any\nnumber of named graphs and a bulk load replaces only the table it\nnames.\n\nEdges carry properties the way nodes do, through a props directory of\n`crate::props`, hung off `props` here rather than off the table index,\nwhose entry for a rel id is this directory. The row domain of those\ncolumns is the edge ordinal: the position of an edge in the sorted\nload order, which is also its position in the forward neighbor arrays\nread group after group, so `edge_base` plus the slot a destination\nsits in names the row without anything being stored per edge to say\nso. Reading a property backward costs the search that finds the slot\n(see [`GraphReader::edge_ordinal`]), and nothing in either direction\ncosts a permutation on disk."
+      "doc": "Bulk-loaded graph storage: node groups of 131,072 rows, per-group CSR\nin both directions, and the group directory meta chain.\n\nThis is the read-optimized COPY path of `docs/04-storage-zu1-format.md`\n§2 and §4. Each group stores two segments per direction: slot offsets\n(131,073 monotone values, so delta wins the cascade) and neighbor ids\nas dense row ids, sorted per list, which is what hits the bits per\nedge target. Fwd is keyed by source, Bwd by destination, so both\nout-neighbors and in-neighbors answer without scanning. Slack gaps and\nthe spill chain arrive with the updatable CSR; bulk-built groups are\ndense.\n\nDirectory layout (version-prefixed, hand-rolled):\n`version: u16`, `from_count: u64`, `to_count: u64`,\n`edge_count: u64`, `props: BlockPtr`, `group_count: u32`,\n`has_keys: u8`, then when `has_keys` is 1 the key and row\n`SegmentMeta` of the primary-key index, then per group\n`row_count: u32`, `edge_base: u64`, and the fwd offsets, fwd\nneighbors, bwd offsets, and bwd neighbors `SegmentMeta`.\n\nA rel table runs between two node tables, which need not be the same\none and need not be the same size: `from_count` is the row domain\nthe forward direction is keyed by and `to_count` the one the\nbackward direction is. The two share a single group array, as long\nas the longer of them needs, because every reader reaches a group by\nrow and a direction at once and the shorter end simply has nothing\npast its own domain. A group beyond an end's rows holds that end's\nempty CSR, the same one a table of no rows loads, which costs a\nsegment of one offset and no neighbors.\n\nEach rel table's directory is its own meta chain, reached through the\ncatalog and the table index of `crate::catalog`, so one file holds any\nnumber of named graphs and a bulk load replaces only the table it\nnames.\n\nEdges carry properties the way nodes do, through a props directory of\n`crate::props`, hung off `props` here rather than off the table index,\nwhose entry for a rel id is this directory. The row domain of those\ncolumns is the edge ordinal: the position of an edge in the sorted\nload order, which is also its position in the forward neighbor arrays\nread group after group, so `edge_base` plus the slot a destination\nsits in names the row without anything being stored per edge to say\nso. Reading a property backward costs the search that finds the slot\n(see [`GraphReader::edge_ordinal`]), and nothing in either direction\ncosts a permutation on disk."
     },
     {
       "id": "zu::zu1::graph::CsrArrays",
@@ -3846,6 +3846,14 @@
       "signature": "u64"
     },
     {
+      "id": "zu::zu1::graph::Directory::from_count",
+      "kind": "field",
+      "name": "from_count",
+      "of": "zu::zu1::graph::Directory",
+      "signature": "u64",
+      "doc": "Rows of the node table the edges leave, the domain a source id\nand the forward CSR are numbered in."
+    },
+    {
       "id": "zu::zu1::graph::Directory::groups",
       "kind": "field",
       "name": "groups",
@@ -3861,11 +3869,12 @@
       "doc": "Primary-key index over original node ids, present when the load\nrelabeled rows."
     },
     {
-      "id": "zu::zu1::graph::Directory::node_count",
-      "kind": "field",
-      "name": "node_count",
+      "id": "zu::zu1::graph::Directory::one_domain",
+      "kind": "method",
+      "name": "one_domain",
       "of": "zu::zu1::graph::Directory",
-      "signature": "u64"
+      "signature": "fn one_domain(&self) -> Result<u64>",
+      "doc": "The one row domain of a rel table that runs inside a single node\ntable, for the algorithms whose answer is a value per node and\nwhich therefore only mean anything on such a table. A table\nbetween two ends of different sizes has no such domain and is\nrefused here; the binder refuses the cross table case ahead of\nthis, and this is what keeps a caller reaching past it honest."
     },
     {
       "id": "zu::zu1::graph::Directory::props",
@@ -3874,6 +3883,58 @@
       "of": "zu::zu1::graph::Directory",
       "signature": "zu_zu1::file::BlockPtr",
       "doc": "Root of the edge property chain, [`NULL_BLOCK`] when the table\nstores none. Its row domain is the edge ordinal."
+    },
+    {
+      "id": "zu::zu1::graph::Directory::rows",
+      "kind": "method",
+      "name": "rows",
+      "of": "zu::zu1::graph::Directory",
+      "signature": "fn rows(&self, dir: Direction) -> u64",
+      "doc": "The row domain `dir` is keyed by: sources for Fwd, destinations\nfor Bwd. This is the range a node id must be in to have a list\nin that direction at all."
+    },
+    {
+      "id": "zu::zu1::graph::Directory::to_count",
+      "kind": "field",
+      "name": "to_count",
+      "of": "zu::zu1::graph::Directory",
+      "signature": "u64",
+      "doc": "Rows of the node table the edges arrive at, the domain a\ndestination id and the backward CSR are numbered in. Equal to\n`from_count` when both ends are the same table, which is what a\nload naming one node table produces."
+    },
+    {
+      "id": "zu::zu1::graph::Ends",
+      "kind": "struct",
+      "name": "Ends",
+      "doc": "The two ends of a rel table: the node table each is, and how many\nrows that table holds. [`Ends::within`] is the common case where\nboth ends are one table, which is what an edge list over a single\nnode table loads as."
+    },
+    {
+      "id": "zu::zu1::graph::Ends::between",
+      "kind": "method",
+      "name": "between",
+      "of": "zu::zu1::graph::Ends",
+      "signature": "fn between(from: (&str, u64), to: (&str, u64)) -> Self",
+      "doc": "Ends in two node tables, which may still be the same one."
+    },
+    {
+      "id": "zu::zu1::graph::Ends::from",
+      "kind": "field",
+      "name": "from",
+      "of": "zu::zu1::graph::Ends",
+      "signature": "(&str, u64)"
+    },
+    {
+      "id": "zu::zu1::graph::Ends::to",
+      "kind": "field",
+      "name": "to",
+      "of": "zu::zu1::graph::Ends",
+      "signature": "(&str, u64)"
+    },
+    {
+      "id": "zu::zu1::graph::Ends::within",
+      "kind": "method",
+      "name": "within",
+      "of": "zu::zu1::graph::Ends",
+      "signature": "fn within(table: &str, count: u64) -> Self",
+      "doc": "Both ends in one node table of `count` rows."
     },
     {
       "id": "zu::zu1::graph::GraphReader",
@@ -4056,7 +4117,8 @@
       "kind": "field",
       "name": "row_count",
       "of": "zu::zu1::graph::GroupMeta",
-      "signature": "u32"
+      "signature": "u32",
+      "doc": "Rows of the FROM table this group covers, which is what the\nforward direction is keyed by. The backward direction is keyed\nby the TO table and carries its own row count in the length of\nits offsets array, so a group past one end's domain holds an\nempty CSR for that end and a full one for the other."
     },
     {
       "id": "zu::zu1::graph::bulk_load",
@@ -4071,6 +4133,13 @@
       "name": "bulk_load_as",
       "signature": "fn bulk_load_as(db: &mut zu_zu1::file::Zu1File, node_table: &str, rel_table: &str, node_count: u64, edges: &[(u32, u32)]) -> zu_common::Result<Directory>",
       "doc": "[`bulk_load_keyed`] without a key index."
+    },
+    {
+      "id": "zu::zu1::graph::bulk_load_between",
+      "kind": "function",
+      "name": "bulk_load_between",
+      "signature": "fn bulk_load_between(db: &mut zu_zu1::file::Zu1File, ends: Ends, rel_table: &str, edges: &[(u32, u32)], undirected: bool) -> zu_common::Result<Directory>",
+      "doc": "[`bulk_load_as`] for a rel table whose ends are different node\ntables, so a source id is a row of `ends.from` and a destination id\na row of `ends.to`.\n\nThis is what a labelled graph needs: `(:Person)-[:LIVES_IN]->(:City)`\nis two node tables of unrelated sizes with one rel table between\nthem, and reading it backward from a city has to land in the person\ntable rather than in a row of its own."
     },
     {
       "id": "zu::zu1::graph::bulk_load_keyed",

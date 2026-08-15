@@ -62,7 +62,7 @@ fn compare(zu: &mut Zu1Side, sq: &SqliteStore, total: u64, what: &str) {
     let props = load_props(&mut zu.db, zu.person).unwrap().unwrap();
     let mut reader = PropsReader::new(props);
     let mut graph = GraphReader::load_table(&mut zu.db, "knows").unwrap();
-    let graph_rows = graph.directory().node_count;
+    let graph_rows = graph.directory().from_count;
     for row in 0..total {
         let sq_row: Option<(i64, String)> = sq
             .raw()

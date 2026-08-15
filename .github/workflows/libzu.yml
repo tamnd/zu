@@ -127,16 +127,30 @@ jobs:
                   --default-toolchain $toolchain
               export PATH=/w/.cargo/bin:\$PATH
               scripts/libzu-build.sh ${{ matrix.target }} ${{ matrix.smoke }}"
+      # What a consumer of the C ABI needs, flat in one directory named
+      # for the target, because this directory is the release artifact:
+      # `cargo xtask artifacts --assemble` packs it as
+      # libzu-<target>.tar.zst and an unpacked release should be four
+      # files rather than four levels of somebody's build path. The
+      # import library goes beside the DLL because a C caller on Windows
+      # links against that and not against the DLL, and it exists
+      # nowhere else, which is why the copy is conditional.
+      - name: Stage the artifact
+        shell: bash
+        env:
+          out: dist/libzu-${{ matrix.target }}
+          from: target/${{ matrix.target }}/release
+        run: |
+          set -eux
+          mkdir -p "$out"
+          cp "$from/${{ matrix.lib }}" "$from/${{ matrix.exe }}" "$out/"
+          if [ -f "$from/zu.dll.lib" ]; then cp "$from/zu.dll.lib" "$out/"; fi
+          cp crates/zu-capi/include/zu.h "$out/"
       # One artifact per platform, named for the target, so that a
       # release assembles what CI built rather than building it again
-      # somewhere else. The import library goes with the DLL because a C
-      # caller on Windows links against that and not against the DLL.
+      # somewhere else.
       - uses: actions/upload-artifact@v4
         with:
           name: libzu-${{ matrix.target }}
           if-no-files-found: error
-          path: |
-            target/${{ matrix.target }}/release/${{ matrix.lib }}
-            target/${{ matrix.target }}/release/${{ matrix.exe }}
-            target/${{ matrix.target }}/release/zu.dll.lib
-            crates/zu-capi/include/zu.h
+          path: dist/libzu-${{ matrix.target }}

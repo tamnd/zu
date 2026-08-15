@@ -915,3 +915,117 @@ fn a_duplicated_edge_with_properties_is_refused() {
         "the error says what is wrong with the store: {err}"
     );
 }
+
+/// A node's extra labels cross both hops, and a pattern naming one on
+/// the converted file finds the rows that carry it.
+///
+/// The two sides store this differently and that is the risk. Sqlite
+/// holds a row per pair and zu1 holds a word per row, so the crossing
+/// has to line the label names up with dictionary positions in one
+/// direction and back out of them in the other, and a table's own
+/// label is on every row in zu1 and on none of them in sqlite.
+#[test]
+fn extra_node_labels_survive_both_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    let mut sq = SqliteStore::open(&a).unwrap();
+    sq.create_node_table("person", &[("age", ColumnType::Integer)])
+        .unwrap();
+    sq.create_rel_table("knows", "person", "person", &[])
+        .unwrap();
+    sq.begin().unwrap();
+    for row in 0..4i64 {
+        sq.insert_node_at("person", row, &[SqlValue::Int(20 + row)])
+            .unwrap();
+    }
+    sq.insert_rel("knows", 0, 1, &[]).unwrap();
+    sq.insert_rel("knows", 1, 2, &[]).unwrap();
+    sq.insert_rel("knows", 2, 3, &[]).unwrap();
+    sq.commit().unwrap();
+    sq.set_node_labels("person", 0, &["Employee"]).unwrap();
+    sq.set_node_labels("person", 2, &["Employee", "Manager"])
+        .unwrap();
+    sq.set_node_labels("person", 3, &["Manager"]).unwrap();
+    drop(sq);
+
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut zu = Zu1File::open(&b).unwrap();
+    let ids = |zu: &mut Zu1File, source: &str| {
+        run_zu1(source, zu, &[])
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                QValue::Int(i) => i,
+                ref other => panic!("id is not an int: {other:?}"),
+            })
+            .collect::<Vec<i64>>()
+    };
+    assert_eq!(
+        ids(&mut zu, "MATCH (n:person) RETURN n.id AS id ORDER BY id"),
+        [0, 1, 2, 3],
+        "the table's own label still names every row"
+    );
+    assert_eq!(
+        ids(&mut zu, "MATCH (n:Employee) RETURN n.id AS id ORDER BY id"),
+        [0, 2]
+    );
+    assert_eq!(
+        ids(&mut zu, "MATCH (n:Manager) RETURN n.id AS id ORDER BY id"),
+        [2, 3]
+    );
+    assert_eq!(
+        ids(&mut zu, "MATCH (n:Employee&Manager) RETURN n.id AS id"),
+        [2]
+    );
+    // The property columns still read, which says the label store did
+    // not write over the directory they hang off.
+    assert_eq!(
+        ids(&mut zu, "MATCH (n:Manager) RETURN n.age AS id ORDER BY id"),
+        [22, 23]
+    );
+    drop(zu);
+
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    assert_eq!(
+        back.node_labels("person").unwrap(),
+        [
+            vec!["Employee".to_string()],
+            vec![],
+            vec!["Employee".to_string(), "Manager".to_string()],
+            vec!["Manager".to_string()],
+        ],
+        "the table's own label does not come back as an extra one"
+    );
+}
+
+/// A table nobody labelled crosses with no label store at all, which
+/// is what keeps a graph that never asked for this from paying a word
+/// per row for it.
+#[test]
+fn a_graph_with_no_extra_labels_stores_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.db"),
+        dir.path().join("b.zu1"),
+        dir.path().join("c.db"),
+    );
+    seed_sqlite(&a);
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut zu = Zu1File::open(&b).unwrap();
+    let props = load_props(&mut zu, 0).unwrap().expect("person has columns");
+    assert!(
+        !PropsReader::new(props).has_labels(),
+        "a table nobody labelled stores no word per row"
+    );
+    drop(zu);
+
+    zu1_to_sqlite(&b, &c).unwrap();
+    let back = SqliteStore::open(&c).unwrap();
+    assert!(back.node_labels("person").unwrap().is_empty());
+}

@@ -26,7 +26,7 @@ use zu_zu1::file::Zu1File;
 use zu_zu1::graph::{Direction as Zu1Direction, Ends, GraphReader, bulk_load_between};
 use zu_zu1::props::{
     ListElement, PropInput, PropValues, PropsReader, list_elements, load_props, load_rel_props,
-    store_props_nullable, store_rel_props_nullable,
+    store_labels, store_props_nullable, store_rel_props_nullable,
 };
 
 /// The staged element kind a stored list's element type names, `None`
@@ -185,6 +185,31 @@ pub fn zu1_to_sqlite(zu1_path: &Path, db_path: &Path) -> Result<()> {
                 }
             }
             sq.insert_node_at(&node.name, row as i64, &values)?;
+            // The label word carries the table's own bit on every row,
+            // and the sqlite side gets what the row carries beyond it,
+            // which is what the word says once that bit is cleared.
+            if let Some(reader) = reader.as_mut()
+                && let Some(word) = reader.label_word(&mut zu, row)?
+            {
+                let extra = word & !(1u64 << node.primary_label());
+                if extra != 0 {
+                    let names: Vec<&str> = (0..catalog.labels().len() as u16)
+                        .filter(|l| extra & (1 << l) != 0)
+                        .map(|l| {
+                            catalog.label_name(l).ok_or_else(|| ZuError::Corrupt {
+                                what: "label dictionary",
+                                detail: format!(
+                                    "node table '{}' row {row} carries label {l} and the \
+                                     dictionary holds {} names",
+                                    node.name,
+                                    catalog.labels().len()
+                                ),
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    sq.set_node_labels(&node.name, row as i64, &names)?;
+                }
+            }
         }
         sq.commit()?;
     }
@@ -749,18 +774,24 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
 
     for node in &nodes {
         let declared = sq.node_column_types(&node.name)?;
-        if declared.is_empty() {
-            continue;
+        if !declared.is_empty() {
+            let names: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
+            let count = sq.node_count(&node.name)? as u64;
+            let staged = Staged::read(&node.name, &declared, count, |row, ci| {
+                sq.read_node_prop(&node.name, row as i64, &names[ci])
+            })?;
+            staged.with_inputs(|columns| {
+                store_props_nullable(&mut zu, &node.name, columns)?;
+                Ok(())
+            })?;
         }
-        let names: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
-        let count = sq.node_count(&node.name)? as u64;
-        let staged = Staged::read(&node.name, &declared, count, |row, ci| {
-            sq.read_node_prop(&node.name, row as i64, &names[ci])
-        })?;
-        staged.with_inputs(|columns| {
-            store_props_nullable(&mut zu, &node.name, columns)?;
-            Ok(())
-        })?;
+        // After the columns and not before, because both hang off the
+        // same directory and the label store is the one that keeps
+        // what is already there.
+        let labels = sq.node_labels(&node.name)?;
+        if !labels.is_empty() {
+            store_labels(&mut zu, &node.name, &labels)?;
+        }
     }
     Ok(())
 }

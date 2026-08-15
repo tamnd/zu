@@ -53,4 +53,6 @@ Ordering rationale: risk fronted, encodings and CSR performance (M0/M1) validate
 
 ## 3. Repo conventions
 
-`tamnd/zu`: Apache-2.0; `docs/` holds these specs ; ADRs in `docs/adr/`; conventional commits; `cargo xtask` for codegen (encoding tables) and bench orchestration; no unsafe without `// SAFETY:` + fuzz coverage; public benchmark harness in `tamnd/zu-bench`.
+`tamnd/zu`: Apache-2.0; `docs/` holds these specs; ADRs in `docs/adr/` with their index at `docs/adr/README.md`; conventional commits; `cargo xtask` for codegen (encoding tables) and bench orchestration; no unsafe without `// SAFETY:` + fuzz coverage; public benchmark harness in `tamnd/graph-bench`.
+
+This repository is one of nine. The boundary between them is the C ABI: code compiling against the engine's internals stays here, code compiling against the frozen ABI gets its own repository. The rule and its consequences are ADR 0005, the map is `docs/adr/0005-the-repository-split.md` and the `Clients` section of the README, and the full topology with per-repository layout is `Spec/2064g/dx/18-repository-topology.md`.

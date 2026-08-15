@@ -13,7 +13,7 @@
 //! a leaf; a block with a predicate in it has to walk until one friend
 //! passes, and there the hubs are where the walk stops early.
 //!
-//! Five queries run over it. The counted semi is the bare block with
+//! Six queries run over it. The counted semi is the bare block with
 //! nothing built above it, so it is the degree read and nothing else,
 //! and that is the shape the floor sits on. The counted anti is the
 //! same read with the answer taken the other way round. The third puts
@@ -21,13 +21,16 @@
 //! bracket: the group walks per outer row, the predicate decides what
 //! counts as a match, and the walk stops at the first one that passes.
 //! The fourth projects the outer rows the semi kept, which is the sink
-//! reading a level the block never touched. The fifth is the same
-//! pattern written as a plain required walk, which answers a different
-//! question, one row per edge, and is here because it is the other
-//! shape that reads degrees alone.
+//! reading a level the block never touched. The fifth writes the block
+//! on a level the pipeline has already walked off, asking about the
+//! near end of a hop rather than about the rows in hand, which is one
+//! degree read for a whole vector instead of one per row. The sixth is
+//! the same pattern written as a plain required walk, which answers a
+//! different question, one row per edge, and is here because it is the
+//! other shape that reads degrees alone.
 //!
 //! Each one runs twice, once through the pipeline and once with
-//! ZU_EXEC2=0, which is where the four block shapes ran before: an
+//! ZU_EXEC2=0, which is where the five block shapes ran before: an
 //! EXISTS block had no compiled shape at all.
 //!
 //! Every run is crosschecked against the edge list the graph was built
@@ -212,12 +215,23 @@ fn main() {
         rows: edges.len() as u64,
         id_total: 0,
     };
+    // The block on a walked level asks whether anyone knows the near
+    // end of the hop, which is a question the walk itself does not
+    // answer, so it keeps the edges whose source has an in edge.
+    let mut known = vec![false; NODES as usize];
+    for &(_, dst) in &edges {
+        known[dst as usize] = true;
+    }
+    let walked = Want {
+        rows: edges.iter().filter(|(src, _)| known[*src as usize]).count() as u64,
+        id_total: 0,
+    };
 
     let filtered_src = format!(
         "MATCH (p:person) WHERE EXISTS {{ MATCH (p)-[:knows]->(f) WHERE f.score > {CUT} }} \
          RETURN count(p) AS n"
     );
-    let cases: [(&str, &str, &Want, usize); 5] = [
+    let cases: [(&str, &str, &Want, usize); 6] = [
         (
             "semi count",
             "MATCH (p:person) WHERE EXISTS { MATCH (p)-[:knows]->(f) } RETURN count(p) AS n",
@@ -235,6 +249,13 @@ fn main() {
             "semi rows",
             "MATCH (p:person) WHERE EXISTS { MATCH (p)-[:knows]->(f) } RETURN p.id AS p",
             &semi,
+            5,
+        ),
+        (
+            "block on a walked level",
+            "MATCH (p:person)-[:knows]->(f) WHERE EXISTS { MATCH (p)<-[:knows]-(g) } \
+             RETURN count(*) AS n",
+            &walked,
             5,
         ),
         (

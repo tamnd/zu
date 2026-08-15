@@ -1,0 +1,114 @@
+schema: 1
+suite: temporal
+doc: Dates, times and durations, which every language already has a type for and no two of those types mean the same thing. A client mapping these onto the host language's own date is where a zone, a precision or a sign quietly goes missing.
+
+cases:
+  - name: date-leap-day
+    doc: A day that exists only every fourth year, in a year that is one. A client computing dates rather than carrying them gets this wrong before it gets anything else wrong.
+    query: RETURN DATE '2024-02-29' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-02-29"
+
+  - name: date-before-epoch
+    doc: A date before 1970, which is negative in the engine's representation and out of range for more than one language's default date type.
+    query: RETURN DATE '1900-01-01' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "1900-01-01"
+
+  - name: local-time-nanoseconds
+    doc: A time with nanosecond precision. A client on a millisecond or microsecond clock truncates this, and truncation is not an error anywhere, so only a case catches it.
+    query: RETURN LOCAL TIME '12:34:56.123456789' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "12:34:56.123456789"
+
+  - name: local-time-midnight
+    doc: Midnight, which is zero in the engine's representation and therefore the value a client that lost the field gives back by accident.
+    query: RETURN LOCAL TIME '00:00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "00:00:00"
+
+  - name: zoned-time-offset
+    doc: A time with an offset. The offset is part of the value and not a rendering of it, so a client that converts to UTC on the way out has thrown away what the user wrote.
+    query: RETURN ZONED TIME '12:34:56+07:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:34:56+07:00"
+
+  - name: local-datetime
+    doc: An instant with no zone, which is a different type from one with a zone and not the same value with a field left blank.
+    query: RETURN LOCAL DATETIME '2024-01-01T00:00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-01-01T00:00:00"
+
+  - name: zoned-datetime-offset
+    doc: An instant written in a zone seven hours ahead. The instant and the offset are both part of the value, and a client keeping only the first gives back a different local time.
+    query: RETURN ZONED DATETIME '2024-01-01T00:00:00+07:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-01T00:00:00+07:00"
+
+  - name: zoned-datetime-negative-offset
+    doc: The same instant written behind UTC rather than ahead of it, because a client packing the offset into an unsigned field passes every case where it is positive.
+    query: RETURN ZONED DATETIME '2024-01-01T00:00:00-05:30' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-01T00:00:00-05:30"
+
+  - name: duration-year-month
+    doc: A duration in months. It is not a number of days, because the number of days it comes to depends on when it starts, and a client that converts it to one has answered a question nobody asked.
+    query: RETURN DURATION 'P1Y2M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1Y2M"
+
+  - name: duration-day-time
+    doc: A duration in nanoseconds, which is the other kind, and the two do not add together for the reason the case above gives.
+    query: RETURN DURATION 'PT1H30M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+
+  - name: duration-negative
+    doc: A duration pointing backwards. The sign is on the whole duration and not on each field, and a client storing the fields separately has to have decided where it went.
+    query: RETURN DURATION '-PT1H' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "-PT1H"

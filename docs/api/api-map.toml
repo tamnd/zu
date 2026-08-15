@@ -1,0 +1,177 @@
+# The map from the API model to what a binding owes it.
+#
+# One of these files lives here and classifies the whole public surface. One lives in each binding repository and gives every classified entity the name that binding calls it by. They are the same schema doing two jobs, and `target` says which.
+#
+# Every entity in `model.json` has to be covered, so a new public symbol that nobody decided about fails CI here rather than shipping unbound in six languages. Check it with `cargo xtask api-map`.
+#
+# `[[group]]` covers a path prefix and everything under it. Longest prefix wins, so a narrower group is an exception to a wider one and the order of the file carries no meaning. `[[entity]]` names one identifier exactly and beats every group. Groups are what make this file reviewable: `zu::zu1` is five hundred entities and one decision, and writing that decision out five hundred times would hide the twenty entries that are not it.
+#
+# The tiers:
+#
+#   1  every tier-1 SDK exposes it, and a release where one does not is a release that fails
+#   2  a binding may expose it, and nothing is gated either way
+#   3  no binding exposes it, and a `reason` is required
+#
+# The reason on a tier 3 is the point of that tier. A public symbol nobody binds is a decision, and a decision with no reason written down is one nobody can revisit.
+#
+# Modules are not mapped. A module is a namespace, and namespaces are the one part of a Rust surface that no binding reproduces: Python flattens them, C prefixes them, Go packages them by repository. Every entity carries its full path already.
+#
+# This file is sorted, groups by prefix and entities by identifier, and the reader refuses it if it is not, because a ledger nobody can follow a diff of is a ledger nobody reviews.
+
+schema = 1
+target = "rust"
+
+[[group]]
+prefix = "zu::CheckpointMode"
+tier = 2
+reason = "how much work a checkpoint does, which only a binding that exposes checkpointing needs"
+
+[[group]]
+prefix = "zu::DiagnosticRecord"
+tier = 1
+reason = "the diagnostic record the standard defines, and half of what an error carries back"
+
+[[group]]
+prefix = "zu::Direction"
+tier = 2
+reason = "traversal direction, which a query says in its text rather than through an argument"
+
+[[group]]
+prefix = "zu::GqlStatus"
+tier = 1
+reason = "the ISO 39075 condition code on every error and every warning"
+
+[[group]]
+prefix = "zu::GraphStore"
+tier = 3
+reason = "the trait the storage engines implement, chosen by the path a session opens rather than by a caller"
+
+[[group]]
+prefix = "zu::NodeId"
+tier = 1
+reason = "a node value carries one, so every binding that returns a node returns this"
+
+[[group]]
+prefix = "zu::Severity"
+tier = 1
+reason = "whether a condition stopped the statement, which decides whether a binding raises or warns"
+
+[[group]]
+prefix = "zu::Snapshot"
+tier = 3
+reason = "the engine's read view at a fixed epoch, an interface the executor uses and no caller holds"
+
+[[group]]
+prefix = "zu::ZuError"
+tier = 1
+reason = "the error every call can return, mapped onto each language's own exception type"
+
+[[group]]
+prefix = "zu::catalog_stmt"
+tier = 3
+reason = "applying a catalog statement to an open file, which a caller reaches by running the statement"
+
+[[group]]
+prefix = "zu::convert"
+tier = 2
+reason = "converting a store between engines, which the CLI exposes and a binding may"
+
+[[group]]
+prefix = "zu::gqlstatus"
+tier = 3
+reason = "the generated condition table's own accessors, which a binding reaches through GqlStatus"
+
+[[group]]
+prefix = "zu::gqlstatus::Condition"
+tier = 1
+reason = "the condition an error names, which is what a caller matches on rather than the code text"
+
+[[group]]
+prefix = "zu::gqlstatus::DiagnosticRecord"
+tier = 2
+reason = "the same type as zu::DiagnosticRecord, which is the path a user types and the one a binding owes"
+
+[[group]]
+prefix = "zu::gqlstatus::GqlStatus"
+tier = 2
+reason = "the same type as zu::GqlStatus, which is the path a user types and the one a binding owes"
+
+[[group]]
+prefix = "zu::gqlstatus::Severity"
+tier = 2
+reason = "the same type as zu::Severity, which is the path a user types and the one a binding owes"
+
+[[group]]
+prefix = "zu::gqlstatus::codes"
+tier = 2
+reason = "one constant per condition, useful to a binding that wants named codes and not required of one"
+
+[[group]]
+prefix = "zu::list_text"
+tier = 3
+reason = "the JSON a staged list column holds while it crosses sqlite, a detail of bulk load"
+
+[[group]]
+prefix = "zu::query"
+tier = 3
+reason = "the one-shot entry points, which pay the open and plan cost per call; a binding holds a session"
+
+[[group]]
+prefix = "zu::query::QueryResult"
+tier = 1
+reason = "the rows a query returns and the warnings it raised, which is the other half of the envelope"
+
+[[group]]
+prefix = "zu::query::Value"
+tier = 1
+reason = "one runtime value, in and out, which is the type every binding spends its conversion code on"
+
+[[group]]
+prefix = "zu::session"
+tier = 1
+reason = "open, prepare, execute, explain, profile: the surface a binding is"
+
+[[group]]
+prefix = "zu::snapshot"
+tier = 3
+reason = "the vectorized read path, zone maps and CSR pins, which sits under the executor"
+
+[[group]]
+prefix = "zu::sqlite"
+tier = 3
+reason = "the sqlite engine's own facade, reached by opening a sqlite path rather than by naming it"
+
+[[group]]
+prefix = "zu::zu1"
+tier = 3
+reason = "the storage engine: blocks, segments, catalog, WAL. A binding talks to a session, and a session talks to this."
+
+[[entity]]
+id = "zu::Epoch"
+tier = 2
+reason = "the commit epoch a snapshot pins, which a binding exposing point-in-time reads would need"
+
+[[entity]]
+id = "zu::Result"
+tier = 3
+reason = "a Rust alias for Result<T, ZuError>, and every other language raises instead of returning"
+
+[[entity]]
+id = "zu::zu1::BLOCK_SIZE"
+tier = 2
+reason = "the block size, which a tool reporting on a file wants and a binding does not have to carry"
+
+[[entity]]
+id = "zu::zu1::FORMAT_VERSION"
+tier = 2
+reason = "what this build writes, which a binding reporting compatibility wants"
+
+[[entity]]
+id = "zu::zu1::MAGIC"
+tier = 2
+reason = "the file magic, enough to tell a zu1 file from anything else without opening it"
+
+[[entity]]
+id = "zu::zu1::MIN_READER_VERSION"
+tier = 2
+reason = "the oldest reader that can open what this build writes, the other half of a compatibility check"

@@ -1,0 +1,313 @@
+schema: 1
+suite: cast
+doc: Conversion between types, which is where a client is most tempted to use its host language's own and where the host language's own is most often wrong. Truncation towards zero rather than rounding, a range check rather than a wrap, and a refusal rather than a zero are the three rules, and each of them contradicts at least one popular language.
+
+cases:
+  - name: integer-to-float
+    doc: The widening direction, which is exact for every integer this small and is here so a client failing the whole suite fails on something simple first.
+    query: RETURN cast(1 AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0"
+
+  - name: integer-past-a-double
+    doc: An integer a double cannot hold exactly becomes the nearest double it can, silently, which is the one lossy cast that does not raise, because the result is the definition of the conversion rather than a failure of it.
+    query: RETURN cast(9007199254740993 AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "9007199254740992.0"
+
+  - name: float-to-integer-truncates
+    doc: The fraction is dropped and nothing is rounded. A client using a host conversion that rounds to nearest gives 2 here.
+    query: RETURN cast(1.9 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: float-to-integer-truncates-towards-zero
+    doc: A negative fraction is dropped towards zero rather than floored, so this is -1 and not -2, which is the direction a client borrowing a floor function gets wrong.
+    query: RETURN cast(-1.9 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-1"
+
+  - name: float-to-integer-does-not-round-half-up
+    doc: A half truncates like every other fraction, so this is 1 and not 2. A client rounding half up passes the first case above and fails this one.
+    query: RETURN cast(1.5 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: float-to-integer-does-not-round-half-to-even
+    doc: The other rounding rule, which would also give 2 here, and does not apply either. Truncation is the whole of the conversion.
+    query: RETURN cast(2.5 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: float-too-large-for-an-integer
+    doc: A float past the whole integer range raises 22003 rather than saturating at the largest integer, which is what the hardware conversion does on some architectures and is undefined on others.
+    query: RETURN cast(1e300 AS INT64) AS n
+    raises: "22003"
+
+  - name: narrowing-checks-the-range
+    doc: A value that does not fit the narrower type raises rather than wrapping. A client casting through a host byte type gives 44 for this, which is 300 with the top bits gone and no sign that anything happened.
+    query: RETURN cast(300 AS INT8) AS n
+    raises: "22003"
+
+  - name: narrowing-at-the-boundary-fits
+    doc: The largest INT8 fits, which says the check above is a range check and not a rejection of the whole type, and puts the boundary exactly where the type says it is.
+    query: RETURN cast(127 AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 127
+
+  - name: narrowing-one-past-the-boundary
+    doc: One more than the case above, which is the smallest possible failure and the one an off-by-one in the range check lets through.
+    query: RETURN cast(128 AS INT8) AS n
+    raises: "22003"
+
+  - name: unsigned-refuses-a-negative
+    doc: A negative into an unsigned type raises rather than reinterpreting the bits, which is what a client casting through a host unsigned type does, and it turns -1 into 255 without a word.
+    query: RETURN cast(-1 AS UINT8) AS n
+    raises: "22003"
+
+  - name: unsigned-at-the-boundary-fits
+    doc: The largest UINT8, which is past the largest INT8 and so also says the two types have separate ranges rather than one signed range with a flag.
+    query: RETURN cast(255 AS UINT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT8
+            value: 255
+
+  - name: float-too-large-for-a-single
+    doc: A double past the largest float raises rather than becoming an infinity, which is what an unchecked narrowing gives and what IEEE would say to do.
+    query: RETURN cast(1e300 AS FLOAT32) AS n
+    raises: "22003"
+
+  - name: float-too-small-for-a-single
+    doc: A double too small for a float becomes zero and does not raise, because underflow is a representable answer and overflow is not. The two directions differ and a client treating them the same is wrong once.
+    query: RETURN cast(1e-50 AS FLOAT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT32
+            value: "0.0"
+
+  - name: single-keeps-only-what-a-single-holds
+    doc: A tenth through a float and back is not a tenth, and the digits it becomes are the ones a client rounding for display would hide. The corpus writes the value as a FLOAT32, which means the double nearest to the float nearest to it.
+    query: RETURN cast(0.1 AS FLOAT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT32
+            value: "0.1"
+
+  - name: boolean-to-integer
+    doc: True is one, which is the only sensible answer and is still worth writing down because a client could have chosen -1, as one long-lived family of languages did.
+    query: RETURN cast(true AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: boolean-to-integer-false
+    doc: False is zero, the other half, so a client mapping both to one fails here.
+    query: RETURN cast(false AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: integer-to-boolean
+    doc: A non-zero integer is true, which is C's truthiness and is a decision rather than a law, so it is pinned.
+    query: RETURN cast(1 AS BOOL) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: integer-to-boolean-zero
+    doc: Zero is false, the other half of the rule above.
+    query: RETURN cast(0 AS BOOL) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: text-to-boolean
+    doc: The word reads as the value, which is the only spelling accepted, and the next case says what is not.
+    query: RETURN cast('true' AS BOOL) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: text-to-boolean-refuses-a-digit
+    doc: The digit that casts to true from an integer does not cast to true from a string, because the string conversion reads a word and does not go through the integer one. A client chaining its conversions gets true here.
+    query: RETURN cast('1' AS BOOL) AS n
+    raises: "22018"
+
+  - name: text-to-boolean-refuses-prose
+    doc: A word that is not a boolean raises rather than being false, which is the answer a client asking its host language whether the string is empty would give.
+    query: RETURN cast('abc' AS BOOL) AS n
+    raises: "22018"
+
+  - name: boolean-to-text
+    doc: The spelling of a boolean as text is lower case, so a client formatting it with its host language gives True or TRUE or 1 in three popular cases.
+    query: RETURN cast(true AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "true"
+
+  - name: text-to-integer
+    doc: Digits read back as a number, which is the direction that can fail and the one every client has a host function for.
+    query: RETURN cast('42' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: text-to-integer-allows-surrounding-space
+    doc: Space around the digits is ignored. It is a decision rather than an obvious one, and half the host parsers a client might reach for refuse it.
+    query: RETURN cast('  42  ' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: text-to-integer-allows-a-leading-plus
+    doc: An explicit sign is read, which the other half of those host parsers refuse.
+    query: RETURN cast('+42' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: text-to-integer-refuses-hexadecimal
+    doc: Only decimal is read, so a client whose host parser guesses the base from a prefix gives 42 for this and the engine raises.
+    query: RETURN cast('0x2a' AS INT64) AS n
+    raises: "22018"
+
+  - name: text-to-integer-refuses-empty
+    doc: The empty string is not a zero. It is the value a client with a missing field is holding, and turning it into a number is how a missing field becomes a plausible one.
+    query: RETURN cast('' AS INT64) AS n
+    raises: "22018"
+
+  - name: text-to-integer-refuses-a-fraction
+    doc: Text with a point in it is not an integer, and is not truncated to one, which is the leniency a client applying its float parser and then this suite's truncation rule would supply.
+    query: RETURN cast('1.5' AS INT64) AS n
+    raises: "22018"
+
+  - name: text-to-float
+    doc: The same text that is not an integer is a float, which is what makes the case above a rule about the target type rather than about the text.
+    query: RETURN cast('1.5' AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.5"
+
+  - name: text-to-float-refuses-prose
+    doc: Text that is not a number raises rather than giving zero or a NaN, which two widely used host parsers do respectively.
+    query: RETURN cast('abc' AS FLOAT64) AS n
+    raises: "22018"
+
+  - name: integer-to-text
+    doc: A number as its digits, with no separators and no sign, which is the format a client re-formatting the number itself has to match.
+    query: RETURN cast(42 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "42"
+
+  - name: float-to-text
+    doc: A float as text keeps the point, so this is not the string 1 with something dropped.
+    query: RETURN cast(1.5 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "1.5"
+
+  - name: negative-zero-to-text
+    doc: Negative zero keeps its sign in text even though it compares equal to zero, which is the one place the difference between the two is visible to a client that never looks at bits.
+    query: RETURN cast(-0.0 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "-0"
+
+  - name: text-to-text
+    doc: A string cast to a string is the same string, which is a no-op and is written down so that a client routing every cast through a formatter cannot quietly change it.
+    query: RETURN cast('abc' AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: abc
+
+  - name: a-list-does-not-cast-to-text
+    doc: There is no rendering of a list as a string, and asking for one raises 22G03 rather than producing whatever the host language prints for an array. A client filling this gap has invented a format nobody else will read.
+    query: RETURN cast([1] AS STRING) AS n
+    raises: "22G03"
+
+  - name: null-casts-to-null
+    doc: A null keeps being a null through every conversion rather than becoming the target type's zero, which is the rule that keeps a cast from inventing data.
+    query: RETURN cast(null AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL

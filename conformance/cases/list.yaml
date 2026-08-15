@@ -1,0 +1,350 @@
+schema: 1
+suite: list
+doc: The one composite type in the v0 core, and the only place a value can hold other values. A client decoding a list has to have decoded every type inside it, so a list case is a test of the whole decoder rather than one branch of it, and the nesting is where a client written against a flat wire format runs out of room.
+
+cases:
+  - name: empty
+    doc: An empty list is a value, and a client giving back a null or a missing column for it has lost the difference between no elements and no list.
+    query: RETURN [] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+
+  - name: integers
+    doc: The ordinary case, three elements in the order they were written, because order is part of what a list is and a client decoding into an unordered container fails here first.
+    query: RETURN [1, 2, 3] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+              - type: INT64
+                value: "3"
+
+  - name: mixed-types
+    doc: A list is not required to be uniform, which is the fact a client decoding into a typed array cannot represent. It has to reach for the dynamic container here or say so in its skip list.
+    query: RETURN [1, 'a', true] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: STRING
+                value: a
+              - type: BOOL
+                value: true
+
+  - name: an-integer-and-a-float-keep-their-types
+    doc: Two elements that compare equal and are stored differently. A client that decides a list's element type from the first element gives back an integer for the second and loses the distinction.
+    query: RETURN [1, 1.0] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: FLOAT64
+                value: "1.0"
+
+  - name: nested
+    doc: A list of lists, where a client flattening on the way through gives back three elements instead of two.
+    query: RETURN [[1, 2], [3]] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: LIST
+                value:
+                  - type: INT64
+                    value: "1"
+                  - type: INT64
+                    value: "2"
+              - type: LIST
+                value:
+                  - type: INT64
+                    value: "3"
+
+  - name: nested-three-deep
+    doc: Three levels, because a client whose decoder recurses once and then assumes scalars passes the case above and fails this one.
+    query: RETURN [[[1]]] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: LIST
+                value:
+                  - type: LIST
+                    value:
+                      - type: INT64
+                        value: "1"
+
+  - name: an-empty-list-inside-a-list
+    doc: One element, and that element has none. A client counting the leaves rather than the elements answers zero for the size of this.
+    query: RETURN [[]] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: LIST
+                value:
+
+  - name: size
+    doc: The number of elements, which is the only thing the v0 core can ask a list about, so it is what every case below is measured with.
+    query: RETURN size([1, 2, 3]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: size-of-empty
+    doc: No elements is a size and not an absence, which a client folding empty into null gets wrong.
+    query: RETURN size([]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: size-counts-elements-not-leaves
+    doc: A list of two lists holding three integers has a size of two. This is the same function as size on a string and the same question a client answers about nesting.
+    query: RETURN size([[1, 2], [3]]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: equality
+    doc: Two lists with the same elements in the same order are the same list, which is by value and not by identity, and a client comparing references answers false.
+    query: RETURN [1, 2] = [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: equality-of-empties
+    doc: Two empty lists are equal, which is worth its own case because it is the one an implementation short-circuiting on length gets right for the wrong reason and the one comparing first elements crashes on.
+    query: RETURN [] = [] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: inequality-by-element
+    doc: Lists of the same length differing in one place are not equal.
+    query: RETURN [1, 2] = [1, 3] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: inequality-by-length
+    doc: A list is not equal to one that extends it, which separates the length check from the element check for a client that only implemented one of them.
+    query: RETURN [1, 2] = [1, 2, 3] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: equality-across-numeric-types
+    doc: An integer element and a float element that compare equal make the lists equal, because a list comparison is the comparison of its elements and inherits their rules rather than comparing storage.
+    query: RETURN [1] = [1.0] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-by-first-difference
+    doc: Lists order at the first element that differs and ignore everything after it, which is the same rule as for strings and is worth pinning separately because it is a separate code path.
+    query: RETURN [1, 2] < [1, 3] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-by-prefix
+    doc: A list sorts before one it is a prefix of, which is how a shorter list is placed when nothing before the end distinguishes them.
+    query: RETURN [1] < [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-of-the-empty-list
+    doc: The empty list sorts before every other list, which follows from the rule above and is the boundary of it.
+    query: RETURN [] < [1] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-of-strings-inside
+    doc: A list of strings orders by the strings, so a client comparing lists by a serialised form rather than element by element has to have serialised in an order-preserving way.
+    query: RETURN ['a'] < ['b'] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: membership
+    doc: IN asks whether any element equals the value, which is the equality of the case above applied once per element.
+    query: RETURN 1 IN [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: membership-absent
+    doc: A value in no element is false and not null, because with no nulls in the list every comparison has an answer.
+    query: RETURN 3 IN [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: membership-across-numeric-types
+    doc: A float finds the integer element it equals, because IN uses the same comparison the equality operator does and not an identity check on the storage.
+    query: RETURN 1.0 IN [1] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: membership-of-a-list
+    doc: A list is a value and can be an element, so it can be looked for. A client flattening the haystack finds an integer here and answers about the wrong question.
+    query: RETURN [1] IN [[1]] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: membership-of-a-null-is-unknown
+    doc: Looking for a null gives a null, because every comparison it makes is unknown and no number of unknowns is a false.
+    query: RETURN null IN [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: membership-found-past-a-null
+    doc: A match found is true even though the list holds a null, because a true settles the question and the unknown behind it cannot unsettle it.
+    query: RETURN 1 IN [1, null] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: membership-not-found-past-a-null
+    doc: No match and a null in the list is unknown rather than false, which is the other half of the case above and the one a client short-circuiting on the end of the list gets wrong.
+    query: RETURN 3 IN [1, null] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: unwind-gives-a-row-per-element
+    doc: UNWIND is how a list becomes rows, which is the only way the v0 core reaches an element, and so it is the operation every list case below leans on.
+    query: UNWIND [1, 2] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: unwind-of-empty-gives-no-rows
+    doc: An empty list produces nothing, not one row holding a null, which is where a client implementing UNWIND as an outer join over the elements differs.
+    query: UNWIND [] AS n RETURN n
+    columns:
+      - n
+    rows:
+
+  - name: unwind-does-not-flatten
+    doc: Unwinding a list of lists gives rows holding lists and does not go a second level down. A client that flattens gives two rows of integers where the answer is two rows of lists.
+    query: UNWIND [[1], [2]] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "2"
+
+  - name: distinct-compares-lists-by-value
+    doc: Two lists built separately with the same elements are one value under DISTINCT, which is the equality rule applied where a client is most likely to have reached for a hash of the container's address.
+    query: UNWIND [[1], [1]] AS n RETURN DISTINCT n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+
+  - name: plus-does-not-concatenate
+    doc: The operator that joins two strings does not join two lists, and asks for numbers instead. A client offering list concatenation on this spelling has invented syntax the engine will not accept.
+    query: RETURN [1, 2] + [3] AS n
+    raises: "22G03"

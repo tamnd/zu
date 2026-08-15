@@ -1,0 +1,237 @@
+schema: 1
+suite: string
+doc: Text, which every language claims to have solved and each of them solved differently. What a character is, how many of them a string has, and whether two strings that look identical are the same string are three questions with three different answers per language, and each one is a case here.
+
+cases:
+  - name: ascii
+    doc: A plain string, here so that a client failing everything below fails this first and the report says whether the problem is text at all or only the awkward parts of it.
+    query: RETURN 'abc' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: abc
+
+  - name: empty
+    doc: The empty string is a string, and a client that gives back a null for it has answered a different question.
+    query: RETURN '' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+
+  - name: double-quoted-is-the-same-string
+    doc: The two quote characters make the same value, so a client re-emitting the statement cannot change the answer by choosing the other one.
+    query: RETURN "abc" AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: abc
+
+  - name: newline-escape
+    doc: An escaped newline is one character and not two, which a client counting the source text rather than the value gets wrong.
+    query: RETURN 'a\nb' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a\nb"
+
+  - name: tab-escape
+    doc: A tab, in double quotes, because the escape rules are the same in both and a client that implemented them once has to have implemented them for both.
+    query: RETURN "a\tb" AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a\tb"
+
+  - name: backslash-escape
+    doc: An escaped backslash is one backslash. It is the escape most often lost in a client that unescapes twice, once on the way in and once on the way out.
+    query: RETURN 'a\\b' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a\\b"
+
+  - name: latin-one-supplement
+    doc: A character outside ASCII but inside one byte of Latin-1, which is where a client assuming one byte per character stops being right.
+    query: RETURN 'é' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "é"
+
+  - name: outside-the-basic-plane
+    doc: A character needing a surrogate pair in UTF-16. A client on a UTF-16 string type has to give back one character here and not two.
+    query: RETURN '𝄞' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "𝄞"
+
+  - name: size-counts-characters-not-bytes
+    doc: Five characters in six bytes. A client measuring the encoded length answers 6.
+    query: RETURN size('héllo') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: size-counts-characters-not-utf16-units
+    doc: One character in two UTF-16 units. A JavaScript client answering with the host string's own length gives 2, and this is the case that says so.
+    query: RETURN size('𝄞') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: size-of-empty
+    doc: The empty string has no characters, which is not the same fact as it being falsy, and a client answering from truthiness has to be told.
+    query: RETURN size('') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: no-normalisation
+    doc: An e with an acute accent written as one character and as two. They look the same and are not the same string, and a client normalising text on the way through makes this true and loses a distinction the user can still see.
+    query: RETURN 'é' = 'é' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: sizes-differ-under-no-normalisation
+    doc: The other half of the case above, counted rather than compared, because a client that normalises would report the same size for both and this says which size each has.
+    query: RETURN size('é') AS a, size('é') AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "2"
+
+  - name: concatenation
+    doc: Two strings joined. A client that concatenates in a narrower encoding than it returns loses the second half of anything outside it.
+    query: RETURN 'héllo ' + '𝄞' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "héllo 𝄞"
+
+  - name: concatenation-with-null
+    doc: A join with a null is a null and not the other operand, which is the rule for every operator and is easiest to forget on this one.
+    query: RETURN 'a' + null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: equality
+    doc: Two strings with the same characters are the same string, which is the assertion every case above is measured against.
+    query: RETURN 'abc' = 'abc' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-is-by-code-point
+    doc: Ordering compares code points, so an upper case letter sorts before a lower case one. A client sorting by the host locale puts 'a' first in some locales and this case fails there, which is the point of it.
+    query: RETURN 'A' < 'a' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-by-prefix
+    doc: A string sorts before another it is a prefix of, which is where a client comparing fixed-width buffers padded with anything has to have padded with nothing.
+    query: RETURN '' < 'a' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-past-the-basic-plane
+    doc: A character outside the basic plane sorts after one inside it. A UTF-16 client comparing units rather than code points gets this backwards, because a surrogate is numerically below the characters it stands for.
+    query: RETURN 'ﬁ' < '𝄞' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: sort-order
+    doc: Three strings sorted, so that the pairwise comparisons above are also asserted where a client actually uses them, which is under an ORDER BY it did not implement itself.
+    query: UNWIND ['b', 'A', 'a'] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: A
+      - values:
+          - type: STRING
+            value: a
+      - values:
+          - type: STRING
+            value: b
+
+  - name: cast-from-integer
+    doc: An integer as text. A client formatting the number itself rather than taking the engine's text has a chance to disagree about the spelling.
+    query: RETURN cast(42 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "42"
+
+  - name: cast-to-integer
+    doc: Text read back as a number, which is the other direction and the one that can fail.
+    query: RETURN cast('42' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: cast-to-integer-refuses-prose
+    doc: Text that is not a number raises 22018 rather than giving zero, which is what several host languages' own parsers do and is the defect this case exists to catch.
+    query: RETURN cast('abc' AS INT64) AS n
+    raises: "22018"

@@ -1,0 +1,267 @@
+schema: 1
+suite: numeric
+doc: Arithmetic, and the places where two languages doing the same sum disagree. Integer division, the sign of a remainder, and what happens at the edge of a type are each decided differently by different host languages, so each one is a case rather than an assumption.
+
+cases:
+  - name: add
+    doc: The smallest arithmetic there is, here so that a client failing everything below fails this first and the report says where to start.
+    query: RETURN 1 + 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: subtract-into-negative
+    doc: A subtraction whose answer is negative, because a client packing the result into an unsigned host type passes every case where it is not.
+    query: RETURN 1 - 3 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-2"
+
+  - name: multiply
+    doc: A product wider than either operand, which is where a client multiplying in a narrower type than it returns first loses a digit.
+    query: RETURN 2147483647 * 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4294967294"
+
+  - name: integer-division-truncates
+    doc: Integer division gives an integer and not a fraction. A client that promotes to a float here gives back 3.5 for a query whose answer is 3, and every later comparison against it disagrees.
+    query: RETURN 7 / 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: integer-division-towards-zero
+    doc: A negative integer division truncates towards zero and does not floor. Python floors and gives -3 for this, so a client written by somebody thinking in Python has a case here it will fail.
+    query: RETURN -5 / 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-2"
+
+  - name: float-division
+    doc: A division with a float on one side is a float division, so the same numerals give a different answer from the case above.
+    query: RETURN 7.0 / 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "3.5"
+
+  - name: modulo-takes-the-sign-of-the-left
+    doc: The remainder carries the sign of the dividend, which is C's rule and not Python's. Python gives 1 for this.
+    query: RETURN -5 % 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-1"
+
+  - name: modulo-of-a-negative-divisor
+    doc: The other half of the rule above, where the divisor is the negative one and the answer stays positive. A client implementing the sign rule from one example gets exactly one of these two right.
+    query: RETURN 5 % -2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: divide-by-zero-integer
+    doc: Integer division by zero raises 22012 rather than giving infinity, which is the arithmetic the standard asks for and not the one the hardware does.
+    query: RETURN 1 / 0 AS n
+    raises: "22012"
+
+  - name: divide-by-zero-float
+    doc: A float division by zero raises too, and does not give the infinity IEEE would. A client passing the operands to the host language's own division silently gets infinity here and no error.
+    query: RETURN 1.0 / 0.0 AS n
+    raises: "22012"
+
+  - name: zero-over-zero
+    doc: Zero divided by zero raises rather than giving NaN, for the reason the case above gives, and it is written separately because it is the one a client is most likely to have special-cased.
+    query: RETURN 0.0 / 0.0 AS n
+    raises: "22012"
+
+  - name: modulus-by-zero
+    doc: A remainder by zero raises the same condition as a division by zero, which is worth pinning because it is a different opcode on every processor and traps on some of them.
+    query: RETURN 1.0 % 0.0 AS n
+    raises: "22012"
+
+  - name: precedence
+    doc: Multiplication binds tighter than addition. A client that re-parses the statement rather than sending it gets a chance to get this wrong.
+    query: RETURN 1 + 2 * 3 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "7"
+
+  - name: parentheses-override-precedence
+    doc: The same numerals with the other grouping, so that a client passing the case above by luck fails this one.
+    query: RETURN (1 + 2) * 3 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9"
+
+  - name: double-negation
+    doc: A negation of a negation, which is where a client folding constants in its own driver has to agree with the engine about the sign.
+    query: RETURN -(-1) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: int-and-float-compare-equal
+    doc: An integer and the float of the same value compare equal, so a client that compares types before values answers false here.
+    query: RETURN 1 = 1.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: int-and-float-order
+    doc: The same mixing under an ordering rather than an equality, because a client with separate comparison paths for the two types has two places to get it wrong.
+    query: RETURN 1 < 1.5 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: negative-zero-equals-zero
+    doc: Negative zero compares equal to zero even though it is a different value, which is IEEE's rule and is the opposite of what the bit pattern says.
+    query: RETURN -0.0 = 0.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: float-exponent-large
+    doc: A float written with an exponent and no point. It is a float and not an integer, and a client deciding the type from whether the text has a point in it gets it wrong.
+    query: RETURN 1e10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "10000000000.0"
+
+  - name: float-exponent-small
+    doc: A float too small to write without an exponent, which is where a client printing with a fixed number of decimal places gives back zero.
+    query: RETURN 1.0e-10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1e-10"
+
+  - name: float-whole-keeps-its-type
+    doc: A float whose value is a whole number is still a float. A client that hands it back as an integer has changed the type of a column, which the next comparison notices and this case notices first.
+    query: RETURN 3.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "3.0"
+
+  - name: int16-boundary-widens
+    doc: One past the largest INT16, in a statement whose operands both fit one. The arithmetic is done in INT64, so this is a value and not an overflow.
+    query: RETURN 32767 + 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "32768"
+
+  - name: int32-boundary-widens
+    doc: The same at the INT32 edge, which is the one a client on a 32-bit host integer reaches first.
+    query: RETURN 2147483647 + 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2147483648"
+
+  - name: uint32-boundary-widens
+    doc: One past the largest UINT32, because a client packing integers into an unsigned 32-bit field wraps here to zero and reports success.
+    query: RETURN 4294967295 + 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4294967296"
+
+  - name: sum-beyond-double
+    doc: An addition whose answer is past where a double is exact. Both operands are inside it, so a client that only checks the size of what it receives lets this through.
+    query: RETURN 9007199254740992 + 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9007199254740993"
+
+  - name: float-not-associative
+    doc: The same three floats added in the two groupings give two different answers, which is not a bug and is the reason a client must not reorder arithmetic on the way through.
+    query: RETURN (0.1 + 0.2) + 0.3 AS a, 0.1 + (0.2 + 0.3) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.6000000000000001"
+          - type: FLOAT64
+            value: "0.6"
+
+  - name: float-tiny-plus-huge
+    doc: An addition where the smaller operand disappears entirely. A client rounding on the way out cannot tell this from a client that lost the addition.
+    query: RETURN 1.0e300 + 1.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1e300"
+
+  - name: string-concatenation
+    doc: Plus on two strings joins them rather than raising, and it is here in the numeric suite because a client dispatching on the operator before the operand types sends this down the arithmetic path.
+    query: RETURN 'a' + 'b' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ab

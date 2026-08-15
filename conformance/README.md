@@ -50,6 +50,22 @@ cases:
 | `rows` | case | with `columns` | The rows, in order. Written as `rows:` with nothing under it when the case expects none, which is a real expectation and needs a spelling. |
 | `raises` | case | no | A GQLSTATUS code the statement must raise. Mutually exclusive with `columns`. |
 
+## What is in it
+
+| Suite | What it pins |
+| --- | --- |
+| `scalar` | The values that cross a language boundary badly: the integer edges, the floats no double holds, the empty and the absent. |
+| `temporal` | Dates, times and durations, where the type is right and the timezone, the precision or the calendar is not. |
+| `numeric` | Arithmetic, and the places two languages doing the same sum disagree: integer division, the sign of a remainder, the edge of a type. |
+| `string` | What a character is, how many of them a string has, and whether two strings that look identical are the same string. |
+| `null` | Three-valued logic, which is the part of the standard a client is most likely to have replaced with its host language's two-valued one. |
+| `list` | The one composite type, and therefore the one place a decoder has to recurse. |
+| `cast` | Conversion, where truncation towards zero, a range check and a refusal each contradict at least one popular language. |
+| `order` | The order values sort in, including across types, which no host comparator gets right by accident. |
+| `aggregate` | The set functions, where a type changes on the way through and a null stops propagating. |
+
+A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. Cases that store a value and read it back wait on `CREATE`, which the v0 core does not implement yet.
+
 ## The value encoding
 
 Every value is a `{type, value}` pair. The type is not decoration and the runner does not infer it: a client is graded on giving back a value of the declared type, and a case that only wrote `1` would grade nine clients on nine different guesses about what `1` is.
@@ -70,8 +86,12 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 That is a gap in this runner and not in the corpus. The declared type is still the contract, and it is the part the eight typed-language runners check most usefully, because a client in a language with an `i8` has somewhere for `INT8` to go and something to get wrong. It is written down here rather than left to be discovered because a reader who assumes this runner checks types would write a case that proves less than it looks like it proves.
 
+Notices are the other gap. A statement can succeed and raise a warning, as a set function that dropped a null does, and a case has no way to say so and the runner does not look. The cases that provoke one say so in their `doc:`. A `notices:` key is the obvious addition and is not worth adding before a second thing needs it, because a key with one user is a key whose shape is guessed.
+
 ## The YAML the reader accepts
 
 A strict block-only subset, not general YAML: two-space indent, no tabs, `- ` with exactly one space after it, one-line plain or single-quoted or double-quoted scalars, and `#` comments. No flow collections, block scalars, anchors, aliases, tags, or document markers. Anything outside the subset is an error with a line number rather than something reinterpreted.
 
 The reason is the reason the TOML reader gives: a construct silently reinterpreted is a case that says one thing to a reviewer and another to the runner, and a corpus whose whole job is to settle disagreements cannot afford to be one of them. Block scalars are refused in particular so that a `doc:` is one unwrapped line, which is the same rule the repository's markdown follows.
+
+Comments are found by the one rule that matters to a case writer: a `#` starts a comment only with whitespace before it, and a quote hides a `#` only if it opens after whitespace and closes on the same line. That last clause is what lets a `query:` hold `cast('  42  ' AS INT64)`, whose closing quote has a space before it and so looks like an opening one. A quote that opens nothing that closes was not a run.

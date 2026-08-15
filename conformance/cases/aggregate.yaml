@@ -1,0 +1,332 @@
+schema: 1
+suite: aggregate
+doc: The set functions, which are where a type changes on the way through: a count is an integer whatever it counted, an average is a float whatever it averaged, and a sum is neither reliably. They are also the one place in the language where a null does not propagate, and the empty input is where each of them chooses separately between zero and null.
+
+cases:
+  - name: count-of-rows
+    doc: Counting rows rather than a value, which is the form that has no argument to be null and so no reason ever to disagree with the number of rows.
+    query: UNWIND [1, 2, 3] AS n RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: count-of-a-value
+    doc: Counting a column counts the rows where it is not null, which is the same number here and is a different question, as the two cases below show.
+    query: UNWIND [1, 2] AS n RETURN count(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: count-of-a-value-skips-nulls
+    doc: A null row is counted by the star and not by the column, which is the difference between the two forms written in one statement so a client cannot pass by implementing one of them twice.
+    query: UNWIND [null] AS n RETURN count(*) AS a, count(n) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "0"
+
+  - name: count-with-no-rows
+    doc: Counting nothing is zero and not null, which is the one set function whose empty answer everybody agrees on and the baseline the others are compared against.
+    query: UNWIND [] AS n RETURN count(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: count-with-no-input-at-all
+    doc: A set function with no rows under it still produces one row, because a statement that groups by nothing has one group. A client that returns no rows here has confused an empty group with no group.
+    query: RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: count-distinct
+    doc: DISTINCT inside a set function counts values rather than rows, which is a different number from the one above whenever anything repeats.
+    query: UNWIND [1, 2, 2] AS n RETURN count(DISTINCT n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: sum
+    doc: A sum of integers is an integer, so a client whose accumulator is a double gives back a float and every later comparison against it is a comparison of a different type.
+    query: UNWIND [1, 2, 3] AS n RETURN sum(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "6"
+
+  - name: sum-stays-exact-past-a-double
+    doc: A sum whose answer is past where a double is exact stays exact, which is the case that catches the client from the case above, because 9007199254740994 is a number a double cannot hold.
+    query: UNWIND [9007199254740993, 1] AS n RETURN sum(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "9007199254740994"
+
+  - name: sum-skips-nulls
+    doc: A null is left out rather than making the whole sum null, which is the rule that separates a set function from every operator in the language. The engine raises a warning saying it happened, which this corpus does not check and a client should surface.
+    query: UNWIND [1, null] AS n RETURN sum(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: sum-with-no-rows
+    doc: A sum of nothing is zero, and this is the choice that differs from the average below. A client that has one empty answer for all its set functions gets one of the two wrong.
+    query: UNWIND [] AS n RETURN sum(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: sum-distinct
+    doc: DISTINCT under a sum adds each value once, so the repeated 1 here is added once and the answer is 3 rather than 4.
+    query: UNWIND [1, 1, 2] AS n RETURN sum(DISTINCT n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: sum-refuses-text
+    doc: A sum of strings raises rather than concatenating them, even though the plus operator on two strings does concatenate. The set function and the operator are separate and this is where they part.
+    query: UNWIND ['a', 'b'] AS n RETURN sum(n) AS c
+    raises: "22G03"
+
+  - name: average-is-a-float
+    doc: An average of integers whose answer is a whole number is still a float. A client giving back an integer has changed the column's type on a value that happened to divide evenly, which means the type of the column depends on the data.
+    query: UNWIND [1, 2, 3] AS n RETURN avg(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+
+  - name: average-of-a-fraction
+    doc: The same function where the answer is not whole, which is the case a client truncating to an integer fails and the case above hides.
+    query: UNWIND [1, 2] AS n RETURN avg(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.5"
+
+  - name: average-skips-nulls
+    doc: A null is left out of both the total and the count, so this is 1 and not the half a client dividing by the number of rows would give.
+    query: UNWIND [1, null] AS n RETURN avg(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0"
+
+  - name: average-with-no-rows
+    doc: An average of nothing is null and not zero, because there is no such number, and this is the case that says a client cannot use one empty answer for every set function.
+    query: UNWIND [] AS n RETURN avg(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: NULL
+
+  - name: minimum
+    doc: The smallest value, which keeps the type of what it selected rather than becoming a number of its own.
+    query: UNWIND [1, 2, 3] AS n RETURN min(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: maximum
+    doc: The other end, written separately because a client implementing one in terms of the other has to have reversed the comparison and not the result.
+    query: UNWIND [1, 2, 3] AS n RETURN max(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: minimum-of-text
+    doc: The smallest string, by the code point order the string suite pins, which says these two functions work on anything that compares and not only on numbers.
+    query: UNWIND ['a', 'b'] AS n RETURN min(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: STRING
+            value: a
+
+  - name: minimum-skips-nulls
+    doc: A null is not the smallest value even though it sorts after everything, because it is left out before the comparison rather than taking part in it.
+    query: UNWIND [1, null] AS n RETURN min(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: minimum-with-no-rows
+    doc: The smallest of nothing is null, which is the third empty answer in this suite and the second of the three shapes: zero for a count and a sum, null for an average and an extreme, an empty list for a collection.
+    query: UNWIND [] AS n RETURN min(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: NULL
+
+  - name: collect
+    doc: Rows back into one list, in the order they arrived, which makes it the only set function whose answer depends on the order of its input.
+    query: UNWIND [1, 2, 3] AS n RETURN collect(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+              - type: INT64
+                value: "3"
+
+  - name: collect-keeps-the-input-order
+    doc: The same function on rows that are not sorted, which gives them back unsorted. A client that sorts what it collects passes the case above and fails this one.
+    query: UNWIND [2, 1] AS n RETURN collect(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "2"
+              - type: INT64
+                value: "1"
+
+  - name: collect-skips-nulls
+    doc: A collected list has no nulls in it, which means its size is not the number of rows, and a client pairing a collected list against another column positionally is pairing the wrong things.
+    query: UNWIND [1, null] AS n RETURN collect(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+
+  - name: collect-with-no-rows
+    doc: A collection of nothing is an empty list and not a null, the third of the three empty answers, and the one where a null would be indistinguishable from a column that was never computed.
+    query: UNWIND [] AS n RETURN collect(n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: LIST
+            value:
+
+  - name: collect-distinct
+    doc: DISTINCT under a collection keeps one of each, in the order each was first seen.
+    query: UNWIND [1, 1, 2] AS n RETURN collect(DISTINCT n) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+
+  - name: grouping
+    doc: Everything returned beside a set function is a grouping key, which is implicit rather than written, and is where a client generating statements from a query builder is most likely to produce something that means a different thing from what it meant to say.
+    query: UNWIND [1, 2, 3, 4] AS n WITH n % 2 AS k, n RETURN k, count(n) AS c ORDER BY k
+    columns:
+      - k
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "2"
+
+  - name: one-group-per-distinct-key
+    doc: Keys that repeat nowhere give a row each and a count of one, which is the degenerate grouping and the one that looks like no grouping happened.
+    query: UNWIND [1, 2] AS n RETURN n, count(*) AS c ORDER BY n
+    columns:
+      - n
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "1"
+
+  - name: filtered-before-aggregating
+    doc: A condition before the set function reduces what it sees, so this counts what passed and not what arrived, which is the ordinary reading and is worth one case because the other reading is a plausible optimisation.
+    query: UNWIND [1, 2, 3] AS n WITH n WHERE n > 1 RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: aggregated-then-used
+    doc: A collected list is a value like any other and can be measured, which is what makes the aggregation a step in the statement rather than the end of it.
+    query: UNWIND [1, 2, 3] AS n WITH collect(n) AS c RETURN size(c) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"

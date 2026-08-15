@@ -115,6 +115,26 @@ pub fn relabel(edges: &mut [(u32, u32)], map: &[u32]) {
     }
 }
 
+/// Sorts an edge list into load order and reports where every edge
+/// came from: `order[i]` is the input position of the edge that ends up
+/// at ordinal `i`.
+///
+/// Load order is source and then destination, which is what numbers the
+/// edge ordinals a property column is addressed by, so an edge list and
+/// its columns arriving in some other order have to move together. This
+/// is the only thing that ties them, and relabeling the nodes changes
+/// the answer for nearly every edge, which is why reorder owes its
+/// property columns this permutation. Ties keep input order, so the
+/// permutation is deterministic and duplicate pairs stay adjacent for
+/// whoever has to refuse them.
+pub fn load_order(edges: &mut [(u32, u32)]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..edges.len() as u32).collect();
+    order.sort_by_key(|&i| edges[i as usize]);
+    let sorted: Vec<(u32, u32)> = order.iter().map(|&i| edges[i as usize]).collect();
+    edges.copy_from_slice(&sorted);
+    order
+}
+
 /// Turns a new-id-to-old-id order into an old-id-to-new-id map.
 fn invert(order: &[u32]) -> Vec<u32> {
     let mut map = vec![0u32; order.len()];
@@ -230,5 +250,39 @@ mod tests {
         let mut relabeled = edges.clone();
         relabel(&mut relabeled, &map);
         assert!(gap_sum(&relabeled) * 2 < before);
+    }
+
+    #[test]
+    fn load_order_sorts_and_says_where_every_edge_came_from() {
+        let mut edges = [(4, 0), (1, 2), (1, 1), (4, 0)];
+        let order = load_order(&mut edges);
+        assert_eq!(edges, [(1, 1), (1, 2), (4, 0), (4, 0)]);
+        assert_eq!(order, vec![2, 1, 0, 3]);
+        // Every input position appears once, which is what makes it
+        // safe to move a property column by it, and the pair that
+        // appears twice keeps input order so the two stay adjacent for
+        // whoever refuses them.
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn relabeling_changes_the_load_order_a_column_has_to_follow() {
+        // The point of the permutation: reorder moves nodes, which
+        // moves edges, which renumbers every ordinal a property column
+        // is addressed by.
+        let edges = [(0, 3), (3, 1), (3, 2), (2, 1)];
+        let mut plain = edges;
+        let plain_order = load_order(&mut plain);
+        assert_eq!(plain_order, vec![0, 3, 1, 2]);
+        let map = degree_order(4, &edges);
+        let mut moved = edges;
+        relabel(&mut moved, &map);
+        let order = load_order(&mut moved);
+        assert_ne!(order, plain_order);
+        // The edge that was input 0 is still an edge, wherever it went.
+        let landed = order.iter().position(|&i| i == 0).expect("input 0 lands");
+        assert_eq!(moved[landed], (map[0], map[3]));
     }
 }

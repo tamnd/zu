@@ -4326,6 +4326,13 @@
       "doc": "Node property columns. A node table's entry in the table index\npoints at a props directory chain: variable width columns stored as\nFullZip blob segments, fixed width columns as cascade-encoded u64\nsegments, every column row-aligned with the table's row domain.\n\nA column carries a [`LogicalType`] from the lattice of gql/plan/02,\nwhich is what tells a reader whether the word it pulls out of a\nfixed width lane is a count, a truth value, a float, a day or a\nnanosecond. The lane itself does not care: the cascade encodes 64\nbit words, so a boolean, a float and a date all ride the encoding\nthe integer columns already had, and only the type at the top says\nwhat a word means. This is the whole reason properties can widen\npast strings and integers without a second storage path.\n\nDirectory layout: `version: u16`, `node_count: u64`,\n`column_count: u32`, then per column `name_len: u16` + UTF-8 bytes,\n`type: u8` (a code from [`TYPE_CODES`], or the list code and then\nthe element's code), the column's `SegmentMeta`, and from version 4\na `nullable: u8` flag followed, when it is set, by the segment meta\nof the column's validity words.\n\nA column is dense whether or not it holds a null: every row of the\ntable's domain has a value in the column's segment. What a null adds\nis a second segment saying which of those values a reader may look\nat, one bit per row packed into 64 bit words that ride the same\ninteger cascade the fixed width columns do. A column with no null in\nit has no validity segment, so nothing written before a property\ncould be null costs anything to read now."
     },
     {
+      "id": "zu::zu1::props::EdgesWithProps",
+      "kind": "type-alias",
+      "name": "EdgesWithProps",
+      "signature": "(Vec<(u32, u32)>, Vec<OwnedColumn>)",
+      "doc": "An edge list and one owned column per edge property, which is the\npair every reader outside the file produces: the edges in the order\nthe source had them and one value per edge in the same order."
+    },
+    {
       "id": "zu::zu1::props::ListElement",
       "kind": "enum",
       "name": "ListElement",
@@ -4344,6 +4351,84 @@
       "name": "Word",
       "of": "zu::zu1::props::ListElement",
       "signature": "Word(u64)"
+    },
+    {
+      "id": "zu::zu1::props::OwnedColumn",
+      "kind": "struct",
+      "name": "OwnedColumn",
+      "doc": "One column held whole, in the shape a reader outside the file\nproduces it: owned values in the row order the source had them.\n\n`PropValues` borrows, which is right at the store call and wrong for\na column that has to survive being read, reordered and only then\nstored. That is the parquet loader's shape exactly, so the owned\nform carries the four types an external edge list brings and\n`store_rel_props_owned` does the borrowing at the one point it is\nneeded."
+    },
+    {
+      "id": "zu::zu1::props::OwnedColumn::name",
+      "kind": "field",
+      "name": "name",
+      "of": "zu::zu1::props::OwnedColumn",
+      "signature": "String"
+    },
+    {
+      "id": "zu::zu1::props::OwnedColumn::values",
+      "kind": "field",
+      "name": "values",
+      "of": "zu::zu1::props::OwnedColumn",
+      "signature": "OwnedValues"
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues",
+      "kind": "enum",
+      "name": "OwnedValues",
+      "doc": "The values of an [`OwnedColumn`]."
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::zu1::props::OwnedValues",
+      "signature": "Bool(Vec<bool>)"
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::zu1::props::OwnedValues",
+      "signature": "Float(Vec<f64>)"
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::zu1::props::OwnedValues",
+      "signature": "Int(Vec<u64>)"
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::zu1::props::OwnedValues",
+      "signature": "Str(Vec<Vec<u8>>)"
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::zu1::props::OwnedValues",
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether the column holds no rows."
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::zu1::props::OwnedValues",
+      "signature": "fn len(&self) -> usize",
+      "doc": "Rows held."
+    },
+    {
+      "id": "zu::zu1::props::OwnedValues::permuted",
+      "kind": "method",
+      "name": "permuted",
+      "of": "zu::zu1::props::OwnedValues",
+      "signature": "fn permuted(&self, order: &[u32]) -> Self",
+      "doc": "The same values in the order `order` names, where `order[i]` is\nthe position the value now at row `i` came from.\n\nThis is how a property column follows its edges. A bulk load\nsorts the edge list, and sorting is what numbers the ordinals a\ncolumn is addressed by, so a column read alongside an unsorted\nedge list belongs to the wrong rows until it is moved the same\nway the edges were."
     },
     {
       "id": "zu::zu1::props::PropColumn",
@@ -4755,6 +4840,13 @@
       "doc": "The same store, for columns some edges of which hold no value."
     },
     {
+      "id": "zu::zu1::props::store_rel_props_owned",
+      "kind": "function",
+      "name": "store_rel_props_owned",
+      "signature": "fn store_rel_props_owned(db: &mut zu_zu1::file::Zu1File, rel_table: &str, columns: &[OwnedColumn]) -> zu_common::Result<PropsDirectory>",
+      "doc": "The same store, for columns a caller holds whole rather than as\nborrowed slices, which is what a parquet edge list produces.\n\nThe string arm is the only reason this exists: `PropValues::Str`\nwants a slice of slices and an owned column has a vector of\nvectors, so the pointers have to live somewhere for the length of\nthe call."
+    },
+    {
       "id": "zu::zu1::reorder",
       "kind": "module",
       "name": "reorder",
@@ -4808,6 +4900,13 @@
       "name": "degree_order",
       "signature": "fn degree_order(node_count: u64, edges: &[(u32, u32)]) -> Vec<u32>",
       "doc": "Old id to new id, densest nodes first. Ties break toward the lower old\nid so the mapping is deterministic."
+    },
+    {
+      "id": "zu::zu1::reorder::load_order",
+      "kind": "function",
+      "name": "load_order",
+      "signature": "fn load_order(edges: &mut [(u32, u32)]) -> Vec<u32>",
+      "doc": "Sorts an edge list into load order and reports where every edge\ncame from: `order[i]` is the input position of the edge that ends up\nat ordinal `i`.\n\nLoad order is source and then destination, which is what numbers the\nedge ordinals a property column is addressed by, so an edge list and\nits columns arriving in some other order have to move together. This\nis the only thing that ties them, and relabeling the nodes changes\nthe answer for nearly every edge, which is why reorder owes its\nproperty columns this permutation. Ties keep input order, so the\npermutation is deterministic and duplicate pairs stay adjacent for\nwhoever has to refuse them."
     },
     {
       "id": "zu::zu1::reorder::relabel",

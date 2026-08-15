@@ -323,6 +323,73 @@ pub struct PropsDirectory {
     pub labels: Option<SegmentMeta>,
 }
 
+/// An edge list and one owned column per edge property, which is the
+/// pair every reader outside the file produces: the edges in the order
+/// the source had them and one value per edge in the same order.
+pub type EdgesWithProps = (Vec<(u32, u32)>, Vec<OwnedColumn>);
+
+/// One column held whole, in the shape a reader outside the file
+/// produces it: owned values in the row order the source had them.
+///
+/// `PropValues` borrows, which is right at the store call and wrong for
+/// a column that has to survive being read, reordered and only then
+/// stored. That is the parquet loader's shape exactly, so the owned
+/// form carries the four types an external edge list brings and
+/// `store_rel_props_owned` does the borrowing at the one point it is
+/// needed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedColumn {
+    pub name: String,
+    pub values: OwnedValues,
+}
+
+/// The values of an [`OwnedColumn`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnedValues {
+    Int(Vec<u64>),
+    Float(Vec<f64>),
+    Bool(Vec<bool>),
+    Str(Vec<Vec<u8>>),
+}
+
+impl OwnedValues {
+    /// Rows held.
+    pub fn len(&self) -> usize {
+        match self {
+            OwnedValues::Int(v) => v.len(),
+            OwnedValues::Float(v) => v.len(),
+            OwnedValues::Bool(v) => v.len(),
+            OwnedValues::Str(v) => v.len(),
+        }
+    }
+
+    /// Whether the column holds no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The same values in the order `order` names, where `order[i]` is
+    /// the position the value now at row `i` came from.
+    ///
+    /// This is how a property column follows its edges. A bulk load
+    /// sorts the edge list, and sorting is what numbers the ordinals a
+    /// column is addressed by, so a column read alongside an unsorted
+    /// edge list belongs to the wrong rows until it is moved the same
+    /// way the edges were.
+    #[must_use]
+    pub fn permuted(&self, order: &[u32]) -> Self {
+        let at = |i: &u32| *i as usize;
+        match self {
+            OwnedValues::Int(v) => OwnedValues::Int(order.iter().map(|i| v[at(i)]).collect()),
+            OwnedValues::Float(v) => OwnedValues::Float(order.iter().map(|i| v[at(i)]).collect()),
+            OwnedValues::Bool(v) => OwnedValues::Bool(order.iter().map(|i| v[at(i)]).collect()),
+            OwnedValues::Str(v) => {
+                OwnedValues::Str(order.iter().map(|i| v[at(i)].clone()).collect())
+            }
+        }
+    }
+}
+
 /// Row-ordered values for one column at store time.
 ///
 /// The fixed width arms all end up as 64 bit words in the same lane;
@@ -1011,6 +1078,41 @@ pub fn store_rel_props(
         .map(|(name, values)| PropInput::dense(name, *values))
         .collect();
     store_rel_props_nullable(db, rel_table, &inputs)
+}
+
+/// The same store, for columns a caller holds whole rather than as
+/// borrowed slices, which is what a parquet edge list produces.
+///
+/// The string arm is the only reason this exists: `PropValues::Str`
+/// wants a slice of slices and an owned column has a vector of
+/// vectors, so the pointers have to live somewhere for the length of
+/// the call.
+pub fn store_rel_props_owned(
+    db: &mut Zu1File,
+    rel_table: &str,
+    columns: &[OwnedColumn],
+) -> Result<PropsDirectory> {
+    let refs: Vec<Vec<&[u8]>> = columns
+        .iter()
+        .map(|c| match &c.values {
+            OwnedValues::Str(v) => v.iter().map(Vec::as_slice).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let values: Vec<(&str, PropValues)> = columns
+        .iter()
+        .zip(&refs)
+        .map(|(c, refs)| {
+            let values = match &c.values {
+                OwnedValues::Int(v) => PropValues::Int(v),
+                OwnedValues::Float(v) => PropValues::Float(v),
+                OwnedValues::Bool(v) => PropValues::Bool(v),
+                OwnedValues::Str(_) => PropValues::Str(refs),
+            };
+            (c.name.as_str(), values)
+        })
+        .collect();
+    store_rel_props(db, rel_table, &values)
 }
 
 /// The same store, for columns some edges of which hold no value.

@@ -12,6 +12,7 @@ use zu::query::{QueryResult, Value};
 use zu::{DiagnosticRecord, Severity};
 
 mod conformance;
+mod corpus;
 mod scoreboard;
 mod shell;
 
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         Some("query") => query_command(&args[1..]),
         Some("shell") => shell::shell_command(&args[1..]),
         Some("conformance") => conformance::conformance_command(&args[1..]),
+        Some("corpus") => corpus::corpus_command(&args[1..]),
         Some("verify") => match args.get(1) {
             Some(path) => verify(std::path::Path::new(path)),
             None => usage_error("zu verify <file.zu1>"),
@@ -1168,7 +1170,7 @@ fn print_usage() {
     println!("usage: zu <command> [args]");
     println!();
     println!(
-        "commands: shell, query, copy, convert, verify, stat, analyze, neighbors [--in] [--key], edge [--in], lookup, conformance, bench"
+        "commands: shell, query, copy, convert, verify, stat, analyze, neighbors [--in] [--key], edge [--in], lookup, conformance, corpus, bench"
     );
     println!("(implemented milestone by milestone, see the repo issues)");
     println!();
@@ -1178,6 +1180,7 @@ fn print_usage() {
     println!("zu conformance --declare [--format toml|json] | --verify <report.json>");
     println!("zu conformance --tally <report.json> | --scoreboard <tally.json>...");
     println!("zu conformance --regressed <report.json> <baseline.json>");
+    println!("{}", corpus::USAGE);
 }
 
 #[cfg(test)]

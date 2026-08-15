@@ -1,0 +1,198 @@
+schema: 1
+suite: scalar
+doc: The values that cross a language boundary badly. Every case here is one a client has got wrong somewhere, which is why the corpus starts with them rather than with the ones that work everywhere.
+
+cases:
+  - name: int64-max
+    doc: The largest INT64. A client that hands its integers to a double gives back 9223372036854775808, which is not a value at all.
+    query: RETURN 9223372036854775807 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9223372036854775807"
+
+  - name: int64-min
+    doc: The smallest INT64, written as a subtraction because the engine reads -9223372036854775808 as a negation of a literal that is itself out of range.
+    query: RETURN -9223372036854775807 - 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-9223372036854775808"
+
+  - name: int64-beyond-double
+    doc: The smallest positive integer a double cannot represent. A client that rounds gives back 9007199254740992, one less, and every other integer case in this file would still pass.
+    query: RETURN 9007199254740993 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9007199254740993"
+
+  - name: int8-by-cast
+    doc: A narrow integer, which a client is free to give back in a narrower host type than it uses for INT64 and has to give back with the same value either way.
+    query: RETURN cast(1 AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: int-out-of-range-cast
+    doc: A cast that does not fit raises rather than wrapping, because a silently truncated integer is the same defect as a rounded one with a different cause.
+    query: RETURN cast(300 AS INT8) AS n
+    raises: "22003"
+
+  - name: float-exact-half
+    doc: A float a double holds exactly, which is the only kind a case can assert without saying how it was rounded.
+    query: RETURN 1.5 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.5"
+
+  - name: float-not-exact
+    doc: The sum every language's tutorial opens with. The answer is not 0.3 and a client that prints it as 0.3 has lost a digit that the next comparison will want.
+    query: RETURN 0.1 + 0.2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.30000000000000004"
+
+  - name: float-negative-zero
+    doc: Negative zero is a different value from zero, it compares equal to it, and a client that normalises it away has changed an answer the user can still see the sign of.
+    query: RETURN -0.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-0.0"
+
+  - name: float-infinity
+    doc: An overflow gives infinity rather than raising, and infinity has no JSON spelling, so a client that goes through JSON has to have decided what to do here.
+    query: RETURN 1e308 * 10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "inf"
+
+  - name: divide-by-zero
+    doc: Integer division by zero raises 22012 rather than giving infinity, which is the arithmetic the standard asks for and not the one the hardware does.
+    query: RETURN 1 / 0 AS n
+    raises: "22012"
+
+  - name: bool-both
+    doc: Both booleans in one row, because a client that returns a truthy value rather than a boolean passes a test that only ever asks about true.
+    query: RETURN true AS t, false AS f
+    columns:
+      - t
+      - f
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+          - type: BOOL
+            value: false
+
+  - name: null-literal
+    doc: A null is a value and not a missing column, and it arrives beside a value in the same row so that a client cannot answer by dropping the field.
+    query: RETURN null AS a, 1 AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: NULL
+          - type: INT64
+            value: "1"
+
+  - name: string-unicode
+    doc: Characters outside the basic plane and a combining mark, because a client counting UTF-16 units or normalising the text gives back something a byte comparison fails on.
+    query: RETURN 'héllo ☃ 𝄞' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "héllo ☃ 𝄞"
+
+  - name: string-empty
+    doc: The empty string is a string, and a client that gives back a null for it has answered a different question.
+    query: RETURN '' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+
+  - name: list-of-int
+    doc: A list of the widest integers, which is where a client that decodes lists on a separate path from scalars first shows it.
+    query: RETURN [1, 9007199254740993] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "9007199254740993"
+
+  - name: list-empty
+    doc: An empty list is a list, and a client that gives back a null for it has answered a different question.
+    query: RETURN [] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+
+  - name: list-mixed
+    doc: A list whose elements are not all one type, which a client with a typed list has to decide about rather than discover in production.
+    query: RETURN [1, 'a', null] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: STRING
+                value: a
+              - type: NULL
+
+  - name: rows-in-order
+    doc: Two rows, in the order the statement produces them, because a client that hands back an unordered collection makes every later case ambiguous.
+    query: UNWIND [1, 2] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: no-rows
+    doc: A statement that matches nothing gives back a result with no rows, which is not an error and not a null row.
+    query: UNWIND [1] AS n WITH n WHERE false RETURN n
+    columns:
+      - n
+    rows:

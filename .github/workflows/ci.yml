@@ -189,6 +189,31 @@ jobs:
       # one machine, so a shared runner cannot move it.
       - run: ZU_GATE=1 cargo bench -p zu --bench tail
 
+  corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The cases themselves run as a test in the matrix above, on all
+      # three platforms, which is what makes them fire on the machine
+      # of whoever adds one. This job runs them the other way, through
+      # the shipped binary against a directory, because that is how the
+      # release artifact is consumed and a runner that only ever ran
+      # from its own source tree would not have been tested doing it.
+      #
+      # `--strict` is the part the test cannot do. A case the engine
+      # does not implement is allowed in a working tree, on purpose,
+      # because the cases are the contract and the engine catches up to
+      # them. It is not allowed on a branch heading for a release, so
+      # the gate lives here rather than in the runner's defaults.
+      - run: cargo run -p zu-cli --release -- corpus conformance/cases --strict
+      # The reader is read by nine repositories on every CI run of each
+      # of them, so its cost per case is asserted to stay linear as the
+      # corpus grows. The bench fails rather than reporting when it
+      # does not.
+      - run: cargo bench -p zu-corpus --bench corpus
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

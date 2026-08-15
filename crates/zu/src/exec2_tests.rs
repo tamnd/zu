@@ -465,6 +465,39 @@ fn covered_shapes_match_the_old_engine() {
          AND NOT EXISTS { MATCH (a)-[:knows]->(c) } RETURN a.id AS a, b.id AS b ORDER BY b",
         "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) WHERE a.age = 13 \
          AND EXISTS { MATCH (a)-[:knows]->(d) } RETURN count(*) AS n",
+        // A block under an OR, which is the mark: the row survives
+        // either way and carries whether the block found anything, and
+        // the predicate around it reads that as a column. Once with
+        // the other side of the OR keeping rows the block missed, once
+        // negated, once where the block answers yes for everything,
+        // once where it answers no for everything, once counted and
+        // once grouped.
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE a.id < 20 OR NOT EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.age > 90 OR NOT EXISTS { MATCH (a)-[:knows]->(b) } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)<-[:knows]-(b) } \
+         RETURN a.age AS age, count(*) AS n",
+        // Two marks under one predicate, and a mark beside an ordinary
+        // conjunct, which is the block lifted out of the AND standing
+        // next to the one that stayed.
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) } \
+         OR NOT EXISTS { MATCH (a)<-[:knows]-(c) } RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.age = 13 AND (a.id < 20 \
+         OR EXISTS { MATCH (a)-[:knows]->(b) }) RETURN a.id AS a ORDER BY a",
+        // A mark on a level the pipeline has walked off: the answer is
+        // the pinned row's and it enters the level the predicate runs
+        // on as a constant column, the same way a correlated end does.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 \
+         AND (b.id < 100 OR EXISTS { MATCH (a)-[:knows]->(c) }) RETURN count(*) AS n",
+        // And one on the level the pipeline is standing on, which is
+        // a degree read over the whole vector.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 \
+         AND (b.id < 100 OR EXISTS { MATCH (b)-[:knows]->(c) }) RETURN count(*) AS n",
         // A block over a pattern with no variable in common with the
         // outer row, tied to it by an equality: the walk a hop would do
         // is a probe into a table built off the other side, and the
@@ -647,6 +680,13 @@ fn unclaimed_shapes_fall_back() {
         "MATCH (p:person) RETURN count(DISTINCT p.age) AS a, count(DISTINCT p.score) AS b",
         "MATCH (a:person)-[r:knows]->(b) RETURN count(r) AS n",
         "MATCH (a:person)-[:knows*1..2]->(b) RETURN count(b) AS n",
+        // A mark whose block is more than a degree read: the answer is
+        // per outer row and the row survives either way, which is a
+        // group the pipeline would have to run and keep both sides of.
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b)-[:knows]->(c) } \
+         RETURN count(a) AS n",
         // An OPTIONAL MATCH with no required match under it has no
         // driving scan the bracket can hang off.
         "OPTIONAL MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",

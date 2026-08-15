@@ -149,6 +149,11 @@ impl Bracket<'_> {
             // row that had none.
             BracketKind::Optional | BracketKind::Anti => !hit,
             BracketKind::Semi => hit,
+            // The pipeline compiles a mark as a column of the level
+            // the block was written on, never as a group, so a bracket
+            // never carries one here. What it would mean is that every
+            // outer row goes on whatever the answer was.
+            BracketKind::Mark { .. } => true,
         }
     }
 }
@@ -790,9 +795,11 @@ impl<'a> Worker<'a> {
                 .iter()
                 .filter_map(|c| match *c {
                     ColSpec::Stored(id, _) => Some(id),
-                    ColSpec::Computed(_) | ColSpec::Outer { .. } | ColSpec::Key | ColSpec::Func => {
-                        None
-                    }
+                    ColSpec::Computed(_)
+                    | ColSpec::Outer { .. }
+                    | ColSpec::Key
+                    | ColSpec::Func
+                    | ColSpec::Mark { .. } => None,
                 })
                 .collect(),
             scratch: Vec::new(),
@@ -1047,6 +1054,14 @@ impl<'a> Worker<'a> {
                         let col = plan.func.as_ref().expect("a call under a func column");
                         func_vec(col, sc.row_base, sc.rows as usize, &mut self.arena)
                     }
+                    // The scan's rows are the chunk's own range, in
+                    // order, which is the order the degree read wants
+                    // to walk them in anyway.
+                    &ColSpec::Mark { rel, dirs, negated } => {
+                        let rows: Vec<u64> =
+                            (sc.row_base..sc.row_base + u64::from(sc.rows)).collect();
+                        self.mark_vec(rel, dirs, negated, &rows)?
+                    }
                 };
                 level0.vecs.push(v);
             }
@@ -1202,7 +1217,10 @@ impl<'a> Worker<'a> {
                 // where it is sent from.
                 match kind {
                     BracketKind::Optional => self.run_ops(rest, set),
-                    BracketKind::Semi | BracketKind::Anti => Ok(()),
+                    // A mark is a column and not a group here, so the
+                    // pipeline never opens a bracket for one. See the
+                    // note on `carries`.
+                    BracketKind::Semi | BracketKind::Anti | BracketKind::Mark { .. } => Ok(()),
                 }
             }
             Op::DegreeProduct { steps, from } => {
@@ -1247,6 +1265,50 @@ impl<'a> Worker<'a> {
     ///
     /// Returns whether any row survived, so the caller can drop the
     /// vector rather than run the rest of the pipeline over nothing.
+    /// An EXISTS block's answer for a whole vector of rows: one per
+    /// row, one where the row has an edge and zero where it has none,
+    /// with a NOT in front of the block folded in. This is the same
+    /// degree read [`Worker::has_edge`] makes its decision from, kept
+    /// as a column instead, which is what a block under an OR needs.
+    fn mark_vec(
+        &mut self,
+        rel: RelId,
+        dirs: Dirs,
+        negated: bool,
+        rows: &[u64],
+    ) -> Result<ValueVector> {
+        // The degree read walks the storage groups in order, so rows
+        // that arrive in some other order are read through an ascending
+        // permutation and written back into the positions they sit at.
+        let ascending = rows.is_sorted();
+        if !ascending {
+            self.order.clear();
+            self.order.extend(0..rows.len() as u32);
+            self.order.sort_unstable_by_key(|&i| rows[i as usize]);
+            self.sorted.clear();
+            self.sorted
+                .extend(self.order.iter().map(|&i| rows[i as usize]));
+        }
+        self.deg.clear();
+        self.deg.resize(rows.len(), 0);
+        for dir in sides(dirs) {
+            let read = if ascending { rows } else { &self.sorted };
+            self.snap.get().degrees(rel, read, dir, &mut self.deg)?;
+        }
+        let mut v = ValueVector::flat_uninit(&mut self.arena, PhysType::Int64, rows.len());
+        let out = v.values_mut::<i64>();
+        if ascending {
+            for (slot, &d) in out.iter_mut().zip(&self.deg) {
+                *slot = i64::from((d > 0) != negated);
+            }
+        } else {
+            for (&i, &d) in self.order.iter().zip(&self.deg) {
+                out[i as usize] = i64::from((d > 0) != negated);
+            }
+        }
+        Ok(v)
+    }
+
     fn has_edge(
         &mut self,
         rel: RelId,
@@ -2169,6 +2231,7 @@ impl<'a> Worker<'a> {
                 // built out of rows rather than scanned is a seek,
                 // which the compiler never puts under a call.
                 ColSpec::Func => unreachable!("a func column is scanned, not gathered"),
+                &ColSpec::Mark { rel, dirs, negated } => self.mark_vec(rel, dirs, negated, part)?,
             };
             chunk.vecs.push(v);
         }

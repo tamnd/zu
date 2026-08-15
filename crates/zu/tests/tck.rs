@@ -207,6 +207,23 @@ fn scenarios() -> Vec<Scenario> {
             int_rows(&[5]),
         ),
         s(
+            "exists",
+            "pattern predicate under an or answers per row",
+            // eve is the only one over 45 and fay is the only one with
+            // no friend, so each side of the or keeps a row the other
+            // one drops, and eve arrives once rather than twice.
+            "MATCH (a:person) WHERE a.age > 45 OR EXISTS { MATCH (a)-[:knows]->(b) } \
+             RETURN a.id AS id ORDER BY id",
+            int_rows(&[0, 1, 2, 3, 4]),
+        ),
+        s(
+            "exists",
+            "negated pattern predicate under an or",
+            "MATCH (a:person) WHERE a.age < 25 OR NOT EXISTS { MATCH (a)-[:knows]->(b) } \
+             RETURN a.id AS id ORDER BY id",
+            int_rows(&[0, 5]),
+        ),
+        s(
             "aggregation",
             "grouped degree",
             "MATCH (a:person)-[:knows]->(b) \

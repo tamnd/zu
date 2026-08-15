@@ -109,12 +109,29 @@ pub(crate) enum ColSpec {
     /// of the domain, so this is a copy where a stored column would
     /// have been a decode.
     Func,
+    /// What an EXISTS block written under an OR answered, for every row
+    /// of the level it was written on: one where the row has an edge of
+    /// this rel, zero where it has none, with a NOT in front of the
+    /// block folded in. The predicate around the block reads it back as
+    /// an ordinary column, which is the whole point of a mark: the row
+    /// survives either way and carries the answer instead of being
+    /// decided by it.
+    ///
+    /// It is an integer column rather than a boolean one because the
+    /// kernels pack booleans into bits and a bit column has no width to
+    /// gather into; a compare against zero costs one pass and needs no
+    /// new load.
+    Mark {
+        rel: RelId,
+        dirs: Dirs,
+        negated: bool,
+    },
 }
 
 /// Traversal sides of one expand: `Both` is an undirected step over a
 /// self-referencing rel, forward list first, matching the old engine's
 /// emission order.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Dirs {
     One(Dir),
     Both,
@@ -608,6 +625,7 @@ pub(crate) fn compile(
         unwind_slot: None,
         func_slot: None,
         func: None,
+        marks: HashMap::new(),
     };
     c.compile(plan)
 }
@@ -682,6 +700,11 @@ struct Compiler<'a> {
     func_slot: Option<usize>,
     /// That kernel's answer, held until it goes on the plan.
     func: Option<FuncCol>,
+    /// Where each mark slot the binder made landed: the level its block
+    /// was written on and the chunk vector position of the column that
+    /// holds the answer. A predicate naming the slot compiles into a
+    /// read of that column.
+    marks: HashMap<usize, (usize, usize)>,
 }
 
 impl Compiler<'_> {
@@ -1157,7 +1180,23 @@ impl Compiler<'_> {
                         // at each of them.
                         Dirs::Both => (d.to == d.from).then_some(d.to),
                     });
-                    if kind != BracketKind::Optional && alone && far == Some(to_table) {
+                    let bare = alone && far == Some(to_table);
+                    // A mark is that same degree read written down
+                    // instead of acted on, so it is a column of the
+                    // level the block was written on and no operator at
+                    // all. Only the bare shape has an answer this
+                    // cheap: anything else would have to run a group per
+                    // outer row and keep the row either way, which is a
+                    // pipeline the runner does not have.
+                    if let BracketKind::Mark { slot, negated } = kind {
+                        if !bare {
+                            return Ok(None);
+                        }
+                        let vec = self.register_mark(src, rel_id, dirs, negated);
+                        self.marks.insert(slot, (src, vec));
+                        continue;
+                    }
+                    if kind != BracketKind::Optional && bare {
                         ops.push(Op::HasEdge {
                             rel: rel_id,
                             dirs,
@@ -2148,6 +2187,24 @@ impl Compiler<'_> {
         self.levels[level].cols.len()
     }
 
+    /// Registers an EXISTS block's answer as a column on the level the
+    /// block was written on, returning its chunk vector position. Two
+    /// blocks asking the same question share the column the way two
+    /// readers of a property share its gather.
+    fn register_mark(&mut self, level: usize, rel: RelId, dirs: Dirs, negated: bool) -> usize {
+        let same = |c: &ColSpec| {
+            matches!(c, ColSpec::Mark { rel: r, dirs: d, negated: n }
+                if *r == rel && *d == dirs && *n == negated)
+        };
+        if let Some(ix) = self.levels[level].cols.iter().position(|(_, c)| same(c)) {
+            return ix + 1;
+        }
+        self.levels[level]
+            .cols
+            .push((String::new(), ColSpec::Mark { rel, dirs, negated }));
+        self.levels[level].cols.len()
+    }
+
     /// Compiles an arithmetic projection into a computed column on the
     /// level its properties come from, returning the scalar the sink
     /// reads it back through. The program is registered after every
@@ -2613,6 +2670,15 @@ impl Compiler<'_> {
         expr: &BoundExpr,
         level: usize,
     ) -> Result<Option<Reg>> {
+        // A mark slot is not a value the query wrote, it is the column
+        // an EXISTS block left on the level it was written on. Zero
+        // there is the miss, so the predicate the row is judged by is a
+        // compare against zero.
+        if let BoundExpr::Var(slot) = expr
+            && let Some(&(from, vec)) = self.marks.get(slot)
+        {
+            return self.mark_reg(b, from, vec, level);
+        }
         let BoundExpr::Binary { op, lhs, rhs } = expr else {
             return Ok(None);
         };
@@ -2657,6 +2723,43 @@ impl Compiler<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Reads a mark column back as a predicate register. The block may
+    /// have been written on a level the pipeline has since walked off,
+    /// and that level is pinned to one row for the whole vector here,
+    /// so its answer enters this level as a constant column the same
+    /// way a correlated end does.
+    fn mark_reg(
+        &mut self,
+        b: &mut ProgBuilder,
+        from: usize,
+        vec: usize,
+        level: usize,
+    ) -> Result<Option<Reg>> {
+        let col = match from == level {
+            true => vec,
+            false => {
+                if from > level {
+                    return Ok(None);
+                }
+                self.register_outer(level, from, vec)
+            }
+        };
+        let Ok(col) = u8::try_from(col) else {
+            return Ok(None);
+        };
+        let dst = b.push_type(PhysType::Int64)?;
+        b.ops.push(ExprOp::LoadCol { col, dst });
+        let zero = b.push_const(OwnedValue::Int(0))?;
+        let out = b.push_type(PhysType::Bool)?;
+        b.ops.push(ExprOp::Compare {
+            op: CmpOp::Ne,
+            l: dst,
+            r: zero,
+            dst: out,
+        });
+        Ok(Some(out))
     }
 
     /// An integer column against a float constant, compiled as one

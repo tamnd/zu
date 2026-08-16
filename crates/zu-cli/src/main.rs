@@ -869,8 +869,11 @@ fn query(
         .map(|(n, v)| (n.as_str(), v.clone()))
         .collect();
     let result = (|| {
-        let mut db = zu::zu1::file::Zu1File::open(path)?;
-        zu::query::run(source, &mut db, &bound)
+        // Through a session rather than the one-shot entry point,
+        // because a session owns the log a write goes through and one
+        // opened for a single statement costs a header read.
+        let mut session = zu::session::Session::open(path)?;
+        session.run(source, &bound)
     })();
     match result {
         Ok(r) => {

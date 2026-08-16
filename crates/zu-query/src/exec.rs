@@ -1368,6 +1368,7 @@ fn input_of(plan: &LogicalPlan) -> Option<&LogicalPlan> {
         | LogicalPlan::Expand { input, .. }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Unwind { input, .. }
+        | LogicalPlan::Insert { input, .. }
         | LogicalPlan::TableFunction { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
@@ -2146,6 +2147,20 @@ fn build_stages(
                     chunk,
                 });
                 b.produced(chunk);
+            }
+            LogicalPlan::Insert { nodes, .. } => {
+                // The elements are already made: the session wrote them
+                // before it ran the plan and passed them in past the
+                // last declared parameter, so what is left here is
+                // binding each one to its slot. An argument holding one
+                // element unwinds to exactly one row, which is why this
+                // compiles to the operator that reads a list.
+                for node in nodes {
+                    let expr = BoundExpr::Param(node.value);
+                    let chunk = b.new_chunk(vec![node.slot], false);
+                    b.push(OpDesc::Unwind { expr, chunk });
+                    b.produced(chunk);
+                }
             }
             LogicalPlan::TableFunction {
                 func,

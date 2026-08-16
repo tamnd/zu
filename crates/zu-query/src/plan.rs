@@ -16,7 +16,8 @@ use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{
-    BoundClause, BoundExpr, BoundItem, BoundQuery, Func, MatchKind, Schema, TableFunc,
+    BoundClause, BoundExpr, BoundInsertNode, BoundItem, BoundQuery, Func, MatchKind, Schema,
+    TableFunc,
 };
 
 /// What a bracket does with an outer row the operators inside it
@@ -137,6 +138,21 @@ pub enum LogicalPlan {
         expr: BoundExpr,
         slot: usize,
     },
+    /// Creates the elements an `INSERT` wrote, binding each one to its
+    /// slot, one row out for every row in.
+    ///
+    /// Nothing under this operator writes. The session runs the write
+    /// before it runs the plan and hands the created elements in as
+    /// arguments past the last declared parameter, and this operator
+    /// binds them, because the executor reads through a graph and a
+    /// graph reads. That is a seam and not a design: when the read path
+    /// consults overlays and the executor can stage a change of its
+    /// own, the staging moves in here and the argument goes away, and
+    /// the plan a query compiles to does not change.
+    Insert {
+        input: Box<LogicalPlan>,
+        nodes: Vec<BoundInsertNode>,
+    },
     /// A table function source: the engine kernel runs once over `rel`
     /// and yields one row per node of its domain, node slot first.
     TableFunction {
@@ -222,6 +238,15 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                         bracket: group,
                     };
                 }
+            }
+            BoundClause::Insert { nodes } => {
+                for node in nodes {
+                    bound.insert(node.slot);
+                }
+                plan = LogicalPlan::Insert {
+                    input: plan.boxed(),
+                    nodes: nodes.clone(),
+                };
             }
             BoundClause::Unwind { expr, slot } => {
                 bound.insert(*slot);
@@ -526,6 +551,32 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             );
             render(input, query, schema, depth + 1, out);
         }
+        LogicalPlan::Insert { input, nodes } => {
+            let written: Vec<String> = nodes
+                .iter()
+                .map(|node| {
+                    let table = schema
+                        .node_by_id(node.table)
+                        .map(|n| n.name.as_str())
+                        .unwrap_or("?");
+                    let props: Vec<String> = node
+                        .props
+                        .iter()
+                        .map(|(key, expr)| format!("{key}: {}", expr_text(expr, query)))
+                        .collect();
+                    match props.is_empty() {
+                        true => format!("({}:{table})", slot_name(query, node.slot)),
+                        false => format!(
+                            "({}:{table} {{{}}})",
+                            slot_name(query, node.slot),
+                            props.join(", ")
+                        ),
+                    }
+                })
+                .collect();
+            let _ = writeln!(out, "{pad}Insert {}", written.join(", "));
+            render(input, query, schema, depth + 1, out);
+        }
         LogicalPlan::TableFunction {
             input,
             func,
@@ -787,6 +838,23 @@ mod tests {
                 "Expand (a)-[#1:KNOWS]->(b)",
                 "Filter a.id = $src",
                 "ScanNodes a: Person",
+            ],
+            "got:\n{text}"
+        );
+    }
+
+    /// An insert prints what it writes, so that a plan says the
+    /// statement changes something rather than looking like a read of
+    /// nowhere.
+    #[test]
+    fn an_insert_prints_the_elements_it_writes() {
+        let text = explained("INSERT (x:Person {name: $who}), (y:Person) RETURN x.id AS id");
+        let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+        assert_eq!(
+            lines,
+            [
+                "Project x.id AS id",
+                "Insert (x:Person {name: $who}), (y:Person)",
             ],
             "got:\n{text}"
         );

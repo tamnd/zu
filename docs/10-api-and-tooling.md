@@ -39,6 +39,14 @@ A connection reads the database as of when it connected. It keeps the header it 
 
 `crates/zu/benches/connect.rs` holds both halves of that to a number, and the second is the one that matters: the warm point read through a `Connection` measures 0.99 to 1.03 times the same read through the engine's own `Session`, which is the noise floor of two ten-thousand-read medians. A public API that costs something over the engine is one the people who care about latency route around, so it is gated rather than asserted.
 
+Loading data goes through an appender rather than through statements. `conn.appender("person")` gives one, `append_row` takes a row as a tuple or a slice of fields, and `close` returns how many rows went in. A row is every column of the table in the order the table declares them, and a column is a position rather than a name, because naming the columns per row costs a lookup per value on the one path where per-value cost is the whole story. The reason for the type is the arithmetic: a statement per row is a commit per row, and a commit is the expensive part, so a million rows loaded that way is a million commits. Buffering makes it one.
+
+A flush is that one commit. The buffered columns are sealed into the data file as segments and the log gets a single frame naming them, which is the bulk-load WAL bypass of `docs/08-transactions-mvcc.md` §6: the log stays the same handful of bytes whether the flush carries ten rows or ten million. The fold that follows seals those segments into the base the query path reads, so when a flush returns the rows are both durable and visible, and before it returns neither. That fold costs time proportional to the table rather than to the batch, which is the whole reason to buffer: flush once per load, not once per row.
+
+`crates/zu/benches/append.rs` gates both ends. Buffering a row costs 26 to 42 ns on a two-column table, one column of which is a string and so costs a copy, which is what says the row path allocates nothing. Two thousand rows loaded with one flush cost 0.0007 to 0.0011 times the same rows loaded with a flush each, both timed in one run, which is the design stated as a ratio.
+
+Because a commit is durable at the log frame and visible at the fold, a crash between the two would leave rows on disk that no statement could see. Every writable open therefore replays a sidecar log that still has something in it and folds it before the first statement runs, so that window closes at the next open rather than staying open forever. A read-only open cannot fold and does not pretend to: it reads the base as the last fold left it.
+
 ## 2. CLI (`zu`)
 
 ```

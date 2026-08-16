@@ -13,8 +13,10 @@ pub use zu_common::{DiagnosticRecord, Epoch, GqlStatus, NodeId, Result, Severity
 pub use zu_storage::{CheckpointMode, Direction, GraphStore, Snapshot};
 pub use zu_zu1 as zu1;
 
+pub use append::{Appender, Field};
 pub use db::{Config, Connection, Database};
 
+pub mod append;
 pub mod catalog_stmt;
 pub mod convert;
 pub mod db;

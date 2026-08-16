@@ -254,6 +254,20 @@ jobs:
       # growing a copy or a re-read on the hot path unnoticed.
       - run: ZU_GATE=1 cargo bench -p zu --bench connect
 
+  append:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The dx/04 section 6 gate on the bulk-load appender: what
+      # buffering one row costs, and what batching buys over committing
+      # per row. The second is a ratio between two loads timed in one
+      # run on one machine, and it is the appender's reason to exist
+      # stated as a number, so a flush that stopped being a batch fails
+      # here rather than being noticed by a user loading a million rows.
+      - run: ZU_GATE=1 cargo bench -p zu --bench append
+
   corpus:
     runs-on: ubuntu-latest
     steps:

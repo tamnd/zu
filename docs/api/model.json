@@ -5,6 +5,53 @@
   "rustdoc_format_version": 61,
   "entities": [
     {
+      "id": "zu::Appender",
+      "kind": "struct",
+      "name": "Appender",
+      "source": "zu::append::Appender",
+      "doc": "A bulk load in progress: rows buffered in memory, written to the\ndatabase when you flush.\n\nTake one with [`crate::Connection::appender`], append rows to it,\nand call [`Appender::close`]. Dropping it without closing flushes\ntoo, because a loader that forgot is better served by its data\narriving than by it vanishing, but a drop has nowhere to put an\nerror and so cannot tell you whether the flush worked. That is the\none footgun dx/04 §6 accepts, and `#[must_use]` is what points a\ncaller at the version that reports. The drop does not panic on a\nbuffer it is handed, in debug builds either: a loader that hits an\nerror between rows and returns is exactly the case where an\nappender is dropped with rows in it, and turning that into an abort\non the way out of an unwind would be the worse failure.\n\nTwo things a table can be that an appender will not append to, both\nrefused when the appender opens rather than at the flush that would\nhave failed. A column that holds a null has no way in this API to\nsay which rows the appended values are for, so the write statements\nof G3 are what answers it. A table whose row domain a rel table's\nkey index is built over cannot grow without that index being\nreallocated, so the fold refuses it, and this refuses it earlier,\nbefore a load is buffered against it."
+    },
+    {
+      "id": "zu::Appender::append_row",
+      "kind": "method",
+      "name": "append_row",
+      "of": "zu::Appender",
+      "signature": "fn append_row<R>(&mut self, row: R) -> Result<()>",
+      "doc": "Appends one row: every column of a node table in declared\norder, or a source and a destination for a rel table.\n\nThe row goes into memory and nothing else happens, so this is a\npush per column and, on a string column, one copy. A row of the\nwrong width or with a field of the wrong type is refused with\nnothing of it kept, so an appender is still usable after a\ncaller fixes the row and tries again."
+    },
+    {
+      "id": "zu::Appender::buffered",
+      "kind": "method",
+      "name": "buffered",
+      "of": "zu::Appender",
+      "signature": "fn buffered(&self) -> u64",
+      "doc": "Rows buffered and not yet written."
+    },
+    {
+      "id": "zu::Appender::close",
+      "kind": "method",
+      "name": "close",
+      "of": "zu::Appender",
+      "signature": "fn close(self) -> Result<u64>",
+      "doc": "Flushes and gives back the rows committed, which is how to\nfinish an appender when you want to know that it worked."
+    },
+    {
+      "id": "zu::Appender::committed",
+      "kind": "method",
+      "name": "committed",
+      "of": "zu::Appender",
+      "signature": "fn committed(&self) -> u64",
+      "doc": "Rows this appender has committed."
+    },
+    {
+      "id": "zu::Appender::flush",
+      "kind": "method",
+      "name": "flush",
+      "of": "zu::Appender",
+      "signature": "fn flush(&mut self) -> Result<()>",
+      "doc": "Writes every buffered row and makes it readable.\n\nOne commit, whatever the buffer holds: the values are sealed\ninto the data file as segments, one frame naming them is\nappended and synced to the log, which is the commit point, and\nthe fold that follows seals them into the base every query\nreads. On return the buffer is empty and the rows are there.\n\nA flush with nothing buffered touches no file and returns, so a\nloader can flush on a timer without writing empty commits."
+    },
+    {
       "id": "zu::CheckpointMode",
       "kind": "enum",
       "name": "CheckpointMode",
@@ -72,6 +119,14 @@
       "name": "Connection",
       "source": "zu::db::Connection",
       "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of when it connected. It holds\nthe header it opened at, so a write another connection published\nsince is not visible to it, and a reader that wants the latest\ncatalog takes a new connection. Cross-connection visibility without\nreconnecting is the snapshot machinery of docs/08, not a header read\non the statement path."
+    },
+    {
+      "id": "zu::Connection::appender",
+      "kind": "method",
+      "name": "appender",
+      "of": "zu::Connection",
+      "signature": "fn appender(&mut self, table: &str) -> Result<Appender>",
+      "doc": "Opens an appender on `table`, the bulk-load path of dx/04 §6.\n\nA load through statements pays a commit per row; an appender\nbuffers rows and pays one per flush. Only one appender exists at\na time on a connection, which the borrow says rather than a\ncheck: it holds the file this connection reads through, so the\nconnection is unusable until the appender is closed or dropped,\nand a row appended is a row the next statement on it sees."
     },
     {
       "id": "zu::Connection::close_prepared",
@@ -255,6 +310,55 @@
       "signature": "u64",
       "source": "zu_common::id::Epoch",
       "doc": "Checkpoint or commit epoch, monotonically increasing."
+    },
+    {
+      "id": "zu::Field",
+      "kind": "enum",
+      "name": "Field",
+      "source": "zu::append::Field",
+      "doc": "One value on its way into a column.\n\nThis is deliberately not [`crate::query::Value`]. A value coming out\nof a query owns its string, because it outlives the row it was read\nfrom; a value going into a column borrows one, because the caller\nalready has it and the appender is about to copy it into a buffer\neither way. On a string column that is the difference between one\ncopy per row and two.\n\nThere is no null. A column that holds a null cannot be appended to\nat all, for the reason [`Appender`] gives, so a null here could only\never be refused, and refusing it in the type is better than\nrefusing it at flush."
+    },
+    {
+      "id": "zu::Field::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::Field",
+      "signature": "Bool(bool)"
+    },
+    {
+      "id": "zu::Field::Bytes",
+      "kind": "variant",
+      "name": "Bytes",
+      "of": "zu::Field",
+      "signature": "Bytes(&[u8])"
+    },
+    {
+      "id": "zu::Field::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::Field",
+      "signature": "Float(f64)"
+    },
+    {
+      "id": "zu::Field::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::Field",
+      "signature": "Int(i64)"
+    },
+    {
+      "id": "zu::Field::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::Field",
+      "signature": "Str(&str)"
+    },
+    {
+      "id": "zu::Field::Temporal",
+      "kind": "variant",
+      "name": "Temporal",
+      "of": "zu::Field",
+      "signature": "Temporal(zu_common::Temporal)"
     },
     {
       "id": "zu::GqlStatus",
@@ -568,6 +672,134 @@
       "doc": "The GQLSTATUS value for this error, if it has one. Engine-internal\nerrors return `None` rather than a code that would be a guess."
     },
     {
+      "id": "zu::append",
+      "kind": "module",
+      "name": "append",
+      "doc": "The bulk-load appender of dx/04 §6.\n\nA row at a time through a write statement is the wrong shape for\nloading data: every row would be parsed, bound, planned, and\ncommitted, and the commit is the expensive part, so a million rows\nwould be a million commits and the load would be dominated by\ndurability work nobody asked for. The appender is the other shape.\nRows go into per-column buffers in memory, and a flush turns the\nwhole buffer into sealed segments in the data file with one\n`IngestRef` frame in the log, which is the WAL bypass docs/08 §6\ndescribes: the log stays a handful of bytes whether the flush\ncarries ten rows or ten million.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut app = conn.appender(\"person\")?;\napp.append_row((1i64, \"ada\"))?;\napp.append_row((2i64, \"grace\"))?;\napp.close()?;\n# Ok::<(), zu::ZuError>(())\n```\n\nA row is every column of the table, in the order the table declares\nthem, and a column is a position rather than a name: naming the\ncolumns per row would cost a lookup per value on the one path where\nper-value cost is the whole story, and a loader knows its own\ncolumn order.\n\nA flush is one commit. When it returns the rows are durable and\nevery later query sees them, and before it returns nothing sees\nanything, because a flush ends by folding the sealed segments into\nthe base the query path reads. That fold costs time proportional to\nthe table rather than to the batch, which is the whole reason the\nappender buffers: flush once per load, not once per row."
+    },
+    {
+      "id": "zu::append::AppendRow",
+      "kind": "trait",
+      "name": "AppendRow",
+      "doc": "What [`Appender::append_row`] accepts: a tuple of things that are\nfields, or a slice of fields already.\n\nA tuple is what a loader writing rows by hand has, and a slice is\nwhat a loader forwarding rows from somewhere else has."
+    },
+    {
+      "id": "zu::append::AppendRow::write_into",
+      "kind": "method",
+      "name": "write_into",
+      "of": "zu::append::AppendRow",
+      "signature": "fn write_into(self, sink: &mut RowSink)",
+      "doc": "Writes this row's fields, in column order."
+    },
+    {
+      "id": "zu::append::Appender",
+      "kind": "struct",
+      "name": "Appender",
+      "doc": "A bulk load in progress: rows buffered in memory, written to the\ndatabase when you flush.\n\nTake one with [`crate::Connection::appender`], append rows to it,\nand call [`Appender::close`]. Dropping it without closing flushes\ntoo, because a loader that forgot is better served by its data\narriving than by it vanishing, but a drop has nowhere to put an\nerror and so cannot tell you whether the flush worked. That is the\none footgun dx/04 §6 accepts, and `#[must_use]` is what points a\ncaller at the version that reports. The drop does not panic on a\nbuffer it is handed, in debug builds either: a loader that hits an\nerror between rows and returns is exactly the case where an\nappender is dropped with rows in it, and turning that into an abort\non the way out of an unwind would be the worse failure.\n\nTwo things a table can be that an appender will not append to, both\nrefused when the appender opens rather than at the flush that would\nhave failed. A column that holds a null has no way in this API to\nsay which rows the appended values are for, so the write statements\nof G3 are what answers it. A table whose row domain a rel table's\nkey index is built over cannot grow without that index being\nreallocated, so the fold refuses it, and this refuses it earlier,\nbefore a load is buffered against it."
+    },
+    {
+      "id": "zu::append::Appender::append_row",
+      "kind": "method",
+      "name": "append_row",
+      "of": "zu::append::Appender",
+      "signature": "fn append_row<R>(&mut self, row: R) -> Result<()>",
+      "doc": "Appends one row: every column of a node table in declared\norder, or a source and a destination for a rel table.\n\nThe row goes into memory and nothing else happens, so this is a\npush per column and, on a string column, one copy. A row of the\nwrong width or with a field of the wrong type is refused with\nnothing of it kept, so an appender is still usable after a\ncaller fixes the row and tries again."
+    },
+    {
+      "id": "zu::append::Appender::buffered",
+      "kind": "method",
+      "name": "buffered",
+      "of": "zu::append::Appender",
+      "signature": "fn buffered(&self) -> u64",
+      "doc": "Rows buffered and not yet written."
+    },
+    {
+      "id": "zu::append::Appender::close",
+      "kind": "method",
+      "name": "close",
+      "of": "zu::append::Appender",
+      "signature": "fn close(self) -> Result<u64>",
+      "doc": "Flushes and gives back the rows committed, which is how to\nfinish an appender when you want to know that it worked."
+    },
+    {
+      "id": "zu::append::Appender::committed",
+      "kind": "method",
+      "name": "committed",
+      "of": "zu::append::Appender",
+      "signature": "fn committed(&self) -> u64",
+      "doc": "Rows this appender has committed."
+    },
+    {
+      "id": "zu::append::Appender::flush",
+      "kind": "method",
+      "name": "flush",
+      "of": "zu::append::Appender",
+      "signature": "fn flush(&mut self) -> Result<()>",
+      "doc": "Writes every buffered row and makes it readable.\n\nOne commit, whatever the buffer holds: the values are sealed\ninto the data file as segments, one frame naming them is\nappended and synced to the log, which is the commit point, and\nthe fold that follows seals them into the base every query\nreads. On return the buffer is empty and the rows are there.\n\nA flush with nothing buffered touches no file and returns, so a\nloader can flush on a timer without writing empty commits."
+    },
+    {
+      "id": "zu::append::Field",
+      "kind": "enum",
+      "name": "Field",
+      "doc": "One value on its way into a column.\n\nThis is deliberately not [`crate::query::Value`]. A value coming out\nof a query owns its string, because it outlives the row it was read\nfrom; a value going into a column borrows one, because the caller\nalready has it and the appender is about to copy it into a buffer\neither way. On a string column that is the difference between one\ncopy per row and two.\n\nThere is no null. A column that holds a null cannot be appended to\nat all, for the reason [`Appender`] gives, so a null here could only\never be refused, and refusing it in the type is better than\nrefusing it at flush."
+    },
+    {
+      "id": "zu::append::Field::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::append::Field",
+      "signature": "Bool(bool)"
+    },
+    {
+      "id": "zu::append::Field::Bytes",
+      "kind": "variant",
+      "name": "Bytes",
+      "of": "zu::append::Field",
+      "signature": "Bytes(&[u8])"
+    },
+    {
+      "id": "zu::append::Field::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::append::Field",
+      "signature": "Float(f64)"
+    },
+    {
+      "id": "zu::append::Field::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::append::Field",
+      "signature": "Int(i64)"
+    },
+    {
+      "id": "zu::append::Field::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::append::Field",
+      "signature": "Str(&str)"
+    },
+    {
+      "id": "zu::append::Field::Temporal",
+      "kind": "variant",
+      "name": "Temporal",
+      "of": "zu::append::Field",
+      "signature": "Temporal(zu_common::Temporal)"
+    },
+    {
+      "id": "zu::append::RowSink",
+      "kind": "struct",
+      "name": "RowSink",
+      "doc": "Where a row's fields go as they are read out of it.\n\nA row writes itself into the appender's column buffers directly,\nwith no vector of values in between, because the row is the hot\npath of a bulk load and an allocation per row is the one cost the\nappender exists to avoid. A field that a column will not take\nleaves the whole row unwritten: the sink counts what it kept, and\nthe appender pops it back off on the way out, so a refused row is a\nrow that never happened rather than half of one nobody can find."
+    },
+    {
+      "id": "zu::append::RowSink::push",
+      "kind": "method",
+      "name": "push",
+      "of": "zu::append::RowSink",
+      "signature": "fn push(&mut self, field: Field)",
+      "doc": "Writes the next field of this row.\n\nA field of the wrong type, or one past the end of the row, is\nrecorded and the rest of the row is written nowhere. Nothing\nhere returns a result, because a row implementation pushing its\nfields in order has nothing useful to do with one and the\nappender is where the error belongs."
+    },
+    {
       "id": "zu::catalog_stmt",
       "kind": "module",
       "name": "catalog_stmt",
@@ -677,6 +909,14 @@
       "kind": "struct",
       "name": "Connection",
       "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of when it connected. It holds\nthe header it opened at, so a write another connection published\nsince is not visible to it, and a reader that wants the latest\ncatalog takes a new connection. Cross-connection visibility without\nreconnecting is the snapshot machinery of docs/08, not a header read\non the statement path."
+    },
+    {
+      "id": "zu::db::Connection::appender",
+      "kind": "method",
+      "name": "appender",
+      "of": "zu::db::Connection",
+      "signature": "fn appender(&mut self, table: &str) -> Result<Appender>",
+      "doc": "Opens an appender on `table`, the bulk-load path of dx/04 §6.\n\nA load through statements pays a commit per row; an appender\nbuffers rows and pays one per flush. Only one appender exists at\na time on a connection, which the borrow says rather than a\ncheck: it holds the file this connection reads through, so the\nconnection is unusable until the appender is closed or dropped,\nand a row appended is a row the next statement on it sees."
     },
     {
       "id": "zu::db::Connection::close_prepared",
@@ -1957,6 +2197,14 @@
       "of": "zu::session::Session",
       "signature": "fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String>",
       "doc": "EXPLAIN ANALYZE through the session: same cache, same options,\nprofiled execution."
+    },
+    {
+      "id": "zu::session::Session::file_mut",
+      "kind": "method",
+      "name": "file_mut",
+      "of": "zu::session::Session",
+      "signature": "fn file_mut(&mut self) -> &mut Zu1File",
+      "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement."
     },
     {
       "id": "zu::session::Session::on",
@@ -4000,6 +4248,14 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn open_read_only(path: &Path) -> Result<Self>",
       "doc": "Opens an existing database on a descriptor the operating system\nwill not let this process write through. Every path that would\nhave written refuses first, with the name of the database in the\nerror, so a caller that asked for a read-only handle and then\nwrote learns which promise it broke rather than which syscall\nfailed."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::path",
+      "kind": "method",
+      "name": "path",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn path(&self) -> &Path",
+      "doc": "Where this handle's file is, which is what a caller needs to\nname the sidecar beside it: docs/04 puts the WAL at `<db>.wal`,\nand a caller holding only the handle would otherwise have to\ncarry the path alongside it and hope the two agree."
     },
     {
       "id": "zu::zu1::file::Zu1File::pin_block",

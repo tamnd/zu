@@ -1,11 +1,23 @@
 /* libzu: C API for the zu embedded property-graph database.
  *
- * One session per thread; sessions, statements, and results are not
- * thread-safe. A statement must be closed before its session, and a
- * result outlives none of them: every pointer an accessor returns
- * (column names, column buffers, cell strings) stays valid exactly
- * until zu_result_free on the result that produced it. Every *_free
- * and *_close call here is a no-op on NULL.
+ * A zu_database is a path and a configuration that have been checked
+ * against a real file. It holds no descriptor and no cache, so it is
+ * thread-safe and shareable. A zu_conn is the state that cannot be
+ * shared: a file handle, the caches, and the plans compiled against a
+ * catalog. A host that queries from four threads opens one database and
+ * connects four times.
+ *
+ * A connection may move between threads but must not be used from two
+ * at once; a call that finds one already in use answers
+ * ZU_MISUSE_CONCURRENT rather than corrupting a cache. Statements
+ * belong to the connection they were prepared on, and using one after
+ * that connection closes answers ZU_MISUSE_CLOSED rather than following
+ * a dangling pointer. Results own their rows outright, so a result
+ * stays readable after its connection has gone back to a pool.
+ *
+ * Every pointer an accessor returns (column names, column buffers, cell
+ * strings) stays valid exactly until zu_result_free on the result that
+ * produced it. Every *_free and *_close call here is a no-op on NULL.
  *
  * Every fallible call returns a zu_status and writes what it produced
  * through an out-parameter, because one returned pointer cannot say
@@ -40,22 +52,27 @@
 extern "C" {
 #endif
 
-typedef struct zu_session zu_session;
+typedef struct zu_database zu_database;
+typedef struct zu_conn zu_conn;
 typedef struct zu_stmt zu_stmt;
 typedef struct zu_result zu_result;
 typedef struct zu_error zu_error;
+
+/* The name a connection had before the database was split out of it.
+ * Kept for one release, along with zu_close below, so that code written
+ * against v0 still compiles; both go at the freeze. */
+typedef zu_conn zu_session;
 
 /* What a call answers. The GQLSTATUS condition a user reads is on the
  * error handle, not here, which is what keeps this from growing a
  * value per condition. Values are fixed; new ones are appended, never
  * inserted.
  *
- * The gaps are held for the rest of the set dx/02 §6 names and nothing
- * produces yet: 1 for ZU_ROW, 5 and 6 for the ownership checks
- * (ZU_MISUSE_CONCURRENT, ZU_MISUSE_CLOSED), 7 for ZU_INTERRUPTED, and
- * 12 for ZU_OOM. Reserving the numbers is free, and it is what lets
- * those land beside the misuse value they belong with instead of at
- * the end because the end was where there was room. */
+ * The gaps that remain are held for the rest of the set dx/02 §6 names
+ * and nothing produces yet: 1 for ZU_ROW, 7 for ZU_INTERRUPTED, and 12
+ * for ZU_OOM. Reserving the numbers is free, and it is what lets those
+ * land beside the value they belong with instead of at the end because
+ * the end was where there was room. */
 typedef enum zu_status {
   /* The call did what it was asked and wrote its out-parameter. */
   ZU_OK = 0,
@@ -70,6 +87,12 @@ typedef enum zu_status {
    * hold what it reads, or a string that is not UTF-8. Nothing was
    * done, and nothing is wrong with the database. */
   ZU_MISUSE = 4,
+  /* Two threads used one connection at once. Nothing was done. Connect
+   * again rather than share. */
+  ZU_MISUSE_CONCURRENT = 5,
+  /* A statement was used after its connection closed. Nothing was
+   * done; the statement handle is still safe to close. */
+  ZU_MISUSE_CLOSED = 6,
   /* A write lost to a concurrent one. */
   ZU_CONFLICT = 8,
   /* The file says something that cannot be true. */
@@ -117,26 +140,79 @@ const char *zu_error_code(const zu_error *e, size_t *len);
 int32_t zu_error_severity(const zu_error *e); /* -1 for a NULL error */
 void zu_error_free(zu_error *e);
 
-/* Session lifecycle. The session keeps the catalog, statistics, plan
- * cache, and block caches resident, so queries after the first run
- * without touching the catalog on disk. */
-zu_status zu_open(const char *path, size_t path_len, zu_session **out, zu_error **err);
-zu_status zu_open_z(const char *path, zu_session **out, zu_error **err);
-void zu_close(zu_session *session);
+/* How a database is opened. The only struct that crosses this boundary
+ * by value, and it does so because it is versioned: struct_size comes
+ * first, the caller sets it with zu_config_init, and every field after
+ * it is read only when that size says the caller's struct is long
+ * enough to hold it. A field appended later is therefore invisible to a
+ * binding compiled against this header, rather than fatal to it.
+ *
+ * Zero means the default in every field, so a zeroed struct with
+ * struct_size set opens the same database as a NULL config. */
+typedef struct zu_config {
+  size_t struct_size;   /* sizeof(zu_config); set this */
+  size_t memory_limit;  /* bytes the caches may hold; 0 for the default */
+  size_t threads;       /* query workers; 0 to let the executor pick, 1 for sequential */
+  int32_t read_only;    /* nonzero opens a descriptor this process cannot write through */
+} zu_config;
+
+zu_status zu_config_init(zu_config *cfg);
+
+/* Sets one option by name, so a binding can forward a user's option map
+ * without this ABI growing a setter per option and without the binding
+ * hard-coding a layout it would have to keep in step. Keys are
+ * memory_limit, threads, and read_only. The first two take a decimal
+ * count; a suffix such as MB is deliberately not parsed here, because
+ * its two readings differ by 4.9% and the language the user typed it in
+ * is a better place to decide which they meant. read_only takes true,
+ * false, 1, or 0. An unrecognized key is refused and named. */
+zu_status zu_config_set(zu_config *cfg, const char *key, size_t key_len, const char *value,
+                        size_t value_len, zu_error **err);
+zu_status zu_config_set_z(zu_config *cfg, const char *key, const char *value, zu_error **err);
+
+/* Database lifecycle. cfg may be NULL for the defaults. The file is
+ * opened once here and closed again, so a path that is not a zu1 file
+ * fails now rather than on the first connection. Closing a database
+ * does not close the connections opened from it: each holds its own
+ * file handle, and this releases only the path and the configuration. */
+zu_status zu_database_open(const char *path, size_t path_len, const zu_config *cfg,
+                           zu_database **out, zu_error **err);
+zu_status zu_database_open_z(const char *path, const zu_config *cfg, zu_database **out,
+                             zu_error **err);
+zu_status zu_database_path(const zu_database *db, const char **out, size_t *len);
+void zu_database_close(zu_database *db);
+
+/* Connection lifecycle. A connection keeps the catalog, statistics,
+ * plan cache, and block caches resident, so queries after the first run
+ * without touching the catalog on disk. That is also why it is per
+ * connection rather than per database, and why a pool calls zu_connect
+ * once per worker instead of sharing one.
+ *
+ * zu_open is the convenience for a host that wants exactly one: it
+ * opens a database with the default configuration, connects once, and
+ * returns the connection. Nothing outlives the database it discards,
+ * since the connection carries its own file handle.
+ *
+ * Closing is itself a use of the connection and obeys the same rule as
+ * every other one. */
+zu_status zu_connect(zu_database *db, zu_conn **out, zu_error **err);
+zu_status zu_open(const char *path, size_t path_len, zu_conn **out, zu_error **err);
+zu_status zu_open_z(const char *path, zu_conn **out, zu_error **err);
+void zu_conn_close(zu_conn *conn);
+void zu_close(zu_conn *conn); /* the old name; goes at the freeze */
 
 /* One-shot statement without parameters. */
-zu_status zu_query(zu_session *session, const char *q, size_t q_len, zu_result **out,
-                   zu_error **err);
-zu_status zu_query_z(zu_session *session, const char *q, zu_result **out, zu_error **err);
+zu_status zu_query(zu_conn *conn, const char *q, size_t q_len, zu_result **out, zu_error **err);
+zu_status zu_query_z(zu_conn *conn, const char *q, zu_result **out, zu_error **err);
 
 /* Prepared statements. Bindings live on the statement and survive
  * zu_execute, so a loop rebinds only what changed. Binding a name
  * again replaces its value. The bind calls return ZU_MISUSE for a NULL
- * statement or a name that is not UTF-8, and take no error handle
- * because that is all they can say. */
-zu_status zu_prepare(zu_session *session, const char *q, size_t q_len, zu_stmt **out,
-                     zu_error **err);
-zu_status zu_prepare_z(zu_session *session, const char *q, zu_stmt **out, zu_error **err);
+ * statement or a name that is not UTF-8, ZU_MISUSE_CLOSED once the
+ * connection has closed, and take no error handle because that is all
+ * they can say. */
+zu_status zu_prepare(zu_conn *conn, const char *q, size_t q_len, zu_stmt **out, zu_error **err);
+zu_status zu_prepare_z(zu_conn *conn, const char *q, zu_stmt **out, zu_error **err);
 zu_status zu_bind_i64(zu_stmt *stmt, const char *name, size_t name_len, int64_t v);
 zu_status zu_bind_i64_z(zu_stmt *stmt, const char *name, int64_t v);
 zu_status zu_bind_f64(zu_stmt *stmt, const char *name, size_t name_len, double v);

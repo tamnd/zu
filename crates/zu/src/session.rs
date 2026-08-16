@@ -275,11 +275,12 @@ impl Session {
         cached: &CachedPlan,
         mut args: Vec<Value>,
     ) -> Result<(Vec<Value>, bool)> {
-        let Some(zu_query::binder::BoundClause::Insert { nodes }) = cached.query.clauses.first()
+        let Some(zu_query::binder::BoundClause::Insert { nodes, rels }) =
+            cached.query.clauses.first()
         else {
             return Ok((args, false));
         };
-        let nodes = nodes.clone();
+        let (nodes, rels) = (nodes.clone(), rels.clone());
         // Asked before anything is worked out, so that a read-only
         // connection is told that it is read-only rather than told
         // something about the statement.
@@ -291,11 +292,15 @@ impl Session {
         let values = self.eval_row(cached, crate::insert::value_exprs(&nodes), &args)?;
         let values = crate::insert::regroup(&nodes, values);
         let new = crate::insert::plan_rows(self.graph.file_mut(), &nodes, &values)?;
-        self.write(|txn| crate::insert::stage(txn, &new))?;
+        let edges = crate::insert::plan_edges(&nodes, &new, &rels)?;
+        self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
         // Each element arrives as a list of one, because the operator
         // that binds it to its slot is the one that reads a list: one
-        // element in, one row out.
+        // element in, one row out. The nodes come first and the edges
+        // behind them, which is the order the binder handed out the
+        // argument positions in.
         args.extend(new.iter().map(|node| Value::List(vec![node.value()])));
+        args.extend(edges.iter().map(|edge| Value::List(vec![edge.value()])));
         Ok((args, true))
     }
 

@@ -484,6 +484,14 @@ impl Zu1File {
         self.writable
     }
 
+    /// Where this handle's file is, which is what a caller needs to
+    /// name the sidecar beside it: docs/04 puts the WAL at `<db>.wal`,
+    /// and a caller holding only the handle would otherwise have to
+    /// carry the path alongside it and hope the two agree.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Refuses the call when this handle is read-only. Every durable
     /// change goes through [`Self::write_block`] or [`Self::checkpoint`],
     /// so the two of them are the whole gate: a block nothing wrote and

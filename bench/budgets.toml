@@ -1205,3 +1205,33 @@ connect_us = 400.0
 # here for: a wrapper that copies the result, or re-reads the header, or
 # rebinds the parameters on the way through, lands at 2x and up.
 api_overhead_x = 1.25
+
+# The per row cost of the appender's buffering path, ns
+# (benches/append.rs). This is the loop a bulk load is in, so every cost
+# in it is paid per row: the row is read out of its tuple straight into
+# the column buffers, with no vector of values in between and no
+# allocation on an integer column at all.
+#
+# Measured 26 to 42 ns per row over 200000 rows on the local M series,
+# for a two column table where one column is a string and so costs a
+# copy; the spread across that range is what else the machine was
+# running. The ceiling is set for a slow box, and the defect it is
+# here for is an allocation or a name lookup creeping into the row path,
+# which lands an order of magnitude above this and nowhere near the
+# ceiling from below. Lower this ceiling, never raise it.
+append_row_ns = 250.0
+
+# What batching buys: the same rows loaded with one flush over the same
+# rows loaded with a flush each, both timed in one run against files
+# built the same way, so a shared runner cannot move the ratio. It is
+# the appender's whole reason to exist as a number, and a regression
+# here means a flush stopped being a batch: an appender that committed
+# per row, or one whose flush did work proportional to what it had
+# already written, would walk this toward 1.
+#
+# Measured 0.0007 to 0.0011 on the local M series, which is 2000 rows
+# in 73 ms against 67 s of committing them one at a time, and the ratio
+# holds across runs because both halves move together. The ceiling
+# leaves two orders of magnitude of room and still fails long before
+# batching stops paying. Lower this ceiling, never raise it.
+append_batch_x = 0.05

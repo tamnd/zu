@@ -22,6 +22,11 @@ schema = 1
 target = "rust"
 
 [[group]]
+prefix = "zu::Appender"
+tier = 1
+reason = "the bulk load path: a binding that can only load through statements pays a commit per row, which is the difference between a load that takes seconds and one that takes an hour"
+
+[[group]]
 prefix = "zu::CheckpointMode"
 tier = 2
 reason = "how much work a checkpoint does, which only a binding that exposes checkpointing needs"
@@ -52,6 +57,11 @@ tier = 2
 reason = "traversal direction, which a query says in its text rather than through an argument"
 
 [[group]]
+prefix = "zu::Field"
+tier = 1
+reason = "one value on its way into a column, which is the appender's half of the conversion code every binding writes"
+
+[[group]]
 prefix = "zu::GqlStatus"
 tier = 1
 reason = "the ISO 39075 condition code on every error and every warning"
@@ -80,6 +90,21 @@ reason = "the engine's read view at a fixed epoch, an interface the executor use
 prefix = "zu::ZuError"
 tier = 1
 reason = "the error every call can return, mapped onto each language's own exception type"
+
+[[group]]
+prefix = "zu::append"
+tier = 1
+reason = "the appender under its own module path, the same surface as zu::Appender and the same obligation"
+
+[[group]]
+prefix = "zu::append::AppendRow"
+tier = 3
+reason = "the trait that lets a tuple be a row, which is how Rust spells a variadic argument and not something another language needs a name for"
+
+[[group]]
+prefix = "zu::append::RowSink"
+tier = 3
+reason = "where a row writes its fields on the way into the column buffers, an implementation detail of that trait and never named by a caller"
 
 [[group]]
 prefix = "zu::catalog_stmt"
@@ -185,6 +210,11 @@ reason = "a Rust alias for Result<T, ZuError>, and every other language raises i
 id = "zu::db::Connection::session_mut"
 tier = 3
 reason = "the same escape hatch under its own module path"
+
+[[entity]]
+id = "zu::session::Session::file_mut"
+tier = 3
+reason = "the engine file under the session, which the appender takes for the length of its borrow and which nothing outside this crate has a use for"
 
 [[entity]]
 id = "zu::session::Session::options"

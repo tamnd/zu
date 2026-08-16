@@ -842,7 +842,8 @@ mod tests {
             .profile("INSERT (x:person {age: 1, name: 'new'})", &[])
             .expect_err("a write has no one plan to profile");
         assert!(
-            err.to_string().contains("profiling a statement that writes"),
+            err.to_string()
+                .contains("profiling a statement that writes"),
             "says what it will not do: {err}"
         );
     }

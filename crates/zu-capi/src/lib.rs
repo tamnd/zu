@@ -1,7 +1,18 @@
-//! libzu: the C surface over [`zudb::session::Session`], built for a
-//! host that keeps the process alive and queries in a loop (a cgo
-//! adapter, an editor, a language binding). One session per thread;
-//! nothing here is thread-safe and the header says so.
+//! libzu: the C surface over [`zudb::Database`] and
+//! [`zudb::Connection`], built for a host that keeps the process alive
+//! and queries in a loop (a cgo adapter, an editor, a language
+//! binding).
+//!
+//! The object model is the Rust one, because dx/02 §3 is where both
+//! came from. A [`ZuDatabase`] is a path and a configuration that have
+//! been checked against a real file; it holds no descriptor and no
+//! cache, so it is shareable across threads without a lock. A
+//! [`ZuConn`] is the state that cannot be shared: a file handle, the
+//! caches, and the plans compiled against a catalog. A host that wants
+//! to query from four threads opens one database and connects four
+//! times, which is the shape every pooling binding above this needs and
+//! the shape a single `zu_open` returning one session could not
+//! express.
 //!
 //! Every fallible call returns a [`ZuStatus`] and writes what it
 //! produced through an out-parameter, which is dx/02 R2. The reason is
@@ -18,10 +29,11 @@
 //! carrying the GQLSTATUS code, the severity, and the message as
 //! fields rather than as one string a binding has to parse. Only the
 //! calls that can fail for a reason the engine has something to say
-//! about take one: opening, running, preparing, executing. The
-//! accessors do not, because their failures are structural (a column
-//! out of range, a column that does not hold what the accessor reads)
-//! and the status names each one exactly.
+//! about take one: opening, connecting, running, preparing, executing,
+//! and setting a configuration key. The accessors do not, because
+//! their failures are structural (a column out of range, a column that
+//! does not hold what the accessor reads) and the status names each
+//! one exactly.
 //!
 //! Strings cross the boundary as a pointer and a length, which is
 //! dx/02 R7. Most source languages have counted strings, and a
@@ -33,7 +45,8 @@
 //! Ownership is the usual C contract: every pointer this library hands
 //! out stays valid until the object that produced it is freed, and is
 //! freed only by the matching `*_free`/`*_close` call, each of which
-//! is a no-op on `NULL` (R8).
+//! is a no-op on `NULL` (R8). Where the contract can be checked it is,
+//! rather than left as undefined behaviour: see [`ConnState`].
 //!
 //! Results read out column-at-a-time: `zu_result_col_i64` materializes
 //! a whole column into a contiguous buffer once, so a host crossing an
@@ -49,12 +62,14 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
+use std::mem::{offset_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use zudb::query::{QueryResult, Value};
-use zudb::session::Session;
-use zudb::{Severity, ZuError as EngineError};
+use zudb::{Config, Connection, Database, Severity, ZuError as EngineError};
 
 /// What a call answers, which is control flow and nothing else.
 ///
@@ -67,11 +82,9 @@ use zudb::{Severity, ZuError as EngineError};
 ///
 /// The values are fixed. New ones are appended, never inserted, so a
 /// binding compiled against an older header keeps its numbering. The
-/// gaps are held for the rest of the set dx/02 §6 names and nothing
-/// produces yet: 1 for `ZU_ROW`, 5 and 6 for the ownership checks, 7
-/// for `ZU_INTERRUPTED`, and 12 for `ZU_OOM`. Reserving the numbers is
-/// free, and it is what lets those land beside the misuse value they
-/// belong with rather than at the end because the end had room.
+/// gaps that remain are held for the rest of the set dx/02 §6 names
+/// and nothing produces yet: 1 for `ZU_ROW`, 7 for `ZU_INTERRUPTED`,
+/// and 12 for `ZU_OOM`.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZuStatus {
@@ -88,6 +101,15 @@ pub enum ZuStatus {
     /// not hold what it reads, or a string that is not UTF-8. Nothing
     /// was done and nothing is wrong with the database.
     Misuse = 4,
+    /// Two threads used one connection at once. Distinct from
+    /// [`ZuStatus::Misuse`] because it is the one mistake a host makes
+    /// by accident rather than by typo, and because the fix is a
+    /// different one: connect again rather than correct the call.
+    MisuseConcurrent = 5,
+    /// A statement was used after the connection it was prepared on
+    /// was closed. Nothing was done; the statement handle is still
+    /// safe to close.
+    MisuseClosed = 6,
     /// A write lost to a concurrent one.
     Conflict = 8,
     /// The file says something that cannot be true, which is damage
@@ -269,16 +291,286 @@ unsafe fn zlen(p: *const c_char) -> usize {
     unsafe { CStr::from_ptr(p) }.to_bytes().len()
 }
 
-/// An open database session. Opaque to C.
-pub struct ZuSession {
-    session: Session,
+/* ---- configuration ---- */
+
+/// How a database is opened. The one struct that crosses this boundary
+/// by value, which dx/02 R1 allows exactly because it is versioned:
+/// `struct_size` is first, the caller sets it, and every field after
+/// it is read only when the size says the caller's struct is long
+/// enough to hold it.
+///
+/// That is what lets a field be appended without breaking a binding
+/// compiled against the header before it. The alternative, an opaque
+/// handle with an allocator and a destructor, costs a heap allocation
+/// and two more calls to express three integers a caller already has
+/// on its stack.
+///
+/// Zero means "the default" for every field, so a caller that
+/// memsets the struct and sets `struct_size` gets the same database as
+/// a caller that passed `NULL`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZuConfig {
+    /// `sizeof(zu_config)` as the caller's header defines it. Set by
+    /// [`zu_config_init`]; a struct that arrives with anything else is
+    /// read as the prefix that size describes.
+    pub struct_size: usize,
+    /// Bytes the caches may hold. Zero leaves the engine default.
+    pub memory_limit: usize,
+    /// Worker threads for the parallel stages of a query. Zero lets
+    /// the executor pick, and one forces sequential execution, which
+    /// is what a host running many connections at once wants.
+    pub threads: usize,
+    /// Nonzero opens on a descriptor this process cannot write
+    /// through.
+    pub read_only: i32,
 }
 
-/// A prepared statement plus its pending bindings. Holds a raw pointer
-/// back to its session; the header requires the statement to die
-/// before the session does, the same contract sqlite3_stmt has.
+impl Default for ZuConfig {
+    fn default() -> ZuConfig {
+        ZuConfig {
+            struct_size: size_of::<ZuConfig>(),
+            memory_limit: 0,
+            threads: 0,
+            read_only: 0,
+        }
+    }
+}
+
+/// Fills a configuration with the defaults and stamps its
+/// `struct_size`. A caller that skips this and zeroes the struct by
+/// hand must still set `struct_size`, because a zero there describes a
+/// struct with no fields.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_config_init(cfg: *mut ZuConfig) -> ZuStatus {
+    if cfg.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { cfg.write(ZuConfig::default()) };
+    ZuStatus::Ok
+}
+
+/// Sets one option by name, so a binding can forward a user's option
+/// map without this ABI growing a setter per option and without the
+/// binding hard-coding a struct layout it would have to keep in step.
+///
+/// Keys are `memory_limit`, `threads`, and `read_only`. The first two
+/// take a decimal count of bytes and of threads; suffixes such as `MB`
+/// are deliberately not parsed here, because the two readings of that
+/// suffix differ by 4.9% and the language the user typed it in is a
+/// better place to decide which one they meant. `read_only` takes
+/// `true`, `false`, `1`, or `0`.
+///
+/// An unrecognized key is refused and named, since a binding
+/// forwarding a map needs to tell its user which entry was the typo.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_config_set(
+    cfg: *mut ZuConfig,
+    key: *const c_char,
+    key_len: usize,
+    value: *const c_char,
+    value_len: usize,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        if cfg.is_null() {
+            return Err(misuse("config is NULL"));
+        }
+        let key = unsafe { counted(key, key_len, "key") }?;
+        let value = unsafe { counted(value, value_len, "value") }?;
+        let count = |what: &str| -> Result<usize, EngineError> {
+            value
+                .parse::<usize>()
+                .map_err(|_| misuse(format!("{what} wants a decimal count, not {value:?}")))
+        };
+        let cfg = unsafe { &mut *cfg };
+        match key {
+            "memory_limit" => cfg.memory_limit = count("memory_limit")?,
+            "threads" => cfg.threads = count("threads")?,
+            "read_only" => {
+                cfg.read_only = match value {
+                    "true" | "1" => 1,
+                    "false" | "0" => 0,
+                    _ => return Err(misuse(format!("read_only wants a boolean, not {value:?}"))),
+                }
+            }
+            _ => return Err(misuse(format!("unknown configuration key {key:?}"))),
+        }
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_config_set_z(
+    cfg: *mut ZuConfig,
+    key: *const c_char,
+    value: *const c_char,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_config_set(cfg, key, zlen(key), value, zlen(value), err) }
+}
+
+/// Reads a caller's configuration as far as its `struct_size` says it
+/// goes, which is the whole point of the field: a binding built
+/// against an older header passes a shorter struct, and the fields it
+/// never heard of take their defaults instead of whatever follows its
+/// allocation.
+unsafe fn config_of(cfg: *const ZuConfig) -> Result<Config, EngineError> {
+    // NULL is the defaults, so a host with nothing to configure calls
+    // zu_database_open without first building a struct to say so.
+    if cfg.is_null() {
+        return Ok(Config::new());
+    }
+    let size = unsafe { (*cfg).struct_size };
+    if size < size_of::<usize>() {
+        return Err(misuse(format!(
+            "config struct_size is {size}, too small to hold the field that holds it"
+        )));
+    }
+    // True when the caller's struct is long enough to contain a field
+    // that ends at `end`. A newer caller's longer struct passes every
+    // one of these and its extra fields are ignored, which is the
+    // other direction of the same compatibility.
+    let has = |end: usize| size >= end;
+    let mut config = Config::new();
+    if has(offset_of!(ZuConfig, memory_limit) + size_of::<usize>()) {
+        let bytes = unsafe { (*cfg).memory_limit };
+        if bytes != 0 {
+            config = config.memory_limit(bytes);
+        }
+    }
+    if has(offset_of!(ZuConfig, threads) + size_of::<usize>()) {
+        config = config.threads(unsafe { (*cfg).threads });
+    }
+    if has(offset_of!(ZuConfig, read_only) + size_of::<i32>()) {
+        config = config.read_only(unsafe { (*cfg).read_only } != 0);
+    }
+    Ok(config)
+}
+
+/* ---- handles ---- */
+
+/// Whether a connection is still open, and whether a call is in it.
+///
+/// dx/02 §5 says a connection may move between threads but must not be
+/// used from two at once, and that a statement used after its
+/// connection closes is a detected mistake rather than undefined
+/// behaviour. Both are checks rather than prose here, because prose in
+/// a header is only read by the hosts that were not going to make the
+/// mistake.
+///
+/// The state is behind an `Arc` shared with every statement prepared
+/// on the connection, so it outlives the connection itself: a
+/// statement closed after its connection finds `alive` false and
+/// declines instead of following a dangling pointer.
+///
+/// `busy` costs one uncontended swap per call, which is a handful of
+/// cycles against a query, and it catches the case that otherwise
+/// corrupts a plan cache silently on a machine the host could not
+/// reproduce.
+struct ConnState {
+    alive: AtomicBool,
+    busy: AtomicBool,
+}
+
+/// The right to use a connection for the length of one call, released
+/// on drop so that an early return, a `?`, or a panic caught at the
+/// boundary all put the connection back.
+struct Claim(Arc<ConnState>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::Release);
+    }
+}
+
+fn claim(state: &Arc<ConnState>) -> Result<Claim, ZuStatus> {
+    if !state.alive.load(Ordering::Acquire) {
+        return Err(ZuStatus::MisuseClosed);
+    }
+    if state.busy.swap(true, Ordering::AcqRel) {
+        return Err(ZuStatus::MisuseConcurrent);
+    }
+    Ok(Claim(Arc::clone(state)))
+}
+
+/* ---- reaching into a handle ---- */
+
+// Every accessor below borrows one field of a handle, never the whole
+// handle, and that is what makes the concurrency check itself safe to
+// run concurrently.
+//
+// A second thread arriving at a connection that is already in a call
+// has to read `state` to find out that it must go away. Writing that
+// as `(&*conn).state` would form a `&ZuConn` covering the same bytes
+// as the `&mut ZuConn` the thread inside the call is holding, which is
+// undefined behaviour whether or not the second thread goes on to
+// touch anything. Projecting the field off the raw pointer instead
+// keeps the two disjoint: the thread inside the call borrows the
+// connection, the thread being turned away borrows the flag, and
+// neither reference covers the other's bytes.
+
+/// The state of a connection, cloned so the caller holds no borrow.
+unsafe fn conn_state(conn: *mut ZuConn) -> Arc<ConnState> {
+    Arc::clone(unsafe { &(*conn).state })
+}
+
+/// The engine connection itself. Only ever called under a [`Claim`],
+/// which is what makes the `&mut` unique.
+unsafe fn conn_of<'a>(conn: *mut ZuConn) -> &'a mut Connection {
+    unsafe { &mut (*conn).conn }
+}
+
+/// The state a statement shares with the connection it belongs to.
+unsafe fn stmt_state(stmt: *mut ZuStmt) -> Arc<ConnState> {
+    Arc::clone(unsafe { &(*stmt).state })
+}
+
+/// A statement's pending bindings, under a [`Claim`] as above.
+unsafe fn stmt_binds<'a>(stmt: *mut ZuStmt) -> &'a mut Vec<(String, Value)> {
+    unsafe { &mut (*stmt).binds }
+}
+
+/// An open database: a path and a configuration, both checked against
+/// a real file. Opaque to C, thread-safe, and cheap, since it holds no
+/// descriptor and no cache.
+pub struct ZuDatabase {
+    db: Database,
+    path: CString,
+}
+
+/// One connection, with its own file handle, caches, and plan cache.
+/// Opaque to C, and not thread-safe: see [`ConnState`].
+pub struct ZuConn {
+    conn: Connection,
+    state: Arc<ConnState>,
+}
+
+impl ZuConn {
+    fn new(conn: Connection) -> ZuConn {
+        ZuConn {
+            conn,
+            state: Arc::new(ConnState {
+                alive: AtomicBool::new(true),
+                busy: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn into_raw(self) -> *mut ZuConn {
+        Box::into_raw(Box::new(self))
+    }
+}
+
+/// A prepared statement plus its pending bindings.
+///
+/// It holds a raw pointer back to its connection and a clone of that
+/// connection's state. The pointer is followed only after the state
+/// says the connection is still open, which is what turns the classic
+/// use-after-close of a `sqlite3_stmt` into [`ZuStatus::MisuseClosed`].
 pub struct ZuStmt {
-    session: *mut ZuSession,
+    conn: *mut ZuConn,
+    state: Arc<ConnState>,
     id: u64,
     binds: Vec<(String, Value)>,
 }
@@ -287,6 +579,12 @@ pub struct ZuStmt {
 /// the boundary: column-name CStrings up front, columnar i64/f64/
 /// validity buffers and cell strings materialized on first request and
 /// kept until the result is freed, so returned pointers stay stable.
+///
+/// A result owns its rows outright and holds nothing of its
+/// connection, so it stays readable after that connection closes. That
+/// is deliberate: a host that hands a result to another layer and
+/// returns the connection to a pool is doing the ordinary thing, and
+/// there is no reason to make it an error when nothing is borrowed.
 pub struct ZuResult {
     result: QueryResult,
     col_names: Vec<CString>,
@@ -397,14 +695,19 @@ pub unsafe extern "C" fn zu_error_free(e: *mut ZuError) {
     }
 }
 
-/* ---- sessions ---- */
+/* ---- databases ---- */
 
-/// Opens a session on a zu1 file.
+/// Opens a database. `cfg` may be NULL for the defaults.
+///
+/// The file is opened once here and closed again, so a path that is
+/// not a zu1 file, or is one this build cannot read, fails now rather
+/// than on the first connection.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zu_open(
+pub unsafe extern "C" fn zu_database_open(
     path: *const c_char,
     path_len: usize,
-    out: *mut *mut ZuSession,
+    cfg: *const ZuConfig,
+    out: *mut *mut ZuDatabase,
     err: *mut *mut ZuError,
 ) -> ZuStatus {
     if out.is_null() {
@@ -413,8 +716,106 @@ pub unsafe extern "C" fn zu_open(
     unsafe { *out = std::ptr::null_mut() };
     guard(err, || {
         let path = unsafe { counted(path, path_len, "path") }?;
-        let session = Session::open(Path::new(path))?;
-        unsafe { *out = Box::into_raw(Box::new(ZuSession { session })) };
+        let db = Database::open_with(Path::new(path), unsafe { config_of(cfg) }?)?;
+        let stored = c_message(path);
+        unsafe { *out = Box::into_raw(Box::new(ZuDatabase { db, path: stored })) };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_database_open_z(
+    path: *const c_char,
+    cfg: *const ZuConfig,
+    out: *mut *mut ZuDatabase,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_database_open(path, zlen(path), cfg, out, err) }
+}
+
+/// The path this database was opened with, valid until it is closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_database_path(
+    db: *const ZuDatabase,
+    out: *mut *const c_char,
+    len: *mut usize,
+) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = std::ptr::null() };
+    if !len.is_null() {
+        unsafe { *len = 0 };
+    }
+    if db.is_null() {
+        return ZuStatus::Misuse;
+    }
+    let path = &unsafe { &*db }.path;
+    unsafe { *out = path.as_ptr() };
+    if !len.is_null() {
+        unsafe { *len = path.as_bytes().len() };
+    }
+    ZuStatus::Ok
+}
+
+/// Closes a database. Connections opened from it keep working, since
+/// each holds its own file handle; this releases the path and the
+/// configuration and nothing else.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_database_close(db: *mut ZuDatabase) {
+    if !db.is_null() {
+        drop(unsafe { Box::from_raw(db) });
+    }
+}
+
+/* ---- connections ---- */
+
+/// A new connection on an open database: its own file handle, its own
+/// caches, its own plan cache. This is the call a pool makes, and it
+/// is why the database is a separate handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_connect(
+    db: *mut ZuDatabase,
+    out: *mut *mut ZuConn,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        if db.is_null() {
+            return Err(misuse("database is NULL"));
+        }
+        let conn = unsafe { &*db }.db.connect()?;
+        unsafe { *out = ZuConn::new(conn).into_raw() };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Opens a database and one connection on it, for the host that wants
+/// exactly one.
+///
+/// The database handle is not returned because nothing outlives it:
+/// the connection carries its own file handle, and a `ZuDatabase` is
+/// only a path and a configuration. A host that wants a second
+/// connection wants [`zu_database_open`] and [`zu_connect`] instead,
+/// which is the point of the split.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_open(
+    path: *const c_char,
+    path_len: usize,
+    out: *mut *mut ZuConn,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let path = unsafe { counted(path, path_len, "path") }?;
+        let conn = Database::open(Path::new(path))?.connect()?;
+        unsafe { *out = ZuConn::new(conn).into_raw() };
         Ok(ZuStatus::Ok)
     })
 }
@@ -422,24 +823,65 @@ pub unsafe extern "C" fn zu_open(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_open_z(
     path: *const c_char,
-    out: *mut *mut ZuSession,
+    out: *mut *mut ZuConn,
     err: *mut *mut ZuError,
 ) -> ZuStatus {
     unsafe { zu_open(path, zlen(path), out, err) }
 }
 
-/// Closes a session. Statements prepared on it must already be closed.
+/// Closes a connection. Statements prepared on it can still be closed
+/// afterwards, and anything else done with them answers
+/// [`ZuStatus::MisuseClosed`].
+///
+/// Closing is itself a use of the connection, so it obeys the same
+/// rule as every other one. A close racing a call on another thread is
+/// the mistake dx/02 §5 forbids; this marks the connection closed and
+/// then leaks it rather than freeing memory the other thread is inside
+/// of, because a leak on a detected mistake is recoverable and the
+/// free is not.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zu_close(session: *mut ZuSession) {
-    if !session.is_null() {
-        drop(unsafe { Box::from_raw(session) });
+pub unsafe extern "C" fn zu_conn_close(conn: *mut ZuConn) {
+    if conn.is_null() {
+        return;
     }
+    let state = unsafe { conn_state(conn) };
+    state.alive.store(false, Ordering::Release);
+    if state.busy.load(Ordering::Acquire) {
+        return;
+    }
+    drop(unsafe { Box::from_raw(conn) });
 }
+
+/// The name this had before dx/02 §8 split the database from the
+/// connection. Kept for one release beside the `zu_session` typedef so
+/// that code written against v0 still compiles; both go at the freeze.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_close(conn: *mut ZuConn) {
+    unsafe { zu_conn_close(conn) }
+}
+
+/// Claims a connection for one call, or says why it cannot be had.
+unsafe fn claim_conn(conn: *mut ZuConn) -> Result<Claim, ZuStatus> {
+    if conn.is_null() {
+        return Err(ZuStatus::Misuse);
+    }
+    claim(&unsafe { conn_state(conn) })
+}
+
+/// Claims a statement's connection for one call.
+unsafe fn claim_stmt(stmt: *mut ZuStmt) -> Result<Claim, ZuStatus> {
+    if stmt.is_null() {
+        return Err(ZuStatus::Misuse);
+    }
+    claim(&unsafe { stmt_state(stmt) })
+}
+
+/* ---- statements ---- */
 
 /// Runs one parameterless statement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_query(
-    session: *mut ZuSession,
+    conn: *mut ZuConn,
     q: *const c_char,
     q_len: usize,
     out: *mut *mut ZuResult,
@@ -450,12 +892,12 @@ pub unsafe extern "C" fn zu_query(
     }
     unsafe { *out = std::ptr::null_mut() };
     guard(err, || {
-        if session.is_null() {
-            return Err(misuse("session is NULL"));
-        }
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
         let q = unsafe { counted(q, q_len, "query") }?;
-        let session = unsafe { &mut *session };
-        let result = session.session.run(q, &[])?;
+        let result = unsafe { conn_of(conn) }.query(q)?;
         unsafe { *out = Box::into_raw(Box::new(ZuResult::new(result))) };
         Ok(ZuStatus::Ok)
     })
@@ -463,20 +905,20 @@ pub unsafe extern "C" fn zu_query(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_query_z(
-    session: *mut ZuSession,
+    conn: *mut ZuConn,
     q: *const c_char,
     out: *mut *mut ZuResult,
     err: *mut *mut ZuError,
 ) -> ZuStatus {
-    unsafe { zu_query(session, q, zlen(q), out, err) }
+    unsafe { zu_query(conn, q, zlen(q), out, err) }
 }
 
-/// Compiles a statement against the session's plan cache. The handle
-/// carries its own bindings; bind then execute, as many times as
-/// wanted.
+/// Compiles a statement against the connection's plan cache. The
+/// handle carries its own bindings; bind then execute, as many times
+/// as wanted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_prepare(
-    session: *mut ZuSession,
+    conn: *mut ZuConn,
     q: *const c_char,
     q_len: usize,
     out: *mut *mut ZuStmt,
@@ -487,15 +929,17 @@ pub unsafe extern "C" fn zu_prepare(
     }
     unsafe { *out = std::ptr::null_mut() };
     guard(err, || {
-        if session.is_null() {
-            return Err(misuse("session is NULL"));
-        }
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
         let q = unsafe { counted(q, q_len, "query") }?;
-        let s = unsafe { &mut *session };
-        let (id, _) = s.session.prepare(q)?;
+        let (id, _) = unsafe { conn_of(conn) }.prepare(q)?;
+        let state = unsafe { conn_state(conn) };
         unsafe {
             *out = Box::into_raw(Box::new(ZuStmt {
-                session,
+                conn,
+                state,
                 id,
                 binds: Vec::new(),
             }))
@@ -506,23 +950,25 @@ pub unsafe extern "C" fn zu_prepare(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_prepare_z(
-    session: *mut ZuSession,
+    conn: *mut ZuConn,
     q: *const c_char,
     out: *mut *mut ZuStmt,
     err: *mut *mut ZuError,
 ) -> ZuStatus {
-    unsafe { zu_prepare(session, q, zlen(q), out, err) }
+    unsafe { zu_prepare(conn, q, zlen(q), out, err) }
 }
 
-/// Frees a statement and drops its slot in the session.
+/// Frees a statement and drops its slot in the connection's plan
+/// cache. Safe after the connection is closed: the plan went with it,
+/// so there is nothing left to release and the handle is only freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_stmt_close(stmt: *mut ZuStmt) {
     if stmt.is_null() {
         return;
     }
     let stmt = unsafe { Box::from_raw(stmt) };
-    if !stmt.session.is_null() {
-        unsafe { &mut *stmt.session }.session.close_stmt(stmt.id);
+    if let Ok(_claim) = claim(&stmt.state) {
+        unsafe { conn_of(stmt.conn) }.close_prepared(stmt.id);
     }
 }
 
@@ -530,17 +976,21 @@ pub unsafe extern "C" fn zu_stmt_close(stmt: *mut ZuStmt) {
 
 unsafe fn bind(stmt: *mut ZuStmt, name: *const c_char, name_len: usize, value: Value) -> ZuStatus {
     guard_status(|| {
-        if stmt.is_null() {
-            return ZuStatus::Misuse;
-        }
+        // A binding touches only the statement, but taking the claim
+        // is what reports a closed connection at the bind rather than
+        // three calls later at the execute.
+        let _claim = match unsafe { claim_stmt(stmt) } {
+            Ok(claim) => claim,
+            Err(status) => return status,
+        };
         let Ok(name) = (unsafe { counted(name, name_len, "name") }) else {
             return ZuStatus::Misuse;
         };
-        let stmt = unsafe { &mut *stmt };
+        let binds = unsafe { stmt_binds(stmt) };
         // Rebinding a name replaces the old value, so a statement in a
         // loop binds the same names over and over without growing.
-        stmt.binds.retain(|(n, _)| n != name);
-        stmt.binds.push((name.to_string(), value));
+        binds.retain(|(n, _)| n != name);
+        binds.push((name.to_string(), value));
         ZuStatus::Ok
     })
 }
@@ -625,20 +1075,16 @@ pub unsafe extern "C" fn zu_execute(
     }
     unsafe { *out = std::ptr::null_mut() };
     guard(err, || {
-        if stmt.is_null() {
-            return Err(misuse("stmt is NULL"));
-        }
-        let stmt = unsafe { &mut *stmt };
-        if stmt.session.is_null() {
-            return Err(misuse("stmt has no session"));
-        }
-        let session = unsafe { &mut *stmt.session };
-        let borrowed: Vec<(&str, Value)> = stmt
-            .binds
+        let _claim = match unsafe { claim_stmt(stmt) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let borrowed: Vec<(&str, Value)> = unsafe { stmt_binds(stmt) }
             .iter()
             .map(|(n, v)| (n.as_str(), v.clone()))
             .collect();
-        let result = session.session.execute(stmt.id, &borrowed)?;
+        let (conn, id) = unsafe { ((*stmt).conn, (*stmt).id) };
+        let result = unsafe { conn_of(conn) }.execute_prepared(id, &borrowed)?;
         unsafe { *out = Box::into_raw(Box::new(ZuResult::new(result))) };
         Ok(ZuStatus::Ok)
     })
@@ -1040,5 +1486,66 @@ mod tests {
         assert!(unsafe { counted(std::ptr::null(), 3, "q") }.is_err());
         assert_eq!(unsafe { zlen(std::ptr::null()) }, 0);
         assert_eq!(unsafe { zlen(c"abc".as_ptr()) }, 3);
+    }
+
+    /// The versioned struct is what R1 allows across the boundary, and
+    /// the size field is the whole of the version. A short struct is
+    /// read as the prefix it is, which is the case that happens when a
+    /// binding built against an older header calls a newer library.
+    #[test]
+    fn a_short_config_is_read_as_the_prefix_it_describes() {
+        let mut cfg = ZuConfig {
+            memory_limit: 4096,
+            threads: 3,
+            read_only: 1,
+            ..ZuConfig::default()
+        };
+
+        let full = unsafe { config_of(&cfg) }.expect("whole struct");
+        assert_eq!(
+            full,
+            Config::new().memory_limit(4096).threads(3).read_only(true)
+        );
+
+        // A caller whose header stopped before read_only.
+        cfg.struct_size = offset_of!(ZuConfig, read_only);
+        let older = unsafe { config_of(&cfg) }.expect("prefix");
+        assert_eq!(older, Config::new().memory_limit(4096).threads(3));
+
+        // And one whose header had only the size field, which is the
+        // smallest struct this can read.
+        cfg.struct_size = size_of::<usize>();
+        assert_eq!(
+            unsafe { config_of(&cfg) }.expect("size only"),
+            Config::new()
+        );
+
+        // NULL is the defaults, and a size that cannot hold itself is
+        // not a struct at all.
+        assert_eq!(
+            unsafe { config_of(std::ptr::null()) }.expect("defaults"),
+            Config::new()
+        );
+        cfg.struct_size = 1;
+        assert!(unsafe { config_of(&cfg) }.is_err());
+    }
+
+    /// A connection is claimed for the length of a call and released
+    /// when the claim drops, so the second thread is turned away
+    /// rather than let in beside the first.
+    #[test]
+    fn a_claim_excludes_a_second_one_and_a_closed_connection_refuses_both() {
+        let state = Arc::new(ConnState {
+            alive: AtomicBool::new(true),
+            busy: AtomicBool::new(false),
+        });
+        let held = claim(&state).expect("free");
+        assert_eq!(claim(&state).err(), Some(ZuStatus::MisuseConcurrent));
+        drop(held);
+        // Released, so the next call gets in.
+        drop(claim(&state).expect("released"));
+
+        state.alive.store(false, Ordering::Release);
+        assert_eq!(claim(&state).err(), Some(ZuStatus::MisuseClosed));
     }
 }

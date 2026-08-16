@@ -1,19 +1,21 @@
-//! Exercises libzu the way a C host does: open, query, prepare, bind,
-//! execute in a loop, read columns out as buffers, and free in the
-//! right order. Everything goes through the extern "C" functions and
-//! raw pointers; nothing reaches into the Rust types behind them.
+//! Exercises libzu the way a C host does: open a database, connect,
+//! query, prepare, bind, execute in a loop, read columns out as
+//! buffers, and free in the right order. Everything goes through the
+//! extern "C" functions and raw pointers; nothing reaches into the Rust
+//! types behind them.
 
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
 use zu::{
-    ZU_SEVERITY_EXCEPTION, ZU_TYPE_INT, ZU_TYPE_NODE, ZU_TYPE_STR, ZuError, ZuResult, ZuSession,
-    ZuStatus, ZuStmt, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_close, zu_error_code,
-    zu_error_free, zu_error_message, zu_error_severity, zu_error_status, zu_execute, zu_open,
-    zu_open_z, zu_prepare, zu_prepare_z, zu_query, zu_query_z, zu_result_cell_str,
-    zu_result_cell_type, zu_result_col_f64, zu_result_col_i64, zu_result_col_name,
-    zu_result_col_node_offset, zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_rows,
-    zu_stmt_close, zu_version,
+    ZU_SEVERITY_EXCEPTION, ZU_TYPE_INT, ZU_TYPE_NODE, ZU_TYPE_STR, ZuConfig, ZuConn, ZuDatabase,
+    ZuError, ZuResult, ZuStatus, ZuStmt, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
+    zu_config_set_z, zu_conn_close, zu_connect, zu_database_close, zu_database_open_z,
+    zu_database_path, zu_error_code, zu_error_free, zu_error_message, zu_error_severity,
+    zu_error_status, zu_execute, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
+    zu_query_z, zu_result_cell_str, zu_result_cell_type, zu_result_col_f64, zu_result_col_i64,
+    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
+    zu_result_free, zu_result_rows, zu_stmt_close, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -29,29 +31,29 @@ fn c(text: &str) -> CString {
 }
 
 /// Opens on the counted form, which is the one every binding uses.
-unsafe fn open(path: &std::path::Path) -> *mut ZuSession {
+unsafe fn open(path: &std::path::Path) -> *mut ZuConn {
     let path = path.to_str().expect("utf-8 path");
-    let mut session: *mut ZuSession = ptr::null_mut();
+    let mut conn: *mut ZuConn = ptr::null_mut();
     let status = unsafe {
         zu_open(
             path.as_ptr().cast::<c_char>(),
             path.len(),
-            &mut session,
+            &mut conn,
             ptr::null_mut(),
         )
     };
     assert_eq!(status, ZuStatus::Ok, "open {path}");
-    assert!(!session.is_null());
-    session
+    assert!(!conn.is_null());
+    conn
 }
 
 /// Runs a statement that is expected to succeed, reusing one error
 /// slot so that a success leaving a stale error behind would show up.
-unsafe fn query(session: *mut ZuSession, text: &str, err: &mut *mut ZuError) -> *mut ZuResult {
+unsafe fn query(conn: *mut ZuConn, text: &str, err: &mut *mut ZuError) -> *mut ZuResult {
     let mut result: *mut ZuResult = ptr::null_mut();
     let status = unsafe {
         zu_query(
-            session,
+            conn,
             text.as_ptr().cast::<c_char>(),
             text.len(),
             &mut result,
@@ -105,12 +107,12 @@ fn a_c_host_can_open_query_prepare_and_read_columns() {
     unsafe {
         assert_eq!(CStr::from_ptr(zu_version()).to_str(), Ok("0.0.1"));
 
-        let session = open(&path);
+        let conn = open(&path);
         let mut err: *mut ZuError = ptr::null_mut();
 
         // One-shot query, whole id column out in one call.
         let result = query(
-            session,
+            conn,
             "MATCH (a:person) RETURN a.id AS id ORDER BY id LIMIT 5",
             &mut err,
         );
@@ -136,7 +138,7 @@ fn a_c_host_can_open_query_prepare_and_read_columns() {
         let mut stmt: *mut ZuStmt = ptr::null_mut();
         assert_eq!(
             zu_prepare(
-                session,
+                conn,
                 q.as_ptr().cast::<c_char>(),
                 q.len(),
                 &mut stmt,
@@ -168,11 +170,7 @@ fn a_c_host_can_open_query_prepare_and_read_columns() {
 
         // A string cell reads back through the cell accessor, and the
         // i64 column accessor refuses the column instead of guessing.
-        let result = query(
-            session,
-            "MATCH (a:person {id: 3}) RETURN 'hi' AS s",
-            &mut err,
-        );
+        let result = query(conn, "MATCH (a:person {id: 3}) RETURN 'hi' AS s", &mut err);
         assert_eq!(cell_type(result, 0, 0), ZU_TYPE_STR);
         let mut len = 0usize;
         let mut s: *const c_char = ptr::null();
@@ -207,7 +205,7 @@ fn a_c_host_can_open_query_prepare_and_read_columns() {
         assert!(ints.is_null(), "a refused accessor still wrote a pointer");
         zu_result_free(result);
 
-        zu_close(session);
+        zu_conn_close(conn);
     }
 }
 
@@ -220,10 +218,10 @@ fn a_node_column_reads_as_offsets_and_not_as_integers() {
     seeded(&path);
 
     unsafe {
-        let session = open(&path);
+        let conn = open(&path);
         let mut err: *mut ZuError = ptr::null_mut();
         let result = query(
-            session,
+            conn,
             "MATCH (a:person) RETURN a AS n ORDER BY a.id LIMIT 4",
             &mut err,
         );
@@ -246,11 +244,7 @@ fn a_node_column_reads_as_offsets_and_not_as_integers() {
 
         // And the offset accessor is just as strict the other way.
         zu_result_free(result);
-        let result = query(
-            session,
-            "MATCH (a:person {id: 3}) RETURN a.id AS id",
-            &mut err,
-        );
+        let result = query(conn, "MATCH (a:person {id: 3}) RETURN a.id AS id", &mut err);
         let mut offsets: *const u64 = ptr::null();
         assert_eq!(
             zu_result_col_node_offset(result, 0, &mut offsets),
@@ -259,7 +253,7 @@ fn a_node_column_reads_as_offsets_and_not_as_integers() {
         assert!(offsets.is_null());
         zu_result_free(result);
 
-        zu_close(session);
+        zu_conn_close(conn);
     }
 }
 
@@ -272,10 +266,10 @@ fn an_empty_result_is_done_rather_than_an_error() {
     seeded(&path);
 
     unsafe {
-        let session = open(&path);
+        let conn = open(&path);
         let mut err: *mut ZuError = ptr::null_mut();
         let result = query(
-            session,
+            conn,
             "MATCH (a:person {id: 999999}) RETURN a.id AS id",
             &mut err,
         );
@@ -295,7 +289,7 @@ fn an_empty_result_is_done_rather_than_an_error() {
         // Out of range is still misuse, empty or not.
         assert_eq!(zu_result_col_i64(result, 7, &mut ints), ZuStatus::Misuse);
         zu_result_free(result);
-        zu_close(session);
+        zu_conn_close(conn);
     }
 }
 
@@ -307,12 +301,12 @@ fn a_refused_statement_carries_a_code_a_severity_and_a_message() {
     seeded(&path);
 
     unsafe {
-        let session = open(&path);
+        let conn = open(&path);
         let mut err: *mut ZuError = ptr::null_mut();
         let bad = "THIS IS NOT A QUERY";
         let mut result: *mut ZuResult = ptr::null_mut();
         let status = zu_query(
-            session,
+            conn,
             bad.as_ptr().cast::<c_char>(),
             bad.len(),
             &mut result,
@@ -345,8 +339,8 @@ fn a_refused_statement_carries_a_code_a_severity_and_a_message() {
         zu_error_free(err);
         err = ptr::null_mut();
 
-        // The session survives, and the next success clears the slot.
-        let result = query(session, "MATCH (a:person) RETURN count(a) AS n", &mut err);
+        // The connection survives, and the next success clears the slot.
+        let result = query(conn, "MATCH (a:person) RETURN count(a) AS n", &mut err);
         assert_eq!(col_i64(result, 0, 1)[0], 97);
         zu_result_free(result);
 
@@ -354,7 +348,7 @@ fn a_refused_statement_carries_a_code_a_severity_and_a_message() {
         let mut result: *mut ZuResult = ptr::null_mut();
         assert_eq!(
             zu_query(
-                session,
+                conn,
                 bad.as_ptr().cast::<c_char>(),
                 bad.len(),
                 &mut result,
@@ -364,7 +358,7 @@ fn a_refused_statement_carries_a_code_a_severity_and_a_message() {
         );
         assert!(result.is_null());
 
-        zu_close(session);
+        zu_conn_close(conn);
     }
 }
 
@@ -378,18 +372,15 @@ fn the_nul_terminated_variants_agree_with_the_counted_ones() {
 
     unsafe {
         let cpath = c(path.to_str().expect("utf-8 path"));
-        let mut session: *mut ZuSession = ptr::null_mut();
+        let mut conn: *mut ZuConn = ptr::null_mut();
         let mut err: *mut ZuError = ptr::null_mut();
-        assert_eq!(
-            zu_open_z(cpath.as_ptr(), &mut session, &mut err),
-            ZuStatus::Ok
-        );
-        assert!(!session.is_null());
+        assert_eq!(zu_open_z(cpath.as_ptr(), &mut conn, &mut err), ZuStatus::Ok);
+        assert!(!conn.is_null());
 
         let q = c("MATCH (a:person {id: $src}) RETURN a.id AS id");
         let mut stmt: *mut ZuStmt = ptr::null_mut();
         assert_eq!(
-            zu_prepare_z(session, q.as_ptr(), &mut stmt, &mut err),
+            zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
             ZuStatus::Ok
         );
         let name = c("src");
@@ -404,7 +395,7 @@ fn the_nul_terminated_variants_agree_with_the_counted_ones() {
         let q = c("MATCH (a:person {id: 3}) RETURN $s AS s");
         let mut stmt: *mut ZuStmt = ptr::null_mut();
         assert_eq!(
-            zu_prepare_z(session, q.as_ptr(), &mut stmt, &mut err),
+            zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
             ZuStatus::Ok
         );
         let name = c("s");
@@ -428,13 +419,13 @@ fn the_nul_terminated_variants_agree_with_the_counted_ones() {
         let mut result: *mut ZuResult = ptr::null_mut();
         let q = c("MATCH (a:person) RETURN count(a) AS n");
         assert_eq!(
-            zu_query_z(session, q.as_ptr(), &mut result, &mut err),
+            zu_query_z(conn, q.as_ptr(), &mut result, &mut err),
             ZuStatus::Ok
         );
         assert_eq!(col_i64(result, 0, 1), [97]);
         zu_result_free(result);
 
-        zu_close(session);
+        zu_conn_close(conn);
     }
 }
 
@@ -444,16 +435,16 @@ fn the_nul_terminated_variants_agree_with_the_counted_ones() {
 fn null_inputs_are_misuse_and_not_crashes() {
     unsafe {
         let missing = "/nonexistent/nowhere.zu1";
-        let mut session: *mut ZuSession = ptr::null_mut();
+        let mut conn: *mut ZuConn = ptr::null_mut();
         let mut err: *mut ZuError = ptr::null_mut();
         let status = zu_open(
             missing.as_ptr().cast::<c_char>(),
             missing.len(),
-            &mut session,
+            &mut conn,
             &mut err,
         );
         assert_ne!(status, ZuStatus::Ok);
-        assert!(session.is_null());
+        assert!(conn.is_null());
         assert!(!err.is_null());
         assert_eq!(zu_error_status(err), status);
         zu_error_free(err);
@@ -461,12 +452,12 @@ fn null_inputs_are_misuse_and_not_crashes() {
 
         // A NULL path with a length is misuse; the message says so and
         // the out-parameter is still written.
-        let mut session: *mut ZuSession = ptr::null_mut();
+        let mut conn: *mut ZuConn = ptr::null_mut();
         assert_eq!(
-            zu_open(ptr::null(), 4, &mut session, &mut err),
+            zu_open(ptr::null(), 4, &mut conn, &mut err),
             ZuStatus::Misuse
         );
-        assert!(session.is_null());
+        assert!(conn.is_null());
         assert!(!err.is_null());
         zu_error_free(err);
 
@@ -492,7 +483,7 @@ fn null_inputs_are_misuse_and_not_crashes() {
         );
 
         // Freeing nothing is nothing.
-        zu_close(ptr::null_mut());
+        zu_conn_close(ptr::null_mut());
         zu_result_free(ptr::null_mut());
         zu_stmt_close(ptr::null_mut());
         zu_error_free(ptr::null_mut());
@@ -525,13 +516,13 @@ fn a_string_that_is_not_utf8_is_refused_at_the_boundary() {
     seeded(&path);
 
     unsafe {
-        let session = open(&path);
+        let conn = open(&path);
         let mut err: *mut ZuError = ptr::null_mut();
         let bad: [u8; 3] = [0xff, 0xfe, 0xfd];
         let mut result: *mut ZuResult = ptr::null_mut();
         assert_eq!(
             zu_query(
-                session,
+                conn,
                 bad.as_ptr().cast::<c_char>(),
                 bad.len(),
                 &mut result,
@@ -546,6 +537,290 @@ fn a_string_that_is_not_utf8_is_refused_at_the_boundary() {
             .expect("utf-8");
         assert!(message.contains("UTF-8"), "{message}");
         zu_error_free(err);
-        zu_close(session);
+        zu_conn_close(conn);
+    }
+}
+
+/// The split dx/02 §8 asks for: one database, many connections. This is
+/// the shape a pooling binding needs, and the shape a single handle
+/// that conflated the two could not express.
+#[test]
+fn one_database_serves_many_connections() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pool.zu1");
+    seeded(&path);
+
+    unsafe {
+        let cpath = c(path.to_str().expect("utf-8 path"));
+        let mut db: *mut ZuDatabase = ptr::null_mut();
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(
+            zu_database_open_z(cpath.as_ptr(), ptr::null(), &mut db, &mut err),
+            ZuStatus::Ok
+        );
+        assert!(!db.is_null() && err.is_null());
+
+        let mut out: *const c_char = ptr::null();
+        let mut len = 0usize;
+        assert_eq!(zu_database_path(db, &mut out, &mut len), ZuStatus::Ok);
+        assert_eq!(
+            CStr::from_ptr(out).to_str(),
+            Ok(path.to_str().expect("utf-8"))
+        );
+        assert_eq!(len, path.to_str().expect("utf-8").len());
+
+        let mut conns = [ptr::null_mut::<ZuConn>(); 3];
+        for conn in &mut conns {
+            assert_eq!(zu_connect(db, conn, &mut err), ZuStatus::Ok);
+            assert!(!conn.is_null());
+        }
+        // Each connection has its own catalog and plan cache, so each
+        // answers the same question independently.
+        for conn in conns {
+            let result = query(conn, "MATCH (a:person) RETURN count(a) AS n", &mut err);
+            assert_eq!(col_i64(result, 0, 1), [97]);
+            zu_result_free(result);
+        }
+
+        // Closing the database releases a path and a configuration; the
+        // connections hold their own file handles and keep working,
+        // which is what lets a host drop the database handle once its
+        // pool is filled.
+        zu_database_close(db);
+        let result = query(conns[0], "MATCH (a:person) RETURN count(a) AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [97]);
+        zu_result_free(result);
+
+        for conn in conns {
+            zu_conn_close(conn);
+        }
+
+        // A NULL database is misuse rather than a fault.
+        let mut conn: *mut ZuConn = ptr::null_mut();
+        assert_eq!(
+            zu_connect(ptr::null_mut(), &mut conn, &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(conn.is_null() && !err.is_null());
+        zu_error_free(err);
+    }
+}
+
+/// The versioned struct and the setter beside it, which is how a
+/// binding forwards a user's option map without knowing the layout.
+#[test]
+fn a_configuration_arrives_by_field_or_by_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.zu1");
+    seeded(&path);
+
+    unsafe {
+        let mut cfg = ZuConfig {
+            struct_size: 0,
+            memory_limit: 0,
+            threads: 0,
+            read_only: 0,
+        };
+        assert_eq!(zu_config_init(&mut cfg), ZuStatus::Ok);
+        assert_eq!(cfg.struct_size, std::mem::size_of::<ZuConfig>());
+        assert_eq!(zu_config_init(ptr::null_mut()), ZuStatus::Misuse);
+
+        let mut err: *mut ZuError = ptr::null_mut();
+        let set = |cfg: &mut ZuConfig, k: &CString, v: &CString, err: &mut *mut ZuError| {
+            zu_config_set_z(cfg, k.as_ptr(), v.as_ptr(), err)
+        };
+        assert_eq!(
+            set(&mut cfg, &c("memory_limit"), &c("8388608"), &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(cfg.memory_limit, 8 * 1024 * 1024);
+        assert_eq!(
+            set(&mut cfg, &c("threads"), &c("1"), &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(cfg.threads, 1);
+        assert_eq!(
+            set(&mut cfg, &c("read_only"), &c("true"), &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(cfg.read_only, 1);
+        assert!(err.is_null(), "a run of successes left an error behind");
+
+        // A typo is named, because a binding forwarding a map has to
+        // tell its user which entry was wrong.
+        assert_eq!(
+            set(&mut cfg, &c("memroy_limit"), &c("1"), &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(!err.is_null());
+        let message = CStr::from_ptr(zu_error_message(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert!(message.contains("memroy_limit"), "{message}");
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        // And so is a value the key cannot take. A suffix is not parsed
+        // here on purpose, so it is refused rather than guessed at.
+        assert_eq!(
+            set(&mut cfg, &c("memory_limit"), &c("512MB"), &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(!err.is_null());
+        zu_error_free(err);
+        err = ptr::null_mut();
+        assert_eq!(
+            set(&mut cfg, &c("read_only"), &c("yes"), &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(!err.is_null());
+        zu_error_free(err);
+        err = ptr::null_mut();
+        assert_eq!(
+            cfg.memory_limit,
+            8 * 1024 * 1024,
+            "a refusal changed nothing"
+        );
+        assert_eq!(cfg.read_only, 1);
+
+        // The configuration reaches the engine: read_only means a write
+        // is refused rather than attempted.
+        let cpath = c(path.to_str().expect("utf-8 path"));
+        let mut db: *mut ZuDatabase = ptr::null_mut();
+        assert_eq!(
+            zu_database_open_z(cpath.as_ptr(), &cfg, &mut db, &mut err),
+            ZuStatus::Ok
+        );
+        let mut conn: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_connect(db, &mut conn, &mut err), ZuStatus::Ok);
+        let result = query(conn, "MATCH (a:person) RETURN count(a) AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [97]);
+        zu_result_free(result);
+
+        let write = c("CREATE (n:person {id: 999})");
+        let mut refused: *mut ZuResult = ptr::null_mut();
+        assert_ne!(
+            zu_query_z(conn, write.as_ptr(), &mut refused, &mut err),
+            ZuStatus::Ok,
+            "a read-only connection accepted a write"
+        );
+        assert!(refused.is_null() && !err.is_null());
+        zu_error_free(err);
+
+        zu_conn_close(conn);
+        zu_database_close(db);
+    }
+}
+
+/// A statement outliving its connection is the classic use-after-close,
+/// and dx/02 §5 asks for it to be answered rather than undefined.
+#[test]
+fn a_statement_outliving_its_connection_is_refused_rather_than_undefined() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("closed.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let q = c("MATCH (a:person {id: $src}) RETURN a.id AS id");
+        let mut stmt: *mut ZuStmt = ptr::null_mut();
+        assert_eq!(
+            zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
+            ZuStatus::Ok
+        );
+        let name = c("src");
+        assert_eq!(zu_bind_i64_z(stmt, name.as_ptr(), 7), ZuStatus::Ok);
+
+        zu_conn_close(conn);
+
+        // Every use of the statement now answers, and none of them
+        // follows the pointer it still holds.
+        assert_eq!(
+            zu_bind_i64_z(stmt, name.as_ptr(), 8),
+            ZuStatus::MisuseClosed
+        );
+        let mut result: *mut ZuResult = ptr::null_mut();
+        assert_eq!(
+            zu_execute(stmt, &mut result, &mut err),
+            ZuStatus::MisuseClosed
+        );
+        assert!(result.is_null());
+        assert!(
+            err.is_null(),
+            "the status names this mistake exactly, so there is nothing to add"
+        );
+
+        // And closing it is still the right thing to do, which is what
+        // makes this recoverable rather than a leak.
+        //
+        // The connection handle itself is a different matter: closing
+        // freed it, so it is gone in the way any C handle is gone after
+        // its free, and nothing here can check a pointer that no longer
+        // points at anything. What the check buys is the statement,
+        // which is a live handle a host has every reason to still be
+        // holding.
+        zu_stmt_close(stmt);
+    }
+}
+
+/// A connection may move between threads but not be used from two at
+/// once. The point is the safety property rather than a count: every
+/// call answers, one of the two answers ZU_MISUSE_CONCURRENT, and no
+/// pair of them is ever inside the engine together.
+#[test]
+fn two_threads_on_one_connection_are_turned_away_rather_than_let_in() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("threads.zu1");
+    seeded(&path);
+
+    /// A raw handle is not `Send`, because whether it may cross a
+    /// thread is exactly what this ABI decides rather than the
+    /// compiler. It may, one thread at a time, which is what makes the
+    /// wrapper sound and the test worth writing.
+    struct Handle(*mut ZuConn);
+    unsafe impl Send for Handle {}
+    unsafe impl Sync for Handle {}
+
+    let conn = unsafe { open(&path) };
+    let handle = Handle(conn);
+    let refused = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let handle = &handle;
+            let refused = &refused;
+            scope.spawn(move || {
+                let q = c("MATCH (a:person) RETURN count(a) AS n");
+                for _ in 0..200 {
+                    let mut result: *mut ZuResult = ptr::null_mut();
+                    let status =
+                        unsafe { zu_query_z(handle.0, q.as_ptr(), &mut result, ptr::null_mut()) };
+                    match status {
+                        ZuStatus::Ok => {
+                            assert_eq!(unsafe { col_i64(result, 0, 1) }, [97]);
+                            unsafe { zu_result_free(result) };
+                        }
+                        ZuStatus::MisuseConcurrent => {
+                            assert!(result.is_null(), "a refusal still handed back a result");
+                            refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        other => panic!("unexpected status {other:?}"),
+                    }
+                }
+            });
+        }
+    });
+
+    // Whether any call actually collided is up to the scheduler, so the
+    // count is reported and not asserted on. What is asserted is that
+    // the connection survived being used wrongly and still answers.
+    let collisions = refused.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(conn, "MATCH (a:person) RETURN count(a) AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [97], "after {collisions} collisions");
+        zu_result_free(result);
+        zu_conn_close(conn);
     }
 }

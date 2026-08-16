@@ -13,7 +13,7 @@
 //! a leaf; a block with a predicate in it has to walk until one friend
 //! passes, and there the hubs are where the walk stops early.
 //!
-//! Seven queries run over it. The counted semi is the bare block with
+//! Eight queries run over it. The counted semi is the bare block with
 //! nothing built above it, so it is the degree read and nothing else,
 //! and that is the shape the floor sits on. The counted anti is the
 //! same read with the answer taken the other way round. The third puts
@@ -29,12 +29,19 @@
 //! whatever the block answered and carries the answer as a column the
 //! predicate reads, so the degree read is the same one the counted
 //! semi makes and what changes is that nothing is dropped by it. The
-//! seventh is the same pattern written as a plain required walk, which
-//! answers a different question, one row per edge, and is here because
-//! it is the other shape that reads degrees alone.
+//! seventh is that same mark with the block's own WHERE back inside
+//! it, which no degree read answers: the group walks per outer row the
+//! way the third query's does, and what it found is written to a
+//! column of the row it was asked about rather than deciding it, so
+//! the walk stops early on a hub and the vector still carries every
+//! row. It is the third and the sixth put together and it should cost
+//! about what the third does. The eighth is the same pattern written
+//! as a plain required walk, which answers a different question, one
+//! row per edge, and is here because it is the other shape that reads
+//! degrees alone.
 //!
 //! Each one runs twice, once through the pipeline and once with
-//! ZU_EXEC2=0, which is where the five block shapes ran before: an
+//! ZU_EXEC2=0, which is where the six block shapes ran before: an
 //! EXISTS block had no compiled shape at all.
 //!
 //! Every run is crosschecked against the edge list the graph was built
@@ -241,15 +248,28 @@ fn main() {
         id_total: 0,
     };
 
+    // And the same with the block's own predicate back inside it,
+    // where the answer is a group's rather than a degree's.
+    let group = Want {
+        rows: (0..NODES)
+            .filter(|&i| score_of(i) > CUT || cut[i as usize])
+            .count() as u64,
+        id_total: 0,
+    };
+
     let mark_src = format!(
         "MATCH (p:person) WHERE p.score > {CUT} \
          OR EXISTS {{ MATCH (p)-[:knows]->(f) }} RETURN count(p) AS n"
+    );
+    let group_src = format!(
+        "MATCH (p:person) WHERE p.score > {CUT} \
+         OR EXISTS {{ MATCH (p)-[:knows]->(f) WHERE f.score > {CUT} }} RETURN count(p) AS n"
     );
     let filtered_src = format!(
         "MATCH (p:person) WHERE EXISTS {{ MATCH (p)-[:knows]->(f) WHERE f.score > {CUT} }} \
          RETURN count(p) AS n"
     );
-    let cases: [(&str, &str, &Want, usize); 7] = [
+    let cases: [(&str, &str, &Want, usize); 8] = [
         (
             "semi count",
             "MATCH (p:person) WHERE EXISTS { MATCH (p)-[:knows]->(f) } RETURN count(p) AS n",
@@ -277,6 +297,7 @@ fn main() {
             5,
         ),
         ("mark under an or", &mark_src, &mark, 9),
+        ("group mark under an or", &group_src, &group, 5),
         (
             "required count",
             "MATCH (p:person)-[:knows]->(f) RETURN count(p) AS n",

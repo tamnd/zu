@@ -21,7 +21,7 @@
 //! table order, and that is what makes the answer match the old engine
 //! row for row rather than just as a set.
 //!
-//! Thirteen shapes. A unique build key, where every probe finds exactly
+//! Fourteen shapes. A unique build key, where every probe finds exactly
 //! one row and the table is at its widest. A key with a thousand rows
 //! under it, where the probe side is small and the cost is streaming
 //! payload. A probe that misses everything, which is the tag doing its
@@ -58,7 +58,7 @@
 //! where the pass stops being worth one probe a row and starts being
 //! worth the row.
 //!
-//! The last shape is the mark, which is the same probe once more with
+//! The last two are the mark, which is the same probe once more with
 //! the answer written down rather than acted on. The block stands
 //! beside an OR, so it may not drop the row it was written about, and
 //! what it leaves is a column of the level it was written on. Nothing
@@ -68,6 +68,14 @@
 //! membership case above, which asks the same table about the same
 //! keys and keeps one probe row in eight: a mark over the whole table
 //! lands near what that case pays for the eighth of it that lives.
+//!
+//! Then the same mark with one more thing asked inside the block, a
+//! predicate on the row the probe matched. The directory cannot answer
+//! that, so this one is a group: the probe and the predicate run once
+//! per outer row and the row is written down and carried on either
+//! way. Against the shape above it, what the difference measures is a
+//! group per row over a column read, both over the same table and the
+//! same keys.
 //!
 //! What the first two ratios do not show is the pass at its best. The
 //! join builds the side the optimizer estimated dearer and drives the
@@ -399,6 +407,14 @@ fn main() {
     // measures is the column being written for every row of the scan.
     let mark_hit = |i: u64| i.is_multiple_of(SPREAD) || city(i) == 0;
     let mark_out = (0..NODES).filter(|&i| mark_hit(i)).count() as u64;
+    // The same mark with one more thing asked inside the block. The
+    // row a probe matches is the one whose sparse key it landed on, so
+    // a predicate on that row's pair key keeps about half of what the
+    // block used to answer yes for, and the directory cannot say which
+    // half: the row has to be read, which is the group.
+    let group_hit =
+        |i: u64| city(i) == 0 || (i.is_multiple_of(SPREAD) && pair(i / SPREAD) < NODES / 2);
+    let group_out = (0..NODES).filter(|&i| group_hit(i)).count() as u64;
     let sparse_out = (0..NODES).filter(|&i| sparse_hit(i)).count() as u64;
     let old_sparse_out = (0..OLD_PROBES).filter(|&i| sparse_hit(i)).count() as u64;
     // The sparse key against the city key: a probe row matches when its
@@ -709,6 +725,23 @@ fn main() {
             },
             probes: NODES,
             out: mark_out,
+            sip: Sip::No,
+        },
+        Case {
+            what: "a mark whose block asks more",
+            new: format!(
+                "MATCH (a:person) WHERE a.city = 0 \
+                 OR EXISTS {{ MATCH (c:person) WHERE c.sparse = a.id AND c.pair < {} }} \
+                 RETURN count(a) AS n",
+                NODES / 2
+            ),
+            old: None,
+            want: Want {
+                rows: 1,
+                total: group_out as i64,
+            },
+            probes: NODES,
+            out: group_out,
             sip: Sip::No,
         },
     ];

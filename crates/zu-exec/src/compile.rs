@@ -137,6 +137,14 @@ pub(crate) enum ColSpec {
         key: ScalarRef,
         negated: bool,
     },
+    /// The same answer where the block asked more than the two above
+    /// can: a predicate on the far node, a predicate over the held
+    /// pattern. That has to be run as a group, once per row, so nothing
+    /// fills this column while the chunk is built. The bracket that owns
+    /// it writes a row of it as the group answers for that row, and by
+    /// the time the group has been round the vector the column holds
+    /// what the block said about every row of it.
+    GroupMark,
 }
 
 /// Traversal sides of one expand: `Both` is an undirected step over a
@@ -242,10 +250,18 @@ pub(crate) enum Op {
     /// bracket and on a miss for an anti one, carrying the same null
     /// row since nothing above the block is allowed to read what it
     /// bound.
+    ///
+    /// A mark bracket hands nothing down either, and decides nothing:
+    /// it writes what the group said into `mark`, the level and the
+    /// chunk vector of the `GroupMark` column, a row at a time as the
+    /// group answers. The pipeline past it runs once the group has
+    /// been round the whole vector, on that vector, since every row of
+    /// it is still there and the group's own level is gone by then.
     Bracket {
         len: usize,
         level: usize,
         kind: BracketKind,
+        mark: Option<(usize, usize)>,
     },
     /// An EXISTS block over a bare pattern (docs/07): whether the row
     /// has an edge of this kind at all, which the CSR offsets answer
@@ -652,6 +668,7 @@ pub(crate) fn compile(
         sip_at: HashMap::new(),
         optional_level: None,
         exists_level: None,
+        marked: None,
         unwind_slot: None,
         func_slot: None,
         func: None,
@@ -721,6 +738,14 @@ struct Compiler<'a> {
     /// the pipeline holds a chunk for, which is what the rules
     /// [`Compiler::bracketed`] gathers are about.
     exists_level: Option<usize>,
+    /// The level a mark group left the pipeline standing on, once one
+    /// has compiled. A mark group binds nothing and decides nothing, so
+    /// the level it walked is gone by the time the rest of the pipeline
+    /// runs and this is the level below it, which is where a predicate
+    /// that reads the mark compiles. Nothing that makes a level goes
+    /// after one, since the number the next level would take is the one
+    /// the group's own level holds.
+    marked: Option<usize>,
     /// The variable a leading UNWIND bound, once its list has become
     /// the batch of seeks that drives the plan. Reading it is reading
     /// the key that found the row, which is level 0's key column.
@@ -746,6 +771,14 @@ impl Compiler<'_> {
     /// walks off the newest level rather than becoming a branch.
     fn bracketed(&self) -> bool {
         self.optional_level.is_some() || self.exists_level.is_some()
+    }
+
+    /// The level the pipeline is standing on, which is where a
+    /// predicate written after everything compiled so far reads its
+    /// columns. That is the newest level everywhere except past a mark
+    /// group, whose level the runner has popped by then.
+    fn standing(&self) -> usize {
+        self.marked.unwrap_or(self.levels.len() - 1)
     }
 
     fn compile(&mut self, plan: &LogicalPlan) -> Result<Option<ExecPlan>> {
@@ -959,6 +992,16 @@ impl Compiler<'_> {
             if self.bracketed() && !bare_block(&mut it.clone()) {
                 break;
             }
+            // Past a mark group the pipeline stands on the level below
+            // the newest one, and the only thing left that compiles
+            // there is a predicate, which is what the mark was written
+            // for. Anything that makes a level would take the number
+            // the group's level is holding.
+            if self.marked.is_some()
+                && !matches!(it.peek(), Some(LogicalPlan::Filter { bracket: None, .. }))
+            {
+                break;
+            }
             match it.peek() {
                 Some(LogicalPlan::Filter {
                     expr,
@@ -978,7 +1021,7 @@ impl Compiler<'_> {
                         }
                         continue;
                     }
-                    let level = self.levels.len() - 1;
+                    let level = self.standing();
                     let Some(prog) = self.build_prog(expr, level)? else {
                         return Ok(None);
                     };
@@ -1083,21 +1126,33 @@ impl Compiler<'_> {
                     //
                     // Only a block with nothing else in it is answered
                     // this cheaply. Another predicate over the held
-                    // pattern decides which build rows count, and that
-                    // is a group run per outer row, which is not
-                    // something a mark may do to a row.
+                    // pattern decides which build rows count, and there
+                    // is nothing in the table that answers that, so it
+                    // goes on to the group below, which runs the probe
+                    // and the predicate per outer row and writes down
+                    // what it found instead of acting on it.
+                    let mut mark = None;
                     if let BracketKind::Mark {
-                        slot: mark,
+                        slot: mark_slot,
                         negated,
                     } = group.kind
                     {
-                        if !group_filters.is_empty() {
-                            return Ok(None);
+                        if group_filters.is_empty() {
+                            let level = key.level();
+                            let vec = self.register_join_mark(level, table, key, negated);
+                            self.marks.insert(mark_slot, (level, vec));
+                            continue;
                         }
-                        let level = key.level();
-                        let vec = self.register_join_mark(level, table, key, negated);
-                        self.marks.insert(mark, (level, vec));
-                        continue;
+                        let held = !pending.is_empty() || !waiting.is_empty();
+                        let Some(at) = self
+                            .levels
+                            .len()
+                            .checked_sub(1)
+                            .and_then(|outer| self.group_mark(mark_slot, outer, held))
+                        else {
+                            return Ok(None);
+                        };
+                        mark = Some(at);
                     }
                     let to_level = self.levels.len();
                     self.levels.push(LevelBuild {
@@ -1121,6 +1176,7 @@ impl Compiler<'_> {
                         len: 0,
                         level: to_level,
                         kind: group.kind,
+                        mark,
                     });
                     ops.push(Op::Join {
                         table,
@@ -1139,11 +1195,7 @@ impl Compiler<'_> {
                         unreachable!("just pushed the bracket");
                     };
                     *slot = len;
-                    if group.kind == BracketKind::Optional {
-                        self.optional_level = Some(to_level);
-                    } else {
-                        self.exists_level = Some(to_level);
-                    }
+                    self.close_bracket(group.kind, to_level, mark);
                 }
                 Some(LogicalPlan::Expand {
                     rel,
@@ -1257,16 +1309,27 @@ impl Compiler<'_> {
                     // instead of acted on, so it is a column of the
                     // level the block was written on and no operator at
                     // all. Only the bare shape has an answer this
-                    // cheap: anything else would have to run a group per
-                    // outer row and keep the row either way, which is a
-                    // pipeline the runner does not have.
-                    if let BracketKind::Mark { slot, negated } = kind {
-                        if !bare {
-                            return Ok(None);
+                    // cheap. Anything else has to run a group per outer
+                    // row, and what makes it a mark rather than a semi
+                    // is that the row goes on either way and the group
+                    // writes its answer to a column of the level below
+                    // instead of deciding the row on it.
+                    let mut mark = None;
+                    if let BracketKind::Mark {
+                        slot: mark_slot,
+                        negated,
+                    } = kind
+                    {
+                        if bare {
+                            let vec = self.register_mark(src, rel_id, dirs, negated);
+                            self.marks.insert(mark_slot, (src, vec));
+                            continue;
                         }
-                        let vec = self.register_mark(src, rel_id, dirs, negated);
-                        self.marks.insert(slot, (src, vec));
-                        continue;
+                        let held = !pending.is_empty() || !waiting.is_empty();
+                        let Some(at) = self.group_mark(mark_slot, src, held) else {
+                            return Ok(None);
+                        };
+                        mark = Some(at);
                     }
                     if kind != BracketKind::Optional && bare {
                         ops.push(Op::HasEdge {
@@ -1295,6 +1358,7 @@ impl Compiler<'_> {
                         len: 0,
                         level: to_level,
                         kind,
+                        mark,
                     });
                     ops.push(Op::Expand {
                         rel: rel_id,
@@ -1329,16 +1393,7 @@ impl Compiler<'_> {
                         unreachable!("just pushed the bracket");
                     };
                     *slot = len;
-                    // Only an OPTIONAL leaves a level the rest of the
-                    // query can read, so only it holds the sink to what
-                    // a null in that level answers. What an EXISTS
-                    // block bound is out of scope above it, which is
-                    // why the two are tracked apart.
-                    if kind == BracketKind::Optional {
-                        self.optional_level = Some(to_level);
-                    } else {
-                        self.exists_level = Some(to_level);
-                    }
+                    self.close_bracket(kind, to_level, mark);
                 }
                 Some(LogicalPlan::Expand {
                     rel,
@@ -1899,7 +1954,12 @@ impl Compiler<'_> {
                     *to = map[*to];
                 }
                 Op::Semi { probe_level, .. } => *probe_level = map[*probe_level],
-                Op::Bracket { level, .. } => *level = map[*level],
+                Op::Bracket { level, mark, .. } => {
+                    *level = map[*level];
+                    if let Some((at, _)) = mark {
+                        *at = map[*at];
+                    }
+                }
                 Op::DegreeProduct { from, .. } => *from = map[*from],
                 Op::Join { key, to, .. } => {
                     match key {
@@ -2311,6 +2371,52 @@ impl Compiler<'_> {
             },
         ));
         self.levels[level].cols.len()
+    }
+
+    /// Reserves the column a group's mark is written to, on the level
+    /// the pipeline is standing on, and returns where the bracket has to
+    /// write it. `None` declines the whole plan.
+    ///
+    /// The group walks the newest level, so a block written about any
+    /// other one is not this shape. Nor is one where a bracket is
+    /// already open, since a group inside another group's continuation
+    /// would walk off the null level that one left as the newest, or
+    /// where a second one has already written a mark, since the two
+    /// would want the same level number. A pattern still held is the
+    /// same objection one step later: settling it builds a level, and
+    /// the only place left to build one is where this group's level
+    /// already is.
+    /// Records what a group the compiler has just finished leaves
+    /// behind.
+    ///
+    /// Only an OPTIONAL leaves a level the rest of the query can read,
+    /// so only it holds the sink to what a null in that level answers.
+    /// What an EXISTS block bound is out of scope above it, which is why
+    /// the two are tracked apart. A mark leaves no level at all: the
+    /// runner pops the group's chunk when the group is done with the
+    /// vector, and what the block had to say is a column of the level
+    /// below by then.
+    fn close_bracket(&mut self, kind: BracketKind, level: usize, mark: Option<(usize, usize)>) {
+        match kind {
+            BracketKind::Optional => self.optional_level = Some(level),
+            BracketKind::Mark { .. } => {
+                let (at, _) = mark.expect("a mark group reserved its column");
+                self.marked = Some(at);
+            }
+            BracketKind::Semi | BracketKind::Anti => self.exists_level = Some(level),
+        }
+    }
+
+    fn group_mark(&mut self, slot: usize, level: usize, held: bool) -> Option<(usize, usize)> {
+        if self.bracketed() || self.marked.is_some() || held || level + 1 != self.levels.len() {
+            return None;
+        }
+        self.levels[level]
+            .cols
+            .push((String::new(), ColSpec::GroupMark));
+        let vec = self.levels[level].cols.len();
+        self.marks.insert(slot, (level, vec));
+        Some((level, vec))
     }
 
     /// Compiles an arithmetic projection into a computed column on the

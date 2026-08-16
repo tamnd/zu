@@ -691,6 +691,44 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
          AND (b.id < 100 OR EXISTS { MATCH (c:person) WHERE c.score = b.age }) \
          RETURN count(*) AS n",
+        // A mark whose block asked more than a degree read or a
+        // directory word. That one runs as a group, once per outer row,
+        // and writes what it found into a column of the row it was
+        // asked about rather than deciding it, so the vector carries on
+        // whole. Once with the block's WHERE deciding the match, once
+        // with an inline property doing the same, once negated, once
+        // where the block matches nothing at all, once counted, once
+        // grouped, once ordered and cut, and once off a walked level
+        // rather than the scan.
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b {age: 7}) } \
+         RETURN a.id AS a ORDER BY a",
+        "MATCH (a:person) WHERE a.id < 20 \
+         OR NOT EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 500 } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)<-[:knows]-(b) WHERE b.age > 90 } \
+         RETURN a.age AS age, count(*) AS n",
+        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         RETURN a.id AS a ORDER BY a LIMIT 4",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 \
+         AND (b.id < 100 OR EXISTS { MATCH (b)-[:knows]->(c) WHERE c.age > 90 }) \
+         RETURN count(*) AS n",
+        // The same shape where the block is a probe rather than a walk:
+        // a second predicate over the held pattern says which build
+        // rows count, and the table alone cannot answer that.
+        "MATCH (a:person) WHERE a.id < 40 \
+         AND (a.id < 20 OR EXISTS { MATCH (c:person) WHERE c.score = a.age AND c.id > 3 }) \
+         RETURN count(a) AS n",
+        "MATCH (a:person) WHERE a.id < 40 \
+         AND (a.id < 20 OR NOT EXISTS { MATCH (c:person) WHERE c.score = a.age AND c.id > 3 }) \
+         RETURN count(a) AS n",
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
+         AND (b.id < 100 OR EXISTS { MATCH (c:person) WHERE c.score = b.age AND c.id > 3 }) \
+         RETURN count(*) AS n",
     ];
     for q in covered_queries {
         covered(&mut db, &catalog, &schema, q);
@@ -729,21 +767,24 @@ fn unclaimed_shapes_fall_back() {
         "MATCH (p:person) RETURN count(DISTINCT p.age) AS a, count(DISTINCT p.score) AS b",
         "MATCH (a:person)-[r:knows]->(b) RETURN count(r) AS n",
         "MATCH (a:person)-[:knows*1..2]->(b) RETURN count(b) AS n",
-        // A mark whose block is more than a degree read: the answer is
-        // per outer row and the row survives either way, which is a
-        // group the pipeline would have to run and keep both sides of.
-        "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
-         RETURN count(a) AS n",
+        // A mark whose block is a group of more than one operator. The
+        // group runs off the level the block was written on, and there
+        // is one walk in it, so a second hop is a level the group would
+        // have to hold across outer rows.
         "MATCH (a:person) WHERE a.id < 20 OR EXISTS { MATCH (a)-[:knows]->(b)-[:knows]->(c) } \
          RETURN count(a) AS n",
-        // A mark over a pattern that shares no variable is a probe, and
-        // the block is answered as a column. A second predicate inside
-        // it is not: it says which build rows count, which is a group
-        // per outer row, and a mark may not drop the rows a group
-        // finds nothing for.
-        "MATCH (a:person) WHERE a.id < 40 \
-         AND (a.id < 20 OR EXISTS { MATCH (c:person) WHERE c.score = a.age AND c.id > 3 }) \
-         RETURN count(a) AS n",
+        // A group mark about a level the pipeline has walked off. The
+        // cheap marks answer that one from the pin, a degree read or a
+        // directory word for the whole vector, but a group walks the
+        // level it stands on and this block is about another.
+        "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
+         AND (b.id < 100 OR EXISTS { MATCH (a)-[:knows]->(c) WHERE c.age > 90 }) \
+         RETURN count(*) AS n",
+        // Two group marks in one predicate: the second one wants a
+        // level, and the number it would take is the one the first
+        // group's level is holding.
+        "MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(b) WHERE b.age > 90 } \
+         OR EXISTS { MATCH (a)<-[:knows]-(c) WHERE c.age > 90 } RETURN count(a) AS n",
         // An OPTIONAL MATCH with no required match under it has no
         // driving scan the bracket can hang off.
         "OPTIONAL MATCH (a:person)-[:knows]->(b) RETURN count(b) AS n",

@@ -112,7 +112,7 @@ Modules are not mapped. A module is a namespace, and namespaces are the one part
 
 Adding a public symbol therefore takes two steps, in this order, and the failures say so: `cargo xtask model` to put it in the model, then an entry in the map to say what a binding owes it.
 
-Where the surface stands today: 780 mappable entities, 73 at tier 1, 111 at tier 2, 596 at tier 3. Tier 1 is the session, values in and out, results, and the error model, which is what a binding is. Tier 3 is almost all of `zu::zu1`, the storage engine a session talks to and a caller does not.
+Where the surface stands today: 858 mappable entities, 114 at tier 1, 111 at tier 2, 633 at tier 3. Tier 1 is `Database`, `Connection`, `Config`, the session under them, values in and out, results, and the error model, which is what a binding is. Tier 3 is almost all of `zu::zu1`, the storage engine a session talks to and a caller does not.
 
 ## Consumers
 

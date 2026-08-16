@@ -33,6 +33,10 @@ name = "session"
 harness = false
 
 [[bench]]
+name = "connect"
+harness = false
+
+[[bench]]
 name = "graphalytics"
 harness = false
 

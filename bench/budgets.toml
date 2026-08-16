@@ -1176,3 +1176,32 @@ json_frame_parse_ns = 2000.0
 # where a slower box has room and the per call decode, an order of
 # magnitude past it, does not. Lower this ceiling, never raise it.
 rel_prop_over_walk_x = 20.0
+
+# Taking a connection off an open database, us, p50 (benches/connect.rs).
+# The whole Database/Connection split of dx/04 §2 rests on this being
+# cheap: a connection that cost what a database costs is a connection
+# every binding would pool around, and the pool would then be the thing
+# with the bugs. What it buys is a private file handle, private caches,
+# and a private plan cache, so two threads reading one graph never share
+# a seek position.
+#
+# Measured on the local M series at 57 to 72 us over 2000 connections
+# against the 10k node synthetic graph, of which the validating open is
+# about 27 and the catalog and schema load is the rest. The ceiling is
+# set for the slowest gate machine with the usual vCPU headroom, and the
+# number it exists to catch is a connection that started copying
+# something per connect rather than reading a header. Lower this
+# ceiling, never raise it.
+connect_us = 400.0
+
+# The warm point read through Connection over the same read through
+# Session, both timed in one run against the same file with the same
+# seed and one thread, so a shared runner cannot move the ratio. This is
+# the dx/04 §9 obligation as a number: the public API is a delegation
+# and a read-only check, and it has to stay one. Measured 0.987 to 1.021
+# on three passes, which is the noise floor of two 10000-read medians.
+#
+# The ceiling has room for a slow box and none for the defect it is
+# here for: a wrapper that copies the result, or re-reads the header, or
+# rebinds the parameters on the way through, lands at 2x and up.
+api_overhead_x = 1.25

@@ -5,11 +5,11 @@
 ```rust
 use zudb::{Database, Config, Value};
 
-let db = Database::open("social.zu1", Config::default())?;          // zu1
-// Database::open("social.db?engine=sqlite", ...)                    // sqlite
-// Database::open("s3://bucket/graphs/social", cfg.s3(s3_opts))      // s3
+let db = Database::open("social.zu1")?;                              // zu1
+// Database::open("social.db?engine=sqlite")                          // sqlite
+// Database::open_with("s3://bucket/graphs/social", cfg.s3(s3_opts))  // s3
 
-let conn = db.connect();                                             // cheap, Send
+let conn = db.connect()?;                                            // cheap, Send
 let mut stmt = conn.prepare(
     "MATCH (p:Person {id: $id})-[:Follows]->(f) RETURN f.name, f.born")?;
 for row in stmt.query(params! { "id" => 42 })? {
@@ -30,6 +30,14 @@ tx.commit()?;
 ```
 
 Design rules: `Database: Send + Sync` (one per process per graph), `Connection` cheap and single-threaded, rows borrow from a result arena (zero-copy strings), every blocking call has a `_timeout` variant, no async in the public core API (an `async` adapter feature wraps via a worker for s3-heavy apps).
+
+`Database::open` takes a path and nothing else, and `open_with` is the second constructor for the callers that configure something. A required configuration argument is a tax charged to every user to serve the few who set anything, and `Config::default()` typed by everybody is a phrase that teaches nothing. `Config` itself is a builder with defaults that work: the memory budget the caches size themselves from, the thread count the executor picks when it is zero, and read-only, which opens the file on a descriptor this process cannot write through so that a database on a read-only mount opens and a statement that would write is refused by name rather than by errno.
+
+The split is what the rest of the program is built on. A `Database` is a path and a configuration that have been checked against a real file, holding no descriptor and no cache, which is why it is shareable without a lock. A `Connection` is a file handle, the caches above it, and a plan cache, which is why it is not: reads through one handle seek, so two threads sharing one would serialize on the seek position at best. Taking one costs an open and a catalog load, tens of microseconds, so a connection per thread or per request is the intended shape and a pool is an optimization rather than a necessity. Every binding on the C ABI inherits this split (`dx/02` §3), which is why the Rust API has it first, and the C ABI's runtime ownership check is the same rule this API gets from the borrow checker for free.
+
+A connection reads the database as of when it connected. It keeps the header it opened at, so a write another connection published since is not visible to it, and a reader that wants the latest catalog takes a new one. Making it otherwise means re-reading two header slots per statement, which is the entire cost of a warm query, so the answer to it is the snapshot machinery of `docs/08-transactions-mvcc.md` and not a read on the hot path.
+
+`crates/zu/benches/connect.rs` holds both halves of that to a number, and the second is the one that matters: the warm point read through a `Connection` measures 0.99 to 1.03 times the same read through the engine's own `Session`, which is the noise floor of two ten-thousand-read medians. A public API that costs something over the engine is one the people who care about latency route around, so it is gated rather than asserted.
 
 ## 2. CLI (`zu`)
 

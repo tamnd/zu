@@ -27,6 +27,21 @@ tier = 2
 reason = "how much work a checkpoint does, which only a binding that exposes checkpointing needs"
 
 [[group]]
+prefix = "zu::Config"
+tier = 1
+reason = "how a database is opened: the memory budget, the thread count, and read-only, which every binding takes as an option map"
+
+[[group]]
+prefix = "zu::Connection"
+tier = 1
+reason = "the object a statement runs on, which is what a binding hands its user"
+
+[[group]]
+prefix = "zu::Database"
+tier = 1
+reason = "the object a process opens once and shares, and the other half of the split every binding inherits"
+
+[[group]]
 prefix = "zu::DiagnosticRecord"
 tier = 1
 reason = "the diagnostic record the standard defines, and half of what an error carries back"
@@ -75,6 +90,11 @@ reason = "applying a catalog statement to an open file, which a caller reaches b
 prefix = "zu::convert"
 tier = 2
 reason = "converting a store between engines, which the CLI exposes and a binding may"
+
+[[group]]
+prefix = "zu::db"
+tier = 1
+reason = "the public API itself: open a database, take a connection, run a statement"
 
 [[group]]
 prefix = "zu::gqlstatus"
@@ -147,6 +167,11 @@ tier = 3
 reason = "the storage engine: blocks, segments, catalog, WAL. A binding talks to a session, and a session talks to this."
 
 [[entity]]
+id = "zu::Connection::session_mut"
+tier = 3
+reason = "the escape hatch to the engine's own session, which exists for the paths this API has not grown yet and which no binding reproduces"
+
+[[entity]]
 id = "zu::Epoch"
 tier = 2
 reason = "the commit epoch a snapshot pins, which a binding exposing point-in-time reads would need"
@@ -155,6 +180,21 @@ reason = "the commit epoch a snapshot pins, which a binding exposing point-in-ti
 id = "zu::Result"
 tier = 3
 reason = "a Rust alias for Result<T, ZuError>, and every other language raises instead of returning"
+
+[[entity]]
+id = "zu::db::Connection::session_mut"
+tier = 3
+reason = "the same escape hatch under its own module path"
+
+[[entity]]
+id = "zu::session::Session::options"
+tier = 3
+reason = "the execution switches on the engine's session, which a binding reaches through Config instead"
+
+[[entity]]
+id = "zu::session::Session::set_options"
+tier = 3
+reason = "the same switches, set, which is what Config does on the caller's behalf"
 
 [[entity]]
 id = "zu::zu1::BLOCK_SIZE"

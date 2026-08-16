@@ -252,6 +252,47 @@ zu_status zu_result_col_f64(zu_result *result, uint32_t col, const double **out)
 zu_status zu_result_col_node_offset(zu_result *result, uint32_t col, const uint64_t **out);
 zu_status zu_result_col_valid(zu_result *result, uint32_t col, const uint8_t **out);
 
+/* Chunked reads: the same columns, a chunk of rows at a time.
+ *
+ * Which one to use is a question of size. A point read wants the whole
+ * column, because the answer is small and one call beats a loop. Every
+ * large answer wants chunks, because the whole-column call converts all
+ * of it before returning any of it, and keeps the conversion until the
+ * result is freed: a million-row int column is eight megabytes of
+ * buffer beyond the rows, and reading the first hundred rows and
+ * stopping pays for the other 999,900. A chunked read converts the
+ * chunk asked for, into a buffer of a fixed size that the next chunk
+ * reuses.
+ *
+ * That is the trade: a chunk pointer is valid until the next call for
+ * the same column and the same accessor, which replaces its contents,
+ * or until zu_result_free. A host that needs one chunk to outlive the
+ * next copies it, which is the copy it was making anyway on the way
+ * into a host array. Columns are independent of each other, so reading
+ * a chunk's values and its validity together costs no reconversion.
+ *
+ * zu_result_chunk_count is the loop bound, and it is 0 for a result
+ * with no rows, which is why nothing here answers ZU_DONE. Ask each
+ * chunk its size rather than multiplying: chunks are the same size
+ * today except the last, and will stop being once a chunk is what the
+ * executor produced rather than a slice of what it materialized. The
+ * offset turns a chunk row back into the row number the cell accessors
+ * take, which is how a string column is read beside a chunked one.
+ *
+ * ZU_MISUSE when the chunk or the column is out of range, or the
+ * column holds something the accessor does not read. */
+uint64_t zu_result_chunk_count(const zu_result *result);
+zu_status zu_result_chunk(const zu_result *result, uint64_t chunk, uint64_t *offset,
+                          uint64_t *rows);
+zu_status zu_result_chunk_col_i64(zu_result *result, uint64_t chunk, uint32_t col,
+                                  const int64_t **out);
+zu_status zu_result_chunk_col_f64(zu_result *result, uint64_t chunk, uint32_t col,
+                                  const double **out);
+zu_status zu_result_chunk_col_node_offset(zu_result *result, uint64_t chunk, uint32_t col,
+                                          const uint64_t **out);
+zu_status zu_result_chunk_col_valid(zu_result *result, uint64_t chunk, uint32_t col,
+                                    const uint8_t **out);
+
 /* One string cell, NUL-terminated, with its byte length through len
  * when that is non-NULL. ZU_MISUSE when the cell is out of range or is
  * not a string. */

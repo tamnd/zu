@@ -142,6 +142,68 @@ int main(int argc, char **argv) {
    * wrong is a platform where every pooled host crashes on shutdown. */
   zu_database_close(db);
 
+  /* The chunked read, which is the loop every binding writes over a
+   * result it does not want to convert whole. Four nodes fit one chunk,
+   * so what this checks is that the loop closes: the count bounds it,
+   * each chunk reports its own size, and the values are the ones the
+   * whole-column call gives. */
+  {
+    zu_result *chunked = NULL;
+    status = zu_query_z(first, "MATCH (a) RETURN a AS n", &chunked, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("chunked query failed", status, err);
+    }
+    uint64_t chunks = zu_result_chunk_count(chunked);
+    uint64_t seen = 0;
+    uint64_t sum = 0;
+    uint64_t i;
+    if (chunks != 1) {
+      zu_result_free(chunked);
+      zu_conn_close(first);
+      return fail("four rows are one chunk");
+    }
+    for (i = 0; i < chunks; i++) {
+      uint64_t offset = 0;
+      uint64_t rows = 0;
+      const uint64_t *offsets = NULL;
+      const uint8_t *valid = NULL;
+      uint64_t r;
+      if (zu_result_chunk(chunked, i, &offset, &rows) != ZU_OK || offset != seen || rows == 0) {
+        zu_result_free(chunked);
+        zu_conn_close(first);
+        return fail("a chunk that does not know where it starts");
+      }
+      if (zu_result_chunk_col_node_offset(chunked, i, 0, &offsets) != ZU_OK || offsets == NULL ||
+          zu_result_chunk_col_valid(chunked, i, 0, &valid) != ZU_OK || valid == NULL) {
+        zu_result_free(chunked);
+        zu_conn_close(first);
+        return fail("a chunk of a node column did not read");
+      }
+      for (r = 0; r < rows; r++) {
+        if (valid[r] != 1) {
+          zu_result_free(chunked);
+          zu_conn_close(first);
+          return fail("a matched node read as null");
+        }
+        sum += offsets[r];
+      }
+      seen += rows;
+    }
+    /* Four nodes, offsets 0 through 3, so the sum is 6. */
+    if (seen != zu_result_rows(chunked) || sum != 6) {
+      zu_result_free(chunked);
+      zu_conn_close(first);
+      return fail("the chunks are not the column");
+    }
+    if (zu_result_chunk(chunked, chunks, NULL, NULL) != ZU_MISUSE) {
+      zu_result_free(chunked);
+      zu_conn_close(first);
+      return fail("a chunk past the end was accepted");
+    }
+    zu_result_free(chunked);
+  }
+
   /* A well formed query with nothing to return answers ZU_DONE rather
    * than an error, which is the whole reason a status crosses this
    * boundary alongside the pointer. */
@@ -156,6 +218,13 @@ int main(int argc, char **argv) {
     zu_result_free(result);
     zu_conn_close(first);
     return fail("an empty column is ZU_DONE and a NULL pointer");
+  }
+  /* The chunked path says the same thing by having nothing to say: no
+   * rows means no chunks, so the loop above would run zero times. */
+  if (zu_result_chunk_count(result) != 0) {
+    zu_result_free(result);
+    zu_conn_close(first);
+    return fail("an empty result has no chunks");
   }
   zu_result_free(result);
 
@@ -214,6 +283,7 @@ int main(int argc, char **argv) {
   }
   zu_stmt_close(stmt);
 
-  printf("smoke: libzu %s on this platform, two connections, four nodes, one refusal\n", version);
+  printf("smoke: libzu %s on this platform, two connections, four nodes, one chunk, one refusal\n",
+         version);
   return 0;
 }

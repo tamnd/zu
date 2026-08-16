@@ -240,6 +240,20 @@ jobs:
       # it.
       - run: ZU_GATE=1 cargo bench -p zu --bench relprops
 
+  connect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The dx/04 section 9 gate on the public API: what a connection
+      # costs to take, and what a statement costs through Connection
+      # against the same statement through Session. The second number is
+      # a ratio between two paths timed in one run on one machine, so a
+      # shared runner cannot move it, and it is what stops the SDK from
+      # growing a copy or a re-read on the hot path unnoticed.
+      - run: ZU_GATE=1 cargo bench -p zu --bench connect
+
   corpus:
     runs-on: ubuntu-latest
     steps:

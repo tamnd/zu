@@ -54,6 +54,13 @@ impl RealFile {
         Ok(Self(OpenOptions::new().read(true).write(true).open(path)?))
     }
 
+    /// Opens an existing file for reading only, so the operating
+    /// system refuses a write this process should not have attempted
+    /// and a database on a read-only mount opens at all.
+    pub fn open_r(path: &Path) -> Result<Self> {
+        Ok(Self(OpenOptions::new().read(true).open(path)?))
+    }
+
     /// Opens for reading and writing, creating when missing, the WAL
     /// contract.
     pub fn open_or_create(path: &Path) -> Result<Self> {

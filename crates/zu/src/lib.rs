@@ -27,3 +27,4 @@ pub mod query;
 pub mod session;
 pub mod snapshot;
 pub mod sqlite;
+pub mod write;

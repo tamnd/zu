@@ -121,6 +121,17 @@ struct Hop {
     close: Option<Close>,
 }
 
+/// The parts of an `Op::Intersect` the close itself reads, lifted out
+/// for the same reason `Hop` is.
+#[derive(Clone, Copy)]
+struct Wedge {
+    seed: (RelId, Dirs),
+    probe: (RelId, Dirs),
+    probe_level: usize,
+    to: usize,
+    batch: bool,
+}
+
 /// The parts of an `Op::Bracket` the operator under it reads: the
 /// level the group introduces, the pipeline waiting past the group,
 /// and what the group is being asked.
@@ -682,6 +693,12 @@ struct Worker<'a> {
     neigh: Vec<u64>,
     /// Intersection scratch for the WCOJ close.
     hits: Vec<u64>,
+    /// The probe side of a WCOJ close as a bitmap, one bit per id from
+    /// the lowest the list holds. Zero everywhere between closes: the
+    /// build sets bits out of the probe list and the teardown zeroes the
+    /// words it touched, so the buffer is never scanned end to end and
+    /// its length is only ever the widest probe list the query met.
+    mask: Vec<u64>,
     /// Survivor scratch for the binary close.
     keep: Vec<u16>,
     /// Per-row degree and running product scratch for hub counts.
@@ -829,6 +846,7 @@ impl<'a> Worker<'a> {
             scratch: Vec::new(),
             neigh: Vec::new(),
             hits: Vec::new(),
+            mask: Vec::new(),
             keep: Vec::new(),
             deg: Vec::new(),
             prod: Vec::new(),
@@ -1174,12 +1192,23 @@ impl<'a> Worker<'a> {
                 }
                 self.run_ops(rest, set)
             }
-            Op::Intersect {
+            &Op::Intersect {
                 seed,
                 probe,
                 probe_level,
                 to,
-            } => self.intersect(*seed, *probe, *probe_level, *to, rest, set),
+                batch,
+            } => self.intersect(
+                Wedge {
+                    seed,
+                    probe,
+                    probe_level,
+                    to,
+                    batch,
+                },
+                rest,
+                set,
+            ),
             Op::Semi {
                 rel,
                 dirs,
@@ -1593,6 +1622,14 @@ impl<'a> Worker<'a> {
             None => None,
         };
         let close_lists: Vec<&[u64]> = probe.as_ref().map(RowLists::slices).unwrap_or_default();
+        // The fused close asks the same question the standalone one
+        // does, once per neighbor of every source row under this
+        // vector, so it takes the same bitmap.
+        let close_bits = match close_lists.is_empty() {
+            true => None,
+            false => self.build_mask(&close_lists),
+        };
+        let close_len: usize = close_lists.iter().map(|l| l.len()).sum();
         let stop_early = brk.is_some_and(|b| b.stops_at_first());
         // The sideways filter over the level this walk builds, taken
         // into the walk instead of run as the operator after it. A
@@ -1735,12 +1772,17 @@ impl<'a> Worker<'a> {
                 // and the whole source list costs one merge.
                 let list = if close.is_some() {
                     masked.clear();
-                    let cur = &mut cursors[..close_lists.len()];
-                    cur.fill(0);
-                    let mut prev = 0;
-                    for &v in list {
-                        if member(&close_lists, cur, &mut prev, v) {
-                            masked.push(v);
+                    match close_bits.filter(|_| list.len() <= close_len * MASK_RUN) {
+                        Some(bits) => mask_hits(&self.mask, bits, list, &mut masked),
+                        None => {
+                            let cur = &mut cursors[..close_lists.len()];
+                            cur.fill(0);
+                            let mut prev = 0;
+                            for &v in list {
+                                if member(&close_lists, cur, &mut prev, v) {
+                                    masked.push(v);
+                                }
+                            }
                         }
                     }
                     &masked[..]
@@ -1851,6 +1893,7 @@ impl<'a> Worker<'a> {
             seen.probes += probes;
             seen.kept += kept;
         }
+        self.drop_mask(&close_lists, close_bits);
         drop(close_lists);
         if let Some(lists) = probe {
             self.recycle(lists);
@@ -2094,15 +2137,14 @@ impl<'a> Worker<'a> {
     /// their CSR pins with nothing copied, and the walk galloping past
     /// the runs it cannot match is what replaces a storage probe per
     /// candidate.
-    fn intersect(
-        &mut self,
-        seed: (RelId, Dirs),
-        probe: (RelId, Dirs),
-        probe_level: usize,
-        to: usize,
-        rest: &[Op],
-        set: &mut ChunkSet,
-    ) -> Result<()> {
+    fn intersect(&mut self, wedge: Wedge, rest: &[Op], set: &mut ChunkSet) -> Result<()> {
+        let Wedge {
+            seed,
+            probe,
+            probe_level,
+            to,
+            batch,
+        } = wedge;
         let src = set.chunks.len() - 1;
         let far = &set.chunks[probe_level];
         let prow = row_at(far, pinned_pos(far));
@@ -2128,6 +2170,7 @@ impl<'a> Worker<'a> {
             self.recycle(pheld);
             return Ok(());
         }
+        let bits = self.build_mask(std::slice::from_ref(&plist));
         // Copy the active rows out first: pinning mutates the chunk the
         // selection and values are read from.
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -2163,8 +2206,19 @@ impl<'a> Worker<'a> {
         // and then the seed's list is read on its own.
         let mut held: [Option<(u32, Option<CsrPin>)>; 2] = [None, None];
         let mut point = self.row_pool.pop().unwrap_or_default();
+        // Where the batched descent gathers closings across seed rows.
+        // A wedge closes on a node or two, so without this the level
+        // below is built for a row or two at a time and the whole cost
+        // of the close is the building, not the walk.
+        let mut fill = self.row_pool.pop().unwrap_or_default();
+        fill.clear();
+        if batch {
+            set.chunks[src].cur = idxs.first().copied();
+        }
         'srcs: for (&phys, &row) in idxs.iter().zip(&rows) {
-            set.chunks[src].cur = Some(phys);
+            if !batch {
+                set.chunks[src].cur = Some(phys);
+            }
             let group = (row / u64::from(GROUP_ROWS)) as u32;
             let at = (row % u64::from(GROUP_ROWS)) as usize;
             hits.clear();
@@ -2192,29 +2246,44 @@ impl<'a> Worker<'a> {
                         &point[..]
                     }
                 };
-                leapfrog(slist, plist, &mut hits);
+                match bits.filter(|_| slist.len() <= plist.len() * MASK_RUN) {
+                    Some(bits) => mask_hits(&self.mask, bits, slist, &mut hits),
+                    None => leapfrog(slist, plist, &mut hits),
+                }
             }
-            for part in hits.chunks(zu_vector::VECTOR_SIZE) {
-                let chunk = match self.make_level(to, part, &set.chunks, &[]) {
-                    Ok(c) => c,
-                    Err(e) => {
+            if batch {
+                let mut tail = &hits[..];
+                while !tail.is_empty() {
+                    let take = (zu_vector::VECTOR_SIZE - fill.len()).min(tail.len());
+                    fill.extend_from_slice(&tail[..take]);
+                    tail = &tail[take..];
+                    if fill.len() == zu_vector::VECTOR_SIZE {
+                        let res = self.descend(to, &fill, rest, set);
+                        fill.clear();
+                        if let Err(e) = res {
+                            result = Err(e);
+                            break 'srcs;
+                        }
+                    }
+                }
+            } else {
+                for part in hits.chunks(zu_vector::VECTOR_SIZE) {
+                    if let Err(e) = self.descend(to, part, rest, set) {
                         result = Err(e);
                         break 'srcs;
                     }
-                };
-                set.chunks.push(chunk);
-                let res = self.run_ops(rest, set);
-                set.chunks.pop();
-                if let Err(e) = res {
-                    result = Err(e);
-                    break 'srcs;
                 }
             }
             if self.stop.stopped() {
                 break;
             }
         }
+        if result.is_ok() && !fill.is_empty() {
+            result = self.descend(to, &fill, rest, set);
+        }
         set.chunks[src].cur = None;
+        self.drop_mask(std::slice::from_ref(&plist), bits);
+        self.row_pool.push(fill);
         self.hits = hits;
         self.idx_pool.push(idxs);
         self.row_pool.push(rows);
@@ -2228,9 +2297,10 @@ impl<'a> Worker<'a> {
     /// The binary close: both ends of the edge are already bound, so
     /// the newest level keeps the rows with an edge back to the pinned
     /// end and nothing else changes. The pinned end's neighbor list is
-    /// read once for the whole vector and each row galloped into it,
-    /// the cursor carried across rows because an expand hands its rows
-    /// over in list order.
+    /// read once for the whole vector and every row asked against it,
+    /// off the bitmap where the list's ids are close enough together
+    /// for one, and otherwise galloped into with the cursor carried
+    /// across rows because an expand hands its rows over in list order.
     fn semi(
         &mut self,
         rel: RelId,
@@ -2249,6 +2319,7 @@ impl<'a> Worker<'a> {
             self.decisions.empty_close += 1;
             return Ok(());
         }
+        let bits = self.build_mask(&lists);
         let last = set.chunks.len() - 1;
         let mut keep = std::mem::take(&mut self.keep);
         keep.clear();
@@ -2258,23 +2329,28 @@ impl<'a> Worker<'a> {
             let mut cur = [0usize; 2];
             let mut prev = 0;
             let cur = &mut cur[..lists.len()];
+            let mut ask = |v: u64| match bits {
+                Some(bits) => in_mask(&self.mask, bits, v),
+                None => member(&lists, cur, &mut prev, v),
+            };
             match &chunk.sel {
                 Some(s) => {
                     for &i in s.as_slice() {
-                        if member(&lists, cur, &mut prev, vals[i as usize]) {
+                        if ask(vals[i as usize]) {
                             keep.push(i);
                         }
                     }
                 }
                 None => {
                     for i in 0..chunk.count {
-                        if member(&lists, cur, &mut prev, vals[i as usize]) {
+                        if ask(vals[i as usize]) {
                             keep.push(i as u16);
                         }
                     }
                 }
             }
         }
+        self.drop_mask(&lists, bits);
         drop(lists);
         self.recycle(held);
         let mut result = Ok(());
@@ -2288,6 +2364,61 @@ impl<'a> Worker<'a> {
         }
         self.keep = keep;
         result
+    }
+
+    /// Builds the probe side of a close into the bitmap, or answers
+    /// `None` where its ids are spread too wide for the bitmap to stay
+    /// in cache and the walk has to close on the gallop instead.
+    ///
+    /// Every close reads its probe side once and then asks about it
+    /// once per neighbor for a whole vector of rows, so the build here
+    /// is paid once against thousands of tests. What the tests turn
+    /// into is the point: a gallop step is a binary search that misses
+    /// cache, and a bit test into a kilobyte of bitmap is not.
+    ///
+    /// The lists come in as they are stored, one per side of an
+    /// undirected end, and the bitmap is their union, which is what
+    /// membership in either of them means anyway.
+    fn build_mask(&mut self, lists: &[&[u64]]) -> Option<Bits> {
+        let (mut base, mut top) = (u64::MAX, 0);
+        for l in lists {
+            if let (Some(&first), Some(&last)) = (l.first(), l.last()) {
+                base = base.min(first);
+                top = top.max(last);
+            }
+        }
+        if base > top {
+            return None;
+        }
+        let words = ((top - base) as usize / 64) + 1;
+        if words > MASK_WORDS {
+            return None;
+        }
+        if self.mask.len() < words {
+            self.mask.resize(words, 0);
+        }
+        for l in lists {
+            for &v in *l {
+                let at = (v - base) as usize;
+                self.mask[at >> 6] |= 1 << (at & 63);
+            }
+        }
+        Some(Bits { base, top })
+    }
+
+    /// Back to all zero for the next close. Only the words the build
+    /// wrote into can hold a bit, so zeroing those is zeroing the
+    /// buffer, and the cost is the probe lists again rather than the
+    /// span they cover.
+    fn drop_mask(&mut self, lists: &[&[u64]], bits: Option<Bits>) {
+        let Some(bits) = bits else {
+            return;
+        };
+        for l in lists {
+            for &v in *l {
+                self.mask[(v - bits.base) as usize >> 6] = 0;
+            }
+        }
     }
 
     /// How many lists of one group the walk is about to want, given the
@@ -3003,6 +3134,53 @@ impl<'a> Worker<'a> {
     }
 }
 
+/// How wide the probe bitmap is allowed to get, in 64 bit words. A
+/// social graph's node ids run to a few hundred thousand and land well
+/// inside this; a graph whose ids are spread wider than a megabyte of
+/// bitmap would be paying cache misses for the test it took the bitmap
+/// to avoid, so that one closes on the gallop.
+const MASK_WORDS: usize = 1 << 14;
+
+/// How much longer than the probe list the seed list may be before the
+/// bitmap stops being worth it. The bitmap tests every neighbor of the
+/// seed; the gallop skips runs of them and touches about the shorter
+/// list, so once the seed is long enough the skipping wins even at a
+/// binary search a step. Eight is where the two meet on the graphs the
+/// benches carry.
+const MASK_RUN: usize = 8;
+
+/// Which ids the probe bitmap stands for: the lowest one it holds a bit
+/// for, and the highest, since everything outside that range is a miss
+/// without a test.
+#[derive(Clone, Copy)]
+struct Bits {
+    base: u64,
+    top: u64,
+}
+
+/// Whether the probe side holds `v`, at one test of a bitmap the whole
+/// close shares.
+fn in_mask(mask: &[u64], bits: Bits, v: u64) -> bool {
+    if v < bits.base || v > bits.top {
+        return false;
+    }
+    let at = (v - bits.base) as usize;
+    mask[at >> 6] >> (at & 63) & 1 == 1
+}
+
+/// Keeps the seed neighbors the probe bitmap holds a bit for. Nothing
+/// is searched: the seed list is walked once and each of its neighbors
+/// costs one test. The rule on repeats is leapfrog's and falls out of
+/// the shape here, a repeat in the seed being tested twice and a repeat
+/// in the probe having set the same bit twice.
+fn mask_hits(mask: &[u64], bits: Bits, seed: &[u64], out: &mut Vec<u64>) {
+    for &v in seed {
+        if in_mask(mask, bits, v) {
+            out.push(v);
+        }
+    }
+}
+
 /// Intersects two sorted neighbor lists, galloping past the runs
 /// neither side can match. A repeat in the seed list is a real
 /// multi-edge row and emits again; a repeat in the probe list is only
@@ -3432,6 +3610,42 @@ mod tests {
         leapfrog(&[5], &[], &mut hits);
         leapfrog(&[], &[5], &mut hits);
         assert_eq!(hits, []);
+    }
+
+    /// The bitmap answers the close the same way the gallop does, or
+    /// the count comes out different depending on which of the two the
+    /// vector happened to pick, which is the one thing the switch is
+    /// not allowed to do.
+    #[test]
+    fn the_probe_bitmap_and_the_gallop_agree() {
+        let probes: [&[u64]; 4] = [
+            &[7],
+            &[1, 2, 7, 7, 8, 12],
+            &[3, 4, 5],
+            &[0, 63, 64, 65, 200],
+        ];
+        let seeds: [&[u64]; 5] = [
+            &[],
+            &[2, 2, 3, 7, 9, 12],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[64, 64, 200],
+            &[999],
+        ];
+        for probe in probes {
+            let base = probe[0];
+            let top = probe[probe.len() - 1];
+            let mut mask = vec![0u64; ((top - base) as usize / 64) + 1];
+            for &v in probe {
+                let at = (v - base) as usize;
+                mask[at >> 6] |= 1 << (at & 63);
+            }
+            for seed in seeds {
+                let (mut want, mut got) = (Vec::new(), Vec::new());
+                leapfrog(seed, probe, &mut want);
+                mask_hits(&mask, Bits { base, top }, seed, &mut got);
+                assert_eq!(got, want, "seed {seed:?} against probe {probe:?}");
+            }
+        }
     }
 
     use zu_query::snapshot::{ColId, GroupId, ScanChunk, TableId, ZonePred};

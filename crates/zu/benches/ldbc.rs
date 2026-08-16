@@ -482,12 +482,12 @@ fn run_ordered_triangle(
     p50
 }
 
-/// Close: the same triangle walked undirected, which is the shape the
-/// optimizer keeps on the binary probe because the fusion reads one
-/// sorted list per side and an undirected end has two. The closing
-/// probe compiles to a semijoin the pipeline folds into the expand
-/// that produced the rows it judges, so this is the number that moves
-/// when that fusion changes. The reference walks the undirected
+/// Close: the same triangle walked undirected, which is the shape that
+/// costs the intersection the most. Every end reads two stored lists,
+/// so the probe side is a union built for the vector and the seed side
+/// is two walks instead of one, and the undirected graph has twice the
+/// edges to walk. That makes this the number that moves furthest when
+/// the closing kernel changes. The reference walks the undirected
 /// adjacency and binary searches the sorted pair list, counting the
 /// same ordered triples the query counts.
 fn run_undirected_close(path: &std::path::Path, edges: &[(u32, u32)], node_count: u64) -> f64 {
@@ -1007,8 +1007,26 @@ fn run_table_functions(
     (pagerank_s, wcc_s, sssp_s, louvain_s)
 }
 
+/// Whether a phase runs. `ZU_ONLY=triangle` loads the graph and runs
+/// that phase and nothing else, which is the difference between waiting
+/// a minute and waiting five seconds between two attempts at a plan.
+/// The names are hop, key, two-hop, triangle, ordered, close, is, ic,
+/// distinct, cardinality and call, comma separated.
+fn only(name: &str) -> bool {
+    match std::env::var("ZU_ONLY") {
+        Ok(want) => want.split(',').any(|w| w.trim() == name),
+        Err(_) => true,
+    }
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
+    // A run of one phase is not the gate, and a gate that quietly
+    // measured one of eleven things is worse than no gate at all.
+    assert!(
+        !(gate && std::env::var("ZU_ONLY").is_ok()),
+        "ZU_ONLY runs a phase at a time, so it cannot stand as the gate"
+    );
     let data = match std::env::var("ZU_DATA") {
         Ok(d)
             if std::path::Path::new(&format!("{d}/ldbc-sf1-person-keys.txt")).exists()
@@ -1030,73 +1048,53 @@ fn main() {
     let (edges, by_row, profiles) = load(&data, &path);
     let node_count = by_row.len() as u64;
 
-    let hop_p50 = run_one_hop(&path, &edges, node_count);
-    let key_p50 = run_key_lookups(&path, &by_row);
-    let two_hop_p50 = run_two_hop(&path, &edges, node_count);
-    let triangle_p50 = run_triangle_count(&path, &edges, node_count);
-    let ordered_p50 = run_ordered_triangle(&path, &edges, &by_row, node_count);
-    let close_p50 = run_undirected_close(&path, &edges, node_count);
-    let is_p50 = run_is_reads(&path, &by_row, &profiles);
-    let ic_p50 = run_ic_friends_of_friends(&path, &edges, &by_row, &profiles);
-    let distinct_p50 = run_distinct_two_hop(&path, &edges, &by_row);
-    let (q50, q90, q99, qmax, violations) = run_cardinality(&path, &by_row, &profiles);
-    let (pagerank_s, wcc_s, sssp_s, louvain_s) = run_table_functions(&path, &edges, node_count);
+    let hop_p50 = only("hop").then(|| run_one_hop(&path, &edges, node_count));
+    let key_p50 = only("key").then(|| run_key_lookups(&path, &by_row));
+    let two_hop_p50 = only("two-hop").then(|| run_two_hop(&path, &edges, node_count));
+    let triangle_p50 = only("triangle").then(|| run_triangle_count(&path, &edges, node_count));
+    let ordered_p50 =
+        only("ordered").then(|| run_ordered_triangle(&path, &edges, &by_row, node_count));
+    let close_p50 = only("close").then(|| run_undirected_close(&path, &edges, node_count));
+    let is_p50 = only("is").then(|| run_is_reads(&path, &by_row, &profiles));
+    let ic_p50 = only("ic").then(|| run_ic_friends_of_friends(&path, &edges, &by_row, &profiles));
+    let distinct_p50 = only("distinct").then(|| run_distinct_two_hop(&path, &edges, &by_row));
+    let cardinality = only("cardinality").then(|| run_cardinality(&path, &by_row, &profiles));
+    let kernels = only("call").then(|| run_table_functions(&path, &edges, node_count));
 
-    let mut failed = false;
-    if let Some(ceiling) = budget("ldbc_hop_p50_us")
-        && hop_p50 > ceiling
-    {
-        println!("GATE FAIL B1 1-hop: p50 {hop_p50:.2} us > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_key_p50_us")
-        && key_p50 > ceiling
-    {
-        println!("GATE FAIL B2 key-lookup: p50 {key_p50:.2} us > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_two_hop_p50_ms")
-        && two_hop_p50 > ceiling
-    {
-        println!("GATE FAIL B4 2-hop: p50 {two_hop_p50:.3} ms > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_triangle_p50_ms")
-        && triangle_p50 > ceiling
-    {
-        println!("GATE FAIL triangle count: p50 {triangle_p50:.3} ms > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_ordered_triangle_p50_ms")
-        && ordered_p50 > ceiling
-    {
-        println!("GATE FAIL ordered triangle: p50 {ordered_p50:.3} ms > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_close_p50_ms")
-        && close_p50 > ceiling
-    {
-        println!("GATE FAIL undirected close: p50 {close_p50:.3} ms > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_is_p50_ms")
-        && is_p50 > ceiling
-    {
-        println!("GATE FAIL IS profile read: p50 {is_p50:.3} ms > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_ic_p50_ms")
-        && ic_p50 > ceiling
-    {
-        println!("GATE FAIL IC friends-of-friends: p50 {ic_p50:.3} ms > ceiling {ceiling}");
-        failed = true;
-    }
-    if let Some(ceiling) = budget("ldbc_distinct_two_hop_p50_ms")
-        && distinct_p50 > ceiling
-    {
-        println!("GATE FAIL distinct two-hop: p50 {distinct_p50:.3} ms > ceiling {ceiling}");
-        failed = true;
-    }
+    let (q50, q90, q99, qmax, violations) = cardinality.unwrap_or_default();
+    let (pagerank_s, wcc_s, sssp_s, louvain_s) = kernels.unwrap_or_default();
+
+    // A phase the filter skipped has no number to hold against its
+    // ceiling, and the run it was left out of is not the gate anyway.
+    let over = |label: &str, got: Option<f64>, key: &str, unit: &str| -> bool {
+        let (Some(got), Some(ceiling)) = (got, budget(key)) else {
+            return false;
+        };
+        if got <= ceiling {
+            return false;
+        }
+        println!("GATE FAIL {label}: p50 {got:.3} {unit} > ceiling {ceiling}");
+        true
+    };
+    let mut failed = over("B1 1-hop", hop_p50, "ldbc_hop_p50_us", "us");
+    failed |= over("B2 key-lookup", key_p50, "ldbc_key_p50_us", "us");
+    failed |= over("B4 2-hop", two_hop_p50, "ldbc_two_hop_p50_ms", "ms");
+    failed |= over("triangle count", triangle_p50, "ldbc_triangle_p50_ms", "ms");
+    failed |= over(
+        "ordered triangle",
+        ordered_p50,
+        "ldbc_ordered_triangle_p50_ms",
+        "ms",
+    );
+    failed |= over("undirected close", close_p50, "ldbc_close_p50_ms", "ms");
+    failed |= over("IS profile read", is_p50, "ldbc_is_p50_ms", "ms");
+    failed |= over("IC friends-of-friends", ic_p50, "ldbc_ic_p50_ms", "ms");
+    failed |= over(
+        "distinct two-hop",
+        distinct_p50,
+        "ldbc_distinct_two_hop_p50_ms",
+        "ms",
+    );
     // No budget line for this one. A ceiling the data walks straight
     // through is wrong, and there is no number of wrong ceilings worth
     // writing down as acceptable.

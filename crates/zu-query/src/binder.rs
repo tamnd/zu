@@ -732,9 +732,13 @@ pub enum BoundClause {
         patterns: Vec<BoundPath>,
         filter: Option<BoundExpr>,
     },
-    /// `INSERT`, one entry per element the statement creates.
+    /// `INSERT`, the elements the statement creates: the nodes first,
+    /// then the edges between them, which is the order the write runs
+    /// in because an edge is written between two rows that have to
+    /// exist by the time it is.
     Insert {
         nodes: Vec<BoundInsertNode>,
+        rels: Vec<BoundInsertRel>,
     },
     Unwind {
         expr: BoundExpr,
@@ -797,6 +801,31 @@ pub struct BoundInsertNode {
     /// one without the executor being able to write. The argument is a
     /// list holding the one element, because binding it to its slot is
     /// what the operator that reads a list does.
+    pub value: usize,
+}
+
+/// One edge an `INSERT` creates.
+///
+/// The ends are slots rather than tables, because an edge is written
+/// between two rows and a row is what a slot holds. Both of them are
+/// nodes the same clause created: an end a `MATCH` bound is an end
+/// whose row is different on every row of the match, and the write
+/// runs once, before the plan does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundInsertRel {
+    /// The slot the created edge binds, which is what a later clause
+    /// reads when the pattern named a variable.
+    pub slot: usize,
+    /// The rel table the edge is created in.
+    pub table: u32,
+    /// The slot holding the row the edge leaves, which is the tail of
+    /// the arrow whichever way round the pattern was written.
+    pub src: usize,
+    /// The slot holding the row the edge arrives at.
+    pub dst: usize,
+    /// Where the created edge arrives in the argument list, past the
+    /// last declared parameter and past the nodes of the same clause.
+    /// The rest of the story is on [`BoundInsertNode::value`].
     pub value: usize,
 }
 
@@ -1179,11 +1208,15 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
     // known, which is here.
     let mut created = binder.params.len();
     for clause in &mut clauses {
-        let BoundClause::Insert { nodes } = clause else {
+        let BoundClause::Insert { nodes, rels } = clause else {
             continue;
         };
         for node in nodes {
             node.value = created;
+            created += 1;
+        }
+        for rel in rels {
+            rel.value = created;
             created += 1;
         }
     }
@@ -1298,20 +1331,26 @@ impl Binder<'_> {
             }
             Clause::Insert { patterns } => {
                 let mut nodes = Vec::new();
+                let mut rels = Vec::new();
                 for path in patterns {
-                    if !path.steps.is_empty() {
-                        return Err(not_yet(
-                            "INSERT of an edge, which needs the nodes at both ends bound first,",
-                        ));
-                    }
                     if path.var.is_some() {
                         return Err(not_yet(
-                            "INSERT binding the path it wrote, which is one node and nothing to walk,",
+                            "INSERT binding the path it wrote, which is a walk over rows that are being made rather than found,",
                         ));
                     }
-                    nodes.push(self.bind_insert_node(&path.start)?);
+                    if path.selector.is_some() || path.mode != PathMode::default() {
+                        return Err(invalid(
+                            "a selector or a path mode says which of the walks that are there to pick, and INSERT is making one rather than picking one".into(),
+                        ));
+                    }
+                    let mut left = self.bind_insert_end(&path.start, &mut nodes)?;
+                    for (rel, node) in &path.steps {
+                        let right = self.bind_insert_end(node, &mut nodes)?;
+                        rels.push(self.bind_insert_rel(rel, left, right, &nodes)?);
+                        left = right;
+                    }
                 }
-                Ok(BoundClause::Insert { nodes })
+                Ok(BoundClause::Insert { nodes, rels })
             }
             Clause::Unwind { expr, alias } => {
                 let mut ctx = ExprCtx::new(false);
@@ -1726,6 +1765,168 @@ impl Binder<'_> {
             self.path_shapes.insert(slot, parts);
         }
         Ok(BoundPath { slot, start, steps })
+    }
+
+    /// Binds one end of a path written under `INSERT`, and says which
+    /// slot holds the row that end is.
+    ///
+    /// An end is either an element the clause makes or a name already
+    /// standing for one. `INSERT (a:person), (a)-[:knows]->(b:person)`
+    /// writes two elements and one edge, and the `(a)` in the second
+    /// pattern is the first one being pointed at rather than a third
+    /// element with the same name. A name that is being pointed at
+    /// carries nothing of its own, because a label or a property there
+    /// would be describing an element that has already been described.
+    fn bind_insert_end(
+        &mut self,
+        pat: &NodePattern,
+        nodes: &mut Vec<BoundInsertNode>,
+    ) -> Result<usize> {
+        let bound = pat
+            .var
+            .as_deref()
+            .and_then(|name| self.scope.get(name).copied());
+        let Some(slot) = bound else {
+            let node = self.bind_insert_node(pat)?;
+            let slot = node.slot;
+            nodes.push(node);
+            return Ok(slot);
+        };
+        if pat.label.is_some() || !pat.props.is_empty() {
+            return Err(invalid(format!(
+                "'{}' already stands for an element here, so writing a label or a property on it would be describing an element that is already described",
+                pat.var.as_deref().unwrap_or("")
+            )));
+        }
+        if self.variables[slot].ty != Type::Node {
+            return Err(bad_type(format!(
+                "'{}' stands for an edge, and an edge is not an end of another one",
+                pat.var.as_deref().unwrap_or("")
+            )));
+        }
+        Ok(slot)
+    }
+
+    /// Binds one edge written under `INSERT`, between the two slots the
+    /// ends of its step landed in.
+    ///
+    /// `nodes` is what the clause has made so far, and an end that is
+    /// not in it is an end the write cannot reach: the write runs once
+    /// and runs before the plan, so a row a `MATCH` found is a row that
+    /// is not there yet when the edge would be written.
+    fn bind_insert_rel(
+        &mut self,
+        pat: &RelPattern,
+        left: usize,
+        right: usize,
+        nodes: &[BoundInsertNode],
+    ) -> Result<BoundInsertRel> {
+        if pat.range.is_some() {
+            return Err(invalid(
+                "a hop range asks for a walk of some length, and INSERT writes one edge".into(),
+            ));
+        }
+        if !pat.props.is_empty() {
+            return Err(not_yet(
+                "INSERT of an edge carrying properties, which the log has no record for,",
+            ));
+        }
+        let [name] = pat.types.as_slice() else {
+            return Err(match pat.types.is_empty() {
+                true => invalid(
+                    "INSERT needs an edge type saying which table the edge goes in, and this one names none".into(),
+                ),
+                false => invalid(format!(
+                    "an edge goes in one table, and '{}' names {}",
+                    pat.types.join("|"),
+                    pat.types.len()
+                )),
+            });
+        };
+        let rel = self
+            .schema
+            .rels
+            .iter()
+            .find(|r| r.name == *name)
+            .ok_or_else(|| bad_reference(format!("no edge table is named '{name}'")))?
+            .clone();
+        // Which way round the arrow points is which row the edge leaves
+        // and which it arrives at, and that is the whole of the
+        // difference: the edge is stored once either way round. A
+        // pattern that does not point says the edge is one of several
+        // things, and an edge being made has to be one thing. Which
+        // arrows a table takes is the table's own answer: an undirected
+        // one holds edges that point nowhere, and writing one of those
+        // with an arrow would be writing something the table cannot
+        // hold.
+        let (src, dst) = match (pat.direction, rel.undirected) {
+            (RelDirection::Out, false) => (left, right),
+            (RelDirection::In, false) => (right, left),
+            (RelDirection::Undirected, true) => (left, right),
+            (_, undirected) => {
+                return Err(invalid(format!(
+                    "'{}' holds {} edges, and this pattern is not written as one of those",
+                    rel.name,
+                    match undirected {
+                        true => "undirected",
+                        false => "directed",
+                    }
+                )));
+            }
+        };
+        // A rel table holds edges between two node tables and nothing
+        // else, so an end in the wrong table is an edge the file has
+        // nowhere to put. Saying so here names both tables; letting it
+        // through would write an edge whose endpoint no reader resolves.
+        for (end, want, side) in [(src, rel.from, "leaves"), (dst, rel.to, "arrives at")] {
+            let made = nodes.iter().find(|n| n.slot == end).ok_or_else(|| {
+                not_yet(
+                    "INSERT of an edge onto an element a MATCH found, which is a write for every row the match answers,",
+                )
+            })?;
+            if made.table != want {
+                return Err(bad_reference(format!(
+                    "an edge in '{}' {side} an element of '{}', and {} is in '{}'",
+                    rel.name,
+                    self.table_name(want),
+                    self.var_text(end),
+                    self.table_name(made.table)
+                )));
+            }
+        }
+        let slot = match &pat.var {
+            Some(name) => self.declare(name, Type::Rel)?,
+            None => self.anon_slot(Type::Rel),
+        };
+        self.variables[slot].rel_tables = vec![rel.id];
+        Ok(BoundInsertRel {
+            slot,
+            table: rel.id,
+            src,
+            dst,
+            // Filled in by [`bind`] once every parameter is known.
+            value: 0,
+        })
+    }
+
+    /// How to write a slot in a message: the name the statement gave
+    /// it, or a description when the statement gave it none.
+    fn var_text(&self, slot: usize) -> String {
+        let name = &self.variables[slot].name;
+        match name.starts_with('#') {
+            true => "the element at that end".to_string(),
+            false => format!("'{name}'"),
+        }
+    }
+
+    /// The name of a node table, for a message that has to say which
+    /// one an element is in.
+    fn table_name(&self, table: u32) -> &str {
+        self.schema
+            .nodes
+            .iter()
+            .find(|n| n.id == table)
+            .map_or("?", |n| n.name.as_str())
     }
 
     /// Binds one node pattern written under `INSERT`.
@@ -3326,7 +3527,7 @@ mod tests {
     fn an_insert_binds_its_elements_past_the_declared_parameters() {
         let q = bound("INSERT (x:Person {name: $who}), (y:Person) RETURN x, y");
         assert_eq!(q.params, ["who"]);
-        let BoundClause::Insert { nodes } = &q.clauses[0] else {
+        let BoundClause::Insert { nodes, .. } = &q.clauses[0] else {
             panic!("INSERT");
         };
         assert_eq!(nodes.len(), 2);
@@ -3346,7 +3547,10 @@ mod tests {
     #[test]
     fn the_parts_of_insert_that_are_not_in_yet_say_which_part() {
         for (source, what) in [
-            ("INSERT (a:Person)-[:KNOWS]->(b:Person)", "edge"),
+            (
+                "INSERT (a:Person)-[k:KNOWS {since: 1}]->(b:Person)",
+                "properties",
+            ),
             ("INSERT p = (a:Person)", "path"),
             ("MATCH (a:Person) INSERT (b:Person)", "INSERT after"),
         ] {
@@ -3354,6 +3558,121 @@ mod tests {
             assert!(e.contains(what), "{source:?} was refused with {e:?}");
             assert!(e.contains("not implemented yet"), "got: {e}");
         }
+    }
+
+    /// An edge written under `INSERT` runs between two elements the
+    /// same clause creates, and the arrow says which of them it leaves.
+    #[test]
+    fn an_insert_writes_an_edge_between_the_elements_it_made() {
+        let q = bound("INSERT (a:Person)-[k:KNOWS]->(b:Person) RETURN k");
+        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].table, 2);
+        assert_eq!(rels[0].src, nodes[0].slot);
+        assert_eq!(rels[0].dst, nodes[1].slot);
+        // The edge arrives behind the two elements it runs between.
+        assert_eq!(nodes[0].value, 0);
+        assert_eq!(nodes[1].value, 1);
+        assert_eq!(rels[0].value, 2);
+        assert_eq!(q.variables[rels[0].slot].name, "k");
+        assert_eq!(var(&q, "k").rel_tables, [2]);
+
+        // A backwards arrow is the same edge written from the other
+        // end, so the ends swap and nothing else does.
+        let q = bound("INSERT (a:Person)<-[:KNOWS]-(b:Person)");
+        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(rels[0].src, nodes[1].slot);
+        assert_eq!(rels[0].dst, nodes[0].slot);
+    }
+
+    /// A name already standing for an element is that element again,
+    /// which is how a statement writes two edges off one node.
+    #[test]
+    fn an_end_that_names_something_already_written_is_that_element() {
+        let q = bound(
+            "INSERT (a:Person)-[:KNOWS]->(b:Person), (a)-[:IS_LOCATED_IN]->(c:Place) RETURN a",
+        );
+        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(nodes.len(), 3, "a is written once and pointed at twice");
+        assert_eq!(rels.len(), 2);
+        assert_eq!(rels[1].src, nodes[0].slot);
+        assert_eq!(rels[1].dst, nodes[2].slot);
+        // An element already described is not described again, whether
+        // the second description is a label or a property.
+        let e = bind_err("INSERT (a:Person)-[:KNOWS]->(b:Person), (a:Person)");
+        assert!(e.contains("already described"), "got: {e}");
+        let e = bind_err("INSERT (a:Person)-[:KNOWS]->(b:Person), (a {name: 'x'})-[:KNOWS]->(b)");
+        assert!(e.contains("already described"), "got: {e}");
+        // An edge is not an end of another edge.
+        let e = bind_err("INSERT (a:Person)-[k:KNOWS]->(b:Person), (k)-[:KNOWS]->(a)");
+        assert!(e.contains("not an end"), "got: {e}");
+    }
+
+    /// What an edge is written into is a table, and the ends have to be
+    /// in the tables that table runs between.
+    #[test]
+    fn an_edge_goes_in_one_table_between_the_two_it_runs_between() {
+        let e = bind_err("INSERT (a:Person)-[]->(b:Person)");
+        assert!(e.contains("names none"), "got: {e}");
+        let e = bind_err("INSERT (a:Person)-[:KNOWS|IS_LOCATED_IN]->(b:Person)");
+        assert!(e.contains("names 2"), "got: {e}");
+        let e = bind_err("INSERT (a:Person)-[:WORKS_AT]->(b:Person)");
+        assert!(e.contains("no edge table"), "got: {e}");
+        let e = bind_err("INSERT (a:Person)-[:IS_LOCATED_IN]->(b:Person)");
+        assert!(e.contains("arrives at an element of 'Place'"), "got: {e}");
+        let e = bind_err("INSERT (a:Person)-[:KNOWS]-(b:Person)");
+        assert!(e.contains("holds directed edges"), "got: {e}");
+        let e = bind_err("INSERT (a:Person)~[:KNOWS]~(b:Person)");
+        assert!(e.contains("holds directed edges"), "got: {e}");
+        let e = bind_err("INSERT (a:Person)-[:KNOWS*2]->(b:Person)");
+        assert!(e.contains("hop range"), "got: {e}");
+        let e = bind_err("INSERT ANY SHORTEST (a:Person)-[:KNOWS]->(b:Person)");
+        assert!(e.contains("selector"), "got: {e}");
+    }
+
+    /// A table of undirected edges takes the pattern that has no arrow
+    /// and only that one, because an arrow written on one of its edges
+    /// would say something the table does not record.
+    #[test]
+    fn an_undirected_table_is_written_with_the_pattern_that_has_no_arrow() {
+        let schema = Schema::new(
+            vec![NodeDef {
+                id: 0,
+                name: "Person".into(),
+                node_count: 9000,
+                labels: Vec::new(),
+            }],
+            vec![RelDef {
+                id: 1,
+                name: "MARRIED_TO".into(),
+                from: 0,
+                to: 0,
+                edge_count: 4000,
+                undirected: true,
+            }],
+        )
+        .expect("schema");
+        let bind_here = |s: &str| bind(&parse(s).expect("parse"), &schema);
+
+        let q = bind_here("INSERT (a:Person)~[m:MARRIED_TO]~(b:Person)").expect("bind");
+        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(rels[0].table, 1);
+        assert_eq!(rels[0].src, nodes[0].slot);
+        assert_eq!(rels[0].dst, nodes[1].slot);
+
+        let e = bind_here("INSERT (a:Person)-[:MARRIED_TO]->(b:Person)")
+            .expect_err("an arrow on an edge that has none")
+            .to_string();
+        assert!(e.contains("holds undirected edges"), "got: {e}");
     }
 
     /// An element goes in one table, and the pattern has to say which:

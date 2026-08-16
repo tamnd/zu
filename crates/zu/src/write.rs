@@ -94,12 +94,7 @@ impl Writer {
     /// and a log beside a database nobody may write to is a file that
     /// only ever confuses the next reader.
     pub fn open(db: &mut Zu1File) -> Result<Writer> {
-        if !db.is_writable() {
-            return Err(ZuError::InvalidArgument(format!(
-                "cannot write to {}, which is open read-only",
-                db.path().display()
-            )));
-        }
+        writable(db)?;
         let path = sidecar(db.path());
         let wal = Wal::open(&path)?;
         let mvcc = recover(db, &wal)?;
@@ -150,6 +145,22 @@ impl Writer {
     pub fn fold(&mut self, db: &mut Zu1File) -> Result<()> {
         checkpoint_fold(db, &mut self.mvcc, &mut self.wal)
     }
+}
+
+/// Refuses a handle nothing may be written through.
+///
+/// A statement that writes asks this before it works out what it would
+/// write, so that a caller holding a read-only connection is told what
+/// is wrong with the connection rather than what is wrong with the
+/// statement.
+pub(crate) fn writable(db: &Zu1File) -> Result<()> {
+    if db.is_writable() {
+        return Ok(());
+    }
+    Err(ZuError::InvalidArgument(format!(
+        "cannot write to {}, which is open read-only",
+        db.path().display()
+    )))
 }
 
 #[cfg(test)]

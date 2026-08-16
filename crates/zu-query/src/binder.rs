@@ -26,6 +26,14 @@ fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
 }
 
+/// A statement the surface accepts and this build does not answer yet,
+/// named rather than described, in the shape the parser uses for the
+/// clauses it refuses by keyword: a reader who wrote one should be told
+/// which milestone they are waiting on, not sent looking for a typo.
+fn not_yet(what: &str) -> ZuError {
+    ZuError::gql(codes::C42001, format!("{what} is not implemented yet"))
+}
+
 /// The label bits every row of every one of these node tables carries,
 /// which is what a label test may take as read. A table's own name is
 /// one such bit and is usually the only one, so this is empty as soon
@@ -724,6 +732,10 @@ pub enum BoundClause {
         patterns: Vec<BoundPath>,
         filter: Option<BoundExpr>,
     },
+    /// `INSERT`, one entry per element the statement creates.
+    Insert {
+        nodes: Vec<BoundInsertNode>,
+    },
     Unwind {
         expr: BoundExpr,
         slot: usize,
@@ -761,6 +773,31 @@ pub struct BoundItem {
     /// True when the item contains an aggregate call; the others are
     /// the grouping keys.
     pub aggregate: bool,
+}
+
+/// One node an `INSERT` creates.
+///
+/// The table is settled here rather than at runtime, because a pattern
+/// that says which labels an element carries says which table it goes
+/// in, and a pattern that leaves that open is a pattern the writer
+/// cannot answer: reading `(x)` finds every table, writing `(x)` would
+/// have to pick one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundInsertNode {
+    /// The slot the created element binds, which is what a later clause
+    /// reads when the pattern named a variable.
+    pub slot: usize,
+    /// The node table the element is created in.
+    pub table: u32,
+    /// The properties the pattern wrote, in written order.
+    pub props: Vec<(String, BoundExpr)>,
+    /// Where the created element arrives in the argument list, past the
+    /// last declared parameter. The write runs before the plan does and
+    /// hands its elements in this way, which is what lets the plan read
+    /// one without the executor being able to write. The argument is a
+    /// list holding the one element, because binding it to its slot is
+    /// what the operator that reads a list does.
+    pub value: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1124,11 +1161,31 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
                     .into(),
             ));
         }
+        if i > 0 && matches!(clause, Clause::Insert { .. }) {
+            return Err(not_yet(
+                "INSERT after another clause, which is inserting what a MATCH found",
+            ));
+        }
         clauses.push(binder.bind_clause(clause)?);
         // An existence block written in the clause's WHERE is a match
         // of its own and runs where the predicate would have, which is
         // straight after the clause it was written in.
         clauses.append(&mut binder.pending);
+    }
+    // An inserted element is a value the plan reads and the write
+    // produces, and the write happens before execution, so it arrives
+    // as an argument past the last declared parameter. The index can
+    // only be handed out once every parameter the query writes is
+    // known, which is here.
+    let mut created = binder.params.len();
+    for clause in &mut clauses {
+        let BoundClause::Insert { nodes } = clause else {
+            continue;
+        };
+        for node in nodes {
+            node.value = created;
+            created += 1;
+        }
     }
     Ok(BoundQuery {
         clauses,
@@ -1238,6 +1295,23 @@ impl Binder<'_> {
                     patterns: bound,
                     filter,
                 })
+            }
+            Clause::Insert { patterns } => {
+                let mut nodes = Vec::new();
+                for path in patterns {
+                    if !path.steps.is_empty() {
+                        return Err(not_yet(
+                            "INSERT of an edge, which needs the nodes at both ends bound first,",
+                        ));
+                    }
+                    if path.var.is_some() {
+                        return Err(not_yet(
+                            "INSERT binding the path it wrote, which is one node and nothing to walk,",
+                        ));
+                    }
+                    nodes.push(self.bind_insert_node(&path.start)?);
+                }
+                Ok(BoundClause::Insert { nodes })
             }
             Clause::Unwind { expr, alias } => {
                 let mut ctx = ExprCtx::new(false);
@@ -1652,6 +1726,59 @@ impl Binder<'_> {
             self.path_shapes.insert(slot, parts);
         }
         Ok(BoundPath { slot, start, steps })
+    }
+
+    /// Binds one node pattern written under `INSERT`.
+    ///
+    /// A written pattern is a description, and reading one and writing
+    /// one read the description differently. A label expression is a
+    /// test when it is matched and an instruction when it is inserted,
+    /// so the only expressions that make sense here are the ones that
+    /// name exactly one table: `(x:person)` says where the row goes,
+    /// `(x)` and `(x:person|company)` do not say, and a table nobody
+    /// named is not one this can pick.
+    fn bind_insert_node(&mut self, pat: &NodePattern) -> Result<BoundInsertNode> {
+        let Some(label) = &pat.label else {
+            return Err(invalid(format!(
+                "INSERT needs a label saying which table the element goes in, and '({})' names none",
+                pat.var.as_deref().unwrap_or("")
+            )));
+        };
+        let LabelExpr::Label(name) = label else {
+            return Err(not_yet(
+                "INSERT of an element whose labels are written as anything but one name,",
+            ));
+        };
+        // A row lands in a table, and the label a table gives every row
+        // it holds is its own name, so that is the one that says where
+        // an element goes. A secondary label is something a row carries
+        // rather than somewhere it lives, and adding one to an element
+        // being created is a key label set change, which is its own
+        // line on the milestone.
+        let table = self
+            .schema
+            .nodes
+            .iter()
+            .find(|n| n.name == *name)
+            .ok_or_else(|| {
+                bad_reference(format!(
+                    "no node table is named '{name}', and an element is created in the table whose own name is the label"
+                ))
+            })?
+            .id;
+        let props = self.bind_props(&pat.props)?;
+        let slot = match &pat.var {
+            Some(name) => self.declare(name, Type::Node)?,
+            None => self.anon_slot(Type::Node),
+        };
+        self.variables[slot].node_tables = vec![table];
+        Ok(BoundInsertNode {
+            slot,
+            table,
+            props,
+            // Filled in by [`bind`] once every parameter is known.
+            value: 0,
+        })
     }
 
     fn bind_node(&mut self, pat: &NodePattern) -> Result<BoundNode> {
@@ -3190,6 +3317,55 @@ mod tests {
         let q = bound("MATCH (n:Person|Employee)-[:KNOWS]->(m) RETURN n");
         assert_eq!(var(&q, "n").node_tables, [0]);
         assert_eq!(start_node(&q).label, None);
+    }
+
+    /// The element a pattern creates is a variable like any other, and
+    /// the place it arrives from is one past the parameters the
+    /// statement declared, in the order the patterns were written.
+    #[test]
+    fn an_insert_binds_its_elements_past_the_declared_parameters() {
+        let q = bound("INSERT (x:Person {name: $who}), (y:Person) RETURN x, y");
+        assert_eq!(q.params, ["who"]);
+        let BoundClause::Insert { nodes } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].table, 0);
+        assert_eq!(nodes[0].value, 1);
+        assert_eq!(nodes[1].value, 2);
+        assert_eq!(nodes[0].props.len(), 1);
+        assert!(nodes[1].props.is_empty());
+        assert_eq!(var(&q, "x").node_tables, [0]);
+        assert_eq!(q.variables[nodes[0].slot].name, "x");
+        assert_eq!(q.variables[nodes[1].slot].name, "y");
+    }
+
+    /// What the write surface does not do yet says so by name, so that
+    /// a statement written against a later milestone fails with the
+    /// piece it is waiting on rather than with a parse error.
+    #[test]
+    fn the_parts_of_insert_that_are_not_in_yet_say_which_part() {
+        for (source, what) in [
+            ("INSERT (a:Person)-[:KNOWS]->(b:Person)", "edge"),
+            ("INSERT p = (a:Person)", "path"),
+            ("MATCH (a:Person) INSERT (b:Person)", "INSERT after"),
+        ] {
+            let e = bind_err(source);
+            assert!(e.contains(what), "{source:?} was refused with {e:?}");
+            assert!(e.contains("not implemented yet"), "got: {e}");
+        }
+    }
+
+    /// An element goes in one table, and the pattern has to say which:
+    /// a label expression that names none, or names more than one, is
+    /// not a table.
+    #[test]
+    fn an_insert_wants_one_plain_label_naming_a_table() {
+        assert!(bind_err("INSERT (x)").contains("label"));
+        let e = bind_err("INSERT (x:Person|Place)");
+        assert!(e.contains("one name"), "got: {e}");
+        let e = bind_err("INSERT (x:Company)");
+        assert!(e.contains("Company"), "got: {e}");
     }
 
     #[test]

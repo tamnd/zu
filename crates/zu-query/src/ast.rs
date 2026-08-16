@@ -181,6 +181,15 @@ pub enum Clause {
         patterns: Vec<PathPattern>,
         filter: Option<Expr>,
     },
+    /// `INSERT (x:Person {name: 'Zoe'}), (y:Person)`, the statement
+    /// that adds elements (ISO 13.2). The patterns are the same shape a
+    /// MATCH writes, because GQL writes them the same way: what makes
+    /// this one a write is the clause in front of them, and a pattern
+    /// here is a description of an element to create rather than one to
+    /// look for.
+    Insert {
+        patterns: Vec<PathPattern>,
+    },
     Unwind {
         expr: Expr,
         alias: String,

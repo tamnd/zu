@@ -732,6 +732,19 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
     let graph = graph_of(&catalog, catalog.home_graph_id(), &parsed)?;
     let schema = schema_with_stats(db, &catalog, graph)?;
     let (query, plan, notes) = compile_parsed(&parsed, &schema)?;
+    // A write needs the log and the overlay a session owns, and this
+    // entry point has neither: it was given a file handle and it hands
+    // it back. Saying so here is better than compiling a plan whose
+    // written elements nobody made.
+    if query
+        .clauses
+        .iter()
+        .any(|c| matches!(c, zu_query::binder::BoundClause::Insert { .. }))
+    {
+        return Err(ZuError::InvalidArgument(
+            "a statement that writes needs a session, which owns the log a write goes through: open one with zu::db::Database or zu::session::Session".into(),
+        ));
+    }
     let args = bind_args(&query.params, params)?;
     Ok(Prepared {
         catalog,

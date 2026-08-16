@@ -458,6 +458,10 @@ mod tests {
             .query("CREATE PROPERTY GRAPH second ANY")
             .expect_err("refused");
         assert!(err.to_string().contains("read-only"), "{err}");
+        let err = conn
+            .query("INSERT (p:person {name: 'zoe'})")
+            .expect_err("refused");
+        assert!(err.to_string().contains("read-only"), "{err}");
     }
 
     /// The API refusal above is a courtesy; this is the guarantee. The
@@ -528,6 +532,34 @@ mod tests {
             .query("USE second MATCH (p) RETURN p")
             .expect_err("no tables there");
         assert!(seen.to_string().contains("no node table"), "{seen}");
+    }
+
+    /// A write through the API a caller actually holds: the connection
+    /// runs the statement, and the element it made answers the next
+    /// question asked of the same connection.
+    #[test]
+    fn a_connection_writes_and_reads_back_what_it_wrote() {
+        let (_dir, path) = scratch("write.zu1");
+        // The seeded table stores no properties and a new row needs a
+        // column to grow, so give it one.
+        let mut file = Zu1File::open(&path).expect("open");
+        let names: Vec<&[u8]> = vec![b"ada", b"bo", b"cy", b"di", b"ed", b"fi", b"gil", b"hal"];
+        crate::zu1::props::store_props(
+            &mut file,
+            "person",
+            &[("name", crate::zu1::props::PropValues::Str(&names))],
+        )
+        .expect("props");
+        drop(file);
+
+        let db = Database::open(&path).expect("open");
+        let mut conn = db.connect().expect("connect");
+        conn.query("INSERT (p:person {name: 'zoe'})")
+            .expect("insert");
+        let out = conn
+            .query("MATCH (p:person) WHERE p.name = 'zoe' RETURN p.name AS name")
+            .expect("read");
+        assert_eq!(out.rows.len(), 1, "the row that was written is there");
     }
 
     #[test]

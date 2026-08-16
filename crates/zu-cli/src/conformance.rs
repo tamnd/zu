@@ -159,8 +159,12 @@ const ENGINE: &[Declared] = &[
 const NOTES: &[&str] = &[
     "driven through `zu shell --format jsonl`, one long-lived process per session",
     "loaded through `zu convert`, which reads a SQLite database in zu's schema",
-    "the evaluator is a read-only subset, MATCH WHERE CALL UNWIND WITH RETURN, so every \
-     case that writes is answered with a syntax error rather than a skip",
+    "the evaluator is MATCH WHERE CALL UNWIND WITH RETURN, plus INSERT of node patterns \
+     standing on their own, so a case that writes anything else is answered with an error \
+     rather than a skip",
+    "an element is created in the node table whose own name is the label the pattern wrote, \
+     and a table is not created by naming one, so a case that inserts into a label its \
+     fixture did not declare is answered with a reference error",
     "a protocol fault, a malformed frame or an unknown op, reports no GQLSTATUS on purpose \
      and is scored on its message",
 ];

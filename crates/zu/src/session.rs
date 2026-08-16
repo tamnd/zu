@@ -223,6 +223,15 @@ impl Session {
         }
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
+        // A statement that writes writes first, and what it created is
+        // what the clauses after it read.
+        let (args, wrote) = self.write_elements(&cached, args)?;
+        if wrote && cached.query.columns.is_empty() {
+            // A write with nothing after it answers no rows, and the
+            // plan over it would produce one row of no columns, which
+            // is a different answer.
+            return Ok(QueryResult::new(Vec::new(), Vec::new()));
+        }
         let options = self.options.clone();
         if query::exec2_enabled() {
             let catalog = self.graph.catalog().clone();
@@ -250,6 +259,111 @@ impl Session {
             &args,
             &options,
         )
+    }
+
+    /// Runs the write half of a statement that has one, and returns the
+    /// arguments the plan reads: the parameters the caller bound, with
+    /// the created elements appended in the order the plan expects
+    /// them. The flag says whether anything was written, which is not
+    /// the same question as whether the argument list grew.
+    ///
+    /// Writing here rather than inside the executor is the seam
+    /// [`zu_query::plan::LogicalPlan::Insert`] describes: the executor
+    /// reads through a graph, and a graph reads.
+    fn write_elements(
+        &mut self,
+        cached: &CachedPlan,
+        mut args: Vec<Value>,
+    ) -> Result<(Vec<Value>, bool)> {
+        let Some(zu_query::binder::BoundClause::Insert { nodes }) = cached.query.clauses.first()
+        else {
+            return Ok((args, false));
+        };
+        let nodes = nodes.clone();
+        // Asked before anything is worked out, so that a read-only
+        // connection is told that it is read-only rather than told
+        // something about the statement.
+        crate::write::writable(self.graph.file())?;
+        // The values go through the same evaluator every other
+        // expression in the statement goes through, so a property
+        // written as 1 + 1 is two here for the same reason it is two in
+        // a WHERE.
+        let values = self.eval_row(cached, crate::insert::value_exprs(&nodes), &args)?;
+        let values = crate::insert::regroup(&nodes, values);
+        let new = crate::insert::plan_rows(self.graph.file_mut(), &nodes, &values)?;
+        self.write(|txn| crate::insert::stage(txn, &new))?;
+        // Each element arrives as a list of one, because the operator
+        // that binds it to its slot is the one that reads a list: one
+        // element in, one row out.
+        args.extend(new.iter().map(|node| Value::List(vec![node.value()])));
+        Ok((args, true))
+    }
+
+    /// Evaluates a handful of expressions that read no row, which is
+    /// what the property values of an `INSERT` are before there is
+    /// anything to insert into.
+    ///
+    /// It runs as a projection over the one empty row rather than
+    /// through an evaluator of its own, because a second evaluator is a
+    /// second set of answers: `1 / 0` and `'a' + 1` have to raise the
+    /// condition here that they raise in a WHERE, and the way to make
+    /// sure of that is to have one implementation.
+    fn eval_row(
+        &mut self,
+        cached: &CachedPlan,
+        exprs: Vec<zu_query::binder::BoundExpr>,
+        args: &[Value],
+    ) -> Result<Vec<Value>> {
+        if exprs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let items: Vec<zu_query::binder::BoundItem> = exprs
+            .into_iter()
+            .enumerate()
+            .map(|(i, expr)| zu_query::binder::BoundItem {
+                expr,
+                ty: zu_query::binder::Type::Any,
+                name: format!("#{i}"),
+                slot: None,
+                aggregate: false,
+            })
+            .collect();
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Empty),
+            items: items.clone(),
+        };
+        // The executor takes its projection items from the query rather
+        // than from the plan node, so the query it runs against has to
+        // be this projection and not the statement the values came out
+        // of. Everything else about the statement carries over: the
+        // parameters are the ones the caller bound and the labels are
+        // the ones it was bound against.
+        let columns = items.iter().map(|item| item.name.clone()).collect();
+        let query = zu_query::binder::BoundQuery {
+            clauses: vec![zu_query::binder::BoundClause::Project {
+                distinct: false,
+                items,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+                filter: None,
+            }],
+            variables: cached.query.variables.clone(),
+            params: cached.query.params.clone(),
+            columns,
+            path_shapes: std::collections::BTreeMap::new(),
+            labels: cached.query.labels.clone(),
+        };
+        let options = self.options.clone();
+        let out = exec::execute(
+            &plan,
+            &query,
+            &cached.schema,
+            &mut self.graph,
+            args,
+            &options,
+        )?;
+        Ok(out.rows.into_iter().next().unwrap_or_default())
     }
 
     /// Compiles a statement and pins it under an id. The id maps back
@@ -369,6 +483,10 @@ impl Session {
         self.refresh()?;
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
+        // A statement that writes writes here too, once, the way it
+        // would if it had been run: the plan reads what the write
+        // created and there is nothing for it to read otherwise.
+        let (args, _) = self.write_elements(&cached, args)?;
         let options = self.options.clone();
         let (_, profile) = exec::execute_profiled(
             &cached.plan,

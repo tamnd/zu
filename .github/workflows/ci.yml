@@ -268,6 +268,20 @@ jobs:
       # here rather than being noticed by a user loading a million rows.
       - run: ZU_GATE=1 cargo bench -p zu --bench append
 
+  capi-result:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The dx/02 section 3 gate on the C ABI's two read paths: what a
+      # chunked scan costs over a whole-column one, and what reading a
+      # chunk instead of a column buys a host that stops early. Both are
+      # ratios timed in one run over one column, so a shared runner
+      # moves neither, and both fail on the same defect from opposite
+      # sides: a chunked read that converts more than its chunk.
+      - run: ZU_GATE=1 cargo bench -p zu-capi --bench result
+
   corpus:
     runs-on: ubuntu-latest
     steps:

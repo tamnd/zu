@@ -53,6 +53,17 @@
 //! FFI boundary pays one call per column, not one per cell. That is
 //! the difference between an in-process point read spending its budget
 //! on the query or on the boundary.
+//!
+//! The same columns read out a chunk at a time as well, through
+//! `zu_result_chunk_count`, `zu_result_chunk`, and the
+//! `zu_result_chunk_col_*` accessors. The whole-column form is the
+//! right one for a point read, where the answer is small and one call
+//! is cheaper than a loop. The chunked form is the right one for
+//! anything large: it converts what was asked for rather than the whole
+//! column, and it holds one [`CHUNK_ROWS`]-row buffer per column
+//! instead of one buffer per column the length of the result. A host
+//! that reads a million-row answer into its own arrays as it goes, or
+//! that stops early, pays for what it read.
 
 // The pointer contract (what must be valid, who frees what, in which
 // order) is one contract for the whole surface; it lives in the module
@@ -592,7 +603,51 @@ pub struct ZuResult {
     f64_cols: Vec<Option<Vec<f64>>>,
     node_cols: Vec<Option<Vec<u64>>>,
     valid_cols: Vec<Option<Vec<u8>>>,
+    chunk_i64: Vec<Chunk<i64>>,
+    chunk_f64: Vec<Chunk<f64>>,
+    chunk_node: Vec<Chunk<u64>>,
+    chunk_valid: Vec<Chunk<u8>>,
     strs: HashMap<(u64, u32), CString>,
+}
+
+/// Rows in a chunk, which is the width the executor works in.
+///
+/// The library fixes it rather than letting a caller choose, because a
+/// chunk is going to be a vector the executor produced rather than a
+/// range this code slices, and a caller who had picked its own size
+/// would be asking for a regroup on every read. A caller that wants to
+/// know asks each chunk how many rows it has.
+const CHUNK_ROWS: usize = 2048;
+
+/// One reusable buffer per column and per accessor, holding whichever
+/// chunk was asked for last.
+///
+/// This is what the chunked path buys. A whole-column accessor converts
+/// every row and keeps the conversion until the result is freed, so a
+/// column of ten million rows costs eighty megabytes of buffer on top
+/// of the rows themselves, and a host that reads the first hundred rows
+/// and stops pays for all ten million. A chunk buffer is
+/// [`CHUNK_ROWS`] elements however long the result is, and converts
+/// only the chunks that were asked for.
+struct Chunk<T> {
+    /// Which chunk the buffer holds, so asking twice converts once.
+    at: Option<u64>,
+    buf: Vec<T>,
+}
+
+/// Not `derive(Default)`, which would want `T: Default` for a field
+/// that is only ever an empty `Vec`.
+impl<T> Default for Chunk<T> {
+    fn default() -> Chunk<T> {
+        Chunk {
+            at: None,
+            buf: Vec::new(),
+        }
+    }
+}
+
+fn chunk_slots<T>(cols: usize) -> Vec<Chunk<T>> {
+    (0..cols).map(|_| Chunk::default()).collect()
 }
 
 impl ZuResult {
@@ -610,6 +665,10 @@ impl ZuResult {
             f64_cols: vec![None; cols],
             node_cols: vec![None; cols],
             valid_cols: vec![None; cols],
+            chunk_i64: chunk_slots(cols),
+            chunk_f64: chunk_slots(cols),
+            chunk_node: chunk_slots(cols),
+            chunk_valid: chunk_slots(cols),
             strs: HashMap::new(),
         }
     }
@@ -1179,18 +1238,76 @@ pub unsafe extern "C" fn zu_result_cell_type(
     ZuStatus::Ok
 }
 
+/// What a cell reads as through one accessor, or `None` when the
+/// column holds something that accessor does not read.
+///
+/// One function per accessor, shared by the whole-column path and the
+/// chunked one, so the two can never come to disagree about what a
+/// column of bools or of nulls means. Disagreeing would be worse than
+/// a plain bug: a host that read a column both ways would get two
+/// answers and no reason to suspect either.
+fn as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Bool(b) => Some(i64::from(*b)),
+        Value::Null => Some(0),
+        _ => None,
+    }
+}
+
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(f) => Some(*f),
+        Value::Int(i) => Some(*i as f64),
+        Value::Null => Some(0.0),
+        _ => None,
+    }
+}
+
+fn as_node_offset(v: &Value) -> Option<u64> {
+    match v {
+        Value::Node { offset, .. } => Some(*offset),
+        Value::Null => Some(0),
+        _ => None,
+    }
+}
+
+/// Reads every column, because every column has nulls or does not.
+fn as_valid(v: &Value) -> Option<u8> {
+    Some(u8::from(!matches!(v, Value::Null)))
+}
+
+/// Appends one column of `rows` to `buf`, or answers false and leaves
+/// whatever it managed on the way to finding out, which the caller
+/// discards.
+fn fill<T>(
+    rows: &[Vec<Value>],
+    col: usize,
+    buf: &mut Vec<T>,
+    read: fn(&Value) -> Option<T>,
+) -> bool {
+    buf.reserve(rows.len());
+    for row in rows {
+        match read(&row[col]) {
+            Some(v) => buf.push(v),
+            None => return false,
+        }
+    }
+    true
+}
+
 /// The body every whole-column accessor shares: check the handle and
 /// the index, answer `Done` for a result with no rows, and otherwise
-/// build the column once and hand back a pointer into it. `build`
-/// returns `None` when the column holds something this accessor does
-/// not read, which is the caller asking the wrong question and so
-/// misuse rather than an engine failure.
+/// build the column once and hand back a pointer into it. `read`
+/// answering `None` for any cell means the column holds something this
+/// accessor does not read, which is the caller asking the wrong
+/// question and so misuse rather than an engine failure.
 unsafe fn column<T>(
     result: *mut ZuResult,
     col: u32,
     out: *mut *const T,
     slot: impl Fn(&mut ZuResult) -> &mut Option<Vec<T>>,
-    build: impl FnOnce(&QueryResult, usize) -> Option<Vec<T>>,
+    read: fn(&Value) -> Option<T>,
 ) -> ZuStatus {
     if out.is_null() {
         return ZuStatus::Misuse;
@@ -1209,12 +1326,72 @@ unsafe fn column<T>(
             return ZuStatus::Done;
         }
         if slot(r).is_none() {
-            match build(&r.result, c) {
-                Some(built) => *slot(r) = Some(built),
-                None => return ZuStatus::Misuse,
+            let mut buf = Vec::new();
+            if !fill(&r.result.rows, c, &mut buf, read) {
+                return ZuStatus::Misuse;
             }
+            *slot(r) = Some(buf);
         }
         unsafe { *out = slot(r).as_ref().expect("filled").as_ptr() };
+        ZuStatus::Ok
+    })
+}
+
+/// The half-open row range a chunk covers, or `None` when the result
+/// has no such chunk. A result with no rows has no chunks at all, so
+/// every index is out of range and the loop a caller writes runs zero
+/// times without needing a status to say so.
+fn chunk_span(total: usize, chunk: u64) -> Option<(usize, usize)> {
+    let lo = usize::try_from(chunk).ok()?.checked_mul(CHUNK_ROWS)?;
+    if lo >= total {
+        return None;
+    }
+    Some((lo, (lo + CHUNK_ROWS).min(total)))
+}
+
+/// The body every chunked accessor shares. Same checks as [`column`],
+/// and then one buffer per column reused across chunks: the chunk the
+/// buffer already holds costs nothing, and any other chunk replaces it.
+unsafe fn chunk_column<T>(
+    result: *mut ZuResult,
+    chunk: u64,
+    col: u32,
+    out: *mut *const T,
+    slot: impl Fn(&mut ZuResult) -> &mut Chunk<T>,
+    read: fn(&Value) -> Option<T>,
+) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = std::ptr::null() };
+    guard_status(|| {
+        if result.is_null() {
+            return ZuStatus::Misuse;
+        }
+        let r = unsafe { &mut *result };
+        let c = col as usize;
+        if c >= r.result.columns.len() {
+            return ZuStatus::Misuse;
+        }
+        let Some((lo, hi)) = chunk_span(r.result.rows.len(), chunk) else {
+            return ZuStatus::Misuse;
+        };
+        if slot(r).at != Some(chunk) {
+            // The buffer comes out so the rows can be borrowed while it
+            // is filled, and goes back either way: a column this
+            // accessor cannot read still leaves its allocation behind
+            // for the next chunk that it can.
+            let mut buf = std::mem::take(&mut slot(r).buf);
+            buf.clear();
+            let ok = fill(&r.result.rows[lo..hi], c, &mut buf, read);
+            let held = slot(r);
+            held.buf = buf;
+            held.at = ok.then_some(chunk);
+            if !ok {
+                return ZuStatus::Misuse;
+            }
+        }
+        unsafe { *out = slot(r).buf.as_ptr() };
         ZuStatus::Ok
     })
 }
@@ -1232,26 +1409,7 @@ pub unsafe extern "C" fn zu_result_col_i64(
     col: u32,
     out: *mut *const i64,
 ) -> ZuStatus {
-    unsafe {
-        column(
-            result,
-            col,
-            out,
-            |r| &mut r.i64_cols[col as usize],
-            |q, c| {
-                let mut v = Vec::with_capacity(q.rows.len());
-                for row in &q.rows {
-                    match &row[c] {
-                        Value::Int(i) => v.push(*i),
-                        Value::Bool(b) => v.push(i64::from(*b)),
-                        Value::Null => v.push(0),
-                        _ => return None,
-                    }
-                }
-                Some(v)
-            },
-        )
-    }
+    unsafe { column(result, col, out, |r| &mut r.i64_cols[col as usize], as_i64) }
 }
 
 /// The whole column as contiguous doubles; ints widen and nulls read
@@ -1262,26 +1420,7 @@ pub unsafe extern "C" fn zu_result_col_f64(
     col: u32,
     out: *mut *const f64,
 ) -> ZuStatus {
-    unsafe {
-        column(
-            result,
-            col,
-            out,
-            |r| &mut r.f64_cols[col as usize],
-            |q, c| {
-                let mut v = Vec::with_capacity(q.rows.len());
-                for row in &q.rows {
-                    match &row[c] {
-                        Value::Float(f) => v.push(*f),
-                        Value::Int(i) => v.push(*i as f64),
-                        Value::Null => v.push(0.0),
-                        _ => return None,
-                    }
-                }
-                Some(v)
-            },
-        )
-    }
+    unsafe { column(result, col, out, |r| &mut r.f64_cols[col as usize], as_f64) }
 }
 
 /// The whole column as the row offsets of its nodes, which is the
@@ -1301,17 +1440,7 @@ pub unsafe extern "C" fn zu_result_col_node_offset(
             col,
             out,
             |r| &mut r.node_cols[col as usize],
-            |q, c| {
-                let mut v = Vec::with_capacity(q.rows.len());
-                for row in &q.rows {
-                    match &row[c] {
-                        Value::Node { offset, .. } => v.push(*offset),
-                        Value::Null => v.push(0),
-                        _ => return None,
-                    }
-                }
-                Some(v)
-            },
+            as_node_offset,
         )
     }
 }
@@ -1330,14 +1459,158 @@ pub unsafe extern "C" fn zu_result_col_valid(
             col,
             out,
             |r| &mut r.valid_cols[col as usize],
-            |q, c| {
-                Some(
-                    q.rows
-                        .iter()
-                        .map(|row| u8::from(!matches!(row[c], Value::Null)))
-                        .collect(),
-                )
-            },
+            as_valid,
+        )
+    }
+}
+
+/* ---- chunked results ---- */
+
+/// How many chunks the result reads out in, 0 when it has no rows.
+///
+/// This is the loop bound a host writes, and the reason the chunked
+/// path needs no equivalent of [`ZuStatus::Done`]: a result with
+/// nothing in it has no chunks, so the loop runs zero times on its own.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_chunk_count(result: *const ZuResult) -> u64 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }.result.rows.len().div_ceil(CHUNK_ROWS) as u64
+}
+
+/// Where one chunk starts and how many rows it holds, either through a
+/// non-NULL out-parameter. `Misuse` when there is no such chunk.
+///
+/// A caller has to ask rather than multiply, because chunks are not
+/// promised to be the same size as each other. They are today, save the
+/// last, and they will stop being once a result is what the executor
+/// produced instead of a slice of what it already materialized.
+///
+/// The offset is what turns a chunk row back into the row number
+/// [`zu_result_cell_str`] and [`zu_result_cell_type`] take, which is
+/// how a host reads a string column alongside a chunked numeric one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_chunk(
+    result: *const ZuResult,
+    chunk: u64,
+    offset: *mut u64,
+    rows: *mut u64,
+) -> ZuStatus {
+    if !offset.is_null() {
+        unsafe { *offset = 0 };
+    }
+    if !rows.is_null() {
+        unsafe { *rows = 0 };
+    }
+    if result.is_null() {
+        return ZuStatus::Misuse;
+    }
+    let total = unsafe { &*result }.result.rows.len();
+    let Some((lo, hi)) = chunk_span(total, chunk) else {
+        return ZuStatus::Misuse;
+    };
+    if !offset.is_null() {
+        unsafe { *offset = lo as u64 };
+    }
+    if !rows.is_null() {
+        unsafe { *rows = (hi - lo) as u64 };
+    }
+    ZuStatus::Ok
+}
+
+/// One chunk of a column as contiguous i64s, reading what
+/// [`zu_result_col_i64`] reads.
+///
+/// The pointer is valid until the next call for this column and this
+/// accessor, which replaces the contents, or until the result is freed.
+/// That is the trade the chunked path makes: the whole-column
+/// accessors keep every conversion alive and so can promise a pointer
+/// that never changes, and these keep one chunk and so cannot. A host
+/// that needs a chunk to outlive the next one copies it, which is the
+/// copy it was going to make anyway on its way into a host array.
+///
+/// Chunks of one column are independent of chunks of another, so
+/// reading values and validity for the same chunk together, which is
+/// the usual thing to want, costs no reconversion.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_chunk_col_i64(
+    result: *mut ZuResult,
+    chunk: u64,
+    col: u32,
+    out: *mut *const i64,
+) -> ZuStatus {
+    unsafe {
+        chunk_column(
+            result,
+            chunk,
+            col,
+            out,
+            |r| &mut r.chunk_i64[col as usize],
+            as_i64,
+        )
+    }
+}
+
+/// One chunk of a column as contiguous doubles, reading what
+/// [`zu_result_col_f64`] reads.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_chunk_col_f64(
+    result: *mut ZuResult,
+    chunk: u64,
+    col: u32,
+    out: *mut *const f64,
+) -> ZuStatus {
+    unsafe {
+        chunk_column(
+            result,
+            chunk,
+            col,
+            out,
+            |r| &mut r.chunk_f64[col as usize],
+            as_f64,
+        )
+    }
+}
+
+/// One chunk of a column as node row offsets, reading what
+/// [`zu_result_col_node_offset`] reads.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_chunk_col_node_offset(
+    result: *mut ZuResult,
+    chunk: u64,
+    col: u32,
+    out: *mut *const u64,
+) -> ZuStatus {
+    unsafe {
+        chunk_column(
+            result,
+            chunk,
+            col,
+            out,
+            |r| &mut r.chunk_node[col as usize],
+            as_node_offset,
+        )
+    }
+}
+
+/// One chunk of a column's validity, one byte per row, reading what
+/// [`zu_result_col_valid`] reads.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_chunk_col_valid(
+    result: *mut ZuResult,
+    chunk: u64,
+    col: u32,
+    out: *mut *const u8,
+) -> ZuStatus {
+    unsafe {
+        chunk_column(
+            result,
+            chunk,
+            col,
+            out,
+            |r| &mut r.chunk_valid[col as usize],
+            as_valid,
         )
     }
 }

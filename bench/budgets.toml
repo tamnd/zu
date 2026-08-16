@@ -1235,3 +1235,33 @@ append_row_ns = 250.0
 # leaves two orders of magnitude of room and still fails long before
 # batching stops paying. Lower this ceiling, never raise it.
 append_batch_x = 0.05
+
+# The C ABI's chunked column reads against its whole-column ones
+# (crates/zu-capi/benches/result.rs). Two numbers, both ratios, so a
+# shared runner or a slow box moves neither: each pair is timed in one
+# run over the same column.
+#
+# scan reads a 500000 row int column both ways and sums it. The chunked
+# loop does the same conversions plus a call and a bounds check per
+# 2048 rows, so the honest expectation is a small tax; measured 0.53 to
+# 0.74 on the local M series and 0.92 on the ubuntu runner, under 1
+# everywhere because a 16 KiB buffer summed while it is still warm
+# beats streaming 3.9 MB out of memory, and closer to 1 on the runner
+# because its memory is quicker to reach relative to its cores. The
+# ceiling is set well above all of that, because what it exists to
+# catch is a per-chunk allocation or a rebuild of the whole column per
+# chunk, either of which lands far above 1 rather than just over it.
+# Lower this ceiling, never raise it.
+capi_chunk_scan_ratio = 1.5
+
+# early reads the first chunk and stops, which is the host that streams
+# into its own arrays or the user who pressed a key. The whole-column
+# call converts all 500000 rows before returning any, so the conversion
+# alone is the result's 244 chunks of work against one; measured 179 to
+# 337 on the local M series and 154 on the ubuntu runner, running above
+# 244 when the 3.9 MB the whole-column path allocates has to be faulted
+# in as well and below it when that memory was already warm. The floor
+# is set under the slowest of those, with room for a noisy vCPU, and
+# still fails immediately if a chunked read ever converts more than its
+# chunk. Raise this floor, never lower it.
+capi_chunk_early_speedup = 50.0

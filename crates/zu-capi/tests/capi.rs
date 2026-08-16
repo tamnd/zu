@@ -13,9 +13,11 @@ use zu::{
     zu_config_set_z, zu_conn_close, zu_connect, zu_database_close, zu_database_open_z,
     zu_database_path, zu_error_code, zu_error_free, zu_error_message, zu_error_severity,
     zu_error_status, zu_execute, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
-    zu_query_z, zu_result_cell_str, zu_result_cell_type, zu_result_col_f64, zu_result_col_i64,
-    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
-    zu_result_free, zu_result_rows, zu_stmt_close, zu_version,
+    zu_query_z, zu_result_cell_str, zu_result_cell_type, zu_result_chunk, zu_result_chunk_col_f64,
+    zu_result_chunk_col_i64, zu_result_chunk_col_node_offset, zu_result_chunk_col_valid,
+    zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64, zu_result_col_name,
+    zu_result_col_node_offset, zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_rows,
+    zu_stmt_close, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -24,6 +26,17 @@ fn seeded(path: &std::path::Path) {
     edges.sort_unstable();
     edges.dedup();
     zudb::zu1::graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load");
+}
+
+/// The same graph with enough people to fill several chunks, which the
+/// 97 of [`seeded`] deliberately do not.
+fn seeded_wide(path: &std::path::Path, nodes: u32) {
+    let mut db = zudb::zu1::file::Zu1File::create(path).expect("create");
+    let mut edges: Vec<(u32, u32)> = (0..nodes).map(|i| (i, (i * 7 + 3) % nodes)).collect();
+    edges.sort_unstable();
+    edges.dedup();
+    zudb::zu1::graph::bulk_load_as(&mut db, "person", "follows", u64::from(nodes), &edges)
+        .expect("load");
 }
 
 fn c(text: &str) -> CString {
@@ -96,6 +109,73 @@ unsafe fn cell_type(result: *mut ZuResult, row: u64, col: u32) -> i32 {
         ZuStatus::Ok
     );
     out
+}
+
+unsafe fn col_node_offset<'a>(result: *mut ZuResult, col: u32, rows: usize) -> &'a [u64] {
+    let mut out: *const u64 = ptr::null();
+    assert_eq!(
+        unsafe { zu_result_col_node_offset(result, col, &mut out) },
+        ZuStatus::Ok
+    );
+    assert!(!out.is_null());
+    unsafe { std::slice::from_raw_parts(out, rows) }
+}
+
+unsafe fn col_valid<'a>(result: *mut ZuResult, col: u32, rows: usize) -> &'a [u8] {
+    let mut out: *const u8 = ptr::null();
+    assert_eq!(
+        unsafe { zu_result_col_valid(result, col, &mut out) },
+        ZuStatus::Ok
+    );
+    assert!(!out.is_null());
+    unsafe { std::slice::from_raw_parts(out, rows) }
+}
+
+/// Where a chunk starts and how many rows it holds.
+unsafe fn chunk_span(result: *mut ZuResult, chunk: u64) -> (u64, u64) {
+    let mut offset = u64::MAX;
+    let mut rows = u64::MAX;
+    assert_eq!(
+        unsafe { zu_result_chunk(result, chunk, &mut offset, &mut rows) },
+        ZuStatus::Ok,
+        "chunk {chunk}"
+    );
+    (offset, rows)
+}
+
+unsafe fn chunk_i64<'a>(result: *mut ZuResult, chunk: u64, col: u32, rows: usize) -> &'a [i64] {
+    let mut out: *const i64 = ptr::null();
+    assert_eq!(
+        unsafe { zu_result_chunk_col_i64(result, chunk, col, &mut out) },
+        ZuStatus::Ok
+    );
+    assert!(!out.is_null());
+    unsafe { std::slice::from_raw_parts(out, rows) }
+}
+
+unsafe fn chunk_node_offset<'a>(
+    result: *mut ZuResult,
+    chunk: u64,
+    col: u32,
+    rows: usize,
+) -> &'a [u64] {
+    let mut out: *const u64 = ptr::null();
+    assert_eq!(
+        unsafe { zu_result_chunk_col_node_offset(result, chunk, col, &mut out) },
+        ZuStatus::Ok
+    );
+    assert!(!out.is_null());
+    unsafe { std::slice::from_raw_parts(out, rows) }
+}
+
+unsafe fn chunk_valid<'a>(result: *mut ZuResult, chunk: u64, col: u32, rows: usize) -> &'a [u8] {
+    let mut out: *const u8 = ptr::null();
+    assert_eq!(
+        unsafe { zu_result_chunk_col_valid(result, chunk, col, &mut out) },
+        ZuStatus::Ok
+    );
+    assert!(!out.is_null());
+    unsafe { std::slice::from_raw_parts(out, rows) }
 }
 
 #[test]
@@ -820,6 +900,215 @@ fn two_threads_on_one_connection_are_turned_away_rather_than_let_in() {
         let mut err: *mut ZuError = ptr::null_mut();
         let result = query(conn, "MATCH (a:person) RETURN count(a) AS n", &mut err);
         assert_eq!(col_i64(result, 0, 1), [97], "after {collisions} collisions");
+        zu_result_free(result);
+        zu_conn_close(conn);
+    }
+}
+
+/// The chunked path and the whole-column path are two ways of reading
+/// the same column, so the thing worth pinning is that they agree: the
+/// chunks laid end to end are the column, boundaries and all.
+#[test]
+fn a_column_read_chunk_by_chunk_is_the_column_read_whole() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("chunks.zu1");
+    // Two full chunks and a short one, so the last-chunk arithmetic is
+    // exercised rather than assumed.
+    let rows = 2048 * 2 + 173;
+    seeded_wide(&path, rows);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(
+            conn,
+            "MATCH (a:person) RETURN a AS n, a.id AS id ORDER BY id",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), u64::from(rows));
+        assert_eq!(zu_result_chunk_count(result), 3);
+
+        let whole = col_i64(result, 1, rows as usize);
+        let mut seen: Vec<i64> = Vec::with_capacity(rows as usize);
+        for chunk in 0..zu_result_chunk_count(result) {
+            let (offset, count) = chunk_span(result, chunk);
+            assert_eq!(
+                offset,
+                seen.len() as u64,
+                "chunk {chunk} starts where the last ended"
+            );
+            // The offset is what makes a chunk row a row number again.
+            assert_eq!(cell_type(result, offset, 1), ZU_TYPE_INT);
+            seen.extend_from_slice(chunk_i64(result, chunk, 1, count as usize));
+        }
+        assert_eq!(seen, whole, "the chunks are the column");
+
+        // Validity and node offsets chunk the same way, and a column is
+        // independent of its neighbour: reading the node column for a
+        // chunk does not disturb the int column's buffer for it.
+        let nodes = col_node_offset(result, 0, rows as usize);
+        let valid = col_valid(result, 1, rows as usize);
+        for chunk in 0..zu_result_chunk_count(result) {
+            let (offset, count) = chunk_span(result, chunk);
+            let lo = offset as usize;
+            let hi = lo + count as usize;
+            let ints = chunk_i64(result, chunk, 1, count as usize);
+            assert_eq!(
+                chunk_node_offset(result, chunk, 0, count as usize),
+                &nodes[lo..hi]
+            );
+            assert_eq!(
+                chunk_valid(result, chunk, 1, count as usize),
+                &valid[lo..hi]
+            );
+            assert_eq!(
+                ints,
+                &whole[lo..hi],
+                "the neighbour's read cost this one nothing"
+            );
+        }
+
+        // Chunks are readable in any order, so a buffer refilled
+        // backwards holds the chunk asked for and not the one before.
+        let (_, first_rows) = chunk_span(result, 0);
+        assert_eq!(
+            chunk_i64(result, 0, 1, first_rows as usize),
+            &whole[..first_rows as usize],
+            "going back to a chunk rereads it"
+        );
+
+        zu_result_free(result);
+        zu_conn_close(conn);
+    }
+}
+
+/// What the chunked accessors refuse, and what they do afterwards. A
+/// refusal has to leave the result usable, because a binding that
+/// probes a column to find out what it holds would otherwise poison it.
+#[test]
+fn a_chunk_out_of_range_or_of_the_wrong_kind_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("chunk-misuse.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(
+            conn,
+            "MATCH (a:person) RETURN a AS n, a.id AS id ORDER BY id",
+            &mut err,
+        );
+        // 97 people, well under one chunk.
+        assert_eq!(zu_result_chunk_count(result), 1);
+        let (offset, count) = chunk_span(result, 0);
+        assert_eq!((offset, count), (0, 97));
+
+        let mut lo = 7u64;
+        let mut n = 7u64;
+        assert_eq!(
+            zu_result_chunk(result, 1, &mut lo, &mut n),
+            ZuStatus::Misuse,
+            "there is no second chunk"
+        );
+        assert_eq!(
+            (lo, n),
+            (0, 0),
+            "a refusal writes zeroes, not the last answer"
+        );
+
+        let mut ints: *const i64 = ptr::null();
+        assert_eq!(
+            zu_result_chunk_col_i64(result, 1, 1, &mut ints),
+            ZuStatus::Misuse
+        );
+        assert!(ints.is_null());
+        assert_eq!(
+            zu_result_chunk_col_i64(result, 0, 9, &mut ints),
+            ZuStatus::Misuse,
+            "no ninth column"
+        );
+        // A node is not an integer here either, chunked or whole.
+        assert_eq!(
+            zu_result_chunk_col_i64(result, 0, 0, &mut ints),
+            ZuStatus::Misuse,
+            "a node column does not read as integers"
+        );
+        assert!(ints.is_null());
+
+        let mut floats: *const f64 = ptr::null();
+        assert_eq!(
+            zu_result_chunk_col_f64(result, 0, 0, &mut floats),
+            ZuStatus::Misuse,
+            "nor as doubles"
+        );
+
+        // And the result still works, both ways round.
+        let ids: Vec<i64> = (0..97).collect();
+        assert_eq!(chunk_i64(result, 0, 1, 97), ids, "a refusal left it usable");
+        assert_eq!(col_i64(result, 1, 97), ids);
+        // An int column widens chunked, the same as it does whole.
+        assert_eq!(
+            zu_result_chunk_col_f64(result, 0, 1, &mut floats),
+            ZuStatus::Ok
+        );
+        let widened: Vec<f64> = ids.iter().map(|i| *i as f64).collect();
+        assert_eq!(std::slice::from_raw_parts(floats, 97), widened);
+
+        zu_result_free(result);
+        zu_conn_close(conn);
+    }
+}
+
+/// A result with no rows has no chunks, which is how the chunked path
+/// says what ZU_DONE says on the whole-column path: the loop a caller
+/// writes runs zero times and asks nothing.
+#[test]
+fn an_empty_result_has_no_chunks_and_needs_no_done() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("chunk-empty.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(
+            conn,
+            "MATCH (a:person {id: 999999}) RETURN a.id AS id",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), 0);
+        assert_eq!(zu_result_chunk_count(result), 0);
+
+        let mut lo = 0u64;
+        let mut n = 0u64;
+        assert_eq!(
+            zu_result_chunk(result, 0, &mut lo, &mut n),
+            ZuStatus::Misuse
+        );
+        let mut ints: *const i64 = ptr::null();
+        assert_eq!(
+            zu_result_chunk_col_i64(result, 0, 0, &mut ints),
+            ZuStatus::Misuse
+        );
+        assert!(ints.is_null());
+
+        // NULL handles answer the same way the rest of the surface does.
+        assert_eq!(zu_result_chunk_count(ptr::null()), 0);
+        assert_eq!(
+            zu_result_chunk(ptr::null(), 0, &mut lo, &mut n),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_result_chunk_col_i64(ptr::null_mut(), 0, 0, &mut ints),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_result_chunk_col_i64(result, 0, 0, ptr::null_mut()),
+            ZuStatus::Misuse,
+            "nowhere to write the answer"
+        );
+
         zu_result_free(result);
         zu_conn_close(conn);
     }

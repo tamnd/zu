@@ -161,6 +161,10 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             expr,
             slot,
         },
+        LogicalPlan::Insert { input, nodes } => LogicalPlan::Insert {
+            input: Box::new(lift_close_filters(*input)),
+            nodes,
+        },
         LogicalPlan::TableFunction {
             input,
             func,
@@ -624,6 +628,18 @@ fn mark_asp_node(
                 est,
             )
         }
+        LogicalPlan::Insert { input, nodes } => {
+            // One row in, one row out, and the elements are created
+            // whatever the estimates say.
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
+            (
+                LogicalPlan::Insert {
+                    input: Box::new(input),
+                    nodes,
+                },
+                est,
+            )
+        }
         LogicalPlan::Unwind { input, expr, slot } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // Nothing bounds how wide a list is.
@@ -797,6 +813,10 @@ fn rewrite(
             input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
             slot,
+        }),
+        LogicalPlan::Insert { input, nodes } => Ok(LogicalPlan::Insert {
+            input: Box::new(rewrite(*input, query, schema, notes)?),
+            nodes,
         }),
         LogicalPlan::TableFunction {
             input,
@@ -1483,6 +1503,10 @@ fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
         }
         LogicalPlan::Unwind { input, slot, .. } => {
             out.insert(*slot);
+            bound_slots(input, out);
+        }
+        LogicalPlan::Insert { input, nodes } => {
+            out.extend(nodes.iter().map(|node| node.slot));
             bound_slots(input, out);
         }
         LogicalPlan::TableFunction { input, slots, .. } => {
@@ -2321,6 +2345,7 @@ mod tests {
                 LogicalPlan::ScanNodes { input, .. }
                 | LogicalPlan::Filter { input, .. }
                 | LogicalPlan::Unwind { input, .. }
+                | LogicalPlan::Insert { input, .. }
                 | LogicalPlan::TableFunction { input, .. }
                 | LogicalPlan::Project { input, .. }
                 | LogicalPlan::Aggregate { input, .. }

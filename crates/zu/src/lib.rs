@@ -22,6 +22,7 @@ pub mod convert;
 pub mod db;
 #[cfg(test)]
 mod exec2_tests;
+mod insert;
 pub mod list_text;
 pub mod query;
 pub mod session;

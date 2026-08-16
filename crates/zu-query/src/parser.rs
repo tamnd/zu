@@ -73,8 +73,8 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "INSERT", "SET", "REMOVE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT",
-    "START", "COMMIT", "ROLLBACK", "SESSION", "FINISH", "FOR",
+    "CREATE", "SET", "REMOVE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT", "START",
+    "COMMIT", "ROLLBACK", "SESSION", "FINISH", "FOR",
 ];
 
 /// Parses one zuQL query.
@@ -693,6 +693,12 @@ impl Parser<'_> {
         Ok(properties)
     }
 
+    /// Whether these clauses change the graph, which is what decides
+    /// whether the statement may end without a RETURN.
+    fn writes(clauses: &[Clause]) -> bool {
+        clauses.iter().any(|c| matches!(c, Clause::Insert { .. }))
+    }
+
     fn parse_query(&mut self) -> Result<Query> {
         let use_graph = self.parse_use_graph()?;
         let mut clauses = Vec::new();
@@ -710,6 +716,12 @@ impl Parser<'_> {
                     patterns,
                     filter,
                 });
+            } else if self.eat_kw("INSERT") {
+                let mut patterns = vec![self.parse_path()?];
+                while self.eat(&TokenKind::Comma) {
+                    patterns.push(self.parse_path()?);
+                }
+                clauses.push(Clause::Insert { patterns });
             } else if self.eat_kw("CALL") {
                 let name = self.expect_name("a table function name after CALL")?;
                 self.expect(&TokenKind::LParen)?;
@@ -754,6 +766,27 @@ impl Parser<'_> {
                         codes::C42001,
                         format!(
                             "{}: nothing may follow RETURN, found {}",
+                            position(self.source, token.start),
+                            token.kind.describe()
+                        ),
+                    ));
+                }
+                return Ok(Query { use_graph, clauses });
+            } else if Self::writes(&clauses)
+                && (self.peek().is_none() || self.at(&TokenKind::Semicolon))
+            {
+                // A write statement is allowed to end without
+                // projecting anything, and that is the ordinary way to
+                // write one: INSERT (x:Person) is a whole statement and
+                // its answer is that it worked. A read query is not
+                // allowed to, because a query nobody returns anything
+                // from asked a question and threw the answer away.
+                self.eat(&TokenKind::Semicolon);
+                if let Some(token) = self.peek() {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        format!(
+                            "{}: nothing may follow the end of a statement, found {}",
                             position(self.source, token.start),
                             token.kind.describe()
                         ),
@@ -2227,7 +2260,6 @@ mod tests {
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
         for (source, kw) in [
-            ("INSERT (x:Person {name: 'Zoe'})", "INSERT"),
             ("MATCH (p) SET p.age = 37 RETURN p", "SET"),
             ("MATCH (p) REMOVE p.age RETURN p", "REMOVE"),
             ("MATCH (p) DELETE p", "DELETE"),
@@ -2816,6 +2848,45 @@ mod tests {
     fn a_use_clause_still_wants_a_query_after_it() {
         assert!(parse_err("USE social").contains("empty query"));
         assert!(parse_err("USE").contains("a graph name"));
+    }
+
+    #[test]
+    fn an_insert_carries_the_patterns_it_was_written_with() {
+        let q = parsed("INSERT (x:person {name: 'zoe'}), (y:person) RETURN x, y");
+        let Clause::Insert { patterns } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0].start.var.as_deref(), Some("x"));
+        assert_eq!(
+            patterns[0].start.label,
+            Some(LabelExpr::Label("person".to_string()))
+        );
+        assert_eq!(patterns[0].start.props.len(), 1);
+        assert_eq!(patterns[1].start.var.as_deref(), Some("y"));
+        assert!(patterns[1].steps.is_empty());
+    }
+
+    /// An edge parses here and is refused later, because what the
+    /// parser sees is a path like any other and which parts of the
+    /// write surface are in yet is not a question about syntax.
+    #[test]
+    fn an_insert_takes_an_edge_pattern() {
+        let q = parsed("INSERT (a:person)-[k:knows]->(b:person)");
+        let Clause::Insert { patterns } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(patterns[0].steps.len(), 1);
+    }
+
+    /// A statement that writes has said what it is for by the time it
+    /// ends, so it need not project anything; a statement that only
+    /// reads still has to.
+    #[test]
+    fn a_write_can_end_without_a_return_and_a_read_cannot() {
+        let q = parsed("INSERT (x:person {name: 'zoe'})");
+        assert_eq!(q.clauses.len(), 1);
+        assert!(parse_err("MATCH (n:person)").contains("RETURN"));
     }
 
     #[test]

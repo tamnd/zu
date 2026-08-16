@@ -16,8 +16,8 @@ use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{
-    BoundClause, BoundExpr, BoundInsertNode, BoundItem, BoundQuery, Func, MatchKind, Schema,
-    TableFunc,
+    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, Func,
+    MatchKind, Schema, TableFunc,
 };
 
 /// What a bracket does with an outer row the operators inside it
@@ -152,6 +152,7 @@ pub enum LogicalPlan {
     Insert {
         input: Box<LogicalPlan>,
         nodes: Vec<BoundInsertNode>,
+        rels: Vec<BoundInsertRel>,
     },
     /// A table function source: the engine kernel runs once over `rel`
     /// and yields one row per node of its domain, node slot first.
@@ -239,13 +240,17 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                     };
                 }
             }
-            BoundClause::Insert { nodes } => {
+            BoundClause::Insert { nodes, rels } => {
                 for node in nodes {
                     bound.insert(node.slot);
+                }
+                for rel in rels {
+                    bound.insert(rel.slot);
                 }
                 plan = LogicalPlan::Insert {
                     input: plan.boxed(),
                     nodes: nodes.clone(),
+                    rels: rels.clone(),
                 };
             }
             BoundClause::Unwind { expr, slot } => {
@@ -551,8 +556,8 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             );
             render(input, query, schema, depth + 1, out);
         }
-        LogicalPlan::Insert { input, nodes } => {
-            let written: Vec<String> = nodes
+        LogicalPlan::Insert { input, nodes, rels } => {
+            let mut written: Vec<String> = nodes
                 .iter()
                 .map(|node| {
                     let table = schema
@@ -574,6 +579,21 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                     }
                 })
                 .collect();
+            // An edge prints as the step it was written as, with the
+            // ends named rather than repeated in full, since the
+            // elements themselves are listed just above.
+            written.extend(rels.iter().map(|rel| {
+                let table = schema
+                    .rel_by_id(rel.table)
+                    .map(|r| r.name.as_str())
+                    .unwrap_or("?");
+                format!(
+                    "({})-[{}:{table}]->({})",
+                    slot_name(query, rel.src),
+                    slot_name(query, rel.slot),
+                    slot_name(query, rel.dst)
+                )
+            }));
             let _ = writeln!(out, "{pad}Insert {}", written.join(", "));
             render(input, query, schema, depth + 1, out);
         }
@@ -855,6 +875,19 @@ mod tests {
             [
                 "Project x.id AS id",
                 "Insert (x:Person {name: $who}), (y:Person)",
+            ],
+            "got:\n{text}"
+        );
+
+        // An edge prints as the step it was written as, pointing the
+        // way it is stored whichever way round it was written.
+        let text = explained("INSERT (x:Person)<-[k:KNOWS]-(y:Person) RETURN k");
+        let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+        assert_eq!(
+            lines,
+            [
+                "Project k",
+                "Insert (x:Person), (y:Person), (y)-[k:KNOWS]->(x)",
             ],
             "got:\n{text}"
         );

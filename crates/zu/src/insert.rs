@@ -8,9 +8,10 @@
 //! method on that trait reads, while appending a row needs the file, so
 //! for now the session does the writing and the plan reads what came
 //! of it. Everything in here is what has to happen in between: work out
-//! what each column of each new row holds, stage the rows in one
-//! transaction, and hand the created elements to the plan as arguments
-//! past the last declared parameter.
+//! what each column of each new row holds, work out which rows the
+//! edges between them run between, stage all of it in one transaction,
+//! and hand the created elements to the plan as arguments past the last
+//! declared parameter.
 //!
 //! What a column takes is decided here rather than by the binder,
 //! because a node table's property columns are not in the schema the
@@ -19,7 +20,7 @@
 //! column, and where a value the column cannot hold is refused.
 
 use zu_common::{FloatBits, LogicalType, Result, Temporal, ZuError};
-use zu_query::binder::{BoundExpr, BoundInsertNode};
+use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
 use crate::query::Value;
 use crate::zu1::file::Zu1File;
@@ -77,8 +78,67 @@ pub(crate) fn plan_rows(
     Ok(out)
 }
 
+/// One edge about to be created: which table, and the two rows it runs
+/// between.
+pub(crate) struct NewRel {
+    pub(crate) table: u32,
+    pub(crate) src: u64,
+    pub(crate) dst: u64,
+}
+
+impl NewRel {
+    /// The value the plan binds for this edge once it exists.
+    pub(crate) fn value(&self) -> Value {
+        Value::Rel {
+            table: self.table,
+            src: self.src,
+            dst: self.dst,
+        }
+    }
+}
+
+/// Works out which rows each edge runs between, given the nodes the
+/// same statement is creating.
+///
+/// The ends are slots and the binder has already refused every slot
+/// that is not one of these nodes, so a slot that is missing here is a
+/// binder that let something through rather than a statement anyone
+/// wrote.
+pub(crate) fn plan_edges(
+    nodes: &[BoundInsertNode],
+    new: &[NewNode],
+    rels: &[BoundInsertRel],
+) -> Result<Vec<NewRel>> {
+    let offset = |slot: usize| -> Result<u64> {
+        nodes
+            .iter()
+            .position(|node| node.slot == slot)
+            .map(|i| new[i].offset)
+            .ok_or_else(|| {
+                ZuError::InvalidArgument(
+                    "an edge is being created between elements this statement is not creating"
+                        .into(),
+                )
+            })
+    };
+    rels.iter()
+        .map(|rel| {
+            Ok(NewRel {
+                table: rel.table,
+                src: offset(rel.src)?,
+                dst: offset(rel.dst)?,
+            })
+        })
+        .collect()
+}
+
 /// Stages every row of one statement in the open transaction.
-pub(crate) fn stage(txn: &mut WriteTxn<'_>, new: &[NewNode]) -> Result<u64> {
+///
+/// The nodes go first. An edge names two rows by their offsets and the
+/// rows are only there once the appends are staged, so staging them the
+/// other way round would name rows that a replay of the log has not
+/// made yet.
+pub(crate) fn stage(txn: &mut WriteTxn<'_>, new: &[NewNode], edges: &[NewRel]) -> Result<u64> {
     let mut rows = 0;
     for node in new {
         let cols = node
@@ -87,6 +147,10 @@ pub(crate) fn stage(txn: &mut WriteTxn<'_>, new: &[NewNode]) -> Result<u64> {
             .map(|(col, cell)| (*col, vec![cell.clone()]))
             .collect();
         rows += txn.insert_nodes(node.table, cols)?;
+    }
+    for edge in edges {
+        txn.insert_rel(edge.table, edge.src, edge.dst);
+        rows += 1;
     }
     Ok(rows)
 }
@@ -484,17 +548,109 @@ mod tests {
         assert!(err.to_string().contains("label"), "got: {err}");
     }
 
-    /// The edge form parses and says which milestone it is waiting on,
-    /// which is the answer #211 gave the whole write surface and the
-    /// one this keeps for the part still missing.
+    /// An edge written between two new elements is an edge the next
+    /// hop walks, which is the whole of what writing one is for.
     #[test]
-    fn inserting_an_edge_says_it_is_not_implemented_yet() {
+    fn an_edge_between_two_new_elements_is_there_to_walk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = open(&dir, "edge.zu1");
 
+        let out = session
+            .run(
+                "INSERT (x:person {age: 30, name: 'zoe'})-[k:knows]->(y:person {age: 40, name: 'raj'}) \
+                 RETURN x.name AS from, y.name AS to",
+                &[],
+            )
+            .expect("insert an edge");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], Value::Str("zoe".into()));
+        assert_eq!(out.rows[0][1], Value::Str("raj".into()));
+
+        let after = session
+            .run(
+                "MATCH (p:person {name: 'zoe'})-[:knows]->(q) RETURN q.name AS name",
+                &[],
+            )
+            .expect("walk it");
+        assert_eq!(strings(&after, 0), ["raj"]);
+        // The edge the fixture came with is still the edge it came
+        // with, so the write added one rather than replacing the list.
+        let all = session
+            .run("MATCH (p:person)-[:knows]->(q) RETURN q.name AS name", &[])
+            .expect("every edge");
+        assert_eq!(all.rows.len(), 2);
+    }
+
+    /// The edge the statement wrote is a value the clauses after it
+    /// read, the same way a created element is.
+    #[test]
+    fn the_edge_a_statement_wrote_is_a_value_it_can_return() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "edge-value.zu1");
+
+        let out = session
+            .run(
+                "INSERT (x:person {age: 30, name: 'zoe'})<-[k:knows]-(y:person {age: 40, name: 'raj'}) \
+                 RETURN k AS edge",
+                &[],
+            )
+            .expect("insert an edge");
+        // The arrow points at zoe, so raj is the end it leaves, and
+        // both of them landed behind the two the fixture seeded.
+        assert_eq!(
+            out.rows[0][0],
+            Value::Rel {
+                table: session
+                    .catalog()
+                    .rel_tables()
+                    .iter()
+                    .find(|t| t.name == "knows")
+                    .expect("knows")
+                    .id,
+                src: 3,
+                dst: 2,
+            }
+        );
+    }
+
+    /// A name already standing for an element is that element again,
+    /// which is how one statement hangs two edges off one node.
+    #[test]
+    fn two_edges_leave_one_element_the_statement_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "two-edges.zu1");
+
+        session
+            .run(
+                "INSERT (a:person {age: 30, name: 'zoe'})-[:knows]->(b:person {age: 40, name: 'raj'}), \
+                 (a)-[:knows]->(c:person {age: 50, name: 'ivy'})",
+                &[],
+            )
+            .expect("two edges off one element");
+
+        let out = session
+            .run(
+                "MATCH (p:person {name: 'zoe'})-[:knows]->(q) RETURN q.name AS name ORDER BY name",
+                &[],
+            )
+            .expect("walk them");
+        assert_eq!(strings(&out, 0), ["ivy", "raj"]);
+    }
+
+    /// An edge onto something a `MATCH` found is a write for every row
+    /// the match answers, which is the next piece rather than this one,
+    /// and it says so by name.
+    #[test]
+    fn an_edge_onto_a_matched_element_says_it_is_not_implemented_yet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "matched.zu1");
+
         let err = session
-            .run("INSERT (a:person)-[k:knows]->(b:person)", &[])
-            .expect_err("edges are the next piece");
+            .run(
+                "MATCH (a:person {name: 'ada'}) INSERT (a)-[:knows]->(b:person {age: 1, name: 'new'})",
+                &[],
+            )
+            .expect_err("the next piece");
         assert!(
             err.to_string().contains("not implemented yet"),
             "got: {err}"

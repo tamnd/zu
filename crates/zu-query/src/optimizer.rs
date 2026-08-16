@@ -161,9 +161,10 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             expr,
             slot,
         },
-        LogicalPlan::Insert { input, nodes } => LogicalPlan::Insert {
+        LogicalPlan::Insert { input, nodes, rels } => LogicalPlan::Insert {
             input: Box::new(lift_close_filters(*input)),
             nodes,
+            rels,
         },
         LogicalPlan::TableFunction {
             input,
@@ -628,7 +629,7 @@ fn mark_asp_node(
                 est,
             )
         }
-        LogicalPlan::Insert { input, nodes } => {
+        LogicalPlan::Insert { input, nodes, rels } => {
             // One row in, one row out, and the elements are created
             // whatever the estimates say.
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
@@ -636,6 +637,7 @@ fn mark_asp_node(
                 LogicalPlan::Insert {
                     input: Box::new(input),
                     nodes,
+                    rels,
                 },
                 est,
             )
@@ -814,9 +816,10 @@ fn rewrite(
             expr,
             slot,
         }),
-        LogicalPlan::Insert { input, nodes } => Ok(LogicalPlan::Insert {
+        LogicalPlan::Insert { input, nodes, rels } => Ok(LogicalPlan::Insert {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             nodes,
+            rels,
         }),
         LogicalPlan::TableFunction {
             input,
@@ -1505,8 +1508,9 @@ fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
             out.insert(*slot);
             bound_slots(input, out);
         }
-        LogicalPlan::Insert { input, nodes } => {
+        LogicalPlan::Insert { input, nodes, rels } => {
             out.extend(nodes.iter().map(|node| node.slot));
+            out.extend(rels.iter().map(|rel| rel.slot));
             bound_slots(input, out);
         }
         LogicalPlan::TableFunction { input, slots, .. } => {

@@ -2148,16 +2148,21 @@ fn build_stages(
                 });
                 b.produced(chunk);
             }
-            LogicalPlan::Insert { nodes, .. } => {
+            LogicalPlan::Insert { nodes, rels, .. } => {
                 // The elements are already made: the session wrote them
                 // before it ran the plan and passed them in past the
                 // last declared parameter, so what is left here is
                 // binding each one to its slot. An argument holding one
                 // element unwinds to exactly one row, which is why this
                 // compiles to the operator that reads a list.
-                for node in nodes {
-                    let expr = BoundExpr::Param(node.value);
-                    let chunk = b.new_chunk(vec![node.slot], false);
+                let bind: Vec<(usize, usize)> = nodes
+                    .iter()
+                    .map(|node| (node.slot, node.value))
+                    .chain(rels.iter().map(|rel| (rel.slot, rel.value)))
+                    .collect();
+                for (slot, value) in bind {
+                    let expr = BoundExpr::Param(value);
+                    let chunk = b.new_chunk(vec![slot], false);
                     b.push(OpDesc::Unwind { expr, chunk });
                     b.produced(chunk);
                 }

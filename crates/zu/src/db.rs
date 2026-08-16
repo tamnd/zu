@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use zu_common::{Result, ZuError};
 use zu_query::exec;
 
+use crate::append::Appender;
 use crate::query::{QueryResult, Value};
 use crate::session::Session;
 use crate::zu1::file::Zu1File;
@@ -237,6 +238,23 @@ impl Connection {
     /// without running it.
     pub fn explain(&mut self, source: &str) -> Result<String> {
         self.session.explain(source)
+    }
+
+    /// Opens an appender on `table`, the bulk-load path of dx/04 §6.
+    ///
+    /// A load through statements pays a commit per row; an appender
+    /// buffers rows and pays one per flush. Only one appender exists at
+    /// a time on a connection, which the borrow says rather than a
+    /// check: it holds the file this connection reads through, so the
+    /// connection is unusable until the appender is closed or dropped,
+    /// and a row appended is a row the next statement on it sees.
+    pub fn appender(&mut self, table: &str) -> Result<Appender<'_>> {
+        if self.read_only {
+            return Err(ZuError::InvalidArgument(
+                "an appender writes and the connection is read-only".to_string(),
+            ));
+        }
+        Appender::open(self.session.file_mut(), table)
     }
 
     /// Whether this connection refuses writes.

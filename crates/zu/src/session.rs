@@ -25,6 +25,36 @@ use zu_query::plan::LogicalPlan;
 use crate::query::{self, QueryResult, Value, Zu1Graph};
 use crate::zu1::file::Zu1File;
 
+/// Replays a sidecar WAL that a previous writer left behind.
+///
+/// A bulk load commits by writing its segments and appending one frame
+/// naming them, and folds those segments into the base afterwards. The
+/// commit is durable at the frame and the base is what a query reads,
+/// so a crash between the two leaves rows that are on disk and that no
+/// statement can see. Folding them here is what closes that window:
+/// every writable open pays one existence check, and one that finds a
+/// log with something in it puts the rows where a reader looks before
+/// the first statement runs.
+///
+/// A read-only open cannot fold, and does not pretend to. It reads the
+/// base as it stands, which is the state the last fold left, and the
+/// next writable open recovers the rest.
+fn replay_sidecar(db: &mut Zu1File) -> Result<()> {
+    if !db.is_writable() {
+        return Ok(());
+    }
+    let path = crate::append::sidecar(db.path());
+    if !path.try_exists().unwrap_or(false) {
+        return Ok(());
+    }
+    let mut wal = crate::zu1::wal::Wal::open(&path)?;
+    if wal.is_empty() {
+        return Ok(());
+    }
+    let mut mvcc = crate::zu1::fold::recover(db, &wal)?;
+    crate::zu1::fold::checkpoint_fold(db, &mut mvcc, &mut wal)
+}
+
 /// Distinct query texts held before the cache starts over. Workloads
 /// cycle a handful of statements; overflow means every text is unique
 /// and caching buys nothing, so wholesale clearing loses nothing.
@@ -80,6 +110,7 @@ impl Session {
     /// [`crate::db::Database`] applies a read-only or memory-limited
     /// open without this module growing a constructor per option.
     pub fn on(mut db: Zu1File) -> Result<Session> {
+        replay_sidecar(&mut db)?;
         let (catalog, schema) = query::load_schema(&mut db)?;
         let epoch = db.db_header().epoch;
         let working = catalog.home_graph_id();
@@ -94,6 +125,17 @@ impl Session {
             next_stmt: 1,
             options: query::env_options(),
         })
+    }
+
+    /// The file this session reads through.
+    ///
+    /// The write paths that are not statements need it: the appender
+    /// of [`crate::append`] seals its buffer straight into this handle,
+    /// and it has to be this one rather than a second open of the same
+    /// path, so that the epoch the write publishes is the epoch
+    /// [`Self::refresh`] reads on the next statement.
+    pub fn file_mut(&mut self) -> &mut Zu1File {
+        self.graph.file_mut()
     }
 
     /// The execution switches this session runs statements under.

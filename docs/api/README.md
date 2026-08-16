@@ -50,16 +50,16 @@ Kinds, and what the current model holds of each:
 
 | Kind | Count | Notes |
 | --- | --- | --- |
-| `method` | 264 | An inherent method, or an item declared on a trait. |
-| `field` | 131 | Named, or a tuple position spelled `0`. |
+| `method` | 334 | An inherent method, or an item declared on a trait. |
+| `field` | 137 | Named, or a tuple position spelled `0`. |
+| `variant` | 112 | |
 | `constant` | 105 | Constants and statics both. |
-| `variant` | 96 | |
-| `function` | 81 | A free function. |
-| `struct` | 59 | |
-| `module` | 29 | |
-| `enum` | 26 | |
-| `type-alias` | 10 | |
-| `trait` | 5 | |
+| `function` | 88 | A free function. |
+| `struct` | 70 | |
+| `module` | 31 | |
+| `enum` | 29 | |
+| `type-alias` | 11 | |
+| `trait` | 6 | |
 
 There is one more kind the generator can emit and the committed model never does. `unresolved` is a public name whose target lives in a crate the generator was not handed, and it is recorded rather than dropped because a gap nobody notices is the worse failure. A test asserts the model contains none, since one means the crate list in `crates/xtask/src/main.rs` is short.
 
@@ -112,7 +112,7 @@ Modules are not mapped. A module is a namespace, and namespaces are the one part
 
 Adding a public symbol therefore takes two steps, in this order, and the failures say so: `cargo xtask model` to put it in the model, then an entry in the map to say what a binding owes it.
 
-Where the surface stands today: 858 mappable entities, 114 at tier 1, 111 at tier 2, 633 at tier 3. Tier 1 is `Database`, `Connection`, `Config`, the session under them, values in and out, results, and the error model, which is what a binding is. Tier 3 is almost all of `zu::zu1`, the storage engine a session talks to and a caller does not.
+Where the surface stands today: 892 mappable entities, 142 at tier 1, 111 at tier 2, 639 at tier 3. Tier 1 is `Database`, `Connection`, `Config`, the appender and the fields it takes, the session under them, values in and out, results, and the error model, which is what a binding is. Tier 3 is almost all of `zu::zu1`, the storage engine a session talks to and a caller does not.
 
 ## Consumers
 

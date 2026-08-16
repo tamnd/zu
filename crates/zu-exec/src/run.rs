@@ -129,6 +129,10 @@ struct Bracket<'a> {
     level: usize,
     cont: &'a [Op],
     kind: BracketKind,
+    /// Where a mark bracket writes what the group said about the outer
+    /// row: the level the group walks, which is the one the block was
+    /// written on, and the vector its `GroupMark` column sits at.
+    mark: Option<(usize, usize)>,
 }
 
 impl Bracket<'_> {
@@ -149,12 +153,30 @@ impl Bracket<'_> {
             // row that had none.
             BracketKind::Optional | BracketKind::Anti => !hit,
             BracketKind::Semi => hit,
-            // The pipeline compiles a mark as a column of the level
-            // the block was written on, never as a group, so a bracket
-            // never carries one here. What it would mean is that every
-            // outer row goes on whatever the answer was.
-            BracketKind::Mark { .. } => true,
+            // A mark decides nothing about the row it was asked over,
+            // so there is no row to send on from here. It writes what
+            // it found into a column instead, and the whole vector
+            // carries on together once the group has answered for all
+            // of its rows.
+            BracketKind::Mark { .. } => false,
         }
+    }
+
+    /// Writes what the group said about one outer row into the column
+    /// the predicate above the block reads it back through. `at` is the
+    /// row's own position in its chunk, so the column ends up in the
+    /// same order as the rows it answers about.
+    ///
+    /// Only a mark bracket has a column at all. The rest answer by
+    /// dropping the row or by carrying it, and the cheap marks, a bare
+    /// block's degree read and a join's directory word, are columns
+    /// built with the chunk and never come through here.
+    fn write_mark(&self, hit: bool, at: u32, set: &mut ChunkSet) {
+        let Some((level, vec)) = self.mark else {
+            return;
+        };
+        let negated = matches!(self.kind, BracketKind::Mark { negated: true, .. });
+        set.chunks[level].vecs[vec].values_mut::<i64>()[at as usize] = i64::from(hit != negated);
     }
 }
 
@@ -800,7 +822,8 @@ impl<'a> Worker<'a> {
                     | ColSpec::Key
                     | ColSpec::Func
                     | ColSpec::Mark { .. }
-                    | ColSpec::JoinMark { .. } => None,
+                    | ColSpec::JoinMark { .. }
+                    | ColSpec::GroupMark => None,
                 })
                 .collect(),
             scratch: Vec::new(),
@@ -1068,6 +1091,7 @@ impl<'a> Worker<'a> {
                         key,
                         negated,
                     } => self.join_mark_vec(table, *key, *negated, &level0),
+                    ColSpec::GroupMark => self.group_mark_vec(sc.rows as usize),
                 };
                 level0.vecs.push(v);
             }
@@ -1167,37 +1191,62 @@ impl<'a> Worker<'a> {
             // its scratch across outer rows, the same as any other
             // expand; a bracket that drove the group itself paid for
             // all of that once per outer row.
-            Op::Bracket { len, level, kind } => {
+            Op::Bracket {
+                len,
+                level,
+                kind,
+                mark,
+            } => {
                 let br = Bracket {
                     level: *level,
                     cont: &rest[*len..],
                     kind: *kind,
+                    mark: *mark,
                 };
                 // A left join wears the same bracket: the probe is what
                 // decides the row rather than the walk, and a probe
                 // that lands on nothing is the miss.
-                if let Op::Join { table, key, to } = &rest[0] {
-                    let table = table.clone();
-                    return self.join(&table, *key, *to, &rest[1..], set, Some(br));
+                let group = match &rest[0] {
+                    Op::Join { table, key, to } => {
+                        let table = table.clone();
+                        self.join(&table, *key, *to, &rest[1..], set, Some(br))
+                    }
+                    &Op::Expand {
+                        rel,
+                        dirs,
+                        to,
+                        close,
+                        ..
+                    } => {
+                        let hop = Hop {
+                            rel,
+                            dirs,
+                            to,
+                            batch: false,
+                            close,
+                        };
+                        self.expand(hop, &rest[1..], set, Some(br))
+                    }
+                    _ => unreachable!("the bracket compiles with its walk under it"),
+                };
+                // Every other kind sends its outer rows on one at a
+                // time from inside the group, since what it has to say
+                // about a row is whether the row is there at all. A
+                // mark has nothing to say about the row, only a column
+                // to fill, so the vector it was asked over is still
+                // whole when the group ends and the rest of the
+                // pipeline runs on it once, vectorized like anything
+                // else. A row the group never reached, which is a
+                // worker that stopped on someone else's quota, keeps
+                // the zero its column was built with and reads as a
+                // miss, so the stop drops rows and never invents one.
+                match matches!(kind, BracketKind::Mark { .. }) {
+                    true => {
+                        group?;
+                        self.run_ops(&rest[*len..], set)
+                    }
+                    false => group,
                 }
-                let &Op::Expand {
-                    rel,
-                    dirs,
-                    to,
-                    close,
-                    ..
-                } = &rest[0]
-                else {
-                    unreachable!("the bracket compiles with its expand under it");
-                };
-                let hop = Hop {
-                    rel,
-                    dirs,
-                    to,
-                    batch: false,
-                    close,
-                };
-                self.expand(hop, &rest[1..], set, Some(br))
             }
             Op::HasEdge {
                 rel,
@@ -1356,6 +1405,18 @@ impl<'a> Worker<'a> {
             // row id, so the key is never a node here.
             ScalarRef::Node { .. } => unreachable!("a node is not a join key"),
         }
+        v
+    }
+
+    /// The column a group's mark is written to, all misses. The bracket
+    /// fills a row of it as the group answers for that row, and the
+    /// predicate above the block reads the column once the group has
+    /// been round the whole vector. Nothing else writes it, so a row
+    /// the group never reached has to read as a miss, and that is what
+    /// the fill is for.
+    fn group_mark_vec(&mut self, rows: usize) -> ValueVector {
+        let mut v = ValueVector::flat_uninit(&mut self.arena, PhysType::Int64, rows);
+        v.values_mut::<i64>().fill(0);
         v
     }
 
@@ -1750,12 +1811,14 @@ impl<'a> Worker<'a> {
             // to say about it too: they sit between the descent and
             // the flag, so a row whose only neighbors they rejected is
             // a miss.
-            if let Some(br) = brk
-                && br.carries(self.bracket_hit)
-                && let Err(e) = self.bracket_row(br, set)
-            {
-                result = Err(e);
-                break 'srcs;
+            if let Some(br) = brk {
+                br.write_mark(self.bracket_hit, phys, set);
+                if br.carries(self.bracket_hit)
+                    && let Err(e) = self.bracket_row(br, set)
+                {
+                    result = Err(e);
+                    break 'srcs;
+                }
             }
             if self.stop.stopped() {
                 break;
@@ -1996,12 +2059,14 @@ impl<'a> Worker<'a> {
             }
             // The probe is done by here, and so are the group's own
             // predicates, which sit between the descent and the flag.
-            if let Some(br) = brk
-                && br.carries(self.bracket_hit)
-                && let Err(e) = self.bracket_row(br, set)
-            {
-                result = Err(e);
-                break 'srcs;
+            if let Some(br) = brk {
+                br.write_mark(self.bracket_hit, phys, set);
+                if br.carries(self.bracket_hit)
+                    && let Err(e) = self.bracket_row(br, set)
+                {
+                    result = Err(e);
+                    break 'srcs;
+                }
             }
             if self.stop.stopped() {
                 break;
@@ -2352,6 +2417,7 @@ impl<'a> Worker<'a> {
                     key,
                     negated,
                 } => self.join_mark_vec(table, *key, *negated, &chunk),
+                ColSpec::GroupMark => self.group_mark_vec(part.len()),
             };
             chunk.vecs.push(v);
         }

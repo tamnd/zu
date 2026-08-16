@@ -65,8 +65,16 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 
 /// Clause keywords the surface reserves but the v0 core does not parse
 /// yet; naming them beats "expected MATCH" when someone writes CREATE.
+///
+/// The write and transaction statements are here rather than absent
+/// because absence is the worse answer: INSERT is how GQL spells the
+/// statement that adds an element, so a reader who writes one and is
+/// told the parser expected MATCH has been sent looking for a typo
+/// instead of a milestone. CREATE is in the list for the opposite
+/// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "SET", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT",
+    "CREATE", "INSERT", "SET", "REMOVE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT",
+    "START", "COMMIT", "ROLLBACK", "SESSION", "FINISH", "FOR",
 ];
 
 /// Parses one zuQL query.
@@ -2210,6 +2218,47 @@ mod tests {
         );
         // CREATE that is not a catalog statement still says what it is.
         assert!(parse_err("CREATE (n) RETURN n").contains("CREATE is not implemented yet"));
+    }
+
+    /// A statement GQL defines and the v0 core does not parse should be
+    /// turned away by name. Being told the parser expected MATCH sends a
+    /// reader looking for a typo in a statement they spelled correctly,
+    /// which is the wrong place to look and the wrong thing to fix.
+    #[test]
+    fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
+        for (source, kw) in [
+            ("INSERT (x:Person {name: 'Zoe'})", "INSERT"),
+            ("MATCH (p) SET p.age = 37 RETURN p", "SET"),
+            ("MATCH (p) REMOVE p.age RETURN p", "REMOVE"),
+            ("MATCH (p) DELETE p", "DELETE"),
+            ("MATCH (p) DETACH DELETE p", "DETACH"),
+            ("START TRANSACTION READ WRITE", "START"),
+            ("COMMIT", "COMMIT"),
+            ("ROLLBACK", "ROLLBACK"),
+            ("SESSION SET VALUE $x = 1", "SESSION"),
+            ("MATCH (p) FINISH", "FINISH"),
+            ("FOR x IN [1, 2] RETURN x", "FOR"),
+        ] {
+            let err = parse_err(source);
+            assert!(
+                err.contains(&format!("{kw} is not implemented yet")),
+                "{source:?} was refused with {err:?}, which does not name {kw}"
+            );
+        }
+    }
+
+    /// ORDER BY, SKIP and LIMIT belong to the projection that precedes
+    /// them, so reserving statement keywords at the head of a clause
+    /// must not reach inside a RETURN that is parsing normally.
+    #[test]
+    fn reserving_statement_keywords_leaves_the_projection_alone() {
+        for source in [
+            "MATCH (n) RETURN n ORDER BY n.age",
+            "MATCH (n) RETURN n ORDER BY n.age DESC LIMIT 3",
+            "MATCH (n) WITH n ORDER BY n.age RETURN n",
+        ] {
+            parsed(source);
+        }
     }
 
     /// The label expression on the first node of the first pattern.

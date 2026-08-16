@@ -23,6 +23,8 @@ use zu_query::exec;
 use zu_query::plan::LogicalPlan;
 
 use crate::query::{self, QueryResult, Value, Zu1Graph};
+use crate::write::Writer;
+use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 
 /// Replays a sidecar WAL that a previous writer left behind.
@@ -99,6 +101,10 @@ pub struct Session {
     /// other part of the process last put in the environment, and
     /// [`crate::db::Config`] is the way a caller sets them on purpose.
     options: exec::Options,
+    /// The write side, opened on the first write and dropped whenever
+    /// the file goes out on loan. Opening it costs a log open and a
+    /// recovery pass, which a session that only reads should not pay.
+    writer: Option<Writer>,
 }
 
 impl Session {
@@ -124,6 +130,7 @@ impl Session {
             stmts: HashMap::new(),
             next_stmt: 1,
             options: query::env_options(),
+            writer: None,
         })
     }
 
@@ -134,8 +141,58 @@ impl Session {
     /// and it has to be this one rather than a second open of the same
     /// path, so that the epoch the write publishes is the epoch
     /// [`Self::refresh`] reads on the next statement.
+    ///
+    /// Handing out the file hands out the log with it. An appender
+    /// opens the same sidecar this session's writer commits to and can
+    /// truncate it, so the writer goes first and the next write opens
+    /// a fresh one. That costs a recovery pass and loses nothing: a
+    /// writer that has folded holds an empty overlay store, so what it
+    /// was holding is what recovery reconstructs.
     pub fn file_mut(&mut self) -> &mut Zu1File {
+        self.writer = None;
         self.graph.file_mut()
+    }
+
+    /// The catalog this session last loaded, which is how a caller
+    /// staging a write turns a label into the table id the transaction
+    /// wants.
+    pub fn catalog(&self) -> &Catalog {
+        self.graph.catalog()
+    }
+
+    /// The epoch this session last reloaded at.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Runs one write transaction: `stage` describes the change
+    /// against an open transaction, and what it returns comes back
+    /// once the change is committed and visible.
+    ///
+    /// Visible is the part that costs something. The write commits,
+    /// folds, and the session reloads, so by the time this returns the
+    /// next statement reads a catalog and a snapshot that both know
+    /// about the change. A closure that raises commits nothing and
+    /// publishes no epoch, which is the rollback an implicit
+    /// transaction owes.
+    pub fn write<T>(
+        &mut self,
+        stage: impl FnOnce(&mut crate::zu1::txn::WriteTxn<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.refresh()?;
+        if self.writer.is_none() {
+            // Opening the writer recovers and folds whatever the log
+            // holds, which can move the epoch, so the reload comes
+            // before the transaction rather than only after it.
+            self.writer = Some(Writer::open(self.graph.file_mut())?);
+            self.refresh()?;
+        }
+        let mut writer = self.writer.take().expect("opened just above");
+        let written = writer.write(self.graph.file_mut(), stage);
+        self.writer = Some(writer);
+        let written = written?;
+        self.refresh()?;
+        Ok(written.value)
     }
 
     /// The execution switches this session runs statements under.

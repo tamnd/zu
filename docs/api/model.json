@@ -2169,11 +2169,27 @@
       "name": "Session"
     },
     {
+      "id": "zu::session::Session::catalog",
+      "kind": "method",
+      "name": "catalog",
+      "of": "zu::session::Session",
+      "signature": "fn catalog(&self) -> &Catalog",
+      "doc": "The catalog this session last loaded, which is how a caller\nstaging a write turns a label into the table id the transaction\nwants."
+    },
+    {
       "id": "zu::session::Session::close_stmt",
       "kind": "method",
       "name": "close_stmt",
       "of": "zu::session::Session",
       "signature": "fn close_stmt(&mut self, stmt: u64) -> bool"
+    },
+    {
+      "id": "zu::session::Session::epoch",
+      "kind": "method",
+      "name": "epoch",
+      "of": "zu::session::Session",
+      "signature": "fn epoch(&self) -> u64",
+      "doc": "The epoch this session last reloaded at."
     },
     {
       "id": "zu::session::Session::execute",
@@ -2204,7 +2220,7 @@
       "name": "file_mut",
       "of": "zu::session::Session",
       "signature": "fn file_mut(&mut self) -> &mut Zu1File",
-      "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement."
+      "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs."
     },
     {
       "id": "zu::session::Session::on",
@@ -2268,6 +2284,14 @@
       "of": "zu::session::Session",
       "signature": "fn warm(&mut self, source: &str) -> Result<bool>",
       "doc": "Makes sure a statement is compiled and cached, and reports\nwhether it already was. A server preloads its statement set\nwith this at startup; the P0 plan-hit gate times the `true`\npath, which is exactly the work between receiving a known\nquery text and starting execution: the epoch check and the\ncache lookup."
+    },
+    {
+      "id": "zu::session::Session::write",
+      "kind": "method",
+      "name": "write",
+      "of": "zu::session::Session",
+      "signature": "fn write<T>(&mut self, stage: impl FnOnce) -> Result<T>",
+      "doc": "Runs one write transaction: `stage` describes the change\nagainst an open transaction, and what it returns comes back\nonce the change is committed and visible.\n\nVisible is the part that costs something. The write commits,\nfolds, and the session reloads, so by the time this returns the\nnext statement reads a catalog and a snapshot that both know\nabout the change. A closure that raises commits nothing and\npublishes no epoch, which is the rollback an implicit\ntransaction owes."
     },
     {
       "id": "zu::snapshot",
@@ -2682,6 +2706,80 @@
       "name": "schema_of",
       "signature": "fn schema_of(store: &zu_sqlite::SqliteStore) -> zu_common::Result<zu_query::binder::Schema>",
       "doc": "Builds the binder schema from the store's `zu_catalog`.\n\nRel tables created before schema version 2 carry no endpoints and\ncannot be bound; recreate them through `create_rel_table`."
+    },
+    {
+      "id": "zu::write",
+      "kind": "module",
+      "name": "write",
+      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nEvery commit that changed something folds, and that is worth being\nplain about, because it is not where this ends up. A fold rewrites\nevery column of every table the transaction touched, so paying one\nper statement is the wrong shape for a write workload, and the\noverlay exists precisely so a reader can see a committed row\nwithout one. But [`Zu1Graph`] reads the sealed file and nothing\nelse, so today a change that is not folded is a change the next\n`MATCH` cannot see, and a write nobody can read is not a write.\nFolding here keeps the visibility contract honest while the read\npath catches up; once it consults overlays this becomes a policy\nand a background checkpoint, and the only thing that changes here\nis when [`Writer::fold`] gets called.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
+    },
+    {
+      "id": "zu::write::Writer",
+      "kind": "struct",
+      "name": "Writer",
+      "doc": "The write side of one open database.\n\nOne of these is the single writer: it holds the only handle on its\noverlay store, and [`Mvcc::begin`] hands out that store's only\nmutable borrow, so a second transaction cannot exist while one is\nopen. Two writers over one file would be two overlay stores and one\nlog between them, and neither would be right, so there is exactly\none place a [`Writer`] lives, which is inside the session that owns\nthe file handle. An appender is the other writer of the same log,\nand it is kept apart the same way: it borrows the file, and a\nsession hands the file out only after dropping its writer."
+    },
+    {
+      "id": "zu::write::Writer::epoch",
+      "kind": "method",
+      "name": "epoch",
+      "of": "zu::write::Writer",
+      "signature": "fn epoch(&self) -> Epoch",
+      "doc": "The newest committed epoch."
+    },
+    {
+      "id": "zu::write::Writer::fold",
+      "kind": "method",
+      "name": "fold",
+      "of": "zu::write::Writer",
+      "signature": "fn fold(&mut self, db: &mut Zu1File) -> Result<()>",
+      "doc": "Seals every committed overlay into the file and truncates the\nlog. On return the file alone answers what the overlays\nanswered, and the header epoch has moved, so anything caching\nthe catalog or a decoded layout has to reload."
+    },
+    {
+      "id": "zu::write::Writer::open",
+      "kind": "method",
+      "name": "open",
+      "of": "zu::write::Writer",
+      "signature": "fn open(db: &mut Zu1File) -> Result<Writer>",
+      "doc": "Opens the write side of `db`, replaying whatever the log holds\nabove the file's last checkpoint and sealing it.\n\nThe sealing is what makes a reopen after a crash the same as\nnever having crashed: a crash between a commit and a checkpoint\nleaves committed transactions in the log and not in the file,\nrecovery brings them back as overlays, and an overlay is what no\nreader reads. A session replays the sidecar when it opens, so on\nthat path this usually finds an empty log and folds nothing;\ndoing it here too is what keeps a [`Writer`] correct for a\ncaller that did not come through a session.\n\nA read-only handle is refused here rather than at the first\ncommit, because opening the write side already creates the log,\nand a log beside a database nobody may write to is a file that\nonly ever confuses the next reader."
+    },
+    {
+      "id": "zu::write::Writer::path",
+      "kind": "method",
+      "name": "path",
+      "of": "zu::write::Writer",
+      "signature": "fn path(&self) -> &Path",
+      "doc": "The log this writer commits to."
+    },
+    {
+      "id": "zu::write::Writer::write",
+      "kind": "method",
+      "name": "write",
+      "of": "zu::write::Writer",
+      "signature": "fn write<T>(&mut self, db: &mut Zu1File, stage: impl FnOnce) -> Result<Written<T>>",
+      "doc": "Runs one transaction: `stage` describes the change against an\nopen [`WriteTxn`], and what it returns comes back alongside the\nepoch the change committed at.\n\nA closure that raises is the rollback path, and it costs\nnothing: staging is local to the transaction and the log has\nnot been touched, so dropping it on the way out of the `?` is\nthe whole of the undo. That is the shape an implicit\ntransaction wants, where a statement that raises anywhere in\nthe middle must leave the database as it found it."
+    },
+    {
+      "id": "zu::write::Written",
+      "kind": "struct",
+      "name": "Written",
+      "doc": "What one [`Writer::write`] did."
+    },
+    {
+      "id": "zu::write::Written::epoch",
+      "kind": "field",
+      "name": "epoch",
+      "of": "zu::write::Written",
+      "signature": "zu_common::Epoch",
+      "doc": "The epoch the change committed at. A transaction that staged\nnothing publishes nothing, so this is the epoch that was\nalready current when the closure did no work."
+    },
+    {
+      "id": "zu::write::Written::value",
+      "kind": "field",
+      "name": "value",
+      "of": "zu::write::Written",
+      "signature": "T",
+      "doc": "Whatever the staging closure returned, which for an insert is\nusually how many rows it appended."
     },
     {
       "id": "zu::zu1",

@@ -187,6 +187,11 @@ tier = 3
 reason = "the sqlite engine's own facade, reached by opening a sqlite path rather than by naming it"
 
 [[group]]
+prefix = "zu::write"
+tier = 3
+reason = "the log, the overlay store and the fold behind a session's writes, staged against the engine's own transaction type and naming tables by catalog id. A binding writes by running a statement."
+
+[[group]]
 prefix = "zu::zu1"
 tier = 3
 reason = "the storage engine: blocks, segments, catalog, WAL. A binding talks to a session, and a session talks to this."
@@ -212,6 +217,16 @@ tier = 3
 reason = "the same escape hatch under its own module path"
 
 [[entity]]
+id = "zu::session::Session::catalog"
+tier = 3
+reason = "the catalog behind the session, which exists so a caller staging a write can turn a label into the table id the transaction wants; a binding never sees a table id"
+
+[[entity]]
+id = "zu::session::Session::epoch"
+tier = 2
+reason = "the epoch the session last reloaded at, which a binding exposing whether some work published anything would want"
+
+[[entity]]
 id = "zu::session::Session::file_mut"
 tier = 3
 reason = "the engine file under the session, which the appender takes for the length of its borrow and which nothing outside this crate has a use for"
@@ -225,6 +240,11 @@ reason = "the execution switches on the engine's session, which a binding reache
 id = "zu::session::Session::set_options"
 tier = 3
 reason = "the same switches, set, which is what Config does on the caller's behalf"
+
+[[entity]]
+id = "zu::session::Session::write"
+tier = 3
+reason = "one write transaction staged against the engine's own WriteTxn, which is the shape the write statements are being built on rather than the shape a binding gets; a binding writes by running a statement"
 
 [[entity]]
 id = "zu::zu1::BLOCK_SIZE"

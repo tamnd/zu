@@ -243,6 +243,11 @@ pub struct Zu1File {
     /// their own slot to `None` before going in, so the pool never
     /// holds a reference to itself.
     forks: Option<Arc<std::sync::Mutex<Vec<Zu1File>>>>,
+    /// Whether this handle may write. A handle opened by
+    /// [`Self::open_read_only`] holds a descriptor the operating system
+    /// will refuse a write on, and this says so before the syscall does,
+    /// so the caller reads which database refused rather than `EBADF`.
+    writable: bool,
 }
 
 impl Zu1File {
@@ -276,6 +281,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            writable: true,
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
             pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         })
@@ -287,9 +293,23 @@ impl Zu1File {
         Self::open_on(Box::new(RealFile::open_rw(path)?), path)
     }
 
+    /// Opens an existing database on a descriptor the operating system
+    /// will not let this process write through. Every path that would
+    /// have written refuses first, with the name of the database in the
+    /// error, so a caller that asked for a read-only handle and then
+    /// wrote learns which promise it broke rather than which syscall
+    /// failed.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_kind(Box::new(RealFile::open_r(path)?), path, false)
+    }
+
     /// [`Self::open`] on an explicit file handle; the crash harness
     /// passes a recording one.
-    pub fn open_on(mut file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
+    pub fn open_on(file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
+        Self::open_kind(file, path, true)
+    }
+
+    fn open_kind(mut file: Box<dyn VfsFile>, path: &Path, writable: bool) -> Result<Self> {
         let mut head = [0u8; FILE_HEADER_SIZE + 2 * DB_HEADER_SIZE];
         file.read_exact_at(&mut head, 0)?;
         let file_header = FileHeader::decode(&head)?;
@@ -323,6 +343,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            writable,
             cache: Arc::new(BlockCache::new(DEFAULT_MEMORY_LIMIT / 2)),
             pools: Arc::new(DecodedPools::new(DEFAULT_MEMORY_LIMIT)),
         };
@@ -360,7 +381,11 @@ impl Zu1File {
             return Ok(fork);
         }
         Ok(Self {
-            file: Box::new(RealFile::open_rw(&self.path)?),
+            file: if self.writable {
+                Box::new(RealFile::open_rw(&self.path)?)
+            } else {
+                Box::new(RealFile::open_r(&self.path)?)
+            },
             path: self.path.clone(),
             file_header: self.file_header.clone(),
             db: self.db.clone(),
@@ -370,6 +395,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             pin_memo: None,
             forks: Some(Arc::clone(pool)),
+            writable: self.writable,
             cache: Arc::clone(&self.cache),
             pools: Arc::clone(&self.pools),
         })
@@ -452,10 +478,31 @@ impl Zu1File {
         Ok(())
     }
 
+    /// Whether this handle may write, which is false for one opened by
+    /// [`Self::open_read_only`].
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Refuses the call when this handle is read-only. Every durable
+    /// change goes through [`Self::write_block`] or [`Self::checkpoint`],
+    /// so the two of them are the whole gate: a block nothing wrote and
+    /// a header that never flipped leave the file as it was found.
+    fn check_writable(&self, what: &'static str) -> Result<()> {
+        if self.writable {
+            return Ok(());
+        }
+        Err(ZuError::InvalidArgument(format!(
+            "{what} on {}, which is open read-only",
+            self.path.display()
+        )))
+    }
+
     /// Writes one full block at `ptr` and drops any cached frame for it,
     /// so the next read refills from the file.
     pub fn write_block(&mut self, ptr: BlockPtr, data: &[u8]) -> Result<()> {
         assert_eq!(data.len(), BLOCK_SIZE as usize, "blocks are fixed size");
+        self.check_writable("write")?;
         self.check_ptr(ptr)?;
         self.pin_memo = None;
         self.cache.remove(ptr);
@@ -538,6 +585,7 @@ impl Zu1File {
     /// the epoch, write the header into the inactive slot, fsync again. A
     /// crash between the two syncs leaves the previous epoch intact.
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.check_writable("checkpoint")?;
         // Everything already free, everything freed this transaction, and
         // the old free-list chain itself are all unreferenced once this
         // checkpoint publishes, so they form the new list. Chain storage

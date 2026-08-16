@@ -63,11 +63,23 @@ pub struct Session {
     plans: HashMap<String, Arc<CachedPlan>>,
     stmts: HashMap<u64, String>,
     next_stmt: u64,
+    /// The execution switches every statement on this session runs
+    /// under, read from the environment once at open. Reading them per
+    /// statement would make a query's thread count depend on what some
+    /// other part of the process last put in the environment, and
+    /// [`crate::db::Config`] is the way a caller sets them on purpose.
+    options: exec::Options,
 }
 
 impl Session {
     pub fn open(path: &Path) -> Result<Session> {
-        let mut db = Zu1File::open(path)?;
+        Session::on(Zu1File::open(path)?)
+    }
+
+    /// A session over a file handle the caller opened, which is how
+    /// [`crate::db::Database`] applies a read-only or memory-limited
+    /// open without this module growing a constructor per option.
+    pub fn on(mut db: Zu1File) -> Result<Session> {
         let (catalog, schema) = query::load_schema(&mut db)?;
         let epoch = db.db_header().epoch;
         let working = catalog.home_graph_id();
@@ -80,7 +92,21 @@ impl Session {
             plans: HashMap::new(),
             stmts: HashMap::new(),
             next_stmt: 1,
+            options: query::env_options(),
         })
+    }
+
+    /// The execution switches this session runs statements under.
+    pub fn options(&self) -> &exec::Options {
+        &self.options
+    }
+
+    /// Replaces them. [`crate::db::Config`] is the supported way to do
+    /// this; the setter is here because the switches belong to the
+    /// session and a caller holding one directly should not have to
+    /// reach through the environment to change them.
+    pub fn set_options(&mut self, options: exec::Options) {
+        self.options = options;
     }
 
     /// Runs one query, compiling it on the first sighting of this text
@@ -98,7 +124,7 @@ impl Session {
         }
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
-        let options = query::env_options();
+        let options = self.options.clone();
         if query::exec2_enabled() {
             let catalog = self.graph.catalog().clone();
             let warm = std::mem::take(&mut self.snap);
@@ -220,6 +246,7 @@ impl Session {
         }
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
+        let options = self.options.clone();
         let catalog = self.graph.catalog().clone();
         let warm = std::mem::take(&mut self.snap);
         let mut snap =
@@ -230,7 +257,7 @@ impl Session {
             &cached.schema,
             &mut snap,
             &args,
-            &query::env_options(),
+            &options,
         );
         self.snap = snap.into_cache();
         Ok(out?.map(|(_, d)| d))
@@ -243,13 +270,14 @@ impl Session {
         self.refresh()?;
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
+        let options = self.options.clone();
         let (_, profile) = exec::execute_profiled(
             &cached.plan,
             &cached.query,
             &cached.schema,
             &mut self.graph,
             &args,
-            &query::env_options(),
+            &options,
         )?;
         Ok(profile)
     }

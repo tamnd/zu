@@ -28,6 +28,171 @@
       "doc": "Fold deltas and flip the root header."
     },
     {
+      "id": "zu::Config",
+      "kind": "struct",
+      "name": "Config",
+      "source": "zu::db::Config",
+      "doc": "How a database is opened and what its statements are allowed to do.\n\nEvery field has a default that works, so a caller sets the one thing\nit cares about and nothing else. The builder takes `self` and gives\nit back, so the whole configuration is one expression and a\nhalf-built `Config` is never a thing anybody holds."
+    },
+    {
+      "id": "zu::Config::memory_limit",
+      "kind": "method",
+      "name": "memory_limit",
+      "of": "zu::Config",
+      "signature": "fn memory_limit(self, bytes: usize) -> Config",
+      "doc": "Bytes the caches may hold, split between block frames and the\ndecoded-object pools by the ratios in perf/04 §2. This is a\nbudget for what the engine keeps warm, not a ceiling on the\nprocess: a query still allocates its own intermediate state."
+    },
+    {
+      "id": "zu::Config::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::Config",
+      "signature": "fn new() -> Config",
+      "doc": "The defaults: the 128 MiB cache budget the perf gates run under,\na thread count the executor picks from the machine, and writes\nallowed."
+    },
+    {
+      "id": "zu::Config::read_only",
+      "kind": "method",
+      "name": "read_only",
+      "of": "zu::Config",
+      "signature": "fn read_only(self, read_only: bool) -> Config",
+      "doc": "Opens the file on a descriptor this process cannot write\nthrough, so nothing here or under here can modify the database,\nand a database on a read-only mount opens rather than failing at\nthe open. Statements that would write are refused with an error\nnaming the database, before the operating system gets a chance\nto refuse them less helpfully."
+    },
+    {
+      "id": "zu::Config::threads",
+      "kind": "method",
+      "name": "threads",
+      "of": "zu::Config",
+      "signature": "fn threads(self, threads: usize) -> Config",
+      "doc": "Worker threads for the parallel stages of a query. Zero, the\ndefault, lets the executor pick `min(cores, 8)`; one forces\nsequential execution, which is what a caller running many\nconnections at once wants, since the parallelism is then across\nconnections and a thread pool per connection would oversubscribe\nthe machine."
+    },
+    {
+      "id": "zu::Connection",
+      "kind": "struct",
+      "name": "Connection",
+      "source": "zu::db::Connection",
+      "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of when it connected. It holds\nthe header it opened at, so a write another connection published\nsince is not visible to it, and a reader that wants the latest\ncatalog takes a new connection. Cross-connection visibility without\nreconnecting is the snapshot machinery of docs/08, not a header read\non the statement path."
+    },
+    {
+      "id": "zu::Connection::close_prepared",
+      "kind": "method",
+      "name": "close_prepared",
+      "of": "zu::Connection",
+      "signature": "fn close_prepared(&mut self, stmt: u64) -> bool",
+      "doc": "Releases a prepared statement, reporting whether the id was one."
+    },
+    {
+      "id": "zu::Connection::execute",
+      "kind": "method",
+      "name": "execute",
+      "of": "zu::Connection",
+      "signature": "fn execute(&mut self, source: &str) -> Result<u64>",
+      "doc": "Runs a statement for its effect and returns the number of rows\nit produced, which is zero for the catalog statements that are\nthe writes this milestone has."
+    },
+    {
+      "id": "zu::Connection::execute_prepared",
+      "kind": "method",
+      "name": "execute_prepared",
+      "of": "zu::Connection",
+      "signature": "fn execute_prepared(&mut self, stmt: u64, params: &[(&str, Value)]) -> Result<QueryResult>",
+      "doc": "Runs a prepared statement with a set of bindings."
+    },
+    {
+      "id": "zu::Connection::explain",
+      "kind": "method",
+      "name": "explain",
+      "of": "zu::Connection",
+      "signature": "fn explain(&mut self, source: &str) -> Result<String>",
+      "doc": "The plan this connection would run for `source`, rendered,\nwithout running it."
+    },
+    {
+      "id": "zu::Connection::is_read_only",
+      "kind": "method",
+      "name": "is_read_only",
+      "of": "zu::Connection",
+      "signature": "fn is_read_only(&self) -> bool",
+      "doc": "Whether this connection refuses writes."
+    },
+    {
+      "id": "zu::Connection::prepare",
+      "kind": "method",
+      "name": "prepare",
+      "of": "zu::Connection",
+      "signature": "fn prepare(&mut self, source: &str) -> Result<(u64, Vec<String>)>",
+      "doc": "Compiles a statement and pins it under an id, so a loop binds\nand executes without recompiling. The names it wants come back\nwith it, in the order the binder assigned them."
+    },
+    {
+      "id": "zu::Connection::query",
+      "kind": "method",
+      "name": "query",
+      "of": "zu::Connection",
+      "signature": "fn query(&mut self, source: &str) -> Result<QueryResult>",
+      "doc": "Runs one statement and returns its rows."
+    },
+    {
+      "id": "zu::Connection::query_with",
+      "kind": "method",
+      "name": "query_with",
+      "of": "zu::Connection",
+      "signature": "fn query_with(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult>",
+      "doc": "Runs one statement with parameters bound by name, without the\nleading `$`."
+    },
+    {
+      "id": "zu::Connection::session_mut",
+      "kind": "method",
+      "name": "session_mut",
+      "of": "zu::Connection",
+      "signature": "fn session_mut(&mut self) -> &mut Session",
+      "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
+    },
+    {
+      "id": "zu::Database",
+      "kind": "struct",
+      "name": "Database",
+      "source": "zu::db::Database",
+      "doc": "An open database: a path, a configuration, and the fact that both\nhave been checked against a real file.\n\nIt is `Send + Sync` and holds no file descriptor and no cache, which\nis what makes it shareable without a lock. The state that cannot be\nshared, the seek position of a handle and the plans compiled against\na catalog, lives on the connections instead, one set per connection,\nwhich is the same division the C ABI and every binding above it use."
+    },
+    {
+      "id": "zu::Database::config",
+      "kind": "method",
+      "name": "config",
+      "of": "zu::Database",
+      "signature": "fn config(&self) -> &Config",
+      "doc": "The configuration it was opened with."
+    },
+    {
+      "id": "zu::Database::connect",
+      "kind": "method",
+      "name": "connect",
+      "of": "zu::Database",
+      "signature": "fn connect(&self) -> Result<Connection>",
+      "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds."
+    },
+    {
+      "id": "zu::Database::open",
+      "kind": "method",
+      "name": "open",
+      "of": "zu::Database",
+      "signature": "fn open(path: impl AsRef<Path>) -> Result<Database>",
+      "doc": "Opens the database at `path` with the default configuration.\n\nThe file is opened once here and closed again, so a path that is\nnot a zu1 file, or is one this build cannot read, fails now\nrather than on the first connection. That open is the O(1) one\nof docs/04 §1: 12 KiB and two header slots."
+    },
+    {
+      "id": "zu::Database::open_with",
+      "kind": "method",
+      "name": "open_with",
+      "of": "zu::Database",
+      "signature": "fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Database>",
+      "doc": "[`Database::open`] with a configuration."
+    },
+    {
+      "id": "zu::Database::path",
+      "kind": "method",
+      "name": "path",
+      "of": "zu::Database",
+      "signature": "fn path(&self) -> &Path",
+      "doc": "Where this database lives."
+    },
+    {
       "id": "zu::DiagnosticRecord",
       "kind": "struct",
       "name": "DiagnosticRecord",
@@ -462,6 +627,174 @@
       "name": "zu1_to_sqlite",
       "signature": "fn zu1_to_sqlite(zu1_path: &std::path::Path, db_path: &std::path::Path) -> zu_common::Result<()>",
       "doc": "Converts a zu1 file into a fresh sqlite store at `db_path`."
+    },
+    {
+      "id": "zu::db",
+      "kind": "module",
+      "name": "db",
+      "doc": "The public Rust API: a [`Database`] you open once and share, and a\n[`Connection`] you take one of per thread.\n\n[`crate::session::Session`] is the engine's own entry point and it\nis one object doing both jobs, which works exactly as long as a\nprocess wants one. The moment two threads want to read the same\ngraph, or a pool wants to hand a connection out and take it back,\nthe two jobs come apart: the database is the thing that is shared\nand immutable, and the connection is the thing that is cheap,\nserial, and owned by whoever is using it. Every binding on the C ABI\ninherits this split (`dx/02` §3), so it is the Rust API that has to\nhave it first.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet rows = conn.query(\"MATCH (p:Person) RETURN p.name\")?;\n# Ok::<(), zu::ZuError>(())\n```\n\n[`Database::open`] takes a path and nothing else, because a\nconfiguration argument every caller has to write is a tax on every\ncaller to serve the few who set anything; [`Database::open_with`] is\nfor those few. Opening reads 12 KiB and pages the rest lazily, so\nconnecting is an open and a catalog load rather than a copy of the\nfile, and a connection is genuinely cheap to take."
+    },
+    {
+      "id": "zu::db::Config",
+      "kind": "struct",
+      "name": "Config",
+      "doc": "How a database is opened and what its statements are allowed to do.\n\nEvery field has a default that works, so a caller sets the one thing\nit cares about and nothing else. The builder takes `self` and gives\nit back, so the whole configuration is one expression and a\nhalf-built `Config` is never a thing anybody holds."
+    },
+    {
+      "id": "zu::db::Config::memory_limit",
+      "kind": "method",
+      "name": "memory_limit",
+      "of": "zu::db::Config",
+      "signature": "fn memory_limit(self, bytes: usize) -> Config",
+      "doc": "Bytes the caches may hold, split between block frames and the\ndecoded-object pools by the ratios in perf/04 §2. This is a\nbudget for what the engine keeps warm, not a ceiling on the\nprocess: a query still allocates its own intermediate state."
+    },
+    {
+      "id": "zu::db::Config::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::db::Config",
+      "signature": "fn new() -> Config",
+      "doc": "The defaults: the 128 MiB cache budget the perf gates run under,\na thread count the executor picks from the machine, and writes\nallowed."
+    },
+    {
+      "id": "zu::db::Config::read_only",
+      "kind": "method",
+      "name": "read_only",
+      "of": "zu::db::Config",
+      "signature": "fn read_only(self, read_only: bool) -> Config",
+      "doc": "Opens the file on a descriptor this process cannot write\nthrough, so nothing here or under here can modify the database,\nand a database on a read-only mount opens rather than failing at\nthe open. Statements that would write are refused with an error\nnaming the database, before the operating system gets a chance\nto refuse them less helpfully."
+    },
+    {
+      "id": "zu::db::Config::threads",
+      "kind": "method",
+      "name": "threads",
+      "of": "zu::db::Config",
+      "signature": "fn threads(self, threads: usize) -> Config",
+      "doc": "Worker threads for the parallel stages of a query. Zero, the\ndefault, lets the executor pick `min(cores, 8)`; one forces\nsequential execution, which is what a caller running many\nconnections at once wants, since the parallelism is then across\nconnections and a thread pool per connection would oversubscribe\nthe machine."
+    },
+    {
+      "id": "zu::db::Connection",
+      "kind": "struct",
+      "name": "Connection",
+      "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of when it connected. It holds\nthe header it opened at, so a write another connection published\nsince is not visible to it, and a reader that wants the latest\ncatalog takes a new connection. Cross-connection visibility without\nreconnecting is the snapshot machinery of docs/08, not a header read\non the statement path."
+    },
+    {
+      "id": "zu::db::Connection::close_prepared",
+      "kind": "method",
+      "name": "close_prepared",
+      "of": "zu::db::Connection",
+      "signature": "fn close_prepared(&mut self, stmt: u64) -> bool",
+      "doc": "Releases a prepared statement, reporting whether the id was one."
+    },
+    {
+      "id": "zu::db::Connection::execute",
+      "kind": "method",
+      "name": "execute",
+      "of": "zu::db::Connection",
+      "signature": "fn execute(&mut self, source: &str) -> Result<u64>",
+      "doc": "Runs a statement for its effect and returns the number of rows\nit produced, which is zero for the catalog statements that are\nthe writes this milestone has."
+    },
+    {
+      "id": "zu::db::Connection::execute_prepared",
+      "kind": "method",
+      "name": "execute_prepared",
+      "of": "zu::db::Connection",
+      "signature": "fn execute_prepared(&mut self, stmt: u64, params: &[(&str, Value)]) -> Result<QueryResult>",
+      "doc": "Runs a prepared statement with a set of bindings."
+    },
+    {
+      "id": "zu::db::Connection::explain",
+      "kind": "method",
+      "name": "explain",
+      "of": "zu::db::Connection",
+      "signature": "fn explain(&mut self, source: &str) -> Result<String>",
+      "doc": "The plan this connection would run for `source`, rendered,\nwithout running it."
+    },
+    {
+      "id": "zu::db::Connection::is_read_only",
+      "kind": "method",
+      "name": "is_read_only",
+      "of": "zu::db::Connection",
+      "signature": "fn is_read_only(&self) -> bool",
+      "doc": "Whether this connection refuses writes."
+    },
+    {
+      "id": "zu::db::Connection::prepare",
+      "kind": "method",
+      "name": "prepare",
+      "of": "zu::db::Connection",
+      "signature": "fn prepare(&mut self, source: &str) -> Result<(u64, Vec<String>)>",
+      "doc": "Compiles a statement and pins it under an id, so a loop binds\nand executes without recompiling. The names it wants come back\nwith it, in the order the binder assigned them."
+    },
+    {
+      "id": "zu::db::Connection::query",
+      "kind": "method",
+      "name": "query",
+      "of": "zu::db::Connection",
+      "signature": "fn query(&mut self, source: &str) -> Result<QueryResult>",
+      "doc": "Runs one statement and returns its rows."
+    },
+    {
+      "id": "zu::db::Connection::query_with",
+      "kind": "method",
+      "name": "query_with",
+      "of": "zu::db::Connection",
+      "signature": "fn query_with(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult>",
+      "doc": "Runs one statement with parameters bound by name, without the\nleading `$`."
+    },
+    {
+      "id": "zu::db::Connection::session_mut",
+      "kind": "method",
+      "name": "session_mut",
+      "of": "zu::db::Connection",
+      "signature": "fn session_mut(&mut self) -> &mut Session",
+      "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
+    },
+    {
+      "id": "zu::db::Database",
+      "kind": "struct",
+      "name": "Database",
+      "doc": "An open database: a path, a configuration, and the fact that both\nhave been checked against a real file.\n\nIt is `Send + Sync` and holds no file descriptor and no cache, which\nis what makes it shareable without a lock. The state that cannot be\nshared, the seek position of a handle and the plans compiled against\na catalog, lives on the connections instead, one set per connection,\nwhich is the same division the C ABI and every binding above it use."
+    },
+    {
+      "id": "zu::db::Database::config",
+      "kind": "method",
+      "name": "config",
+      "of": "zu::db::Database",
+      "signature": "fn config(&self) -> &Config",
+      "doc": "The configuration it was opened with."
+    },
+    {
+      "id": "zu::db::Database::connect",
+      "kind": "method",
+      "name": "connect",
+      "of": "zu::db::Database",
+      "signature": "fn connect(&self) -> Result<Connection>",
+      "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds."
+    },
+    {
+      "id": "zu::db::Database::open",
+      "kind": "method",
+      "name": "open",
+      "of": "zu::db::Database",
+      "signature": "fn open(path: impl AsRef<Path>) -> Result<Database>",
+      "doc": "Opens the database at `path` with the default configuration.\n\nThe file is opened once here and closed again, so a path that is\nnot a zu1 file, or is one this build cannot read, fails now\nrather than on the first connection. That open is the O(1) one\nof docs/04 §1: 12 KiB and two header slots."
+    },
+    {
+      "id": "zu::db::Database::open_with",
+      "kind": "method",
+      "name": "open_with",
+      "of": "zu::db::Database",
+      "signature": "fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Database>",
+      "doc": "[`Database::open`] with a configuration."
+    },
+    {
+      "id": "zu::db::Database::path",
+      "kind": "method",
+      "name": "path",
+      "of": "zu::db::Database",
+      "signature": "fn path(&self) -> &Path",
+      "doc": "Where this database lives."
     },
     {
       "id": "zu::gqlstatus",
@@ -1626,11 +1959,27 @@
       "doc": "EXPLAIN ANALYZE through the session: same cache, same options,\nprofiled execution."
     },
     {
+      "id": "zu::session::Session::on",
+      "kind": "method",
+      "name": "on",
+      "of": "zu::session::Session",
+      "signature": "fn on(db: Zu1File) -> Result<Session>",
+      "doc": "A session over a file handle the caller opened, which is how\n[`crate::db::Database`] applies a read-only or memory-limited\nopen without this module growing a constructor per option."
+    },
+    {
       "id": "zu::session::Session::open",
       "kind": "method",
       "name": "open",
       "of": "zu::session::Session",
       "signature": "fn open(path: &Path) -> Result<Session>"
+    },
+    {
+      "id": "zu::session::Session::options",
+      "kind": "method",
+      "name": "options",
+      "of": "zu::session::Session",
+      "signature": "fn options(&self) -> &exec::Options",
+      "doc": "The execution switches this session runs statements under."
     },
     {
       "id": "zu::session::Session::prepare",
@@ -1655,6 +2004,14 @@
       "of": "zu::session::Session",
       "signature": "fn run(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult>",
       "doc": "Runs one query, compiling it on the first sighting of this text\nand reusing the cached plan afterwards."
+    },
+    {
+      "id": "zu::session::Session::set_options",
+      "kind": "method",
+      "name": "set_options",
+      "of": "zu::session::Session",
+      "signature": "fn set_options(&mut self, options: exec::Options)",
+      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them."
     },
     {
       "id": "zu::session::Session::warm",
@@ -3613,6 +3970,14 @@
       "doc": "Marks `ptr` free. The committed epoch still references it, so it\nbecomes allocatable only after the next checkpoint; until then its\ncontents must survive a crash. Frees staged on a handle that closes\nwithout a checkpoint are dropped, which leaks the blocks until\nVACUUM rewrites the file, never corrupts it."
     },
     {
+      "id": "zu::zu1::file::Zu1File::is_writable",
+      "kind": "method",
+      "name": "is_writable",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn is_writable(&self) -> bool",
+      "doc": "Whether this handle may write, which is false for one opened by\n[`Self::open_read_only`]."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::open",
       "kind": "method",
       "name": "open",
@@ -3627,6 +3992,14 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn open_on(file: Box<dyn VfsFile>, path: &Path) -> Result<Self>",
       "doc": "[`Self::open`] on an explicit file handle; the crash harness\npasses a recording one."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::open_read_only",
+      "kind": "method",
+      "name": "open_read_only",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn open_read_only(path: &Path) -> Result<Self>",
+      "doc": "Opens an existing database on a descriptor the operating system\nwill not let this process write through. Every path that would\nhave written refuses first, with the name of the database in the\nerror, so a caller that asked for a read-only handle and then\nwrote learns which promise it broke rather than which syscall\nfailed."
     },
     {
       "id": "zu::zu1::file::Zu1File::pin_block",
@@ -5786,6 +6159,14 @@
       "of": "zu::zu1::vfs::RealFile",
       "signature": "fn open_or_create(path: &Path) -> Result<Self>",
       "doc": "Opens for reading and writing, creating when missing, the WAL\ncontract."
+    },
+    {
+      "id": "zu::zu1::vfs::RealFile::open_r",
+      "kind": "method",
+      "name": "open_r",
+      "of": "zu::zu1::vfs::RealFile",
+      "signature": "fn open_r(path: &Path) -> Result<Self>",
+      "doc": "Opens an existing file for reading only, so the operating\nsystem refuses a write this process should not have attempted\nand a database on a read-only mount opens at all."
     },
     {
       "id": "zu::zu1::vfs::RealFile::open_rw",

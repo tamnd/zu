@@ -661,6 +661,12 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
                 slot_names(&stage.chunk_slots[*chunk], query)
             )
         }
+        OpDesc::ArgSource { chunk, .. } => {
+            format!(
+                "ArgSource {}",
+                slot_names(&stage.chunk_slots[*chunk], query)
+            )
+        }
         OpDesc::Scan { tables, chunk } => format!(
             "Scan {}: {}",
             var(stage.chunk_slots[*chunk][0]),
@@ -1001,6 +1007,14 @@ enum OpDesc {
     Source,
     /// Feeds the previous stage's rows back in as unflat batches.
     RowSource {
+        chunk: usize,
+    },
+    /// Feeds an argument's rows in as unflat batches: the same thing
+    /// [`OpDesc::RowSource`] does for a stage boundary, for a row set
+    /// that came from a run of its own. That is what the clauses after
+    /// a write read.
+    ArgSource {
+        arg: usize,
         chunk: usize,
     },
     Scan {
@@ -1363,7 +1377,7 @@ fn expr_slots(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
 
 fn input_of(plan: &LogicalPlan) -> Option<&LogicalPlan> {
     match plan {
-        LogicalPlan::Empty => None,
+        LogicalPlan::Empty | LogicalPlan::Rows { .. } => None,
         LogicalPlan::ScanNodes { input, .. }
         | LogicalPlan::Expand { input, .. }
         | LogicalPlan::Filter { input, .. }
@@ -1786,6 +1800,7 @@ fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
         OpDesc::TableFunction { args, .. } => args.iter().for_each(|e| expr_slots(e, out)),
         OpDesc::Source
         | OpDesc::RowSource { .. }
+        | OpDesc::ArgSource { .. }
         | OpDesc::Scan { .. }
         | OpDesc::Flatten { .. }
         | OpDesc::BracketBegin
@@ -2073,6 +2088,9 @@ fn build_stages(
         linear.push(cur);
         cur = input;
     }
+    // The leaf is not an operator that pulls, so it stays out of the
+    // linearized run and is compiled below the rest of them.
+    let leaf = cur;
     linear.reverse();
 
     let projections: Vec<&Vec<BoundItem>> = query
@@ -2112,6 +2130,11 @@ fn build_stages(
     let mut stages = Vec::new();
     let mut b = StageBuilder::new(options.flat, options.wcoj, shapes.clone());
     b.push(OpDesc::Source);
+    if let LogicalPlan::Rows { slots, arg } = leaf {
+        let chunk = b.new_chunk(slots.clone(), false);
+        b.push(OpDesc::ArgSource { arg: *arg, chunk });
+        b.produced(chunk);
+    }
 
     let mut i = 0;
     while i < linear.len() {
@@ -2121,7 +2144,9 @@ fn build_stages(
             continue;
         }
         match linear[i] {
-            LogicalPlan::Empty => unreachable!("Empty never appears in the linearized ops"),
+            LogicalPlan::Empty | LogicalPlan::Rows { .. } => {
+                unreachable!("a leaf never appears in the linearized ops")
+            }
             LogicalPlan::ScanNodes { .. }
             | LogicalPlan::Expand { .. }
             | LogicalPlan::Filter { .. } => {
@@ -2148,24 +2173,16 @@ fn build_stages(
                 });
                 b.produced(chunk);
             }
-            LogicalPlan::Insert { nodes, rels, .. } => {
-                // The elements are already made: the session wrote them
-                // before it ran the plan and passed them in past the
-                // last declared parameter, so what is left here is
-                // binding each one to its slot. An argument holding one
-                // element unwinds to exactly one row, which is why this
-                // compiles to the operator that reads a list.
-                let bind: Vec<(usize, usize)> = nodes
-                    .iter()
-                    .map(|node| (node.slot, node.value))
-                    .chain(rels.iter().map(|rel| (rel.slot, rel.value)))
-                    .collect();
-                for (slot, value) in bind {
-                    let expr = BoundExpr::Param(value);
-                    let chunk = b.new_chunk(vec![slot], false);
-                    b.push(OpDesc::Unwind { expr, chunk });
-                    b.produced(chunk);
-                }
+            LogicalPlan::Insert { .. } => {
+                // A write is not an operator here. The session splits
+                // the statement at it, runs the clauses before it,
+                // writes once for each row they answered, and runs the
+                // clauses after it over those rows, because this
+                // executor reads through a graph and a graph reads.
+                // Nothing else runs a plan holding one of these.
+                return Err(invalid(
+                    "an INSERT is run by the session that owns the log, not by the executor".into(),
+                ));
             }
             LogicalPlan::TableFunction {
                 func,
@@ -2580,6 +2597,7 @@ fn live_unflat(descs: &[OpDesc]) -> Vec<Vec<usize>> {
                 unflat.insert(*chunk);
             }
             OpDesc::RowSource { chunk }
+            | OpDesc::ArgSource { chunk, .. }
             | OpDesc::Scan { chunk, .. }
             | OpDesc::IndexLookup { chunk, .. }
             | OpDesc::Expand { chunk, .. }
@@ -2635,6 +2653,7 @@ fn produced_rows(descs: &[OpDesc], ctx: &StageCtx, i: usize) -> u64 {
             retain: Some(f), ..
         } => ctx.chunks[*f].size as u64,
         OpDesc::RowSource { chunk }
+        | OpDesc::ArgSource { chunk, .. }
         | OpDesc::Scan { chunk, .. }
         | OpDesc::IndexLookup { chunk, .. }
         | OpDesc::Expand { chunk, .. }
@@ -3032,6 +3051,45 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let ncols = ctx.chunks[*chunk].cols.len();
             let mut cols = vec![Vec::with_capacity(end - start); ncols];
             for row in &ctx.rows[start..end] {
+                for (col, v) in cols.iter_mut().zip(row) {
+                    col.push(v.clone());
+                }
+            }
+            let c = &mut ctx.chunks[*chunk];
+            c.cols = cols;
+            c.size = end - start;
+            c.cur = None;
+            ctx.states[i].pos = end;
+            Ok(true)
+        }
+        OpDesc::ArgSource { arg, chunk } => {
+            let rows = match ctx.params.get(*arg) {
+                Some(Value::List(rows)) => rows,
+                other => {
+                    return Err(invalid(format!(
+                        "the rows a write carried across it arrive as a list, got {other:?}"
+                    )));
+                }
+            };
+            let start = ctx.states[i].pos;
+            if start >= rows.len() {
+                return Ok(false);
+            }
+            let end = (start + VECTOR_SIZE).min(rows.len());
+            let ncols = ctx.chunks[*chunk].cols.len();
+            let mut cols = vec![Vec::with_capacity(end - start); ncols];
+            for row in &rows[start..end] {
+                let Value::List(row) = row else {
+                    return Err(invalid(format!(
+                        "each row a write carried across it is a list, got {row:?}"
+                    )));
+                };
+                if row.len() != ncols {
+                    return Err(invalid(format!(
+                        "a row a write carried across it holds {} columns and the plan reads {ncols}",
+                        row.len()
+                    )));
+                }
                 for (col, v) in cols.iter_mut().zip(row) {
                     col.push(v.clone());
                 }

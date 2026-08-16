@@ -739,6 +739,12 @@ pub enum BoundClause {
     Insert {
         nodes: Vec<BoundInsertNode>,
         rels: Vec<BoundInsertRel>,
+        /// The slots in scope where the write runs, in slot order.
+        /// The write runs once for each row the clauses before it
+        /// answered, and the clauses after it read those rows rather
+        /// than reading the store again, so this is what the run
+        /// carries across the write.
+        carry: Vec<usize>,
     },
     Unwind {
         expr: BoundExpr,
@@ -795,22 +801,15 @@ pub struct BoundInsertNode {
     pub table: u32,
     /// The properties the pattern wrote, in written order.
     pub props: Vec<(String, BoundExpr)>,
-    /// Where the created element arrives in the argument list, past the
-    /// last declared parameter. The write runs before the plan does and
-    /// hands its elements in this way, which is what lets the plan read
-    /// one without the executor being able to write. The argument is a
-    /// list holding the one element, because binding it to its slot is
-    /// what the operator that reads a list does.
-    pub value: usize,
 }
 
 /// One edge an `INSERT` creates.
 ///
 /// The ends are slots rather than tables, because an edge is written
-/// between two rows and a row is what a slot holds. Both of them are
-/// nodes the same clause created: an end a `MATCH` bound is an end
-/// whose row is different on every row of the match, and the write
-/// runs once, before the plan does.
+/// between two rows and a row is what a slot holds. An end is either a
+/// node the same clause creates or one a `MATCH` found, and in the
+/// second case the row is a different one on every row the match
+/// answered, which is why the write runs once per row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundInsertRel {
     /// The slot the created edge binds, which is what a later clause
@@ -823,10 +822,6 @@ pub struct BoundInsertRel {
     pub src: usize,
     /// The slot holding the row the edge arrives at.
     pub dst: usize,
-    /// Where the created edge arrives in the argument list, past the
-    /// last declared parameter and past the nodes of the same clause.
-    /// The rest of the story is on [`BoundInsertNode::value`].
-    pub value: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1190,35 +1185,11 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
                     .into(),
             ));
         }
-        if i > 0 && matches!(clause, Clause::Insert { .. }) {
-            return Err(not_yet(
-                "INSERT after another clause, which is inserting what a MATCH found",
-            ));
-        }
         clauses.push(binder.bind_clause(clause)?);
         // An existence block written in the clause's WHERE is a match
         // of its own and runs where the predicate would have, which is
         // straight after the clause it was written in.
         clauses.append(&mut binder.pending);
-    }
-    // An inserted element is a value the plan reads and the write
-    // produces, and the write happens before execution, so it arrives
-    // as an argument past the last declared parameter. The index can
-    // only be handed out once every parameter the query writes is
-    // known, which is here.
-    let mut created = binder.params.len();
-    for clause in &mut clauses {
-        let BoundClause::Insert { nodes, rels } = clause else {
-            continue;
-        };
-        for node in nodes {
-            node.value = created;
-            created += 1;
-        }
-        for rel in rels {
-            rel.value = created;
-            created += 1;
-        }
     }
     Ok(BoundQuery {
         clauses,
@@ -1330,6 +1301,27 @@ impl Binder<'_> {
                 })
             }
             Clause::Insert { patterns } => {
+                // Read before the clause writes anything into scope,
+                // so that what the run carries across the write is the
+                // rows the clauses before it answered and nothing the
+                // write itself made.
+                let mut carry: Vec<usize> = self.scope.values().copied().collect();
+                // A path variable is assembled from the slots of its
+                // walk, and the ones the query never named are in no
+                // scope, so they come along by way of the shape.
+                let parts: Vec<usize> = carry
+                    .iter()
+                    .filter_map(|slot| self.path_shapes.get(slot))
+                    .flatten()
+                    .map(|part| match part {
+                        PathPart::Node(slot) | PathPart::Rel(slot) | PathPart::VarRel(slot) => {
+                            *slot
+                        }
+                    })
+                    .collect();
+                carry.extend(parts);
+                carry.sort_unstable();
+                carry.dedup();
                 let mut nodes = Vec::new();
                 let mut rels = Vec::new();
                 for path in patterns {
@@ -1350,7 +1342,7 @@ impl Binder<'_> {
                         left = right;
                     }
                 }
-                Ok(BoundClause::Insert { nodes, rels })
+                Ok(BoundClause::Insert { nodes, rels, carry })
             }
             Clause::Unwind { expr, alias } => {
                 let mut ctx = ExprCtx::new(false);
@@ -1878,19 +1870,23 @@ impl Binder<'_> {
         // else, so an end in the wrong table is an edge the file has
         // nowhere to put. Saying so here names both tables; letting it
         // through would write an edge whose endpoint no reader resolves.
+        // An end this clause writes is in the table its label named. An
+        // end a MATCH found is in whichever table the match narrowed it
+        // to, which can be more than one, and then the row itself is
+        // the answer and the write checks it against the one it has.
         for (end, want, side) in [(src, rel.from, "leaves"), (dst, rel.to, "arrives at")] {
-            let made = nodes.iter().find(|n| n.slot == end).ok_or_else(|| {
-                not_yet(
-                    "INSERT of an edge onto an element a MATCH found, which is a write for every row the match answers,",
-                )
-            })?;
-            if made.table != want {
+            let tables = match nodes.iter().find(|n| n.slot == end) {
+                Some(made) => std::slice::from_ref(&made.table),
+                None => self.variables[end].node_tables.as_slice(),
+            };
+            if !tables.is_empty() && !tables.contains(&want) {
+                let names: Vec<&str> = tables.iter().map(|t| self.table_name(*t)).collect();
                 return Err(bad_reference(format!(
                     "an edge in '{}' {side} an element of '{}', and {} is in '{}'",
                     rel.name,
                     self.table_name(want),
                     self.var_text(end),
-                    self.table_name(made.table)
+                    names.join("|")
                 )));
             }
         }
@@ -1904,8 +1900,6 @@ impl Binder<'_> {
             table: rel.id,
             src,
             dst,
-            // Filled in by [`bind`] once every parameter is known.
-            value: 0,
         })
     }
 
@@ -1973,13 +1967,7 @@ impl Binder<'_> {
             None => self.anon_slot(Type::Node),
         };
         self.variables[slot].node_tables = vec![table];
-        Ok(BoundInsertNode {
-            slot,
-            table,
-            props,
-            // Filled in by [`bind`] once every parameter is known.
-            value: 0,
-        })
+        Ok(BoundInsertNode { slot, table, props })
     }
 
     fn bind_node(&mut self, pat: &NodePattern) -> Result<BoundNode> {
@@ -3520,25 +3508,55 @@ mod tests {
         assert_eq!(start_node(&q).label, None);
     }
 
-    /// The element a pattern creates is a variable like any other, and
-    /// the place it arrives from is one past the parameters the
-    /// statement declared, in the order the patterns were written.
+    /// The element a pattern creates is a variable like any other, in
+    /// the order the patterns were written.
     #[test]
-    fn an_insert_binds_its_elements_past_the_declared_parameters() {
+    fn an_insert_binds_the_elements_its_patterns_wrote() {
         let q = bound("INSERT (x:Person {name: $who}), (y:Person) RETURN x, y");
         assert_eq!(q.params, ["who"]);
-        let BoundClause::Insert { nodes, .. } = &q.clauses[0] else {
+        let BoundClause::Insert { nodes, carry, .. } = &q.clauses[0] else {
             panic!("INSERT");
         };
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].table, 0);
-        assert_eq!(nodes[0].value, 1);
-        assert_eq!(nodes[1].value, 2);
         assert_eq!(nodes[0].props.len(), 1);
         assert!(nodes[1].props.is_empty());
+        // Nothing ran before the write, so the run carries nothing
+        // across it and the elements are all the rows hold.
+        assert!(carry.is_empty());
         assert_eq!(var(&q, "x").node_tables, [0]);
         assert_eq!(q.variables[nodes[0].slot].name, "x");
         assert_eq!(q.variables[nodes[1].slot].name, "y");
+    }
+
+    /// A write after a match runs for each row the match answered, and
+    /// what the run carries across it is the row: the slots in scope
+    /// where the write is written, and nothing the write itself makes.
+    #[test]
+    fn an_insert_after_a_match_carries_the_row_across_the_write() {
+        let q = bound(
+            "MATCH (a:Person)-[:IS_LOCATED_IN]->(p:Place) INSERT (a)-[k:KNOWS]->(b:Person) RETURN p, k",
+        );
+        let BoundClause::Insert { nodes, rels, carry } = &q.clauses[1] else {
+            panic!("INSERT");
+        };
+        let slot = |name: &str| q.variables.iter().position(|v| v.name == name).expect(name);
+        assert_eq!(carry, &[slot("a"), slot("p")]);
+        assert_eq!(nodes.len(), 1, "only b is written");
+        assert_eq!(nodes[0].slot, slot("b"));
+        assert_eq!(rels[0].src, slot("a"));
+        assert_eq!(rels[0].dst, slot("b"));
+    }
+
+    /// An end a match found has to be in the table the edge runs from,
+    /// and a match that narrowed it to something else is refused with
+    /// both tables named.
+    #[test]
+    fn an_end_a_match_found_is_checked_against_the_table_the_edge_runs_between() {
+        bound("MATCH (p:Place) INSERT (a:Person)-[:IS_LOCATED_IN]->(p)");
+        let e = bind_err("MATCH (p:Place) INSERT (p)-[:KNOWS]->(b:Person)");
+        assert!(e.contains("leaves an element of 'Person'"), "got: {e}");
+        assert!(e.contains("'p' is in 'Place'"), "got: {e}");
     }
 
     /// What the write surface does not do yet says so by name, so that
@@ -3552,7 +3570,6 @@ mod tests {
                 "properties",
             ),
             ("INSERT p = (a:Person)", "path"),
-            ("MATCH (a:Person) INSERT (b:Person)", "INSERT after"),
         ] {
             let e = bind_err(source);
             assert!(e.contains(what), "{source:?} was refused with {e:?}");
@@ -3565,7 +3582,7 @@ mod tests {
     #[test]
     fn an_insert_writes_an_edge_between_the_elements_it_made() {
         let q = bound("INSERT (a:Person)-[k:KNOWS]->(b:Person) RETURN k");
-        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+        let BoundClause::Insert { nodes, rels, .. } = &q.clauses[0] else {
             panic!("INSERT");
         };
         assert_eq!(nodes.len(), 2);
@@ -3573,17 +3590,13 @@ mod tests {
         assert_eq!(rels[0].table, 2);
         assert_eq!(rels[0].src, nodes[0].slot);
         assert_eq!(rels[0].dst, nodes[1].slot);
-        // The edge arrives behind the two elements it runs between.
-        assert_eq!(nodes[0].value, 0);
-        assert_eq!(nodes[1].value, 1);
-        assert_eq!(rels[0].value, 2);
         assert_eq!(q.variables[rels[0].slot].name, "k");
         assert_eq!(var(&q, "k").rel_tables, [2]);
 
         // A backwards arrow is the same edge written from the other
         // end, so the ends swap and nothing else does.
         let q = bound("INSERT (a:Person)<-[:KNOWS]-(b:Person)");
-        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+        let BoundClause::Insert { nodes, rels, .. } = &q.clauses[0] else {
             panic!("INSERT");
         };
         assert_eq!(rels[0].src, nodes[1].slot);
@@ -3597,7 +3610,7 @@ mod tests {
         let q = bound(
             "INSERT (a:Person)-[:KNOWS]->(b:Person), (a)-[:IS_LOCATED_IN]->(c:Place) RETURN a",
         );
-        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+        let BoundClause::Insert { nodes, rels, .. } = &q.clauses[0] else {
             panic!("INSERT");
         };
         assert_eq!(nodes.len(), 3, "a is written once and pointed at twice");
@@ -3662,7 +3675,7 @@ mod tests {
         let bind_here = |s: &str| bind(&parse(s).expect("parse"), &schema);
 
         let q = bind_here("INSERT (a:Person)~[m:MARRIED_TO]~(b:Person)").expect("bind");
-        let BoundClause::Insert { nodes, rels } = &q.clauses[0] else {
+        let BoundClause::Insert { nodes, rels, .. } = &q.clauses[0] else {
             panic!("INSERT");
         };
         assert_eq!(rels[0].table, 1);

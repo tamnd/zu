@@ -160,11 +160,13 @@ const NOTES: &[&str] = &[
     "driven through `zu shell --format jsonl`, one long-lived process per session",
     "loaded through `zu convert`, which reads a SQLite database in zu's schema",
     "the evaluator is MATCH WHERE CALL UNWIND WITH RETURN, plus INSERT of node patterns and \
-     of edges between elements the same INSERT creates, so a case that writes anything else \
-     is answered with an error rather than a skip",
-    "an INSERT runs before the clauses after it and runs once, so an edge onto an element a \
-     MATCH found is refused by name: that is a write for every row the match answers and it \
-     is the next piece of the write surface rather than a case that is scored",
+     of edges between the elements a statement has in scope, so a case that writes anything \
+     else is answered with an error rather than a skip",
+    "an INSERT runs once for every row the clauses before it answered, and the clauses after \
+     it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
+     one element per row the match answered",
+    "an edge carrying properties is refused by name because the log has no record that holds \
+     them, and that is the next piece of the write surface rather than a case that is scored",
     "an element is created in the node table whose own name is the label the pattern wrote, \
      and a table is not created by naming one, so a case that inserts into a label its \
      fixture did not declare is answered with a reference error",

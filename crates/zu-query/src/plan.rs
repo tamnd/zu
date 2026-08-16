@@ -88,6 +88,20 @@ pub struct VarLength {
 pub enum LogicalPlan {
     /// One row, no columns: the seed under the first scan or unwind.
     Empty,
+    /// Rows that are already values, read from the argument at `arg`
+    /// as a list of lists, one column per slot in `slots`.
+    ///
+    /// This is what a statement that wrote something runs its later
+    /// clauses over. The write reads the rows its own clauses answered
+    /// and then writes, so the clauses after it cannot read through
+    /// the same operators again: those operators would answer over the
+    /// store the write just changed and a row would meet what it
+    /// created. So the rows are carried across the write as values,
+    /// and this is the operator that reads them back in.
+    Rows {
+        slots: Vec<usize>,
+        arg: usize,
+    },
     /// Introduces every row of a node slot's candidate tables.
     /// `bracket` carries the group this operator belongs to, `None`
     /// for a plain match. Operators and filters sharing a group run as
@@ -141,14 +155,16 @@ pub enum LogicalPlan {
     /// Creates the elements an `INSERT` wrote, binding each one to its
     /// slot, one row out for every row in.
     ///
-    /// Nothing under this operator writes. The session runs the write
-    /// before it runs the plan and hands the created elements in as
-    /// arguments past the last declared parameter, and this operator
-    /// binds them, because the executor reads through a graph and a
-    /// graph reads. That is a seam and not a design: when the read path
-    /// consults overlays and the executor can stage a change of its
-    /// own, the staging moves in here and the argument goes away, and
-    /// the plan a query compiles to does not change.
+    /// This is the shape of the statement rather than something the
+    /// executor runs. The session splits a statement at its write: the
+    /// operators under this one answer the rows the write runs for, the
+    /// write runs once for each of them, and the operators above run
+    /// over [`LogicalPlan::Rows`] holding what came of it. That is a
+    /// seam and not a design: it is here because the executor reads
+    /// through a graph and a graph reads. When the read path consults
+    /// overlays and the executor can stage a change of its own, the
+    /// staging moves in here and the split goes away, and the plan a
+    /// query compiles to does not change.
     Insert {
         input: Box<LogicalPlan>,
         nodes: Vec<BoundInsertNode>,
@@ -199,9 +215,19 @@ impl LogicalPlan {
 
 /// Builds the logical plan for a bound query.
 pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
-    let mut plan = LogicalPlan::Empty;
+    build_over(query, LogicalPlan::Empty)
+}
+
+/// Builds the plan for a bound query over something other than the one
+/// empty row, which is what the clauses after a write run over: the
+/// rows the write carried across it, already bound to their slots.
+pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> {
     // Slots a plan operator has already introduced.
     let mut bound: HashSet<usize> = HashSet::new();
+    if let LogicalPlan::Rows { slots, .. } = &base {
+        bound.extend(slots.iter().copied());
+    }
+    let mut plan = base;
     // Every bracketed clause is a group of its own, counted in written
     // order.
     let mut groups = 0;
@@ -240,7 +266,7 @@ pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
                     };
                 }
             }
-            BoundClause::Insert { nodes, rels } => {
+            BoundClause::Insert { nodes, rels, .. } => {
                 for node in nodes {
                     bound.insert(node.slot);
                 }
@@ -474,6 +500,10 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
     let pad = "  ".repeat(depth);
     match plan {
         LogicalPlan::Empty => {}
+        LogicalPlan::Rows { slots, .. } => {
+            let names: Vec<&str> = slots.iter().map(|slot| slot_name(query, *slot)).collect();
+            let _ = writeln!(out, "{pad}Rows {}", names.join(", "));
+        }
         LogicalPlan::ScanNodes {
             input,
             slot,

@@ -551,13 +551,32 @@ fn read_edges_with_props(
 /// alone, so they come off the line first and the shared parse sees what
 /// is left. The alternative is a second spelling of `--format` here, and
 /// two spellings of a flag are two behaviors eventually.
+///
+/// `--node` and `--rel` repeat and name a table each, which is the
+/// dataset load rather than the edge list one. They share the command
+/// because they do the same thing, and mixing them with `--nodes` or an
+/// edge list argument asks for both loads at once, which is refused.
 fn copy_command(args: &[String]) -> ExitCode {
     let mut reorder = zu::zu1::reorder::Reorder::None;
     let mut nodes: Option<&str> = None;
+    let mut node_files: Vec<zu::dataset::NodeFile> = Vec::new();
+    let mut rel_files: Vec<zu::dataset::RelFile> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--reorder" {
+        if args[i] == "--node" {
+            match args.get(i + 1).and_then(|s| parse_node_arg(s)) {
+                Some(file) => node_files.push(file),
+                None => return usage_error("copy"),
+            }
+            i += 2;
+        } else if args[i] == "--rel" {
+            match args.get(i + 1).and_then(|s| parse_rel_arg(s)) {
+                Some(file) => rel_files.push(file),
+                None => return usage_error("copy"),
+            }
+            i += 2;
+        } else if args[i] == "--reorder" {
             match args
                 .get(i + 1)
                 .and_then(|s| zu::zu1::reorder::Reorder::parse(s))
@@ -580,8 +599,13 @@ fn copy_command(args: &[String]) -> ExitCode {
     let Some((format, positional)) = take_format(&rest, TEXT_OR_JSON) else {
         return usage_error("copy");
     };
-    match positional[..] {
-        [edges, out] => copy(
+    let dataset = !node_files.is_empty() || !rel_files.is_empty();
+    if dataset && (nodes.is_some() || reorder != zu::zu1::reorder::Reorder::None) {
+        return usage_error("copy");
+    }
+    match (dataset, &positional[..]) {
+        (true, [out]) => copy_dataset(&node_files, &rel_files, std::path::Path::new(out), format),
+        (false, [edges, out]) => copy(
             std::path::Path::new(edges),
             std::path::Path::new(out),
             reorder,
@@ -590,6 +614,136 @@ fn copy_command(args: &[String]) -> ExitCode {
         ),
         _ => usage_error("copy"),
     }
+}
+
+/// Parses `Table=file.csv`, one node file of a dataset load.
+fn parse_node_arg(arg: &str) -> Option<zu::dataset::NodeFile> {
+    let (table, path) = arg.split_once('=')?;
+    (!table.is_empty() && !path.is_empty()).then(|| zu::dataset::NodeFile {
+        table: table.to_string(),
+        path: std::path::PathBuf::from(path),
+    })
+}
+
+/// Parses `Table=From:To:file.csv`, one rel file of a dataset load.
+///
+/// The path comes last and is split off last, so a windows path with a
+/// drive letter in it still reaches the loader whole.
+fn parse_rel_arg(arg: &str) -> Option<zu::dataset::RelFile> {
+    let (table, ends) = arg.split_once('=')?;
+    let (from, rest) = ends.split_once(':')?;
+    let (to, path) = rest.split_once(':')?;
+    (!table.is_empty() && !from.is_empty() && !to.is_empty() && !path.is_empty()).then(|| {
+        zu::dataset::RelFile {
+            table: table.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            path: std::path::PathBuf::from(path),
+            undirected: false,
+        }
+    })
+}
+
+/// Loads a dataset of node files and rel files into a fresh zu1 file and
+/// prints what went in, table by table.
+///
+/// The numbers are the ones a load of many tables has to report: an edge
+/// list load can quote one edge count and one node count and be done,
+/// and here a total says nothing about whether the table you wanted is
+/// in there.
+fn copy_dataset(
+    nodes: &[zu::dataset::NodeFile],
+    rels: &[zu::dataset::RelFile],
+    out_path: &std::path::Path,
+    format: Format,
+) -> ExitCode {
+    let started = std::time::Instant::now();
+    let stats = match zu::dataset::load_dataset(nodes, rels, out_path) {
+        Ok(s) => s,
+        Err(e) => return command_error("copy", &e),
+    };
+    let total = started.elapsed();
+    let file_bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    let node_rows: u64 = stats.nodes.iter().map(|(_, n)| n).sum();
+    let edge_count: u64 = stats.rels.iter().map(|(_, n)| n).sum();
+    match format {
+        Format::Text => {
+            println!(
+                "copied {edge_count} edges, {node_rows} nodes, {} node table(s), {} rel table(s)",
+                stats.nodes.len(),
+                stats.rels.len()
+            );
+            for (name, rows) in &stats.nodes {
+                println!("  node {name}: {rows} rows");
+            }
+            for (name, edges) in &stats.rels {
+                println!("  rel {name}: {edges} edges");
+            }
+            println!(
+                "properties: {} node column(s), {} edge column(s); key index on {}",
+                stats.node_columns,
+                stats.rel_columns,
+                if stats.keyed.is_empty() {
+                    "no table".to_string()
+                } else {
+                    stats.keyed.join(", ")
+                }
+            );
+            println!(
+                "total {:.2}s, {:.2} M edges/s end to end, {file_bytes} bytes on disk",
+                total.as_secs_f64(),
+                edge_count as f64 / total.as_secs_f64() / 1e6,
+            );
+        }
+        Format::Json => println!(
+            "{}",
+            Json::Obj(vec![
+                ("file".into(), Json::Str(out_path.display().to_string())),
+                ("edges".into(), count(edge_count)),
+                ("nodes".into(), count(node_rows)),
+                (
+                    "node_tables".into(),
+                    Json::Arr(
+                        stats
+                            .nodes
+                            .iter()
+                            .map(|(name, rows)| Json::Obj(vec![
+                                ("table".into(), Json::Str(name.clone())),
+                                ("rows".into(), count(*rows)),
+                            ]))
+                            .collect()
+                    ),
+                ),
+                (
+                    "rel_tables".into(),
+                    Json::Arr(
+                        stats
+                            .rels
+                            .iter()
+                            .map(|(name, edges)| Json::Obj(vec![
+                                ("table".into(), Json::Str(name.clone())),
+                                ("edges".into(), count(*edges)),
+                            ]))
+                            .collect()
+                    ),
+                ),
+                ("node_columns".into(), count(stats.node_columns)),
+                ("edge_columns".into(), count(stats.rel_columns)),
+                (
+                    "keyed".into(),
+                    Json::Arr(stats.keyed.iter().map(|n| Json::Str(n.clone())).collect()),
+                ),
+                ("bytes".into(), count(file_bytes)),
+                ("total_secs".into(), Json::Float(total.as_secs_f64())),
+                (
+                    "edges_per_sec".into(),
+                    Json::Float(edge_count as f64 / total.as_secs_f64()),
+                ),
+            ])
+            .to_compact()
+        ),
+    }
+    ExitCode::SUCCESS
 }
 
 /// Reads the highest node id declared by a node file, which is one id
@@ -1944,6 +2098,93 @@ mod tests {
             _ => unreachable!("built as ints"),
         });
         assert_eq!(r.rows, want);
+    }
+
+    /// The dataset spellings say a table each, and a value that names
+    /// less than one is a usage error rather than a table called the
+    /// empty string.
+    #[test]
+    fn the_dataset_flags_name_a_table_each() {
+        let node = parse_node_arg("Account=nodes/Account.csv").expect("a node file");
+        assert_eq!(node.table, "Account");
+        assert_eq!(node.path, std::path::PathBuf::from("nodes/Account.csv"));
+        let rel = parse_rel_arg("transfer=Account:Account:rels/transfer.csv").expect("a rel file");
+        assert_eq!(rel.table, "transfer");
+        assert_eq!((rel.from.as_str(), rel.to.as_str()), ("Account", "Account"));
+        assert_eq!(rel.path, std::path::PathBuf::from("rels/transfer.csv"));
+        assert!(parse_node_arg("Account").is_none(), "no file");
+        assert!(parse_node_arg("=nodes.csv").is_none(), "no table");
+        assert!(
+            parse_rel_arg("transfer=Account:Account").is_none(),
+            "no file"
+        );
+        assert!(parse_rel_arg("transfer=Account").is_none(), "one end");
+    }
+
+    /// A dataset load through the command reads back as the tables the
+    /// flags named, with the ids the files gave the rows.
+    #[test]
+    fn a_dataset_copy_keeps_every_table_it_was_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).expect("write csv");
+            path
+        };
+        let accounts = write(
+            "Account.csv",
+            "id:ID,name:STRING\n10,checking\n11,savings\n",
+        );
+        let people = write("Person.csv", "id:ID\n100\n");
+        let transfers = write(
+            "transfer.csv",
+            ":START_ID,:END_ID,:TYPE,ts:INT64\n10,11,transfer,7\n",
+        );
+        let owns = write("own.csv", ":START_ID,:END_ID,:TYPE\n100,10,own\n");
+        let db_path = dir.path().join("fin.zu1");
+        let node = |table: &str, path: std::path::PathBuf| zu::dataset::NodeFile {
+            table: table.into(),
+            path,
+        };
+        let rel =
+            |table: &str, from: &str, to: &str, path: std::path::PathBuf| zu::dataset::RelFile {
+                table: table.into(),
+                from: from.into(),
+                to: to.into(),
+                path,
+                undirected: false,
+            };
+        assert_eq!(
+            copy_dataset(
+                &[node("Account", accounts), node("Person", people)],
+                &[
+                    rel("transfer", "Account", "Account", transfers),
+                    rel("own", "Person", "Account", owns),
+                ],
+                &db_path,
+                Format::Text,
+            ),
+            ExitCode::SUCCESS
+        );
+
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let r = zu::query::run(
+            "MATCH (p:Person)-[:own]->(a:Account)-[t:transfer]->(b:Account) \
+             RETURN p.id AS p, a.id AS a, b.id AS b, b.name AS name, t.ts AS ts",
+            &mut db,
+            &[],
+        )
+        .expect("read back");
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                Value::Int(100),
+                Value::Int(10),
+                Value::Int(11),
+                Value::Str("savings".into()),
+                Value::Int(7),
+            ]]
+        );
     }
 
     #[test]

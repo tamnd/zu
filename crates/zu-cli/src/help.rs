@@ -65,13 +65,18 @@ pub(crate) const COMMANDS: &[Command] = &[
     },
     Command {
         name: "copy",
-        summary: "bulk load an edge list into a new file",
-        synopsis: &["zu copy [--reorder degree|bfs|none] [--nodes <nodes.csv>] \
-             <edges.txt|csv|parquet> <out.zu1> [--format text|json]"],
+        summary: "bulk load an edge list, or a whole dataset, into a new file",
+        synopsis: &[
+            "zu copy [--reorder degree|bfs|none] [--nodes <nodes.csv>] \
+             <edges.txt|csv|parquet> <out.zu1> [--format text|json]",
+            "zu copy --node <Table>=<nodes.csv> ... --rel <Table>=<From>:<To>:<rels.csv> ... \
+             <out.zu1> [--format text|json]",
+        ],
         examples: &[
             "zu copy edges.txt graph.zu1",
             "zu copy --nodes nodes.csv edges.txt graph.zu1",
             "zu copy --reorder degree edges.parquet graph.zu1 --format json",
+            "zu copy --node Account=nodes/Account.csv --rel transfer=Account:Account:rels/transfer.csv fin.zu1",
         ],
         see_also: &["convert", "stat", "verify"],
     },

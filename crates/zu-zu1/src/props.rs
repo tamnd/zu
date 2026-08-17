@@ -328,6 +328,17 @@ pub struct PropsDirectory {
 /// the source had them and one value per edge in the same order.
 pub type EdgesWithProps = (Vec<(u32, u32)>, Vec<OwnedColumn>);
 
+/// The same pair for a rel file that names its endpoints by the ids a
+/// node file gave its rows rather than by row offsets, which is what a
+/// dataset of many node tables is written with. Which row of which table
+/// each id is takes every node file to answer, so the translation is the
+/// loader's and not the reader's.
+pub type KeyedEdgesWithProps = (Vec<(u64, u64)>, Vec<OwnedColumn>);
+
+/// A node file read whole: the id of every row in row order, and one
+/// owned column per property the header named.
+pub type NodesWithProps = (Vec<u64>, Vec<OwnedColumn>);
+
 /// One column held whole, in the shape a reader outside the file
 /// produces it: owned values in the row order the source had them.
 ///
@@ -912,6 +923,41 @@ pub fn store_props(
         .map(|(name, values)| PropInput::dense(name, *values))
         .collect();
     store_props_nullable(db, node_table, &inputs)
+}
+
+/// The same store, for columns a caller holds whole rather than as
+/// borrowed slices, which is what a node file read off disk produces.
+///
+/// This is [`store_rel_props_owned`] over a node table, and it exists
+/// for the same reason: `PropValues::Str` wants a slice of slices and an
+/// owned column has a vector of vectors, so the pointers have to live
+/// somewhere for the length of the call.
+pub fn store_props_owned(
+    db: &mut Zu1File,
+    node_table: &str,
+    columns: &[OwnedColumn],
+) -> Result<PropsDirectory> {
+    let refs: Vec<Vec<&[u8]>> = columns
+        .iter()
+        .map(|c| match &c.values {
+            OwnedValues::Str(v) => v.iter().map(Vec::as_slice).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let values: Vec<(&str, PropValues)> = columns
+        .iter()
+        .zip(&refs)
+        .map(|(c, refs)| {
+            let values = match &c.values {
+                OwnedValues::Int(v) => PropValues::Int(v),
+                OwnedValues::Float(v) => PropValues::Float(v),
+                OwnedValues::Bool(v) => PropValues::Bool(v),
+                OwnedValues::Str(_) => PropValues::Str(refs),
+            };
+            (c.name.as_str(), values)
+        })
+        .collect();
+    store_props(db, node_table, &values)
 }
 
 /// The same store, for columns some rows of which hold no value.

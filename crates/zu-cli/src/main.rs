@@ -23,8 +23,12 @@ use zu_json::Json;
 mod conformance;
 mod corpus;
 mod help;
+mod keys;
+mod line;
+mod repl;
 mod scoreboard;
 mod shell;
+mod term;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

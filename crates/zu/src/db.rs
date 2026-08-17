@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use zu_common::{Result, ZuError};
+use zu_common::{Interrupt, Result, ZuError};
 use zu_query::exec;
 
 use crate::append::Appender;
@@ -292,6 +292,19 @@ impl Connection {
     /// Whether this connection refuses writes.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// The handle a statement on this connection can be stopped
+    /// through, and the count of rows it has read.
+    ///
+    /// A statement runs on the thread that asked for it, so the handle
+    /// is taken before the call and raised from another thread: it is
+    /// how a shell answers `Ctrl-C` and how a server answers a client
+    /// that hung up. The statement returns
+    /// [`zu_common::ZuError::Interrupted`] and the connection is
+    /// unchanged, which is what makes this different from closing it.
+    pub fn interrupt(&self) -> Interrupt {
+        self.session.interrupt()
     }
 
     /// The session under this connection, for the paths that have not

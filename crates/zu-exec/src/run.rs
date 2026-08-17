@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use zu_common::{GROUP_ROWS, Result, ZuError};
+use zu_common::{GROUP_ROWS, Interrupt, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Value};
 use zu_query::plan::BracketKind;
 use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
@@ -54,7 +54,11 @@ pub(crate) fn run(
         Source::Seeks(keys) => seeks_work(keys, options),
         Source::Scan(_) => scan_work(plan, snap, options)?,
     };
-    let (partials, mut decisions) = drive(plan, snap, &sched)?;
+    let (partials, mut decisions) = drive(plan, snap, &sched, &options.interrupt)?;
+    // Workers drain at their next chunk boundary when the caller asks
+    // them to stop, so what came back is a piece of an answer rather
+    // than a short one. Asked here, before any of it is assembled.
+    options.interrupt.check()?;
     decisions.split = sched.split.clone();
 
     let rows = match &plan.sink {
@@ -436,6 +440,7 @@ fn drive(
     plan: &ExecPlan,
     snap: &mut dyn Snapshot,
     sched: &Schedule,
+    asked: &Interrupt,
 ) -> Result<(Vec<SinkState>, Decisions)> {
     let Schedule {
         work,
@@ -448,7 +453,7 @@ fn drive(
         SinkSpec::Rows { post, .. } => quota_of(post),
         _ => None,
     };
-    let stop = StopState::new(quota, morsels.len());
+    let stop = StopState::new(quota, morsels.len(), asked.clone());
     let claim = AtomicUsize::new(0);
 
     // A single worker needs none of the handoff machinery, and a point
@@ -604,6 +609,12 @@ fn quota_of(post: &[PostSpec]) -> Option<u64> {
 struct StopState {
     needed: Option<u64>,
     stop: AtomicBool,
+    /// The caller's handle on the statement, which stops every worker
+    /// the same way the quota does. Held here rather than checked
+    /// separately because this is already the flag every chunk
+    /// boundary reads, and a second one would be a second set of
+    /// places to remember.
+    asked: Interrupt,
     progress: Mutex<Progress>,
 }
 
@@ -614,10 +625,11 @@ struct Progress {
 }
 
 impl StopState {
-    fn new(needed: Option<u64>, morsels: usize) -> Self {
+    fn new(needed: Option<u64>, morsels: usize, asked: Interrupt) -> Self {
         StopState {
             needed,
             stop: AtomicBool::new(false),
+            asked,
             progress: Mutex::new(Progress {
                 counts: vec![None; morsels],
                 prefix: 0,
@@ -627,7 +639,13 @@ impl StopState {
     }
 
     fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
+        self.stop.load(Ordering::Relaxed) || self.asked.stopped()
+    }
+
+    /// Rows a finished morsel read, for whoever is watching the
+    /// statement. One add per morsel, off the run's hot path.
+    fn read(&self, rows: u64) {
+        self.asked.read(rows);
     }
 
     fn abort(&self) {
@@ -895,6 +913,9 @@ impl<'a> Worker<'a> {
                 return Ok(());
             }
             claimed += 1;
+            // The rows this morsel covers, counted as it is claimed: a
+            // seek covers one row and the ranges cover what they span.
+            self.stop.read((morsels[m].1 - morsels[m].0).max(1));
             if let Err(e) = self.run_morsel(m, morsels[m]) {
                 self.stop.abort();
                 return Err(e);
@@ -3908,7 +3929,7 @@ mod tests {
 
     #[test]
     fn stop_state_advances_a_contiguous_prefix() {
-        let s = StopState::new(Some(10), 3);
+        let s = StopState::new(Some(10), 3, Interrupt::default());
         s.morsel_done(1, 5);
         assert!(!s.stopped(), "morsel 0 still open, no prefix yet");
         assert!(
@@ -3921,6 +3942,17 @@ mod tests {
         );
         s.morsel_done(0, 6);
         assert!(s.stopped(), "prefix 0..2 holds 11 rows");
+    }
+
+    #[test]
+    fn an_asked_stop_drains_the_workers_the_way_a_met_quota_does() {
+        let asked = Interrupt::armed();
+        let s = StopState::new(None, 3, asked.clone());
+        assert!(!s.stopped(), "nobody has asked and there is no quota");
+        asked.stop();
+        assert!(s.stopped(), "the chunk boundaries read the caller's ask");
+        s.read(2048);
+        assert_eq!(asked.rows(), 2048);
     }
 
     #[test]

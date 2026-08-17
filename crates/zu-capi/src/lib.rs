@@ -140,6 +140,11 @@ pub enum ZuStatus {
     /// was closed. Nothing was done; the statement handle is still
     /// safe to close.
     MisuseClosed = 6,
+    /// The caller stopped the statement while it was running. The
+    /// connection is unharmed and the next call on it runs normally,
+    /// which is what tells this apart from every other non-zero status
+    /// here: nothing went wrong.
+    Interrupted = 7,
     /// A write lost to a concurrent one.
     Conflict = 8,
     /// The file says something that cannot be true, which is damage
@@ -230,6 +235,7 @@ fn status_of(e: &EngineError) -> ZuStatus {
         // width, a connection asked to write when it is read-only.
         EngineError::InvalidArgument(_) => ZuStatus::Misuse,
         EngineError::Conflict(_) => ZuStatus::Conflict,
+        EngineError::Interrupted => ZuStatus::Interrupted,
     }
 }
 

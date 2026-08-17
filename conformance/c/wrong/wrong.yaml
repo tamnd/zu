@@ -58,7 +58,7 @@ cases:
 
   - name: ahead-of-the-engine
     doc: A statement this engine does not implement, which is the third outcome and neither of the other two.
-    query: START TRANSACTION
+    query: MERGE (n:person)
     columns:
       - n
     rows:

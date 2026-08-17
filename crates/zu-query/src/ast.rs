@@ -7,17 +7,39 @@
 
 use zu_common::{LogicalType, Temporal};
 
-/// One statement: a query that reads, or a catalog statement that
-/// changes what the file declares.
+/// One statement: a query that reads, a catalog statement that changes
+/// what the file declares, or one of the three that say where a
+/// transaction begins and ends.
 ///
-/// The two are parsed by the same entry point and told apart by their
+/// They are parsed by the same entry point and told apart by their
 /// first word, because a caller with a string in its hand does not know
 /// which it has. They share nothing after that: a catalog statement has
-/// no binding table, so it never reaches the binder or the optimizer.
+/// no binding table, so it never reaches the binder or the optimizer,
+/// and a transaction statement has no plan at all.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Query(Query),
     Catalog(CatalogStmt),
+    Transaction(TxnStmt),
+}
+
+/// Where a transaction begins and ends (docs/08 §1, GT01, GT02).
+///
+/// A statement written outside one runs in a transaction of its own,
+/// so these three do not turn transactions on. What they do is say
+/// that several statements are one transaction: what the first one
+/// wrote is either kept by the `COMMIT` at the end or unmade by the
+/// `ROLLBACK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnStmt {
+    /// `START TRANSACTION`, with the access mode it was written with.
+    /// Nothing written is `READ WRITE`, which is what GQL implies when
+    /// the characteristics are left off.
+    Start {
+        read_only: bool,
+    },
+    Commit,
+    Rollback,
 }
 
 /// A statement that changes the catalog (docs/07 §9, GC03).

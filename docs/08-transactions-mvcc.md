@@ -9,6 +9,23 @@ Model: **single writer, many snapshot readers**, the DuckDB/Kùzu/SQLite consens
 - Auto-commit for single statements. Interactive write txns bounded by `max_write_txn_bytes` (default 256 MiB), beyond that, use bulk `COPY`.
 - Isolation: writes serializable; reads snapshot isolation (anomaly-free for read-only). Cross-engine identical semantics.
 
+## 1a. Explicit transactions, as they are implemented today (GT01 to GT03)
+
+`START TRANSACTION [READ ONLY | READ WRITE]`, `COMMIT` and `ROLLBACK` are statements a session runs, not a query: they have no binding table and no plan, so `zu::session::Session` takes them before the plan cache is asked for anything. A one-shot `zu::query::run` refuses them by saying so, because a transaction runs across statements and that needs a session.
+
+The unit that is taken back is a **file savepoint** (`zu_zu1::Zu1File::begin_savepoint`), not a deferred commit. A read goes through the sealed file, so every statement folds its overlays into new segments and flips the header on the way out, and by the time the second statement of a transaction runs the first one is already published. Undo is therefore at the file: the savepoint keeps the pre-transaction `DatabaseHeader`, the free list, and the blocks the free list is written in, and a rollback republishes the kept header. Two guards make that sound while a savepoint is held:
+
+- The free list splits in two. A checkpoint inside the transaction publishes the blocks the transaction freed, because the epoch it publishes has let go of them, but it holds them out of allocation until the transaction ends, since the kept header still reads them. What was already free when the transaction began stays allocatable, because it is free in the kept state too, so whatever the transaction writes into it is garbage in a block nothing reads. That is what keeps a write statement from growing the file: `bench/write` measures 0 bytes of growth per statement for `SET` and `INSERT`, the same as before transactions existed.
+- Blocks that were freed before the transaction and not published yet are frozen with the rest, because the kept header still references them as live.
+
+The epoch is the one thing not restored. The kept header is republished one past the newest epoch in the file, since a header behind the other slot would lose the next open. Blocks written past the kept high-water mark fall outside the file the restored header describes, so the next writer hands them out again; blocks the transaction freed are dropped rather than published, because the restored header still references them. A transaction that published nothing costs no epoch at all: the rollback forgets the staged blocks and does not flip.
+
+Two things fall out of the same machinery. A statement outside an explicit transaction takes and owns a savepoint of its own, so a multi-part write whose later clause raises is undone whole (an implicit transaction, `INSERT ... WITH p RETURN p.name / 0` leaves no row behind). And a catalog statement stages under the same savepoint, which is the transaction-local catalog GP18 asks for: `CREATE GRAPH TYPE` publishes immediately so the next statement sees it, and a rollback unmakes it together with the rows.
+
+One thing this does not buy: a crash in the middle of an explicit transaction. Every statement of it has already published, so what a reopen finds is the statements that ran, not the state the transaction started from. The savepoint lives in memory, which is why it is worth saying out loud: rollback is a statement, and a process that dies is not one. Making the savepoint durable is a header field and a recovery step, and it is on the list rather than done.
+
+Codes: `25G01` for a transaction already running, `25G03` for a statement that writes inside one started `READ ONLY` (raised before the statement is compiled and before anything is staged), `2D000` for a `COMMIT` or `ROLLBACK` with nothing running. A session dropped mid-transaction rolls back, which is why ending one with a statement is worth doing: the statement can say what went wrong and a drop cannot.
+
 ## 2. MVCC (HyPer-derived, node-group-grained, Kùzu #2529 lineage)
 
 - Committed state = **base epoch data + in-memory delta overlays** per (table, node group): appended rows, tombstone bitmaps, property update chains (newest-first, epoch-stamped), CSR slack fills / overlay edges.

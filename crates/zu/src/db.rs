@@ -323,7 +323,10 @@ impl Connection {
         if !self.read_only {
             return Ok(());
         }
-        if matches!(crate::query::catalog_statement(source), Ok(Some(_))) {
+        if matches!(
+            crate::query::not_a_query(source),
+            Ok(Some(crate::query::NotAQuery::Catalog(_)))
+        ) {
             return Err(ZuError::InvalidArgument(
                 "this statement writes and the connection is read-only".to_string(),
             ));

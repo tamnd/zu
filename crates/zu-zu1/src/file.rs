@@ -7,6 +7,7 @@
 //! committed state; new data goes to free blocks and becomes visible only
 //! when the next header flip publishes it.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -203,6 +204,26 @@ impl DatabaseHeader {
     }
 }
 
+/// What a file looked like before a transaction started.
+///
+/// A statement commits by folding and flipping the header, so by the
+/// time a second statement of the same transaction runs, the first one
+/// is already published and there is nothing left in memory to drop.
+/// Undoing it means putting the roots back, and the roots are three
+/// pieces: the header itself, the blocks the file held free, and the
+/// blocks the free list is written in.
+#[derive(Debug)]
+struct Savepoint {
+    db: DatabaseHeader,
+    free: Vec<BlockPtr>,
+    free_chain: Vec<BlockPtr>,
+    /// The blocks that were already free when the transaction began,
+    /// which are the only ones it may write into: they are free in the
+    /// state a rollback goes back to as well, so whatever the
+    /// transaction leaves in them is garbage in a block nothing reads.
+    reusable: HashSet<BlockPtr>,
+}
+
 /// An open zu1 file: block I/O, the free list, and the header flip.
 #[derive(Debug)]
 pub struct Zu1File {
@@ -224,6 +245,12 @@ pub struct Zu1File {
     /// Blocks holding the committed free-list chain itself; a checkpoint
     /// writes a fresh chain and recycles these.
     free_chain: Vec<BlockPtr>,
+    /// Free blocks a transaction may not write into: it freed them
+    /// itself, or they were pending when it began, so the state a
+    /// rollback goes back to still reads them. A checkpoint publishes
+    /// them as free, because the epoch it publishes has let go of them;
+    /// they only stay out of allocation. Empty outside a transaction.
+    frozen: Vec<BlockPtr>,
     /// The block cache every read goes through, shared with handles
     /// forked by [`Self::reopen`] so workers warm each other.
     cache: Arc<BlockCache>,
@@ -248,6 +275,12 @@ pub struct Zu1File {
     /// will refuse a write on, and this says so before the syscall does,
     /// so the caller reads which database refused rather than `EBADF`.
     writable: bool,
+    /// The state a transaction can be put back to, held from
+    /// [`Self::begin_savepoint`] to the commit or rollback that ends it.
+    /// While one is held, allocation reuses only the blocks that were
+    /// already free when it began, because a block the transaction
+    /// frees is a block the state being kept still reads.
+    savepoint: Option<Savepoint>,
 }
 
 impl Zu1File {
@@ -279,6 +312,8 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            frozen: Vec::new(),
+            savepoint: None,
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             writable: true,
@@ -341,6 +376,8 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            frozen: Vec::new(),
+            savepoint: None,
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             writable,
@@ -393,6 +430,8 @@ impl Zu1File {
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
+            frozen: Vec::new(),
+            savepoint: None,
             pin_memo: None,
             forks: Some(Arc::clone(pool)),
             writable: self.writable,
@@ -434,12 +473,111 @@ impl Zu1File {
     /// Returns a block to write into: a committed-free block when one
     /// exists, otherwise one past the high-water mark. Either way the
     /// block becomes durable state only via the next checkpoint.
+    ///
+    /// A transaction narrows what counts as free. A checkpoint inside
+    /// one publishes the blocks that transaction has freed, and the
+    /// state the savepoint keeps still reads them, so those are held in
+    /// [`Self::frozen`] until the transaction ends and this list holds
+    /// only what was free before it began.
     pub fn allocate_block(&mut self) -> BlockPtr {
         if let Some(ptr) = self.free.pop() {
             return ptr;
         }
         self.db.block_count += 1;
         self.db.block_count
+    }
+
+    /// Keeps what the file is now, so that [`Self::rollback_savepoint`]
+    /// can put it back after any number of statements have committed on
+    /// top of it.
+    ///
+    /// This is what makes an explicit transaction more than a word. A
+    /// statement commits by folding its overlays into new segments and
+    /// flipping the header, and there is no undoing that in memory
+    /// afterwards, so the undo is at the file: keep the roots, refuse to
+    /// reuse anything freed while the transaction runs, and publish the
+    /// kept roots again if the transaction ends in a rollback.
+    ///
+    /// One savepoint at a time. Nested transactions are not a thing GQL
+    /// has, and a second one here would quietly become the first.
+    pub fn begin_savepoint(&mut self) -> Result<()> {
+        self.check_writable("a transaction")?;
+        if self.savepoint.is_some() {
+            return Err(ZuError::InvalidArgument(format!(
+                "{} is already inside a transaction",
+                self.path.display()
+            )));
+        }
+        self.savepoint = Some(Savepoint {
+            db: self.db.clone(),
+            free: self.free.clone(),
+            free_chain: self.free_chain.clone(),
+            reusable: self.free.iter().copied().collect(),
+        });
+        // Blocks freed before the transaction and not published yet are
+        // referenced by the header it keeps, so they go straight into
+        // the list it may not write into.
+        self.frozen.append(&mut self.pending_free);
+        Ok(())
+    }
+
+    /// Whether a transaction is holding this file to a state it can be
+    /// put back to.
+    pub fn in_savepoint(&self) -> bool {
+        self.savepoint.is_some()
+    }
+
+    /// Ends the transaction by keeping what it did. Everything it wrote
+    /// is already published, so this only drops what was being held and
+    /// lets allocation reuse free blocks again.
+    pub fn release_savepoint(&mut self) {
+        self.savepoint = None;
+        // What it freed is free for good now, so it goes back into the
+        // list allocation draws from. The next checkpoint publishes it
+        // as free either way; this is about reuse, not about the list.
+        self.free.append(&mut self.frozen);
+    }
+
+    /// Ends the transaction by putting the file back where it started
+    /// and publishing that, so a reader after this reads what a reader
+    /// before the transaction read.
+    ///
+    /// The epoch is the one thing not put back: the kept header is
+    /// republished with the next epoch after the newest, because a
+    /// header written with a lower epoch than the other slot would be
+    /// the older of the two and the transaction's last state would win
+    /// the next open. Blocks the transaction wrote past the kept
+    /// high-water mark are outside the file the header describes, so the
+    /// next writer hands them out again; blocks it freed are still
+    /// referenced by the header going back in, so what it freed is
+    /// dropped rather than published.
+    pub fn rollback_savepoint(&mut self) -> Result<()> {
+        let Some(saved) = self.savepoint.take() else {
+            return Err(ZuError::InvalidArgument(format!(
+                "{} is not inside a transaction",
+                self.path.display()
+            )));
+        };
+        let epoch = self.db.epoch;
+        let published = epoch != saved.db.epoch;
+        self.db = saved.db;
+        self.free = saved.free;
+        self.free_chain = saved.free_chain;
+        self.pending_free.clear();
+        // What the transaction freed is live again in the header going
+        // back in, so it is dropped rather than published.
+        self.frozen.clear();
+        self.pin_memo = None;
+        // A transaction that staged blocks and published nothing is
+        // undone by forgetting them, and a header flip would only cost
+        // an epoch to say the same thing. This is the common shape:
+        // every statement holds the file for the length of itself, and
+        // most of them do not write.
+        if !published {
+            return Ok(());
+        }
+        self.db.epoch = epoch;
+        self.checkpoint()
     }
 
     /// Takes the committed-free list out of allocation, forcing every
@@ -606,6 +744,11 @@ impl Zu1File {
         let committed = std::mem::take(&mut self.free);
         let safe = committed.len();
         let mut all = committed;
+        // Inside a transaction the free blocks it may not write into
+        // are held aside rather than listed, so they come back here to
+        // be listed: the epoch being published has let go of them, and
+        // it is only allocation they stay out of.
+        all.append(&mut self.frozen);
         all.append(&mut self.pending_free);
         all.append(&mut self.free_chain);
         self.db.free_list_root = if all.is_empty() {
@@ -641,7 +784,18 @@ impl Zu1File {
         if root != NULL_BLOCK {
             self.free_chain = crate::meta::chain_blocks(self, root)?;
         }
-        self.free = all;
+        // Outside a transaction every free block is allocatable again.
+        // Inside one the list splits: what was free before it began is
+        // allocatable, and what it freed on the way is not, because the
+        // state a rollback goes back to still reads it.
+        match &self.savepoint {
+            Some(saved) => {
+                let (free, frozen) = all.into_iter().partition(|p| saved.reusable.contains(p));
+                self.free = free;
+                self.frozen = frozen;
+            }
+            None => self.free = all,
+        }
         Ok(())
     }
 
@@ -908,6 +1062,148 @@ mod tests {
         // Both free blocks are handed out; the next one extends the file
         // past the free-list chain block.
         assert_eq!(db.allocate_block(), db.db_header().block_count);
+    }
+
+    /// A transaction that publishes two epochs of its own and is then
+    /// rolled back leaves the file reading what it read before, and
+    /// leaves it reading that after a reopen rather than only in the
+    /// handle that rolled back.
+    #[test]
+    fn a_rollback_puts_back_what_the_transaction_published_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let before = db.allocate_block();
+        db.write_block(before, &vec![7; BLOCK_SIZE as usize])
+            .unwrap();
+        db.db_header_mut().catalog_root = before;
+        db.checkpoint().unwrap();
+        let epoch = db.db_header().epoch;
+
+        db.begin_savepoint().unwrap();
+        assert!(db.in_savepoint());
+        for fill in [8u8, 9] {
+            let root = db.allocate_block();
+            db.write_block(root, &vec![fill; BLOCK_SIZE as usize])
+                .unwrap();
+            // What a fold does: write the new segment, hand the old one
+            // back, publish.
+            let old = db.db_header().catalog_root;
+            db.free_block(old).unwrap();
+            db.db_header_mut().catalog_root = root;
+            db.checkpoint().unwrap();
+        }
+        assert!(db.db_header().epoch > epoch, "the statements published");
+        db.rollback_savepoint().unwrap();
+        assert!(!db.in_savepoint());
+        assert_eq!(db.db_header().catalog_root, before);
+        assert_eq!(db.read_block(before).unwrap()[0], 7, "and it still reads");
+
+        let mut reopened = Zu1File::open(&path).unwrap();
+        assert_eq!(reopened.db_header().catalog_root, before);
+        assert_eq!(reopened.read_block(before).unwrap()[0], 7);
+        assert!(
+            reopened.db_header().epoch > db.db_header().epoch - 1,
+            "the rollback published an epoch of its own"
+        );
+    }
+
+    /// The other end: a transaction that commits keeps everything it
+    /// published, and the blocks it freed on the way are free again.
+    #[test]
+    fn a_released_savepoint_keeps_what_the_transaction_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let first = db.allocate_block();
+        db.write_block(first, &vec![7; BLOCK_SIZE as usize])
+            .unwrap();
+        db.db_header_mut().catalog_root = first;
+        db.checkpoint().unwrap();
+
+        db.begin_savepoint().unwrap();
+        let second = db.allocate_block();
+        db.write_block(second, &vec![8; BLOCK_SIZE as usize])
+            .unwrap();
+        db.free_block(first).unwrap();
+        db.db_header_mut().catalog_root = second;
+        db.checkpoint().unwrap();
+        db.release_savepoint();
+
+        assert_eq!(db.db_header().catalog_root, second);
+        assert_eq!(
+            db.allocate_block(),
+            first,
+            "the block the transaction freed is allocatable again"
+        );
+        let reopened = Zu1File::open(&path).unwrap();
+        assert_eq!(reopened.db_header().catalog_root, second);
+    }
+
+    /// One transaction at a time, and a rollback outside one is a
+    /// caller mistake rather than a checkpoint.
+    #[test]
+    fn a_savepoint_does_not_nest_and_a_rollback_needs_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        assert!(db.rollback_savepoint().is_err());
+        db.begin_savepoint().unwrap();
+        assert!(db.begin_savepoint().is_err());
+        db.rollback_savepoint().unwrap();
+        db.begin_savepoint().unwrap();
+    }
+
+    /// A block freed inside a transaction is not handed out inside it,
+    /// because the state a rollback goes back to still reads it.
+    #[test]
+    fn a_transaction_does_not_reuse_what_it_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let a = db.allocate_block();
+        db.write_block(a, &vec![1; BLOCK_SIZE as usize]).unwrap();
+        db.checkpoint().unwrap();
+        db.begin_savepoint().unwrap();
+        db.free_block(a).unwrap();
+        db.checkpoint().unwrap();
+        assert_ne!(db.allocate_block(), a, "still held for the rollback");
+        db.release_savepoint();
+        assert_eq!(db.allocate_block(), a, "and free once it is not");
+    }
+
+    /// The other half of that rule, and the one that keeps a write
+    /// statement from growing the file: a block that was already free
+    /// when the transaction began is free in the state a rollback goes
+    /// back to as well, so the transaction may write into it.
+    #[test]
+    fn a_transaction_reuses_what_was_free_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        // Two of them, because the free-list chain takes one of the
+        // blocks a checkpoint finds free and the point here is the
+        // other one.
+        let (a, b) = (db.allocate_block(), db.allocate_block());
+        for ptr in [a, b] {
+            db.write_block(ptr, &vec![1; BLOCK_SIZE as usize]).unwrap();
+            db.free_block(ptr).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let watermark = db.db_header().block_count;
+
+        db.begin_savepoint().unwrap();
+        let got = db.allocate_block();
+        assert!(got == a || got == b, "free before, so free to write");
+        db.write_block(got, &vec![2; BLOCK_SIZE as usize]).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(
+            db.db_header().block_count,
+            watermark,
+            "and the file did not grow to say it"
+        );
+        db.rollback_savepoint().unwrap();
+        assert_eq!(db.db_header().block_count, watermark);
     }
 
     #[test]

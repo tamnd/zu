@@ -56,7 +56,7 @@ fn replay_sidecar(db: &mut Zu1File) -> Result<()> {
     if wal.is_empty() {
         return Ok(());
     }
-    let mut mvcc = crate::zu1::fold::recover(db, &wal)?;
+    let mut mvcc = crate::zu1::fold::recover(db, &mut wal)?;
     crate::zu1::fold::checkpoint_fold(db, &mut mvcc, &mut wal)
 }
 
@@ -208,19 +208,26 @@ impl Session {
         stage: impl FnOnce(&mut crate::zu1::txn::WriteTxn<'_>) -> Result<T>,
     ) -> Result<T> {
         self.refresh()?;
-        if self.writer.is_none() {
-            // Opening the writer recovers and folds whatever the log
-            // holds, which can move the epoch, so the reload comes
-            // before the transaction rather than only after it.
-            self.writer = Some(Writer::open(self.graph.file_mut())?);
-            self.refresh()?;
-        }
+        self.open_writer()?;
         let mut writer = self.writer.take().expect("opened just above");
         let written = writer.write(self.graph.file_mut(), stage);
         self.writer = Some(writer);
         let written = written?;
         self.refresh()?;
         Ok(written.value)
+    }
+
+    /// Opens the writer if it is not open already.
+    ///
+    /// Opening it recovers and folds whatever the log holds, which can
+    /// move the epoch, so the reload comes with it rather than only
+    /// after the next write.
+    fn open_writer(&mut self) -> Result<()> {
+        if self.writer.is_none() {
+            self.writer = Some(Writer::open(self.graph.file_mut())?);
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     /// Whether an explicit transaction is running on this session.
@@ -267,7 +274,7 @@ impl Session {
                 // end it the same way and neither costs an epoch.
                 if self.graph.file().in_savepoint() {
                     if matches!(stmt, TxnStmt::Commit) {
-                        self.graph.file_mut().release_savepoint();
+                        self.graph.file_mut().release_savepoint()?;
                     } else {
                         self.undo()?;
                     }
@@ -305,7 +312,17 @@ impl Session {
             return Ok(false);
         }
         crate::write::writable(self.graph.file())?;
-        self.graph.file_mut().begin_savepoint()?;
+        // A transaction starts from a folded file. Opening the writer
+        // is what folds it, and the savepoint keeps where the log
+        // stands once it has, so a rollback takes back the frames the
+        // transaction wrote and leaves alone the ones that were in the
+        // log before it, which somebody else committed and this
+        // transaction has no say over.
+        self.open_writer()?;
+        let floor = self.writer.as_ref().expect("opened just above").epoch();
+        self.graph
+            .file_mut()
+            .begin_savepoint(self.txn.is_some(), floor)?;
         Ok(self.txn.is_none())
     }
 
@@ -317,7 +334,7 @@ impl Session {
         }
         match out {
             Ok(value) => {
-                self.graph.file_mut().release_savepoint();
+                self.graph.file_mut().release_savepoint()?;
                 Ok(value)
             }
             // The rollback is reported over the error that caused it
@@ -981,6 +998,67 @@ mod tests {
             .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
             .expect("names");
         assert_eq!(names.rows.len(), 2);
+    }
+
+    /// The rollback the process never got to run. A session that goes
+    /// away without a word at the end has its transaction taken back by
+    /// the drop, so the way to be the crash is to leave the handle
+    /// where the drop cannot reach it, which is what a process that
+    /// stops does to every handle it holds.
+    #[test]
+    fn a_transaction_the_process_died_inside_is_gone_when_the_file_opens_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crash.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("first");
+        session
+            .run("INSERT (p:person {name: 'raj'})", &[])
+            .expect("second");
+        assert_eq!(count(&mut session, PEOPLE), 4);
+        std::mem::forget(session);
+
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert_eq!(
+            count(&mut reopened, PEOPLE),
+            2,
+            "both statements of the open transaction went with it"
+        );
+        // And the file is a file again: what comes after the rollback
+        // is written on top of the state it went back to and stays.
+        reopened
+            .run("INSERT (p:person {name: 'ann'})", &[])
+            .expect("after");
+        drop(reopened);
+        let mut again = Session::open(&path).expect("open a third time");
+        assert_eq!(count(&mut again, PEOPLE), 3);
+    }
+
+    /// The other half of it: a transaction whose `COMMIT` returned is a
+    /// transaction a crash cannot take back.
+    #[test]
+    fn a_committed_transaction_survives_the_process_going_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crash-after-commit.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("first");
+        session
+            .run("INSERT (p:person {name: 'raj'})", &[])
+            .expect("second");
+        session.run("COMMIT", &[]).expect("commit");
+        std::mem::forget(session);
+
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert_eq!(count(&mut reopened, PEOPLE), 4);
     }
 
     #[test]

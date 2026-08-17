@@ -196,7 +196,7 @@ fn recovered_state(dir: &std::path::Path, db: &[u8], wal: &[u8], tables: Tables)
     std::fs::write(&wal_path, wal).unwrap();
     let mut db = Zu1File::open(&db_path).unwrap();
     let mut wal = Wal::open(&wal_path).unwrap();
-    let mut mvcc = recover(&mut db, &wal).unwrap();
+    let mut mvcc = recover(&mut db, &mut wal).unwrap();
     let before = state(&mut db, &mvcc, tables);
     checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
     let after = state(&mut db, &mvcc, tables);
@@ -272,7 +272,7 @@ fn every_cut_recovers_to_a_committed_prefix() {
         };
         let person = tables.person;
         let knows = tables.knows;
-        let mut mvcc = recover(&mut db, &wal).unwrap();
+        let mut mvcc = recover(&mut db, &mut wal).unwrap();
         let s0 = state(&mut db, &mvcc, tables);
         // The edge property write path, inside the recording: it frees
         // the old columns, writes the new ones, republishes the table
@@ -338,6 +338,36 @@ fn every_cut_recovers_to_a_committed_prefix() {
         ingest_edges(&mut db, &mut wal, &mut mvcc, knows, &[6, 0], &[0, 6]).unwrap();
         let ack4 = log.lock().unwrap().len();
         let s4 = state(&mut db, &mvcc, tables);
+        // A transaction starts from a folded file. What it keeps is the
+        // file's roots and a rollback publishes those again, so a frame
+        // the log is still holding would go back along with it.
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        assert_eq!(
+            state(&mut db, &mvcc, tables),
+            s4,
+            "the fold must seal exactly the committed state"
+        );
+        // A transaction the process never finishes. It has the file
+        // keep the state it starts from, publishes a statement over
+        // that, and then the recording stops, which is the process
+        // going away with the transaction still open. What the
+        // statement inside it wrote is not one of the states below, so
+        // any image recovering to it fails the check, and its commit
+        // floors nothing: a commit inside an explicit transaction says
+        // the statement reached the log, not that the transaction is
+        // one a crash may keep.
+        db.begin_savepoint(true, mvcc.epoch()).unwrap();
+        let mut txn = mvcc.begin();
+        txn.update(person, 3, 0, Cell::Int(99));
+        txn.insert_rel(knows, 1, 0);
+        db.keep_savepoint().unwrap();
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        assert_ne!(
+            state(&mut db, &mvcc, tables),
+            s4,
+            "the open transaction must change what a reader sees"
+        );
         // Every acknowledgment carries the state it floors at rather
         // than being counted, because the workload now passes through a
         // state no commit acknowledged and the number of

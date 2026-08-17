@@ -606,7 +606,7 @@ impl<'c> Appender<'c> {
     /// The write itself, split out so that one place marks the
     /// appender when any step of it fails.
     fn write_buffer(&mut self) -> Result<()> {
-        let mut mvcc = recover(self.db, &self.wal)?;
+        let mut mvcc = recover(self.db, &mut self.wal)?;
         match &self.target {
             Target::Nodes { table, cols } => {
                 // A blob column needs its slice of slices to outlive
@@ -951,7 +951,7 @@ mod tests {
         {
             let mut file = Zu1File::open(&path).expect("open");
             let mut wal = Wal::open(&sidecar(&path)).expect("wal");
-            let mut mvcc = recover(&mut file, &wal).expect("recover");
+            let mut mvcc = recover(&mut file, &mut wal).expect("recover");
             let names: Vec<&[u8]> = vec![b"linus"];
             let table = Catalog::load(&mut file)
                 .expect("catalog")

@@ -68,7 +68,7 @@ fn reopen_picks_the_newest_header_and_replays_the_tail() {
         )
         .unwrap();
         let mut wal = Wal::open(&wal_path).unwrap();
-        let mut mvcc = recover(&mut db, &wal).unwrap();
+        let mut mvcc = recover(&mut db, &mut wal).unwrap();
         let mut txn = mvcc.begin();
         txn.update(0, 0, 0, Cell::Int(11));
         txn.insert_rel(1, 2, 0);
@@ -82,8 +82,8 @@ fn reopen_picks_the_newest_header_and_replays_the_tail() {
         txn.commit(&mut wal).unwrap();
     }
     let mut db = Zu1File::open(&db_path).unwrap();
-    let wal = Wal::open(&wal_path).unwrap();
-    let mvcc = recover(&mut db, &wal).unwrap();
+    let mut wal = Wal::open(&wal_path).unwrap();
+    let mvcc = recover(&mut db, &mut wal).unwrap();
     let epoch = mvcc.epoch();
     let catalog = Catalog::load(&mut db).unwrap();
     let person = catalog.node_by_name("person").unwrap().id;
@@ -127,7 +127,7 @@ fn recovery_reads_headers_and_meta_not_data_blocks() {
         let ages: Vec<u64> = (0..rows).collect();
         store_props(&mut db, "person", &[("age", PropValues::Int(&ages))]).unwrap();
         let mut wal = Wal::open(&wal_path).unwrap();
-        let mut mvcc = recover(&mut db, &wal).unwrap();
+        let mut mvcc = recover(&mut db, &mut wal).unwrap();
         // A fold with a delete persists a tombstone chain, so recovery
         // below exercises every read it can issue: headers, the table
         // index, and the tombstone metas.
@@ -154,8 +154,8 @@ fn recovery_reads_headers_and_meta_not_data_blocks() {
         &db_path,
     )
     .unwrap();
-    let wal = Wal::open(&wal_path).unwrap();
-    let mvcc = recover(&mut db, &wal).unwrap();
+    let mut wal = Wal::open(&wal_path).unwrap();
+    let mvcc = recover(&mut db, &mut wal).unwrap();
     // Open plus recover touches the 12 KiB head, the free list chain
     // (twice, payload then block list), the table index chain, and the
     // tombstone chain, each a single meta block here. Data segments

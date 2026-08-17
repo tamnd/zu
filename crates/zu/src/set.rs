@@ -1342,6 +1342,42 @@ mod tests {
         assert_eq!(after.rows[0][0], Value::Str("kay".into()));
     }
 
+    /// The declaration a statement makes inside a transaction goes back
+    /// with the transaction, and it goes back after a crash the same
+    /// way it goes back after a `ROLLBACK`: the widened catalog is
+    /// published by the same roots the savepoint keeps, so putting the
+    /// roots back takes the label out of the dictionary along with the
+    /// bit off the row.
+    #[test]
+    fn a_label_declared_inside_a_transaction_the_process_died_inside_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("declare-crash.zu1");
+        seeded_with_labels(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Manager", &[])
+            .expect("declare and set");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'kay' SET p.age = 99", &[])
+            .expect("a second statement over the first");
+        // The process stops here, with the transaction open and both
+        // statements published.
+        std::mem::forget(session);
+
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert!(
+            reopened.catalog().label_id("Manager").is_none(),
+            "the declaration went back with the transaction"
+        );
+        let ages = reopened
+            .run("MATCH (p:person) RETURN p.age AS age ORDER BY age", &[])
+            .expect("read");
+        assert_eq!(ages.rows.len(), 2);
+        assert_ne!(ages.rows[1][0], Value::Int(99), "and so did the write");
+    }
+
     /// A table that had no labels beyond its own name stores no bitset
     /// at all, so the first label put on one of its rows is both a
     /// catalog change and the segment coming into being.

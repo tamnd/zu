@@ -117,3 +117,7 @@ harness = false
 [[bench]]
 name = "write"
 harness = false
+
+[[bench]]
+name = "rows"
+harness = false

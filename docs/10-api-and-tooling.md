@@ -3,30 +3,30 @@
 ## 1. Rust API (crate `zudb`)
 
 ```rust
-use zudb::{Database, Config, Value};
+use zudb::{Config, Database, params};
 
 let db = Database::open("social.zu1")?;                              // zu1
 // Database::open("social.db?engine=sqlite")                          // sqlite
-// Database::open_with("s3://bucket/graphs/social", cfg.s3(s3_opts))  // s3
+// Database::open_with("s3://bucket/graphs/social", Config::new())    // s3
 
-let conn = db.connect()?;                                            // cheap, Send
-let mut stmt = conn.prepare(
-    "MATCH (p:Person {id: $id})-[:Follows]->(f) RETURN f.name, f.born")?;
-for row in stmt.query(params! { "id" => 42 })? {
-    let (name, born): (&str, Option<zudb::Date>) = row.get()?;      // typed, borrowed
+let mut conn = db.connect()?;                                        // cheap, Send
+let rows = conn.query_with(
+    "MATCH (p:person {id: $id})-[:follows]->(f) RETURN f.name AS name, f.born AS born",
+    &params! { "id" => 42 },
+)?;
+for row in rows.iter() {
+    let (name, born): (&str, Option<i64>) = row.get()?;              // typed, borrowed
 }
 
+// Compiled once, run per binding
+let (stmt, wanted) = conn.prepare("MATCH (p:person {id: $id}) RETURN p.name AS name")?;
+let rows = conn.execute_prepared(stmt, &params! { "id" => 7 })?;
+conn.close_prepared(stmt);
+
 // Bulk
-conn.execute("COPY Person FROM 'people.parquet'", [])?;
-conn.execute("COPY Follows FROM 'follows.csv' WITH (REORDER = degree)", [])?;
-
-// Arrow (feature `arrow`)
-let batches: Vec<arrow::RecordBatch> = stmt.query_arrow(params!{})?.collect()?;
-
-// Write txn
-let tx = conn.begin_write()?;
-tx.execute("CREATE (:Person {id: $id, name: $n})", params!{ ... })?;
-tx.commit()?;
+let mut people = conn.appender("person")?;
+people.append_row((1i64, "Ada"))?;
+let loaded = people.close()?;
 ```
 
 Design rules: `Database: Send + Sync` (one per process per graph), `Connection` cheap and single-threaded, rows borrow from a result arena (zero-copy strings), every blocking call has a `_timeout` variant, no async in the public core API (an `async` adapter feature wraps via a worker for s3-heavy apps).
@@ -36,6 +36,14 @@ Design rules: `Database: Send + Sync` (one per process per graph), `Connection` 
 The split is what the rest of the program is built on. A `Database` is a path and a configuration that have been checked against a real file, holding no descriptor and no cache, which is why it is shareable without a lock. A `Connection` is a file handle, the caches above it, and a plan cache, which is why it is not: reads through one handle seek, so two threads sharing one would serialize on the seek position at best. Taking one costs an open and a catalog load, tens of microseconds, so a connection per thread or per request is the intended shape and a pool is an optimization rather than a necessity. Every binding on the C ABI inherits this split (`dx/02` §3), which is why the Rust API has it first, and the C ABI's runtime ownership check is the same rule this API gets from the borrow checker for free.
 
 A connection reads the database as of when it connected. It keeps the header it opened at, so a write another connection published since is not visible to it, and a reader that wants the latest catalog takes a new one. Making it otherwise means re-reading two header slots per statement, which is the entire cost of a warm query, so the answer to it is the snapshot machinery of `docs/08-transactions-mvcc.md` and not a read on the hot path.
+
+Rows come back as columns and values, and `rows.iter()` is the typed view over them (`dx/04` §4). A `Row` borrows the result, so `let (name, born): (&str, Option<i64>) = row.get()?` reads the bytes the executor already materialized and copies nothing, and a caller that wants an owned `String` asks for one and pays for it there. One column at a time is `row.get_at(2)` by position and `row.get_by_name("name")` by the name the statement projected, and the untyped `row.value(2)` is still there for a caller doing its own matching, because the typed layer is built on the values rather than in place of them. Reading by name compares a column name per row and measures about five times reading by index, so a loop over a large result hoists `result.column_index("name")` out of itself and reads by position; that is the only performance advice this API has.
+
+The two ways a typed read can fail are deliberately different conditions, and the difference is the one a program tests. Asking a `STRING` column for an `i64` is `22G03 invalid value type`, a data exception the standard defines, with both type names and the column's name in the message. Asking for a column the result does not have, by name or by index, or destructuring a three column row into a two slot tuple, is `ZuError::InvalidArgument` and carries no condition code, because no value was involved: the caller and the query disagree about the shape of the answer, which is a bug in the program and not a condition in the data.
+
+Parameters go the other way and `params!` writes them: `&params! { "id" => 42, "ids" => vec![1, 2, 3] }` binds by the names the statement uses, without the `$`, which is the same spelling the C ABI and the JSONL protocol use. It expands to an array literal rather than a `Vec`, so the bindings live on the caller's stack and the `&` is the slice the query methods take, with no allocation for the call itself. Every Rust type that is a value converts with `From`, including lists, options as null, and temporals; a string that means a date does not, because `date($when)` is where the caller says which calendar type it meant and the wire has no business guessing that from the characters.
+
+`crates/zu/benches/rows.rs` gates the claim that the typed layer is free. Tuple destructuring measures 0.97 to 1.12 times the same read written as a `match` on `Value`, and one borrowed string column 1.09 to 1.53 times, both of them under a nanosecond and a half per row on results of a hundred thousand rows. The defect the ceilings exist for is a string that starts being copied, which allocates per row and lands at eight times and up.
 
 `conn.interrupt()` hands out the one part of a `Connection` another thread may touch: the handle that stops the statement running on it and counts the rows it has read so far. A statement runs on the thread that asked for it, so stopping one means having taken the handle before the call, which is the shape both callers that want this already have, a shell answering a keystroke and a server answering a client that hung up. Asking is a relaxed store, the answer comes back at the next chunk boundary as `ZuError::Interrupted` and carries no condition code because nothing failed, and the connection runs the next statement as if the stopped one had never been asked for. Clearing the handle is the caller's to do and belongs before the next statement rather than after the stopped one. §2 has what the executors check, what the count is counted in, and what it costs.
 

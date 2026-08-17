@@ -621,16 +621,22 @@ mod tests {
         );
     }
 
-    /// A label that names no table is a reference error, not a parse
-    /// error: the statement is well formed and mentions something that
-    /// is not there.
+    /// An edge type that names no rel table is a reference error, not a
+    /// parse error: the statement is well formed and mentions something
+    /// that is not there. A node label that names no table is not this,
+    /// because a table gets made for it (`crate::declare`), and an edge
+    /// table cannot be made the same way: it is between two tables and
+    /// the pattern says which two only for the edge it is writing.
     #[test]
-    fn a_label_that_names_no_table_is_refused() {
+    fn an_edge_type_that_names_no_table_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = open(&dir, "label.zu1");
 
         let err = session
-            .run("INSERT (x:company {name: 'acme'})", &[])
+            .run(
+                "MATCH (a:person {name: 'ada'}), (b:person {name: 'kay'}) INSERT (a)-[e:employs]->(b)",
+                &[],
+            )
             .expect_err("no such table");
         assert_eq!(
             err.gqlstatus().map(|s| s.code()),

@@ -208,11 +208,24 @@ pub struct ZuError {
     /// Engine-internal failures carry none rather than a guessed one,
     /// which the accessor reports as `NULL`.
     code: Option<CString>,
+    /// The standard's own words for that condition, which is the text a
+    /// conformance harness grades and the text a binding shows when it
+    /// would rather not repeat our detail.
+    standard_text: Option<CString>,
+    /// The page that documents the condition, built from the code.
+    doc_url: Option<CString>,
     severity: i32,
-    /// Line and column, both 1-based, for a condition raised at a place
-    /// in the statement text. A failure that happened at runtime, or in
-    /// the engine rather than in a statement, has none.
+    /// Whether running the same statement again could succeed, as 0 or
+    /// 1, so that a binding's retry loop is a field read and not a set
+    /// of codes each binding writes out for itself.
+    retryable: i32,
+    /// Offset, line and column for a condition raised at a place in the
+    /// statement text. A failure that happened at runtime, or in the
+    /// engine rather than in a statement, has none.
     position: Option<Position>,
+    /// The line that position is on, when the statement text was in
+    /// hand where the condition was raised.
+    excerpt: Option<CString>,
 }
 
 /// The status an engine error becomes.
@@ -262,10 +275,14 @@ impl ZuError {
             status: status_of(e),
             message: c_message(&e.to_string()),
             code: record.map(|r| c_message(r.status.code())),
+            standard_text: record.map(|r| c_message(&r.status.standard_text())),
+            doc_url: record.map(|r| c_message(&r.doc_url())),
             // An error with no condition is still an exception: it
             // stopped the statement, which is what severity is for.
             severity: record.map_or(ZU_SEVERITY_EXCEPTION, |r| severity_of(r.severity())),
+            retryable: i32::from(e.retryable()),
             position: e.position(),
+            excerpt: e.excerpt().map(c_message),
         }
     }
 
@@ -277,8 +294,12 @@ impl ZuError {
             status: ZuStatus::Error,
             message: c"internal panic in libzu".into(),
             code: None,
+            standard_text: None,
+            doc_url: None,
             severity: ZU_SEVERITY_EXCEPTION,
+            retryable: 0,
             position: None,
+            excerpt: None,
         }
     }
 }
@@ -759,27 +780,93 @@ pub unsafe extern "C" fn zu_error_message(e: *const ZuError, len: *mut usize) ->
     e.message.as_ptr()
 }
 
+/// One of the strings an error carries when it has one, as a pointer
+/// and a length, with a NULL pointer and a zero length when it does
+/// not. A field that is absent is absent rather than empty, because an
+/// empty condition code and no condition code are different facts.
+fn field(field: &Option<CString>, len: *mut usize) -> *const c_char {
+    if !len.is_null() {
+        unsafe { *len = field.as_ref().map_or(0, |s| s.as_bytes().len()) };
+    }
+    field.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
+}
+
 /// The GQLSTATUS code, such as `42001`, or NULL when this failure
 /// carries no condition. An engine-internal failure has none rather
 /// than one that would be a guess, and a binding mapping codes to
 /// exception classes needs to be able to tell those apart.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_error_code(e: *const ZuError, len: *mut usize) -> *const c_char {
-    if !len.is_null() {
-        unsafe { *len = 0 };
-    }
     if e.is_null() {
-        return std::ptr::null();
+        return field(&None, len);
     }
-    match &unsafe { &*e }.code {
-        Some(code) => {
-            if !len.is_null() {
-                unsafe { *len = code.as_bytes().len() };
-            }
-            code.as_ptr()
-        }
-        None => std::ptr::null(),
+    field(&unsafe { &*e }.code, len)
+}
+
+/// The standard's own name for the condition, such as `syntax error or
+/// access rule violation, invalid syntax`, or NULL when this failure
+/// carries no condition.
+///
+/// This is the class name and the subclass name, in the standard's
+/// words, which is what a conformance harness compares and what a
+/// binding shows when it presents the condition rather than our
+/// account of it. [`zu_error_message`] is that account, and it says
+/// which table, which token, which value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_standard_text(
+    e: *const ZuError,
+    len: *mut usize,
+) -> *const c_char {
+    if e.is_null() {
+        return field(&None, len);
     }
+    field(&unsafe { &*e }.standard_text, len)
+}
+
+/// Where this condition is documented, or NULL when the failure
+/// carries no condition. Built from the code, so a binding that puts
+/// it in a message hands the reader a page rather than five characters
+/// to go and search for.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_doc_url(e: *const ZuError, len: *mut usize) -> *const c_char {
+    if e.is_null() {
+        return field(&None, len);
+    }
+    field(&unsafe { &*e }.doc_url, len)
+}
+
+/// The line of the statement the condition was raised on, without its
+/// newline, or NULL when there is none.
+///
+/// The column from [`zu_error_position`] counts characters into this
+/// line, so a caller has both halves of a caret without holding the
+/// statement text: the line to print and the place to point at. There
+/// is none when the failure has no position, when that line is empty,
+/// and when it is longer than anyone would read under a caret, which
+/// is the case a cut line would misplace the column for.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_excerpt(e: *const ZuError, len: *mut usize) -> *const c_char {
+    if e.is_null() {
+        return field(&None, len);
+    }
+    field(&unsafe { &*e }.excerpt, len)
+}
+
+/// Whether running the same statement again could succeed: 1 for yes,
+/// 0 for no, -1 for a NULL error.
+///
+/// A write that lost to a concurrent one is the yes: nothing of it was
+/// applied and the same call on a fresh read may win. A statement that
+/// will not parse is the no, and so is one the caller interrupted,
+/// which did not fail so much as stop. A binding's retry loop reads
+/// this instead of carrying its own list of codes, which is the sort
+/// of list that is right in one binding and stale in the other five.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_retryable(e: *const ZuError) -> i32 {
+    if e.is_null() {
+        return -1;
+    }
+    unsafe { &*e }.retryable
 }
 
 /// The severity, one of the `ZU_SEVERITY_*` values, or -1 for a NULL
@@ -822,6 +909,34 @@ pub unsafe extern "C" fn zu_error_position(
             }
             if !column.is_null() {
                 unsafe { *column = at.column };
+            }
+            ZuStatus::Ok
+        }
+        None => ZuStatus::Done,
+    }
+}
+
+/// The same place counted in bytes from the start of the statement,
+/// 0-based, for a caller that indexes the text rather than printing
+/// it.
+///
+/// [`ZuStatus::Ok`] and `offset` written when there is a position,
+/// [`ZuStatus::Done`] and `offset` left alone when there is not,
+/// [`ZuStatus::Misuse`] for a NULL error, which is
+/// [`zu_error_position`] exactly. It is always on a character boundary
+/// of the statement, so a binding slicing at it cannot split a
+/// character in half, and it is what an editor mapping the failure
+/// into its own buffer wants: recovering it from the line and the
+/// column means counting the text again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_offset(e: *const ZuError, offset: *mut u32) -> ZuStatus {
+    if e.is_null() {
+        return ZuStatus::Misuse;
+    }
+    match unsafe { &*e }.position {
+        Some(at) => {
+            if !offset.is_null() {
+                unsafe { *offset = at.offset };
             }
             ZuStatus::Ok
         }
@@ -2869,6 +2984,47 @@ mod tests {
         assert!(internal.code.is_none());
         assert_eq!(internal.severity, ZU_SEVERITY_EXCEPTION);
         assert!(internal.message.to_str().expect("utf-8").contains("lost"));
+    }
+
+    /// The rest of the model dx/03 §5 fixes, as fields on the handle:
+    /// the standard's words, the page, the place counted both ways,
+    /// the line that place is on, and whether to try again.
+    #[test]
+    fn an_error_handle_carries_the_whole_error_model() {
+        let source = "MATCH (n)\nRETURN n.x +";
+        let offset = source.find("n.x").expect("n.x");
+        let e = ZuError::from_engine(&EngineError::gql_in(
+            codes::C42001,
+            source,
+            offset,
+            "expected an expression",
+        ));
+        let text = |s: &Option<CString>| s.as_ref().map(|s| s.to_str().expect("utf-8").to_string());
+        assert_eq!(
+            text(&e.standard_text).as_deref(),
+            Some("syntax error or access rule violation, invalid syntax")
+        );
+        assert_eq!(
+            text(&e.doc_url).as_deref(),
+            Some("https://zu.dev/docs/errors/42001")
+        );
+        assert_eq!(text(&e.excerpt).as_deref(), Some("RETURN n.x +"));
+        let at = e.position.expect("a place");
+        assert_eq!((at.offset, at.line, at.column), (17, 2, 8));
+        assert_eq!(e.retryable, 0);
+
+        // A lost write is the failure worth repeating, and it says so
+        // without carrying a condition to say it with.
+        let lost = ZuError::from_engine(&EngineError::Conflict("write lost".to_string()));
+        assert_eq!(lost.retryable, 1);
+        assert!(lost.standard_text.is_none() && lost.doc_url.is_none());
+        assert!(lost.excerpt.is_none() && lost.position.is_none());
+
+        // And a panic caught at the boundary is a bug here rather than
+        // anything a caller can retry or look up.
+        let panicked = ZuError::from_panic();
+        assert_eq!(panicked.retryable, 0);
+        assert!(panicked.doc_url.is_none());
     }
 
     /// A NUL inside a message would truncate it at the boundary, so

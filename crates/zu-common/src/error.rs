@@ -57,6 +57,24 @@ impl ZuError {
         ZuError::Gql(Box::new(DiagnosticRecord::at(status, position, detail)))
     }
 
+    /// The same, raised at a byte offset into the statement text.
+    ///
+    /// The front end raises through this one rather than through
+    /// [`Self::gql_at`], because the source is what turns an offset
+    /// into a line and a column and it is also the only way to quote
+    /// the line back. A caller three layers up has the message and the
+    /// numbers and no longer has the text.
+    pub fn gql_in(
+        status: GqlStatus,
+        source: &str,
+        offset: usize,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        ZuError::Gql(Box::new(DiagnosticRecord::in_source(
+            status, source, offset, detail,
+        )))
+    }
+
     /// Where in the statement this was raised, when it was raised
     /// somewhere. An engine-internal failure and a runtime condition
     /// both answer `None`.
@@ -83,6 +101,32 @@ impl ZuError {
             _ => None,
         }
     }
+
+    /// The line of the statement this was raised on, when the statement
+    /// text was in hand where it was raised.
+    pub fn excerpt(&self) -> Option<&str> {
+        match self {
+            ZuError::Gql(record) => record.excerpt.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whether running the same thing again could succeed, which is the
+    /// one question a caller writing a retry loop is asking.
+    ///
+    /// A lost compare-and-swap is the case: a concurrent writer got
+    /// there first, so the work was not applied and the same call on a
+    /// fresh read may well win. A condition answers for itself, which
+    /// is `40000 transaction rollback` and nothing else. Everything
+    /// remaining is false, including an interruption, which is not the
+    /// engine failing but the caller having asked it to stop.
+    pub fn retryable(&self) -> bool {
+        match self {
+            ZuError::Gql(record) => record.retryable(),
+            ZuError::Conflict(_) => true,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +149,39 @@ mod tests {
         };
         assert_eq!(e.gqlstatus(), None);
         assert!(e.diagnostic().is_none());
+    }
+
+    #[test]
+    fn an_error_raised_in_a_statement_carries_the_line_it_was_raised_on() {
+        let source = "MATCH (n)\nRETURN n.x + ";
+        let offset = source.find("n.x").expect("n.x");
+        let e = ZuError::gql_in(codes::C42001, source, offset, "expected an expression");
+        assert_eq!(e.excerpt(), Some("RETURN n.x + "));
+        let at = e.position().expect("a place");
+        assert_eq!((at.line, at.column), (2, 8));
+        assert_eq!(&source[at.offset as usize..][..3], "n.x");
+        assert_eq!(
+            e.to_string(),
+            "42001: line 2, column 8: expected an expression"
+        );
+    }
+
+    #[test]
+    fn only_the_failures_worth_repeating_say_so() {
+        // A writer that lost the race did not apply its write, so the
+        // same call on a fresh read is a reasonable next move.
+        assert!(ZuError::Conflict("lost the swap".into()).retryable());
+        assert!(ZuError::gql(codes::C40000, "rolled back").retryable());
+        // Text that will not parse will not parse again, and a caller
+        // that asked for a stop got one.
+        assert!(!ZuError::gql(codes::C42001, "bad syntax").retryable());
+        assert!(!ZuError::Interrupted.retryable());
+        assert!(
+            !ZuError::Corrupt {
+                what: "block",
+                detail: "bad crc".into(),
+            }
+            .retryable()
+        );
     }
 }

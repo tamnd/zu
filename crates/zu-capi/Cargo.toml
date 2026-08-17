@@ -33,5 +33,9 @@ tempfile.workspace = true
 name = "result"
 harness = false
 
+[[bench]]
+name = "loader"
+harness = false
+
 [lints]
 workspace = true

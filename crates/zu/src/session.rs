@@ -73,6 +73,10 @@ struct CachedPlan {
     schema: Arc<zu_query::binder::Schema>,
     query: BoundQuery,
     plan: LogicalPlan,
+    /// The parts a statement that writes runs as, `None` for one that
+    /// only reads. The plan above is the whole statement, which is
+    /// what EXPLAIN prints; these are what runs.
+    parts: Option<Vec<crate::split::Part>>,
     /// What the optimizer wants EXPLAIN to say that the tree does not.
     notes: Vec<String>,
 }
@@ -223,14 +227,11 @@ impl Session {
         }
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
-        // A statement that writes writes first, and what it created is
-        // what the clauses after it read.
-        let (args, wrote) = self.write_elements(&cached, args)?;
-        if wrote && cached.query.columns.is_empty() {
-            // A write with nothing after it answers no rows, and the
-            // plan over it would produce one row of no columns, which
-            // is a different answer.
-            return Ok(QueryResult::new(Vec::new(), Vec::new()));
+        // A statement that writes runs as the parts it was split into,
+        // because the clauses after the write read what it made rather
+        // than reading the store again.
+        if let Some(parts) = &cached.parts {
+            return self.run_parts(&cached, parts, args);
         }
         let options = self.options.clone();
         if query::exec2_enabled() {
@@ -261,114 +262,71 @@ impl Session {
         )
     }
 
-    /// Runs the write half of a statement that has one, and returns the
-    /// arguments the plan reads: the parameters the caller bound, with
-    /// the created elements appended in the order the plan expects
-    /// them. The flag says whether anything was written, which is not
-    /// the same question as whether the argument list grew.
+    /// Runs a statement that writes, one part at a time: the clauses
+    /// before the write answer the rows it runs for, the write runs
+    /// once for each of them in one transaction, and the clauses after
+    /// it run over those rows with the created elements on the end.
     ///
     /// Writing here rather than inside the executor is the seam
     /// [`zu_query::plan::LogicalPlan::Insert`] describes: the executor
     /// reads through a graph, and a graph reads.
-    fn write_elements(
+    fn run_parts(
         &mut self,
         cached: &CachedPlan,
-        mut args: Vec<Value>,
-    ) -> Result<(Vec<Value>, bool)> {
-        let Some(zu_query::binder::BoundClause::Insert { nodes, rels }) =
-            cached.query.clauses.first()
-        else {
-            return Ok((args, false));
-        };
-        let (nodes, rels) = (nodes.clone(), rels.clone());
+        parts: &[crate::split::Part],
+        args: Vec<Value>,
+    ) -> Result<QueryResult> {
         // Asked before anything is worked out, so that a read-only
         // connection is told that it is read-only rather than told
         // something about the statement.
         crate::write::writable(self.graph.file())?;
-        // The values go through the same evaluator every other
-        // expression in the statement goes through, so a property
-        // written as 1 + 1 is two here for the same reason it is two in
-        // a WHERE.
-        let values = self.eval_row(cached, crate::insert::value_exprs(&nodes), &args)?;
-        let values = crate::insert::regroup(&nodes, values);
-        let new = crate::insert::plan_rows(self.graph.file_mut(), &nodes, &values)?;
-        let edges = crate::insert::plan_edges(&nodes, &new, &rels)?;
-        self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
-        // Each element arrives as a list of one, because the operator
-        // that binds it to its slot is the one that reads a list: one
-        // element in, one row out. The nodes come first and the edges
-        // behind them, which is the order the binder handed out the
-        // argument positions in.
-        args.extend(new.iter().map(|node| Value::List(vec![node.value()])));
-        args.extend(edges.iter().map(|edge| Value::List(vec![edge.value()])));
-        Ok((args, true))
-    }
-
-    /// Evaluates a handful of expressions that read no row, which is
-    /// what the property values of an `INSERT` are before there is
-    /// anything to insert into.
-    ///
-    /// It runs as a projection over the one empty row rather than
-    /// through an evaluator of its own, because a second evaluator is a
-    /// second set of answers: `1 / 0` and `'a' + 1` have to raise the
-    /// condition here that they raise in a WHERE, and the way to make
-    /// sure of that is to have one implementation.
-    fn eval_row(
-        &mut self,
-        cached: &CachedPlan,
-        exprs: Vec<zu_query::binder::BoundExpr>,
-        args: &[Value],
-    ) -> Result<Vec<Value>> {
-        if exprs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let items: Vec<zu_query::binder::BoundItem> = exprs
-            .into_iter()
-            .enumerate()
-            .map(|(i, expr)| zu_query::binder::BoundItem {
-                expr,
-                ty: zu_query::binder::Type::Any,
-                name: format!("#{i}"),
-                slot: None,
-                aggregate: false,
-            })
-            .collect();
-        let plan = LogicalPlan::Project {
-            input: Box::new(LogicalPlan::Empty),
-            items: items.clone(),
-        };
-        // The executor takes its projection items from the query rather
-        // than from the plan node, so the query it runs against has to
-        // be this projection and not the statement the values came out
-        // of. Everything else about the statement carries over: the
-        // parameters are the ones the caller bound and the labels are
-        // the ones it was bound against.
-        let columns = items.iter().map(|item| item.name.clone()).collect();
-        let query = zu_query::binder::BoundQuery {
-            clauses: vec![zu_query::binder::BoundClause::Project {
-                distinct: false,
-                items,
-                order_by: Vec::new(),
-                skip: None,
-                limit: None,
-                filter: None,
-            }],
-            variables: cached.query.variables.clone(),
-            params: cached.query.params.clone(),
-            columns,
-            path_shapes: std::collections::BTreeMap::new(),
-            labels: cached.query.labels.clone(),
-        };
         let options = self.options.clone();
-        let out = exec::execute(
-            &plan,
-            &query,
-            &cached.schema,
-            &mut self.graph,
-            args,
-            &options,
-        )?;
-        Ok(out.rows.into_iter().next().unwrap_or_default())
+        let mut carried: Option<Value> = None;
+        for part in parts {
+            let Some(write) = &part.write else {
+                // A write with nothing after it answers no rows, and a
+                // plan of no clauses would answer one row of no
+                // columns, which is a different answer.
+                if part.query.clauses.is_empty() {
+                    return Ok(QueryResult::new(Vec::new(), Vec::new()));
+                }
+                let mut args = args.clone();
+                args.extend(carried);
+                return exec::execute(
+                    &part.plan,
+                    &part.query,
+                    &cached.schema,
+                    &mut self.graph,
+                    &args,
+                    &options,
+                );
+            };
+            let mut args = args.clone();
+            args.extend(carried.take());
+            let rows = exec::execute(
+                &part.plan,
+                &part.query,
+                &cached.schema,
+                &mut self.graph,
+                &args,
+                &options,
+            )?
+            .rows;
+            let mut batch = crate::insert::Batch::open(self.graph.file_mut(), write)?;
+            let mut next = Vec::with_capacity(rows.len());
+            for row in &rows {
+                // The row holds the slots the write carries across it
+                // and then the property values, which is the order the
+                // projection at the end of this part wrote them in.
+                let (carry, props) = row.split_at(write.carry.len());
+                let made = batch.row(carry, props)?;
+                next.push(Value::List(carry.iter().cloned().chain(made).collect()));
+            }
+            let (new, edges) = batch.staged();
+            self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
+            carried = Some(Value::List(next));
+        }
+        unreachable!("the last part of a split statement writes nothing")
     }
 
     /// Compiles a statement and pins it under an id. The id maps back
@@ -487,11 +445,13 @@ impl Session {
     pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<exec::Profile> {
         self.refresh()?;
         let cached = self.plan_for(source)?;
+        if cached.parts.is_some() {
+            return Err(ZuError::Unsupported {
+                what: "profiling a statement that writes, which runs as the parts it was split at its write into rather than as the one plan a profile describes",
+                id: 0,
+            });
+        }
         let args = query::bind_args(&cached.query.params, params)?;
-        // A statement that writes writes here too, once, the way it
-        // would if it had been run: the plan reads what the write
-        // created and there is nothing for it to read otherwise.
-        let (args, _) = self.write_elements(&cached, args)?;
         let options = self.options.clone();
         let (_, profile) = exec::execute_profiled(
             &cached.plan,
@@ -515,10 +475,12 @@ impl Session {
         let graph = query::graph_of(self.graph.catalog(), self.working, &parsed)?;
         let schema = self.schema_for(graph)?;
         let (query, plan, notes) = query::compile_parsed(&parsed, &schema)?;
+        let parts = crate::split::split(&query, &schema)?;
         let cached = Arc::new(CachedPlan {
             schema,
             query,
             plan,
+            parts,
             notes,
         });
         if self.plans.len() >= PLAN_CAP {

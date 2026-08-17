@@ -204,6 +204,65 @@ int main(int argc, char **argv) {
     zu_result_free(chunked);
   }
 
+  /* The cell reader, which is how the values that have no column reach
+   * a C host. A pointer into the result rather than a handle, so what
+   * this checks on top of the answers is that nothing here needs
+   * freeing and that a borrowed pointer is still good after its
+   * neighbours have been read: a sanitizer running this is the reason
+   * it is in the C test and not only in the Rust one. */
+  {
+    zu_result *values = NULL;
+    const zu_value *cell = NULL;
+    const zu_value *inner = NULL;
+    const char *text = NULL;
+    size_t text_len = 0;
+    int32_t kind = -1;
+    int64_t count = 0;
+    int32_t offset = -1;
+    int64_t n = 0;
+    status = zu_query_z(first, "RETURN DATE '2024-02-29' AS d, [[1, 2], 'hi'] AS l", &values, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("cell query failed", status, err);
+    }
+    if (zu_result_cell(values, 0, 0, &cell) != ZU_OK || zu_value_type(cell) != ZU_TYPE_TEMPORAL ||
+        zu_value_temporal(cell, &kind, &count, &offset) != ZU_OK || kind != ZU_TEMPORAL_DATE ||
+        count != 19782 || offset != 0) {
+      zu_result_free(values);
+      zu_conn_close(first);
+      return fail("a date did not read as days from the epoch");
+    }
+    /* The list, then the list inside it, then a string beside it, all
+     * borrowed from the one result at the same time. */
+    if (zu_result_cell(values, 0, 1, &cell) != ZU_OK || zu_value_type(cell) != ZU_TYPE_LIST ||
+        zu_value_len(cell) != 2 || zu_value_at(cell, 0, &inner) != ZU_OK ||
+        zu_value_len(inner) != 2) {
+      zu_result_free(values);
+      zu_conn_close(first);
+      return fail("a list did not read as its elements");
+    }
+    if (zu_value_at(inner, 1, &inner) != ZU_OK || zu_value_i64(inner, &n) != ZU_OK || n != 2) {
+      zu_result_free(values);
+      zu_conn_close(first);
+      return fail("a nested element did not read");
+    }
+    if (zu_value_at(cell, 1, &inner) != ZU_OK || zu_value_str(inner, &text, &text_len) != ZU_OK ||
+        text_len != 2 || memcmp(text, "hi", 2) != 0) {
+      zu_result_free(values);
+      zu_conn_close(first);
+      return fail("a borrowed string is a pointer and a length");
+    }
+    /* Past the end and the wrong accessor, which is where a host that
+     * walks a list by hand goes wrong. */
+    if (zu_value_at(cell, 2, &inner) != ZU_MISUSE || inner != NULL ||
+        zu_value_i64(cell, &n) != ZU_MISUSE || n != 0) {
+      zu_result_free(values);
+      zu_conn_close(first);
+      return fail("a list was read past its end or as an integer");
+    }
+    zu_result_free(values);
+  }
+
   /* A well formed query with nothing to return answers ZU_DONE rather
    * than an error, which is the whole reason a status crosses this
    * boundary alongside the pointer. */
@@ -283,7 +342,9 @@ int main(int argc, char **argv) {
   }
   zu_stmt_close(stmt);
 
-  printf("smoke: libzu %s on this platform, two connections, four nodes, one chunk, one refusal\n",
-         version);
+  printf(
+      "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
+      "nested list, one refusal\n",
+      version);
   return 0;
 }

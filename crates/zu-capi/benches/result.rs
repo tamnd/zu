@@ -1,7 +1,7 @@
 //! What the chunked read path is for, measured against the whole-column
 //! one it sits beside (dx/02 §3, zu#167).
 //!
-//! Three numbers. scan drives a whole column both ways and sums it, so
+//! Four numbers. scan drives a whole column both ways and sums it, so
 //! the chunked loop pays for the same conversions plus a call and a
 //! bounds check per chunk; the ratio is what that overhead costs, and
 //! it is a ceiling because the chunked path is meant to be the default
@@ -11,7 +11,12 @@
 //! whole-column call converts every row before returning any, so the
 //! speedup is the number of chunks in the result, give or take the
 //! megabytes the whole-column path also has to fault in, and it is a
-//! floor. buffer is not timed at all, because the point it makes is
+//! floor. cell reads the same column one value at a time through the
+//! cell reader, which is the path the values with no column take, and
+//! the ratio is what a binding would pay for taking it on a column that
+//! has one; it is a ceiling, and it is also where a cell that started
+//! copying instead of borrowing would show up. buffer is not timed at
+//! all, because the point it makes is
 //! about memory: the conversion the whole-column path keeps alive until
 //! the result is freed grows with the result, and the chunked one does
 //! not.
@@ -26,9 +31,9 @@ use std::ptr;
 use std::time::Instant;
 
 use zu::{
-    ZuConn, ZuResult, ZuStatus, zu_conn_close, zu_open, zu_query, zu_result_chunk,
-    zu_result_chunk_col_i64, zu_result_chunk_count, zu_result_col_i64, zu_result_free,
-    zu_result_rows,
+    ZuConn, ZuResult, ZuStatus, ZuValue, zu_conn_close, zu_open, zu_query, zu_result_cell,
+    zu_result_chunk, zu_result_chunk_col_i64, zu_result_chunk_count, zu_result_col_i64,
+    zu_result_free, zu_result_rows, zu_value_i64,
 };
 
 /// People in the graph, and so rows in the column every measurement
@@ -215,6 +220,44 @@ fn main() {
         chunk_early * 1e3
     );
 
+    // ---- cell: the same column one value at a time ----
+    //
+    // The cell reader exists for the values a column cannot hold, and a
+    // binding that reached for it on an int column instead would be
+    // taking the wrong path. This measures what that costs, on the one
+    // column both paths can read, so the number is a like for like
+    // comparison rather than two different questions.
+    //
+    // It is also the check that a cell allocates nothing. Every value
+    // is a borrow of the result's own row, so 500000 of them are 500000
+    // pointers and no memory beyond the rows; a copy per cell would
+    // show up here as a ratio that keeps climbing with the row count.
+    let mut cell_scan = f64::MAX;
+    for _ in 0..REPS {
+        unsafe {
+            let result = fresh(conn);
+            let t = Instant::now();
+            let mut sum = 0u64;
+            for row in 0..u64::from(NODES) {
+                let mut value: *const ZuValue = ptr::null();
+                assert_eq!(zu_result_cell(result, row, 0, &mut value), ZuStatus::Ok);
+                let mut v = 0i64;
+                assert_eq!(zu_value_i64(value, &mut v), ZuStatus::Ok);
+                sum += v as u64;
+            }
+            cell_scan = cell_scan.min(t.elapsed().as_secs_f64());
+            assert_eq!(sum, reference, "cell by cell sum");
+            zu_result_free(result);
+        }
+    }
+    let cell_ratio = cell_scan / whole_scan;
+    println!(
+        "cell: whole {:.1} ms, cell by cell {:.1} ms, ratio {cell_ratio:.1}x, {:.0} ns per value",
+        whole_scan * 1e3,
+        cell_scan * 1e3,
+        cell_scan * 1e9 / f64::from(NODES)
+    );
+
     // ---- buffer: what each path keeps alive, untimed ----
     let whole_bytes = NODES as usize * size_of::<i64>();
     let chunk_bytes = head * size_of::<i64>();
@@ -247,6 +290,17 @@ fn main() {
                 failed = true;
             } else {
                 println!("gate: early speedup {early_speedup:.0}x over {min}");
+            }
+        }
+        // A ceiling on the per-value path, which is what catches a cell
+        // that starts copying what it is meant to borrow. Lower this
+        // ceiling, never raise it.
+        if let Some(max) = budget("capi_cell_scan_ratio") {
+            if cell_ratio > max {
+                println!("GATE FAIL: cell ratio {cell_ratio:.1}x over ceiling {max}");
+                failed = true;
+            } else {
+                println!("gate: cell ratio {cell_ratio:.1}x within {max}");
             }
         }
     }

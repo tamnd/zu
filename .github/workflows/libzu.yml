@@ -40,39 +40,46 @@ jobs:
             runner: ubuntu-latest
             container: quay.io/pypa/manylinux_2_28_x86_64:2026.08.15-1
             lib: libzu.so
+            staticlib: libzu.a
             exe: zu
             smoke: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             container: quay.io/pypa/manylinux_2_28_aarch64:2026.08.15-1
             lib: libzu.so
+            staticlib: libzu.a
             exe: zu
             smoke: true
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             container: alpine:3.24.1
             lib: libzu.so
+            staticlib: libzu.a
             exe: zu
             smoke: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             container: alpine:3.24.1
             lib: libzu.so
+            staticlib: libzu.a
             exe: zu
             smoke: true
           - target: aarch64-apple-darwin
             runner: macos-latest
             lib: libzu.dylib
+            staticlib: libzu.a
             exe: zu
             smoke: true
           - target: x86_64-apple-darwin
             runner: macos-latest
             lib: libzu.dylib
+            staticlib: libzu.a
             exe: zu
             smoke: false
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             lib: zu.dll
+            staticlib: zu.lib
             exe: zu.exe
             smoke: true
     runs-on: ${{ matrix.runner }}
@@ -109,7 +116,10 @@ jobs:
       # goes in rather than the action above, because that one decides it
       # is on glibc from the operating system alone and fetches a binary
       # Alpine cannot run. Both write the pinned version, in the syntax
-      # `cargo xtask pins` reads, and it reads both.
+      # `cargo xtask pins` reads, and it reads both. cmake and pkgconf
+      # go in because the script skips the build system checks on a
+      # machine without them, and a row that quietly skipped half of
+      # what it reports is worth less than two packages cost.
       - name: Build, measure and smoke inside Alpine
         if: contains(matrix.container, 'alpine')
         shell: bash
@@ -121,34 +131,23 @@ jobs:
             -e CARGO_HOME=/w/.cargo -e RUSTUP_HOME=/w/.rustup \
             -e RUSTFLAGS='-C target-feature=-crt-static' \
             "${{ matrix.container }}" sh -eux -c "
-              apk add --no-cache build-base curl
+              apk add --no-cache build-base curl cmake pkgconf
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
                 sh -s -- -y --no-modify-path --profile minimal \
                   --default-toolchain $toolchain
               export PATH=/w/.cargo/bin:\$PATH
               scripts/libzu-build.sh ${{ matrix.target }} ${{ matrix.smoke }}"
-      # What a consumer of the C ABI needs, flat in one directory named
-      # for the target, because this directory is the release artifact:
-      # `cargo xtask artifacts --assemble` packs it as
-      # libzu-<target>.tar.zst and an unpacked release should be four
-      # files rather than four levels of somebody's build path. The
-      # import library goes beside the DLL because a C caller on Windows
-      # links against that and not against the DLL, and it exists
-      # nowhere else, which is why the copy is conditional.
-      - name: Stage the artifact
-        shell: bash
-        env:
-          out: dist/libzu-${{ matrix.target }}
-          from: target/${{ matrix.target }}/release
-        run: |
-          set -eux
-          mkdir -p "$out"
-          cp "$from/${{ matrix.lib }}" "$from/${{ matrix.exe }}" "$out/"
-          if [ -f "$from/zu.dll.lib" ]; then cp "$from/zu.dll.lib" "$out/"; fi
-          cp crates/zu-capi/include/zu.h "$out/"
       # One artifact per platform, named for the target, so that a
       # release assembles what CI built rather than building it again
-      # somewhere else.
+      # somewhere else. The directory is staged by the build script
+      # above rather than by a step here, because what goes in it is a
+      # prefix that pkg-config and find_package(zu) resolve their paths
+      # against (dx/09 C-4) and a second spelling of that layout in
+      # yaml is a layout two of the seven rows would eventually
+      # disagree about. Uploading loses the executable bit, which costs
+      # nothing: `cargo xtask artifacts --assemble` packs
+      # libzu-<target>.tar.zst with the mode decided from the name, so
+      # what a user unpacks is runnable whatever the transport did.
       - uses: actions/upload-artifact@v4
         with:
           name: libzu-${{ matrix.target }}

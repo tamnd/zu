@@ -218,8 +218,20 @@ ldbc_distinct_two_hop_p50_ms = 2.0
 # metal hosts are inside the 25 ms perf/05 asks for; the shared vCPU
 # hosts are 4 to 8x behind that and the ceiling has to clear all of
 # them, so it sits at 150 with headroom over server1's worst p50
-# rather than at the target. Lower this ceiling, never raise it.
-ldbc_triangle_p50_ms = 150.0
+# rather than at the target.
+#
+# The close then went from a gallop to a bitmap over the probe side.
+# Every question the close asks was a binary search into a neighbor
+# array; the probe side is a kilobyte of bits instead and the question
+# is one test. Measured at 558deac with main and the branch interleaved
+# on the same host in the same session, three passes each: gamingpc
+# 6.812 6.103 6.612 against 4.133 3.815 4.633, server1 41.091 38.603
+# 33.923 against 16.565 14.153 22.149, local M series 16.3 against 7.8.
+# server1 read 39.790 on the clean gate pass, which is its worst branch
+# p50 and what the ceiling is set over, so it comes down 150 to 100.
+# Both bare metal hosts are now inside the 25 ms perf/05 asks for by
+# 3 to 5x. Lower this ceiling, never raise it.
+ldbc_triangle_p50_ms = 100.0
 
 # The same SF1 triangle walked undirected, 1.77 M closed paths. It is a
 # fifth of the graph's paths and it stands in for the 2-hop shapes
@@ -237,9 +249,19 @@ ldbc_triangle_p50_ms = 150.0
 # gamingpc, 9x locally and 5x on server1, so the ceiling comes down
 # 1200 to 400. server1 read 147 on one pass and 182 with a 218 max on
 # the next, so the room over it is that spread and not slack, and the
-# old plan measured 761 on the same box. Lower this ceiling, never
-# raise it.
-ldbc_close_p50_ms = 400.0
+# old plan measured 761 on the same box.
+#
+# This is the phase the bitmap close moves furthest, and it should be:
+# every end reads two stored lists, so the probe side is a union and
+# the seed side is two walks, over an undirected graph with twice the
+# edges. Measured at 558deac interleaved on the same host in the same
+# session, three passes each: gamingpc 39.668 39.387 39.127 against
+# 16.417 17.148 17.059, server1 221.725 187.770 154.382 against 73.756
+# 75.913 82.372, local M series 89.6 against 26.3. server1's worst
+# branch p50 outside the throwaway pass right after its build is 82.833
+# and the ceiling comes down 400 to 200 over it. Lower this ceiling,
+# never raise it.
+ldbc_close_p50_ms = 200.0
 
 # The directed triangle again with `a.id < b.id < c.id` on it, the same
 # 295 K triangles reached the way a user writes the query when they
@@ -264,7 +286,17 @@ ldbc_close_p50_ms = 400.0
 # 11.838 ms, server1 94.902 to 42.352, local M series 33.249 to
 # 22.288. server1 is the floor host and read 53.141 on the pass right
 # after its build with a 65 max, so the ceiling comes down 400 to 150
-# on that spread. Lower this ceiling, never raise it.
+# on that spread.
+#
+# The bitmap close moves this one too, though less than the other two:
+# the broadcast reads the wedge middle at its pin, so this is the close
+# that cannot batch and only the kernel changes. Measured at 558deac
+# interleaved, three passes each: gamingpc 10.867 10.812 10.812 against
+# 5.978 7.222 6.810, server1 103.386 56.262 39.655 against 28.841
+# 42.895 35.736, local M series 25.4 against 12.8. server1 read 62.195
+# on the clean gate pass, so the spread over its p50 is what holds the
+# ceiling where it is rather than the p50 itself, and 150 stays.
+# Lower this ceiling, never raise it.
 ldbc_ordered_triangle_p50_ms = 150.0
 
 # Table function kernels on SF1 (docs/07 section 4, docs/12 M4), timed
@@ -1266,6 +1298,43 @@ capi_chunk_scan_ratio = 1.5
 # chunk. Raise this floor, never lower it.
 capi_chunk_early_speedup = 50.0
 
+# What a `zu` invocation costs before it does anything, milliseconds per
+# run, measured end to end on `zu version`
+# (crates/zu-cli/benches/cli.rs). It is mostly fork, exec and the
+# dynamic loader, so it moves with the machine and with the size of the
+# binary that T7 caps at 15 MiB, and only a little with what the command
+# does. Measured: local M series 4.5, with `zu --help` and `zu --help
+# --format json` inside a millisecond of it because generated help is a
+# print and not a build.
+#
+# The ceiling sits far above that on purpose. A CLI's startup regresses
+# in kind and not by percent: a config file read at launch, a thread
+# pool, a runtime, a lazy table that turned out to be eager, each of
+# which lands in the hundreds of milliseconds and none of which is
+# hiding in the noise of a shared runner. A tighter number here would
+# fail on a busy vCPU and teach everyone to ignore it. The bench also
+# asserts, on every run and on every machine, that no help form costs
+# twice the floor, which is the sensitive half of the check.
+# Lower this ceiling, never raise it.
+cli_startup_ms = 25.0
+
+# SHA-256 throughput in MiB/s at 16 MiB, single core, from the hasher
+# the release writes its digest list with and both install scripts check
+# against. Measured: local M series 231, and flat from 64 KiB up, which
+# is what says the cost per block does not grow with the input.
+#
+# The floor is a third of that, because this is a scalar implementation
+# on purpose (a build tool that pulls a crate to hash ten files has
+# added a supply chain to the thing whose job is to be the trusted end
+# of one) and a shared vCPU runs it at half the speed of a laptop. What
+# it catches is the order of magnitude: a rewrite that allocates per
+# block, or a copy of the input per call, lands at 20 MiB/s and turns a
+# release into a minute of hashing and an install into a pause on the
+# step meant to reassure. The bench also asserts on every machine that
+# 16 MiB runs within a factor of two of 64 KiB, which is the shape half
+# of the check. Raise this floor, never lower it.
+sha256_mibs = 80.0
+
 # What one write statement costs, in each of the resources it spends
 # (crates/zu/benches/write.rs). A `SET` of one property of one element
 # and an `INSERT` of one element, each its own statement and so each its
@@ -1279,10 +1348,11 @@ capi_chunk_early_speedup = 50.0
 # and it rewrites every column of the table the statement touched. Both
 # of those are in these numbers and neither is meant to stay.
 #
-# Measured on the local M series, where an fdatasync is 3.9 ms: 39 to 42
-# ms and 1556 kB written per SET at 10000 rows, 45 ms and 2835 kB per
-# INSERT, no growth in the store for a SET that puts back what it found,
-# and 19 MB of peak resident growth across a 200 statement run. The
+# Measured on the local M series, where an fdatasync is 3.9 ms: 39 to 50
+# ms and 1556 kB written per SET at 10000 rows, 45 to 54 ms and 2836 kB
+# per INSERT, no growth in the store for a SET that puts back what it
+# found, and 19 to 23 MB of peak resident growth across a 200 statement
+# run. The
 # ceilings are set for a box whose syncs are several times slower, and
 # what they exist to catch is a regression that adds another sync or
 # another rewrite, which lands multiples above rather than just over.

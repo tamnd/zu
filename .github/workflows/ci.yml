@@ -90,6 +90,17 @@ jobs:
       # per-artifact cost has to stay flat as the contract grows past
       # the seven platforms it has today.
       - run: cargo bench -p xtask --bench artifacts
+      # The two package manager manifests are rendered from the platform
+      # table rather than maintained, so a tier 1 target reaches Homebrew
+      # and Scoop by being tier 1. This is the check that a formula
+      # someone edited by hand, or a table that moved without them, fails
+      # here rather than at the release that publishes them.
+      - run: cargo run -p xtask -- packaging --check
+      # The digest list is written over the whole release and checked by
+      # every install, and the hasher is this repository's own. What the
+      # floor catches is the order of magnitude, since a rewrite that
+      # allocates per block turns a release into a minute of hashing.
+      - run: ZU_GATE=1 cargo bench -p xtask --bench sha256
       # And the table under all of it: the nine repositories the split
       # created. The conductor dispatches to that list, the README
       # publishes it, and the contract above names its consumers from
@@ -296,6 +307,20 @@ jobs:
       # moves neither, and both fail on the same defect from opposite
       # sides: a chunked read that converts more than its chunk.
       - run: ZU_GATE=1 cargo bench -p zu-capi --bench result
+
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # What an invocation costs before it does anything, which is the
+      # one number a library bench cannot give because the process is
+      # the unit a user waits for. The ceiling in bench/budgets.toml is
+      # deliberately loose, since startup regresses in kind and not by
+      # percent; the assertion that no help form costs twice the floor
+      # runs on every machine and is the sensitive half.
+      - run: ZU_GATE=1 cargo bench -p zu-cli --bench cli
 
   corpus:
     runs-on: ubuntu-latest

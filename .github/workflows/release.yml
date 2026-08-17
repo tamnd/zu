@@ -69,11 +69,24 @@ jobs:
           version="${tag#v}"
           cargo run -p xtask -- artifacts --assemble dist --built built --version "$version"
           cargo run -p xtask -- artifacts --verify dist --version "$version"
+          # The two package manager manifests, rendered over the digest
+          # list that was just written, so what `brew install` and
+          # `scoop install` check is the release's own numbers rather
+          # than a person's copy of them. They go to a tap and a bucket
+          # that live in other repositories, which is the publish step
+          # below that is still a no-op, so they are uploaded here and
+          # pushed there.
+          cargo run -p xtask -- packaging --version "$version" --sums dist/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: release
           if-no-files-found: error
           path: dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packaging
+          if-no-files-found: error
+          path: packaging
 
   # The eight repositories, driven rather than releasing on their own
   # schedule, which is what keeps one version number meaning one thing.
@@ -125,7 +138,7 @@ jobs:
           echo "no-op: push the tag on zu-go, last of the registries because a Go module cannot be unpublished"
       - name: Docs and release notes
         run: |
-          echo "no-op: deploy zu-web against this version, publish the notes, bump Homebrew, Scoop and AUR"
+          echo "no-op: deploy zu-web against this version, publish the notes, push the rendered Homebrew formula and Scoop manifest to the tap and the bucket, and bump AUR"
       - name: What this run did not do
         run: |
           echo "The dispatches to the eight repositories ran and did nothing, because none of them has a release workflow yet."

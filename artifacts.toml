@@ -1,6 +1,6 @@
 schema = 1
 doc = "What a release of zu publishes, one table for nine repositories."
-audited = "2026-08-16"
+audited = "2026-08-17"
 
 # A release is a tag on this repository and a run that drives the eight
 # others (dx/14 section 6). Each of them builds against what this one
@@ -15,20 +15,22 @@ audited = "2026-08-16"
 # stopped being produced fails the release that dropped it rather than
 # the eight repositories that wanted it.
 #
-# `made` says where a row comes from and there are four answers. `file`
+# `made` says where a row comes from and there are five answers. `file`
 # is a path this tree already holds and the release copies. `corpus` is
 # packed by the corpus packer. `platform` is one row per tier 1 target
 # of platforms.toml, so the seven move with that table and not with this
-# one. `later` is an artifact the contract names and nothing makes yet,
-# with the milestone that makes it: writing it down early is the point,
-# since a consumer needs to know what a release will eventually carry
-# and the alternative is eight repositories each guessing.
+# one. `sums` is the digests of everything else, written last because it
+# is over the rest of the release. `later` is an artifact the contract
+# names and nothing makes yet, with the milestone that makes it: writing
+# it down early is the point, since a consumer needs to know what a
+# release will eventually carry and the alternative is eight
+# repositories each guessing.
 
 [[artifact]]
 name = "libzu-<target>.tar.zst"
 made = "platform"
 consumers = ["zu-c", "zu-go", "zu-java", "zu-dotnet", "zu-kit"]
-doc = "The shared library, the CLI and the header for one tier 1 target, as the platform's job built them. The five repositories here reach the engine through the C ABI rather than compiling against it, so this archive is the whole of what they link."
+doc = "An install prefix for one tier 1 target, as the platform's job built it: the header, both library forms, the CLI, a pkg-config file, a CMake package config, the export list in each linker's syntax and the license. The five repositories here reach the engine through the C ABI rather than compiling against it, so this archive is the whole of what they link, and it unpacks as a prefix because that is the only shape pkg-config and find_package(zu) can both resolve their paths against (dx/09 C-4, C-5)."
 
 [[artifact]]
 name = "zu.h"
@@ -49,6 +51,12 @@ name = "conformance-<version>.tar.zst"
 made = "corpus"
 consumers = ["zu-c", "zu-python", "zu-node", "zu-go", "zu-java", "zu-dotnet", "zu-kit"]
 doc = "The cross-client conformance corpus for this exact version. A client pins an engine version and needs the cases that shipped with it, not the cases on this branch, which are the cases for a version it has not adopted (dx/15 section 2)."
+
+[[artifact]]
+name = "SHA256SUMS"
+made = "sums"
+consumers = ["zu-c", "zu-python", "zu-node", "zu-go", "zu-java", "zu-dotnet", "zu-kit", "zu-web"]
+doc = "The digest of every other file of the release, one `sha256sum -c` line each, written last because it is over the rest of them. The install one-liners of dx/12 section 6 fetch this before they fetch anything else, since a `curl | sh` that pipes an unverified download into a shell is the install story every audit stops at, and the packaging manifests carry the same numbers so Homebrew and Scoop check what they install too."
 
 [[artifact]]
 name = "cli.json"

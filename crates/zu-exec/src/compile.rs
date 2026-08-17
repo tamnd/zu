@@ -225,6 +225,13 @@ pub(crate) enum Op {
         /// the op runs.
         probe_level: usize,
         to: usize,
+        /// Whether the closings of several seed rows ride down together
+        /// instead of one vector per seed row. Set by `batch_walks` on
+        /// the same rule an expand batches on, and it matters more
+        /// here: a wedge closes about twice on a social graph, so
+        /// without this the pipeline under the close runs on two rows
+        /// at a time instead of the 2048 it is written for.
+        batch: bool,
     },
     /// The binary close (perf/05 section 6): both ends of the edge are
     /// already bound, so nothing is built and the newest level only
@@ -521,7 +528,7 @@ fn reads_newest(above: &[Op]) -> bool {
     false
 }
 
-/// Marks the expands that may descend on whole vectors.
+/// Marks the walks that may descend on whole vectors.
 ///
 /// An expand pins one source row at a time because the pin is how
 /// everything above the expand knows which row the neighbors below
@@ -532,20 +539,37 @@ fn reads_newest(above: &[Op]) -> bool {
 /// concatenate neighbor lists across source rows instead, which is the
 /// same rows in the same order, just handed down in full vectors.
 ///
-/// Only the expand's own level matters. Levels under it stay pinned by
-/// the expands that built them, so a probe or a projection reaching
-/// past this one is none of this decision's business.
-fn batch_expands(ops: &mut [Op], sink: &SinkSpec, levels: &[LevelBuild]) {
+/// The WCOJ close is the same walk under a different name and takes the
+/// same treatment, on a worse starting point: a wedge on a social graph
+/// closes on about two nodes, so the row at a time descent there hands
+/// the pipeline two rows and pays a whole level build for them.
+///
+/// Only the walk's own source level matters. Levels under it stay
+/// pinned by the expands that built them, so a probe or a projection
+/// reaching past this one is none of this decision's business.
+fn batch_walks(ops: &mut [Op], sink: &SinkSpec, levels: &[LevelBuild]) {
     for i in 0..ops.len() {
-        let Op::Expand { from, close, .. } = ops[i] else {
-            continue;
+        // An intersection seeds off the level right under the one it
+        // builds, always, which is what makes its close a close. Levels
+        // are already renumbered by the time this runs, so that level
+        // is `to - 1` and no dropped one sits between them.
+        let from = match ops[i] {
+            Op::Expand { from, .. } => from,
+            Op::Intersect { to, .. } => to - 1,
+            _ => continue,
+        };
+        let close = match ops[i] {
+            Op::Expand { close, .. } => close,
+            _ => None,
         };
         // The hub weight is the one thing that reads a source level
         // without needing its pin: when everything above this expand is
         // a filter and then the degree product off this expand's own
         // source, the runner takes one degree per source row before it
-        // descends and carries the weights down with the rows.
-        let hub = matches!(ops.last(), Some(Op::DegreeProduct { from: f, .. }) if *f == from)
+        // descends and carries the weights down with the rows. Only the
+        // expand does that, so only the expand gets the exemption.
+        let hub = matches!(ops[i], Op::Expand { .. })
+            && matches!(ops.last(), Some(Op::DegreeProduct { from: f, .. }) if *f == from)
             && ops[i + 1..]
                 .iter()
                 .all(|op| matches!(op, Op::Filter { .. } | Op::DegreeProduct { .. }));
@@ -574,8 +598,9 @@ fn batch_expands(ops: &mut [Op], sink: &SinkSpec, levels: &[LevelBuild]) {
         // The expand's own fused close counts: it reads the probe
         // level through that level's pin like a standalone semi does.
         let probed = close.is_some_and(|c| c.probe_level == from) || ops[i + 1..].iter().any(reads);
-        if let Op::Expand { batch, .. } = &mut ops[i] {
-            *batch = !probed && !sink_reads(sink, from) && !outer_reads(levels, from);
+        let whole = !probed && !sink_reads(sink, from) && !outer_reads(levels, from);
+        if let Op::Expand { batch, .. } | Op::Intersect { batch, .. } = &mut ops[i] {
+            *batch = whole;
         }
     }
 }
@@ -1867,7 +1892,7 @@ impl Compiler<'_> {
         }
 
         fuse_closes(&mut ops);
-        batch_expands(&mut ops, &sink, &self.levels);
+        batch_walks(&mut ops, &sink, &self.levels);
         // The bracket runs its group one outer row at a time, because
         // whether the group matched is a fact about that row. A
         // batched descent drops the pin and concatenates neighbors
@@ -1875,7 +1900,7 @@ impl Compiler<'_> {
         // inside the bracket batches.
         if let Some(head) = ops.iter().position(|op| matches!(op, Op::Bracket { .. })) {
             for op in &mut ops[head..] {
-                if let Op::Expand { batch, .. } = op {
+                if let Op::Expand { batch, .. } | Op::Intersect { batch, .. } = op {
                     *batch = false;
                 }
             }
@@ -2101,6 +2126,7 @@ impl Compiler<'_> {
             probe,
             probe_level,
             to: built_to,
+            batch: false,
         })
     }
 
@@ -3599,7 +3625,7 @@ mod tests {
     fn a_folded_close_keeps_the_probe_levels_pin() {
         let mut ops = vec![hop(0, 1), hop(1, 2), semi(1)];
         fuse_closes(&mut ops);
-        batch_expands(&mut ops, &SinkSpec::Count, &[]);
+        batch_walks(&mut ops, &SinkSpec::Count, &[]);
         assert_eq!(
             batched(&ops),
             [true, false],
@@ -3610,11 +3636,11 @@ mod tests {
     #[test]
     fn an_expand_batches_when_nothing_above_reads_its_source() {
         let mut ops = vec![hop(0, 1), hop(1, 2)];
-        batch_expands(&mut ops, &SinkSpec::Count, &[]);
+        batch_walks(&mut ops, &SinkSpec::Count, &[]);
         assert_eq!(batched(&ops), [true, true], "a bare count reads no level");
 
         let mut ops = vec![hop(0, 1), hop(1, 2)];
-        batch_expands(
+        batch_walks(
             &mut ops,
             &SinkSpec::Rows {
                 items: vec![ScalarRef::RowId { level: 2 }],
@@ -3629,10 +3655,61 @@ mod tests {
         );
     }
 
+    /// The close is a walk off the level under the one it builds, so
+    /// the same rule applies to it, and it is the one that needs it:
+    /// a wedge closes on a node or two and the row at a time descent
+    /// builds a level for those two.
+    #[test]
+    fn a_close_batches_on_the_same_rule_the_expand_does() {
+        let wcoj = |probe_level, to| Op::Intersect {
+            seed: (0, Dirs::One(Dir::Fwd)),
+            probe: (0, Dirs::One(Dir::Fwd)),
+            probe_level,
+            to,
+            batch: false,
+        };
+        let closed = |ops: &[Op]| match ops.last() {
+            Some(Op::Intersect { batch, .. }) => *batch,
+            _ => unreachable!("the close is the last op here"),
+        };
+
+        let mut ops = vec![hop(0, 1), wcoj(0, 2)];
+        batch_walks(&mut ops, &SinkSpec::Count, &[]);
+        assert!(closed(&ops), "a bare count reads neither end of the wedge");
+
+        // The seed level is level 1 here, which is `to` minus one and
+        // never the probe level, so probing the far end is no reason
+        // for the close itself to stay row at a time.
+        let mut ops = vec![hop(0, 1), wcoj(0, 2)];
+        batch_walks(
+            &mut ops,
+            &SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 0 }],
+                post: Vec::new(),
+            },
+            &[],
+        );
+        assert!(closed(&ops), "the projected level is the pinned far end");
+
+        let mut ops = vec![hop(0, 1), wcoj(0, 2)];
+        batch_walks(
+            &mut ops,
+            &SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 1 }],
+                post: Vec::new(),
+            },
+            &[],
+        );
+        assert!(
+            !closed(&ops),
+            "the wedge middle is projected, so the close keeps its pin"
+        );
+    }
+
     #[test]
     fn an_expand_whose_source_is_read_above_it_keeps_its_pin() {
         let mut ops = vec![hop(0, 1), hop(1, 2)];
-        batch_expands(
+        batch_walks(
             &mut ops,
             &SinkSpec::Rows {
                 items: vec![ScalarRef::RowId { level: 1 }],
@@ -3655,7 +3732,7 @@ mod tests {
                 probe_level: 1,
             },
         ];
-        batch_expands(&mut ops, &SinkSpec::Count, &[]);
+        batch_walks(&mut ops, &SinkSpec::Count, &[]);
         assert_eq!(
             batched(&ops),
             [true, false],
@@ -3671,7 +3748,7 @@ mod tests {
             level(Vec::new()),
             level(vec![ColSpec::Outer { from: 1, vec: 0 }]),
         ];
-        batch_expands(&mut ops, &SinkSpec::Count, &levels);
+        batch_walks(&mut ops, &SinkSpec::Count, &levels);
         assert_eq!(
             batched(&ops),
             [true, false],
@@ -3684,7 +3761,7 @@ mod tests {
             level(Vec::new()),
             level(vec![ColSpec::Outer { from: 0, vec: 0 }]),
         ];
-        batch_expands(&mut ops, &SinkSpec::Count, &levels);
+        batch_walks(&mut ops, &SinkSpec::Count, &levels);
         assert_eq!(
             batched(&ops),
             [false, true],
@@ -3695,7 +3772,7 @@ mod tests {
     #[test]
     fn an_aggregate_argument_counts_as_a_read() {
         let mut ops = vec![hop(0, 1), hop(1, 2)];
-        batch_expands(
+        batch_walks(
             &mut ops,
             &SinkSpec::Agg {
                 item_agg: vec![true],

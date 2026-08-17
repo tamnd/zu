@@ -24,8 +24,6 @@ use std::process::ExitCode;
 
 use zu_corpus::{Outcome, load, run};
 
-pub(crate) const USAGE: &str = "zu corpus <dir> [--strict] [--quiet]";
-
 /// Parses the argument list and runs the corpus in `dir`.
 pub(crate) fn corpus_command(args: &[String]) -> ExitCode {
     let mut dir: Option<&str> = None;
@@ -35,13 +33,13 @@ pub(crate) fn corpus_command(args: &[String]) -> ExitCode {
         match arg.as_str() {
             "--strict" => strict = true,
             "--quiet" | "-q" => quiet = true,
-            arg if arg.starts_with('-') => return crate::usage_error(USAGE),
+            arg if arg.starts_with('-') => return crate::usage_error("corpus"),
             arg if dir.is_none() => dir = Some(arg),
-            _ => return crate::usage_error(USAGE),
+            _ => return crate::usage_error("corpus"),
         }
     }
     let Some(dir) = dir else {
-        return crate::usage_error(USAGE);
+        return crate::usage_error("corpus");
     };
     corpus(Path::new(dir), strict, quiet)
 }
@@ -176,11 +174,14 @@ mod tests {
             ExitCode::SUCCESS
         );
         // No directory is a usage error and not a run of the working
-        // directory, which holds no cases and would report as one.
-        assert_eq!(corpus_command(&args(&["--quiet"])), ExitCode::FAILURE);
+        // directory, which holds no cases and would report as one. A
+        // usage error is 2 and a run that found something wrong is 1, so
+        // a script can tell "you called this wrongly" from "the corpus
+        // does not pass".
+        assert_eq!(corpus_command(&args(&["--quiet"])), ExitCode::from(2));
         assert_eq!(
             corpus_command(&args(&[&path, "--verbose"])),
-            ExitCode::FAILURE,
+            ExitCode::from(2),
             "an unknown flag is a usage error rather than a path"
         );
     }

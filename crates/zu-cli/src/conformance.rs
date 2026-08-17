@@ -401,10 +401,6 @@ fn render_json() -> String {
     out
 }
 
-const USAGE: &str = "zu conformance --declare [--format toml|json] | --verify <report.json> \
-                     | --tally <report.json> | --scoreboard <tally.json>... \
-                     | --regressed <report.json> <baseline.json>";
-
 pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("--declare") => match args.get(1).map(String::as_str) {
@@ -421,26 +417,26 @@ pub(crate) fn conformance_command(args: &[String]) -> ExitCode {
                     print!("{}", render_json());
                     ExitCode::SUCCESS
                 }
-                _ => crate::usage_error(USAGE),
+                _ => crate::usage_error("conformance"),
             },
-            _ => crate::usage_error(USAGE),
+            _ => crate::usage_error("conformance"),
         },
         Some("--verify") => match args.get(1) {
             Some(path) => verify(path),
-            None => crate::usage_error(USAGE),
+            None => crate::usage_error("conformance"),
         },
         Some("--tally") => match args.get(1) {
             Some(path) => crate::scoreboard::tally_command(path),
-            None => crate::usage_error(USAGE),
+            None => crate::usage_error("conformance"),
         },
         Some("--scoreboard") if args.len() > 1 => crate::scoreboard::scoreboard_command(&args[1..]),
         Some("--regressed") => match (args.get(1), args.get(2)) {
             (Some(report), Some(baseline)) => {
                 crate::scoreboard::regressed_command(report, baseline)
             }
-            _ => crate::usage_error(USAGE),
+            _ => crate::usage_error("conformance"),
         },
-        _ => crate::usage_error(USAGE),
+        _ => crate::usage_error("conformance"),
     }
 }
 

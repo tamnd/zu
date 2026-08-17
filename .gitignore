@@ -1,4 +1,9 @@
 /target
+# Where a platform's build stages its package and where a release is
+# assembled. CI made it first, but `scripts/libzu-build.sh` makes it on
+# any machine that runs a platform's build, which is the point of the
+# script being the one CI runs.
+/dist
 # CI clones the terminology table's repository here, and a person may
 # well do the same rather than keeping it beside this one.
 /zu-web

@@ -14,21 +14,24 @@
 //! then fails the release that dropped it, which is the run that can
 //! still do something about it.
 //!
-//! Four kinds of row, because there are four ways an artifact comes to
+//! Five kinds of row, because there are five ways an artifact comes to
 //! exist here. A `file` is a path the tree already holds. A `corpus` is
 //! packed by the packer beside this. A `platform` row is one artifact
 //! per tier 1 target, expanded against `platforms.toml` so the seven
-//! move with that table rather than with this one. And a `later` row is
-//! an artifact the contract names that nothing makes yet, carrying the
-//! milestone that will make it: naming it early is the point, since a
-//! consumer needs to know what a release will eventually carry, and the
-//! alternative is eight repositories each guessing.
+//! move with that table rather than with this one. A `sums` row is the
+//! digests of everything else, written last because it is over the rest
+//! of the release and read first by anything that installs from it. And
+//! a `later` row is an artifact the contract names that nothing makes
+//! yet, carrying the milestone that will make it: naming it early is
+//! the point, since a consumer needs to know what a release will
+//! eventually carry, and the alternative is eight repositories each
+//! guessing.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::toml::Doc;
-use crate::{corpus, platforms, tarball};
+use crate::{corpus, platforms, sha256, tarball};
 
 /// The table's schema version, which moves when the shape of the file
 /// changes and not when the artifacts do.
@@ -54,6 +57,9 @@ pub enum Made {
     Corpus,
     /// One artifact per tier 1 target of `platforms.toml`.
     Platform,
+    /// The digests of everything else, written last because it is over
+    /// the rest of the release.
+    Sums,
     /// Named by the contract, made by nobody yet, and this is the
     /// milestone that changes that.
     Later { milestone: String },
@@ -66,6 +72,7 @@ impl Made {
             Made::File { .. } => "file",
             Made::Corpus => "corpus",
             Made::Platform => "platform",
+            Made::Sums => "sums",
             Made::Later { .. } => "later",
         }
     }
@@ -158,6 +165,11 @@ pub enum Fault {
     Empty { name: String },
     /// A file in the release that no row accounts for.
     Stranger { file: String },
+    /// A published file the digest list does not carry, which is a file
+    /// an installer cannot check and therefore will not install.
+    Unsummed { name: String },
+    /// A published file whose digest is not the one recorded beside it.
+    Mismatch { name: String },
 }
 
 impl std::fmt::Display for Fault {
@@ -168,6 +180,14 @@ impl std::fmt::Display for Fault {
             Fault::Stranger { file } => {
                 write!(f, "{file} is in the release and not in {PATH}")
             }
+            Fault::Unsummed { name } => {
+                write!(f, "{name} is in the release and has no digest beside it")
+            }
+            Fault::Mismatch { name } => write!(
+                f,
+                "{name} is not the file the digest list says it is, so either it was rebuilt \
+                 after the digests were written or it was replaced"
+            ),
         }
     }
 }
@@ -244,6 +264,7 @@ impl Table {
                         .ok_or_else(|| format!("line {line}: {name} is a file with no from"))?,
                 },
                 Some("corpus") => Made::Corpus,
+                Some("sums") => Made::Sums,
                 Some("platform") => {
                     if !name.contains("<target>") {
                         return Err(format!(
@@ -261,7 +282,7 @@ impl Table {
                 found => {
                     return Err(format!(
                         "line {line}: {name} is made {found:?}, and the ways are file, corpus, \
-                         platform and later"
+                         platform, sums and later"
                     ));
                 }
             };
@@ -321,6 +342,12 @@ impl Table {
         }
         if artifacts.is_empty() {
             return Err("a release that publishes nothing".to_string());
+        }
+        // One digest file, because two of them is a user asking which
+        // one to trust and an installer picking whichever it was
+        // written to read.
+        if artifacts.iter().filter(|a| a.made == Made::Sums).count() > 1 {
+            return Err("two rows write the digests of the release".to_string());
         }
 
         Ok(Table {
@@ -429,8 +456,28 @@ impl Table {
                         made.push(write(out, &name, &archive, "platform")?);
                     }
                 }
+                // Written after this loop, because it is over what the
+                // loop produced.
+                Made::Sums => {}
                 Made::Later { .. } => unreachable!("published rows only"),
             }
+        }
+        if let Some(artifact) = self.artifacts.iter().find(|a| a.made == Made::Sums) {
+            let name = artifact.expand(version, "");
+            made.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut lines = String::new();
+            for shipped in &made {
+                let path = out.join(&shipped.name);
+                let bytes =
+                    std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+                // The format `sha256sum -c` reads: the digest, two
+                // spaces, the name. An installer on a machine with no
+                // coreutils reads the same line by hand, which is why
+                // the whole file is one shape and not a header and a
+                // table.
+                lines.push_str(&format!("{}  {}\n", sha256::hex(&bytes), shipped.name));
+            }
+            made.push(write(out, &name, lines.as_bytes(), "sums")?);
         }
         Ok(made)
     }
@@ -479,6 +526,37 @@ impl Table {
             }
         }
         faults.extend(found.into_keys().map(|file| Fault::Stranger { file }));
+
+        // The digests are checked here rather than trusted, because the
+        // one thing a release cannot ship is a digest list that does not
+        // describe the release: an installer that verifies a download
+        // against it would refuse every install, and the failure would
+        // arrive as a user's bug report rather than as this line.
+        if let Some(artifact) = self.artifacts.iter().find(|a| a.made == Made::Sums) {
+            let list = artifact.expand(version, "");
+            let text = std::fs::read_to_string(dir.join(&list)).unwrap_or_default();
+            let recorded: BTreeMap<&str, &str> = text
+                .lines()
+                .filter_map(|line| line.split_once("  "))
+                .map(|(digest, name)| (name, digest))
+                .collect();
+            for entry in shipped.iter().filter(|s| s.name != list) {
+                let path = dir.join(&entry.name);
+                let bytes =
+                    std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+                match recorded.get(entry.name.as_str()) {
+                    None => faults.push(Fault::Unsummed {
+                        name: entry.name.clone(),
+                    }),
+                    Some(digest) if *digest != sha256::hex(&bytes) => {
+                        faults.push(Fault::Mismatch {
+                            name: entry.name.clone(),
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         Ok((shipped, faults))
     }
 }
@@ -597,8 +675,45 @@ mod tests {
         "doc = \"The language as data.\"\n",
     );
 
+    /// The same contract with the digest list on it, which is its own
+    /// constant so the tests above keep counting the rows they were
+    /// written to count.
+    const SUMMED: &str = concat!(
+        "[[artifact]]\n",
+        "name = \"SHA256SUMS\"\n",
+        "made = \"sums\"\n",
+        "consumers = [\"zu-c\"]\n",
+        "doc = \"The digests of the rest.\"\n",
+    );
+
     fn table() -> Table {
         Table::parse(TABLE).expect("the table parses")
+    }
+
+    fn summed() -> Table {
+        Table::parse(&format!("{TABLE}\n{SUMMED}")).expect("the table parses")
+    }
+
+    /// A release of the `summed` table, assembled into a fresh
+    /// directory, which is what the digest tests all start from.
+    fn released(name: &str) -> (PathBuf, PathBuf, Vec<String>) {
+        let dir = scratch(name);
+        let root = dir.join("tree");
+        let built = dir.join("built");
+        let out = dir.join("dist");
+        std::fs::create_dir_all(root.join("crates/zu-capi/include")).expect("writes");
+        std::fs::write(root.join("crates/zu-capi/include/zu.h"), "#define ZU 1\n").expect("writes");
+        std::fs::create_dir_all(built.join("libzu-x86_64-apple-darwin")).expect("writes");
+        std::fs::write(
+            built.join("libzu-x86_64-apple-darwin/libzu.dylib"),
+            vec![9u8; 4096],
+        )
+        .expect("writes");
+        let targets = vec!["x86_64-apple-darwin".to_string()];
+        summed()
+            .assemble(&root, &built, &out, "0.5.0", &targets)
+            .expect("assembles");
+        (dir, out, targets)
     }
 
     /// A scratch tree, so a test can assemble into something.
@@ -819,6 +934,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The digest list is the file an installer reads before it reads
+    /// anything else, so it has to describe the release it shipped with
+    /// exactly: a line per file, in the format `sha256sum -c` reads, and
+    /// no line for itself, which nothing could check.
+    #[test]
+    fn the_release_carries_the_digest_of_everything_it_publishes() {
+        let (dir, out, targets) = released("sums");
+        let text = std::fs::read_to_string(out.join("SHA256SUMS")).expect("reads");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        for (line, name) in lines
+            .iter()
+            .zip(["libzu-x86_64-apple-darwin.tar.zst", "zu.h"])
+        {
+            let (digest, file) = line.split_once("  ").expect("a sha256sum line");
+            assert_eq!(file, name);
+            assert_eq!(digest.len(), 64, "{line}");
+            let bytes = std::fs::read(out.join(file)).expect("reads");
+            assert_eq!(digest, sha256::hex(&bytes), "{file}");
+        }
+        assert!(!text.contains("SHA256SUMS"), "a list cannot check itself");
+
+        let (shipped, faults) = summed().verify(&out, "0.5.0", &targets).expect("verifies");
+        assert_eq!(faults, [] as [Fault; 0]);
+        assert_eq!(shipped.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The failure this check exists for: an artifact rebuilt after the
+    /// digests were written, which an installer would refuse and a
+    /// release should catch here instead.
+    #[test]
+    fn a_file_that_is_not_what_its_digest_says_stops_the_release() {
+        let (dir, out, targets) = released("mismatch");
+        std::fs::write(out.join("zu.h"), "#define ZU 2\n").expect("writes");
+        let (_, faults) = summed().verify(&out, "0.5.0", &targets).expect("verifies");
+        assert_eq!(
+            faults,
+            [Fault::Mismatch {
+                name: "zu.h".to_string()
+            }]
+        );
+
+        // And a published file with no line at all, which is the same
+        // failure from the other side: an installer that cannot check
+        // it will not install it.
+        let text = std::fs::read_to_string(out.join("SHA256SUMS")).expect("reads");
+        let kept: String = text
+            .lines()
+            .filter(|l| !l.ends_with("zu.h"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(out.join("SHA256SUMS"), kept).expect("writes");
+        let (_, faults) = summed().verify(&out, "0.5.0", &targets).expect("verifies");
+        assert_eq!(
+            faults,
+            [Fault::Unsummed {
+                name: "zu.h".to_string()
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_rows_of_digests_are_refused() {
+        let text = format!(
+            "{TABLE}\n{SUMMED}\n{}",
+            SUMMED.replace("SHA256SUMS", "sums")
+        );
+        let error = Table::parse(&text).expect_err("two digest lists");
+        assert!(error.contains("two rows write the digests"), "{error}");
+    }
+
     #[test]
     fn the_committed_contract_is_what_this_tree_publishes() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -834,6 +1022,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "SHA256SUMS",
                 "cli.json",
                 "conformance-<version>.tar.zst",
                 "errors.json",
@@ -849,6 +1038,6 @@ mod tests {
         // written out.
         let targets = tier1(&root).expect("the platform table loads");
         assert_eq!(targets.len(), 7);
-        assert_eq!(table.names("0.5.0", &targets).len(), 7 + 3);
+        assert_eq!(table.names("0.5.0", &targets).len(), 7 + 4);
     }
 }

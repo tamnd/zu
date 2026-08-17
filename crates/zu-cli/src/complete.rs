@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn nothing_is_offered_where_a_name_cannot_go() {
         assert_eq!(at_end("RETURN 'Per"), Completion::default());
-        assert_eq!(at_end("-- Per"), Completion::default());
+        assert_eq!(at_end("// Per"), Completion::default());
         assert_eq!(at_end("/* Per"), Completion::default());
         assert_eq!(at_end("RETURN $per"), Completion::default());
         assert_eq!(at_end("MATCH "), Completion::default());

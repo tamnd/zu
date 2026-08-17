@@ -376,6 +376,49 @@ jobs:
           cc $flags -o "$RUNNER_TEMP/value_test" \
             conformance/c/yaml.c conformance/c/value.c conformance/c/value_test.c
           "$RUNNER_TEMP/value_test" conformance/cases/*.yaml
+      # The same cases as the first step of this job, through the C ABI
+      # instead of through the crate, which is the thing eight client
+      # repositories will be doing with them. `--strict` for the reason
+      # given up there, and both sanitizers because this one runs the
+      # engine as well as the reader: a pointer a result hands back and
+      # a C host holds on to for one line too long is the failure that
+      # would otherwise be found by a client and not by us. The library
+      # is not instrumented and does not need to be, since what is being
+      # watched here is the C side of the boundary.
+      # What the two runners print is diffed rather than only checked,
+      # because agreeing is the property that matters and passing is
+      # only the case where agreeing is easy. Two runners that both
+      # break in the same week would otherwise show as two red jobs
+      # nobody can line up; this shows as the one case they differ on.
+      # The C run's exit code is kept and used at the end, so a failure
+      # gets diffed before it stops the step.
+      - name: The C runner over every case, against the C ABI
+        run: |
+          cargo build -p zu-capi --release
+          cc -std=c99 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer -Icrates/zu-capi/include \
+            -o "$RUNNER_TEMP/runner" \
+            conformance/c/yaml.c conformance/c/value.c conformance/c/runner.c \
+            -Ltarget/release -lzu -Wl,-rpath,"$PWD/target/release"
+          mkdir -p "$RUNNER_TEMP/corpus"
+          status=0
+          "$RUNNER_TEMP/runner" --dir "$RUNNER_TEMP/corpus" --strict \
+            conformance/cases/*.yaml > "$RUNNER_TEMP/c.txt" || status=$?
+          cargo run -q -p zu-cli --release -- corpus conformance/cases \
+            > "$RUNNER_TEMP/rust.txt" || true
+          diff -u "$RUNNER_TEMP/rust.txt" "$RUNNER_TEMP/c.txt"
+          cat "$RUNNER_TEMP/c.txt"
+          # The other half of agreeing, which the corpus cannot show
+          # because it passes: what the two say when a case does not.
+          # Both of these exit 1 on purpose, so what is gated is the
+          # diff and not the status.
+          "$RUNNER_TEMP/runner" --dir "$RUNNER_TEMP/corpus" \
+            conformance/c/wrong/wrong.yaml > "$RUNNER_TEMP/c-wrong.txt" || true
+          cargo run -q -p zu-cli --release -- corpus conformance/c/wrong \
+            > "$RUNNER_TEMP/rust-wrong.txt" || true
+          diff -u "$RUNNER_TEMP/rust-wrong.txt" "$RUNNER_TEMP/c-wrong.txt"
+          exit $status
 
   terms:
     runs-on: ubuntu-latest

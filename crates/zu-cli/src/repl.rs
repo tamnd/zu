@@ -21,6 +21,7 @@ use std::process::ExitCode;
 
 use zu::session::Session;
 
+use crate::complete::Names;
 use crate::keys::{self, Decoded};
 use crate::line::{Editor, Step};
 use crate::term::{self, Raw};
@@ -45,9 +46,14 @@ enum Line {
 pub(crate) fn run(session: &mut Session, path: &str) -> ExitCode {
     let version = crate::VERSION;
     println!("zu {version}, {path}. Ctrl-J for a new line, quit or Ctrl-D to leave.");
-    let mut editor = Editor::default();
+    let mut editor = Editor::new(crate::highlight::wanted());
+    // Gathered here and again after every statement, since a statement
+    // is how a table or a label comes into being and a completion that
+    // did not know about the graph just created would be a completion
+    // people stopped pressing.
+    let mut names = names(session);
     loop {
-        let line = match read(&mut editor) {
+        let line = match read(&mut editor, &names) {
             Ok(line) => line,
             // A terminal that cannot be put in raw mode, or one that
             // stopped answering. Neither is worth a second attempt, and
@@ -65,9 +71,45 @@ pub(crate) fn run(session: &mut Session, path: &str) -> ExitCode {
                     return ExitCode::SUCCESS;
                 }
                 print!("{}", answer(session, &statement));
+                names = self::names(session);
             }
         }
     }
+}
+
+/// The names the open file has, in the shapes completion offers them.
+///
+/// Labels come from the dictionary and from the table names, because a
+/// node table's name is the label every one of its rows carries and a
+/// rel table's name is what a pattern writes after the colon in
+/// `-[r:KNOWS]->`. Properties come from the declared graph types, which
+/// is every property a typed graph has; a graph with no type declared
+/// for it has no property names to offer, and offering the ones from
+/// another graph would be worse than offering none.
+fn names(session: &Session) -> Names {
+    let catalog = session.catalog();
+    let mut names = Names::default();
+    for table in catalog.node_tables() {
+        names.tables.push(table.name.clone());
+        names.labels.push(table.name.clone());
+    }
+    for rel in catalog.rel_tables() {
+        names.tables.push(rel.name.clone());
+        names.labels.push(rel.name.clone());
+    }
+    names.labels.extend(catalog.labels().iter().cloned());
+    for graph in catalog.graphs() {
+        names.tables.push(graph.name.clone());
+    }
+    for ty in catalog.graph_types() {
+        for element in &ty.elements {
+            names
+                .properties
+                .extend(element.properties.iter().map(|p| p.name.clone()));
+        }
+    }
+    names.tidy();
+    names
 }
 
 /// Runs one statement and renders whatever came back, result or
@@ -104,7 +146,7 @@ fn answer(session: &mut Session, statement: &str) -> String {
 /// The byte buffer outlives each read because an escape sequence
 /// arrives split across reads often enough to be the normal case on a
 /// slow link, and the decoder is written to say so rather than to guess.
-fn read(editor: &mut Editor) -> std::io::Result<Line> {
+fn read(editor: &mut Editor, names: &Names) -> std::io::Result<Line> {
     let _raw = Raw::enter()?;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -130,6 +172,20 @@ fn read(editor: &mut Editor) -> std::io::Result<Line> {
                     // again from the top of a screen nothing else is on.
                     term::emit("\x1b[H\x1b[2J")?;
                     editor.drawn_nothing();
+                    term::emit(&editor.render(term::width(), PROMPT, MORE))?;
+                }
+                Step::Complete => {
+                    let list = editor.complete(names);
+                    if !list.is_empty() {
+                        // The candidates go above the prompt and stay
+                        // there, the way a shell's do: the statement is
+                        // drawn again underneath them, so the screen
+                        // keeps both what was offered and what is being
+                        // typed.
+                        term::emit(&editor.tail())?;
+                        editor.drawn_nothing();
+                        term::emit(&crate::complete::grid(&list, term::width()))?;
+                    }
                     term::emit(&editor.render(term::width(), PROMPT, MORE))?;
                 }
                 Step::Submit(statement) => {

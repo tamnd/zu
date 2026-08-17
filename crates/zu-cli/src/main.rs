@@ -20,9 +20,11 @@ use zu::query::{QueryResult, Value};
 use zu::{DiagnosticRecord, Severity};
 use zu_json::Json;
 
+mod complete;
 mod conformance;
 mod corpus;
 mod help;
+mod highlight;
 mod keys;
 mod line;
 mod repl;

@@ -25,6 +25,7 @@ WalRecord { len u32 | crc32c u32 | epoch u64 | kind u8 | payload }
 kinds: TxnBegin, NodeInsert{table, rows(columnar)}, RelInsert{...},
        Update{table, group, col, offsets, values}, Delete{ids},
        RelDelete{rel, src, dst}, RelUpdate{rel, col, src, dst, values},
+       LabelUpdate{table, offsets, add, remove},
        DdlCatalog{delta}, TxnCommit{epoch},
        IngestRef{sealed group ptrs}, CheckpointNote{epoch}
 ```
@@ -32,6 +33,7 @@ kinds: TxnBegin, NodeInsert{table, rows(columnar)}, RelInsert{...},
 - Commit = append records + fsync (zu1: `fdatasync` per commit, group-commit window 1 ms when writers queue; s3: durability per §06 modes).
 - `RelDelete` names the rows an edge runs between rather than an offset, because an edge has none: the fold drops the pair out of the CSR it rebuilds, so there is nothing for a reader to filter by afterwards.
 - `RelUpdate` names its edges the same way and for the same reason, and it carries one column per record: an edge property column is dense over the edges in the order the table holds them, so the fold rewrites the whole column and the pair is what survives the reorder an added edge causes.
+- `LabelUpdate` carries two masks rather than a word, because a row's label word is read-modify-written and the file the txn would read it from does not hold the txn's own earlier changes yet. The masks are disjoint, the fold applies `(word | add) & !remove`, and two changes to one row compose to one pair of masks, so a label going on and another coming off in one statement both land.
 - `IngestRef` is the DuckDB trick: bulk loads write sealed segments directly to free blocks/objects, WAL only references them, no double write.
 - Replay: idempotent by epoch (records ≤ checkpointed epoch skipped); stops at first CRC failure (torn tail = uncommitted).
 

@@ -173,6 +173,19 @@ pub enum WalRecord {
         dst: Vec<u64>,
         values: WalValues,
     },
+    /// Which labels one txn put on rows and which it took off them. The
+    /// two masks are a bit per label of the graph's dictionary, and the
+    /// rows named share them, so one record is one shape of change over
+    /// however many rows were changed that way. A label is not a column,
+    /// so there is no column here and no value: the row's label word is
+    /// one word, and what a change to it says is which bits go on and
+    /// which come off.
+    LabelUpdate {
+        table: u32,
+        offsets: Vec<u64>,
+        add: u64,
+        remove: u64,
+    },
     DdlCatalog {
         delta: Vec<u8>,
     },
@@ -198,6 +211,7 @@ impl WalRecord {
             WalRecord::CheckpointNote => KIND_CHECKPOINT_NOTE,
             WalRecord::RelDelete { .. } => 10,
             WalRecord::RelUpdate { .. } => 11,
+            WalRecord::LabelUpdate { .. } => 12,
         }
     }
 
@@ -271,6 +285,18 @@ impl WalRecord {
                 put_u64s(out, src);
                 put_u64s(out, dst);
                 values.encode(out);
+            }
+            WalRecord::LabelUpdate {
+                table,
+                offsets,
+                add,
+                remove,
+            } => {
+                out.extend_from_slice(&table.to_le_bytes());
+                out.extend_from_slice(&add.to_le_bytes());
+                out.extend_from_slice(&remove.to_le_bytes());
+                out.extend_from_slice(&(offsets.len() as u32).to_le_bytes());
+                put_u64s(out, offsets);
             }
             WalRecord::DdlCatalog { delta } => out.extend_from_slice(delta),
             WalRecord::IngestRef { table, ptrs } => {
@@ -398,6 +424,24 @@ impl WalRecord {
                     src,
                     dst,
                     values,
+                }
+            }
+            12 => {
+                let table = r.u32()?;
+                let add = r.u64()?;
+                let remove = r.u64()?;
+                let count = r.u32()? as usize;
+                if add & remove != 0 {
+                    return Err(corrupt(format!(
+                        "label update both sets and clears {:#x}",
+                        add & remove
+                    )));
+                }
+                WalRecord::LabelUpdate {
+                    table,
+                    offsets: u64s(r, count)?,
+                    add,
+                    remove,
                 }
             }
             other => return Err(corrupt(format!("unknown record kind {other}"))),
@@ -692,6 +736,18 @@ mod tests {
                 dst: vec![3],
                 values: WalValues::Null(1),
             },
+            WalRecord::LabelUpdate {
+                table: 3,
+                offsets: vec![0, 5, 17],
+                add: 0b0000_0110,
+                remove: 0b0001_0000,
+            },
+            WalRecord::LabelUpdate {
+                table: 3,
+                offsets: vec![2],
+                add: 0,
+                remove: 1 << 63,
+            },
             WalRecord::DdlCatalog {
                 delta: vec![0xAB; 100],
             },
@@ -886,6 +942,25 @@ mod tests {
         wal.commit(3).unwrap();
         let epochs: Vec<Epoch> = collect(&wal, 0).iter().map(|(e, _)| *e).collect();
         assert_eq!(epochs, vec![1, 1, 3, 3]);
+    }
+
+    /// A label update that both sets and clears the same bit says
+    /// nothing a reader can act on, so it reads as corruption rather
+    /// than as one of the two halves winning silently.
+    #[test]
+    fn a_label_update_that_contradicts_itself_is_refused() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&0b0110u64.to_le_bytes());
+        payload.extend_from_slice(&0b0010u64.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let mut r = Reader {
+            buf: &payload,
+            pos: 0,
+        };
+        let err = WalRecord::decode(12, &mut r).unwrap_err();
+        assert!(format!("{err}").contains("both sets and clears"), "{err}");
     }
 
     /// Truncation resets the log for the next txn.

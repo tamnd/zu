@@ -343,7 +343,8 @@ impl Session {
                     next
                 }
                 crate::split::Write::Set(set) => {
-                    let mut changes = crate::set::Changes::open(set);
+                    let catalog = self.graph.catalog().clone();
+                    let mut changes = crate::set::Changes::open(set, catalog);
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
                         let (carried, values) = row.split_at(carry);

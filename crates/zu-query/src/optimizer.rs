@@ -535,12 +535,13 @@ fn mark_asp_node(
             bracket,
         } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
+            let range_is_none = range.is_none();
             let e = ExpandOp {
                 rel,
                 from,
                 to,
                 direction,
-                range,
+                range: range.clone(),
                 into,
             };
             let (asp, wcoj, est) = if into {
@@ -550,7 +551,7 @@ fn mark_asp_node(
                     .filter_map(|id| schema.rel_by_id(*id))
                     .map(|rd| rd.edge_count as f64)
                     .sum();
-                let asp = bracket.is_none() && range.is_none() && est > edges.max(1.0);
+                let asp = bracket.is_none() && range_is_none && est > edges.max(1.0);
                 // A closing expand completes a cycle in the join graph
                 // by construction, so docs/07 §4 injects the multiway
                 // intersection here. Multi-table rels keep the binary
@@ -571,7 +572,7 @@ fn mark_asp_node(
                 let one_list = lone
                     .and_then(|rd| direction.resolve(rd.undirected))
                     .is_some_and(|d| !d.both_ways());
-                let wcoj = range.is_none()
+                let wcoj = range_is_none
                     && query.variables[rel].rel_tables.len() == 1
                     && (self_ref || one_list);
                 // A close keeps or drops rows, never adds, so the
@@ -1097,7 +1098,7 @@ fn reorder_run(
                         from: *from,
                         to: *to,
                         direction,
-                        range: e.range,
+                        range: e.range.clone(),
                         into: *into,
                         asp: false,
                         wcoj: false,
@@ -1687,7 +1688,10 @@ fn hist_fanout(edges: f64, hist: &[u64]) -> Option<f64> {
 /// the count ratios otherwise. Var-length steps raise the degree to
 /// their minimum hop count as a heuristic.
 fn degree(e: &ExpandOp, source: usize, spread: Spread, query: &BoundQuery, schema: &Schema) -> f64 {
-    let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8)) as i32;
+    let hops = e
+        .range
+        .as_ref()
+        .map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8)) as i32;
     hop_degree(e, source, spread, query, schema)
         .max(1e-6)
         .powi(hops)
@@ -1911,7 +1915,10 @@ fn expand_estimate(
         RelDirection::In => !reversed,
         _ => reversed,
     };
-    let hops = e.range.map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8));
+    let hops = e
+        .range
+        .as_ref()
+        .map_or(1, |v| v.min.unwrap_or(1).clamp(1, 8));
     // Every fan-out the summary itself produces carries the scale, which
     // is the graceful part of the degradation: the coloring is trusted
     // for the shape of the frontier and the counts under it are pulled
@@ -2149,7 +2156,7 @@ fn step_bound(
     query: &BoundQuery,
     schema: &Schema,
 ) -> Option<f64> {
-    let hops = match e.range {
+    let hops = match &e.range {
         None => 1,
         Some(v) => v.max?.clamp(1, 8) as i32,
     };

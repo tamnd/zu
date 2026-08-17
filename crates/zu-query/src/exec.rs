@@ -724,6 +724,7 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             mode,
             selector,
             target,
+            edge_filter,
             chunk,
             ..
         } => {
@@ -741,8 +742,14 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             let pinned = target.as_ref().map_or(String::new(), |key| {
                 format!(" [id = {}]", expr_text(key, query))
             });
+            // The edge predicate reads as part of the walk, because
+            // that is where it runs: an edge that fails it is not
+            // followed, so it is not a filter over the result.
+            let gate = edge_filter.as_ref().map_or(String::new(), |expr| {
+                format!(" where {}", expr_text(expr, query))
+            });
             format!(
-                "VarExpand *{min}..{max}{mode}{sel} {}{pinned}",
+                "VarExpand *{min}..{max}{mode}{sel} {}{pinned}{gate}",
                 rel_text(
                     var(*from),
                     var(stage.chunk_slots[*chunk][0]),
@@ -1100,6 +1107,11 @@ enum OpDesc {
         /// under ANY SHORTEST, where it turns the whole operator into a
         /// single-pair search that meets in the middle.
         target: Option<BoundExpr>,
+        /// The step's own `WHERE`, asked of every edge before it is
+        /// walked, and the slot it reads that edge out of. A path
+        /// through an edge that fails it is never built.
+        edge_filter: Option<BoundExpr>,
+        edge_slot: Option<usize>,
         chunk: usize,
     },
     /// Both endpoints bound: an edge probe instead of a list read.
@@ -1678,6 +1690,8 @@ fn compile_match_op(
                     selector: v.selector,
                     to_tables,
                     target,
+                    edge_filter: v.edge_filter.clone(),
+                    edge_slot: v.edge_slot,
                     chunk,
                 });
                 b.produced(chunk);
@@ -2749,6 +2763,7 @@ struct VarSpec<'a> {
     max: Option<u64>,
     mode: PathMode,
     levels: Option<&'a BTreeMap<(u32, u64), u64>>,
+    gate: EdgeGate<'a>,
 }
 
 /// Every hop leaving `(table, offset)` across the pattern's rel steps
@@ -2758,6 +2773,7 @@ fn hop_edges(
     ctx: &mut StageCtx,
     rels: &[RelStep],
     direction: RelDirection,
+    gate: EdgeGate<'_>,
     table: u32,
     offset: u64,
 ) -> Result<Vec<(Value, u32, u64)>> {
@@ -2796,7 +2812,52 @@ fn hop_edges(
             }
         }
     }
+    if gate.expr.is_some() {
+        let mut kept = Vec::with_capacity(hops.len());
+        for hop in hops {
+            if edge_passes(ctx, gate, &hop.0)? {
+                kept.push(hop);
+            }
+        }
+        return Ok(kept);
+    }
     Ok(hops)
+}
+
+/// The step's own `WHERE` and the slot it reads the edge out of. Every
+/// search that walks edges takes one, so a predicate written on the
+/// step prunes the walk itself and not the paths it has already built.
+/// The default gate lets everything through.
+#[derive(Clone, Copy)]
+struct EdgeGate<'a> {
+    expr: Option<&'a BoundExpr>,
+    slot: Option<usize>,
+}
+
+impl EdgeGate<'_> {
+    /// The gate a step with no `WHERE` walks through.
+    const OPEN: EdgeGate<'static> = EdgeGate {
+        expr: None,
+        slot: None,
+    };
+}
+
+/// Whether one edge satisfies the step's predicate. The edge goes into
+/// the overlay under the slot the binder gave it for as long as the
+/// predicate is being read, so an expression that names the step's
+/// variable sees this edge and not the list of them. Null is a miss,
+/// the same as it is in a WHERE.
+fn edge_passes(ctx: &mut StageCtx, gate: EdgeGate<'_>, rel: &Value) -> Result<bool> {
+    let (Some(expr), Some(slot)) = (gate.expr, gate.slot) else {
+        return Ok(true);
+    };
+    let shadowed = ctx.overlay.insert(slot, rel.clone());
+    let verdict = eval(ctx, expr);
+    match shadowed {
+        Some(previous) => ctx.overlay.insert(slot, previous),
+        None => ctx.overlay.remove(&slot),
+    };
+    Ok(truth(&verdict?)? == Some(true))
 }
 
 /// Depth-first path enumeration for `VarExpand`: every path of
@@ -2827,7 +2888,7 @@ fn enumerate_paths(
         return Ok(());
     }
     for (rel_val, next_table, next_offset) in
-        hop_edges(ctx, spec.rels, spec.direction, table, offset)?
+        hop_edges(ctx, spec.rels, spec.direction, spec.gate, table, offset)?
     {
         if let Some(levels) = spec.levels {
             if levels.get(&(next_table, next_offset)) != Some(&(depth + 1)) {
@@ -2884,6 +2945,7 @@ fn hop_levels(
     ctx: &mut StageCtx,
     rels: &[RelStep],
     direction: RelDirection,
+    gate: EdgeGate<'_>,
     max: Option<u64>,
     table: u32,
     offset: u64,
@@ -2900,7 +2962,7 @@ fn hop_levels(
         depth += 1;
         let mut next = Vec::new();
         for (t, o) in frontier {
-            for (rel_val, nt, no) in hop_edges(ctx, rels, direction, t, o)? {
+            for (rel_val, nt, no) in hop_edges(ctx, rels, direction, gate, t, o)? {
                 if bfs.levels.contains_key(&(nt, no)) {
                     continue;
                 }
@@ -2999,6 +3061,7 @@ fn pair_shortest(
     ctx: &mut StageCtx,
     rels: &[RelStep],
     direction: RelDirection,
+    gate: EdgeGate<'_>,
     max: Option<u64>,
     src: (u32, u64),
     dst: (u32, u64),
@@ -3029,7 +3092,7 @@ fn pair_shortest(
         let depth = near.depth + 1;
         let mut next = Vec::new();
         for &(t, o) in &std::mem::take(&mut near.frontier) {
-            for (rel_val, nt, no) in hop_edges(ctx, rels, dir, t, o)? {
+            for (rel_val, nt, no) in hop_edges(ctx, rels, dir, gate, t, o)? {
                 if near.seen.contains_key(&(nt, no)) {
                     continue;
                 }
@@ -3619,6 +3682,8 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             selector,
             to_tables,
             target,
+            edge_filter,
+            edge_slot,
             chunk,
         } => loop {
             if !next(descs, ctx, i - 1)? {
@@ -3629,6 +3694,15 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 continue;
             }
             let (table, offset) = node_value(v, "var expand")?;
+            // A step with no predicate, or one whose predicate reads no
+            // edge, walks through an open gate and pays nothing for it.
+            let gate = match (edge_filter.as_ref(), *edge_slot) {
+                (Some(expr), Some(slot)) => EdgeGate {
+                    expr: Some(expr),
+                    slot: Some(slot),
+                },
+                _ => EdgeGate::OPEN,
+            };
             let mut far = Vec::new();
             let mut trails = Vec::new();
             if let Some(key) = target {
@@ -3639,7 +3713,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 let dsts = key_nodes(ctx, key, to_tables)?;
                 for dst in dsts {
                     let Some(chain) =
-                        pair_shortest(ctx, rels, *direction, *max, (table, offset), dst)?
+                        pair_shortest(ctx, rels, *direction, gate, *max, (table, offset), dst)?
                     else {
                         continue;
                     };
@@ -3667,7 +3741,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     // Chains build in discovery order, so a node's
                     // parent chain always exists before its own and
                     // every endpoint's path is one `Arc` clone.
-                    let bfs = hop_levels(ctx, rels, *direction, *max, table, offset)?;
+                    let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
                     let mut chains: BTreeMap<(u32, u64), Arc<PathLink>> = BTreeMap::new();
                     chains.insert((table, offset), chain_root(table, offset));
                     for &(t, o) in &bfs.order {
@@ -3698,7 +3772,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     }
                 }
                 Some(Selector::AllShortest) => {
-                    let bfs = hop_levels(ctx, rels, *direction, *max, table, offset)?;
+                    let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
                     let spec = VarSpec {
                         rels,
                         direction: *direction,
@@ -3707,6 +3781,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         max: *max,
                         mode: *mode,
                         levels: Some(&bfs.levels),
+                        gate,
                     };
                     let root = chain_root(table, offset);
                     enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
@@ -3720,6 +3795,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         max: *max,
                         mode: *mode,
                         levels: None,
+                        gate,
                     };
                     let root = chain_root(table, offset);
                     enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
@@ -7675,6 +7751,7 @@ mod tests {
             max: Some(6),
             mode: PathMode::Trail,
             levels: None,
+            gate: EdgeGate::OPEN,
         };
         let root = chain_root(0, 0);
         let (mut far, mut trails) = (Vec::new(), Vec::new());

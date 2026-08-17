@@ -1162,7 +1162,7 @@ impl Parser<'_> {
         let inbound = self.eat(&TokenKind::Lt);
         let left_tilde = self.parse_rel_bar()?;
         let bracketed = self.at(&TokenKind::LBracket);
-        let (var, types, range, props) = if self.eat(&TokenKind::LBracket) {
+        let (var, types, range, props, filter) = if self.eat(&TokenKind::LBracket) {
             let var = match self.peek().map(|t| &t.kind) {
                 Some(TokenKind::Ident(_)) | Some(TokenKind::QuotedIdent(_)) => {
                     Some(self.expect_name("a variable")?)
@@ -1186,10 +1186,20 @@ impl Parser<'_> {
             } else {
                 Vec::new()
             };
+            // A WHERE inside the brackets belongs to the step: it is
+            // asked of every edge the step walks, one at a time, while
+            // the walk is happening. The same text after the pattern
+            // would be a different question, asked of whole paths once
+            // they have been built.
+            let filter = if self.eat_kw("WHERE") {
+                Some(Box::new(self.parse_expr()?))
+            } else {
+                None
+            };
             self.expect(&TokenKind::RBracket)?;
-            (var, types, range, props)
+            (var, types, range, props, filter)
         } else {
-            (None, Vec::new(), None, Vec::new())
+            (None, Vec::new(), None, Vec::new(), None)
         };
         let right_tilde = if bracketed || self.at(&TokenKind::Minus) || self.at(&TokenKind::Tilde) {
             self.parse_rel_bar()?
@@ -1226,6 +1236,7 @@ impl Parser<'_> {
             direction,
             range,
             props,
+            filter,
         })
     }
 
@@ -2605,6 +2616,45 @@ mod tests {
             };
             assert_eq!(patterns[0].steps[0].0.range, Some(want), "range {text}");
         }
+    }
+
+    /// A `WHERE` inside the brackets belongs to the step, and it reads
+    /// after the type, the range and the property map, which are the
+    /// three things that can precede it in there.
+    #[test]
+    fn a_where_inside_the_brackets_belongs_to_the_step() {
+        for text in [
+            "t:transfer WHERE t.ts >= 5",
+            "t:transfer*1..3 WHERE t.ts >= 5",
+            "t:transfer*1..3 {kind: 'wire'} WHERE t.ts >= 5",
+        ] {
+            let q = parsed(&format!("MATCH (a)-[{text}]->(b) RETURN a"));
+            let Clause::Match { patterns, .. } = &q.clauses[0] else {
+                panic!("MATCH");
+            };
+            let (rel, _) = &patterns[0].steps[0];
+            let Some(filter) = &rel.filter else {
+                panic!("no predicate on {text}");
+            };
+            assert!(
+                matches!(
+                    **filter,
+                    Expr::Binary {
+                        op: BinaryOp::Ge,
+                        ..
+                    }
+                ),
+                "predicate of {text} parsed as {filter:?}"
+            );
+        }
+
+        // Without one the step carries none, so nothing downstream has
+        // to tell an absent predicate from one that is always true.
+        let q = parsed("MATCH (a)-[t:transfer*1..3]->(b) RETURN a");
+        let Clause::Match { patterns, .. } = &q.clauses[0] else {
+            panic!("MATCH");
+        };
+        assert!(patterns[0].steps[0].0.filter.is_none());
     }
 
     #[test]

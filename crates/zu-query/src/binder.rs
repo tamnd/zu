@@ -1058,6 +1058,15 @@ pub struct BoundRel {
     /// minimum-hop paths.
     pub selector: Option<Selector>,
     pub props: Vec<(String, BoundExpr)>,
+    /// The `WHERE` written inside the brackets, asked of every edge
+    /// the step walks rather than of the path it ends up building.
+    pub filter: Option<BoundExpr>,
+    /// The slot that predicate reads the edge out of. On a
+    /// variable-length step it is a slot of its own, holding whichever
+    /// edge the walk is standing on; on a single step it is the rel's
+    /// own slot, and the predicate is an ordinary filter after the
+    /// expand.
+    pub edge_slot: Option<usize>,
 }
 
 /// Whole-graph table functions the binder accepts in `CALL` (docs/07
@@ -2423,8 +2432,47 @@ impl Binder<'_> {
             }
             None => self.anon_slot(ty),
         };
-        self.variables[slot].rel_tables = candidates;
+        self.variables[slot].rel_tables = candidates.clone();
         let props = self.bind_props(&pat.props)?;
+        // The WHERE inside the brackets is asked of one edge at a
+        // time, so on a variable-length step the pattern's variable
+        // means something different inside it than it does outside:
+        // one edge in here, the list of them out there. It binds
+        // against an edge slot of its own with the name pointed at
+        // that slot for as long as the predicate is being bound.
+        let (filter, edge_slot) = match &pat.filter {
+            Some(expr) => {
+                let edge = if pat.range.is_some() {
+                    // It carries the pattern's name so that a plan
+                    // listing spells the predicate the way it was
+                    // written. Nothing resolves by that name, since
+                    // the scope entry below is what the predicate
+                    // reads and it is put back afterwards.
+                    let edge = match &pat.var {
+                        Some(name) => self.new_slot(name.clone(), Type::Rel),
+                        None => self.anon_slot(Type::Rel),
+                    };
+                    self.variables[edge].rel_tables = candidates;
+                    edge
+                } else {
+                    slot
+                };
+                let shadowed = pat
+                    .var
+                    .as_ref()
+                    .map(|name| (name.clone(), self.scope.insert(name.clone(), edge)));
+                let mut ctx = ExprCtx::new(false);
+                let bound = self.bind_expr(expr, &mut ctx).map(|(value, _)| value);
+                if let Some((name, previous)) = shadowed {
+                    match previous {
+                        Some(slot) => self.scope.insert(name, slot),
+                        None => self.scope.remove(&name),
+                    };
+                }
+                (Some(bound?), Some(edge))
+            }
+            None => (None, None),
+        };
         Ok(BoundRel {
             slot,
             direction: pat.direction,
@@ -2432,6 +2480,8 @@ impl Binder<'_> {
             mode,
             selector,
             props,
+            filter,
+            edge_slot,
         })
     }
 

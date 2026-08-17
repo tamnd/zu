@@ -672,10 +672,16 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             let written: Vec<String> = items
                 .iter()
                 .map(|item| {
+                    // An item with no key writes the whole record, so
+                    // there is nothing to put after the dot and the plan
+                    // reads the way the statement was written.
+                    let key = item
+                        .key
+                        .as_ref()
+                        .map_or_else(String::new, |k| format!(".{k}"));
                     format!(
-                        "{}.{} = {}",
+                        "{}{key} = {}",
                         slot_name(query, item.target),
-                        item.key,
                         expr_text(&item.value, query)
                     )
                 })

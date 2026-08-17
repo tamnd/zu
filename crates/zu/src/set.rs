@@ -44,6 +44,7 @@ pub(crate) struct Update {
 /// A row is named by its offset and an edge by the rows it runs between,
 /// which is the only name an edge has: its values sit in the order its
 /// table holds its edges, and a fold rebuilds that order.
+#[derive(Clone, Copy)]
 pub(crate) enum At {
     Row(u64),
     Edge(u64, u64),
@@ -95,21 +96,38 @@ impl<'a> Changes<'a> {
                 Entry::Occupied(held) => held.into_mut(),
                 Entry::Vacant(empty) => empty.insert(columns_of(db, table, &element)?),
             };
-            let col = columns
-                .iter()
-                .position(|col| col.name == item.key)
-                .ok_or_else(|| {
-                    ZuError::InvalidArgument(format!(
-                        "'{}' is not a column of the table the element it is being set on is in",
-                        item.key
-                    ))
-                })?;
-            self.updates.push(Update {
-                table,
-                at: element,
-                col: col as u32,
-                cell: written(&columns[col], &values[at], &item.key)?,
-            });
+            match &item.key {
+                Some(key) => {
+                    let col = column_of(columns, key)?;
+                    self.updates.push(Update {
+                        table,
+                        at: element,
+                        col: col as u32,
+                        cell: written(&columns[col], &values[at], key)?,
+                    });
+                }
+                None => {
+                    // Every column of the table is written, whether the
+                    // record named it or not, because what this form says
+                    // is what the element holds afterwards and not what
+                    // to change about it. A column the record leaves out
+                    // therefore takes a null, which is the same value
+                    // REMOVE writes.
+                    let given = named(&values[at], columns)?;
+                    for (ci, col) in columns.iter().enumerate() {
+                        let cell = match given.get(&ci) {
+                            Some(value) => written(col, value, &col.name)?,
+                            None => Cell::Null,
+                        };
+                        self.updates.push(Update {
+                            table,
+                            at: element,
+                            col: ci as u32,
+                            cell,
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -171,6 +189,41 @@ pub(crate) fn stage(txn: &mut WriteTxn<'_>, updates: &[Update]) -> Result<u64> {
         }
     }
     Ok(updates.len() as u64)
+}
+
+/// Which column of a table a key names.
+fn column_of(columns: &[PropColumn], key: &str) -> Result<usize> {
+    columns
+        .iter()
+        .position(|col| col.name == key)
+        .ok_or_else(|| {
+            ZuError::InvalidArgument(format!(
+                "'{key}' is not a column of the table the element it is being set on is in"
+            ))
+        })
+}
+
+/// The columns a whole record assignment gave a value for, by column
+/// position.
+///
+/// A field naming something the table does not keep is refused here
+/// rather than passed over, for the reason `SET p.nope = 1` is: a table
+/// holds the columns it holds, and a caller who wrote a key it does not
+/// have has either mistyped it or is thinking of another table.
+fn named<'a>(value: &'a Value, columns: &[PropColumn]) -> Result<BTreeMap<usize, &'a Value>> {
+    let Value::Record(fields) = value else {
+        // Unreachable through the parser, whose grammar for this form is
+        // a record written out, so there is nothing else it can be.
+        return Err(ZuError::InvalidArgument(format!(
+            "SET of a whole record takes a record, and this one is {}",
+            describe(value)
+        )));
+    };
+    let mut given = BTreeMap::new();
+    for (name, field) in fields {
+        given.insert(column_of(columns, name)?, field);
+    }
+    Ok(given)
 }
 
 /// The cell one assignment puts in one column.
@@ -766,6 +819,180 @@ mod tests {
             .expect("read");
         assert_eq!(after.rows[1][0], Value::Int(44));
         assert_eq!(after.rows[1][1], Value::Null);
+    }
+
+    /// The whole record form says what an element holds afterwards, so a
+    /// property the record leaves out is gone rather than left alone.
+    /// This is the conformance case for the form, spelling and all.
+    #[test]
+    fn a_whole_record_replaces_every_property_of_a_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "set-record.zu1");
+
+        session
+            .run(
+                "MATCH (p:person {name: 'ada'}) SET p = {name: 'ada lovelace'}",
+                &[],
+            )
+            .expect("set a record");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Str("ada lovelace".into()));
+        assert_eq!(after.rows[0][1], Value::Null, "the age was not named");
+        // The other person was not in the match, so nothing about them
+        // moved.
+        assert_eq!(after.rows[1][0], Value::Str("kay".into()));
+        assert_eq!(after.rows[1][1], Value::Int(20));
+    }
+
+    /// A record that names every column writes every column, which is
+    /// the case where the form empties nothing.
+    #[test]
+    fn a_whole_record_that_names_every_column_writes_them_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "set-record-full.zu1");
+
+        session
+            .run(
+                "MATCH (p:person {name: 'ada'}) SET p = {age: 41, name: 'ada again'}",
+                &[],
+            )
+            .expect("set a record");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY age",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[1][0], Value::Str("ada again".into()));
+        assert_eq!(after.rows[1][1], Value::Int(41));
+    }
+
+    /// The empty record is the way to say that an element holds nothing
+    /// at all, and it is the same write as removing every property.
+    #[test]
+    fn an_empty_record_empties_every_property() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "set-record-empty.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'ada'}) SET p = {}", &[])
+            .expect("set an empty record");
+
+        let after = session
+            .run("MATCH (p:person) RETURN p.name AS name, p.age AS age", &[])
+            .expect("read");
+        let emptied = after
+            .rows
+            .iter()
+            .filter(|row| row[0] == Value::Null && row[1] == Value::Null)
+            .count();
+        assert_eq!(emptied, 1, "one person holds nothing and one still does");
+    }
+
+    /// A field of the record is an expression like any other, and it is
+    /// worked out before the write, so it can read the element the record
+    /// is about to replace.
+    #[test]
+    fn a_field_of_the_record_can_read_what_it_replaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "set-record-read.zu1");
+
+        session
+            .run(
+                "MATCH (p:person {name: 'ada'}) SET p = {age: p.age + 1, name: p.name}",
+                &[],
+            )
+            .expect("set a record");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY age",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Str("ada".into()));
+        assert_eq!(after.rows[0][1], Value::Int(11));
+    }
+
+    /// A key the table does not keep is refused, the way it is when one
+    /// assignment names it: what columns a table has is a matter for the
+    /// catalog, and a caller who wrote one it has not has mistyped it.
+    #[test]
+    fn a_record_naming_a_key_the_table_does_not_have_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "set-record-bad-key.zu1");
+
+        let err = session
+            .run("MATCH (p:person) SET p = {nope: 1}", &[])
+            .expect_err("no such column");
+        assert!(err.to_string().contains("'nope'"), "got: {err}");
+    }
+
+    /// A record replaces an edge's properties the way it replaces a
+    /// node's. Where the values go is different and settled elsewhere;
+    /// what this says is that the form reaches both kinds of element.
+    #[test]
+    fn a_whole_record_replaces_every_property_of_an_edge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_three_edges(&dir, "set-record-edge.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'ada'})-[k:knows]->(b:person) SET k = {since: 2000}",
+                &[],
+            )
+            .expect("set a record on an edge");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS who, k.since AS since, k.note AS note ORDER BY who",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Str("ada".into()));
+        assert_eq!(after.rows[0][1], Value::Int(2000));
+        assert_eq!(after.rows[0][2], Value::Null, "the note was not named");
+        // The two edges the statement did not name kept both of theirs.
+        assert_eq!(after.rows[1][0], Value::Str("joe".into()));
+        assert_eq!(after.rows[1][1], Value::Int(1992));
+        assert_eq!(after.rows[1][2], Value::Str("three".into()));
+        assert_eq!(after.rows[2][1], Value::Int(1991));
+        assert_eq!(after.rows[2][2], Value::Str("two".into()));
+    }
+
+    /// The replacement is in the file and not only in the overlay, so it
+    /// is still there after a close and an open.
+    #[test]
+    fn a_replaced_record_stays_replaced_after_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("set-record-reopen.zu1");
+        seeded(&path);
+        {
+            let mut session = Session::open(&path).expect("open");
+            session
+                .run(
+                    "MATCH (p:person {name: 'ada'}) SET p = {name: 'ada lovelace'}",
+                    &[],
+                )
+                .expect("set a record");
+        }
+
+        let mut session = Session::open(&path).expect("reopen");
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Str("ada lovelace".into()));
+        assert_eq!(after.rows[0][1], Value::Null);
     }
 
     /// A label is the other thing GQL lets REMOVE take, and an element

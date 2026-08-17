@@ -562,6 +562,25 @@ fn covered_shapes_match_the_old_engine() {
          LIMIT 20",
         "CALL sssp('knows', 1) YIELD node, distance MATCH (node)-[:knows]->(f) \
          WHERE distance = 1 RETURN count(f) AS n",
+        // The null test over the yielded value. Dropping the nodes the
+        // walk never reached is how a caller reads a traversal answer,
+        // so it runs off the validity the column already carries rather
+        // than sending the query back a row at a time.
+        "CALL bfs('knows', 1) YIELD node, level WITH node, level \
+         WHERE level IS NOT NULL RETURN count(node) AS n",
+        "CALL bfs('knows', 1) YIELD node, level WITH node, level \
+         WHERE level IS NOT NULL RETURN node.id AS id, level ORDER BY id LIMIT 20",
+        "CALL bfs('knows', 1) YIELD node, level WITH node, level \
+         WHERE level IS NULL RETURN count(node) AS n",
+        "CALL bfs('knows', 1) YIELD node, level WITH node, level \
+         WHERE level IS NOT NULL AND level > 1 RETURN count(node) AS n",
+        // A WITH that only carries variables forward. It computes
+        // nothing, so it leaves the pipeline alone and the filter above
+        // it runs where the filter below it would have.
+        "MATCH (p:person)-[:knows]->(f) WITH p, f WHERE f.age > 50 RETURN count(f) AS n",
+        "MATCH (p:person) WITH p WHERE p.age > 50 RETURN p.id AS id ORDER BY id LIMIT 10",
+        "MATCH (p:person)-[:knows]->(f) WITH p, f WHERE f.age > 50 \
+         RETURN f.id AS id ORDER BY id LIMIT 10",
         // Two patterns sharing no variable, tied by an equality on a
         // property. The held one is read into a table once and the
         // pipeline probes it a row at a time, which is the same answer
@@ -837,6 +856,16 @@ fn unclaimed_shapes_fall_back() {
         "CALL sssp('knows', 1) YIELD node, distance RETURN DISTINCT distance AS d",
         "CALL sssp('knows', 1) YIELD node, distance RETURN node.id AS id, distance \
          ORDER BY distance LIMIT 5",
+        // A null test reads a column's validity, and an expression has
+        // none to read: what it computes from a null is a rule the old
+        // engine owns.
+        "CALL sssp('knows', 1) YIELD node, distance WITH node, distance \
+         WHERE distance + 1 IS NOT NULL RETURN count(node) AS n",
+        // A WITH that computes is a projection in earnest: the rows
+        // above it are not the rows below it, so it stays in the plan
+        // and the plan goes back.
+        "MATCH (p:person) WITH p.age AS a WHERE a > 50 RETURN count(a) AS n",
+        "MATCH (p:person) WITH p, p.age AS a WHERE a > 50 RETURN count(p) AS n",
         // A bound above 2^53 is where an integer stops converting to a
         // float without losing a digit, so the two domains stop
         // agreeing and the rewrite that moves the bound into the

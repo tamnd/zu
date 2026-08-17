@@ -16,8 +16,8 @@ use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{
-    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetItem,
-    Func, MatchKind, Schema, TableFunc,
+    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetInto,
+    BoundSetItem, Func, MatchKind, Schema, TableFunc,
 };
 
 /// What a bracket does with an outer row the operators inside it
@@ -699,18 +699,24 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             let written: Vec<String> = items
                 .iter()
                 .map(|item| {
-                    // An item with no key writes the whole record, so
-                    // there is nothing to put after the dot and the plan
-                    // reads the way the statement was written.
-                    let key = item
-                        .key
-                        .as_ref()
-                        .map_or_else(String::new, |k| format!(".{k}"));
-                    format!(
-                        "{}{key} = {}",
-                        slot_name(query, item.target),
-                        expr_text(&item.value, query)
-                    )
+                    let name = slot_name(query, item.target);
+                    // The listing reads the way the statement was
+                    // written: a record form has nothing to put after
+                    // the dot, and a label form has nothing to put
+                    // after the equals either, so what it shows is the
+                    // labels going on or coming off.
+                    match &item.into {
+                        BoundSetInto::Property(key) => {
+                            format!("{name}.{key} = {}", expr_text(&item.value, query))
+                        }
+                        BoundSetInto::Record => {
+                            format!("{name} = {}", expr_text(&item.value, query))
+                        }
+                        BoundSetInto::Labels { labels, on } => {
+                            let sign = if *on { "+" } else { "-" };
+                            format!("{name}{sign}:{}", labels.join("&"))
+                        }
+                    }
                 })
                 .collect();
             let _ = writeln!(out, "{pad}Set {}", written.join(", "));

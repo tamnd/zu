@@ -45,7 +45,7 @@ use std::time::Instant;
 use zu::query::Value;
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props, store_rel_props};
+use zu::zu1::props::{PropValues, store_labels, store_props, store_rel_props};
 use zu::{Config, Database};
 
 /// The small table, where the fold is cheap enough that the statement
@@ -282,6 +282,23 @@ fn build_edge_props(dir: &Path, rows: u64) -> std::path::PathBuf {
     path
 }
 
+/// The same table with a label beyond its own name declared on it,
+/// which is what a `SET` of a label needs: a label the table has not
+/// declared is refused, because declaring one is a catalog change and a
+/// statement cannot make that yet.
+///
+/// The label goes on and comes straight back off, so the table has
+/// declared it and no row carries it, which is where the run starts.
+fn build_labels(dir: &Path, rows: u64) -> std::path::PathBuf {
+    let path = build(dir, rows);
+    let mut db = Zu1File::open(&path).expect("open");
+    let all: Vec<Vec<&str>> = (0..rows as usize).map(|_| vec!["Bot"]).collect();
+    store_labels(&mut db, "person", &all).expect("labels");
+    let none: Vec<Vec<&str>> = (0..rows as usize).map(|_| Vec::new()).collect();
+    store_labels(&mut db, "person", &none).expect("labels");
+    path
+}
+
 fn build_with(dir: &Path, rows: u64, edges: &[(u32, u32)]) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).expect("dir");
     let path = dir.join("db.zu1");
@@ -407,6 +424,60 @@ fn run_set_record(dir: &Path, rows: u64) -> Cost {
         ),
         1,
         "and both values written back are the values that were there"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
+/// A `SET` of a label on one element, `WRITES` times over.
+///
+/// A label is not a property: it is one bit of one word beside the row,
+/// and the word is one per row rather than one per column. So this is
+/// the cheapest write the statement has, and the number beside the one
+/// property run is what a column costs that a bit does not. Each write
+/// puts the label on and the next takes it off again, so the table ends
+/// where it started and the growth column is what changing nothing cost.
+fn run_set_label(dir: &Path, rows: u64) -> Cost {
+    let path = build_labels(dir, rows);
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    conn.query("MATCH (p:person) WHERE p.age = 0 SET p:Bot")
+        .expect("warmup");
+    conn.query("MATCH (p:person) WHERE p.age = 0 REMOVE p:Bot")
+        .expect("warmup");
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        let age = i % rows;
+        let verb = match i % 2 {
+            0 => "SET",
+            _ => "REMOVE",
+        };
+        conn.query(&format!(
+            "MATCH (p:person) WHERE p.age = {age} {verb} p:Bot"
+        ))
+        .expect("set a label");
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    assert_eq!(
+        one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),
+        rows as i64,
+        "no row was added or lost"
+    );
+    assert_eq!(
+        one(&mut conn, "MATCH (p:Bot) RETURN count(p) AS n"),
+        (WRITES / 2) as i64,
+        "every other write put the label on and the one after took it off"
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
@@ -651,6 +722,9 @@ fn main() {
     let set_record = run_set_record(&root.path().join("set-record"), SMALL);
     set_record.report(&format!("SET a record, {SMALL} rows"));
 
+    let set_label = run_set_label(&root.path().join("set-label"), SMALL);
+    set_label.report(&format!("SET a label, {SMALL} rows"));
+
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"));
 
@@ -676,6 +750,8 @@ fn main() {
         ("set_edge_stmt_kb", set_edge.written / 1024.0),
         ("set_record_stmt_us", set_record.us),
         ("set_record_stmt_kb", set_record.written / 1024.0),
+        ("set_label_stmt_us", set_label.us),
+        ("set_label_stmt_kb", set_label.written / 1024.0),
         ("insert_stmt_us", insert.us),
         ("delete_stmt_us", delete.us),
         ("detach_stmt_us", detach.us),

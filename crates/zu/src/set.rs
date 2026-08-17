@@ -19,24 +19,42 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use zu_common::{Result, ZuError};
-use zu_query::binder::BoundSetItem;
+use zu_query::binder::{BoundSetInto, BoundSetItem};
 
 use crate::insert::{cell, describe};
 use crate::query::Value;
 use crate::split::Set;
+use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::props::{PropColumn, load_props, load_rel_props};
 use crate::zu1::txn::{Cell, WriteTxn};
 
-/// One cell about to change: which table, which element of it, which
-/// column, and what the column takes.
-pub(crate) struct Update {
-    pub(crate) table: u32,
-    pub(crate) at: At,
-    /// The column's position in the table's props directory, which is
-    /// what the fold reads a staged cell back by.
-    pub(crate) col: u32,
-    pub(crate) cell: Cell,
+/// One change about to be staged.
+///
+/// A property and a label are both what an element carries, and both are
+/// what a `SET` writes, but they are not written the same way: a property
+/// is a cell of a column, and a label is a bit of the row's label word.
+/// So the two are one enum rather than one struct with a spare field.
+pub(crate) enum Update {
+    /// One cell: which table, which element of it, which column, and
+    /// what the column takes.
+    Cell {
+        table: u32,
+        at: At,
+        /// The column's position in the table's props directory, which
+        /// is what the fold reads a staged cell back by.
+        col: u32,
+        cell: Cell,
+    },
+    /// The labels one row takes on and stops carrying, as bits of the
+    /// graph's label dictionary. Only a row has labels: an edge carries
+    /// the one name its rel table is.
+    Labels {
+        table: u32,
+        row: u64,
+        add: u64,
+        remove: u64,
+    },
 }
 
 /// Which element of a table a change lands on.
@@ -68,14 +86,18 @@ pub(crate) struct Changes<'a> {
     /// the rows arrive, because a slot the write names is bound by a
     /// match and a match can leave several tables open.
     columns: BTreeMap<u32, Vec<PropColumn>>,
+    /// The catalog as the statement started, which is what says which
+    /// bit a label is and which labels a table has declared.
+    catalog: Catalog,
     updates: Vec<Update>,
 }
 
 impl<'a> Changes<'a> {
-    pub(crate) fn open(write: &'a Set) -> Self {
+    pub(crate) fn open(write: &'a Set, catalog: Catalog) -> Self {
         Self {
             write,
             columns: BTreeMap::new(),
+            catalog,
             updates: Vec::new(),
         }
     }
@@ -92,21 +114,42 @@ impl<'a> Changes<'a> {
     ) -> Result<()> {
         for (at, item) in self.write.items.iter().enumerate() {
             let (table, element) = self.element(item, carried)?;
+            // A label is not a column, so an item that writes one needs
+            // nothing read out of the table's props and is settled
+            // before they are.
+            if let BoundSetInto::Labels { labels, on } = &item.into {
+                let mask = self.mask(table, &element, labels)?;
+                let (add, remove) = match on {
+                    true => (mask, 0),
+                    false => (0, mask),
+                };
+                let At::Row(row) = element else {
+                    unreachable!("an edge was turned away where the mask was worked out");
+                };
+                self.updates.push(Update::Labels {
+                    table,
+                    row,
+                    add,
+                    remove,
+                });
+                continue;
+            }
             let columns = match self.columns.entry(table) {
                 Entry::Occupied(held) => held.into_mut(),
                 Entry::Vacant(empty) => empty.insert(columns_of(db, table, &element)?),
             };
-            match &item.key {
-                Some(key) => {
+            match &item.into {
+                BoundSetInto::Labels { .. } => unreachable!("settled above"),
+                BoundSetInto::Property(key) => {
                     let col = column_of(columns, key)?;
-                    self.updates.push(Update {
+                    self.updates.push(Update::Cell {
                         table,
                         at: element,
                         col: col as u32,
                         cell: written(&columns[col], &values[at], key)?,
                     });
                 }
-                None => {
+                BoundSetInto::Record => {
                     // Every column of the table is written, whether the
                     // record named it or not, because what this form says
                     // is what the element holds afterwards and not what
@@ -119,7 +162,7 @@ impl<'a> Changes<'a> {
                             Some(value) => written(col, value, &col.name)?,
                             None => Cell::Null,
                         };
-                        self.updates.push(Update {
+                        self.updates.push(Update::Cell {
                             table,
                             at: element,
                             col: ci as u32,
@@ -166,6 +209,54 @@ impl<'a> Changes<'a> {
         }
     }
 
+    /// The bits a set of written labels is, against the table the
+    /// element sits in.
+    ///
+    /// A label a table has not declared is turned away by name. It is
+    /// not that the bit cannot be written: it is that the catalog would
+    /// then say the table cannot hold what the file says one of its rows
+    /// holds, and a catalog change is a piece of its own. An edge is
+    /// turned away too, because an edge carries the one name its rel
+    /// table is and there is no word beside it to hold another.
+    fn mask(&self, table: u32, at: &At, labels: &[String]) -> Result<u64> {
+        if matches!(at, At::Edge(..)) {
+            return Err(ZuError::Unsupported {
+                what: "changing the labels of an edge, which carries the name of its table",
+                id: table,
+            });
+        }
+        let node = self.catalog.node_by_id(table).ok_or_else(|| {
+            ZuError::InvalidArgument(format!(
+                "the element being changed is in unknown table {table}"
+            ))
+        })?;
+        let primary = node.primary_label();
+        let declared = node.label_mask();
+        let mut mask = 0u64;
+        for label in labels {
+            let id = self
+                .catalog
+                .label_id(label)
+                .filter(|id| declared & 1 << id != 0);
+            let Some(id) = id else {
+                return Err(ZuError::Unsupported {
+                    what: "changing an element to a label its table has not declared",
+                    id: table,
+                });
+            };
+            if id == primary {
+                return Err(ZuError::gql(
+                    zu_common::gqlstatus::codes::C22G03,
+                    format!(
+                        "'{label}' is the name of the table the element is in, so every row of it carries that label"
+                    ),
+                ));
+            }
+            mask |= 1 << id;
+        }
+        Ok(mask)
+    }
+
     /// What the whole run changes, in written order.
     pub(crate) fn staged(self) -> Vec<Update> {
         self.updates
@@ -179,13 +270,25 @@ impl<'a> Changes<'a> {
 /// one written is the one the column ends up holding.
 pub(crate) fn stage(txn: &mut WriteTxn<'_>, updates: &[Update]) -> Result<u64> {
     for update in updates {
-        match update.at {
-            At::Row(offset) => {
-                txn.update(update.table, offset, update.col, update.cell.clone());
-            }
-            At::Edge(src, dst) => {
-                txn.update_rel(update.table, src, dst, update.col, update.cell.clone());
-            }
+        match update {
+            Update::Cell {
+                table,
+                at: At::Row(offset),
+                col,
+                cell,
+            } => txn.update(*table, *offset, *col, cell.clone()),
+            Update::Cell {
+                table,
+                at: At::Edge(src, dst),
+                col,
+                cell,
+            } => txn.update_rel(*table, *src, *dst, *col, cell.clone()),
+            Update::Labels {
+                table,
+                row,
+                add,
+                remove,
+            } => txn.update_labels(*table, *row, *add, *remove)?,
         }
     }
     Ok(updates.len() as u64)
@@ -314,6 +417,28 @@ mod tests {
         .expect("props");
         store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1990]))])
             .expect("edge props");
+    }
+
+    /// The same two people with one of them a Bot, so the graph's
+    /// label dictionary holds names beyond the table's own and the
+    /// table has declared them. A declared label is what a change can
+    /// put on a row, and Admin is declared without being on anyone,
+    /// which is the state a statement that puts it on someone starts
+    /// from.
+    fn seeded_with_labels(path: &Path) {
+        seeded(path);
+        let mut db = Zu1File::open(path).expect("open");
+        crate::zu1::props::store_labels(&mut db, "person", &[vec!["Bot"], vec!["Admin"]])
+            .expect("labels");
+        // Admin goes on and comes straight back off, so the table has
+        // declared it and no row carries it.
+        crate::zu1::props::store_labels(&mut db, "person", &[vec!["Bot"], vec![]]).expect("labels");
+    }
+
+    fn open_with_labels(dir: &tempfile::TempDir, name: &str) -> Session {
+        let path = dir.path().join(name);
+        seeded_with_labels(&path);
+        Session::open(&path).expect("open")
     }
 
     fn open_with_edge_props(dir: &tempfile::TempDir, name: &str) -> Session {
@@ -995,18 +1120,144 @@ mod tests {
         assert_eq!(after.rows[0][1], Value::Null);
     }
 
-    /// A label is the other thing GQL lets REMOVE take, and an element
-    /// carries the labels of the table it is in, so it is turned away
-    /// by name rather than by a parse error about a colon.
+    /// A label the table declares goes onto the row the statement
+    /// found, and a pattern naming that label then finds it. The rows
+    /// the statement did not name keep the labels they had.
     #[test]
-    fn removing_a_label_says_which_part_is_not_in_yet() {
+    fn a_label_is_put_on_a_row_and_a_pattern_then_finds_it() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = open(&dir, "remove-label.zu1");
+        let mut session = open_with_labels(&dir, "set-label.zu1");
+
+        session
+            .run("MATCH (p:person) WHERE p.name = 'kay' SET p:Bot", &[])
+            .expect("set");
+        let after = session
+            .run("MATCH (p:Bot) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read");
+        assert_eq!(after.rows.len(), 2, "ada was one already");
+        assert_eq!(after.rows[0][0], Value::Str("ada".into()));
+        assert_eq!(after.rows[1][0], Value::Str("kay".into()));
+        // The properties are what they were: a label is a bit beside
+        // the row rather than anything in a column.
+        let ages = session
+            .run("MATCH (p:person) RETURN p.age AS age ORDER BY age", &[])
+            .expect("read");
+        assert_eq!(ages.rows[0][0], Value::Int(10));
+        assert_eq!(ages.rows[1][0], Value::Int(20));
+    }
+
+    /// A label comes off the row REMOVE named, and the row stays where
+    /// it was: what changed is one bit of one word.
+    #[test]
+    fn a_label_taken_off_a_row_stops_a_pattern_finding_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "remove-label.zu1");
+
+        session
+            .run("MATCH (p:Bot) REMOVE p:Bot", &[])
+            .expect("remove");
+        let after = session
+            .run("MATCH (p:Bot) RETURN p.name", &[])
+            .expect("read");
+        assert!(after.rows.is_empty());
+        let all = session
+            .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read");
+        assert_eq!(all.rows.len(), 2, "both rows are still there");
+    }
+
+    /// Two changes to one row in one statement both land, because the
+    /// two masks compose rather than the second replacing the first.
+    #[test]
+    fn a_label_going_on_and_another_coming_off_both_land() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "both-labels.zu1");
+
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Admin", &[])
+            .expect("set");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' REMOVE p:Bot", &[])
+            .expect("remove");
+        let admins = session
+            .run("MATCH (p:Admin) RETURN p.name AS name", &[])
+            .expect("read");
+        assert_eq!(admins.rows[0][0], Value::Str("ada".into()));
+        let bots = session
+            .run("MATCH (p:Bot) RETURN p.name", &[])
+            .expect("read");
+        assert!(
+            bots.rows.is_empty(),
+            "the one that was a Bot is not one now"
+        );
+    }
+
+    /// A label change is in the file rather than in the session, so a
+    /// reopen reads it back.
+    #[test]
+    fn a_label_change_stays_after_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reopen-label.zu1");
+        seeded_with_labels(&path);
+        {
+            let mut session = Session::open(&path).expect("open");
+            session
+                .run("MATCH (p:person) WHERE p.name = 'kay' SET p:Admin", &[])
+                .expect("set");
+        }
+        let mut session = Session::open(&path).expect("reopen");
+        let after = session
+            .run("MATCH (p:Admin) RETURN p.name AS name", &[])
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Str("kay".into()));
+    }
+
+    /// A label the table has not declared cannot be put on one of its
+    /// rows yet: the catalog would then say the table cannot hold what
+    /// the file says a row of it holds, and changing the catalog inside
+    /// a transaction is a piece of its own.
+    #[test]
+    fn a_label_the_table_has_not_declared_is_turned_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "undeclared.zu1");
 
         let err = session
-            .run("MATCH (p:person) REMOVE p:person", &[])
-            .expect_err("not in yet");
-        assert!(err.to_string().contains("REMOVE of a label"), "got: {err}");
+            .run("MATCH (p:person) SET p:Manager", &[])
+            .expect_err("not declared");
+        assert!(err.to_string().contains("has not declared"), "got: {err}");
+    }
+
+    /// The name of the table is the label every row of it carries, so
+    /// it is not a label a statement puts on a row or takes off one.
+    #[test]
+    fn the_name_of_the_table_is_not_a_label_to_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "primary-label.zu1");
+
+        for source in [
+            "MATCH (p:person) SET p:person",
+            "MATCH (p:person) REMOVE p:person",
+        ] {
+            let err = session.run(source, &[]).expect_err("the table's own name");
+            assert!(
+                err.to_string().contains("name of the table"),
+                "{source}: {err}"
+            );
+        }
+    }
+
+    /// An edge carries the one name its rel table is, and there is no
+    /// word beside it to hold another, so a label change on one is
+    /// turned away by name.
+    #[test]
+    fn an_edge_has_no_labels_to_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "edge-label.zu1");
+
+        let err = session
+            .run("MATCH (p:person)-[k:knows]->(q:person) SET k:Bot", &[])
+            .expect_err("an edge has no labels");
+        assert!(err.to_string().contains("labels of an edge"), "got: {err}");
     }
 
     /// A property comes off an edge the way it comes off a node, and

@@ -241,34 +241,56 @@ pub enum Clause {
     },
 }
 
-/// One assignment under `SET`: the element it changes, the property it
-/// writes, and what that property takes.
+/// What one item of a `SET` writes, which is the one thing that differs
+/// between the three forms the statement has.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetInto {
+    /// `SET p.age = 37`: one property, named.
+    Property(String),
+    /// `SET p = {age: 37}`: every property the element has, out of the
+    /// record on the right. A property the record leaves out is emptied
+    /// rather than left alone, which is why this form names no key.
+    Record,
+    /// `SET p:Admin&Bot`: labels the element takes on. A label is not a
+    /// property, so there is nothing on the right of it; the labels
+    /// written are what it says.
+    Labels(Vec<String>),
+}
+
+/// One assignment under `SET`: the element it changes, what it writes,
+/// and what that takes.
 ///
 /// The value is an expression like any other, so it is evaluated once
 /// for every row the clauses before the `SET` answered and can read
-/// the element it is about to change.
+/// the element it is about to change. An item that writes labels
+/// carries a null there, because what it writes is in the statement
+/// rather than in a value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetItem {
     /// The variable standing for the element, which an earlier clause
     /// bound.
     pub target: String,
-    /// The property the assignment writes, or nothing when it writes
-    /// every property the element has: `SET p = {age: 37}` names no one
-    /// key, because what it assigns is the whole record and a property
-    /// the record leaves out is emptied rather than left alone. The
-    /// value of that form is the record, so it is one expression either
-    /// way.
-    pub key: Option<String>,
+    pub into: SetInto,
     pub value: Expr,
 }
 
-/// One property under `REMOVE`: the element it comes off and which
-/// property it is. There is no value, which is the whole difference
-/// between this and [`SetItem`].
+/// What one item of a `REMOVE` takes off an element.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Removed {
+    /// `REMOVE p.age`: one property, which GQL defines as setting it to
+    /// null.
+    Property(String),
+    /// `REMOVE p:Admin`: labels the element stops carrying.
+    Labels(Vec<String>),
+}
+
+/// One item under `REMOVE`: the element it comes off and what comes
+/// off it. There is no value, which is the whole difference between
+/// this and [`SetItem`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoveItem {
     pub target: String,
-    pub key: String,
+    pub what: Removed,
 }
 
 /// The shared shape of `WITH` and `RETURN`.

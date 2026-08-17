@@ -160,9 +160,9 @@ const NOTES: &[&str] = &[
     "driven through `zu shell --format jsonl`, one long-lived process per session",
     "loaded through `zu convert`, which reads a SQLite database in zu's schema",
     "the evaluator is MATCH WHERE CALL UNWIND WITH RETURN, plus INSERT of node patterns and \
-     of edges between the elements a statement has in scope, SET and REMOVE of properties, and \
-     DELETE and DETACH DELETE of elements, so a case that writes anything else is answered with \
-     an error rather than a skip",
+     of edges between the elements a statement has in scope, SET and REMOVE of properties and \
+     of labels, and DELETE and DETACH DELETE of elements, so a case that writes anything else \
+     is answered with an error rather than a skip",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",
@@ -172,8 +172,12 @@ const NOTES: &[&str] = &[
     "a SET changes what an element an earlier clause found holds, one row at a time, and the \
      clauses after it read the new value; a property of a node, a property of an edge and the \
      whole record of either are all reachable, and the record form empties every property it \
-     does not name, while SET of a label is refused by name because an element carries the \
-     labels of the table it is in",
+     does not name",
+    "SET and REMOVE of a label change the bit the label is in the row's label word, so a \
+     pattern naming that label finds the row afterwards; the label has to be one the row's \
+     table has already declared, because declaring one is a catalog change and a statement \
+     cannot make that yet, and the name of the table is the label every row of it carries \
+     rather than one a statement puts on or takes off",
     "a REMOVE is the assignment of a null the standard says it is, so it and SET of a null are \
      one write and a column holds the absence as a clear validity bit",
     "a DELETE takes away the element an earlier clause found, a DETACH DELETE takes its edges \

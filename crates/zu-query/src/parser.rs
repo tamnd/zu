@@ -16,7 +16,7 @@ use crate::ast::{
     BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
     GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
     PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
-    Selector, SetItem, SortKey, Statement, UnaryOp,
+    RemoveItem, Selector, SetItem, SortKey, Statement, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -73,8 +73,8 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "REMOVE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT", "START", "COMMIT",
-    "ROLLBACK", "SESSION", "FINISH", "FOR",
+    "CREATE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT", "START", "COMMIT", "ROLLBACK",
+    "SESSION", "FINISH", "FOR",
 ];
 
 /// Parses one zuQL query.
@@ -696,9 +696,12 @@ impl Parser<'_> {
     /// Whether these clauses change the graph, which is what decides
     /// whether the statement may end without a RETURN.
     fn writes(clauses: &[Clause]) -> bool {
-        clauses
-            .iter()
-            .any(|c| matches!(c, Clause::Insert { .. } | Clause::Set { .. }))
+        clauses.iter().any(|c| {
+            matches!(
+                c,
+                Clause::Insert { .. } | Clause::Set { .. } | Clause::Remove { .. }
+            )
+        })
     }
 
     /// One item of a `SET`: `p.age = 37`.
@@ -709,6 +712,26 @@ impl Parser<'_> {
     /// the record does not mention, and `SET p:Label` changes which
     /// labels it carries, which is a catalog change. Both are pieces of
     /// their own, and a reader who wrote one spelled it correctly.
+    /// One `REMOVE` item, which is a property and nothing else. A label
+    /// after the variable is the other thing GQL lets `REMOVE` take,
+    /// and an element carries the labels of the table it is in, so that
+    /// one is turned away by name.
+    fn parse_remove_item(&mut self) -> Result<RemoveItem> {
+        let target = self.expect_name("a variable after REMOVE")?;
+        if self.at(&TokenKind::Colon) || self.at_kw("IS") {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{}: REMOVE of a label is not implemented yet, an element carries the labels of the table it is in",
+                    position(self.source, self.peek().expect("peeked").start)
+                ),
+            ));
+        }
+        self.expect(&TokenKind::Dot)?;
+        let key = self.expect_name("a property name after the dot")?;
+        Ok(RemoveItem { target, key })
+    }
+
     fn parse_set_item(&mut self) -> Result<SetItem> {
         let target = self.expect_name("a variable after SET")?;
         if self.at(&TokenKind::Colon) || self.at_kw("IS") {
@@ -765,6 +788,12 @@ impl Parser<'_> {
                     items.push(self.parse_set_item()?);
                 }
                 clauses.push(Clause::Set { items });
+            } else if self.eat_kw("REMOVE") {
+                let mut items = vec![self.parse_remove_item()?];
+                while self.eat(&TokenKind::Comma) {
+                    items.push(self.parse_remove_item()?);
+                }
+                clauses.push(Clause::Remove { items });
             } else if self.eat_kw("CALL") {
                 let name = self.expect_name("a table function name after CALL")?;
                 self.expect(&TokenKind::LParen)?;
@@ -2303,7 +2332,6 @@ mod tests {
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
         for (source, kw) in [
-            ("MATCH (p) REMOVE p.age RETURN p", "REMOVE"),
             ("MATCH (p) DELETE p", "DELETE"),
             ("MATCH (p) DETACH DELETE p", "DETACH"),
             ("START TRANSACTION READ WRITE", "START"),
@@ -2944,6 +2972,33 @@ mod tests {
         assert_eq!(items[0].target, "p");
         assert_eq!(items[0].key, "age");
         assert_eq!(items[1].key, "name");
+    }
+
+    #[test]
+    fn a_remove_carries_the_properties_it_was_written_with() {
+        let q = parsed("MATCH (p:person) REMOVE p.age, p.name");
+        let Clause::Remove { items } = &q.clauses[1] else {
+            panic!("REMOVE");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].target, "p");
+        assert_eq!(items[0].key, "age");
+        assert_eq!(items[1].key, "name");
+        // A REMOVE is a write, so the statement ends without a RETURN
+        // the way a SET does.
+        assert_eq!(q.clauses.len(), 2);
+    }
+
+    /// A label is the other thing GQL lets REMOVE take, and it is named
+    /// rather than met with a syntax error about a colon.
+    #[test]
+    fn removing_a_label_says_which_part_is_not_in_yet() {
+        for source in [
+            "MATCH (p:person) REMOVE p:Manager",
+            "MATCH (p:person) REMOVE p IS Manager",
+        ] {
+            assert!(parse_err(source).contains("REMOVE of a label"), "{source}");
+        }
     }
 
     /// The two forms of the item that are not in yet are named rather

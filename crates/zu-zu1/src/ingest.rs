@@ -436,7 +436,9 @@ pub(crate) fn resolve(
                     .ok_or_else(|| corrupt(format!("edge manifest misses endpoint {col}")))?;
                 match read_values(db, seg)? {
                     WalValues::Int(v) => Ok(v),
-                    WalValues::Str(_) => Err(corrupt("edge endpoints must be ints".into())),
+                    WalValues::Str(_) | WalValues::Null(_) => {
+                        Err(corrupt("edge endpoints must be ints".into()))
+                    }
                 }
             };
             IngestPayload::Edges {

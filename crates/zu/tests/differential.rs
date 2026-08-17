@@ -82,12 +82,16 @@ fn compare(zu: &mut Zu1Side, sq: &SqliteStore, total: u64, what: &str) {
         if let Some((sq_age, sq_name)) = sq_row {
             let age = match zu.mvcc.cell(zu.person, base, row, 0, epoch) {
                 Some(Cell::Int(x)) => x,
-                Some(Cell::Str(_)) => unreachable!("age is an int column"),
+                Some(Cell::Str(_) | Cell::Null) => {
+                    unreachable!("age is an int column nothing removes")
+                }
                 None => reader.read_int(&mut zu.db, 0, row).unwrap(),
             };
             let name = match zu.mvcc.cell(zu.person, base, row, 1, epoch) {
                 Some(Cell::Str(s)) => s,
-                Some(Cell::Int(_)) => unreachable!("name is a str column"),
+                Some(Cell::Int(_) | Cell::Null) => {
+                    unreachable!("name is a str column nothing removes")
+                }
                 None => {
                     let mut buf = Vec::new();
                     reader.read_str(&mut zu.db, 1, row, &mut buf).unwrap();

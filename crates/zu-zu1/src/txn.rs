@@ -30,6 +30,10 @@ use crate::wal::{Wal, WalColumn, WalRecord, WalValues};
 pub enum Cell {
     Int(u64),
     Str(Vec<u8>),
+    /// The absence a `REMOVE` leaves behind. A column holds it the way
+    /// storage does, as a row whose validity bit is clear, so what the
+    /// fold writes for one of these is a bit rather than a value.
+    Null,
 }
 
 /// One committed batch of appended rows, columnar like the props store.
@@ -124,34 +128,53 @@ pub struct WriteTxn<'a> {
     ops: Vec<Op>,
 }
 
+/// The kind of one staged cell, which is what a logged column is made
+/// of one of: a record carries words, byte strings, or absences, and
+/// never two of the three, because a column of the store is one of the
+/// three as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Int,
+    Str,
+    Null,
+}
+
+fn kind_of(cell: &Cell) -> Kind {
+    match cell {
+        Cell::Int(_) => Kind::Int,
+        Cell::Str(_) => Kind::Str,
+        Cell::Null => Kind::Null,
+    }
+}
+
 fn cell_values(cells: &[Cell]) -> Result<WalValues> {
-    let all_int = cells.iter().all(|c| matches!(c, Cell::Int(_)));
-    if all_int {
-        return Ok(WalValues::Int(
+    let first = cells.first().map_or(Kind::Int, kind_of);
+    if cells.iter().any(|c| kind_of(c) != first) {
+        return Err(ZuError::InvalidArgument(
+            "a logged column cannot mix values of different kinds".into(),
+        ));
+    }
+    Ok(match first {
+        Kind::Int => WalValues::Int(
             cells
                 .iter()
                 .map(|c| match c {
                     Cell::Int(x) => *x,
-                    Cell::Str(_) => unreachable!(),
+                    _ => unreachable!("checked above"),
                 })
                 .collect(),
-        ));
-    }
-    let all_str = cells.iter().all(|c| matches!(c, Cell::Str(_)));
-    if !all_str {
-        return Err(ZuError::InvalidArgument(
-            "a column cannot mix int and string values".into(),
-        ));
-    }
-    Ok(WalValues::Str(
-        cells
-            .iter()
-            .map(|c| match c {
-                Cell::Str(s) => s.clone(),
-                Cell::Int(_) => unreachable!(),
-            })
-            .collect(),
-    ))
+        ),
+        Kind::Str => WalValues::Str(
+            cells
+                .iter()
+                .map(|c| match c {
+                    Cell::Str(s) => s.clone(),
+                    _ => unreachable!("checked above"),
+                })
+                .collect(),
+        ),
+        Kind::Null => WalValues::Null(cells.len() as u32),
+    })
 }
 
 impl Mvcc {
@@ -248,6 +271,7 @@ impl Mvcc {
                                     let cell = match &c.values {
                                         WalValues::Int(v) => Cell::Int(v[i]),
                                         WalValues::Str(v) => Cell::Str(v[i].clone()),
+                                        WalValues::Null(_) => Cell::Null,
                                     };
                                     (c.col, cell)
                                 })
@@ -268,6 +292,7 @@ impl Mvcc {
                         let cell = match values {
                             WalValues::Int(v) => Cell::Int(v[i]),
                             WalValues::Str(v) => Cell::Str(v[i].clone()),
+                            WalValues::Null(_) => Cell::Null,
                         };
                         overlay
                             .updates
@@ -347,6 +372,7 @@ impl Mvcc {
                 return Some(match &column.values {
                     WalValues::Int(v) => Cell::Int(v[row]),
                     WalValues::Str(v) => Cell::Str(v[row].clone()),
+                    WalValues::Null(_) => Cell::Null,
                 });
             }
             if batch.epoch <= epoch {
@@ -678,13 +704,28 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
         }
     }
     for ((table, group, col), (offsets, cells)) in updates {
-        out.push(WalRecord::Update {
-            table,
-            group,
-            col,
-            offsets,
-            values: cell_values(&cells).expect("staged cells are column-typed"),
-        });
+        // One record carries one kind of value, so a batch that changes
+        // kind partway is logged as one record per run of a kind. The
+        // runs go out in the order they were staged, which is the order
+        // a cell's chain has to end up in: a statement that writes a
+        // value over an absence and one that writes an absence over a
+        // value differ only in that order.
+        let mut at = 0usize;
+        while at < cells.len() {
+            let kind = kind_of(&cells[at]);
+            let mut end = at + 1;
+            while end < cells.len() && kind_of(&cells[end]) == kind {
+                end += 1;
+            }
+            out.push(WalRecord::Update {
+                table,
+                group,
+                col,
+                offsets: offsets[at..end].to_vec(),
+                values: cell_values(&cells[at..end]).expect("one run is one kind"),
+            });
+            at = end;
+        }
     }
     for (table, ids) in deletes {
         out.push(WalRecord::Delete { table, ids });

@@ -527,7 +527,7 @@ impl Graph for Zu1Graph<'_> {
         let Self { db, readers, .. } = self;
         let reader = readers.get_mut(&rel).expect("just loaded");
         match name {
-            "pagerank" => Ok(algo::pagerank(db, reader, algo::PAGERANK_ITERATIONS)?
+            "pagerank" => Ok(algo::pagerank_converged(db, reader)?
                 .into_iter()
                 .map(|rank| vec![Value::Float(rank)])
                 .collect()),

@@ -419,6 +419,69 @@ jobs:
             > "$RUNNER_TEMP/rust-wrong.txt" || true
           diff -u "$RUNNER_TEMP/rust-wrong.txt" "$RUNNER_TEMP/c-wrong.txt"
           exit $status
+      # The fourth C program the repository has, and the one a package
+      # consumer actually writes: scripts/libzu-build.sh runs it on
+      # seven platforms against the staged package, where it proves the
+      # artifact links and answers and nothing is watching how. Here it
+      # is watched. Both sanitizers, for the same reason the runner
+      # gets them, and it is built from the same source file so that
+      # what is checked is the program that ships and not a copy.
+      - name: The C smoke test under the sanitizers
+        run: |
+          printf '1 2\n1 3\n2 3\n3 1\n' > "$RUNNER_TEMP/edges.txt"
+          cargo run -q -p zu-cli --release -- \
+            copy "$RUNNER_TEMP/edges.txt" "$RUNNER_TEMP/smoke.zu1"
+          cc -std=c99 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer -Icrates/zu-capi/include \
+            -o "$RUNNER_TEMP/smoke" crates/zu-capi/tests/smoke.c \
+            -Ltarget/release -lzu -Wl,-rpath,"$PWD/target/release"
+          "$RUNNER_TEMP/smoke" "$RUNNER_TEMP/smoke.zu1"
+      # The third tool over the same four programs, and the one that
+      # watches what the other two cannot. ASan instruments the source
+      # it compiles, so it sees nothing libzu does with its own memory
+      # and nothing a prebuilt library does with the pointers it was
+      # handed; Valgrind instruments the instructions that run, so the
+      # engine is watched too, across the boundary the ABI draws. It
+      # also reports a read of memory nobody wrote, which ASan does not
+      # look for at all and which is the bug a C client hits first. This
+      # is a separate, uninstrumented build because ASan and Valgrind
+      # cannot share a process.
+      #
+      # --error-exitcode is what makes a report a failure rather than
+      # something in a log nobody opens. Definite leaks only: a Rust
+      # process holds one-time allocations at exit that are still
+      # reachable and not lost, and counting those would fire this gate
+      # on every run and teach everyone to ignore it. --track-origins
+      # roughly doubles the cost, so the two readers get it, where it
+      # turns "uninitialised" into the line that left it that way, and
+      # the runner does not, because the runner also runs the engine
+      # over all 555 cases and that is where the minutes are.
+      - name: The C programs under Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          vg() {
+            valgrind --error-exitcode=1 --leak-check=full \
+              --errors-for-leak-kinds=definite -q "$@"
+          }
+          flags="-std=c99 -O1 -g -Wall -Wextra -Werror -pedantic"
+          cc $flags -o "$RUNNER_TEMP/vg-yaml" \
+            conformance/c/yaml.c conformance/c/yaml_test.c
+          cc $flags -o "$RUNNER_TEMP/vg-value" \
+            conformance/c/yaml.c conformance/c/value.c conformance/c/value_test.c
+          cc $flags -Icrates/zu-capi/include -o "$RUNNER_TEMP/vg-runner" \
+            conformance/c/yaml.c conformance/c/value.c conformance/c/runner.c \
+            -Ltarget/release -lzu -Wl,-rpath,"$PWD/target/release"
+          cc $flags -Icrates/zu-capi/include -o "$RUNNER_TEMP/vg-smoke" \
+            crates/zu-capi/tests/smoke.c \
+            -Ltarget/release -lzu -Wl,-rpath,"$PWD/target/release"
+          vg --track-origins=yes "$RUNNER_TEMP/vg-yaml" conformance/cases/*.yaml
+          vg --track-origins=yes "$RUNNER_TEMP/vg-value" conformance/cases/*.yaml
+          vg --track-origins=yes "$RUNNER_TEMP/vg-smoke" "$RUNNER_TEMP/smoke.zu1"
+          mkdir -p "$RUNNER_TEMP/vg-corpus"
+          vg "$RUNNER_TEMP/vg-runner" --dir "$RUNNER_TEMP/vg-corpus" --quiet \
+            --strict conformance/cases/*.yaml
 
   terms:
     runs-on: ubuntu-latest

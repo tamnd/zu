@@ -19,7 +19,7 @@ use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
     self, BinaryOp, Clause, Expr, LabelExpr, Literal, NodePattern, PathMode, Projection,
-    RelDirection, RelPattern, Selector, SetItem, SortKey, UnaryOp,
+    RelDirection, RelPattern, RemoveItem, Selector, SetItem, SortKey, UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
@@ -1368,6 +1368,17 @@ impl Binder<'_> {
                     carry,
                 })
             }
+            Clause::Remove { items } => {
+                let carry = self.carried();
+                let mut bound = Vec::with_capacity(items.len());
+                for item in items {
+                    bound.push(self.bind_remove_item(item)?);
+                }
+                Ok(BoundClause::Set {
+                    items: bound,
+                    carry,
+                })
+            }
             Clause::Unwind { expr, alias } => {
                 let mut ctx = ExprCtx::new(false);
                 let (bound, ty) = self.bind_expr(expr, &mut ctx)?;
@@ -1856,26 +1867,7 @@ impl Binder<'_> {
     /// properties are stored in the order its table holds its edges and
     /// nothing writes into that order yet.
     fn bind_set_item(&mut self, item: &SetItem) -> Result<BoundSetItem> {
-        let Some(&target) = self.scope.get(&item.target) else {
-            return Err(bad_reference(format!(
-                "'{}' stands for nothing here, and SET changes an element an earlier clause found",
-                item.target
-            )));
-        };
-        match self.variables[target].ty {
-            Type::Node => {}
-            Type::Rel => {
-                return Err(not_yet(
-                    "SET on an edge, whose properties are stored in the order its table holds its edges,",
-                ));
-            }
-            ref other => {
-                return Err(bad_type(format!(
-                    "SET changes an element, and '{}' is {other}",
-                    item.target
-                )));
-            }
-        }
+        let target = self.write_target("SET", &item.target)?;
         let mut ctx = ExprCtx::new(false);
         let (value, _) = self.bind_expr(&item.value, &mut ctx)?;
         Ok(BoundSetItem {
@@ -1883,6 +1875,42 @@ impl Binder<'_> {
             key: item.key.clone(),
             value,
         })
+    }
+
+    /// Binds one `REMOVE` item as the assignment GQL says it is: the
+    /// property takes null, and a column takes a null by holding
+    /// nothing in that row. Everything downstream of here sees a `SET`,
+    /// which is why `SET p.age = null` and `REMOVE p.age` do the same
+    /// thing rather than nearly the same thing.
+    fn bind_remove_item(&mut self, item: &RemoveItem) -> Result<BoundSetItem> {
+        let target = self.write_target("REMOVE", &item.target)?;
+        let mut ctx = ExprCtx::new(false);
+        let (value, _) = self.bind_expr(&Expr::Literal(Literal::Null), &mut ctx)?;
+        Ok(BoundSetItem {
+            target,
+            key: item.key.clone(),
+            value,
+        })
+    }
+
+    /// The slot a write names, which has to be a node an earlier clause
+    /// bound. `verb` is the statement asking, so that a reader is told
+    /// which of their clauses is the one that cannot run.
+    fn write_target(&self, verb: &str, name: &str) -> Result<usize> {
+        let Some(&target) = self.scope.get(name) else {
+            return Err(bad_reference(format!(
+                "'{name}' stands for nothing here, and {verb} changes an element an earlier clause found"
+            )));
+        };
+        match self.variables[target].ty {
+            Type::Node => Ok(target),
+            Type::Rel => Err(not_yet(&format!(
+                "{verb} on an edge, whose properties are stored in the order its table holds its edges,"
+            ))),
+            ref other => Err(bad_type(format!(
+                "{verb} changes an element, and '{name}' is {other}"
+            ))),
+        }
     }
 
     /// Binds one edge written under `INSERT`, between the two slots the

@@ -196,6 +196,86 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
     seed_persisted_tombstones(db, mvcc)
 }
 
+/// The validity words of one column while a fold rewrites it: what the
+/// base said about the rows it had, widened over the rows the appends
+/// added, and then whatever the overlay says about each row it names.
+///
+/// A column stores a mask only when some row of it holds nothing, so
+/// this starts as every bit set on a column that had no mask, and it
+/// writes nothing back when every bit is still set at the end. That is
+/// what keeps a store that never removed anything the same size and the
+/// same shape as one that could not.
+struct Validity {
+    words: Vec<u64>,
+    rows: u64,
+}
+
+impl Validity {
+    /// Reads the column's mask over `base` rows and widens it to
+    /// `rows`, where the rows the appends added start out holding a
+    /// value because an appended row carries one for every column.
+    fn read(
+        db: &mut Zu1File,
+        col: &crate::props::PropColumn,
+        base: u64,
+        rows: u64,
+    ) -> Result<Self> {
+        let mut words = vec![u64::MAX; rows.div_ceil(64) as usize];
+        if let Some(meta) = &col.validity {
+            let mut stored = Vec::new();
+            read_segment(db, meta, &mut stored)?;
+            for (at, word) in stored.iter().enumerate() {
+                let Some(slot) = words.get_mut(at) else { break };
+                // The last stored word covers rows past `base` only if
+                // the base did not end on a word boundary, and those
+                // rows are appended ones, which hold a value. Keeping
+                // their bits set is what the OR does.
+                let covered = base.saturating_sub(at as u64 * 64).min(64);
+                let mask = match covered {
+                    64 => u64::MAX,
+                    n => (1u64 << n) - 1,
+                };
+                *slot = (word & mask) | !mask;
+            }
+        }
+        Ok(Self { words, rows })
+    }
+
+    fn set(&mut self, offset: u64) {
+        self.words[(offset / 64) as usize] |= 1u64 << (offset % 64);
+    }
+
+    fn clear(&mut self, offset: u64) {
+        self.words[(offset / 64) as usize] &= !(1u64 << (offset % 64));
+    }
+
+    /// Whether every row of the column holds a value, which is asked of
+    /// the rows the column has rather than of the words, since the last
+    /// word runs past the last row.
+    fn all_set(&self) -> bool {
+        (0..self.rows)
+            .all(|offset| self.words[(offset / 64) as usize] & (1u64 << (offset % 64)) != 0)
+    }
+
+    /// The segment the rebuilt column points at, or `None` when every
+    /// row holds a value and the column needs no mask.
+    fn write(mut self, db: &mut Zu1File) -> Result<Option<crate::segment::SegmentMeta>> {
+        if self.all_set() {
+            return Ok(None);
+        }
+        // The bits past the last row belong to no row, and a mask is
+        // compared word for word by everything that reads it, so they
+        // are cleared rather than left as whatever the widening put
+        // there.
+        if let Some(last) = self.words.last_mut()
+            && !self.rows.is_multiple_of(64)
+        {
+            *last &= (1u64 << (self.rows % 64)) - 1;
+        }
+        Ok(Some(write_segment(db, &self.words)?))
+    }
+}
+
 /// Merges one table's appended rows and update chains into a rebuilt
 /// props directory. A table without stored props cannot absorb column
 /// data, and its row count still grows through the catalog alone.
@@ -240,19 +320,14 @@ fn fold_props(
     };
     let mut columns = Vec::with_capacity(dir.columns.len());
     for (ci, col) in dir.columns.iter().enumerate() {
-        // A fold rewrites a column out of its old values and the cells
-        // the overlay holds, and an overlay cell is a word or a byte
-        // string and never an absence. There is no way to say here
-        // whether an appended row of a nullable column holds a value,
-        // so the fold refuses rather than deciding for it. Nothing
-        // writes a property yet, so nothing reaches this; the write
-        // statements of G3 are what has to answer it.
-        if col.validity.is_some() {
-            return Err(ZuError::Unsupported {
-                what: "folding an overlay into a column that holds a null",
-                id: table,
-            });
-        }
+        // A column holds a null the way storage does, as a row whose
+        // validity bit is clear, so the fold carries a mask beside the
+        // values: what the base said, widened over the rows the appends
+        // added, and then whatever the overlay says about each row it
+        // names. A column nothing removed from ends with every bit set
+        // and stores no mask at all, so a graph with no null in it pays
+        // nothing for the ones that could have been.
+        let mut valid = Validity::read(db, col, base, new_count)?;
         // The fold splits the way storage does, on the lane against
         // the blob, because that is what it rewrites. Cells the overlay
         // holds are words or byte strings and the column's type says
@@ -262,8 +337,24 @@ fn fold_props(
             read_segment(db, &col.meta, &mut values)?;
             for offset in 0..new_count {
                 match mvcc.cell(table, base, offset, ci as u32, epoch) {
-                    Some(Cell::Int(x)) if offset < base => values[offset as usize] = x,
-                    Some(Cell::Int(x)) => values.push(x),
+                    Some(Cell::Int(x)) if offset < base => {
+                        values[offset as usize] = x;
+                        valid.set(offset);
+                    }
+                    Some(Cell::Int(x)) => {
+                        values.push(x);
+                        valid.set(offset);
+                    }
+                    // A removed row keeps a word where its value was,
+                    // because the lane is fixed width and a reader that
+                    // has been told the bit is clear never looks at it.
+                    Some(Cell::Null) => {
+                        match offset < base {
+                            true => values[offset as usize] = 0,
+                            false => values.push(0),
+                        }
+                        valid.clear(offset);
+                    }
                     Some(Cell::Str(_)) => return Err(mismatch(&col.name, offset)),
                     None if offset < base => {}
                     None => return Err(missing(&col.name, offset)),
@@ -281,8 +372,25 @@ fn fold_props(
             }
             for offset in 0..new_count {
                 match mvcc.cell(table, base, offset, ci as u32, epoch) {
-                    Some(Cell::Str(s)) if offset < base => values[offset as usize] = s,
-                    Some(Cell::Str(s)) => values.push(s),
+                    Some(Cell::Str(s)) if offset < base => {
+                        values[offset as usize] = s;
+                        valid.set(offset);
+                    }
+                    Some(Cell::Str(s)) => {
+                        values.push(s);
+                        valid.set(offset);
+                    }
+                    // The blob side stores the absence as the empty
+                    // string, which costs the row nothing: a blob is
+                    // addressed by its ends and two equal ends are no
+                    // bytes at all.
+                    Some(Cell::Null) => {
+                        match offset < base {
+                            true => values[offset as usize].clear(),
+                            false => values.push(Vec::new()),
+                        }
+                        valid.clear(offset);
+                    }
                     Some(Cell::Int(_)) => return Err(mismatch(&col.name, offset)),
                     None if offset < base => {}
                     None => return Err(missing(&col.name, offset)),
@@ -295,7 +403,7 @@ fn fold_props(
             name: col.name.clone(),
             ty: col.ty.clone(),
             meta,
-            validity: None,
+            validity: valid.write(db)?,
         });
     }
     // The label bitset grows with the row domain, and an appended row
@@ -570,7 +678,7 @@ fn fold_rel_props(
                     Came::Base(at) => old[*at],
                     Came::Overlay(at) => match cell(*at)? {
                         Cell::Int(x) => *x,
-                        Cell::Str(_) => return Err(mismatch(&col.name)),
+                        Cell::Str(_) | Cell::Null => return Err(mismatch(&col.name)),
                     },
                 });
             }
@@ -590,7 +698,7 @@ fn fold_rel_props(
                     Came::Base(at) => old[*at],
                     Came::Overlay(at) => match cell(*at)? {
                         Cell::Str(s) => s.as_slice(),
-                        Cell::Int(_) => return Err(mismatch(&col.name)),
+                        Cell::Int(_) | Cell::Null => return Err(mismatch(&col.name)),
                     },
                 });
             }

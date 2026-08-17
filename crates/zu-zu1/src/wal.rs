@@ -46,6 +46,11 @@ fn corrupt(detail: String) -> ZuError {
 pub enum WalValues {
     Int(Vec<u64>),
     Str(Vec<Vec<u8>>),
+    /// This many absences in a row, which is what a `REMOVE` writes.
+    /// An absence carries nothing per row, so the count is the whole
+    /// record: what a reader needs to know is which rows the record
+    /// names, and the offsets beside it already say.
+    Null(u32),
 }
 
 impl WalValues {
@@ -53,6 +58,7 @@ impl WalValues {
         match self {
             WalValues::Int(v) => v.len(),
             WalValues::Str(v) => v.len(),
+            WalValues::Null(n) => *n as usize,
         }
     }
 
@@ -77,6 +83,10 @@ impl WalValues {
                     out.extend_from_slice(s);
                 }
             }
+            WalValues::Null(n) => {
+                out.push(2);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
         }
     }
 
@@ -99,6 +109,7 @@ impl WalValues {
                 }
                 Ok(WalValues::Str(v))
             }
+            2 => Ok(WalValues::Null(count as u32)),
             other => Err(corrupt(format!("unknown value tag {other}"))),
         }
     }

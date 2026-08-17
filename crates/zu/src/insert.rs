@@ -24,7 +24,7 @@ use zu_common::{FloatBits, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
 use crate::query::Value;
-use crate::split::Write;
+use crate::split::Insert;
 use crate::zu1::file::Zu1File;
 use crate::zu1::props::{PropColumn, load_props, load_rel_props};
 use crate::zu1::txn::{Cell, WriteTxn};
@@ -87,7 +87,7 @@ impl NewRel {
 /// raise before the transaction opens, so that the failing case costs
 /// no log write and no fold.
 pub(crate) struct Batch<'a> {
-    write: &'a Write,
+    write: &'a Insert,
     /// The property columns of each node table being written to, read
     /// once.
     columns: BTreeMap<u32, Vec<PropColumn>>,
@@ -103,7 +103,7 @@ pub(crate) struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn open(db: &mut Zu1File, write: &'a Write) -> Result<Self> {
+    pub(crate) fn open(db: &mut Zu1File, write: &'a Insert) -> Result<Self> {
         let mut columns = BTreeMap::new();
         let mut next = BTreeMap::new();
         for node in &write.nodes {
@@ -132,11 +132,11 @@ impl<'a> Batch<'a> {
 
     /// Works out what one row of the run writes: `carried` is the row
     /// the clauses before the write answered, holding the slots in
-    /// [`Write::carry`] in that order, and `props` is the property
+    /// [`Insert::carry`] in that order, and `props` is the property
     /// values behind them, one per property in written order.
     ///
     /// The created elements come back in the order
-    /// [`Write::created`] names them, which is the order they are
+    /// [`Insert::created`] names them, which is the order they are
     /// appended to the row the clauses after the write read.
     pub(crate) fn row(&mut self, carried: &[Value], props: &[Value]) -> Result<Vec<Value>> {
         let mut made: Vec<Value> = Vec::with_capacity(self.write.created.len());
@@ -360,7 +360,7 @@ fn fill(
 /// have to agree: the lane stores 64 bit words, so what a word out of a
 /// boolean column means and what a boolean has to be written as are the
 /// same fact read in two directions.
-fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
+pub(crate) fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
     let wrong = || {
         ZuError::gql(
             zu_common::gqlstatus::codes::C22G03,
@@ -409,7 +409,7 @@ fn cell(ty: &LogicalType, value: &Value, key: &str) -> Result<Cell> {
 }
 
 /// What a value is, for the message when its column cannot hold it.
-fn describe(value: &Value) -> &'static str {
+pub(crate) fn describe(value: &Value) -> &'static str {
     match value {
         Value::Null => "a null",
         Value::Bool(_) => "a boolean",

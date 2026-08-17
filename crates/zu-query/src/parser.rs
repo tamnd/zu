@@ -16,7 +16,7 @@ use crate::ast::{
     BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
     GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
     PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
-    Selector, SortKey, Statement, UnaryOp,
+    Selector, SetItem, SortKey, Statement, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -73,8 +73,8 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "SET", "REMOVE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT", "START",
-    "COMMIT", "ROLLBACK", "SESSION", "FINISH", "FOR",
+    "CREATE", "REMOVE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT", "START", "COMMIT",
+    "ROLLBACK", "SESSION", "FINISH", "FOR",
 ];
 
 /// Parses one zuQL query.
@@ -696,7 +696,44 @@ impl Parser<'_> {
     /// Whether these clauses change the graph, which is what decides
     /// whether the statement may end without a RETURN.
     fn writes(clauses: &[Clause]) -> bool {
-        clauses.iter().any(|c| matches!(c, Clause::Insert { .. }))
+        clauses
+            .iter()
+            .any(|c| matches!(c, Clause::Insert { .. } | Clause::Set { .. }))
+    }
+
+    /// One item of a `SET`: `p.age = 37`.
+    ///
+    /// The other two forms of the item are named rather than met with a
+    /// syntax error. `SET p = {...}` replaces every property an element
+    /// holds, which is a column the element leaves empty for each one
+    /// the record does not mention, and `SET p:Label` changes which
+    /// labels it carries, which is a catalog change. Both are pieces of
+    /// their own, and a reader who wrote one spelled it correctly.
+    fn parse_set_item(&mut self) -> Result<SetItem> {
+        let target = self.expect_name("a variable after SET")?;
+        if self.at(&TokenKind::Colon) || self.at_kw("IS") {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{}: SET of a label is not implemented yet, an element carries the labels of the table it is in",
+                    position(self.source, self.peek().expect("peeked").start)
+                ),
+            ));
+        }
+        if self.at(&TokenKind::Eq) {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{}: SET of a whole record is not implemented yet, which would empty every property the record does not name",
+                    position(self.source, self.peek().expect("peeked").start)
+                ),
+            ));
+        }
+        self.expect(&TokenKind::Dot)?;
+        let key = self.expect_name("a property name after the dot")?;
+        self.expect(&TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        Ok(SetItem { target, key, value })
     }
 
     fn parse_query(&mut self) -> Result<Query> {
@@ -722,6 +759,12 @@ impl Parser<'_> {
                     patterns.push(self.parse_path()?);
                 }
                 clauses.push(Clause::Insert { patterns });
+            } else if self.eat_kw("SET") {
+                let mut items = vec![self.parse_set_item()?];
+                while self.eat(&TokenKind::Comma) {
+                    items.push(self.parse_set_item()?);
+                }
+                clauses.push(Clause::Set { items });
             } else if self.eat_kw("CALL") {
                 let name = self.expect_name("a table function name after CALL")?;
                 self.expect(&TokenKind::LParen)?;
@@ -2260,7 +2303,6 @@ mod tests {
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
         for (source, kw) in [
-            ("MATCH (p) SET p.age = 37 RETURN p", "SET"),
             ("MATCH (p) REMOVE p.age RETURN p", "REMOVE"),
             ("MATCH (p) DELETE p", "DELETE"),
             ("MATCH (p) DETACH DELETE p", "DETACH"),
@@ -2887,6 +2929,38 @@ mod tests {
         let q = parsed("INSERT (x:person {name: 'zoe'})");
         assert_eq!(q.clauses.len(), 1);
         assert!(parse_err("MATCH (n:person)").contains("RETURN"));
+        // A SET is a write too, so the same statement ends the same
+        // way.
+        assert_eq!(parsed("MATCH (p:person) SET p.age = 1").clauses.len(), 2);
+    }
+
+    #[test]
+    fn a_set_carries_the_assignments_it_was_written_with() {
+        let q = parsed("MATCH (p:person) SET p.age = 37, p.name = 'zoe'");
+        let Clause::Set { items } = &q.clauses[1] else {
+            panic!("SET");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].target, "p");
+        assert_eq!(items[0].key, "age");
+        assert_eq!(items[1].key, "name");
+    }
+
+    /// The two forms of the item that are not in yet are named rather
+    /// than met with a syntax error, because a reader who wrote one
+    /// spelled it correctly.
+    #[test]
+    fn the_forms_of_set_that_are_not_in_yet_say_which_one() {
+        for source in [
+            "MATCH (p:person) SET p:Manager",
+            "MATCH (p:person) SET p IS Manager",
+        ] {
+            assert!(parse_err(source).contains("SET of a label"), "{source}");
+        }
+        assert!(
+            parse_err("MATCH (p:person) SET p = {age: 1}").contains("SET of a whole record"),
+            "a record replaces every property"
+        );
     }
 
     #[test]

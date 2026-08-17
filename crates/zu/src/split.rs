@@ -16,7 +16,8 @@
 
 use zu_common::Result;
 use zu_query::binder::{
-    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, Schema, Type,
+    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetItem,
+    Schema, Type,
 };
 use zu_query::plan::LogicalPlan;
 use zu_query::{optimizer, plan};
@@ -29,9 +30,51 @@ pub(crate) struct Part {
     pub(crate) write: Option<Write>,
 }
 
-/// The write one part ends in, and what the row on either side of it
+/// The write one part ends in.
+///
+/// The two of them are the two things a write does to a row: make
+/// elements the clauses after it read, or change what elements already
+/// there hold. What they share is the row on either side, which is why
+/// the split is written once over both.
+pub(crate) enum Write {
+    Insert(Insert),
+    Set(Set),
+}
+
+impl Write {
+    /// The slots the part before the write projects, in the order its
+    /// rows hold them. The write's own values follow them in the same
+    /// row.
+    pub(crate) fn carry(&self) -> &[usize] {
+        match self {
+            Write::Insert(insert) => &insert.carry,
+            Write::Set(set) => &set.carry,
+        }
+    }
+
+    /// The value expressions the projection at the end of the part
+    /// carries behind the row, in the order the write reads them back.
+    fn values(&self) -> Vec<BoundExpr> {
+        match self {
+            Write::Insert(insert) => crate::insert::value_exprs(&insert.nodes, &insert.rels),
+            Write::Set(set) => set.items.iter().map(|item| item.value.clone()).collect(),
+        }
+    }
+
+    /// The slots the write binds, which the next part reads on the end
+    /// of the row. A `SET` binds nothing: it changes what a name
+    /// already stands for.
+    fn created(&self) -> &[usize] {
+        match self {
+            Write::Insert(insert) => &insert.created,
+            Write::Set(_) => &[],
+        }
+    }
+}
+
+/// An `INSERT`: what it writes, and what the row on either side of it
 /// holds.
-pub(crate) struct Write {
+pub(crate) struct Insert {
     pub(crate) nodes: Vec<BoundInsertNode>,
     pub(crate) rels: Vec<BoundInsertRel>,
     /// The slots the part before the write projects, in the order its
@@ -44,15 +87,21 @@ pub(crate) struct Write {
     pub(crate) created: Vec<usize>,
 }
 
+/// A `SET`: the assignments it makes, and the row it carries across
+/// itself unchanged.
+pub(crate) struct Set {
+    pub(crate) items: Vec<BoundSetItem>,
+    /// The slots the part before the write projects. The values the
+    /// assignments take follow them in the same row, one per item in
+    /// written order.
+    pub(crate) carry: Vec<usize>,
+}
+
 /// Splits a bound statement into the parts the session runs, or
 /// answers `None` for a statement that writes nothing and runs as one
 /// plan the way every read does.
 pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Part>>> {
-    if !query
-        .clauses
-        .iter()
-        .any(|c| matches!(c, BoundClause::Insert { .. }))
-    {
+    if !query.clauses.iter().any(is_write) {
         return Ok(None);
     }
     let mut parts: Vec<Part> = Vec::new();
@@ -61,10 +110,7 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
     // first one: it runs over the store the way a read does.
     let mut base: Option<Vec<usize>> = None;
     loop {
-        let at = rest
-            .iter()
-            .position(|c| matches!(c, BoundClause::Insert { .. }));
-        let Some(at) = at else {
+        let Some(at) = rest.iter().position(is_write) else {
             let part = compile(query, rest.to_vec(), query.columns.clone(), base, schema)?;
             parts.push(Part {
                 query: part.0,
@@ -73,14 +119,13 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
             });
             return Ok(Some(parts));
         };
-        let BoundClause::Insert { nodes, rels, carry } = &rest[at] else {
-            unreachable!("the position that matched");
-        };
+        let write = write_of(&rest[at]);
         let mut clauses = rest[..at].to_vec();
-        let exprs = carry
+        let exprs = write
+            .carry()
             .iter()
             .map(|slot| BoundExpr::Var(*slot))
-            .chain(crate::insert::value_exprs(nodes, rels));
+            .chain(write.values());
         let items: Vec<BoundItem> = exprs.enumerate().map(|(i, expr)| item(expr, i)).collect();
         let columns = (0..items.len()).map(|i| format!("#{i}")).collect();
         clauses.push(BoundClause::Project {
@@ -92,29 +137,46 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
             filter: None,
         });
         let part = compile(query, clauses, columns, base, schema)?;
-        let created: Vec<usize> = nodes
-            .iter()
-            .map(|node| node.slot)
-            .chain(rels.iter().map(|rel| rel.slot))
-            .collect();
         base = Some(
-            carry
+            write
+                .carry()
                 .iter()
                 .copied()
-                .chain(created.iter().copied())
+                .chain(write.created().iter().copied())
                 .collect(),
         );
         parts.push(Part {
             query: part.0,
             plan: part.1,
-            write: Some(Write {
-                nodes: nodes.clone(),
-                rels: rels.clone(),
-                carry: carry.clone(),
-                created,
-            }),
+            write: Some(write),
         });
         rest = &rest[at + 1..];
+    }
+}
+
+/// Whether a clause is one the statement has to be split at.
+fn is_write(clause: &BoundClause) -> bool {
+    matches!(clause, BoundClause::Insert { .. } | BoundClause::Set { .. })
+}
+
+/// The write a clause [`is_write`] answered for describes.
+fn write_of(clause: &BoundClause) -> Write {
+    match clause {
+        BoundClause::Insert { nodes, rels, carry } => Write::Insert(Insert {
+            nodes: nodes.clone(),
+            rels: rels.clone(),
+            carry: carry.clone(),
+            created: nodes
+                .iter()
+                .map(|node| node.slot)
+                .chain(rels.iter().map(|rel| rel.slot))
+                .collect(),
+        }),
+        BoundClause::Set { items, carry } => Write::Set(Set {
+            items: items.clone(),
+            carry: carry.clone(),
+        }),
+        _ => unreachable!("the position that matched"),
     }
 }
 

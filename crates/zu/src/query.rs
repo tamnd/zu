@@ -643,6 +643,26 @@ impl Graph for Zu1Graph<'_> {
                 .into_iter()
                 .map(|coeff| vec![Value::Float(coeff)])
                 .collect()),
+            "betweenness" => {
+                let Some(Value::List(sources)) = args.first() else {
+                    return Err(ZuError::InvalidArgument(
+                        "betweenness needs a list of source node offsets".into(),
+                    ));
+                };
+                let mut offsets = Vec::with_capacity(sources.len());
+                for source in sources {
+                    let Value::Int(offset) = source else {
+                        return Err(ZuError::InvalidArgument(format!(
+                            "betweenness's sources must be node offsets, got {source:?}"
+                        )));
+                    };
+                    offsets.push(*offset as u64);
+                }
+                Ok(algo::betweenness(db, reader, &offsets)?
+                    .into_iter()
+                    .map(|score| vec![Value::Float(score)])
+                    .collect())
+            }
             "triangle_count" => Ok(algo::triangle_count(db, reader)?
                 .into_iter()
                 .map(|corners| vec![Value::Int(corners as i64)])

@@ -3099,6 +3099,13 @@
       "signature": "Out"
     },
     {
+      "id": "zu::zu1::algo::betweenness",
+      "kind": "function",
+      "name": "betweenness",
+      "signature": "fn betweenness(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, sources: &[u64]) -> zu_common::Result<Vec<f64>>",
+      "doc": "Betweenness centrality accumulated from `sources` by Brandes, the\nGAP BC kernel. A node's score is how much of the shortest path\ntraffic out of those sources runs through it: for every node the\nsource reaches, each node in the middle of a shortest path to it\ntakes the fraction of those paths that pass through. The scores are\nthe unnormalized pair dependency sums, which is what the sampled GAP\nrun reports, and a source that names no row contributes nothing\nrather than failing the run.\n\nStored direction, because the reference this is measured against\nrelaxes out edges only. A pair joined twice is two shortest paths\nwhere a single edge is one, which is also what the reference counts:\npath counts are over edges and not over adjacencies, so a parallel\nedge really does double the traffic through the node it arrives at.\n\nNo predecessor lists. What the accumulation wants for a node is the\nnodes one level above it with an edge into it, and that is the\nnode's in edges filtered by level, which the backward CSR already\nholds. Building the lists during the forward pass instead would cost\nan allocation a node and a second copy of the graph in memory, for\nsomething the file can answer.\n\nBoth passes go level by level, and a level is walked in row order so\nthe nodes of one group are one run: a level decodes each group once\nrather than once per node in it. The accumulation is free to do that\nbecause the order inside a level does not matter to it, only that\nthe levels are taken from the far end back."
+    },
+    {
       "id": "zu::zu1::algo::bfs",
       "kind": "function",
       "name": "bfs",

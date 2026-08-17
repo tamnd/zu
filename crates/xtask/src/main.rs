@@ -18,7 +18,8 @@
 //! reads two committed files and needs nothing.
 
 use xtask::{
-    apimap, artifacts, corpus, model, package, packaging, pins, platforms, repos, rustdoc, terms,
+    apimap, artifacts, corpus, model, package, packaging, pins, platforms, repos, rustdoc, tarball,
+    terms,
 };
 
 use std::path::{Path, PathBuf};
@@ -69,7 +70,7 @@ cargo xtask package [--stage DIR --built DIR --target TARGET] [--syslibs LIBS] [
 
   With no --stage, checks that the header and the C ABI crate declare and define the same functions.
 
-cargo xtask artifacts [--table PATH] [--list] [--assemble DIR] [--verify DIR] [--built DIR] [--version V]
+cargo xtask artifacts [--table PATH] [--list] [--assemble DIR] [--verify DIR] [--built DIR] [--version V] [--target TARGET]
 
   --table PATH      the artifact contract (default artifacts.toml)
   --list            print `made<TAB>name<TAB>consumers` for every row, and check nothing
@@ -77,6 +78,8 @@ cargo xtask artifacts [--table PATH] [--list] [--assemble DIR] [--verify DIR] [-
   --verify DIR      read a release directory back against the contract
   --built DIR       where the platform jobs' artifacts were downloaded (default built)
   --version V       the version being released (default this workspace's)
+  --target TARGET   only this platform's rows, repeatable (default every tier 1 platform)
+  --fast            pack the platform archives for speed, for a release that is installed once and deleted
 
 cargo xtask packaging [--check] [--root DIR] [--version V] [--sums PATH]
 
@@ -507,6 +510,14 @@ fn artifacts_command(args: &[String]) -> Result<ExitCode, String> {
     // build rather than from a habit, so an artifact cannot be named
     // for a version it does not hold.
     let mut version = env!("CARGO_PKG_VERSION").to_string();
+    // Empty means every tier 1 platform, which is what a release is. A
+    // named one is a single platform's row of it, which is what the
+    // build that produced that platform can assemble on its own and
+    // install from, and the only other thing anybody wants here.
+    let mut only: Vec<String> = Vec::new();
+    // What a release is packed at, since a release is what this
+    // assembles unless somebody says otherwise.
+    let mut level = tarball::LEVEL;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -535,6 +546,11 @@ fn artifacts_command(args: &[String]) -> Result<ExitCode, String> {
                 version = args.get(i + 1).ok_or("--version wants a version")?.clone();
                 i += 1;
             }
+            "--target" => {
+                only.push(args.get(i + 1).ok_or("--target wants a target")?.clone());
+                i += 1;
+            }
+            "--fast" => level = tarball::FAST,
             other => return Err(format!("no option {other:?}\n\n{USAGE}")),
         }
         i += 1;
@@ -556,10 +572,10 @@ fn artifacts_command(args: &[String]) -> Result<ExitCode, String> {
     // The table sits at the root of the tree it describes, the same as
     // the two tables beside it.
     let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let targets = artifacts::tier1(&root)?;
+    let targets = artifacts::only(&artifacts::tier1(&root)?, &only)?;
 
     if let Some(out) = &assemble {
-        let made = table.assemble(&root, &built, out, &version, &targets)?;
+        let made = table.assemble(&root, &built, out, &version, &targets, level)?;
         for one in &made {
             println!("{one}");
         }

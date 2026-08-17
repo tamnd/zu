@@ -6496,12 +6496,28 @@
       "doc": "The newest overlay value of one cell at `epoch`: an update chain\nentry first, then an appended row's stored column. `base_count`\nis the row count of the sealed file, where appended offsets\nstart. Returns `None` when the base file holds the answer."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::dead_edges",
+      "kind": "method",
+      "name": "dead_edges",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn dead_edges(&self, rel: u32, epoch: Epoch) -> Vec<(u64, u64)>",
+      "doc": "The pairs `rel` has lost by `epoch`, ascending, which is what a\nfold drops out of the CSR it rebuilds."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc::edge_cells",
       "kind": "method",
       "name": "edge_cells",
       "of": "zu::zu1::txn::Mvcc",
       "signature": "fn edge_cells(&self, rel: u32, epoch: Epoch) -> impl Iterator",
       "doc": "The same edges with what they carry, which is what a fold of a\nrel table that stores edge properties has to write."
+    },
+    {
+      "id": "zu::zu1::txn::Mvcc::edge_gone",
+      "kind": "method",
+      "name": "edge_gone",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn edge_gone(&self, rel: u32, src: u64, dst: u64, epoch: Epoch) -> bool",
+      "doc": "Whether the edges between two rows are gone for a reader at\n`epoch`. The base holds edges the overlay never saw, so this is\nasked about a pair rather than about an overlay entry, and the\nfacade asks it of every base edge it reads."
     },
     {
       "id": "zu::zu1::txn::Mvcc::edges",
@@ -6628,6 +6644,14 @@
       "of": "zu::zu1::txn::WriteTxn",
       "signature": "fn delete(&mut self, table: u32, offset: u64)",
       "doc": "Stages one row deletion."
+    },
+    {
+      "id": "zu::zu1::txn::WriteTxn::delete_rel",
+      "kind": "method",
+      "name": "delete_rel",
+      "of": "zu::zu1::txn::WriteTxn",
+      "signature": "fn delete_rel(&mut self, rel: u32, src: u64, dst: u64)",
+      "doc": "Stages the removal of the edges between two rows. An edge is\nnamed by the rows it runs between, so a table holding a pair\ntwice loses both, which is what a `DETACH DELETE` of either end\nwants anyway."
     },
     {
       "id": "zu::zu1::txn::WriteTxn::insert_nodes",
@@ -6970,6 +6994,14 @@
       "name": "NodeInsert",
       "of": "zu::zu1::wal::WalRecord",
       "signature": "NodeInsert { table: u32, cols: Vec<WalColumn> }"
+    },
+    {
+      "id": "zu::zu1::wal::WalRecord::RelDelete",
+      "kind": "variant",
+      "name": "RelDelete",
+      "of": "zu::zu1::wal::WalRecord",
+      "signature": "RelDelete { rel: u32, src: Vec<u64>, dst: Vec<u64> }",
+      "doc": "The edges one txn took away, named by the rows they run between\nbecause that is the only name an edge has: the file holds them\nin a CSR that a fold rebuilds, so there is no offset to log."
     },
     {
       "id": "zu::zu1::wal::WalRecord::RelInsert",

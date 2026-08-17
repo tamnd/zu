@@ -796,21 +796,20 @@ impl Parser<'_> {
                     items.push(self.parse_remove_item()?);
                 }
                 clauses.push(Clause::Remove { items });
-            } else if self.at_kw("DELETE") || self.at_kw("DETACH") {
+            } else if self.at_kw("DELETE") || self.at_kw("DETACH") || self.at_kw("NODETACH") {
+                // NODETACH is the explicit spelling of the default, so
+                // it is read and then forgotten: what it says is that
+                // the edges do not go, which is what no word says too.
                 let detach = self.eat_kw("DETACH");
-                self.expect_kw("DELETE")?;
-                if detach {
-                    return Err(ZuError::gql_at(
-                        codes::C42001,
-                        position(self.source, self.peek().expect("peeked").start),
-                        "DETACH DELETE is not implemented yet, it takes the edges on an element with it and an edge cannot be deleted yet",
-                    ));
+                if !detach {
+                    self.eat_kw("NODETACH");
                 }
+                self.expect_kw("DELETE")?;
                 let mut targets = vec![self.parse_delete_target()?];
                 while self.eat(&TokenKind::Comma) {
                     targets.push(self.parse_delete_target()?);
                 }
-                clauses.push(Clause::Delete { targets });
+                clauses.push(Clause::Delete { targets, detach });
             } else if self.eat_kw("CALL") {
                 let name = self.expect_name("a table function name after CALL")?;
                 self.expect(&TokenKind::LParen)?;
@@ -2360,7 +2359,6 @@ mod tests {
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
         for (source, kw) in [
-            ("MATCH (p) DETACH DELETE p", "DETACH DELETE"),
             ("START TRANSACTION READ WRITE", "START"),
             ("COMMIT", "COMMIT"),
             ("ROLLBACK", "ROLLBACK"),
@@ -3019,13 +3017,38 @@ mod tests {
     #[test]
     fn a_delete_carries_the_variables_it_was_written_with() {
         let q = parsed("MATCH (p:person), (q:person) DELETE p, q");
-        let Clause::Delete { targets } = &q.clauses[1] else {
+        let Clause::Delete { targets, detach } = &q.clauses[1] else {
             panic!("DELETE");
         };
         assert_eq!(targets, &["p".to_string(), "q".to_string()]);
+        assert!(!detach, "no DETACH was written");
         // A DELETE is a write, so the statement ends without a RETURN
         // the way a SET does.
         assert_eq!(q.clauses.len(), 2);
+    }
+
+    /// `DETACH` is the word that says the edges go too, and it reaches
+    /// the clause rather than being another way of writing DELETE.
+    #[test]
+    fn a_detach_delete_says_so_on_the_clause() {
+        let q = parsed("MATCH (p:person) DETACH DELETE p");
+        let Clause::Delete { targets, detach } = &q.clauses[1] else {
+            panic!("DELETE");
+        };
+        assert_eq!(targets, &["p".to_string()]);
+        assert!(detach, "DETACH was written");
+    }
+
+    /// NODETACH says out loud what a plain DELETE says by saying
+    /// nothing, so the clause it parses to is the same one.
+    #[test]
+    fn nodetach_delete_is_a_plain_delete() {
+        let q = parsed("MATCH (p:person) NODETACH DELETE p");
+        let Clause::Delete { targets, detach } = &q.clauses[1] else {
+            panic!("DELETE");
+        };
+        assert_eq!(targets, &["p".to_string()]);
+        assert!(!detach, "NODETACH is the default spelled out");
     }
 
     /// DELETE takes a variable and not an expression, so a property

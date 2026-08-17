@@ -469,6 +469,31 @@ int main(int argc, char **argv) {
     zu_conn_close(first);
     return fail("a syntax error that will not say where");
   }
+  /* The same place as an index into the text, and the line that place
+   * is on, which is what makes the column usable by a caller that no
+   * longer holds the statement. */
+  uint32_t offset = 99;
+  if (zu_error_offset(err, &offset) != ZU_OK || offset != 0) {
+    zu_error_free(err);
+    zu_conn_close(first);
+    return fail("a syntax error that will not say where in bytes");
+  }
+  size_t excerpt_len = 0;
+  const char *excerpt = zu_error_excerpt(err, &excerpt_len);
+  if (excerpt == NULL || strcmp(excerpt, "NOT A QUERY") != 0 ||
+      excerpt_len != strlen(excerpt)) {
+    zu_error_free(err);
+    zu_conn_close(first);
+    return fail("a syntax error that will not quote its line");
+  }
+  /* The standard's words, the page they are written up on, and the one
+   * question a retry loop asks. */
+  if (zu_error_standard_text(err, NULL) == NULL ||
+      zu_error_doc_url(err, NULL) == NULL || zu_error_retryable(err) != 0) {
+    zu_error_free(err);
+    zu_conn_close(first);
+    return fail("a syntax error with no standard name, page, or verdict");
+  }
   zu_error_free(err);
 
   /* A condition raised while the statement runs happened at no token,
@@ -488,6 +513,13 @@ int main(int argc, char **argv) {
     zu_error_free(err);
     zu_conn_close(first);
     return fail("an error with no place wrote one anyway");
+  }
+  offset = 11;
+  if (zu_error_offset(err, &offset) != ZU_DONE || offset != 11 ||
+      zu_error_excerpt(err, NULL) != NULL) {
+    zu_error_free(err);
+    zu_conn_close(first);
+    return fail("an error with no place quoted a line anyway");
   }
   zu_error_free(err);
 

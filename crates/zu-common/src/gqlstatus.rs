@@ -95,6 +95,16 @@ impl GqlStatus {
         self.condition().severity
     }
 
+    /// The two characters that open the code, which is the condition
+    /// class: `22` for the data exceptions, `42` for the syntax
+    /// errors, `40` for the rollbacks. A binding raises one exception
+    /// type per class, so this is the field it switches on, and taking
+    /// the first two characters of a five-character code is the sort of
+    /// thing every binding would otherwise write for itself.
+    pub fn class(self) -> &'static str {
+        &self.condition().code[..2]
+    }
+
     /// The standard's own words for this condition: the class name, and
     /// the subclass name after it when there is one. This is the text a
     /// conformance harness compares against, so zu never paraphrases it.
@@ -106,7 +116,34 @@ impl GqlStatus {
             None => c.class.to_string(),
         }
     }
+
+    /// The page that documents this condition. Derived from the code
+    /// rather than stored, because a table of eighty urls is eighty
+    /// chances for one of them to be the url of a different condition.
+    pub fn doc_url(self) -> String {
+        format!("{DOC_BASE}{}", self.code())
+    }
+
+    /// Whether running the same statement again could succeed.
+    ///
+    /// True for `40000 transaction rollback`, which is the engine
+    /// saying it undid the work and nothing of it is in the file. False
+    /// for `40003 statement completion unknown`, which is the same
+    /// class and the opposite advice: a statement that may or may not
+    /// have committed is one a retry could apply twice, and a caller
+    /// that wants to retry it has to establish which happened first.
+    /// False for everything else, since a statement that failed to
+    /// parse parses no better the second time.
+    pub fn retryable(self) -> bool {
+        self.code() == "40000"
+    }
 }
+
+/// Where a condition is written up. The code goes on the end, so an
+/// error hands the reader a url rather than a code to go and search
+/// for, which is the difference between a message a user can act on
+/// and a message a user has to research.
+pub const DOC_BASE: &str = "https://zu.dev/docs/errors/";
 
 impl fmt::Debug for GqlStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -120,25 +157,36 @@ impl fmt::Display for GqlStatus {
     }
 }
 
-/// Where in the statement text a condition was raised. Both are 1-based
-/// and columns count characters rather than bytes, so a line of
-/// multi-byte text does not read as wider than it looks.
+/// Where in the statement text a condition was raised, said three ways.
 ///
-/// This is a pair rather than a byte offset because a byte offset is
-/// only useful to something holding the source, and the caller that
-/// most wants a position is an editor or a shell that has already
-/// printed the line and wants to point under it.
+/// `line` and `column` are 1-based and the column counts characters
+/// rather than bytes, so a line of multi-byte text does not read as
+/// wider than it looks. That pair is what an editor or a shell wants:
+/// it has printed the line already and needs somewhere to put the
+/// caret.
+///
+/// `offset` is the same place as a byte index into the statement, and
+/// it is here for the caller the pair does not serve: a tool that holds
+/// the text and wants to slice it, an editor mapping into a buffer it
+/// indexes by byte, a highlighter marking a range. Recovering it from
+/// the pair means counting lines and characters again, over text the
+/// engine had in hand when it raised the condition. It is always on a
+/// character boundary of that text, so slicing at it cannot panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
+    /// Bytes into the statement, 0-based.
+    pub offset: u32,
     pub line: u32,
     pub column: u32,
 }
 
 impl Position {
-    /// The pair `offset` bytes into `source`. An offset past the end
+    /// The place `offset` bytes into `source`. An offset past the end
     /// lands at the end, which is where an error about a query that
-    /// stopped too early belongs.
+    /// stopped too early belongs, and an offset inside a character
+    /// lands on the start of that character.
     pub fn of(source: &str, offset: usize) -> Self {
+        let offset = boundary(source, offset);
         let mut line = 1u32;
         let mut column = 1u32;
         for (ix, ch) in source.char_indices() {
@@ -152,8 +200,41 @@ impl Position {
                 column += 1;
             }
         }
-        Position { line, column }
+        Position {
+            offset: u32::try_from(offset).unwrap_or(u32::MAX),
+            line,
+            column,
+        }
     }
+}
+
+/// The nearest character boundary of `source` at or before `offset`,
+/// with an offset past the end landing on the end.
+fn boundary(source: &str, offset: usize) -> usize {
+    let mut offset = offset.min(source.len());
+    while !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+/// The longest line quoted back as an excerpt. A line longer than this
+/// was written by a program rather than by a person, and nobody is
+/// going to read four kilobytes of it under a caret. It is left out
+/// rather than cut short, because a cut line puts the column somewhere
+/// other than where the column says it is.
+const EXCERPT_LIMIT: usize = 4096;
+
+/// The line `offset` falls on, without its newline, or `None` when
+/// that line is empty or too long to quote.
+fn line_at(source: &str, offset: usize) -> Option<&str> {
+    let offset = boundary(source, offset);
+    let start = source[..offset].rfind('\n').map_or(0, |ix| ix + 1);
+    let end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |ix| offset + ix);
+    let line = source[start..end].trim_end_matches('\r');
+    (!line.is_empty() && line.len() <= EXCERPT_LIMIT).then_some(line)
 }
 
 impl fmt::Display for Position {
@@ -174,6 +255,12 @@ impl fmt::Display for Position {
 /// saying it because a message a user reads should be complete on its
 /// own, and the pair exists because a caller that wants to underline the
 /// offending token should not have to parse English back into numbers.
+///
+/// `excerpt` is the line that position falls on, kept because the
+/// caller furthest from the statement is the one most likely to be
+/// showing this to a person: a driver, a notebook cell, a log line. The
+/// engine has the text in hand when it raises the condition and the
+/// caller may not have it at all by the time it prints one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticRecord {
     pub status: GqlStatus,
@@ -182,6 +269,12 @@ pub struct DiagnosticRecord {
     /// A division by zero happens at runtime and has no token to point
     /// at, so this is `None` rather than a guess at one.
     pub position: Option<Position>,
+    /// The whole line `position` is on, without its newline, so that
+    /// `column` indexes into it. `None` when there is no position, when
+    /// the line is empty, and when it is longer than a person is going
+    /// to read, which are the three cases where quoting it back helps
+    /// nobody.
+    pub excerpt: Option<String>,
 }
 
 impl DiagnosticRecord {
@@ -190,6 +283,7 @@ impl DiagnosticRecord {
             status,
             detail: detail.into(),
             position: None,
+            excerpt: None,
         }
     }
 
@@ -201,11 +295,41 @@ impl DiagnosticRecord {
             status,
             detail: format!("{position}: {detail}"),
             position: Some(position),
+            excerpt: None,
+        }
+    }
+
+    /// The same again, raised at a byte offset into the statement text.
+    ///
+    /// This is the form to reach for wherever the text is in hand,
+    /// which is every place inside the front end, because it is the
+    /// only form that can fill the excerpt: the line comes from the
+    /// source and nothing downstream of here still has it.
+    pub fn in_source(
+        status: GqlStatus,
+        source: &str,
+        offset: usize,
+        detail: impl fmt::Display,
+    ) -> Self {
+        let position = Position::of(source, offset);
+        DiagnosticRecord {
+            excerpt: line_at(source, offset).map(str::to_string),
+            ..DiagnosticRecord::at(status, position, detail)
         }
     }
 
     pub fn severity(&self) -> Severity {
         self.status.severity()
+    }
+
+    /// The page that documents the condition this record carries.
+    pub fn doc_url(&self) -> String {
+        self.status.doc_url()
+    }
+
+    /// Whether running the statement again could succeed.
+    pub fn retryable(&self) -> bool {
+        self.status.retryable()
     }
 }
 
@@ -318,7 +442,11 @@ mod tests {
         // The pair is added to the record, not swapped for the words:
         // a message that stopped saying where would be a message a
         // user has to go and look something up to act on.
-        let at = Position { line: 1, column: 7 };
+        let at = Position {
+            offset: 6,
+            line: 1,
+            column: 7,
+        };
         let raised = DiagnosticRecord::at(codes::C42001, at, "expected MATCH");
         assert_eq!(
             raised.to_string(),
@@ -334,22 +462,22 @@ mod tests {
     #[test]
     fn an_offset_lands_on_the_line_and_column_a_reader_would_count() {
         let source = "MATCH (n)\nWHERE n.x\nRETURN n";
-        assert_eq!(Position::of(source, 0), Position { line: 1, column: 1 });
-        assert_eq!(Position::of(source, 6), Position { line: 1, column: 7 });
+        let at = |offset, line, column| Position {
+            offset,
+            line,
+            column,
+        };
+        assert_eq!(Position::of(source, 0), at(0, 1, 1));
+        assert_eq!(Position::of(source, 6), at(6, 1, 7));
         // The newline itself belongs to the line it ends, and the byte
         // after it starts the next one at column 1.
-        assert_eq!(
-            Position::of(source, 9),
-            Position {
-                line: 1,
-                column: 10
-            }
-        );
-        assert_eq!(Position::of(source, 10), Position { line: 2, column: 1 });
-        assert_eq!(Position::of(source, 20), Position { line: 3, column: 1 });
+        assert_eq!(Position::of(source, 9), at(9, 1, 10));
+        assert_eq!(Position::of(source, 10), at(10, 2, 1));
+        assert_eq!(Position::of(source, 20), at(20, 3, 1));
         // Past the end is the end, which is where an error about a
-        // query that stopped too early belongs.
-        assert_eq!(Position::of(source, 9999), Position { line: 3, column: 9 });
+        // query that stopped too early belongs, and the offset says the
+        // end too rather than the number nobody could index with.
+        assert_eq!(Position::of(source, 9999), at(28, 3, 9));
     }
 
     #[test]
@@ -362,9 +490,78 @@ mod tests {
         assert_eq!(
             Position::of(source, offset),
             Position {
+                offset: 15,
                 line: 1,
                 column: 15
             }
         );
+        // The offset is a byte index into that same text, so slicing at
+        // it is the point of having it, and an offset landing inside a
+        // character walks back to the start of it rather than cutting
+        // one in half.
+        let at = Position::of(source, offset);
+        assert_eq!(&source[at.offset as usize..], "wörld'");
+        let inside = source.find('é').expect("e") + 1;
+        assert_eq!(Position::of(source, inside).offset as usize, inside - 1);
+    }
+
+    #[test]
+    fn an_excerpt_is_the_line_the_column_counts_into() {
+        let source = "MATCH (n)\nWHERE n.x = 1\nRETURN n";
+        let offset = source.find("n.x").expect("n.x");
+        let record = DiagnosticRecord::in_source(codes::C42001, source, offset, "no such property");
+        let excerpt = record.excerpt.as_deref().expect("a line to quote");
+        assert_eq!(excerpt, "WHERE n.x = 1");
+        // Which is what makes the column usable: it counts characters
+        // into the excerpt, so a caret goes under the token.
+        let position = record.position.expect("a place");
+        assert_eq!(position.line, 2);
+        let caret: String = excerpt
+            .chars()
+            .take(position.column as usize - 1)
+            .map(|_| ' ')
+            .chain(['^'])
+            .collect();
+        assert_eq!(caret, "      ^");
+        assert_eq!(&source[position.offset as usize..][..3], "n.x");
+        // The words are unchanged by any of it, so a caller that only
+        // prints the message still reads the same sentence.
+        assert_eq!(
+            record.to_string(),
+            "42001: line 2, column 7: no such property"
+        );
+    }
+
+    #[test]
+    fn a_line_nobody_would_read_is_left_out_rather_than_cut() {
+        // An empty line quotes as nothing, so it says nothing.
+        let record = DiagnosticRecord::in_source(codes::C42001, "\n\nRETURN 1", 1, "empty");
+        assert!(record.excerpt.is_none());
+        // And a generated line past the limit is dropped whole, since
+        // a cut one would put the column somewhere it is not.
+        let long = format!("RETURN {}", "1 + ".repeat(2000));
+        let record = DiagnosticRecord::in_source(codes::C42001, &long, 7, "long");
+        assert!(long.len() > 4096, "the fixture has to pass the limit");
+        assert!(record.excerpt.is_none());
+        // A record made without the text has no excerpt either, rather
+        // than an empty one that reads as a blank line.
+        assert!(DiagnosticRecord::new(codes::C22012, "").excerpt.is_none());
+    }
+
+    #[test]
+    fn a_condition_says_where_it_is_written_up_and_whether_to_try_again() {
+        assert_eq!(codes::C42001.class(), "42");
+        assert_eq!(
+            codes::C42001.doc_url(),
+            "https://zu.dev/docs/errors/42001",
+            "the code is the page, so a message hands over a link rather than a thing to search for"
+        );
+        // A rollback undid the work, so the same statement can run
+        // again. Statement completion unknown is the same class and the
+        // opposite advice, because a retry could apply it twice.
+        assert!(codes::C40000.retryable());
+        assert!(!codes::C40003.retryable());
+        assert!(!codes::C42001.retryable());
+        assert!(!codes::C22012.retryable());
     }
 }

@@ -49,12 +49,12 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.5 and another
+ * system tests when it has to compile one way against 0.6 and another
  * against what comes next. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.5"
+#define ZU_ABI_VERSION "0.6"
 
 #ifdef __cplusplus
 extern "C" {
@@ -156,30 +156,69 @@ typedef enum zu_status {
 const char *zu_version(void);
 
 /* Errors. An error carries the status its call returned, the GQLSTATUS
- * code, the severity, the position, and the message, as fields rather
- * than as one string to parse: the code picks which exception class a
- * binding raises and the severity decides whether it raises at all.
+ * code, the standard's name for it, the severity, whether it is worth
+ * retrying, where in the statement it happened, the line that place is
+ * on, and the message, as fields rather than as one string to parse:
+ * the code picks which exception class a binding raises, the severity
+ * decides whether it raises at all, and neither survives being
+ * formatted into prose and parsed back out.
+ *
  * The strings live until zu_error_free, and each len out-parameter may
- * be NULL. zu_error_code is NULL for a failure that carries no
- * condition, which a binding mapping codes to classes has to tell from
- * a code it does not know.
+ * be NULL. A string a failure does not carry is NULL rather than
+ * empty, since no condition and an empty condition are different
+ * facts: zu_error_code, zu_error_standard_text and zu_error_doc_url
+ * are all NULL for an engine-internal failure, which has no code
+ * rather than one that would be a guess.
+ *
+ * zu_error_message is zu's own account, naming the table, the token or
+ * the value. zu_error_standard_text is the standard's words for the
+ * condition class and subclass, which is what a conformance harness
+ * grades. zu_error_doc_url is where that condition is written up, so a
+ * binding hands a reader a page rather than five characters to search
+ * for.
+ *
+ * zu_error_retryable answers 1 when running the same statement again
+ * could succeed, 0 when it could not, -1 for a NULL error. A write
+ * that lost to a concurrent one is the 1: nothing of it was applied.
+ * Text that will not parse is the 0, and so is a statement the caller
+ * interrupted, which did not fail so much as stop. A retry loop reads
+ * this rather than carrying a list of codes, which is the sort of list
+ * that is right in one binding and stale in the other five.
  *
  * zu_error_position writes the line and column the condition was
  * raised at, both 1-based, the column counted in characters so a line
- * of multi-byte text does not read as wider than it looks. It answers
- * ZU_OK and writes them when there is a position, ZU_DONE and writes
- * nothing when there is not, and ZU_MISUSE for a NULL error. Not every
- * failure has one: a division by zero happens while the statement runs
- * and has no token to point at, and an io error has no statement at
- * all. Either out-parameter may be NULL. The message says the same
- * thing in words and keeps saying it, so printing it alone is still a
- * complete report; this is for a caller that would rather underline
- * the token than read the numbers back out of the sentence. */
+ * of multi-byte text does not read as wider than it looks, and
+ * zu_error_offset writes the same place as a 0-based byte index into
+ * the statement, for a caller that slices the text rather than
+ * printing it. Both answer ZU_OK and write when there is a position,
+ * ZU_DONE and write nothing when there is not, and ZU_MISUSE for a
+ * NULL error. Not every failure has one: a division by zero happens
+ * while the statement runs and has no token to point at, and an io
+ * error has no statement at all. Every out-parameter may be NULL. The
+ * offset is always on a character boundary, so slicing at it cannot
+ * split a character in half.
+ *
+ * zu_error_excerpt is the line that position is on, without its
+ * newline, which the column counts characters into: a caller has both
+ * halves of a caret without having kept the statement text. It is NULL
+ * when there is no position, when the line is empty, and when the line
+ * is longer than anyone would read under a caret, since a line cut to
+ * fit would put the column somewhere it is not.
+ *
+ * The message says all of this in words and keeps saying it, so
+ * printing it alone is still a complete report. The fields are for the
+ * caller that would rather underline the token than read the numbers
+ * back out of the sentence. */
 zu_status zu_error_status(const zu_error *e);
 const char *zu_error_message(const zu_error *e, size_t *len);
 const char *zu_error_code(const zu_error *e, size_t *len);
-int32_t zu_error_severity(const zu_error *e); /* -1 for a NULL error */
+const char *zu_error_standard_text(const zu_error *e, size_t *len);
+const char *zu_error_doc_url(const zu_error *e, size_t *len);
+int32_t zu_error_severity(const zu_error *e);  /* -1 for a NULL error */
+int32_t zu_error_retryable(const zu_error *e); /* -1 for a NULL error */
 zu_status zu_error_position(const zu_error *e, uint32_t *line, uint32_t *column);
+zu_status zu_error_offset(const zu_error *e, uint32_t *offset);
+const char *zu_error_excerpt(const zu_error *e, size_t *len);
 void zu_error_free(zu_error *e);
 
 /* How a database is opened. The only struct that crosses this boundary

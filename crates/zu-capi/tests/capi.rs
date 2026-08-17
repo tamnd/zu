@@ -14,8 +14,9 @@ use zu::{
     ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
     ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
     zu_config_set_z, zu_conn_close, zu_connect, zu_create, zu_create_z, zu_database_close,
-    zu_database_create_z, zu_database_open_z, zu_database_path, zu_error_code, zu_error_free,
-    zu_error_message, zu_error_position, zu_error_severity, zu_error_status, zu_execute,
+    zu_database_create_z, zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url,
+    zu_error_excerpt, zu_error_free, zu_error_message, zu_error_offset, zu_error_position,
+    zu_error_retryable, zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute,
     zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
     zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
     zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
@@ -422,9 +423,12 @@ fn an_empty_result_is_done_rather_than_an_error() {
     }
 }
 
-/// The fields a binding needs off an error, as fields.
+/// The whole error model dx/03 §5 fixes, as fields: the code, the
+/// standard's words, the severity, the place counted both ways, the
+/// line that place is on, the page it is written up on, whether to try
+/// again, and our own account of it.
 #[test]
-fn a_refused_statement_carries_a_code_a_severity_a_place_and_a_message() {
+fn a_refused_statement_carries_the_whole_error_model_as_fields() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("errors.zu1");
     seeded(&path);
@@ -484,6 +488,43 @@ fn a_refused_statement_carries_a_code_a_severity_a_place_and_a_message() {
             ZuStatus::Ok
         );
         assert_eq!(only, 1);
+
+        // The same place as an index into the text, for a caller that
+        // slices rather than prints, and the line it is on, which is
+        // what the column counts characters into.
+        let mut offset = u32::MAX;
+        assert_eq!(zu_error_offset(err, &mut offset), ZuStatus::Ok);
+        assert_eq!(offset, 0);
+        let mut excerpt_len = 0usize;
+        let excerpt = zu_error_excerpt(err, &mut excerpt_len);
+        assert!(!excerpt.is_null(), "a syntax error quotes its line back");
+        let excerpt = CStr::from_ptr(excerpt).to_str().expect("utf-8");
+        assert_eq!(excerpt, bad);
+        assert_eq!(excerpt_len, excerpt.len());
+
+        // The standard's words for the condition, which is what a
+        // conformance harness grades, beside our own account of it.
+        let mut standard_len = 0usize;
+        let standard = CStr::from_ptr(zu_error_standard_text(err, &mut standard_len))
+            .to_str()
+            .expect("utf-8");
+        assert_eq!(
+            standard,
+            "syntax error or access rule violation, invalid syntax"
+        );
+        assert_eq!(standard_len, standard.len());
+        assert!(
+            message.contains("expected"),
+            "our detail says more than the standard's name: {message}"
+        );
+
+        // Where it is written up, and whether trying again could help,
+        // which for text that will not parse it cannot.
+        let doc = CStr::from_ptr(zu_error_doc_url(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert_eq!(doc, "https://zu.dev/docs/errors/42001");
+        assert_eq!(zu_error_retryable(err), 0);
         zu_error_free(err);
         err = ptr::null_mut();
 
@@ -511,6 +552,16 @@ fn a_refused_statement_carries_a_code_a_severity_a_place_and_a_message() {
             ZuStatus::Done
         );
         assert_eq!((line, column), (7, 9), "an absent place wrote something");
+        let mut offset = 11u32;
+        assert_eq!(zu_error_offset(err, &mut offset), ZuStatus::Done);
+        assert_eq!(offset, 11, "an absent offset wrote something");
+        // And with no place there is no line to quote, rather than an
+        // empty one that reads as a blank.
+        assert!(zu_error_excerpt(err, ptr::null_mut()).is_null());
+        // The condition is still documented and still not worth a
+        // second attempt: dividing by zero divides by zero again.
+        assert!(!zu_error_doc_url(err, ptr::null_mut()).is_null());
+        assert_eq!(zu_error_retryable(err), 0);
         zu_error_free(err);
         err = ptr::null_mut();
 
@@ -670,10 +721,23 @@ fn null_inputs_are_misuse_and_not_crashes() {
         assert_eq!(zu_error_status(ptr::null()), ZuStatus::Misuse);
         assert!(zu_error_message(ptr::null(), ptr::null_mut()).is_null());
         assert!(zu_error_code(ptr::null(), ptr::null_mut()).is_null());
+        assert!(zu_error_standard_text(ptr::null(), ptr::null_mut()).is_null());
+        assert!(zu_error_doc_url(ptr::null(), ptr::null_mut()).is_null());
+        assert!(zu_error_excerpt(ptr::null(), ptr::null_mut()).is_null());
+        assert_eq!(zu_error_retryable(ptr::null()), -1);
         assert_eq!(
             zu_error_position(ptr::null(), ptr::null_mut(), ptr::null_mut()),
             ZuStatus::Misuse
         );
+        assert_eq!(
+            zu_error_offset(ptr::null(), ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+        // A length asked of a NULL handle is a zero rather than the
+        // number that was in the caller's variable before the call.
+        let mut len = 7usize;
+        assert!(zu_error_excerpt(ptr::null(), &mut len).is_null());
+        assert_eq!(len, 0);
         let mut ints: *const i64 = ptr::null();
         assert_eq!(
             zu_result_col_i64(ptr::null_mut(), 0, &mut ints),

@@ -1409,6 +1409,17 @@ set_stmt_kb = 4096.0
 delete_stmt_us = 250000.0
 delete_stmt_kb = 4096.0
 
+# A DETACH DELETE of an element that still has edges on it, measured 29
+# to 56 ms and 2324 kB at 10000 rows and 10000 edges. It costs about what a
+# DELETE does in time and about twice in bytes, and the difference is
+# the CSR: an edge has no offset a reader could filter it out by, so it
+# cannot be tombstoned the way a row is and the fold drops it out of the
+# CSR it rebuilds instead. That rebuild is the whole table's edges, so
+# this number grows with the edge count and not with the edges the
+# statement took away. Lower these ceilings, never raise them.
+detach_stmt_us = 250000.0
+detach_stmt_kb = 8192.0
+
 # What a statement that changed nothing added to the store, per
 # statement. A SET that writes back the value it read leaves a table of
 # the same shape, so the fold's new blocks must come out of the free

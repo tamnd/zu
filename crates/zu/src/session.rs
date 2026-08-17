@@ -338,8 +338,8 @@ impl Session {
                         removals.row(self.graph.file_mut(), carried)?;
                         next.push(Value::List(carried.to_vec()));
                     }
-                    let rows = removals.staged();
-                    self.write(|txn| crate::delete::stage(txn, &rows))?;
+                    let (rows, edges) = removals.staged();
+                    self.write(|txn| crate::delete::stage(txn, &rows, &edges))?;
                     next
                 }
                 crate::split::Write::Set(set) => {

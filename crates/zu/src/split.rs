@@ -110,6 +110,8 @@ pub(crate) struct Delete {
     /// The slots the part before the write projects. A delete carries
     /// nothing behind them.
     pub(crate) carry: Vec<usize>,
+    /// Whether the edges on the elements go with them.
+    pub(crate) detach: bool,
 }
 
 /// Splits a bound statement into the parts the session runs, or
@@ -194,9 +196,14 @@ fn write_of(clause: &BoundClause) -> Write {
             items: items.clone(),
             carry: carry.clone(),
         }),
-        BoundClause::Delete { slots, carry } => Write::Delete(Delete {
+        BoundClause::Delete {
+            slots,
+            carry,
+            detach,
+        } => Write::Delete(Delete {
             slots: slots.clone(),
             carry: carry.clone(),
+            detach: *detach,
         }),
         _ => unreachable!("the position that matched"),
     }

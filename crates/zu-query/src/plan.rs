@@ -194,6 +194,9 @@ pub enum LogicalPlan {
     Delete {
         input: Box<LogicalPlan>,
         slots: Vec<usize>,
+        /// Whether the edges on the elements go with them, which is the
+        /// `DETACH` the statement was written with.
+        detach: bool,
     },
     /// A table function source: the engine kernel runs once over `rel`
     /// and yields one row per node of its domain, node slot first.
@@ -310,10 +313,11 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                     items: items.clone(),
                 };
             }
-            BoundClause::Delete { slots, .. } => {
+            BoundClause::Delete { slots, detach, .. } => {
                 plan = LogicalPlan::Delete {
                     input: plan.boxed(),
                     slots: slots.clone(),
+                    detach: *detach,
                 };
             }
             BoundClause::Unwind { expr, slot } => {
@@ -679,9 +683,14 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
             let _ = writeln!(out, "{pad}Set {}", written.join(", "));
             render(input, query, schema, depth + 1, out);
         }
-        LogicalPlan::Delete { input, slots } => {
+        LogicalPlan::Delete {
+            input,
+            slots,
+            detach,
+        } => {
             let taken: Vec<&str> = slots.iter().map(|&s| slot_name(query, s)).collect();
-            let _ = writeln!(out, "{pad}Delete {}", taken.join(", "));
+            let word = if *detach { "DetachDelete" } else { "Delete" };
+            let _ = writeln!(out, "{pad}{word} {}", taken.join(", "));
             render(input, query, schema, depth + 1, out);
         }
         LogicalPlan::TableFunction {

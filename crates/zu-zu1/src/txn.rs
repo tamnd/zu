@@ -54,10 +54,18 @@ struct TableOverlay {
     updates: HashMap<(u64, u32), Vec<(Epoch, Cell)>>,
 }
 
-/// Committed overlay edges of one rel table, in commit order.
+/// Committed overlay edges of one rel table, in commit order, and the
+/// edges a `DETACH DELETE` took away.
 #[derive(Debug, Default)]
 struct RelOverlay {
     edges: Vec<OverlayEdge>,
+    /// The rows a removed edge ran between, stamped with the removing
+    /// epoch. An edge has no offset of its own, so the pair is its name,
+    /// which means an entry here takes away every edge over that pair.
+    /// Nothing that has a name of its own is lost by that: a table that
+    /// stores edge properties holds a pair once, and one that stores
+    /// none has nothing to tell two edges over a pair apart with.
+    dead: BTreeMap<(u64, u64), Epoch>,
 }
 
 /// One committed edge the base does not hold yet: the rows it runs
@@ -117,6 +125,11 @@ enum Op {
     Delete {
         table: u32,
         offset: u64,
+    },
+    DeleteRel {
+        rel: u32,
+        src: u64,
+        dst: u64,
     },
 }
 
@@ -309,6 +322,13 @@ impl Mvcc {
                     }
                     Ok(())
                 }
+                WalRecord::RelDelete { rel, src, dst } => {
+                    let overlay = mvcc.rels.entry(*rel).or_default();
+                    for (s, d) in src.iter().zip(dst) {
+                        overlay.dead.entry((*s, *d)).or_insert(epoch);
+                    }
+                    Ok(())
+                }
                 WalRecord::IngestRef { table, ptrs } => {
                     let (payload, root) = resolve(*table, ptrs)?;
                     mvcc.publish_ingest(epoch, *table, payload, root);
@@ -389,7 +409,7 @@ impl Mvcc {
     pub fn neighbors(&self, rel: u32, node: u64, reversed: bool, epoch: Epoch, out: &mut Vec<u64>) {
         if let Some(overlay) = self.rels.get(&rel) {
             for edge in &overlay.edges {
-                if edge.epoch > epoch {
+                if edge.epoch > epoch || self.edge_gone(rel, edge.src, edge.dst, epoch) {
                     continue;
                 }
                 if !reversed && edge.src == node {
@@ -399,6 +419,29 @@ impl Mvcc {
                 }
             }
         }
+    }
+
+    /// Whether the edges between two rows are gone for a reader at
+    /// `epoch`. The base holds edges the overlay never saw, so this is
+    /// asked about a pair rather than about an overlay entry, and the
+    /// facade asks it of every base edge it reads.
+    pub fn edge_gone(&self, rel: u32, src: u64, dst: u64, epoch: Epoch) -> bool {
+        self.rels
+            .get(&rel)
+            .and_then(|o| o.dead.get(&(src, dst)))
+            .is_some_and(|&e| e <= epoch)
+    }
+
+    /// The pairs `rel` has lost by `epoch`, ascending, which is what a
+    /// fold drops out of the CSR it rebuilds.
+    pub fn dead_edges(&self, rel: u32, epoch: Epoch) -> Vec<(u64, u64)> {
+        self.rels.get(&rel).map_or_else(Vec::new, |o| {
+            o.dead
+                .iter()
+                .filter(|&(_, &e)| e <= epoch)
+                .map(|(&pair, _)| pair)
+                .collect()
+        })
     }
 
     /// Overlay edges of `rel` visible at `epoch`, for checkpoint folds.
@@ -417,7 +460,9 @@ impl Mvcc {
             .get(&rel)
             .into_iter()
             .flat_map(|o| &o.edges)
-            .filter(move |edge| edge.epoch <= epoch)
+            .filter(move |edge| {
+                edge.epoch <= epoch && !self.edge_gone(rel, edge.src, edge.dst, epoch)
+            })
             .map(|edge| (edge.src, edge.dst, edge.cols.as_slice()))
     }
 
@@ -566,6 +611,14 @@ impl Mvcc {
                         .entry(offset)
                         .or_insert(epoch);
                 }
+                Op::DeleteRel { rel, src, dst } => {
+                    self.rels
+                        .entry(rel)
+                        .or_default()
+                        .dead
+                        .entry((src, dst))
+                        .or_insert(epoch);
+                }
             }
         }
         self.epoch = epoch;
@@ -628,6 +681,14 @@ impl WriteTxn<'_> {
         self.ops.push(Op::Delete { table, offset });
     }
 
+    /// Stages the removal of the edges between two rows. An edge is
+    /// named by the rows it runs between, so a table holding a pair
+    /// twice loses both, which is what a `DETACH DELETE` of either end
+    /// wants anyway.
+    pub fn delete_rel(&mut self, rel: u32, src: u64, dst: u64) {
+        self.ops.push(Op::DeleteRel { rel, src, dst });
+    }
+
     /// Whether nothing has been staged.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
@@ -662,6 +723,7 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
     let mut out = Vec::new();
     let mut updates = UpdateBatches::new();
     let mut deletes: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+    let mut detaches: BTreeMap<u32, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
     for op in ops {
         match op {
             Op::InsertNodes { table, cols, .. } => out.push(WalRecord::NodeInsert {
@@ -701,6 +763,11 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
                 cells.push(value.clone());
             }
             Op::Delete { table, offset } => deletes.entry(*table).or_default().push(*offset),
+            Op::DeleteRel { rel, src, dst } => {
+                let (srcs, dsts) = detaches.entry(*rel).or_default();
+                srcs.push(*src);
+                dsts.push(*dst);
+            }
         }
     }
     for ((table, group, col), (offsets, cells)) in updates {
@@ -726,6 +793,11 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
             });
             at = end;
         }
+    }
+    // The edges go before the rows, so a replay that stops partway
+    // never leaves a row that is gone with an edge that still names it.
+    for (rel, (src, dst)) in detaches {
+        out.push(WalRecord::RelDelete { rel, src, dst });
     }
     for (table, ids) in deletes {
         out.push(WalRecord::Delete { table, ids });
@@ -817,6 +889,43 @@ mod tests {
             let mut nbrs = Vec::new();
             m.neighbors(9, 6, true, e2, &mut nbrs);
             assert_eq!(nbrs, vec![5]);
+        }
+    }
+
+    /// An edge the overlay took away stops being a neighbor at the
+    /// epoch that took it, and recovery reads the same thing back out
+    /// of the log.
+    #[test]
+    fn a_removed_edge_leaves_the_overlay_at_its_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.insert_rel(9, 0, 1);
+        txn.insert_rel(9, 0, 2);
+        let e1 = txn.commit(&mut wal).unwrap();
+        let mut txn = mvcc.begin();
+        txn.delete_rel(9, 0, 1);
+        let e2 = txn.commit(&mut wal).unwrap();
+
+        let recovered = Mvcc::recover(&wal, 0).unwrap();
+        for m in [&mvcc, &recovered] {
+            let mut nbrs = Vec::new();
+            m.neighbors(9, 0, false, e1, &mut nbrs);
+            assert_eq!(nbrs, vec![1, 2], "both edges stand one epoch earlier");
+            nbrs.clear();
+            m.neighbors(9, 0, false, e2, &mut nbrs);
+            assert_eq!(nbrs, vec![2]);
+            nbrs.clear();
+            m.neighbors(9, 1, true, e2, &mut nbrs);
+            assert!(nbrs.is_empty(), "the end it arrived at loses it too");
+            assert!(m.edge_gone(9, 0, 1, e2));
+            assert!(!m.edge_gone(9, 0, 1, e1));
+            assert_eq!(m.dead_edges(9, e2), vec![(0, 1)]);
+            assert!(m.dead_edges(9, e1).is_empty());
+            // What a fold would seal: the edge that was taken away is
+            // not among the edges it would write.
+            assert_eq!(m.edges(9, e2).collect::<Vec<_>>(), vec![(0, 2)]);
         }
     }
 

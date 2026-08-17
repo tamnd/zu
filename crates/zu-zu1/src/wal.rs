@@ -154,6 +154,14 @@ pub enum WalRecord {
         table: u32,
         ids: Vec<u64>,
     },
+    /// The edges one txn took away, named by the rows they run between
+    /// because that is the only name an edge has: the file holds them
+    /// in a CSR that a fold rebuilds, so there is no offset to log.
+    RelDelete {
+        rel: u32,
+        src: Vec<u64>,
+        dst: Vec<u64>,
+    },
     DdlCatalog {
         delta: Vec<u8>,
     },
@@ -177,6 +185,7 @@ impl WalRecord {
             WalRecord::TxnCommit => 7,
             WalRecord::IngestRef { .. } => 8,
             WalRecord::CheckpointNote => KIND_CHECKPOINT_NOTE,
+            WalRecord::RelDelete { .. } => 10,
         }
     }
 
@@ -230,6 +239,12 @@ impl WalRecord {
                 out.extend_from_slice(&table.to_le_bytes());
                 out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
                 put_u64s(out, ids);
+            }
+            WalRecord::RelDelete { rel, src, dst } => {
+                out.extend_from_slice(&rel.to_le_bytes());
+                out.extend_from_slice(&(src.len() as u32).to_le_bytes());
+                put_u64s(out, src);
+                put_u64s(out, dst);
             }
             WalRecord::DdlCatalog { delta } => out.extend_from_slice(delta),
             WalRecord::IngestRef { table, ptrs } => {
@@ -329,6 +344,15 @@ impl WalRecord {
                 }
             }
             9 => WalRecord::CheckpointNote,
+            10 => {
+                let rel = r.u32()?;
+                let count = r.u32()? as usize;
+                WalRecord::RelDelete {
+                    rel,
+                    src: u64s(r, count)?,
+                    dst: u64s(r, count)?,
+                }
+            }
             other => return Err(corrupt(format!("unknown record kind {other}"))),
         };
         if !r.rest().is_empty() {
@@ -601,6 +625,11 @@ mod tests {
             WalRecord::Delete {
                 table: 3,
                 ids: vec![11, 12],
+            },
+            WalRecord::RelDelete {
+                rel: 5,
+                src: vec![1, 7],
+                dst: vec![3, 9],
             },
             WalRecord::DdlCatalog {
                 delta: vec![0xAB; 100],

@@ -24,7 +24,7 @@
 //! granularity is the whole table; group-local rebuilds with slack
 //! arrive with the updatable CSR work.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use zu_common::{Epoch, Result, ZuError};
 
@@ -510,10 +510,19 @@ fn fold_rel(
     // overlay adds takes the value it was written with.
     let mut edges: Vec<(u32, u32, Came)> =
         Vec::with_capacity(old.edge_count as usize + overlay.len());
+    // An edge the statement took away is dropped here rather than
+    // tombstoned, because the CSR is being rebuilt anyway and an edge
+    // has no offset a reader could filter by. The ordinal still counts
+    // it: the property columns it is being cut out of are in the old
+    // load order, and dropping an edge does not move the ones behind it
+    // in that order.
+    let dead: BTreeSet<(u64, u64)> = mvcc.dead_edges(rel.id, epoch).into_iter().collect();
     let mut ordinal = 0usize;
     for node in 0..old.from_count {
         for &dst in reader.neighbors_dir(db, node, Direction::Fwd)? {
-            edges.push((node as u32, dst as u32, Came::Base(ordinal)));
+            if !dead.contains(&(node, dst)) {
+                edges.push((node as u32, dst as u32, Came::Base(ordinal)));
+            }
             ordinal += 1;
         }
     }
@@ -1135,6 +1144,91 @@ mod tests {
             assert_eq!(got, text.as_bytes(), "{src} to {dst}");
         }
         let path = dir.path().join("relprops.zu1");
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// An edge the overlay took away is gone from the CSR the fold
+    /// rebuilds, on both sides, and the edge count the catalog holds
+    /// says so.
+    #[test]
+    fn a_removed_edge_leaves_the_csr_the_fold_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        let mut txn = f.mvcc.begin();
+        txn.delete_rel(f.knows, 1, 2);
+        txn.commit(&mut f.wal).unwrap();
+        checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap();
+
+        // Three loaded, two added by the fixture, one taken away here.
+        let catalog = Catalog::load(&mut f.db).unwrap();
+        assert_eq!(catalog.rel_by_id(f.knows).unwrap().edge_count, 4);
+        let mut reader = GraphReader::load_table(&mut f.db, "knows").unwrap();
+        assert_eq!(
+            reader.neighbors_dir(&mut f.db, 1, Direction::Fwd).unwrap(),
+            &[] as &[u64]
+        );
+        assert_eq!(
+            reader.neighbors_dir(&mut f.db, 2, Direction::Bwd).unwrap(),
+            &[] as &[u64],
+            "the end the edge arrived at loses it too"
+        );
+        assert_eq!(
+            reader.neighbors_dir(&mut f.db, 2, Direction::Fwd).unwrap(),
+            &[3],
+            "the edges beside it stay"
+        );
+        let path = dir.path().join("fold.zu1");
+        drop(f.db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A column is dense over the edges in load order, so an edge taken
+    /// away moves every edge behind it, and the fold has to cut the
+    /// value out rather than leave the column pointing one edge along.
+    #[test]
+    fn a_removed_edge_takes_its_property_values_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relcut.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        let notes: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        crate::props::store_rel_props(
+            &mut db,
+            "knows",
+            &[
+                ("since", PropValues::Int(&[1, 2, 3])),
+                ("note", PropValues::Str(&notes)),
+            ],
+        )
+        .unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("relcut.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.delete_rel(knows, 0, 1);
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let (since, note) = (reader.col("since").unwrap(), reader.col("note").unwrap());
+        let mut graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        assert!(graph.edge_ordinal(&mut db, 0, 1).unwrap().is_none());
+        for (src, dst, year, text) in [(1u64, 2u64, 2u64, "two"), (2, 3, 3, "three")] {
+            let row = graph.edge_ordinal(&mut db, src, dst).unwrap().unwrap();
+            assert_eq!(reader.read_int(&mut db, since, row).unwrap(), year);
+            let mut got = Vec::new();
+            reader.read_str(&mut db, note, row, &mut got).unwrap();
+            assert_eq!(got, text.as_bytes(), "{src} to {dst}");
+        }
+        let path = dir.path().join("relcut.zu1");
         drop(db);
         crate::verify(&path).unwrap();
     }

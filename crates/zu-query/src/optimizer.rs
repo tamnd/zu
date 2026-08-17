@@ -170,9 +170,14 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(lift_close_filters(*input)),
             items,
         },
-        LogicalPlan::Delete { input, slots } => LogicalPlan::Delete {
+        LogicalPlan::Delete {
+            input,
+            slots,
+            detach,
+        } => LogicalPlan::Delete {
             input: Box::new(lift_close_filters(*input)),
             slots,
+            detach,
         },
         LogicalPlan::TableFunction {
             input,
@@ -666,13 +671,18 @@ fn mark_asp_node(
                 est,
             )
         }
-        LogicalPlan::Delete { input, slots } => {
+        LogicalPlan::Delete {
+            input,
+            slots,
+            detach,
+        } => {
             // A delete hands its row on too, for the same reason.
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             (
                 LogicalPlan::Delete {
                     input: Box::new(input),
                     slots,
+                    detach,
                 },
                 est,
             )
@@ -860,9 +870,14 @@ fn rewrite(
             input: Box::new(rewrite(*input, query, schema, notes)?),
             items,
         }),
-        LogicalPlan::Delete { input, slots } => Ok(LogicalPlan::Delete {
+        LogicalPlan::Delete {
+            input,
+            slots,
+            detach,
+        } => Ok(LogicalPlan::Delete {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             slots,
+            detach,
         }),
         LogicalPlan::TableFunction {
             input,

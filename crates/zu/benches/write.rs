@@ -2,9 +2,10 @@
 //! write spends: latency, throughput, bytes pushed to the disk, bytes
 //! the store grew by, and memory.
 //!
-//! A `SET` of one property of one element, an `INSERT` of one element
-//! and a `DELETE` of one element, all three through the query engine,
-//! all three one statement per commit. That is the shape of a linkbench update and of an SNB
+//! A `SET` of one property of one element, an `INSERT` of one element,
+//! a `DELETE` of one element and a `DETACH DELETE` of one that still
+//! has edges on it, all four through the query engine, all four one
+//! statement per commit. That is the shape of a linkbench update and of an SNB
 //! insert, so it is the number those workloads are made of. The read
 //! benches say what finding the row costs; what is left in here is the
 //! write path, which is the log append, the fdatasync the commit is,
@@ -230,14 +231,14 @@ struct Cost {
 impl Cost {
     fn header() {
         println!(
-            "{:<22} {:>10} {:>12} {:>13} {:>12} {:>10} {:>12}",
+            "{:<26} {:>10} {:>12} {:>13} {:>12} {:>10} {:>12}",
             "statement", "latency", "throughput", "written", "growth", "RSS", "peak growth"
         );
     }
 
     fn report(&self, what: &str) {
         println!(
-            "{what:<22} {:>7.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
+            "{what:<26} {:>7.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
             self.us,
             1e6 / self.us.max(0.001),
             self.written / 1024.0,
@@ -259,9 +260,9 @@ fn build(dir: &Path, rows: u64) -> std::path::PathBuf {
 }
 
 /// The same table with nothing following anybody, which is the table a
-/// `DELETE` run needs: GQL refuses to take away an element that still
-/// has edges on it (G1001), and `DETACH DELETE`, which takes them with
-/// it, is not in yet.
+/// plain `DELETE` run needs: GQL refuses to take away an element that
+/// still has edges on it (G1001), so a `DELETE` run over the followed
+/// table would measure the refusal and not the write.
 fn build_bare(dir: &Path, rows: u64) -> std::path::PathBuf {
     build_with(dir, rows, &[])
 }
@@ -438,6 +439,72 @@ fn run_delete(dir: &Path, rows: u64) -> Cost {
     }
 }
 
+/// A `DETACH DELETE` of one element, `WRITES` times over, over the
+/// table where everybody follows somebody, which is what makes it
+/// different from the `DELETE` run: the element has edges on it, and
+/// they go with it.
+///
+/// This is the expensive shape of a write, and deliberately so. An edge
+/// has no offset a reader could filter it out by, so it cannot be
+/// tombstoned the way a row is: the fold drops it out of the CSR it
+/// rebuilds, and a CSR rebuild is the whole table's edges rather than
+/// the one that went. The number here is therefore the ceiling on what
+/// detaching costs today and the thing a group-local rebuild has to
+/// beat, and the bytes column says the same in what it pushes at the
+/// disk.
+///
+/// Both ends are checked afterwards: the rows are counted, and so are
+/// the edges, so a path that timed well by leaving an edge behind fails
+/// instead of scoring.
+fn run_detach(dir: &Path, rows: u64) -> Cost {
+    let path = build(dir, rows);
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    let edges = one(
+        &mut conn,
+        "MATCH (p:person)-[:follows]->(q:person) RETURN count(*) AS n",
+    );
+    conn.query(&format!(
+        "MATCH (p:person) WHERE p.age = {} DETACH DELETE p",
+        rows - 1
+    ))
+    .expect("warmup");
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        conn.query(&format!(
+            "MATCH (p:person) WHERE p.age = {i} DETACH DELETE p"
+        ))
+        .expect("detach delete");
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    assert_eq!(
+        one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),
+        (rows - WRITES - 1) as i64,
+        "every element deleted is gone, and no other one is"
+    );
+    let left = one(
+        &mut conn,
+        "MATCH (p:person)-[:follows]->(q:person) RETURN count(*) AS n",
+    );
+    assert!(
+        left < edges - WRITES as i64,
+        "every deleted element took its edges with it: {left} left of {edges}"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let root = tempfile::tempdir().expect("tempdir");
@@ -455,6 +522,9 @@ fn main() {
     let delete = run_delete(&root.path().join("delete"), SMALL);
     delete.report(&format!("DELETE, {SMALL} rows"));
 
+    let detach = run_detach(&root.path().join("detach"), SMALL);
+    detach.report(&format!("DETACH DELETE, {SMALL} rows"));
+
     // How much of a one cell write is the table it sits in, in time and
     // in bytes. One means the write path does not read the table; ten
     // means it reads all of it, since the large table is ten times the
@@ -469,8 +539,10 @@ fn main() {
         ("set_stmt_us", set_small.us),
         ("insert_stmt_us", insert.us),
         ("delete_stmt_us", delete.us),
+        ("detach_stmt_us", detach.us),
         ("set_stmt_kb", set_small.written / 1024.0),
         ("delete_stmt_kb", delete.written / 1024.0),
+        ("detach_stmt_kb", detach.written / 1024.0),
         ("set_stmt_growth_b", set_small.growth),
         ("set_peak_rss_mb", set_small.peak as f64 / MB),
         ("set_fold_x", fold_x),

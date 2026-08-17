@@ -211,13 +211,13 @@ pub enum Clause {
     /// bound, one variable each, because what a delete takes away is an
     /// element and not a value computed from one.
     ///
-    /// There is no `detach` flag because `DETACH DELETE` is turned away
-    /// by name: it says the edges on the element go with it, and edges
-    /// are not deletable yet. Without `DETACH`, an element that still
-    /// has edges is an error rather than a way to leave one hanging, so
-    /// what this clause deletes never leaves an edge behind.
+    /// `DETACH` says the edges on the element go with it. Without it, an
+    /// element that still has edges is an error rather than a way to
+    /// leave one hanging, so either way what this clause deletes never
+    /// leaves an edge behind.
     Delete {
         targets: Vec<String>,
+        detach: bool,
     },
     Unwind {
         expr: Expr,

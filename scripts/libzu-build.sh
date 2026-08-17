@@ -38,8 +38,21 @@ cargo run -q -p xtask -- platforms --measure "$out" --target "$target"
 # rather than written down, because the answer differs per target and
 # changes with the toolchain, and a pkg-config file whose Libs.private
 # is a guess is a `pkg-config --static` line that does not link.
-syslibs="$(cargo rustc -q --release --target "$target" -p zu-capi --crate-type staticlib -- \
-    --print native-static-libs 2>&1 | sed -n 's/^note: native-static-libs: //p' | tail -1)"
+#
+# `--color never` because CI sets CARGO_TERM_COLOR=always and a note
+# wrapped in escape codes is a note this pattern does not match, which
+# is an empty answer rather than a wrong one. An empty answer stops the
+# build here: everything downstream would carry on and fail at the far
+# end of it, where the message is a page of undefined references to
+# pthread_create rather than the one sentence that explains them.
+syslibs="$(cargo rustc -q --color never --release --target "$target" -p zu-capi \
+    --crate-type staticlib -- --print native-static-libs 2>&1 |
+    sed -n 's/^note: native-static-libs: //p' | tail -1)"
+if [ -z "$syslibs" ]; then
+    echo "static link: rustc did not say what $target needs beside the archive"
+    exit 1
+fi
+echo "static link: $syslibs"
 
 # The archive this row publishes, laid out as a prefix so that the two
 # build systems can find things in it (dx/09 C-4). The layout is code

@@ -460,6 +460,35 @@ int main(int argc, char **argv) {
     zu_conn_close(first);
     return fail("a syntax error with no GQLSTATUS code");
   }
+  /* The place, as numbers. A binding that wants to underline the token
+   * reads it here rather than out of the message, which also says it. */
+  uint32_t line = 0;
+  uint32_t column = 0;
+  if (zu_error_position(err, &line, &column) != ZU_OK || line != 1 || column != 1) {
+    zu_error_free(err);
+    zu_conn_close(first);
+    return fail("a syntax error that will not say where");
+  }
+  zu_error_free(err);
+
+  /* A condition raised while the statement runs happened at no token,
+   * and says it has no place rather than pointing at one it guessed. */
+  err = NULL;
+  result = NULL;
+  status = zu_query_z(first, "RETURN 1 / 0", &result, &err);
+  if (status != ZU_ERROR || err == NULL) {
+    zu_result_free(result);
+    zu_error_free(err);
+    zu_conn_close(first);
+    return fail("dividing by zero was not refused");
+  }
+  line = 7;
+  column = 9;
+  if (zu_error_position(err, &line, &column) != ZU_DONE || line != 7 || column != 9) {
+    zu_error_free(err);
+    zu_conn_close(first);
+    return fail("an error with no place wrote one anyway");
+  }
   zu_error_free(err);
 
   /* A statement that outlives its connection answers rather than
@@ -481,7 +510,7 @@ int main(int argc, char **argv) {
 
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
-      "nested list, one load, one refusal\n",
+      "nested list, one load, one refusal with a place and one without\n",
       version);
   return 0;
 }

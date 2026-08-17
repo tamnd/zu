@@ -99,7 +99,7 @@ use zudb::query::{QueryResult, Value};
 use zudb::zu1::file::Zu1File;
 use zudb::zu1::graph::bulk_load_keyed;
 use zudb::zu1::props::{PropValues, store_props};
-use zudb::{Config, Connection, Database, Severity, ZuError as EngineError};
+use zudb::{Config, Connection, Database, Position, Severity, ZuError as EngineError};
 
 /// What a call answers, which is control flow and nothing else.
 ///
@@ -204,6 +204,10 @@ pub struct ZuError {
     /// which the accessor reports as `NULL`.
     code: Option<CString>,
     severity: i32,
+    /// Line and column, both 1-based, for a condition raised at a place
+    /// in the statement text. A failure that happened at runtime, or in
+    /// the engine rather than in a statement, has none.
+    position: Option<Position>,
 }
 
 /// The status an engine error becomes.
@@ -255,6 +259,7 @@ impl ZuError {
             // An error with no condition is still an exception: it
             // stopped the statement, which is what severity is for.
             severity: record.map_or(ZU_SEVERITY_EXCEPTION, |r| severity_of(r.severity())),
+            position: e.position(),
         }
     }
 
@@ -267,6 +272,7 @@ impl ZuError {
             message: c"internal panic in libzu".into(),
             code: None,
             severity: ZU_SEVERITY_EXCEPTION,
+            position: None,
         }
     }
 }
@@ -778,6 +784,43 @@ pub unsafe extern "C" fn zu_error_severity(e: *const ZuError) -> i32 {
         return -1;
     }
     unsafe { &*e }.severity
+}
+
+/// Where in the statement text the condition was raised, both 1-based,
+/// with the column counted in characters rather than bytes.
+///
+/// [`ZuStatus::Ok`] and the two out-parameters written when there is a
+/// position, [`ZuStatus::Done`] and both left alone when there is not,
+/// [`ZuStatus::Misuse`] for a NULL error. Not every failure has one: a
+/// division by zero happens while the statement runs and has no token
+/// to point at, and an io error has no statement at all. Either
+/// out-parameter may be NULL for a caller that wants only the other.
+///
+/// The message says the same thing in words, and keeps saying it, so
+/// that printing the message alone is still a complete report. This is
+/// for the caller that would rather underline the token than parse the
+/// sentence back into numbers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_error_position(
+    e: *const ZuError,
+    line: *mut u32,
+    column: *mut u32,
+) -> ZuStatus {
+    if e.is_null() {
+        return ZuStatus::Misuse;
+    }
+    match unsafe { &*e }.position {
+        Some(at) => {
+            if !line.is_null() {
+                unsafe { *line = at.line };
+            }
+            if !column.is_null() {
+                unsafe { *column = at.column };
+            }
+            ZuStatus::Ok
+        }
+        None => ZuStatus::Done,
+    }
 }
 
 /// Frees an error handle. No-op on NULL.

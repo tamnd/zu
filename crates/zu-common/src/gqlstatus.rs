@@ -120,6 +120,48 @@ impl fmt::Display for GqlStatus {
     }
 }
 
+/// Where in the statement text a condition was raised. Both are 1-based
+/// and columns count characters rather than bytes, so a line of
+/// multi-byte text does not read as wider than it looks.
+///
+/// This is a pair rather than a byte offset because a byte offset is
+/// only useful to something holding the source, and the caller that
+/// most wants a position is an editor or a shell that has already
+/// printed the line and wants to point under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Position {
+    /// The pair `offset` bytes into `source`. An offset past the end
+    /// lands at the end, which is where an error about a query that
+    /// stopped too early belongs.
+    pub fn of(source: &str, offset: usize) -> Self {
+        let mut line = 1u32;
+        let mut column = 1u32;
+        for (ix, ch) in source.char_indices() {
+            if ix >= offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        Position { line, column }
+    }
+}
+
+impl fmt::Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "line {}, column {}", self.line, self.column)
+    }
+}
+
 /// What zu hands back when a condition is raised: the standard's code and
 /// zu's own account of what happened.
 ///
@@ -127,10 +169,19 @@ impl fmt::Display for GqlStatus {
 /// engines and is what a conformance run grades. `detail` is ours and can
 /// say whatever is most useful, including the line and column, without
 /// putting that in the field a harness matches on.
+///
+/// `position` is that line and column again, as a pair. The detail keeps
+/// saying it because a message a user reads should be complete on its
+/// own, and the pair exists because a caller that wants to underline the
+/// offending token should not have to parse English back into numbers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticRecord {
     pub status: GqlStatus,
     pub detail: String,
+    /// Where in the statement, for the conditions that happen somewhere.
+    /// A division by zero happens at runtime and has no token to point
+    /// at, so this is `None` rather than a guess at one.
+    pub position: Option<Position>,
 }
 
 impl DiagnosticRecord {
@@ -138,6 +189,18 @@ impl DiagnosticRecord {
         DiagnosticRecord {
             status,
             detail: detail.into(),
+            position: None,
+        }
+    }
+
+    /// The same, raised at a place. The position is written into the
+    /// detail as well, ahead of it and separated by a colon, which is
+    /// the form every parser message already had.
+    pub fn at(status: GqlStatus, position: Position, detail: impl fmt::Display) -> Self {
+        DiagnosticRecord {
+            status,
+            detail: format!("{position}: {detail}"),
+            position: Some(position),
         }
     }
 
@@ -248,5 +311,60 @@ mod tests {
         let ours = DiagnosticRecord::new(codes::C42001, "line 1, column 7: expected MATCH");
         assert_eq!(ours.to_string(), "42001: line 1, column 7: expected MATCH");
         assert_eq!(ours.status.code(), "42001");
+    }
+
+    #[test]
+    fn a_position_reads_the_same_way_it_did_when_it_was_only_prose() {
+        // The pair is added to the record, not swapped for the words:
+        // a message that stopped saying where would be a message a
+        // user has to go and look something up to act on.
+        let at = Position { line: 1, column: 7 };
+        let raised = DiagnosticRecord::at(codes::C42001, at, "expected MATCH");
+        assert_eq!(
+            raised.to_string(),
+            "42001: line 1, column 7: expected MATCH"
+        );
+        assert_eq!(raised.position, Some(at));
+        assert_eq!(at.to_string(), "line 1, column 7");
+        // And a record made the old way has no position rather than
+        // one parsed back out of its own detail.
+        assert!(DiagnosticRecord::new(codes::C22012, "").position.is_none());
+    }
+
+    #[test]
+    fn an_offset_lands_on_the_line_and_column_a_reader_would_count() {
+        let source = "MATCH (n)\nWHERE n.x\nRETURN n";
+        assert_eq!(Position::of(source, 0), Position { line: 1, column: 1 });
+        assert_eq!(Position::of(source, 6), Position { line: 1, column: 7 });
+        // The newline itself belongs to the line it ends, and the byte
+        // after it starts the next one at column 1.
+        assert_eq!(
+            Position::of(source, 9),
+            Position {
+                line: 1,
+                column: 10
+            }
+        );
+        assert_eq!(Position::of(source, 10), Position { line: 2, column: 1 });
+        assert_eq!(Position::of(source, 20), Position { line: 3, column: 1 });
+        // Past the end is the end, which is where an error about a
+        // query that stopped too early belongs.
+        assert_eq!(Position::of(source, 9999), Position { line: 3, column: 9 });
+    }
+
+    #[test]
+    fn a_column_counts_characters_and_not_the_bytes_they_took() {
+        // Four characters in, on a line where those four took ten
+        // bytes. A column of 11 would point past the end of a line the
+        // user sees as four wide.
+        let source = "RETURN 'héllo wörld'";
+        let offset = source.find('w').expect("w");
+        assert_eq!(
+            Position::of(source, offset),
+            Position {
+                line: 1,
+                column: 15
+            }
+        );
     }
 }

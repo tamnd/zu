@@ -323,6 +323,9 @@ pub fn read_edge_csv(path: &Path) -> Result<Vec<(u32, u32)>> {
 enum CsvRole {
     Src,
     Dst,
+    /// The id a node file gives its row, which a rel file names its
+    /// endpoints by. Only a node file has one.
+    Key,
     Prop(usize),
     Skip,
 }
@@ -409,7 +412,9 @@ pub fn read_edge_csv_with_props(path: &Path, props: bool) -> Result<crate::props
             match role {
                 CsvRole::Src => src = cell.parse::<u32>().ok(),
                 CsvRole::Dst => dst = cell.parse::<u32>().ok(),
-                CsvRole::Skip => {}
+                // A rel header never names one, since `:ID` there is
+                // the edge's own name and nothing reads it.
+                CsvRole::Key | CsvRole::Skip => {}
                 CsvRole::Prop(col) => {
                     let column = &mut columns[*col];
                     push_csv_value(&mut column.values, cell).ok_or_else(|| {
@@ -432,9 +437,184 @@ pub fn read_edge_csv_with_props(path: &Path, props: bool) -> Result<crate::props
     }
 }
 
+/// The non-empty lines of a file, trimmed, with the number of the line
+/// each was read from, which is what the two dataset readers below walk.
+///
+/// The edge reader above keeps its own loop on purpose. That one is the
+/// ingest hot path and reads two integers a line with nothing else in
+/// the way; these two read a header, a key space and typed columns, and
+/// sharing the line handling is the only thing worth sharing.
+struct CsvLines {
+    reader: std::io::BufReader<std::fs::File>,
+    line: String,
+    line_no: usize,
+}
+
+impl CsvLines {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(CsvLines {
+            reader: std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?),
+            line: String::new(),
+            line_no: 0,
+        })
+    }
+
+    /// The next line that holds anything, `None` at the end of the file.
+    fn next(&mut self) -> Result<Option<(usize, &str)>> {
+        loop {
+            self.line.clear();
+            if self.reader.read_line(&mut self.line)? == 0 {
+                return Ok(None);
+            }
+            self.line_no += 1;
+            if !self.line.trim().is_empty() {
+                return Ok(Some((self.line_no, self.line.trim())));
+            }
+        }
+    }
+}
+
+/// Reads a node file: one row a line, the row's own id in the column the
+/// header marked `:ID`, and every named column beside it a property of
+/// that row.
+///
+/// The first line is the header, always, which is the one place this
+/// differs from [`read_edge_csv_with_props`]. An edge file can be two
+/// integers a line and still be a graph; a node file with no header
+/// names no property and no id, so there is nothing to read it as.
+///
+/// The row an id gets is the line it was written on, counting from zero
+/// past the header. A rel file names its endpoints by id and the loader
+/// maps them through that, so the order of a node file is the order of
+/// the table it loads as, and nothing else decides it.
+pub fn read_node_csv(path: &Path) -> Result<crate::props::NodesWithProps> {
+    let mut lines = CsvLines::open(path)?;
+    let mut keys: Vec<u64> = Vec::new();
+    let mut columns = Vec::new();
+    let mut roles: Vec<CsvRole> = Vec::new();
+    let mut header = false;
+    while let Some((line_no, line)) = lines.next()? {
+        let cells: Vec<&str> = line.split(',').map(str::trim).collect();
+        if !header {
+            header = true;
+            (roles, columns) = parse_header(&cells, true)?;
+            continue;
+        }
+        if cells.len() != roles.len() {
+            return Err(wrong_csv_width(line_no, cells.len(), roles.len()));
+        }
+        let mut key = None;
+        for (cell, role) in cells.iter().zip(&roles) {
+            match role {
+                CsvRole::Key => key = cell.parse::<u64>().ok(),
+                CsvRole::Prop(col) => push_csv_prop(&mut columns[*col], cell, line_no)?,
+                _ => {}
+            }
+        }
+        match key {
+            Some(key) => keys.push(key),
+            None => {
+                return Err(ZuError::InvalidArgument(format!(
+                    "line {line_no}: the id column holds no node id"
+                )));
+            }
+        }
+    }
+    if !header {
+        return Err(ZuError::InvalidArgument(
+            "the file is empty, so it heads no node table".into(),
+        ));
+    }
+    Ok((keys, columns))
+}
+
+/// Reads a rel file whose endpoints are the ids a node file gave its
+/// rows rather than row offsets, together with the edge property columns
+/// the header names.
+///
+/// The ids stay as they were written. Which row of which node table each
+/// one is takes both node files to answer, and this reads one file, so
+/// the translation belongs to the loader that holds all of them.
+pub fn read_rel_csv_keyed(path: &Path) -> Result<crate::props::KeyedEdgesWithProps> {
+    let mut lines = CsvLines::open(path)?;
+    let mut edges: Vec<(u64, u64)> = Vec::new();
+    let mut columns = Vec::new();
+    let mut roles: Vec<CsvRole> = Vec::new();
+    let mut header = false;
+    while let Some((line_no, line)) = lines.next()? {
+        let cells: Vec<&str> = line.split(',').map(str::trim).collect();
+        if !header {
+            header = true;
+            (roles, columns) = parse_header(&cells, false)?;
+            continue;
+        }
+        if cells.len() != roles.len() {
+            return Err(wrong_csv_width(line_no, cells.len(), roles.len()));
+        }
+        let (mut src, mut dst) = (None, None);
+        for (cell, role) in cells.iter().zip(&roles) {
+            match role {
+                CsvRole::Src => src = cell.parse::<u64>().ok(),
+                CsvRole::Dst => dst = cell.parse::<u64>().ok(),
+                CsvRole::Prop(col) => push_csv_prop(&mut columns[*col], cell, line_no)?,
+                _ => {}
+            }
+        }
+        match (src, dst) {
+            (Some(src), Some(dst)) => edges.push((src, dst)),
+            _ => {
+                return Err(ZuError::InvalidArgument(format!(
+                    "line {line_no}: an endpoint column holds no node id"
+                )));
+            }
+        }
+    }
+    if !header {
+        return Err(ZuError::InvalidArgument(
+            "the file is empty, so it heads no rel table".into(),
+        ));
+    }
+    Ok((edges, columns))
+}
+
+/// A row with a different field count than the header, which is refused
+/// rather than padded: a column is addressed by its ordinal and a short
+/// row would shift every value after it.
+fn wrong_csv_width(line_no: usize, got: usize, want: usize) -> ZuError {
+    ZuError::InvalidArgument(format!(
+        "line {line_no}: {got} fields where the header names {want}"
+    ))
+}
+
+/// Appends one field to the column it belongs to, or says the field is
+/// not a value of that column's type.
+fn push_csv_prop(column: &mut crate::props::OwnedColumn, cell: &str, line_no: usize) -> Result<()> {
+    push_csv_value(&mut column.values, cell).ok_or_else(|| {
+        ZuError::InvalidArgument(format!(
+            "line {line_no}, column '{}': '{cell}' is not a {}",
+            column.name,
+            csv_type_name(&column.values)
+        ))
+    })
+}
+
+/// [`parse_header`] for a rel file, where `:ID` is structure to skip
+/// rather than the row's own id.
+fn parse_edge_header(cells: &[&str]) -> Result<(Vec<CsvRole>, Vec<crate::props::OwnedColumn>)> {
+    parse_header(cells, false)
+}
+
 /// Reads the header cells into a role per column and an empty column
 /// per property. See [`read_edge_csv_with_props`] for the form.
-fn parse_edge_header(cells: &[&str]) -> Result<(Vec<CsvRole>, Vec<crate::props::OwnedColumn>)> {
+///
+/// `node` says which kind of file this heads. A node file's `:ID` cell
+/// is the key its rows are named by elsewhere, and it has no endpoints;
+/// a rel file's endpoints are `:START_ID` and `:END_ID`, and an `:ID`
+/// there is the edge's own name, which nothing reads.
+fn parse_header(
+    cells: &[&str],
+    node: bool,
+) -> Result<(Vec<CsvRole>, Vec<crate::props::OwnedColumn>)> {
     use crate::props::{OwnedColumn, OwnedValues};
 
     let mut roles = vec![CsvRole::Skip; cells.len()];
@@ -454,6 +634,10 @@ fn parse_edge_header(cells: &[&str]) -> Result<(Vec<CsvRole>, Vec<crate::props::
             "END_ID" => {
                 roles[i] = CsvRole::Dst;
                 named_ends = true;
+                continue;
+            }
+            "ID" if node => {
+                roles[i] = CsvRole::Key;
                 continue;
             }
             "TYPE" | "LABEL" | "ID" => continue,
@@ -493,6 +677,20 @@ fn parse_edge_header(cells: &[&str]) -> Result<(Vec<CsvRole>, Vec<crate::props::
             values,
         });
     }
+    if node {
+        // A node file names one column with `:ID`, and if it named none
+        // the first column is it, the same fallback the endpoints take.
+        if !roles.contains(&CsvRole::Key) {
+            if cells.is_empty() {
+                return Err(ZuError::InvalidArgument(
+                    "header names no columns, so it names no node".into(),
+                ));
+            }
+            drop_prop(&mut roles, &mut columns, 0);
+            roles[0] = CsvRole::Key;
+        }
+        return Ok((roles, columns));
+    }
     if !named_ends {
         // Nothing said which columns the endpoints are, so they are the
         // first two, and whatever the header called them is not a
@@ -503,21 +701,29 @@ fn parse_edge_header(cells: &[&str]) -> Result<(Vec<CsvRole>, Vec<crate::props::
             ));
         }
         for i in [0, 1] {
-            if let CsvRole::Prop(col) = roles[i] {
-                columns.remove(col);
-                for role in &mut roles {
-                    if let CsvRole::Prop(other) = role
-                        && *other > col
-                    {
-                        *other -= 1;
-                    }
-                }
-            }
+            drop_prop(&mut roles, &mut columns, i);
         }
         roles[0] = CsvRole::Src;
         roles[1] = CsvRole::Dst;
     }
     Ok((roles, columns))
+}
+
+/// Takes column `i` out of the property set, for a cell the header
+/// typed as a property and the shape of the file says is structure.
+/// Every later column's index moves down one to follow it.
+fn drop_prop(roles: &mut [CsvRole], columns: &mut Vec<crate::props::OwnedColumn>, i: usize) {
+    let CsvRole::Prop(col) = roles[i] else {
+        return;
+    };
+    columns.remove(col);
+    for role in roles.iter_mut() {
+        if let CsvRole::Prop(other) = role
+            && *other > col
+        {
+            *other -= 1;
+        }
+    }
 }
 
 /// Parses one field into the column's own type and appends it, or says
@@ -873,6 +1079,25 @@ pub fn bulk_load_between(
     undirected: bool,
 ) -> Result<Directory> {
     bulk_load_inner(db, ends, rel_table, edges, None, undirected)
+}
+
+/// [`bulk_load_between`] carrying the primary-key index of its FROM
+/// table, which is what a dataset of many node files needs.
+///
+/// The index is sized to `ends.from`, so `key_by_row` is the original id
+/// of every row of that table and nothing else. Only one rel table has
+/// to carry it: a lookup finds the index through whichever table leaves
+/// the node table, so the second one would be the same map written
+/// twice.
+pub fn bulk_load_between_keyed(
+    db: &mut Zu1File,
+    ends: Ends<'_>,
+    rel_table: &str,
+    edges: &[(u32, u32)],
+    key_by_row: Option<&[u64]>,
+    undirected: bool,
+) -> Result<Directory> {
+    bulk_load_inner(db, ends, rel_table, edges, key_by_row, undirected)
 }
 
 /// Bulk-loads both CSR directions from an edge list into `db` as the rel

@@ -10,6 +10,7 @@ $ zu query --no-such-flag
 
 $ zu copy --no-such-flag
 ! usage: zu copy [--reorder degree|bfs|none] [--nodes <nodes.csv>] <edges.txt|csv|parquet> <out.zu1> [--format text|json]
+!        zu copy --node <Table>=<nodes.csv> ... --rel <Table>=<From>:<To>:<rels.csv> ... <out.zu1> [--format text|json]
 ! try `zu copy --help` for examples
 # exit 2
 

@@ -122,6 +122,11 @@ tier = 2
 reason = "converting a store between engines, which the CLI exposes and a binding may"
 
 [[group]]
+prefix = "zu::dataset"
+tier = 2
+reason = "bulk loading a directory of node files and rel files as the tables it names, which the CLI exposes and a binding may"
+
+[[group]]
 prefix = "zu::db"
 tier = 1
 reason = "the public API itself: open a database, take a connection, run a statement"

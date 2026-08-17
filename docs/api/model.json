@@ -946,6 +946,125 @@
       "doc": "Converts a zu1 file into a fresh sqlite store at `db_path`."
     },
     {
+      "id": "zu::dataset",
+      "kind": "module",
+      "name": "dataset",
+      "doc": "A directory of node files and rel files, loaded as the graph it\ndescribes rather than as the edge list underneath it.\n\nThe edge list loader builds one node table and one rel table, which\nis the whole of a SNAP or GAP graph and none of a labelled one. A\nfinbench dataset is three node labels and six rel types, and a query\nover it asks for a transfer's amount and a person's name, so a load\nthat flattens it answers nothing it was written to answer. What this\nadds is the tables: one node table per node file, one rel table per\nrel file, each rel table bound to the two node tables its ends name.\n\nIds are the dataset's own and stay that way. A node file gives every\nrow an id, a rel file names its endpoints by those ids, and the two\nneed not be dense or start at zero or even be disjoint from another\nlabel's, because each label is mapped separately. A row of a table is\nthe line it was written on; the id it came in with is kept twice, as\nthe `id` property so `RETURN n.id` answers with it, and as the\nprimary-key index so `{id: $k}` finds the row without a scan.\n\nWhat this does not do is guess. Every node file names its table,\nevery rel file names its table and both of its ends, and an edge\nwhose endpoint no node file declared is an error naming the id\nrather than a row invented for it."
+    },
+    {
+      "id": "zu::dataset::DatasetStats",
+      "kind": "struct",
+      "name": "DatasetStats",
+      "doc": "What a load put in the file, for the caller that reports it."
+    },
+    {
+      "id": "zu::dataset::DatasetStats::keyed",
+      "kind": "field",
+      "name": "keyed",
+      "of": "zu::dataset::DatasetStats",
+      "signature": "Vec<String>",
+      "doc": "The node tables whose rows carry a primary-key index."
+    },
+    {
+      "id": "zu::dataset::DatasetStats::node_columns",
+      "kind": "field",
+      "name": "node_columns",
+      "of": "zu::dataset::DatasetStats",
+      "signature": "u64",
+      "doc": "The property columns stored, node ones and edge ones."
+    },
+    {
+      "id": "zu::dataset::DatasetStats::nodes",
+      "kind": "field",
+      "name": "nodes",
+      "of": "zu::dataset::DatasetStats",
+      "signature": "Vec<(String, u64)>",
+      "doc": "Each node table and how many rows it holds, in load order."
+    },
+    {
+      "id": "zu::dataset::DatasetStats::rel_columns",
+      "kind": "field",
+      "name": "rel_columns",
+      "of": "zu::dataset::DatasetStats",
+      "signature": "u64"
+    },
+    {
+      "id": "zu::dataset::DatasetStats::rels",
+      "kind": "field",
+      "name": "rels",
+      "of": "zu::dataset::DatasetStats",
+      "signature": "Vec<(String, u64)>",
+      "doc": "Each rel table and how many edges it holds, in load order."
+    },
+    {
+      "id": "zu::dataset::NodeFile",
+      "kind": "struct",
+      "name": "NodeFile",
+      "doc": "One node file: the table its rows load as, and where to read them."
+    },
+    {
+      "id": "zu::dataset::NodeFile::path",
+      "kind": "field",
+      "name": "path",
+      "of": "zu::dataset::NodeFile",
+      "signature": "std::path::PathBuf"
+    },
+    {
+      "id": "zu::dataset::NodeFile::table",
+      "kind": "field",
+      "name": "table",
+      "of": "zu::dataset::NodeFile",
+      "signature": "String"
+    },
+    {
+      "id": "zu::dataset::RelFile",
+      "kind": "struct",
+      "name": "RelFile",
+      "doc": "One rel file: the table its edges load as, the node tables its two\nends name their rows in, and where to read them."
+    },
+    {
+      "id": "zu::dataset::RelFile::from",
+      "kind": "field",
+      "name": "from",
+      "of": "zu::dataset::RelFile",
+      "signature": "String"
+    },
+    {
+      "id": "zu::dataset::RelFile::path",
+      "kind": "field",
+      "name": "path",
+      "of": "zu::dataset::RelFile",
+      "signature": "std::path::PathBuf"
+    },
+    {
+      "id": "zu::dataset::RelFile::table",
+      "kind": "field",
+      "name": "table",
+      "of": "zu::dataset::RelFile",
+      "signature": "String"
+    },
+    {
+      "id": "zu::dataset::RelFile::to",
+      "kind": "field",
+      "name": "to",
+      "of": "zu::dataset::RelFile",
+      "signature": "String"
+    },
+    {
+      "id": "zu::dataset::RelFile::undirected",
+      "kind": "field",
+      "name": "undirected",
+      "of": "zu::dataset::RelFile",
+      "signature": "bool"
+    },
+    {
+      "id": "zu::dataset::load_dataset",
+      "kind": "function",
+      "name": "load_dataset",
+      "signature": "fn load_dataset(nodes: &[NodeFile], rels: &[RelFile], out: &std::path::Path) -> zu_common::Result<DatasetStats>",
+      "doc": "Loads a dataset of node files and rel files into a fresh zu1 file at\n`out`.\n\nEvery rel file's two ends must name node files given here, and every\nnode file must be an end of some rel file, because a node table's row\ndomain is declared by the loads that touch it and a table no load\ntouches would come out of this holding nothing."
+    },
+    {
       "id": "zu::db",
       "kind": "module",
       "name": "db",
@@ -5150,6 +5269,13 @@
       "doc": "[`bulk_load_as`] for a rel table whose ends are different node\ntables, so a source id is a row of `ends.from` and a destination id\na row of `ends.to`.\n\nThis is what a labelled graph needs: `(:Person)-[:LIVES_IN]->(:City)`\nis two node tables of unrelated sizes with one rel table between\nthem, and reading it backward from a city has to land in the person\ntable rather than in a row of its own."
     },
     {
+      "id": "zu::zu1::graph::bulk_load_between_keyed",
+      "kind": "function",
+      "name": "bulk_load_between_keyed",
+      "signature": "fn bulk_load_between_keyed(db: &mut zu_zu1::file::Zu1File, ends: Ends, rel_table: &str, edges: &[(u32, u32)], key_by_row: Option<&[u64]>, undirected: bool) -> zu_common::Result<Directory>",
+      "doc": "[`bulk_load_between`] carrying the primary-key index of its FROM\ntable, which is what a dataset of many node files needs.\n\nThe index is sized to `ends.from`, so `key_by_row` is the original id\nof every row of that table and nothing else. Only one rel table has\nto carry it: a lookup finds the index through whichever table leaves\nthe node table, so the second one would be the same map written\ntwice."
+    },
+    {
       "id": "zu::zu1::graph::bulk_load_keyed",
       "kind": "function",
       "name": "bulk_load_keyed",
@@ -5218,6 +5344,20 @@
       "name": "read_key_list",
       "signature": "fn read_key_list(path: &std::path::Path) -> zu_common::Result<Vec<u64>>",
       "doc": "Reads a node key list, one u64 per line, skipping empty lines and\n`#` comments. Keys are original source ids too wide for dense rows;\nLDBC SNB ids are the motivating corpus."
+    },
+    {
+      "id": "zu::zu1::graph::read_node_csv",
+      "kind": "function",
+      "name": "read_node_csv",
+      "signature": "fn read_node_csv(path: &std::path::Path) -> zu_common::Result<zu_zu1::props::NodesWithProps>",
+      "doc": "Reads a node file: one row a line, the row's own id in the column the\nheader marked `:ID`, and every named column beside it a property of\nthat row.\n\nThe first line is the header, always, which is the one place this\ndiffers from [`read_edge_csv_with_props`]. An edge file can be two\nintegers a line and still be a graph; a node file with no header\nnames no property and no id, so there is nothing to read it as.\n\nThe row an id gets is the line it was written on, counting from zero\npast the header. A rel file names its endpoints by id and the loader\nmaps them through that, so the order of a node file is the order of\nthe table it loads as, and nothing else decides it."
+    },
+    {
+      "id": "zu::zu1::graph::read_rel_csv_keyed",
+      "kind": "function",
+      "name": "read_rel_csv_keyed",
+      "signature": "fn read_rel_csv_keyed(path: &std::path::Path) -> zu_common::Result<zu_zu1::props::KeyedEdgesWithProps>",
+      "doc": "Reads a rel file whose endpoints are the ids a node file gave its\nrows rather than row offsets, together with the edge property columns\nthe header names.\n\nThe ids stay as they were written. Which row of which node table each\none is takes both node files to answer, and this reads one file, so\nthe translation belongs to the loader that holds all of them."
     },
     {
       "id": "zu::zu1::ingest",
@@ -5362,6 +5502,13 @@
       "doc": "An edge list and one owned column per edge property, which is the\npair every reader outside the file produces: the edges in the order\nthe source had them and one value per edge in the same order."
     },
     {
+      "id": "zu::zu1::props::KeyedEdgesWithProps",
+      "kind": "type-alias",
+      "name": "KeyedEdgesWithProps",
+      "signature": "(Vec<(u64, u64)>, Vec<OwnedColumn>)",
+      "doc": "The same pair for a rel file that names its endpoints by the ids a\nnode file gave its rows rather than by row offsets, which is what a\ndataset of many node tables is written with. Which row of which table\neach id is takes every node file to answer, so the translation is the\nloader's and not the reader's."
+    },
+    {
       "id": "zu::zu1::props::ListElement",
       "kind": "enum",
       "name": "ListElement",
@@ -5380,6 +5527,13 @@
       "name": "Word",
       "of": "zu::zu1::props::ListElement",
       "signature": "Word(u64)"
+    },
+    {
+      "id": "zu::zu1::props::NodesWithProps",
+      "kind": "type-alias",
+      "name": "NodesWithProps",
+      "signature": "(Vec<u64>, Vec<OwnedColumn>)",
+      "doc": "A node file read whole: the id of every row in row order, and one\nowned column per property the header named."
     },
     {
       "id": "zu::zu1::props::OwnedColumn",
@@ -5861,6 +6015,13 @@
       "name": "store_props_nullable",
       "signature": "fn store_props_nullable(db: &mut zu_zu1::file::Zu1File, node_table: &str, columns: &[PropInput]) -> zu_common::Result<PropsDirectory>",
       "doc": "The same store, for columns some rows of which hold no value."
+    },
+    {
+      "id": "zu::zu1::props::store_props_owned",
+      "kind": "function",
+      "name": "store_props_owned",
+      "signature": "fn store_props_owned(db: &mut zu_zu1::file::Zu1File, node_table: &str, columns: &[OwnedColumn]) -> zu_common::Result<PropsDirectory>",
+      "doc": "The same store, for columns a caller holds whole rather than as\nborrowed slices, which is what a node file read off disk produces.\n\nThis is [`store_rel_props_owned`] over a node table, and it exists\nfor the same reason: `PropValues::Str` wants a slice of slices and an\nowned column has a vector of vectors, so the pointers have to live\nsomewhere for the length of the call."
     },
     {
       "id": "zu::zu1::props::store_rel_props",

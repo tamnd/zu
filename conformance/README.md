@@ -19,6 +19,11 @@ cargo run -p xtask -- corpus-pack           # target/conformance-<version>.tar.z
 cargo run -p xtask -- corpus-pack --check   # pack and report, writing nothing
 ```
 
+```
+cc -std=c99 -Wall -Wextra -Werror -o yaml_test conformance/c/yaml.c conformance/c/yaml_test.c
+./yaml_test conformance/cases/*.yaml          # the same files through the C reader
+```
+
 The Rust runner in `crates/zu-corpus` is the first of nine and the reference for the rest. When a runner in another language disagrees with it about a case, the Rust one is right by definition: the cases and the engine version together are the contract, and this runner is the one compiled against the engine that defines it.
 
 Every case gets a database of its own. Cases are written as if nothing came before them, and the cheapest way to keep that true is to make it true. A case that leaked a table into the next one would be a failure that moves when the file is reordered, which is the worst kind to be handed. A suite with a `load:` gets it applied to each of those databases in turn, for the same reason.
@@ -157,3 +162,5 @@ A strict block-only subset, not general YAML: two-space indent, no tabs, `- ` wi
 The reason is the reason the TOML reader gives: a construct silently reinterpreted is a case that says one thing to a reviewer and another to the runner, and a corpus whose whole job is to settle disagreements cannot afford to be one of them. Block scalars are refused in particular so that a `doc:` is one unwrapped line, which is the same rule the repository's markdown follows.
 
 Comments are found by the one rule that matters to a case writer: a `#` starts a comment only with whitespace before it, and a quote hides a `#` only if it opens after whitespace and closes on the same line. That last clause is what lets a `query:` hold `cast('  42  ' AS INT64)`, whose closing quote has a space before it and so looks like an opening one. A quote that opens nothing that closes was not a run.
+
+There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 555 files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.

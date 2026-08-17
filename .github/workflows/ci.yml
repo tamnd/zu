@@ -354,6 +354,22 @@ jobs:
       # out it does not hold.
       - run: cargo run -p xtask -- corpus-pack --check
       - run: cargo bench -p xtask --bench corpus
+      # The second reader of the same files, in the language the C
+      # runner is written in. It runs over every case rather than over
+      # a handful of literals, because 555 files of hand written YAML
+      # are a better adversary than anything a test would think to
+      # write, and it runs under both sanitizers, because a reader in C
+      # over files nobody validated first is exactly where a bad index
+      # lives. `-fno-sanitize-recover` because UBSan prints and carries
+      # on by default, and a report nothing acts on is a report nobody
+      # reads.
+      - name: The C reader over every case
+        run: |
+          cc -std=c99 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer \
+            -o "$RUNNER_TEMP/yaml_test" conformance/c/yaml.c conformance/c/yaml_test.c
+          "$RUNNER_TEMP/yaml_test" conformance/cases/*.yaml
 
   terms:
     runs-on: ubuntu-latest

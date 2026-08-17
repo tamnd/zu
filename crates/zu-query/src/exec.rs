@@ -4072,6 +4072,34 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     .ok_or_else(|| invalid(format!("{name} source {key} names no node")))?;
                 vals[0] = Value::Int(offset as i64);
             }
+            // The same resolution over a list, with one difference: a
+            // sample drawn against a bigger graph names rows this table
+            // does not have, and the kernel counts nothing for those
+            // rather than failing the query over them.
+            if matches!(func, TableFunc::Betweenness) {
+                let Some(Value::List(items)) = vals.first() else {
+                    return Err(invalid(format!(
+                        "betweenness's sources must be a list of node ids, got {:?}",
+                        vals.first()
+                    )));
+                };
+                let mut offsets = Vec::with_capacity(items.len());
+                for item in items {
+                    let Value::Int(key) = item else {
+                        return Err(invalid(format!(
+                            "betweenness's sources must be node ids, got {item:?}"
+                        )));
+                    };
+                    let found = u64::try_from(*key)
+                        .ok()
+                        .and_then(|k| ctx.graph.lookup_key(*table, k).transpose())
+                        .transpose()?;
+                    if let Some(offset) = found {
+                        offsets.push(Value::Int(offset as i64));
+                    }
+                }
+                vals[0] = Value::List(offsets);
+            }
             let rows = ctx.graph.table_function(func.name(), *rel, &vals)?;
             // The kernel answers for every row of the table's extent,
             // deleted rows included, because it walks an adjacency
@@ -6073,6 +6101,23 @@ mod tests {
                 "lcc" => Ok((0..n)
                     .map(|o| vec![Value::Float(o as f64 / 100.0)])
                     .collect()),
+                "triangle_count" => Ok((0..n).map(|o| vec![Value::Int(o + 1)]).collect()),
+                // The stub scores the sources themselves, which is
+                // enough to show the list arrived and resolved.
+                "betweenness" => {
+                    let Some(Value::List(sources)) = args.first() else {
+                        return Err(invalid("mock betweenness needs a source list".into()));
+                    };
+                    Ok((0..n)
+                        .map(|o| {
+                            vec![Value::Float(if sources.contains(&Value::Int(o)) {
+                                1.0
+                            } else {
+                                0.0
+                            })]
+                        })
+                        .collect())
+                }
                 "sssp" => {
                     let Some(Value::Int(source)) = args.first() else {
                         return Err(invalid("mock sssp needs a source".into()));

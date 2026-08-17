@@ -643,6 +643,30 @@ impl Graph for Zu1Graph<'_> {
                 .into_iter()
                 .map(|coeff| vec![Value::Float(coeff)])
                 .collect()),
+            "betweenness" => {
+                let Some(Value::List(sources)) = args.first() else {
+                    return Err(ZuError::InvalidArgument(
+                        "betweenness needs a list of source node offsets".into(),
+                    ));
+                };
+                let mut offsets = Vec::with_capacity(sources.len());
+                for source in sources {
+                    let Value::Int(offset) = source else {
+                        return Err(ZuError::InvalidArgument(format!(
+                            "betweenness's sources must be node offsets, got {source:?}"
+                        )));
+                    };
+                    offsets.push(*offset as u64);
+                }
+                Ok(algo::betweenness(db, reader, &offsets)?
+                    .into_iter()
+                    .map(|score| vec![Value::Float(score)])
+                    .collect())
+            }
+            "triangle_count" => Ok(algo::triangle_count(db, reader)?
+                .into_iter()
+                .map(|corners| vec![Value::Int(corners as i64)])
+                .collect()),
             "louvain" => Ok(algo::louvain(db, reader)?
                 .into_iter()
                 .map(|label| vec![Value::Int(label as i64)])
@@ -2028,6 +2052,49 @@ mod tests {
         )
         .expect("compose");
         assert_eq!(r.rows, [[Value::Int(1)]]);
+    }
+
+    #[test]
+    fn triangle_count_runs_through_call_and_sums_to_the_gap_figure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("triangles.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // A closed triple 0 1 2, a fourth node joined to two of them so
+        // it closes a second triangle, and a fifth hanging off the end
+        // closing nothing.
+        let edges: [(u32, u32); 6] = [(0, 1), (0, 2), (1, 2), (1, 3), (2, 3), (3, 4)];
+        graph::bulk_load_as(&mut db, "person", "follows", 5, &edges).expect("load");
+        drop(db);
+        let mut db = Zu1File::open(&path).expect("open");
+
+        let r = run(
+            "CALL triangle_count('follows') YIELD node, triangles \
+             RETURN node.id AS id, triangles ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("triangle_count");
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Int(1)],
+                [Value::Int(1), Value::Int(2)],
+                [Value::Int(2), Value::Int(2)],
+                [Value::Int(3), Value::Int(1)],
+                [Value::Int(4), Value::Int(0)],
+            ]
+        );
+
+        // The whole-graph figure, which is the sum over corners with
+        // each triangle's three of them divided back out.
+        let r = run(
+            "CALL triangle_count('follows') YIELD node, triangles \
+             WITH sum(triangles) AS corners RETURN corners / 3 AS triangles",
+            &mut db,
+            &[],
+        )
+        .expect("total");
+        assert_eq!(r.rows, [[Value::Int(2)]]);
     }
 
     #[test]

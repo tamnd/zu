@@ -1,5 +1,5 @@
 //! Whole-graph table function kernels: bfs, pagerank, wcc, sssp, cdlp,
-//! lcc, louvain (docs/07 §4, TableFunction). Each kernel runs directly
+//! lcc, triangle_count, louvain (docs/07 §4, TableFunction). Each kernel runs directly
 //! on a rel table's CSR through [`GraphReader`], one sequential sweep per
 //! iteration so the per-direction group cache decodes every group once
 //! per pass, and returns one value per node in dense row order. The
@@ -657,6 +657,278 @@ pub fn lcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<f64>> {
     Ok(coeff)
 }
 
+/// A list this many times longer than the one it is being intersected
+/// with is searched rather than walked. A merge costs the sum of the
+/// two lengths and a search costs the short one times the log of the
+/// long one, so the crossover is where the log stops paying, and on a
+/// power law graph the pairing of a hub with a leaf is most of the
+/// work.
+const GALLOP_RATIO: usize = 32;
+
+/// Members two sorted lists of distinct ids have in common. Each one
+/// found adds to its own count, which is the third corner of a triangle
+/// whose other two are the nodes the lists belong to.
+fn intersect(a: &[u32], b: &[u32], counts: &mut [u64]) -> u64 {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.is_empty() {
+        return 0;
+    }
+    let mut hits = 0;
+    if long.len() >= short.len().saturating_mul(GALLOP_RATIO) {
+        // Every search starts where the last one ended, so the whole
+        // pass over the short list walks the long one once at worst and
+        // the log is on what is left rather than on all of it.
+        let mut rest = long;
+        for &x in short {
+            let at = rest.partition_point(|&y| y < x);
+            rest = &rest[at..];
+            match rest.first() {
+                Some(&y) if y == x => {
+                    counts[x as usize] += 1;
+                    hits += 1;
+                    rest = &rest[1..];
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        return hits;
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < short.len() && j < long.len() {
+        match short[i].cmp(&long[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                counts[short[i] as usize] += 1;
+                hits += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    hits
+}
+
+/// Undirected triangles, one count per node: how many triangles that
+/// node is a corner of. The single figure the GAP TC kernel reports is
+/// the sum over nodes divided by three, a triangle being counted once
+/// at each of its corners.
+///
+/// Direction is dropped and a pair joined more than once is still one
+/// adjacency. A triangle is three nodes that all know each other, and
+/// how many stored edges run between two of them does not make more of
+/// them, which is the same rule [`lcc`] closes a neighbor pair by.
+///
+/// The work is the forward algorithm. Every node keeps only the
+/// neighbors above it, so a triangle is looked at from its smallest
+/// corner and found once rather than six times, and the lists being
+/// intersected are half the length. That adjacency is built once into
+/// one flat `u32` array, four bytes a stored edge, because the shape
+/// this kernel wants from the reader is the list of a node somewhere
+/// else in the graph once per edge, and the group the reader decodes to
+/// answer that is thrown away by the question after it. Two sequential
+/// sweeps to build it cost two group decodes each; asking as it goes
+/// would cost one per edge.
+pub fn triangle_count(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
+    let domain = reader.directory().one_domain()?;
+    if domain > u32::MAX as u64 {
+        return Err(zu_common::ZuError::InvalidArgument(format!(
+            "triangle_count holds a node id in 4 bytes and this table has {domain} nodes"
+        )));
+    }
+    let n = domain as usize;
+    let mut counts = vec![0u64; n];
+    if n == 0 {
+        return Ok(counts);
+    }
+
+    // Pass one sizes each node's upward list. A stored edge lands on
+    // one list, its lower endpoint's, so the array is one slot an edge
+    // before the duplicates come out of it.
+    let mut offsets = vec![0u64; n + 1];
+    for v in 0..n {
+        for &d in reader.neighbors_dir(db, v as u64, Direction::Fwd)? {
+            let d = d as usize;
+            if d != v {
+                offsets[v.min(d) + 1] += 1;
+            }
+        }
+    }
+    for v in 0..n {
+        offsets[v + 1] += offsets[v];
+    }
+    let mut adj = vec![0u32; offsets[n] as usize];
+
+    // Pass two fills it. The cursor is the running write position per
+    // node, which is the offsets array again until it has been used up.
+    let mut cursor = offsets[..n].to_vec();
+    for v in 0..n {
+        for &d in reader.neighbors_dir(db, v as u64, Direction::Fwd)? {
+            let d = d as usize;
+            if d == v {
+                continue;
+            }
+            let (lo, hi) = if v < d { (v, d) } else { (d, v) };
+            adj[cursor[lo] as usize] = hi as u32;
+            cursor[lo] += 1;
+        }
+    }
+    drop(cursor);
+
+    // Sorted and without repeats, which is what the intersection reads
+    // and what makes a pair joined twice one adjacency. The unique run
+    // stays at the front of the node's slice and `lens` says how far it
+    // goes, so nothing is copied to close the gaps.
+    let mut lens = vec![0u32; n];
+    for v in 0..n {
+        let list = &mut adj[offsets[v] as usize..offsets[v + 1] as usize];
+        list.sort_unstable();
+        let mut kept = 0;
+        for i in 0..list.len() {
+            if i == 0 || list[i] != list[i - 1] {
+                list[kept] = list[i];
+                kept += 1;
+            }
+        }
+        lens[v] = kept as u32;
+    }
+
+    for v in 0..n {
+        let (vo, vl) = (offsets[v] as usize, lens[v] as usize);
+        let mut corners = 0;
+        for k in 0..vl {
+            let u = adj[vo + k] as usize;
+            let (uo, ul) = (offsets[u] as usize, lens[u] as usize);
+            let shared = intersect(&adj[vo..vo + vl], &adj[uo..uo + ul], &mut counts);
+            counts[u] += shared;
+            corners += shared;
+        }
+        counts[v] += corners;
+    }
+    Ok(counts)
+}
+
+/// Betweenness centrality accumulated from `sources` by Brandes, the
+/// GAP BC kernel. A node's score is how much of the shortest path
+/// traffic out of those sources runs through it: for every node the
+/// source reaches, each node in the middle of a shortest path to it
+/// takes the fraction of those paths that pass through. The scores are
+/// the unnormalized pair dependency sums, which is what the sampled GAP
+/// run reports, and a source that names no row contributes nothing
+/// rather than failing the run.
+///
+/// Stored direction, because the reference this is measured against
+/// relaxes out edges only. A pair joined twice is two shortest paths
+/// where a single edge is one, which is also what the reference counts:
+/// path counts are over edges and not over adjacencies, so a parallel
+/// edge really does double the traffic through the node it arrives at.
+///
+/// No predecessor lists. What the accumulation wants for a node is the
+/// nodes one level above it with an edge into it, and that is the
+/// node's in edges filtered by level, which the backward CSR already
+/// holds. Building the lists during the forward pass instead would cost
+/// an allocation a node and a second copy of the graph in memory, for
+/// something the file can answer.
+///
+/// Both passes go level by level, and a level is walked in row order so
+/// the nodes of one group are one run: a level decodes each group once
+/// rather than once per node in it. The accumulation is free to do that
+/// because the order inside a level does not matter to it, only that
+/// the levels are taken from the far end back.
+pub fn betweenness(
+    db: &mut Zu1File,
+    reader: &mut GraphReader,
+    sources: &[u64],
+) -> Result<Vec<f64>> {
+    let n = reader.directory().one_domain()? as usize;
+    let mut bc = vec![0.0f64; n];
+    if n == 0 {
+        return Ok(bc);
+    }
+    let mut dist = vec![u64::MAX; n];
+    let mut sigma = vec![0.0f64; n];
+    let mut delta = vec![0.0f64; n];
+    for &source in sources {
+        if source >= n as u64 {
+            continue;
+        }
+        dist.fill(u64::MAX);
+        sigma.fill(0.0);
+        delta.fill(0.0);
+        dist[source as usize] = 0;
+        sigma[source as usize] = 1.0;
+
+        // Forward pass: levels out of the source, and with them the
+        // number of shortest paths reaching each node.
+        let mut levels: Vec<Vec<u64>> = Vec::new();
+        let mut frontier = vec![source];
+        loop {
+            let depth = levels.len() as u64 + 1;
+            let mut next = Vec::new();
+            let mut at = 0;
+            while at < frontier.len() {
+                let (group, _) = locate(frontier[at]);
+                let mut end = at + 1;
+                while end < frontier.len() && locate(frontier[end]).0 == group {
+                    end += 1;
+                }
+                let (offsets, nbrs) = reader.csr_group(db, group, Direction::Fwd)?;
+                for &v in &frontier[at..end] {
+                    let (_, row) = locate(v);
+                    let paths = sigma[v as usize];
+                    for &far in &nbrs[offsets[row] as usize..offsets[row + 1] as usize] {
+                        if dist[far as usize] == u64::MAX {
+                            dist[far as usize] = depth;
+                            next.push(far);
+                        }
+                        if dist[far as usize] == depth {
+                            sigma[far as usize] += paths;
+                        }
+                    }
+                }
+                at = end;
+            }
+            levels.push(frontier);
+            if next.is_empty() {
+                break;
+            }
+            next.sort_unstable();
+            frontier = next;
+        }
+
+        // Backward pass: a node's dependency is its own share of the
+        // traffic through it plus what the level below sends back, and
+        // it is complete before the level above reads it.
+        for depth in (1..levels.len()).rev() {
+            let level = &levels[depth];
+            let mut at = 0;
+            while at < level.len() {
+                let (group, _) = locate(level[at]);
+                let mut end = at + 1;
+                while end < level.len() && locate(level[end]).0 == group {
+                    end += 1;
+                }
+                let (offsets, nbrs) = reader.csr_group(db, group, Direction::Bwd)?;
+                for &w in &level[at..end] {
+                    let (_, row) = locate(w);
+                    let share = (1.0 + delta[w as usize]) / sigma[w as usize];
+                    for &v in &nbrs[offsets[row] as usize..offsets[row + 1] as usize] {
+                        if dist[v as usize] == depth as u64 - 1 {
+                            delta[v as usize] += sigma[v as usize] * share;
+                        }
+                    }
+                }
+                at = end;
+            }
+            for &w in level {
+                bc[w as usize] += delta[w as usize];
+            }
+        }
+    }
+    Ok(bc)
+}
+
 /// Louvain community detection over the undirected view: repeated
 /// local-move sweeps in row order until a full sweep moves nothing,
 /// then one aggregation level, repeated until aggregation stops
@@ -1116,6 +1388,216 @@ mod tests {
     }
 
     #[test]
+    fn triangle_count_finds_one_triangle_from_all_three_corners() {
+        // A closed triple plus a wedge hanging off it. Every corner of
+        // the triangle scores one and nothing else scores at all, so
+        // the sum is three times the one triangle there is.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 2), (2, 3), (3, 4)], 5);
+        let counts = triangle_count(&mut db, &mut reader).expect("tc");
+        assert_eq!(counts, vec![1, 1, 1, 0, 0]);
+        assert_eq!(counts.iter().sum::<u64>() / 3, 1);
+    }
+
+    #[test]
+    fn triangle_count_reads_edges_undirected() {
+        // Stored the three edges run 0 -> 1 -> 2 -> 0, a cycle, and
+        // 0 -> 1, 0 -> 2, 1 -> 2, a DAG. Both are the same triangle
+        // once direction is dropped, which is the graph TC counts.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (1, 2), (2, 0)], 3);
+        assert_eq!(
+            triangle_count(&mut db, &mut reader).expect("tc"),
+            vec![1, 1, 1]
+        );
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 2)], 3);
+        assert_eq!(
+            triangle_count(&mut db, &mut reader).expect("tc"),
+            vec![1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn triangle_count_ignores_self_loops_and_repeated_pairs() {
+        // Neither a loop nor a second copy of an edge is a third node,
+        // so neither makes a triangle and neither makes more of the one
+        // triangle that is there.
+        let (_dir, mut db, mut reader) =
+            open_with(&[(0, 0), (0, 1), (0, 1), (1, 0), (0, 2), (1, 2), (2, 2)], 3);
+        assert_eq!(
+            triangle_count(&mut db, &mut reader).expect("tc"),
+            vec![1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn triangle_count_matches_a_brute_force_pass_over_hubs_and_leaves() {
+        // A hub joined to everyone, a second smaller hub, and a ring
+        // through the rest. The degrees are far enough apart that the
+        // intersection takes the searching path for the hub against a
+        // leaf and the merging path between two leaves, so a mistake on
+        // either side of the threshold shows up as a disagreement with
+        // the reference below.
+        const N: u32 = 60;
+        let mut edges = vec![];
+        for v in 1..N {
+            edges.push((0, v));
+            edges.push((v, v % (N - 1) + 1));
+        }
+        for v in 30..N {
+            edges.push((1, v));
+        }
+        let mut want = vec![0u64; N as usize];
+        let mut nbrs: Vec<std::collections::BTreeSet<u32>> = vec![Default::default(); N as usize];
+        for &(s, d) in &edges {
+            if s != d {
+                nbrs[s as usize].insert(d);
+                nbrs[d as usize].insert(s);
+            }
+        }
+        for v in 0..N as usize {
+            let list: Vec<u32> = nbrs[v].iter().copied().collect();
+            for (i, &a) in list.iter().enumerate() {
+                for &b in &list[i + 1..] {
+                    if nbrs[a as usize].contains(&b) {
+                        want[v] += 1;
+                    }
+                }
+            }
+        }
+        assert!(want.iter().sum::<u64>() > 0, "fixture has no triangles");
+        let (_dir, mut db, mut reader) = open_with(&edges, N as u64);
+        assert_eq!(triangle_count(&mut db, &mut reader).expect("tc"), want);
+    }
+
+    #[test]
+    fn betweenness_puts_a_chain_on_the_nodes_in_the_middle() {
+        // 0 -> 1 -> 2 -> 3 from source 0: node 1 is on the way to both
+        // 2 and 3, node 2 on the way to 3 alone, and the source and the
+        // far end are in the middle of nothing.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (1, 2), (2, 3)], 4);
+        assert_eq!(
+            betweenness(&mut db, &mut reader, &[0]).expect("bc"),
+            vec![0.0, 2.0, 1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn betweenness_splits_a_pair_of_equally_short_ways_round() {
+        // Two shortest paths from 0 to 3, so each middle node carries
+        // half the traffic rather than all of it.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 3), (2, 3)], 4);
+        assert_eq!(
+            betweenness(&mut db, &mut reader, &[0]).expect("bc"),
+            vec![0.0, 0.5, 0.5, 0.0]
+        );
+    }
+
+    #[test]
+    fn betweenness_counts_a_parallel_edge_as_a_second_way_through() {
+        // 0 -> 1 twice and 0 -> 2 once, both joining at 3. Two of the
+        // three shortest paths to 3 go through 1, which is what makes
+        // path counts a count of edges rather than of adjacencies.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 1), (0, 2), (1, 3), (2, 3)], 4);
+        let bc = betweenness(&mut db, &mut reader, &[0]).expect("bc");
+        assert!((bc[1] - 2.0 / 3.0).abs() < 1e-12, "{bc:?}");
+        assert!((bc[2] - 1.0 / 3.0).abs() < 1e-12, "{bc:?}");
+        assert_eq!((bc[0], bc[3]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn betweenness_sums_its_sources_and_skips_the_ones_that_name_no_row() {
+        // The sampled GAP run adds one source's dependencies to the
+        // next, and a sample drawn against a bigger graph can name a
+        // row this one does not have. Missing sources contribute
+        // nothing rather than failing the run.
+        let edges = [(0, 1), (1, 2), (2, 3), (3, 0)];
+        let (_dir, mut db, mut reader) = open_with(&edges, 4);
+        let from_zero = betweenness(&mut db, &mut reader, &[0]).expect("bc");
+        let from_two = betweenness(&mut db, &mut reader, &[2]).expect("bc");
+        let both = betweenness(&mut db, &mut reader, &[0, 2]).expect("bc");
+        for v in 0..4 {
+            assert!((both[v] - (from_zero[v] + from_two[v])).abs() < 1e-12);
+        }
+        assert_eq!(
+            betweenness(&mut db, &mut reader, &[0, 99]).expect("bc"),
+            from_zero
+        );
+        assert_eq!(
+            betweenness(&mut db, &mut reader, &[]).expect("bc"),
+            vec![0.0; 4]
+        );
+    }
+
+    #[test]
+    fn betweenness_matches_a_brute_force_pass_over_a_graph_with_choices() {
+        // A ring with chords, where most pairs have more than one way
+        // between them and the levels run deep enough that the backward
+        // pass has to take them in order. The reference below is
+        // Brandes written the other way round: every path counted, then
+        // every node's share of the ones that pass through it.
+        const N: u64 = 24;
+        let mut edges = vec![];
+        for v in 0..N as u32 {
+            edges.push((v, (v + 1) % N as u32));
+            edges.push((v, (v + 5) % N as u32));
+            edges.push((v, (v + 7) % N as u32));
+        }
+        let (_dir, mut db, mut reader) = open_with(&edges, N);
+        let sources = [0u64, 5, 17];
+        let got = betweenness(&mut db, &mut reader, &sources).expect("bc");
+
+        let mut want = vec![0.0f64; N as usize];
+        for &s in &sources {
+            // Path counts by level, then dependencies by the same rule
+            // written over an adjacency matrix rather than a CSR.
+            let mut dist = vec![u64::MAX; N as usize];
+            let mut sigma = vec![0.0f64; N as usize];
+            dist[s as usize] = 0;
+            sigma[s as usize] = 1.0;
+            let mut order = vec![s];
+            let mut at = 0;
+            while at < order.len() {
+                let v = order[at];
+                at += 1;
+                for &(a, b) in &edges {
+                    if a as u64 != v {
+                        continue;
+                    }
+                    let b = b as usize;
+                    if dist[b] == u64::MAX {
+                        dist[b] = dist[v as usize] + 1;
+                        order.push(b as u64);
+                    }
+                    if dist[b] == dist[v as usize] + 1 {
+                        sigma[b] += sigma[v as usize];
+                    }
+                }
+            }
+            let mut delta = vec![0.0f64; N as usize];
+            for &w in order.iter().rev() {
+                for &(a, b) in &edges {
+                    if b as u64 != w || dist[a as usize] + 1 != dist[w as usize] {
+                        continue;
+                    }
+                    delta[a as usize] +=
+                        sigma[a as usize] / sigma[w as usize] * (1.0 + delta[w as usize]);
+                }
+                if w != s {
+                    want[w as usize] += delta[w as usize];
+                }
+            }
+        }
+        for v in 0..N as usize {
+            assert!(
+                (got[v] - want[v]).abs() < 1e-9,
+                "node {v}: kernel {} reference {}",
+                got[v],
+                want[v]
+            );
+        }
+        assert!(want.iter().sum::<f64>() > 0.0, "fixture has no paths");
+    }
+
+    #[test]
     fn empty_graphs_run_every_kernel_cleanly() {
         let (_dir, mut db, mut reader) = open_with(&[], 0);
         assert!(
@@ -1124,6 +1606,16 @@ mod tests {
                 .is_empty()
         );
         assert!(wcc(&mut db, &mut reader).expect("wcc").is_empty());
+        assert!(
+            triangle_count(&mut db, &mut reader)
+                .expect("triangle_count")
+                .is_empty()
+        );
+        assert!(
+            betweenness(&mut db, &mut reader, &[0])
+                .expect("betweenness")
+                .is_empty()
+        );
         assert!(sssp(&mut db, &mut reader, 0).expect("sssp").is_empty());
         assert!(bfs(&mut db, &mut reader, 0).expect("bfs").is_empty());
         assert!(

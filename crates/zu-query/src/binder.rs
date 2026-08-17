@@ -1076,6 +1076,11 @@ pub enum TableFunc {
     SsspWeighted,
     Cdlp,
     Lcc,
+    /// Undirected triangles a node is a corner of. Takes nothing.
+    TriangleCount,
+    /// Shortest path traffic through a node, accumulated from a list of
+    /// sources. Takes that list.
+    Betweenness,
     Louvain,
 }
 
@@ -1089,6 +1094,8 @@ impl TableFunc {
             "sssp_weighted" => TableFunc::SsspWeighted,
             "cdlp" => TableFunc::Cdlp,
             "lcc" => TableFunc::Lcc,
+            "triangle_count" => TableFunc::TriangleCount,
+            "betweenness" => TableFunc::Betweenness,
             "louvain" => TableFunc::Louvain,
             _ => return None,
         })
@@ -1104,6 +1111,8 @@ impl TableFunc {
             TableFunc::SsspWeighted => "sssp_weighted",
             TableFunc::Cdlp => "cdlp",
             TableFunc::Lcc => "lcc",
+            TableFunc::TriangleCount => "triangle_count",
+            TableFunc::Betweenness => "betweenness",
             TableFunc::Louvain => "louvain",
         }
     }
@@ -1119,6 +1128,8 @@ impl TableFunc {
             TableFunc::Sssp | TableFunc::SsspWeighted => ("distance", Type::Int),
             TableFunc::Cdlp => ("community", Type::Int),
             TableFunc::Lcc => ("coefficient", Type::Float),
+            TableFunc::TriangleCount => ("triangles", Type::Int),
+            TableFunc::Betweenness => ("centrality", Type::Float),
             TableFunc::Louvain => ("community", Type::Int),
         }
     }
@@ -1580,7 +1591,8 @@ impl Binder<'_> {
         let func = TableFunc::resolve(name).ok_or_else(|| {
             invalid(format!(
                 "unknown table function '{name}', the v0 functions are \
-                 pagerank, wcc, bfs, sssp, sssp_weighted, cdlp, lcc, louvain"
+                 pagerank, wcc, bfs, sssp, sssp_weighted, cdlp, lcc, \
+                 triangle_count, betweenness, louvain"
             ))
         })?;
         // The rel table must resolve at bind time, so the first
@@ -1645,6 +1657,24 @@ impl Binder<'_> {
                     return Err(invalid(
                         "sssp_weighted's weight column must be a string literal".into(),
                     ));
+                }
+            }
+            TableFunc::Betweenness => {
+                // The sources are a list and not a single node,
+                // because the score a node gets is a sum over the
+                // sample and running the sample one source at a time
+                // would be one pass of the graph per source with the
+                // adding left to the caller.
+                if bound_args.len() != 1 {
+                    return Err(invalid(
+                        "betweenness takes the rel table and a list of source node ids".into(),
+                    ));
+                }
+                if !matches!(bound_args[0].1, Type::List(_) | Type::Any) {
+                    return Err(invalid(format!(
+                        "betweenness's sources must be a list of node ids, got {}",
+                        bound_args[0].1
+                    )));
                 }
             }
             TableFunc::Cdlp => {

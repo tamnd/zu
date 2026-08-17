@@ -30,7 +30,7 @@ Parser (MATCH/WHERE/RETURN/WITH/UNWIND core), binder, DP join order with degree 
 WAL, single-writer commit, overlays, checkpoint, recovery, crash-injection harness; sqlite engine complete; differential testing online. **Exit: §08 invariants under fault harness; TCK-subset parity zu1↔sqlite.**
 
 ### M4, Recursion + WCOJ + algorithms
-RecursiveBFS (hybrid morsels), path modes/selectors, PMR path returns, bidirectional shortest, MultiwayIntersect + optimizer injection, COLOR summaries + pessimistic bounds, table functions (pagerank, wcc, sssp, louvain). **Exit: B5; Graphalytics kernels; SNB IC13/14-class path queries.**
+RecursiveBFS (hybrid morsels), path modes/selectors, PMR path returns, bidirectional shortest, MultiwayIntersect + optimizer injection, COLOR summaries + pessimistic bounds, table functions (pagerank, wcc, sssp, cdlp, lcc, louvain). **Exit: B5; Graphalytics kernels; SNB IC13/14-class path queries.**
 
 ### M5, s3 engine
 Manifest/CAS/fencing, WAL objects + durability modes, segment packs + footers, foyer integration, frontier prefetch, checkpoint/GC, request accountant, CAS conformance suite, partitions. **Exit: B9/B10; T9 scenario demonstrated on real S3 + R2; chaos suite green.**

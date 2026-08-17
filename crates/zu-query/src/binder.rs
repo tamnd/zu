@@ -1053,6 +1053,8 @@ pub enum TableFunc {
     Bfs,
     /// Hop levels over the undirected view. Takes a source.
     Sssp,
+    Cdlp,
+    Lcc,
     Louvain,
 }
 
@@ -1063,6 +1065,8 @@ impl TableFunc {
             "wcc" => TableFunc::Wcc,
             "bfs" => TableFunc::Bfs,
             "sssp" => TableFunc::Sssp,
+            "cdlp" => TableFunc::Cdlp,
+            "lcc" => TableFunc::Lcc,
             "louvain" => TableFunc::Louvain,
             _ => return None,
         })
@@ -1075,6 +1079,8 @@ impl TableFunc {
             TableFunc::Wcc => "wcc",
             TableFunc::Bfs => "bfs",
             TableFunc::Sssp => "sssp",
+            TableFunc::Cdlp => "cdlp",
+            TableFunc::Lcc => "lcc",
             TableFunc::Louvain => "louvain",
         }
     }
@@ -1088,6 +1094,8 @@ impl TableFunc {
             TableFunc::Wcc => ("component", Type::Int),
             TableFunc::Bfs => ("level", Type::Int),
             TableFunc::Sssp => ("distance", Type::Int),
+            TableFunc::Cdlp => ("community", Type::Int),
+            TableFunc::Lcc => ("coefficient", Type::Float),
             TableFunc::Louvain => ("community", Type::Int),
         }
     }
@@ -1536,7 +1544,8 @@ impl Binder<'_> {
     ) -> Result<BoundClause> {
         let func = TableFunc::resolve(name).ok_or_else(|| {
             invalid(format!(
-                "unknown table function '{name}', the v0 functions are pagerank, wcc, bfs, sssp, louvain"
+                "unknown table function '{name}', the v0 functions are \
+                 pagerank, wcc, bfs, sssp, cdlp, lcc, louvain"
             ))
         })?;
         // The rel table must resolve at bind time, so the first
@@ -1577,6 +1586,23 @@ impl Binder<'_> {
                     return Err(invalid(format!(
                         "{name}'s source must be a node id, got {}",
                         bound_args[0].1
+                    )));
+                }
+            }
+            TableFunc::Cdlp => {
+                // The round count is what makes label propagation
+                // reproducible, so it is spellable, and the default is
+                // the one Graphalytics fixed.
+                if bound_args.len() > 1 {
+                    return Err(invalid(
+                        "cdlp takes the rel table and an optional round count".into(),
+                    ));
+                }
+                if let Some((_, ty)) = bound_args.first()
+                    && !matches!(ty, Type::Int | Type::Any)
+                {
+                    return Err(invalid(format!(
+                        "cdlp's round count must be an integer, got {ty}"
                     )));
                 }
             }

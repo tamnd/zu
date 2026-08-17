@@ -5989,6 +5989,19 @@ mod tests {
                     .map(|o| vec![Value::Float(o as f64 / 10.0)])
                     .collect()),
                 "wcc" | "louvain" => Ok((0..n).map(|o| vec![Value::Int(o % 2)]).collect()),
+                // The round count is optional, so the stub reports what
+                // reached it rather than a label: that is the only part
+                // of cdlp the plumbing decides.
+                "cdlp" => {
+                    let rounds = match args.first() {
+                        Some(Value::Int(rounds)) => *rounds,
+                        _ => -1,
+                    };
+                    Ok((0..n).map(|_| vec![Value::Int(rounds)]).collect())
+                }
+                "lcc" => Ok((0..n)
+                    .map(|o| vec![Value::Float(o as f64 / 100.0)])
+                    .collect()),
                 "sssp" => {
                     let Some(Value::Int(source)) = args.first() else {
                         return Err(invalid("mock sssp needs a source".into()));
@@ -6714,6 +6727,31 @@ mod tests {
     }
 
     #[test]
+    fn call_passes_the_cdlp_round_count_or_leaves_it_to_the_kernel() {
+        let r = run(
+            "CALL cdlp('KNOWS', 4) YIELD node, community RETURN DISTINCT community",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[4]]);
+        let r = run(
+            "CALL cdlp('KNOWS') YIELD node, community RETURN DISTINCT community",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[-1]]);
+    }
+
+    #[test]
+    fn call_yields_the_lcc_coefficient_column() {
+        let r = run(
+            "CALL lcc('KNOWS') YIELD node, coefficient \
+             RETURN node.id AS id, coefficient ORDER BY id DESC LIMIT 1",
+            &[],
+        );
+        assert_eq!(r.columns, ["id", "coefficient"]);
+        assert_eq!(r.rows, [[Value::Int(5), Value::Float(0.05)]]);
+    }
+
+    #[test]
     fn call_rejects_bad_shapes_at_bind_time() {
         let schema = schema();
         for (source, want) in [
@@ -6736,6 +6774,18 @@ mod tests {
             (
                 "CALL sssp('KNOWS') YIELD node, distance RETURN distance",
                 "source node id",
+            ),
+            (
+                "CALL cdlp('KNOWS', 2, 3) YIELD node, community RETURN community",
+                "optional round count",
+            ),
+            (
+                "CALL cdlp('KNOWS', 'ten') YIELD node, community RETURN community",
+                "round count must be an integer",
+            ),
+            (
+                "CALL lcc('KNOWS', 1) YIELD node, coefficient RETURN coefficient",
+                "takes only the rel table",
             ),
             (
                 "MATCH (a:Person) CALL wcc('KNOWS') YIELD node, component RETURN component",

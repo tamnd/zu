@@ -143,7 +143,7 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
         let node = catalog.node_by_id(table).ok_or_else(|| {
             ZuError::InvalidArgument(format!("overlay names unknown node table {table}"))
         })?;
-        let (name, base, primary) = (node.name.clone(), node.node_count, node.primary_label());
+        let (base, primary) = (node.node_count, node.primary_label());
         // What the table has declared it may hold, which is what bounds
         // a label change: a bit outside it would leave a file that says
         // a row carries a label its table never declared.
@@ -161,7 +161,7 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
             )?;
         }
         if appended > 0 {
-            catalog.upsert_node(&name, base + appended)?;
+            catalog.grow_node(table, base + appended)?;
             grown.insert(table);
             changed = true;
         }
@@ -181,7 +181,7 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
             continue;
         }
         let edge_count = fold_rel(db, mvcc, &catalog, &mut index, &rel, epoch)?;
-        catalog.upsert_rel(&rel.name, rel.from, rel.to, edge_count)?;
+        catalog.set_edge_count(rel.id, edge_count)?;
         changed = true;
     }
     // Ingested segments are sealed into the rebuilt tables above, so

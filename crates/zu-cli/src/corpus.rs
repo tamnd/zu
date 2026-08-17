@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn a_case_ahead_of_the_engine_passes_until_strict_says_otherwise() {
         let dir = corpus_dir(
-            "  - name: ahead\n    doc: a case written ahead of the engine, which is allowed on purpose\n    query: START TRANSACTION\n    columns:\n      - n\n    rows:\n",
+            "  - name: ahead\n    doc: a case written ahead of the engine, which is allowed on purpose\n    query: MERGE (n:person)\n    columns:\n      - n\n    rows:\n",
         );
         assert_eq!(corpus(dir.path(), false, true), ExitCode::SUCCESS);
         assert_eq!(corpus(dir.path(), true, true), ExitCode::FAILURE);

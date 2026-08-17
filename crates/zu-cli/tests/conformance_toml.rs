@@ -156,7 +156,7 @@ fn verify_accepts_a_report_that_agrees_and_rejects_one_that_does_not() {
         "null-properties":true,"float-values":true,"boolean-values":true,
         "undirected-edges":true,"self-loops":true,"parallel-edges":true,
         "parallel-edge-properties":false},
-        "GQLStatus":true,"Parameters":true,"Transactions":false,
+        "GQLStatus":true,"Parameters":true,"Transactions":true,
         "MultipleStatements":true,"Isolated":true}},
         "cases":[{"id":"a","got_gqlstatus":"22012"}]}"#;
     let ok = dir.join("agree.json");

@@ -16,7 +16,7 @@ use crate::ast::{
     BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
     GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
     PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
-    RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, Statement, UnaryOp,
+    RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, Statement, TxnStmt, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -73,8 +73,7 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "MERGE", "FILTER", "LET", "NEXT", "START", "COMMIT", "ROLLBACK", "SESSION", "FINISH",
-    "FOR",
+    "CREATE", "MERGE", "FILTER", "LET", "NEXT", "SESSION", "FINISH", "FOR",
 ];
 
 /// Parses one zuQL query.
@@ -84,6 +83,10 @@ pub fn parse(source: &str) -> Result<Query> {
         Statement::Catalog(_) => Err(ZuError::gql(
             codes::C42001,
             "a catalog statement changes the file and answers no rows, so it runs through the session rather than the query path".to_string(),
+        )),
+        Statement::Transaction(_) => Err(ZuError::gql(
+            codes::C42001,
+            "a transaction statement says where a transaction begins or ends and reads nothing, so it runs through the session rather than the query path".to_string(),
         )),
     }
 }
@@ -98,6 +101,10 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         pos: 0,
         depth: 0,
     };
+    if parser.at_txn_stmt() {
+        let stmt = parser.parse_txn_stmt()?;
+        return Ok(Statement::Transaction(stmt));
+    }
     if parser.at_catalog_stmt() {
         let stmt = parser.parse_catalog_stmt()?;
         return Ok(Statement::Catalog(stmt));
@@ -200,6 +207,67 @@ impl Parser<'_> {
             }
             _ => Err(self.error(what)),
         }
+    }
+
+    /// Whether this statement says where a transaction begins or ends.
+    /// `START` opens nothing else, and `COMMIT` and `ROLLBACK` are
+    /// whole statements on their own.
+    fn at_txn_stmt(&self) -> bool {
+        self.at_kw("START") || self.at_kw("COMMIT") || self.at_kw("ROLLBACK")
+    }
+
+    /// `START TRANSACTION`, `COMMIT` and `ROLLBACK` (GT01), with the
+    /// access mode a start may carry (GT02).
+    ///
+    /// GQL writes the characteristics as a list because it has more of
+    /// them to come; the two that mean something here are the access
+    /// modes, and a list naming both modes names no mode, so it is
+    /// refused rather than resolved by order.
+    fn parse_txn_stmt(&mut self) -> Result<TxnStmt> {
+        let stmt = if self.eat_kw("COMMIT") {
+            TxnStmt::Commit
+        } else if self.eat_kw("ROLLBACK") {
+            TxnStmt::Rollback
+        } else {
+            self.expect_kw("START")?;
+            self.expect_kw("TRANSACTION")?;
+            let mut read_only = None;
+            loop {
+                let mode = if self.at_kw("READ") && self.kw_at(1, "ONLY") {
+                    true
+                } else if self.at_kw("READ") && self.kw_at(1, "WRITE") {
+                    false
+                } else {
+                    break;
+                };
+                self.pos += 2;
+                if read_only.is_some_and(|already| already != mode) {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        "a transaction is read only or it is read write, and this one is written both".to_string(),
+                    ));
+                }
+                read_only = Some(mode);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            TxnStmt::Start {
+                read_only: read_only.unwrap_or(false),
+            }
+        };
+        self.eat(&TokenKind::Semicolon);
+        if let Some(token) = self.peek() {
+            return Err(ZuError::gql_at(
+                codes::C42001,
+                position(self.source, token.start),
+                format_args!(
+                    "nothing may follow a transaction statement, found {}",
+                    token.kind.describe()
+                ),
+            ));
+        }
+        Ok(stmt)
     }
 
     /// Whether this statement changes the catalog rather than reading
@@ -2025,7 +2093,14 @@ mod tests {
     fn catalog_stmt(source: &str) -> CatalogStmt {
         match parse_statement(source).expect("parse") {
             Statement::Catalog(stmt) => stmt,
-            Statement::Query(_) => panic!("parsed as a query"),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    fn txn_stmt(source: &str) -> TxnStmt {
+        match parse_statement(source).expect("parse") {
+            Statement::Transaction(stmt) => stmt,
+            other => panic!("parsed as {other:?}"),
         }
     }
 
@@ -2384,9 +2459,6 @@ mod tests {
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
         for (source, kw) in [
-            ("START TRANSACTION READ WRITE", "START"),
-            ("COMMIT", "COMMIT"),
-            ("ROLLBACK", "ROLLBACK"),
             ("SESSION SET VALUE $x = 1", "SESSION"),
             ("MATCH (p) FINISH", "FINISH"),
             ("FOR x IN [1, 2] RETURN x", "FOR"),
@@ -2397,6 +2469,41 @@ mod tests {
                 "{source:?} was refused with {err:?}, which does not name {kw}"
             );
         }
+    }
+
+    #[test]
+    fn a_transaction_starts_read_write_unless_it_says_otherwise() {
+        assert_eq!(
+            txn_stmt("START TRANSACTION"),
+            TxnStmt::Start { read_only: false }
+        );
+        assert_eq!(
+            txn_stmt("start transaction read only"),
+            TxnStmt::Start { read_only: true }
+        );
+        assert_eq!(
+            txn_stmt("START TRANSACTION READ WRITE"),
+            TxnStmt::Start { read_only: false }
+        );
+        assert_eq!(txn_stmt("COMMIT"), TxnStmt::Commit);
+        assert_eq!(txn_stmt("ROLLBACK;"), TxnStmt::Rollback);
+    }
+
+    #[test]
+    fn a_transaction_statement_says_what_it_could_not_read() {
+        assert!(
+            catalog_err("START TRANSACTION READ ONLY, READ WRITE").contains("written both"),
+            "a transaction that is both is neither"
+        );
+        assert!(
+            catalog_err("START TRANSACTION MATCH (n) RETURN n")
+                .contains("nothing may follow a transaction statement")
+        );
+        assert!(catalog_err("START READ ONLY").contains("expected TRANSACTION"));
+        assert!(
+            parse_err("COMMIT").contains("runs through the session"),
+            "the query path does not run a statement that ends a transaction"
+        );
     }
 
     /// ORDER BY, SKIP and LIMIT belong to the projection that precedes

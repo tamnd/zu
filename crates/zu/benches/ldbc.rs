@@ -870,6 +870,7 @@ fn run_cardinality(
 fn run_table_functions(
     path: &std::path::Path,
     edges: &[(u32, u32)],
+    by_row: &[u64],
     node_count: u64,
 ) -> (f64, f64, f64, f64) {
     use zu::zu1::algo;
@@ -930,12 +931,21 @@ fn run_table_functions(
             parent[a as usize] = b;
         }
     }
-    let reference: Vec<u64> = (0..n as u32).map(|v| find(&mut parent, v) as u64).collect();
+    // The label of a component is the smallest person id in it, not
+    // the smallest row: this file is keyed and its rows are in load
+    // order, so the two are different numbers.
+    let roots: Vec<u32> = (0..n as u32).map(|v| find(&mut parent, v)).collect();
+    let mut smallest = vec![u64::MAX; n];
+    for (row, &root) in roots.iter().enumerate() {
+        let slot = &mut smallest[root as usize];
+        *slot = (*slot).min(by_row[row]);
+    }
+    let reference: Vec<u64> = roots.iter().map(|&r| smallest[r as usize]).collect();
     assert_eq!(labels, reference, "wcc labels disagree with the reference");
-    let components = labels
+    let components = roots
         .iter()
         .enumerate()
-        .filter(|(v, l)| **l == *v as u64)
+        .filter(|(v, r)| **r == *v as u32)
         .count();
     println!(
         "sf1 wcc: {components} components in {wcc_s:.3} s, labels match the edge-list reference"
@@ -1059,7 +1069,7 @@ fn main() {
     let ic_p50 = only("ic").then(|| run_ic_friends_of_friends(&path, &edges, &by_row, &profiles));
     let distinct_p50 = only("distinct").then(|| run_distinct_two_hop(&path, &edges, &by_row));
     let cardinality = only("cardinality").then(|| run_cardinality(&path, &by_row, &profiles));
-    let kernels = only("call").then(|| run_table_functions(&path, &edges, node_count));
+    let kernels = only("call").then(|| run_table_functions(&path, &edges, &by_row, node_count));
 
     let (q50, q90, q99, qmax, violations) = cardinality.unwrap_or_default();
     let (pagerank_s, wcc_s, sssp_s, louvain_s) = kernels.unwrap_or_default();

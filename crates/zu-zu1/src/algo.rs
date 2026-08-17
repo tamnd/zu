@@ -166,8 +166,16 @@ fn power_iteration(
 
 /// Weakly connected components over the undirected view of the rel
 /// table: union-find over the forward lists, which name every edge
-/// once. Each node's component id is the smallest row in it, the
-/// Graphalytics convention.
+/// once. Each node's component id is the smallest id in the component,
+/// the Graphalytics convention.
+///
+/// The smallest id, not the smallest row. A load that reorders rows,
+/// which every load of a real graph does because degree order is what
+/// makes the CSR read well, leaves the two unrelated, and the caller
+/// that wanted a component id then has to join the answer back to the
+/// keys and take a minimum per group. That is a group-by and an unwind
+/// over the whole node table to repair an answer the kernel already
+/// had the parts of.
 pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
     let n = reader.directory().one_domain()? as usize;
     let mut parent: Vec<u64> = (0..n as u64).collect();
@@ -191,7 +199,25 @@ pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
             }
         }
     }
-    Ok((0..n as u64).map(|x| find(&mut parent, x)).collect())
+    let roots: Vec<u64> = (0..n as u64).map(|x| find(&mut parent, x)).collect();
+    // An unkeyed table is dense and the row is the id, so the roots
+    // are already the answer.
+    let Some(index) = reader.directory().keys.clone() else {
+        return Ok(roots);
+    };
+    let key = crate::keys::key_by_row(db, &index)?;
+    if key.len() != n {
+        return Err(zu_common::ZuError::Corrupt {
+            what: "key index",
+            detail: format!("{} keys over {n} nodes", key.len()),
+        });
+    }
+    let mut smallest = vec![u64::MAX; n];
+    for (row, &root) in roots.iter().enumerate() {
+        let slot = &mut smallest[root as usize];
+        *slot = (*slot).min(key[row]);
+    }
+    Ok(roots.iter().map(|&root| smallest[root as usize]).collect())
 }
 
 /// Single-source hop distances over the undirected view. Rel tables
@@ -709,11 +735,27 @@ mod tests {
     }
 
     #[test]
-    fn wcc_labels_components_by_their_smallest_row() {
-        // Two components, 0-1-2 and 3-4, direction ignored.
+    fn wcc_labels_components_by_their_smallest_id() {
+        // Two components, 0-1-2 and 3-4, direction ignored. The table
+        // is unkeyed, so the row is the id.
         let (_dir, mut db, mut reader) = open_with(&[(1, 0), (1, 2), (4, 3)], 5);
         let labels = wcc(&mut db, &mut reader).expect("wcc");
         assert_eq!(labels, [0, 0, 0, 3, 3]);
+    }
+
+    #[test]
+    fn wcc_labels_a_reordered_load_by_the_smallest_key_not_the_smallest_row() {
+        // Rows 0..3 hold keys 30, 10, 20, 40. The component on rows
+        // 0-1-2 is 10 and the one on row 3 is 40, and neither of those
+        // is the row a load in id order would have put them at.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Zu1File::create(&dir.path().join("keyed.zu1")).expect("create");
+        let edges = [(0u32, 1u32), (1, 2)];
+        crate::graph::bulk_load_keyed(&mut db, "n", "e", 4, &edges, Some(&[30, 10, 20, 40]))
+            .expect("load");
+        let mut reader = GraphReader::load(&mut db).expect("reader");
+        let labels = wcc(&mut db, &mut reader).expect("wcc");
+        assert_eq!(labels, [10, 10, 10, 40]);
     }
 
     #[test]

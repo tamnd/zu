@@ -74,12 +74,19 @@ impl Bracket {
 
 /// The hop range of a variable-length expand together with the path
 /// mode and selector that govern its enumeration (docs/07 §1, §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VarLength {
     pub min: Option<u64>,
     pub max: Option<u64>,
     pub mode: PathMode,
     pub selector: Option<Selector>,
+    /// The step's own `WHERE`, asked of every edge as the walk stands
+    /// on it, reading that edge out of `edge_slot`. An edge that fails
+    /// it is not walked, so neither are the paths through it, which is
+    /// the whole point of asking here rather than after the expansion
+    /// has enumerated them.
+    pub edge_filter: Option<BoundExpr>,
+    pub edge_slot: Option<usize>,
 }
 
 /// One operator tree. Children are boxed inputs; `Empty` is the single
@@ -442,6 +449,8 @@ fn build_path(
                 max,
                 mode: rel.mode,
                 selector: rel.selector,
+                edge_filter: rel.filter.clone(),
+                edge_slot: rel.edge_slot,
             }),
             into,
             asp: false,
@@ -449,6 +458,18 @@ fn build_path(
             bracket,
         };
         plan = prop_filters(plan, rel.slot, &rel.props, bracket);
+        // A single step's WHERE reads the one edge it walked, so it is
+        // an ordinary filter sitting on top of the expand. Only a
+        // variable-length step has to carry it inside.
+        if rel.range.is_none()
+            && let Some(expr) = &rel.filter
+        {
+            plan = LogicalPlan::Filter {
+                input: plan.boxed(),
+                expr: expr.clone(),
+                bracket,
+            };
+        }
         plan = label_filter(plan, node, bracket);
         plan = prop_filters(plan, node.slot, &node.props, bracket);
         from = node.slot;
@@ -586,6 +607,12 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                         Some(Selector::AnyShortest) => s.push_str(" any shortest"),
                         Some(Selector::AllShortest) => s.push_str(" all shortest"),
                         None => {}
+                    }
+                    // The step's own predicate prints inside the
+                    // brackets it was written in, because that is where
+                    // it runs: on the edge, before the walk takes it.
+                    if let Some(expr) = &v.edge_filter {
+                        let _ = write!(s, " WHERE {}", expr_text(expr, query));
                     }
                     s
                 }

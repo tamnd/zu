@@ -405,6 +405,11 @@ pub struct RelPattern {
     /// single hop, `Some((None, None))` is a bare `*`.
     pub range: Option<(Option<u64>, Option<u64>)>,
     pub props: Vec<(String, Expr)>,
+    /// A `WHERE` written inside the brackets, which every edge the
+    /// step walks has to satisfy. On a variable-length step the
+    /// variable names one edge at a time inside this predicate, and
+    /// the list of them everywhere else.
+    pub filter: Option<Box<Expr>>,
 }
 
 /// Which edges a pattern walks, and which way round.

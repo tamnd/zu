@@ -22,7 +22,7 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Result, Temporal, ZuError};
 use zu_query::ast::{Clause, Expr, LabelExpr, Literal, NodePattern, Query};
 
-use crate::zu1::catalog::Catalog;
+use crate::zu1::catalog::{Catalog, ElementKind};
 use crate::zu1::file::Zu1File;
 use crate::zu1::props::{PropInput, PropValues, store_props_for};
 
@@ -68,6 +68,7 @@ pub(crate) fn wanted(catalog: &Catalog, graph: u32, parsed: &Query) -> Result<Ve
                     agree(first, node)?;
                     continue;
                 }
+                promised(catalog, graph, name)?;
                 wanted.push(NewTable {
                     name: name.clone(),
                     columns: columns_of(name, node)?,
@@ -96,6 +97,45 @@ pub(crate) fn create(db: &mut Zu1File, graph: u32, tables: &[NewTable]) -> Resul
         store_props_for(db, id, 0, &columns)?;
     }
     Ok(())
+}
+
+/// Whether the graph's type leaves room for a table of this name.
+///
+/// A graph created with a closed type has said what its elements look
+/// like, and a table made out of a pattern is a shape nobody promised:
+/// its rows would carry a label the type either never mentions, which
+/// no element of the graph may carry, or mentions with properties of
+/// its own that the pattern knows nothing about. Both are refused, and
+/// the message says which one it is, because the answer to the second
+/// is to make the table the type describes and the answer to the first
+/// is that the graph is not for this.
+///
+/// A graph with no type or an open one promises nothing, which is every
+/// graph a zu1 file has held until now, so this answers yes.
+fn promised(catalog: &Catalog, graph: u32, name: &str) -> Result<()> {
+    let Some(ty) = catalog.closed_type_of(graph) else {
+        return Ok(());
+    };
+    let described = catalog.label_id(name).is_some_and(|id| {
+        ty.types_for(ElementKind::Node, 1 << id)
+            .iter()
+            .any(|e| e.labels.contains(&id))
+    });
+    let why = if described {
+        format!(
+            "graph type '{}' describes a node labelled '{name}' and says what it holds, which is not what this pattern says",
+            ty.name
+        )
+    } else {
+        format!(
+            "no element type of graph type '{}' describes a node labelled '{name}'",
+            ty.name
+        )
+    };
+    Err(ZuError::gql(
+        codes::CG2000,
+        format!("no node table is named '{name}' in this graph, and {why}"),
+    ))
 }
 
 /// The columns of a table made for one pattern: one per property, in
@@ -418,5 +458,38 @@ mod tests {
             .run("MATCH (c:city) RETURN c.name AS name ORDER BY name", &[])
             .expect("read");
         assert_eq!(strings(&after, 0), ["bath", "york"]);
+    }
+    /// A graph created with a closed type has said what its elements
+    /// look like, so a table made out of a pattern is a shape nobody
+    /// promised and the statement is refused rather than answered by
+    /// widening the graph behind the type's back.
+    #[test]
+    fn a_table_is_not_made_in_a_graph_whose_type_says_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "typed.zu1");
+        for stmt in [
+            "CREATE PROPERTY GRAPH TYPE t { (:person {name :: STRING, age :: INT}) }",
+            "CREATE GRAPH g TYPED t AS COPY OF home",
+        ] {
+            session.run(stmt, &[]).expect("the graph and its type");
+        }
+
+        let err = session
+            .run("USE g INSERT (c:city {name: 'york'})", &[])
+            .expect_err("the type does not describe a city");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("G2000"));
+        assert!(
+            err.to_string().contains("labelled 'city'"),
+            "the refusal names the element: {err}"
+        );
+
+        // The graph is as it was: a refusal that had made the table
+        // and then taken it back would leave the label dictionary
+        // holding a name for it.
+        assert!(session.catalog().label_id("city").is_none());
+        // And the graph that has no type still takes one.
+        session
+            .run("INSERT (c:city {name: 'york'})", &[])
+            .expect("the home graph promises nothing");
     }
 }

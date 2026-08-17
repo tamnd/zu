@@ -1925,9 +1925,9 @@ impl Binder<'_> {
     ///
     /// The element has to be in scope, because a statement changes what
     /// it found: a name no clause bound stands for nothing to change.
-    /// An edge is refused by name rather than by type, because its
-    /// properties are stored in the order its table holds its edges and
-    /// nothing writes into that order yet.
+    /// A node and an edge are both elements here, and which column the
+    /// key names is settled where the table's columns are, which is the
+    /// file rather than the schema the binder is given.
     fn bind_set_item(&mut self, item: &SetItem) -> Result<BoundSetItem> {
         let target = self.write_target("SET", &item.target)?;
         let mut ctx = ExprCtx::new(false);
@@ -1965,10 +1965,12 @@ impl Binder<'_> {
             )));
         };
         match self.variables[target].ty {
-            Type::Node => Ok(target),
-            Type::Rel => Err(not_yet(&format!(
-                "{verb} on an edge, whose properties are stored in the order its table holds its edges,"
-            ))),
+            // An edge takes a property the way a node does. Where it
+            // keeps it is different, since an edge column is in the
+            // order its table holds its edges rather than in row order,
+            // but which column a key names is settled against the file
+            // and not here either way.
+            Type::Node | Type::Rel => Ok(target),
             ref other => Err(bad_type(format!(
                 "{verb} changes an element, and '{name}' is {other}"
             ))),

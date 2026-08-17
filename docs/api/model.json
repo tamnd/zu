@@ -6520,6 +6520,14 @@
       "doc": "Whether the edges between two rows are gone for a reader at\n`epoch`. The base holds edges the overlay never saw, so this is\nasked about a pair rather than about an overlay entry, and the\nfacade asks it of every base edge it reads."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::edge_updates",
+      "kind": "method",
+      "name": "edge_updates",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn edge_updates(&self, rel: u32, epoch: Epoch) -> BTreeMap<(u64, u64, u32), Cell>",
+      "doc": "What `rel` has had written onto its edges by `epoch`, keyed by\nthe rows an edge runs between and the column, one cell each.\n\nA cell's chain holds every value written to it in order, and the\none a reader at `epoch` sees is the last one written at or before\nit, which is what makes two assignments to one property in one\nstatement end with the second."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc::edges",
       "kind": "method",
       "name": "edges",
@@ -6534,6 +6542,14 @@
       "of": "zu::zu1::txn::Mvcc",
       "signature": "fn epoch(&self) -> Epoch",
       "doc": "The newest committed epoch; a new reader pins this."
+    },
+    {
+      "id": "zu::zu1::txn::Mvcc::has_edge_updates",
+      "kind": "method",
+      "name": "has_edge_updates",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn has_edge_updates(&self, rel: u32, epoch: Epoch) -> bool",
+      "doc": "Whether `rel` holds any edge update visible at `epoch`, which is\nwhat says a fold has work to do on a rel table nothing else\ntouched."
     },
     {
       "id": "zu::zu1::txn::Mvcc::has_updates",
@@ -6692,6 +6708,14 @@
       "of": "zu::zu1::txn::WriteTxn",
       "signature": "fn update(&mut self, table: u32, offset: u64, col: u32, value: Cell)",
       "doc": "Stages one cell update."
+    },
+    {
+      "id": "zu::zu1::txn::WriteTxn::update_rel",
+      "kind": "method",
+      "name": "update_rel",
+      "of": "zu::zu1::txn::WriteTxn",
+      "signature": "fn update_rel(&mut self, rel: u32, src: u64, dst: u64, col: u32, value: Cell)",
+      "doc": "Stages one cell update on an edge that is already there. The\nedge is named by the rows it runs between, the way a removed one\nis, and `col` is the column's position in the rel table's props\ndirectory."
     },
     {
       "id": "zu::zu1::verify",
@@ -7009,6 +7033,14 @@
       "name": "RelInsert",
       "of": "zu::zu1::wal::WalRecord",
       "signature": "RelInsert { rel: u32, src: Vec<u64>, dst: Vec<u64>, cols: Vec<WalColumn> }"
+    },
+    {
+      "id": "zu::zu1::wal::WalRecord::RelUpdate",
+      "kind": "variant",
+      "name": "RelUpdate",
+      "of": "zu::zu1::wal::WalRecord",
+      "signature": "RelUpdate { rel: u32, col: u32, src: Vec<u64>, dst: Vec<u64>, values: WalValues }",
+      "doc": "What one txn changed on edges that were already there, named the\nway a removed edge is: by the rows the edge runs between. One\nrecord carries one column, so the values run beside the pairs the\nway a node update's run beside its offsets."
     },
     {
       "id": "zu::zu1::wal::WalRecord::TxnBegin",

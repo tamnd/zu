@@ -45,7 +45,7 @@ use std::time::Instant;
 use zu::query::Value;
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
-use zu::zu1::props::{PropValues, store_props};
+use zu::zu1::props::{PropValues, store_props, store_rel_props};
 use zu::{Config, Database};
 
 /// The small table, where the fold is cheap enough that the statement
@@ -267,6 +267,21 @@ fn build_bare(dir: &Path, rows: u64) -> std::path::PathBuf {
     build_with(dir, rows, &[])
 }
 
+/// The followed table with a property on the edges, which is what a
+/// `SET` on an edge needs: a table that stores no edge column has no
+/// place to put a value and refuses the statement.
+///
+/// Every row follows exactly one other, so the edges sort by their
+/// source and the edge in the order the table holds them is the row it
+/// leaves, which is what lets the run write back the value it found.
+fn build_edge_props(dir: &Path, rows: u64) -> std::path::PathBuf {
+    let path = build(dir, rows);
+    let mut db = Zu1File::open(&path).expect("open");
+    let since: Vec<u64> = (0..rows).collect();
+    store_rel_props(&mut db, "follows", &[("since", PropValues::Int(&since))]).expect("rel props");
+    path
+}
+
 fn build_with(dir: &Path, rows: u64, edges: &[(u32, u32)]) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).expect("dir");
     let path = dir.join("db.zu1");
@@ -337,6 +352,68 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
         one(
             &mut conn,
             "MATCH (p:person) WHERE p.age = 7 RETURN count(p) AS n"
+        ),
+        1,
+        "and the value written back is the value that was there"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
+/// A `SET` of one property of one edge, `WRITES` times over, which is
+/// the same statement as the run above against the other half of the
+/// store.
+///
+/// It is worth its own number because an edge property is kept in a
+/// different shape. A node column is in row order, so a change to one
+/// cell is a change to one place in it, whereas an edge column is dense
+/// over the edges in the order the table holds them and an edge has no
+/// offset of its own to name that place by. So the change names the pair
+/// of rows the edge runs between, and the fold rewrites the column
+/// through the edge order it rebuilds. That makes this the write to
+/// watch when the CSR rebuild gets cheaper: it is what a linkbench
+/// update of a link's payload costs.
+///
+/// Each write puts back the value it found, as the node run does, so the
+/// growth column is what changing nothing cost the store.
+fn run_set_edge(dir: &Path, rows: u64) -> Cost {
+    let path = build_edge_props(dir, rows);
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    conn.query("MATCH (p:person)-[f:follows]->(q:person) WHERE p.age = 0 SET f.since = 0")
+        .expect("warmup");
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        let age = i % rows;
+        conn.query(&format!(
+            "MATCH (p:person)-[f:follows]->(q:person) WHERE p.age = {age} SET f.since = {age}"
+        ))
+        .expect("set");
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    assert_eq!(
+        one(
+            &mut conn,
+            "MATCH (p:person)-[f:follows]->(q:person) RETURN count(*) AS n"
+        ),
+        rows as i64,
+        "no edge was added or lost"
+    );
+    assert_eq!(
+        one(
+            &mut conn,
+            "MATCH (p:person)-[f:follows]->(q:person) WHERE f.since = 7 RETURN count(*) AS n"
         ),
         1,
         "and the value written back is the value that was there"
@@ -516,6 +593,9 @@ fn main() {
     let set_large = run_set(&root.path().join("set-large"), LARGE);
     set_large.report(&format!("SET, {LARGE} rows"));
 
+    let set_edge = run_set_edge(&root.path().join("set-edge"), SMALL);
+    set_edge.report(&format!("SET on an edge, {SMALL} rows"));
+
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"));
 
@@ -537,6 +617,8 @@ fn main() {
     let mut failed = false;
     let checks = [
         ("set_stmt_us", set_small.us),
+        ("set_edge_stmt_us", set_edge.us),
+        ("set_edge_stmt_kb", set_edge.written / 1024.0),
         ("insert_stmt_us", insert.us),
         ("delete_stmt_us", delete.us),
         ("detach_stmt_us", detach.us),

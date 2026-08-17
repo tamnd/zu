@@ -66,6 +66,12 @@ struct RelOverlay {
     /// stores edge properties holds a pair once, and one that stores
     /// none has nothing to tell two edges over a pair apart with.
     dead: BTreeMap<(u64, u64), Epoch>,
+    /// What a statement wrote onto an edge that was already there,
+    /// keyed by the rows it runs between and the column, newest last.
+    /// The pair names the edge here for the same reason it does in
+    /// `dead`, and the column has to be part of the key because two
+    /// statements can change two properties of one edge.
+    updates: BTreeMap<(u64, u64, u32), Vec<(Epoch, Cell)>>,
 }
 
 /// One committed edge the base does not hold yet: the rows it runs
@@ -130,6 +136,13 @@ enum Op {
         rel: u32,
         src: u64,
         dst: u64,
+    },
+    UpdateRel {
+        rel: u32,
+        src: u64,
+        dst: u64,
+        col: u32,
+        value: Cell,
     },
 }
 
@@ -329,6 +342,28 @@ impl Mvcc {
                     }
                     Ok(())
                 }
+                WalRecord::RelUpdate {
+                    rel,
+                    col,
+                    src,
+                    dst,
+                    values,
+                } => {
+                    let overlay = mvcc.rels.entry(*rel).or_default();
+                    for (i, (s, d)) in src.iter().zip(dst).enumerate() {
+                        let cell = match values {
+                            WalValues::Int(v) => Cell::Int(v[i]),
+                            WalValues::Str(v) => Cell::Str(v[i].clone()),
+                            WalValues::Null(_) => Cell::Null,
+                        };
+                        overlay
+                            .updates
+                            .entry((*s, *d, *col))
+                            .or_default()
+                            .push((epoch, cell));
+                    }
+                    Ok(())
+                }
                 WalRecord::IngestRef { table, ptrs } => {
                     let (payload, root) = resolve(*table, ptrs)?;
                     mvcc.publish_ingest(epoch, *table, payload, root);
@@ -441,6 +476,38 @@ impl Mvcc {
                 .filter(|&(_, &e)| e <= epoch)
                 .map(|(&pair, _)| pair)
                 .collect()
+        })
+    }
+
+    /// What `rel` has had written onto its edges by `epoch`, keyed by
+    /// the rows an edge runs between and the column, one cell each.
+    ///
+    /// A cell's chain holds every value written to it in order, and the
+    /// one a reader at `epoch` sees is the last one written at or before
+    /// it, which is what makes two assignments to one property in one
+    /// statement end with the second.
+    pub fn edge_updates(&self, rel: u32, epoch: Epoch) -> BTreeMap<(u64, u64, u32), Cell> {
+        self.rels.get(&rel).map_or_else(BTreeMap::new, |overlay| {
+            overlay
+                .updates
+                .iter()
+                .filter_map(|(key, chain)| {
+                    let (_, cell) = chain.iter().rev().find(|(e, _)| *e <= epoch)?;
+                    Some((*key, cell.clone()))
+                })
+                .collect()
+        })
+    }
+
+    /// Whether `rel` holds any edge update visible at `epoch`, which is
+    /// what says a fold has work to do on a rel table nothing else
+    /// touched.
+    pub fn has_edge_updates(&self, rel: u32, epoch: Epoch) -> bool {
+        self.rels.get(&rel).is_some_and(|overlay| {
+            overlay
+                .updates
+                .values()
+                .any(|chain| chain.iter().any(|&(e, _)| e <= epoch))
         })
     }
 
@@ -619,6 +686,21 @@ impl Mvcc {
                         .entry((src, dst))
                         .or_insert(epoch);
                 }
+                Op::UpdateRel {
+                    rel,
+                    src,
+                    dst,
+                    col,
+                    value,
+                } => {
+                    self.rels
+                        .entry(rel)
+                        .or_default()
+                        .updates
+                        .entry((src, dst, col))
+                        .or_default()
+                        .push((epoch, value));
+                }
             }
         }
         self.epoch = epoch;
@@ -689,6 +771,20 @@ impl WriteTxn<'_> {
         self.ops.push(Op::DeleteRel { rel, src, dst });
     }
 
+    /// Stages one cell update on an edge that is already there. The
+    /// edge is named by the rows it runs between, the way a removed one
+    /// is, and `col` is the column's position in the rel table's props
+    /// directory.
+    pub fn update_rel(&mut self, rel: u32, src: u64, dst: u64, col: u32, value: Cell) {
+        self.ops.push(Op::UpdateRel {
+            rel,
+            src,
+            dst,
+            col,
+            value,
+        });
+    }
+
     /// Whether nothing has been staged.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
@@ -718,10 +814,15 @@ impl WriteTxn<'_> {
 /// order within each cell's chain.
 /// Update batches per (table, group, column) while lowering.
 type UpdateBatches = BTreeMap<(u32, u64, u32), (Vec<u64>, Vec<Cell>)>;
+/// Edge update batches per (rel table, column) while lowering. An edge
+/// is named by a pair rather than an offset, so there is no group to
+/// batch by: a pair says nothing about where in the file the edge is.
+type EdgeUpdateBatches = BTreeMap<(u32, u32), (Vec<u64>, Vec<u64>, Vec<Cell>)>;
 
 fn build_records(ops: &[Op]) -> Vec<WalRecord> {
     let mut out = Vec::new();
     let mut updates = UpdateBatches::new();
+    let mut edge_updates = EdgeUpdateBatches::new();
     let mut deletes: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
     let mut detaches: BTreeMap<u32, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
     for op in ops {
@@ -768,6 +869,18 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
                 srcs.push(*src);
                 dsts.push(*dst);
             }
+            Op::UpdateRel {
+                rel,
+                src,
+                dst,
+                col,
+                value,
+            } => {
+                let (srcs, dsts, cells) = edge_updates.entry((*rel, *col)).or_default();
+                srcs.push(*src);
+                dsts.push(*dst);
+                cells.push(value.clone());
+            }
         }
     }
     for ((table, group, col), (offsets, cells)) in updates {
@@ -789,6 +902,27 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
                 group,
                 col,
                 offsets: offsets[at..end].to_vec(),
+                values: cell_values(&cells[at..end]).expect("one run is one kind"),
+            });
+            at = end;
+        }
+    }
+    // An edge's cells are logged in runs of a kind for the reason a
+    // row's are: one record carries one kind of value, and the order
+    // the runs go out in is the order the cell's chain ends up in.
+    for ((rel, col), (src, dst, cells)) in edge_updates {
+        let mut at = 0usize;
+        while at < cells.len() {
+            let kind = kind_of(&cells[at]);
+            let mut end = at + 1;
+            while end < cells.len() && kind_of(&cells[end]) == kind {
+                end += 1;
+            }
+            out.push(WalRecord::RelUpdate {
+                rel,
+                col,
+                src: src[at..end].to_vec(),
+                dst: dst[at..end].to_vec(),
                 values: cell_values(&cells[at..end]).expect("one run is one kind"),
             });
             at = end;
@@ -926,6 +1060,63 @@ mod tests {
             // What a fold would seal: the edge that was taken away is
             // not among the edges it would write.
             assert_eq!(m.edges(9, e2).collect::<Vec<_>>(), vec![(0, 2)]);
+        }
+    }
+
+    /// A value written onto an edge is in the overlay at the epoch that
+    /// wrote it and not one epoch earlier, and the log says the same
+    /// thing, which is what a fold after a crash reads.
+    #[test]
+    fn a_value_written_onto_an_edge_leaves_the_overlay_at_its_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_rel(9, 0, 1, 0, Cell::Int(1990));
+        txn.update_rel(9, 0, 2, 1, Cell::Str(b"note".to_vec()));
+        let e1 = txn.commit(&mut wal).unwrap();
+        // A second value over the first one, which the chain keeps in
+        // order so the reader takes the later of the two.
+        let mut txn = mvcc.begin();
+        txn.update_rel(9, 0, 1, 0, Cell::Null);
+        let e2 = txn.commit(&mut wal).unwrap();
+
+        let recovered = Mvcc::recover(&wal, 0).unwrap();
+        for m in [&mvcc, &recovered] {
+            assert!(!m.has_edge_updates(9, 0));
+            assert!(m.has_edge_updates(9, e1));
+            let first = m.edge_updates(9, e1);
+            assert_eq!(first.get(&(0, 1, 0)), Some(&Cell::Int(1990)));
+            assert_eq!(
+                first.get(&(0, 2, 1)),
+                Some(&Cell::Str(b"note".to_vec())),
+                "the other edge and the other column"
+            );
+            let second = m.edge_updates(9, e2);
+            assert_eq!(second.get(&(0, 1, 0)), Some(&Cell::Null));
+            assert!(m.edge_updates(9, 0).is_empty());
+        }
+    }
+
+    /// Two values written onto one property of one edge in one txn end
+    /// with the second, because the chain is read back in the order it
+    /// was staged.
+    #[test]
+    fn the_last_value_written_onto_an_edge_is_the_one_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_rel(9, 0, 1, 0, Cell::Int(1));
+        txn.update_rel(9, 0, 1, 0, Cell::Int(2));
+        let epoch = txn.commit(&mut wal).unwrap();
+
+        let recovered = Mvcc::recover(&wal, 0).unwrap();
+        for m in [&mvcc, &recovered] {
+            assert_eq!(
+                m.edge_updates(9, epoch).get(&(0, 1, 0)),
+                Some(&Cell::Int(2))
+            );
         }
     }
 

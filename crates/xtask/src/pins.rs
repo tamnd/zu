@@ -369,7 +369,14 @@ impl Table {
             let path = root.join(&site.file);
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            let found = values(&text, &site.key);
+            // Channels are dropped before the count, so a file whose
+            // only remaining value is a channel reads as the site
+            // having gone, which is what it would mean: the version
+            // this row holds is no longer written there.
+            let found: Vec<_> = values(&text, &site.key)
+                .into_iter()
+                .filter(|(_, value)| !is_channel(value))
+                .collect();
             if found.is_empty() {
                 notes.push(Note::Gone {
                     file: site.file.clone(),
@@ -432,7 +439,7 @@ impl Table {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
             for (line, value) in values(&text, "toolchain") {
-                if self.components.iter().any(|c| c.pinned == value) {
+                if is_channel(&value) || self.components.iter().any(|c| c.pinned == value) {
                     continue;
                 }
                 notes.push(Note::Unpinned {
@@ -449,6 +456,19 @@ impl Table {
         }
         Ok(notes)
     }
+}
+
+/// Whether a toolchain is a channel rather than a version.
+///
+/// A channel is what rustup calls the moving target, and a job that
+/// names one is saying it wants whatever that is today: the format
+/// check runs on the newest stable on purpose, and the fuzzer and miri
+/// want the newest nightly. There is no version written down, so there
+/// is nothing for the table to hold it to, and demanding a pin here
+/// would be demanding the opposite of what those jobs are for. A dated
+/// nightly is a version and is held like any other.
+fn is_channel(value: &str) -> bool {
+    matches!(value, "stable" | "beta" | "nightly")
 }
 
 /// Whether a value written in a file agrees with a version.
@@ -626,7 +646,7 @@ mod tests {
                 ("rust-toolchain.toml", "channel = \"1.97.1\"\n"),
                 (
                     ".github/workflows/ci.yml",
-                    "jobs:\n  a:\n    steps:\n      - uses: dtolnay/rust-toolchain@master\n        with:\n          toolchain: nightly-2026-01-01\n",
+                    "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/rust\n        with:\n          toolchain: nightly-2026-01-01\n",
                 ),
             ],
         );
@@ -648,7 +668,24 @@ mod tests {
                 ("rust-toolchain.toml", "channel = \"1.97.1\"\n"),
                 (
                     ".github/workflows/ci.yml",
-                    "      - uses: dtolnay/rust-toolchain@master\n        with:\n          toolchain: 1.97.1\n",
+                    "      - uses: ./.github/actions/rust\n        with:\n          toolchain: 1.97.1\n",
+                ),
+            ],
+        );
+        assert_eq!(table().check(&dir).expect("checks"), []);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_job_that_asks_for_a_channel_is_left_alone() {
+        let dir = tree(
+            "a_job_that_asks_for_a_channel_is_left_alone",
+            &[
+                ("rust-toolchain.toml", "channel = \"1.97.1\"\n"),
+                (
+                    ".github/workflows/ci.yml",
+                    "      - uses: ./.github/actions/rust\n        with:\n          toolchain: \
+                     nightly\n          components: miri\n",
                 ),
             ],
         );

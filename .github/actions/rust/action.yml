@@ -1,0 +1,123 @@
+# The compiler a job builds with, installed by the rustup that is
+# already on the machine.
+#
+# This replaced dtolnay/rust-toolchain, which is a fine action and was
+# doing nothing wrong. What it was is a dependency, in two ways this
+# repository does not take elsewhere. It was used at `@master`, a
+# mutable branch of somebody else's repository, in every job of a tree
+# that pins nine languages' toolchains to the patch level. And an action
+# is downloaded from codeload.github.com before the job's first step
+# runs, so a workflow is only as available as that host: when it answers
+# 429 or 503, as it did through the GitHub incident of 2026-08-17, the
+# job dies in `Set up job`, before there is a step to rerun or to mark
+# as allowed to fail.
+#
+# A local action is part of the checkout, so there is nothing to fetch
+# and no version of it but this one. What it does is three rustup
+# commands, which is what the other action did too.
+name: Rust
+description: Install the toolchain this job builds with, from the local rustup.
+
+inputs:
+  toolchain:
+    description: The channel or the exact version, spelled the way rustup spells it. `cargo xtask pins` reads this key in the workflows, so a pinned version is written here and held to toolchains.toml.
+    required: false
+    default: stable
+  components:
+    description: Components to install alongside it, comma or space separated.
+    required: false
+    default: ''
+  targets:
+    description: Targets to add, comma or space separated.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+      run: |
+        set -eu
+
+        # Every hosted image ships rustup, so this is for the job
+        # containers: the manylinux rows of the libzu workflow build in
+        # an image that has a compiler for the wheels of somebody else's
+        # ecosystem and not this one. A toolchain of `none` because the
+        # install below is what decides which one, and downloading a
+        # stable first would be a download nothing uses.
+        if ! command -v rustup > /dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+
+        # One install rather than an install and then an add per piece,
+        # since rustup resolves the manifest once that way and a
+        # component that does not exist for the version asked for fails
+        # here rather than half way through a job.
+        #
+        # The minimal profile leaves out the documentation and the local
+        # standard library sources, which nothing in CI reads and which
+        # are most of what a default install downloads.
+        flags="--profile minimal --no-self-update"
+        for component in $(echo "$components" | tr ',' ' '); do
+          flags="$flags --component $component"
+        done
+        for target in $(echo "$targets" | tr ',' ' '); do
+          flags="$flags --target $target"
+        done
+
+        install() { rustup toolchain install "$1" $flags; }
+
+        # The date some days ago, spelled the way rustup names a
+        # nightly. GNU date first and BSD date second, because this runs
+        # on the macOS rows as well.
+        back() {
+          date -u -d "$1 days ago" +%Y-%m-%d 2> /dev/null || date -u -v-"$1"d +%Y-%m-%d
+        }
+
+        if ! install "$toolchain"; then
+          # A nightly is published with the components that built that
+          # night, and the ones outside the compiler go missing for a
+          # day or two at a time: miri is the usual one. Rustup will not
+          # fall back on its own, so walk back a fortnight and take the
+          # first nightly that has everything asked for. Only a floating
+          # nightly gets this. A dated one and a released version are
+          # both somebody's decision, and quietly building with a
+          # different compiler than the one written down is worse than
+          # failing.
+          if [ "$toolchain" != nightly ]; then
+            exit 1
+          fi
+          for day in $(seq 1 14); do
+            dated="nightly-$(back "$day")"
+            if install "$dated"; then
+              toolchain="$dated"
+              break
+            fi
+          done
+          if [ "$toolchain" = nightly ]; then
+            echo "no nightly in the last fortnight has $components" >&2
+            exit 1
+          fi
+          echo "the newest nightly is missing $components, using $toolchain"
+        fi
+
+        # An environment variable rather than `rustup default`, because
+        # this repository has a rust-toolchain.toml and that file wins
+        # over the default. It is the pin every developer and every
+        # release build gets, and it is right for them; a job that asked
+        # for stable or for a dated nightly asked on purpose, and would
+        # otherwise silently build with the pinned version instead.
+        export RUSTUP_TOOLCHAIN="$toolchain"
+        echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+
+        # In the log, because the first question about a failure that
+        # reproduces nowhere else is which compiler saw it.
+        rustc --version --verbose
+        cargo --version

@@ -6073,6 +6073,7 @@ mod tests {
                 "lcc" => Ok((0..n)
                     .map(|o| vec![Value::Float(o as f64 / 100.0)])
                     .collect()),
+                "triangle_count" => Ok((0..n).map(|o| vec![Value::Int(o + 1)]).collect()),
                 "sssp" => {
                     let Some(Value::Int(source)) = args.first() else {
                         return Err(invalid("mock sssp needs a source".into()));

@@ -6589,6 +6589,14 @@
       "doc": "Whether `rel` holds any edge update visible at `epoch`, which is\nwhat says a fold has work to do on a rel table nothing else\ntouched."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::has_label_changes",
+      "kind": "method",
+      "name": "has_label_changes",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn has_label_changes(&self, table: u32, epoch: Epoch) -> bool",
+      "doc": "Whether `table` holds any label change visible at `epoch`, which\nis what says a fold has work to do on a table whose rows and\nproperties nothing touched."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc::has_updates",
       "kind": "method",
       "name": "has_updates",
@@ -6611,6 +6619,14 @@
       "of": "zu::zu1::txn::Mvcc",
       "signature": "fn is_deleted(&self, table: u32, offset: u64, epoch: Epoch) -> bool",
       "doc": "Whether the row at `offset` is deleted for a reader at `epoch`."
+    },
+    {
+      "id": "zu::zu1::txn::Mvcc::label_changes",
+      "kind": "method",
+      "name": "label_changes",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn label_changes(&self, table: u32, epoch: Epoch) -> BTreeMap<u64, (u64, u64)>",
+      "doc": "What `table` has had put on its rows' labels and taken off them\nby `epoch`, keyed by offset: one pair of masks per row, the bits\nto set and the bits to clear.\n\nA row's chain is composed rather than read at its end, because\ntwo statements can change two labels of one row and both have to\nland. Composing keeps the two masks disjoint, so the fold can\nwrite `(word | add) & !remove` and get the same answer whichever\norder it applies them in."
     },
     {
       "id": "zu::zu1::txn::Mvcc::neighbors",
@@ -6745,6 +6761,14 @@
       "of": "zu::zu1::txn::WriteTxn",
       "signature": "fn update(&mut self, table: u32, offset: u64, col: u32, value: Cell)",
       "doc": "Stages one cell update."
+    },
+    {
+      "id": "zu::zu1::txn::WriteTxn::update_labels",
+      "kind": "method",
+      "name": "update_labels",
+      "of": "zu::zu1::txn::WriteTxn",
+      "signature": "fn update_labels(&mut self, table: u32, row: u64, add: u64, remove: u64) -> Result<()>",
+      "doc": "Stages a change to one row's labels: the bits to set and the\nbits to clear, against the graph's label dictionary. The two\nmasks have to be disjoint, because a label cannot be both put on\na row and taken off it by one change."
     },
     {
       "id": "zu::zu1::txn::WriteTxn::update_rel",
@@ -7048,6 +7072,14 @@
       "name": "IngestRef",
       "of": "zu::zu1::wal::WalRecord",
       "signature": "IngestRef { table: u32, ptrs: Vec<u64> }"
+    },
+    {
+      "id": "zu::zu1::wal::WalRecord::LabelUpdate",
+      "kind": "variant",
+      "name": "LabelUpdate",
+      "of": "zu::zu1::wal::WalRecord",
+      "signature": "LabelUpdate { table: u32, offsets: Vec<u64>, add: u64, remove: u64 }",
+      "doc": "Which labels one txn put on rows and which it took off them. The\ntwo masks are a bit per label of the graph's dictionary, and the\nrows named share them, so one record is one shape of change over\nhowever many rows were changed that way. A label is not a column,\nso there is no column here and no value: the row's label word is\none word, and what a change to it says is which bits go on and\nwhich come off."
     },
     {
       "id": "zu::zu1::wal::WalRecord::NodeInsert",

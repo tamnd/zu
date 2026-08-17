@@ -19,7 +19,7 @@ use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
     self, BinaryOp, Clause, Expr, LabelExpr, Literal, NodePattern, PathMode, Projection,
-    RelDirection, RelPattern, RemoveItem, Selector, SetItem, SortKey, UnaryOp,
+    RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
@@ -854,22 +854,40 @@ pub struct BoundInsertRel {
     pub props: Vec<(String, BoundExpr)>,
 }
 
+/// What one assignment writes: one property, every property, or the
+/// labels the element carries. A `REMOVE` of labels binds to the same
+/// place as a `SET` of them with the labels going the other way, for
+/// the reason a `REMOVE` of a property binds to an assignment of null.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundSetInto {
+    Property(String),
+    Record,
+    Labels {
+        labels: Vec<String>,
+        /// Whether the element takes the labels on or stops carrying
+        /// them.
+        on: bool,
+    },
+}
+
 /// One assignment a `SET` makes.
 ///
 /// The element is a slot rather than a table and a row, because which
 /// element it is differs per row and the row is what says. Which column
 /// the key names is settled where the write runs, for the same reason
 /// an inserted element's columns are: the columns are in the file
-/// rather than in the schema the binder is given.
+/// rather than in the schema the binder is given. A label is settled
+/// there too, because which bit it is is a question about the file's
+/// label dictionary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSetItem {
     /// The slot holding the element the assignment changes.
     pub target: usize,
-    /// The property key it writes, or nothing when it writes every
-    /// property of the element and the value is the record they come
-    /// out of.
-    pub key: Option<String>,
-    /// What the property takes, evaluated once per row.
+    /// What the assignment writes.
+    pub into: BoundSetInto,
+    /// What the property takes, evaluated once per row. An item that
+    /// writes labels carries a null here, because what it writes is in
+    /// the statement rather than in a value.
     pub value: BoundExpr,
 }
 
@@ -1998,7 +2016,14 @@ impl Binder<'_> {
         let (value, _) = self.bind_expr(&item.value, &mut ctx)?;
         Ok(BoundSetItem {
             target,
-            key: item.key.clone(),
+            into: match &item.into {
+                SetInto::Property(key) => BoundSetInto::Property(key.clone()),
+                SetInto::Record => BoundSetInto::Record,
+                SetInto::Labels(labels) => BoundSetInto::Labels {
+                    labels: labels.clone(),
+                    on: true,
+                },
+            },
             value,
         })
     }
@@ -2014,7 +2039,13 @@ impl Binder<'_> {
         let (value, _) = self.bind_expr(&Expr::Literal(Literal::Null), &mut ctx)?;
         Ok(BoundSetItem {
             target,
-            key: Some(item.key.clone()),
+            into: match &item.what {
+                Removed::Property(key) => BoundSetInto::Property(key.clone()),
+                Removed::Labels(labels) => BoundSetInto::Labels {
+                    labels: labels.clone(),
+                    on: false,
+                },
+            },
             value,
         })
     }

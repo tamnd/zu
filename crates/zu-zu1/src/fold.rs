@@ -144,9 +144,21 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
             ZuError::InvalidArgument(format!("overlay names unknown node table {table}"))
         })?;
         let (name, base, primary) = (node.name.clone(), node.node_count, node.primary_label());
+        // What the table has declared it may hold, which is what bounds
+        // a label change: a bit outside it would leave a file that says
+        // a row carries a label its table never declared.
+        let declared = node.label_mask();
         let appended = mvcc.appended_rows(table, epoch);
-        if appended > 0 || mvcc.has_updates(table, epoch) {
-            changed |= fold_props(db, mvcc, &mut index, table, primary, base, epoch)?;
+        if appended > 0 || mvcc.has_updates(table, epoch) || mvcc.has_label_changes(table, epoch) {
+            changed |= fold_props(
+                db,
+                mvcc,
+                &mut index,
+                table,
+                Labels { primary, declared },
+                base,
+                epoch,
+            )?;
         }
         if appended > 0 {
             catalog.upsert_node(&name, base + appended)?;
@@ -290,15 +302,25 @@ impl Validity {
 /// Merges one table's appended rows and update chains into a rebuilt
 /// props directory. A table without stored props cannot absorb column
 /// data, and its row count still grows through the catalog alone.
+/// What one table's rows may be called: the label its own name is,
+/// which every row carries, and the mask of every label the table has
+/// declared, which bounds what a change may put on a row.
+#[derive(Debug, Clone, Copy)]
+struct Labels {
+    primary: u16,
+    declared: u64,
+}
+
 fn fold_props(
     db: &mut Zu1File,
     mvcc: &Mvcc,
     index: &mut TableIndex,
     table: u32,
-    primary: u16,
+    labels_of: Labels,
     base: u64,
     epoch: Epoch,
 ) -> Result<bool> {
+    let primary = labels_of.primary;
     let Some(root) = index.get(table) else {
         if mvcc.appends_carry_columns(table, epoch) || mvcc.has_updates(table, epoch) {
             return Err(ZuError::Unsupported {
@@ -306,7 +328,29 @@ fn fold_props(
                 id: table,
             });
         }
-        return Ok(false);
+        if !mvcc.has_label_changes(table, epoch) {
+            return Ok(false);
+        }
+        // A table that stores nothing on its rows still has labels to
+        // hold, and the bitset hangs off a props directory, so the
+        // first label change is what makes the directory exist. Its
+        // columns stay empty: what the change carries is a word per
+        // row, not a value.
+        let new_count = base + mvcc.appended_rows(table, epoch);
+        let mut words = vec![1u64 << primary; new_count as usize];
+        apply_label_changes(
+            &mvcc.label_changes(table, epoch),
+            &mut words,
+            table,
+            labels_of,
+        )?;
+        let dir = PropsDirectory {
+            node_count: new_count,
+            columns: Vec::new(),
+            labels: Some(write_segment(db, &words)?),
+        };
+        index.set(table, meta::write_chain(db, &dir.encode())?);
+        return Ok(true);
     };
     let dir = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
     if dir.node_count != base {
@@ -418,15 +462,21 @@ fn fold_props(
         });
     }
     // The label bitset grows with the row domain, and an appended row
-    // carries the table's own label and nothing else: nothing in an
-    // overlay says otherwise yet, and a row of a table is what that
-    // table is called.
-    let labels = match &dir.labels {
-        None => None,
-        Some(meta) => {
+    // carries the table's own label and nothing else until something
+    // says otherwise: a row of a table is what that table is called.
+    // What says otherwise is a label change, which is a pair of masks
+    // per row rather than a word, so a row nothing named keeps what it
+    // had and the ones named take their bits on and off.
+    let changes = mvcc.label_changes(table, epoch);
+    let labels = match (&dir.labels, changes.is_empty()) {
+        (None, true) => None,
+        (base_labels, _) => {
             let mut words = Vec::with_capacity(new_count as usize);
-            read_segment(db, meta, &mut words)?;
+            if let Some(meta) = base_labels {
+                read_segment(db, meta, &mut words)?;
+            }
             words.resize(new_count as usize, 1u64 << primary);
+            apply_label_changes(&changes, &mut words, table, labels_of)?;
             Some(write_segment(db, &words)?)
         }
     };
@@ -438,6 +488,41 @@ fn fold_props(
     };
     index.set(table, meta::write_chain(db, &new_dir.encode())?);
     Ok(true)
+}
+
+/// Puts the labels one txn added onto the rows it named and takes the
+/// ones it removed off them. The two masks of a change are disjoint, so
+/// the order of the two halves does not matter and the row ends with
+/// exactly what the last statement to name it said.
+fn apply_label_changes(
+    changes: &BTreeMap<u64, (u64, u64)>,
+    words: &mut [u64],
+    table: u32,
+    labels_of: Labels,
+) -> Result<()> {
+    let rows = words.len();
+    let primary = 1u64 << labels_of.primary;
+    for (&offset, &(add, remove)) in changes {
+        let undeclared = add & !labels_of.declared;
+        if undeclared != 0 {
+            return Err(ZuError::InvalidArgument(format!(
+                "a label change puts {undeclared:#x} on a row of table {table}, \
+                 which has not declared it"
+            )));
+        }
+        if remove & primary != 0 {
+            return Err(ZuError::InvalidArgument(format!(
+                "a label change takes the name of table {table} off one of its own rows"
+            )));
+        }
+        let word = words.get_mut(offset as usize).ok_or_else(|| {
+            ZuError::InvalidArgument(format!(
+                "a label change names row {offset} of table {table}, which holds {rows} rows"
+            ))
+        })?;
+        *word = (*word | add) & !remove;
+    }
+    Ok(())
 }
 
 /// Merges one table's overlay tombstones with its persisted chain and
@@ -860,6 +945,20 @@ mod tests {
         }
     }
 
+    /// Declares a label for a table and publishes the catalog, without
+    /// storing a bitset. That is the state a txn will leave once it can
+    /// stage a catalog change of its own, and it is what a fold has to
+    /// be able to write the first bitset from.
+    fn declare(db: &mut Zu1File, table: u32, label: &str) -> u16 {
+        let mut catalog = Catalog::load(db).unwrap();
+        let id = catalog.declare_label(table, label).unwrap();
+        free_chain(db, db.db_header().catalog_root).unwrap();
+        let root = meta::write_chain(db, &catalog.encode()).unwrap();
+        db.db_header_mut().catalog_root = root;
+        db.checkpoint().unwrap();
+        id
+    }
+
     fn read_age(db: &mut Zu1File, person: u32, row: u64) -> u64 {
         let dir = load_props(db, person).unwrap().unwrap();
         let mut reader = PropsReader::new(dir);
@@ -940,6 +1039,136 @@ mod tests {
         let path = dir.path().join("fold.zu1");
         drop(f);
         crate::verify(&path).unwrap();
+    }
+
+    /// A label the overlay put on a row and one it took off land in the
+    /// bitset the fold writes, and a row nothing named keeps the word it
+    /// had.
+    #[test]
+    fn a_label_change_lands_in_the_bitset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        crate::props::store_labels(
+            &mut f.db,
+            "person",
+            &[vec!["Bot"], vec![], vec!["Bot", "Admin"], vec![]],
+        )
+        .unwrap();
+        let mut txn = f.mvcc.begin();
+        // Admin onto kay, Bot off ada: bit 0 is the table's own label,
+        // bit 1 is Bot and bit 2 is Admin, in the order they were first
+        // declared.
+        txn.update_labels(f.person, 1, 0b100, 0).unwrap();
+        txn.update_labels(f.person, 0, 0, 0b010).unwrap();
+        txn.commit(&mut f.wal).unwrap();
+        checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap();
+        let directory = load_props(&mut f.db, f.person).unwrap().unwrap();
+        let mut reader = PropsReader::new(directory);
+        let words: Vec<u64> = (0..6)
+            .map(|row| reader.label_word(&mut f.db, row).unwrap().unwrap())
+            .collect();
+        assert_eq!(words, [0b001, 0b101, 0b111, 0b001, 0b001, 0b001]);
+        assert_eq!(read_name(&mut f.db, f.person, 0), b"ada", "props untouched");
+        let path = dir.path().join("fold.zu1");
+        drop(f);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A table whose rows carry no labels yet gets the bitset from the
+    /// first change: the rows nothing named take the table's own label,
+    /// which is what they had all along without a word to say it in.
+    #[test]
+    fn a_first_label_change_writes_the_bitset_a_table_lacked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        assert_eq!(declare(&mut f.db, f.person, "Bot"), 1);
+        let mut txn = f.mvcc.begin();
+        txn.update_labels(f.person, 3, 0b010, 0).unwrap();
+        txn.commit(&mut f.wal).unwrap();
+        checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap();
+        let directory = load_props(&mut f.db, f.person).unwrap().unwrap();
+        let mut reader = PropsReader::new(directory);
+        let words: Vec<u64> = (0..6)
+            .map(|row| reader.label_word(&mut f.db, row).unwrap().unwrap())
+            .collect();
+        assert_eq!(words, [1, 1, 1, 0b011, 1, 1]);
+        let path = dir.path().join("fold.zu1");
+        drop(f);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A table that stores nothing on its rows has no props directory
+    /// for a bitset to hang off, so the first label change is what makes
+    /// one, holding the labels and no columns.
+    #[test]
+    fn a_label_change_makes_the_directory_a_bare_table_lacked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("bare.zu1")).unwrap();
+        bulk_load_as(&mut db, "thing", "links", 3, &[(0, 1)]).unwrap();
+        let catalog = Catalog::load(&mut db).unwrap();
+        let thing = catalog.node_by_name("thing").unwrap().id;
+        assert_eq!(declare(&mut db, thing, "Bot"), 1);
+        let mut wal = Wal::open(&dir.path().join("bare.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        assert!(
+            load_props(&mut db, thing).unwrap().is_none(),
+            "nothing stored on the rows to begin with"
+        );
+        let mut txn = mvcc.begin();
+        txn.update_labels(thing, 2, 0b010, 0).unwrap();
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        let directory = load_props(&mut db, thing).unwrap().unwrap();
+        assert_eq!(directory.node_count, 3);
+        assert!(directory.columns.is_empty());
+        let mut reader = PropsReader::new(directory);
+        let words: Vec<u64> = (0..3)
+            .map(|row| reader.label_word(&mut db, row).unwrap().unwrap())
+            .collect();
+        assert_eq!(words, [1, 1, 0b011]);
+        let path = dir.path().join("bare.zu1");
+        drop(db);
+        drop(wal);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A label the table has not declared is refused at the fold, and
+    /// so is taking the table's own name off one of its rows: either one
+    /// would leave a file saying something about a row that the catalog
+    /// says cannot be true.
+    #[test]
+    fn a_label_change_stays_inside_what_the_table_declares() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        let mut txn = f.mvcc.begin();
+        txn.update_labels(f.person, 0, 0b100, 0).unwrap();
+        txn.commit(&mut f.wal).unwrap();
+        let err = checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap_err();
+        assert!(format!("{err}").contains("has not declared it"), "{err:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        let mut txn = f.mvcc.begin();
+        txn.update_labels(f.person, 0, 0, 0b001).unwrap();
+        txn.commit(&mut f.wal).unwrap();
+        let err = checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap_err();
+        assert!(
+            format!("{err}").contains("off one of its own rows"),
+            "{err:?}"
+        );
+    }
+
+    /// A change naming a row past the end of the table is refused
+    /// rather than written past the words the table has.
+    #[test]
+    fn a_label_change_past_the_last_row_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        let mut txn = f.mvcc.begin();
+        txn.update_labels(f.person, 99, 0b010, 0).unwrap();
+        txn.commit(&mut f.wal).unwrap();
+        let err = checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap_err();
+        assert!(matches!(err, ZuError::InvalidArgument(_)), "{err:?}");
     }
 
     /// A reopened file recovers to the folded state: nothing replays,

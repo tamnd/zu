@@ -1461,6 +1461,17 @@ set_edge_stmt_kb = 8192.0
 set_record_stmt_us = 250000.0
 set_record_stmt_kb = 4096.0
 
+# A SET or a REMOVE of a label, measured 82 ms and 1812 kB at 10000 rows.
+# A label is one bit of one word beside the row rather than a cell of a
+# column, so the write itself is the cheapest one the statement has, and
+# the bytes are almost all the fold: it rewrites the columns of the table
+# it touched even when what changed was not in a column, and then writes
+# the label word per row on top of that. The gap between this and the one
+# property number is that extra word segment. Lower these ceilings, never
+# raise them.
+set_label_stmt_us = 250000.0
+set_label_stmt_kb = 4096.0
+
 # What a statement that changed nothing added to the store, per
 # statement. A SET that writes back the value it read leaves a table of
 # the same shape, so the fold's new blocks must come out of the free

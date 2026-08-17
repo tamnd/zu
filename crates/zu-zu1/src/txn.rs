@@ -52,6 +52,12 @@ struct TableOverlay {
     tombstones: BTreeMap<u64, Epoch>,
     /// Update chains keyed by cell, newest entry last.
     updates: HashMap<(u64, u32), Vec<(Epoch, Cell)>>,
+    /// What a statement put on a row's labels and took off them, keyed
+    /// by offset and newest last. A label is not a column, so there is
+    /// no cell to overwrite: the entry is the pair of masks the change
+    /// was written as, and a reader composes the chain rather than
+    /// taking its last entry.
+    labels: BTreeMap<u64, Vec<(Epoch, u64, u64)>>,
 }
 
 /// Committed overlay edges of one rel table, in commit order, and the
@@ -143,6 +149,12 @@ enum Op {
         dst: u64,
         col: u32,
         value: Cell,
+    },
+    UpdateLabels {
+        table: u32,
+        row: u64,
+        add: u64,
+        remove: u64,
     },
 }
 
@@ -364,6 +376,22 @@ impl Mvcc {
                     }
                     Ok(())
                 }
+                WalRecord::LabelUpdate {
+                    table,
+                    offsets,
+                    add,
+                    remove,
+                } => {
+                    let overlay = mvcc.tables.entry(*table).or_default();
+                    for offset in offsets {
+                        overlay
+                            .labels
+                            .entry(*offset)
+                            .or_default()
+                            .push((epoch, *add, *remove));
+                    }
+                    Ok(())
+                }
                 WalRecord::IngestRef { table, ptrs } => {
                     let (payload, root) = resolve(*table, ptrs)?;
                     mvcc.publish_ingest(epoch, *table, payload, root);
@@ -578,6 +606,45 @@ impl Mvcc {
         })
     }
 
+    /// What `table` has had put on its rows' labels and taken off them
+    /// by `epoch`, keyed by offset: one pair of masks per row, the bits
+    /// to set and the bits to clear.
+    ///
+    /// A row's chain is composed rather than read at its end, because
+    /// two statements can change two labels of one row and both have to
+    /// land. Composing keeps the two masks disjoint, so the fold can
+    /// write `(word | add) & !remove` and get the same answer whichever
+    /// order it applies them in.
+    pub fn label_changes(&self, table: u32, epoch: Epoch) -> BTreeMap<u64, (u64, u64)> {
+        self.tables.get(&table).map_or_else(BTreeMap::new, |t| {
+            t.labels
+                .iter()
+                .filter_map(|(&offset, chain)| {
+                    let mut add = 0u64;
+                    let mut remove = 0u64;
+                    let mut seen = false;
+                    for &(_, add2, rm2) in chain.iter().filter(|&&(e, _, _)| e <= epoch) {
+                        add = (add & !rm2) | add2;
+                        remove = (remove & !add2) | rm2;
+                        seen = true;
+                    }
+                    seen.then_some((offset, (add, remove)))
+                })
+                .collect()
+        })
+    }
+
+    /// Whether `table` holds any label change visible at `epoch`, which
+    /// is what says a fold has work to do on a table whose rows and
+    /// properties nothing touched.
+    pub fn has_label_changes(&self, table: u32, epoch: Epoch) -> bool {
+        self.tables.get(&table).is_some_and(|t| {
+            t.labels
+                .values()
+                .any(|chain| chain.iter().any(|&(e, _, _)| e <= epoch))
+        })
+    }
+
     /// Seeds tombstones a checkpoint persisted into the base file. They
     /// enter at epoch 0 so every reader sees them, matching their state
     /// as folded rather than freshly deleted.
@@ -701,6 +768,20 @@ impl Mvcc {
                         .or_default()
                         .push((epoch, value));
                 }
+                Op::UpdateLabels {
+                    table,
+                    row,
+                    add,
+                    remove,
+                } => {
+                    self.tables
+                        .entry(table)
+                        .or_default()
+                        .labels
+                        .entry(row)
+                        .or_default()
+                        .push((epoch, add, remove));
+                }
             }
         }
         self.epoch = epoch;
@@ -785,6 +866,25 @@ impl WriteTxn<'_> {
         });
     }
 
+    /// Stages a change to one row's labels: the bits to set and the
+    /// bits to clear, against the graph's label dictionary. The two
+    /// masks have to be disjoint, because a label cannot be both put on
+    /// a row and taken off it by one change.
+    pub fn update_labels(&mut self, table: u32, row: u64, add: u64, remove: u64) -> Result<()> {
+        if add & remove != 0 {
+            return Err(ZuError::InvalidArgument(
+                "a label change cannot both set and clear the same label".into(),
+            ));
+        }
+        self.ops.push(Op::UpdateLabels {
+            table,
+            row,
+            add,
+            remove,
+        });
+        Ok(())
+    }
+
     /// Whether nothing has been staged.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
@@ -823,6 +923,7 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
     let mut out = Vec::new();
     let mut updates = UpdateBatches::new();
     let mut edge_updates = EdgeUpdateBatches::new();
+    let mut labels: Vec<(u32, u64, u64, Vec<u64>)> = Vec::new();
     let mut deletes: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
     let mut detaches: BTreeMap<u32, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
     for op in ops {
@@ -881,6 +982,24 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
                 dsts.push(*dst);
                 cells.push(value.clone());
             }
+            Op::UpdateLabels {
+                table,
+                row,
+                add,
+                remove,
+            } => {
+                // A record is one shape of change over the rows that
+                // were changed that way, and the shapes go out in the
+                // order they were staged, because two changes to one
+                // row compose in that order. So a run of the same shape
+                // coalesces and a change of shape starts a record.
+                match labels.last_mut() {
+                    Some((t, a, r, rows)) if (*t, *a, *r) == (*table, *add, *remove) => {
+                        rows.push(*row);
+                    }
+                    _ => labels.push((*table, *add, *remove, vec![*row])),
+                }
+            }
         }
     }
     for ((table, group, col), (offsets, cells)) in updates {
@@ -927,6 +1046,14 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
             });
             at = end;
         }
+    }
+    for (table, add, remove, offsets) in labels {
+        out.push(WalRecord::LabelUpdate {
+            table,
+            offsets,
+            add,
+            remove,
+        });
     }
     // The edges go before the rows, so a replay that stops partway
     // never leaves a row that is gone with an edge that still names it.
@@ -1118,6 +1245,77 @@ mod tests {
                 Some(&Cell::Int(2))
             );
         }
+    }
+
+    /// A label put on a row is in the overlay at the epoch that put it
+    /// there and not one epoch earlier, and the log says the same
+    /// thing.
+    #[test]
+    fn a_label_put_on_a_row_leaves_the_overlay_at_its_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_labels(1, 0, 0b0010, 0).unwrap();
+        txn.update_labels(1, 4, 0, 0b0100).unwrap();
+        let e1 = txn.commit(&mut wal).unwrap();
+        let mut txn = mvcc.begin();
+        txn.update_labels(1, 0, 0b1000, 0).unwrap();
+        let e2 = txn.commit(&mut wal).unwrap();
+
+        let recovered = Mvcc::recover(&wal, 0).unwrap();
+        for m in [&mvcc, &recovered] {
+            assert!(!m.has_label_changes(1, 0));
+            assert!(m.has_label_changes(1, e1));
+            let first = m.label_changes(1, e1);
+            assert_eq!(first.get(&0), Some(&(0b0010, 0)));
+            assert_eq!(first.get(&4), Some(&(0, 0b0100)));
+            let second = m.label_changes(1, e2);
+            assert_eq!(
+                second.get(&0),
+                Some(&(0b1010, 0)),
+                "the second label joins the first rather than replacing it"
+            );
+            assert!(m.label_changes(1, 0).is_empty());
+        }
+    }
+
+    /// Taking a label off a row that the same txn put on it leaves the
+    /// row without it, and putting one back on after taking it off
+    /// leaves the row with it, because the chain composes in order and
+    /// the two masks it composes to stay disjoint.
+    #[test]
+    fn a_label_taken_off_after_being_put_on_composes_to_the_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_labels(1, 0, 0b0001, 0).unwrap();
+        txn.update_labels(1, 0, 0, 0b0001).unwrap();
+        txn.update_labels(1, 7, 0, 0b0001).unwrap();
+        txn.update_labels(1, 7, 0b0001, 0).unwrap();
+        let epoch = txn.commit(&mut wal).unwrap();
+
+        let recovered = Mvcc::recover(&wal, 0).unwrap();
+        for m in [&mvcc, &recovered] {
+            let changes = m.label_changes(1, epoch);
+            assert_eq!(changes.get(&0), Some(&(0, 0b0001)));
+            assert_eq!(changes.get(&7), Some(&(0b0001, 0)));
+        }
+    }
+
+    /// A change that both sets and clears one label says nothing a
+    /// reader could act on, so it is refused where it is staged rather
+    /// than logged and sorted out later.
+    #[test]
+    fn a_label_change_that_contradicts_itself_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let _wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        let err = txn.update_labels(1, 0, 0b0011, 0b0010).unwrap_err();
+        assert!(matches!(err, ZuError::InvalidArgument(_)), "{err:?}");
+        assert!(txn.is_empty());
     }
 
     /// A txn abandoned before commit leaves no trace: not in the

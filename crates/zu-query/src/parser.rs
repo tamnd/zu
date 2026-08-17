@@ -16,7 +16,7 @@ use crate::ast::{
     BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
     GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
     PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
-    RemoveItem, Selector, SetItem, SortKey, Statement, UnaryOp,
+    RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, Statement, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex, position};
 use crate::value_type;
@@ -712,22 +712,24 @@ impl Parser<'_> {
         })
     }
 
-    /// One `REMOVE` item, which is a property and nothing else. A label
-    /// after the variable is the other thing GQL lets `REMOVE` take,
-    /// and an element carries the labels of the table it is in, so that
-    /// one is turned away by name.
+    /// One `REMOVE` item: a property, or the labels an element stops
+    /// carrying. `IS` is the other spelling of the colon, the way it is
+    /// in a pattern.
     fn parse_remove_item(&mut self) -> Result<RemoveItem> {
         let target = self.expect_name("a variable after REMOVE")?;
-        if self.at(&TokenKind::Colon) || self.at_kw("IS") {
-            return Err(ZuError::gql_at(
-                codes::C42001,
-                position(self.source, self.peek().expect("peeked").start),
-                "REMOVE of a label is not implemented yet, an element carries the labels of the table it is in",
-            ));
+        if self.eat(&TokenKind::Colon) || self.eat_kw("IS") {
+            let labels = self.parse_label_set()?;
+            return Ok(RemoveItem {
+                target,
+                what: Removed::Labels(labels),
+            });
         }
         self.expect(&TokenKind::Dot)?;
         let key = self.expect_name("a property name after the dot")?;
-        Ok(RemoveItem { target, key })
+        Ok(RemoveItem {
+            target,
+            what: Removed::Property(key),
+        })
     }
 
     /// One item of a `SET`: `p.age = 37`, or `p = {age: 37}`, which is
@@ -739,24 +741,26 @@ impl Parser<'_> {
     /// `INSERT`'s are. Each field's value is still an expression, so it
     /// can read the element the record is about to replace.
     ///
-    /// The third form of the item is named rather than met with a syntax
-    /// error. `SET p:Label` changes which labels an element carries,
-    /// which is a catalog change and a piece of its own, and a reader who
-    /// wrote it spelled it correctly.
+    /// The third form is `SET p:Admin&Bot`, the labels an element takes
+    /// on. There is nothing on the right of it, because what it writes is
+    /// written in the statement; the item carries a null there so every
+    /// item is still one value per row. `IS` is the other spelling of the
+    /// colon, the way it is in a pattern.
     fn parse_set_item(&mut self) -> Result<SetItem> {
         let target = self.expect_name("a variable after SET")?;
-        if self.at(&TokenKind::Colon) || self.at_kw("IS") {
-            return Err(ZuError::gql_at(
-                codes::C42001,
-                position(self.source, self.peek().expect("peeked").start),
-                "SET of a label is not implemented yet, an element carries the labels of the table it is in",
-            ));
+        if self.eat(&TokenKind::Colon) || self.eat_kw("IS") {
+            let labels = self.parse_label_set()?;
+            return Ok(SetItem {
+                target,
+                into: SetInto::Labels(labels),
+                value: Expr::Literal(Literal::Null),
+            });
         }
         if self.eat(&TokenKind::Eq) {
             let props = self.parse_property_map()?;
             return Ok(SetItem {
                 target,
-                key: None,
+                into: SetInto::Record,
                 value: Expr::Map(props),
             });
         }
@@ -766,7 +770,7 @@ impl Parser<'_> {
         let value = self.parse_expr()?;
         Ok(SetItem {
             target,
-            key: Some(key),
+            into: SetInto::Property(key),
             value,
         })
     }
@@ -3005,8 +3009,8 @@ mod tests {
         };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].target, "p");
-        assert_eq!(items[0].key.as_deref(), Some("age"));
-        assert_eq!(items[1].key.as_deref(), Some("name"));
+        assert_eq!(items[0].into, SetInto::Property("age".into()));
+        assert_eq!(items[1].into, SetInto::Property("name".into()));
     }
 
     /// The whole record form names no key and carries the fields as the
@@ -3020,7 +3024,7 @@ mod tests {
         };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].target, "p");
-        assert_eq!(items[0].key, None);
+        assert_eq!(items[0].into, SetInto::Record);
         let Expr::Map(fields) = &items[0].value else {
             panic!("a record");
         };
@@ -3056,8 +3060,8 @@ mod tests {
         };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].target, "p");
-        assert_eq!(items[0].key, "age");
-        assert_eq!(items[1].key, "name");
+        assert_eq!(items[0].what, Removed::Property("age".into()));
+        assert_eq!(items[1].what, Removed::Property("name".into()));
         // A REMOVE is a write, so the statement ends without a RETURN
         // the way a SET does.
         assert_eq!(q.clauses.len(), 2);
@@ -3110,29 +3114,58 @@ mod tests {
         assert!(parse_err("MATCH (p:person) DELETE").contains("a variable after DELETE"));
     }
 
-    /// A label is the other thing GQL lets REMOVE take, and it is named
-    /// rather than met with a syntax error about a colon.
+    /// A label is the other thing GQL lets REMOVE take, in either of
+    /// the two spellings of the colon, and a set of them comes off in
+    /// one item.
     #[test]
-    fn removing_a_label_says_which_part_is_not_in_yet() {
+    fn a_remove_of_labels_carries_them_in_one_item() {
         for source in [
-            "MATCH (p:person) REMOVE p:Manager",
-            "MATCH (p:person) REMOVE p IS Manager",
+            "MATCH (p:person) REMOVE p:Manager&Bot",
+            "MATCH (p:person) REMOVE p IS Manager&Bot",
         ] {
-            assert!(parse_err(source).contains("REMOVE of a label"), "{source}");
+            let q = parsed(source);
+            let Clause::Remove { items } = &q.clauses[1] else {
+                panic!("REMOVE");
+            };
+            assert_eq!(items.len(), 1, "{source}");
+            assert_eq!(items[0].target, "p");
+            assert_eq!(
+                items[0].what,
+                Removed::Labels(vec!["Manager".into(), "Bot".into()]),
+                "{source}"
+            );
         }
     }
 
-    /// The form of the item that is not in yet is named rather than met
-    /// with a syntax error, because a reader who wrote it spelled it
-    /// correctly.
+    /// A SET of labels carries the labels and a null value, because what
+    /// it writes is written in the statement rather than on the right of
+    /// an equals sign.
     #[test]
-    fn the_form_of_set_that_is_not_in_yet_says_which_one() {
+    fn a_set_of_labels_carries_them_and_no_value() {
         for source in [
-            "MATCH (p:person) SET p:Manager",
-            "MATCH (p:person) SET p IS Manager",
+            "MATCH (p:person) SET p:Manager&Bot",
+            "MATCH (p:person) SET p IS Manager&Bot",
         ] {
-            assert!(parse_err(source).contains("SET of a label"), "{source}");
+            let q = parsed(source);
+            let Clause::Set { items } = &q.clauses[1] else {
+                panic!("SET");
+            };
+            assert_eq!(items.len(), 1, "{source}");
+            assert_eq!(
+                items[0].into,
+                SetInto::Labels(vec!["Manager".into(), "Bot".into()]),
+                "{source}"
+            );
+            assert_eq!(items[0].value, Expr::Literal(Literal::Null));
         }
+    }
+
+    /// A colon with no label after it is a syntax error that says what
+    /// was wanted, rather than an item that writes nothing.
+    #[test]
+    fn a_label_item_wants_a_label() {
+        assert!(parse_err("MATCH (p:person) SET p:").contains("a label"));
+        assert!(parse_err("MATCH (p:person) REMOVE p:").contains("a label"));
     }
 
     /// Every syntax error that names a place carries that place as a

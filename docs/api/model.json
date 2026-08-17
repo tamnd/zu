@@ -6238,6 +6238,14 @@
       "signature": "Int(u64)"
     },
     {
+      "id": "zu::zu1::txn::Cell::Null",
+      "kind": "variant",
+      "name": "Null",
+      "of": "zu::zu1::txn::Cell",
+      "signature": "Null",
+      "doc": "The absence a `REMOVE` leaves behind. A column holds it the way\nstorage does, as a row whose validity bit is clear, so what the\nfold writes for one of these is a bit rather than a value."
+    },
+    {
       "id": "zu::zu1::txn::Cell::Str",
       "kind": "variant",
       "name": "Str",
@@ -6818,6 +6826,14 @@
       "name": "Int",
       "of": "zu::zu1::wal::WalValues",
       "signature": "Int(Vec<u64>)"
+    },
+    {
+      "id": "zu::zu1::wal::WalValues::Null",
+      "kind": "variant",
+      "name": "Null",
+      "of": "zu::zu1::wal::WalValues",
+      "signature": "Null(u32)",
+      "doc": "This many absences in a row, which is what a `REMOVE` writes.\nAn absence carries nothing per row, so the count is the whole\nrecord: what a reader needs to know is which rows the record\nnames, and the offsets beside it already say."
     },
     {
       "id": "zu::zu1::wal::WalValues::Str",

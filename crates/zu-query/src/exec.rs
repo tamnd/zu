@@ -350,6 +350,11 @@ impl QueryResult {
     }
 }
 
+/// The rows each table has lost to `DELETE`, ascending, keyed by
+/// table id. The sets are shared rather than copied because a reader
+/// hands the same one to every worker of a query.
+pub type DeletedRows = BTreeMap<u32, Arc<[u64]>>;
+
 /// What the executor needs from a storage engine. Methods take
 /// `&mut self` because readers cache decoded state.
 pub trait Graph {
@@ -408,6 +413,14 @@ pub trait Graph {
     fn rel_property(&mut self, rel: u32, src: u64, dst: u64, key: &str) -> Result<Value> {
         let _ = (rel, src, dst, key);
         Ok(Value::Null)
+    }
+    /// The rows a `DELETE` took away, read once per query. A delete
+    /// does not compact, because every edge names its endpoints by row
+    /// offset, so a scan still walks the row it took and this is what
+    /// says the row is gone. The default is what an engine whose rows
+    /// only ever arrive answers.
+    fn deleted(&mut self) -> Result<DeletedRows> {
+        Ok(DeletedRows::new())
     }
     /// An independent reader over the same storage for a morsel
     /// worker, with its own decoded-state caches. The default `None`
@@ -1396,6 +1409,7 @@ fn input_of(plan: &LogicalPlan) -> Option<&LogicalPlan> {
         | LogicalPlan::Unwind { input, .. }
         | LogicalPlan::Insert { input, .. }
         | LogicalPlan::Set { input, .. }
+        | LogicalPlan::Delete { input, .. }
         | LogicalPlan::TableFunction { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
@@ -2210,7 +2224,7 @@ fn build_stages(
                 });
                 b.produced(chunk);
             }
-            LogicalPlan::Insert { .. } | LogicalPlan::Set { .. } => {
+            LogicalPlan::Insert { .. } | LogicalPlan::Set { .. } | LogicalPlan::Delete { .. } => {
                 // A write is not an operator here. The session splits
                 // the statement at it, runs the clauses before it,
                 // writes once for each row they answered, and runs the
@@ -2457,6 +2471,9 @@ struct StageCtx<'a> {
     graph: &'a mut dyn Graph,
     params: &'a [Value],
     counts: &'a BTreeMap<u32, u64>,
+    /// The rows a delete took away, which a scan of a table's extent
+    /// walks straight over and every source here filters out.
+    gone: &'a DeletedRows,
     slot_loc: &'a BTreeMap<usize, (usize, usize)>,
     /// Path variable shapes from the binder, the assembly recipe
     /// behind [`assemble_path`]. No operator produces a path slot.
@@ -2898,6 +2915,16 @@ fn hop_levels(
     Ok(bfs)
 }
 
+/// Whether one row of one table is a row a `DELETE` took away.
+///
+/// The sets are per table and ascending, so this is a binary search
+/// over a handful of words on a file that has deleted something and a
+/// map lookup that misses on every other one.
+fn deleted(gone: &DeletedRows, table: u32, offset: u64) -> bool {
+    gone.get(&table)
+        .is_some_and(|rows| rows.binary_search(&offset).is_ok())
+}
+
 /// The nodes a key expression names, one per candidate table it exists
 /// in, the same resolution `IndexLookup` does. An empty answer is a
 /// miss, not an error: a key of the wrong type, or one nobody carries,
@@ -2914,7 +2941,7 @@ fn key_nodes(ctx: &mut StageCtx, key: &BoundExpr, tables: &[u32]) -> Result<Vec<
         let Some(offset) = ctx.graph.lookup_key(table, k)? else {
             continue;
         };
-        if offset < *ctx.counts.get(&table).unwrap_or(&0) {
+        if offset < *ctx.counts.get(&table).unwrap_or(&0) && !deleted(ctx.gone, table, offset) {
             out.push((table, offset));
         }
     }
@@ -3322,14 +3349,22 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 };
             }
             let mut vals = Vec::with_capacity(VECTOR_SIZE);
+            let gone = ctx.gone;
             if let Some(m) = morsel {
                 let st = &mut ctx.states[i];
                 while vals.len() < VECTOR_SIZE && st.offset < m.end {
+                    let offset = st.offset;
+                    st.offset += 1;
+                    // A deleted row keeps its offset, so the extent
+                    // still covers it and the scan steps over it here
+                    // rather than the table having grown shorter.
+                    if deleted(gone, m.table, offset) {
+                        continue;
+                    }
                     vals.push(Value::Node {
                         table: m.table,
-                        offset: st.offset,
+                        offset,
                     });
-                    st.offset += 1;
                 }
             } else {
                 let st = &mut ctx.states[i];
@@ -3341,11 +3376,12 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         st.offset = 0;
                         continue;
                     }
-                    vals.push(Value::Node {
-                        table,
-                        offset: st.offset,
-                    });
+                    let offset = st.offset;
                     st.offset += 1;
+                    if deleted(gone, table, offset) {
+                        continue;
+                    }
+                    vals.push(Value::Node { table, offset });
                 }
             }
             if vals.is_empty() {
@@ -3373,7 +3409,9 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 let Some(offset) = ctx.graph.lookup_key(table, k)? else {
                     continue;
                 };
-                if offset < *ctx.counts.get(&table).unwrap_or(&0) {
+                if offset < *ctx.counts.get(&table).unwrap_or(&0)
+                    && !deleted(ctx.gone, table, offset)
+                {
                     vals.push(Value::Node { table, offset });
                 }
             }
@@ -4032,7 +4070,15 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 vals[0] = Value::Int(offset as i64);
             }
             let rows = ctx.graph.table_function(func.name(), *rel, &vals)?;
-            if rows.is_empty() {
+            // The kernel answers for every row of the table's extent,
+            // deleted rows included, because it walks an adjacency
+            // whose offsets do not move. Their answers are dropped
+            // here, so a CALL yields what a MATCH over the same table
+            // would.
+            let offsets: Vec<u64> = (0..rows.len() as u64)
+                .filter(|&offset| !deleted(ctx.gone, *table, offset))
+                .collect();
+            if offsets.is_empty() {
                 return Ok(false);
             }
             let c = &mut ctx.chunks[*chunk];
@@ -4042,15 +4088,19 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     func.name()
                 )));
             }
-            c.size = rows.len();
-            c.cols[0] = (0..rows.len())
-                .map(|offset| Value::Node {
+            c.size = offsets.len();
+            c.cols[0] = offsets
+                .iter()
+                .map(|&offset| Value::Node {
                     table: *table,
-                    offset: offset as u64,
+                    offset,
                 })
                 .collect();
             for (j, col) in c.cols.iter_mut().enumerate().skip(1) {
-                *col = rows.iter().map(|r| r[j - 1].clone()).collect();
+                *col = offsets
+                    .iter()
+                    .map(|&offset| rows[offset as usize][j - 1].clone())
+                    .collect();
             }
             c.cur = None;
             Ok(true)
@@ -5461,6 +5511,7 @@ struct StageJob<'a> {
     stage: &'a StageDef,
     query: &'a BoundQuery,
     counts: &'a BTreeMap<u32, u64>,
+    gone: &'a DeletedRows,
     params: &'a [Value],
 }
 
@@ -5501,6 +5552,7 @@ fn drive_worker(
         graph,
         params: job.params,
         counts: job.counts,
+        gone: job.gone,
         slot_loc: &stage.slot_loc,
         path_shapes: &job.query.path_shapes,
         chunks: Vec::new(),
@@ -5607,6 +5659,7 @@ fn run_stage_parallel(
         graph,
         params: job.params,
         counts: job.counts,
+        gone: job.gone,
         slot_loc: &stage.slot_loc,
         path_shapes: &job.query.path_shapes,
         chunks: Vec::new(),
@@ -5707,6 +5760,10 @@ fn run_stages(
         .iter()
         .map(|n| (n.id, n.node_count))
         .collect();
+    // Read once for the whole query, beside the counts, because the
+    // extent and what is missing out of it are the same fact: a table
+    // holds `counts` rows and every source below skips the ones here.
+    let gone = graph.deleted()?;
     let auto = detected_parallelism().min(8);
     let threads = if options.threads == 0 {
         auto
@@ -5737,6 +5794,7 @@ fn run_stages(
                     stage,
                     query,
                     counts: &counts,
+                    gone: &gone,
                     params,
                 };
                 rows = run_stage_parallel(&job, graph, forks, morsels, &mut notices)?;
@@ -5747,6 +5805,7 @@ fn run_stages(
             graph: &mut *graph,
             params,
             counts: &counts,
+            gone: &gone,
             slot_loc: &stage.slot_loc,
             path_shapes: &query.path_shapes,
             chunks: stage
@@ -5911,6 +5970,7 @@ mod tests {
 
     struct MockGraph {
         edges: BTreeMap<u32, Vec<(u64, u64)>>,
+        gone: DeletedRows,
     }
 
     fn mock() -> MockGraph {
@@ -5929,7 +5989,10 @@ mod tests {
             ],
         );
         edges.insert(3, vec![(0, 0), (1, 1), (2, 2), (3, 0), (4, 1), (5, 2)]);
-        MockGraph { edges }
+        MockGraph {
+            edges,
+            gone: DeletedRows::new(),
+        }
     }
 
     impl Graph for MockGraph {
@@ -5969,9 +6032,14 @@ mod tests {
             }
         }
 
+        fn deleted(&mut self) -> Result<DeletedRows> {
+            Ok(self.gone.clone())
+        }
+
         fn fork(&self) -> Option<Box<dyn Graph + Send>> {
             Some(Box::new(MockGraph {
                 edges: self.edges.clone(),
+                gone: self.gone.clone(),
             }))
         }
 
@@ -6024,6 +6092,56 @@ mod tests {
         }
         let mut graph = mock();
         execute(&optimized, &query, &schema, &mut graph, &args, &options).expect("execute")
+    }
+
+    /// The same run over a graph that has lost rows: `dead` names the
+    /// rows a delete took away, by table.
+    fn run_deleted(source: &str, dead: &[(u32, &[u64])]) -> QueryResult {
+        let schema = schema();
+        let parsed = crate::parser::parse(source).expect("parse");
+        let query = crate::binder::bind(&parsed, &schema).expect("bind");
+        let built = crate::plan::build(&query).expect("plan");
+        let optimized = crate::optimizer::optimize(built, &query, &schema).expect("optimize");
+        let mut graph = mock();
+        graph.gone = dead
+            .iter()
+            .map(|&(table, rows)| (table, rows.into()))
+            .collect();
+        let options = Options {
+            threads: 1,
+            ..Options::default()
+        };
+        execute(&optimized, &query, &schema, &mut graph, &[], &options).expect("execute")
+    }
+
+    #[test]
+    fn a_deleted_row_is_not_scanned() {
+        let r = run_deleted(
+            "MATCH (p:Person) RETURN p.id AS id ORDER BY id",
+            &[(0, &[2, 4])],
+        );
+        assert_eq!(int_rows(&r), [[0], [1], [3], [5]]);
+    }
+
+    #[test]
+    fn a_deleted_row_is_not_found_by_its_key() {
+        let r = run_deleted("MATCH (p:Person {id: 2}) RETURN p.id AS id", &[(0, &[2])]);
+        assert!(r.rows.is_empty(), "the key names a row that is gone");
+        let still = run_deleted("MATCH (p:Person {id: 3}) RETURN p.id AS id", &[(0, &[2])]);
+        assert_eq!(int_rows(&still), [[3]]);
+    }
+
+    #[test]
+    fn a_call_does_not_yield_a_deleted_row() {
+        // The kernel answers for every row of the table, deleted rows
+        // included, because it walks an adjacency whose offsets do not
+        // move; what comes back out of the CALL is the rows that are
+        // still there.
+        let r = run_deleted(
+            "CALL wcc('KNOWS') YIELD node, component RETURN node.id AS id ORDER BY id",
+            &[(0, &[0, 5])],
+        );
+        assert_eq!(int_rows(&r), [[1], [2], [3], [4]]);
     }
 
     fn run_with(source: &str, params: &[(&str, Value)], flat: bool) -> QueryResult {
@@ -6317,6 +6435,7 @@ mod tests {
         // triangles are (1, 3, 0) and (2, 4, 0).
         let mut graph = MockGraph {
             edges: BTreeMap::from([(2u32, vec![(1, 0), (2, 0), (3, 0), (4, 0), (1, 3), (2, 4)])]),
+            gone: DeletedRows::new(),
         };
         let options = Options {
             threads: 1,
@@ -7401,11 +7520,13 @@ mod tests {
             .collect();
         let slot_loc = BTreeMap::new();
         let shapes = BTreeMap::new();
+        let gone = DeletedRows::new();
         let mut graph = mock();
         let mut ctx = StageCtx {
             graph: &mut graph,
             params: &[],
             counts: &counts,
+            gone: &gone,
             slot_loc: &slot_loc,
             path_shapes: &shapes,
             chunks: Vec::new(),

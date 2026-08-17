@@ -2,9 +2,9 @@
 //! write spends: latency, throughput, bytes pushed to the disk, bytes
 //! the store grew by, and memory.
 //!
-//! A `SET` of one property of one element and an `INSERT` of one
-//! element, both through the query engine, both one statement per
-//! commit. That is the shape of a linkbench update and of an SNB
+//! A `SET` of one property of one element, an `INSERT` of one element
+//! and a `DELETE` of one element, all three through the query engine,
+//! all three one statement per commit. That is the shape of a linkbench update and of an SNB
 //! insert, so it is the number those workloads are made of. The read
 //! benches say what finding the row costs; what is left in here is the
 //! write path, which is the log append, the fdatasync the commit is,
@@ -252,13 +252,25 @@ impl Cost {
 /// and the `follows` rel table over it, in a directory of its own so
 /// what it occupies can be told apart from every other run's.
 fn build(dir: &Path, rows: u64) -> std::path::PathBuf {
-    std::fs::create_dir_all(dir).expect("dir");
-    let path = dir.join("db.zu1");
-    let mut db = Zu1File::create(&path).expect("create");
     let edges: Vec<(u32, u32)> = (0..rows as u32)
         .map(|i| (i, (i * 7 + 1) % rows as u32))
         .collect();
-    bulk_load_as(&mut db, "person", "follows", rows, &edges).expect("load");
+    build_with(dir, rows, &edges)
+}
+
+/// The same table with nothing following anybody, which is the table a
+/// `DELETE` run needs: GQL refuses to take away an element that still
+/// has edges on it (G1001), and `DETACH DELETE`, which takes them with
+/// it, is not in yet.
+fn build_bare(dir: &Path, rows: u64) -> std::path::PathBuf {
+    build_with(dir, rows, &[])
+}
+
+fn build_with(dir: &Path, rows: u64, edges: &[(u32, u32)]) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).expect("dir");
+    let path = dir.join("db.zu1");
+    let mut db = Zu1File::create(&path).expect("create");
+    bulk_load_as(&mut db, "person", "follows", rows, edges).expect("load");
     let names: Vec<Vec<u8>> = (0..rows).map(|i| format!("seed{i}").into_bytes()).collect();
     let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
     let ages: Vec<u64> = (0..rows).collect();
@@ -378,6 +390,54 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
     }
 }
 
+/// A `DELETE` of one element, `WRITES` times over, at the same shape as
+/// the other two.
+///
+/// A delete does not compact, because every edge in the file names its
+/// endpoints by row offset, so what a delete writes is a tombstone: the
+/// row keeps its place and the fold merges the offset into the table's
+/// tombstone chain, which every scan after that filters by. That makes
+/// this the one write of the three whose cost has two halves, and both
+/// are in the number: the statement itself, and the chain growing by
+/// one offset a statement so every read pays a little more.
+///
+/// The count is read back afterwards, so a path that timed well by not
+/// taking the row away fails instead of scoring.
+fn run_delete(dir: &Path, rows: u64) -> Cost {
+    let path = build_bare(dir, rows);
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    conn.query(&format!(
+        "MATCH (p:person) WHERE p.age = {} DELETE p",
+        rows - 1
+    ))
+    .expect("warmup");
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        conn.query(&format!("MATCH (p:person) WHERE p.age = {i} DELETE p"))
+            .expect("delete");
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    assert_eq!(
+        one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),
+        (rows - WRITES - 1) as i64,
+        "every element deleted is gone, and no other one is"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let root = tempfile::tempdir().expect("tempdir");
@@ -392,6 +452,9 @@ fn main() {
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"));
 
+    let delete = run_delete(&root.path().join("delete"), SMALL);
+    delete.report(&format!("DELETE, {SMALL} rows"));
+
     // How much of a one cell write is the table it sits in, in time and
     // in bytes. One means the write path does not read the table; ten
     // means it reads all of it, since the large table is ten times the
@@ -405,7 +468,9 @@ fn main() {
     let checks = [
         ("set_stmt_us", set_small.us),
         ("insert_stmt_us", insert.us),
+        ("delete_stmt_us", delete.us),
         ("set_stmt_kb", set_small.written / 1024.0),
+        ("delete_stmt_kb", delete.written / 1024.0),
         ("set_stmt_growth_b", set_small.growth),
         ("set_peak_rss_mb", set_small.peak as f64 / MB),
         ("set_fold_x", fold_x),

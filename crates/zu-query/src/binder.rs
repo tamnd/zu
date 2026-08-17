@@ -756,6 +756,18 @@ pub enum BoundClause {
         /// nothing more.
         carry: Vec<usize>,
     },
+    /// `DELETE`, the elements the statement takes out of the graph, as
+    /// the slots they were found in.
+    Delete {
+        slots: Vec<usize>,
+        /// The slots in scope where the write runs, the same thing
+        /// [`BoundClause::Insert::carry`] holds. A `DELETE` creates
+        /// nothing either, so the row on the other side of it is what
+        /// came into it, with the elements it took away still named:
+        /// GQL leaves a deleted element bound, and a clause after the
+        /// delete that reads one gets 22G11.
+        carry: Vec<usize>,
+    },
     Unwind {
         expr: BoundExpr,
         slot: usize,
@@ -1385,6 +1397,14 @@ impl Binder<'_> {
                     carry,
                 })
             }
+            Clause::Delete { targets } => {
+                let carry = self.carried();
+                let mut slots = Vec::with_capacity(targets.len());
+                for name in targets {
+                    slots.push(self.bind_delete_target(name)?);
+                }
+                Ok(BoundClause::Delete { slots, carry })
+            }
             Clause::Unwind { expr, alias } => {
                 let mut ctx = ExprCtx::new(false);
                 let (bound, ty) = self.bind_expr(expr, &mut ctx)?;
@@ -1916,6 +1936,29 @@ impl Binder<'_> {
             ))),
             ref other => Err(bad_type(format!(
                 "{verb} changes an element, and '{name}' is {other}"
+            ))),
+        }
+    }
+
+    /// Binds one variable under `DELETE` to the slot it stands for.
+    ///
+    /// A delete takes away an element, so the variable has to stand for
+    /// one: a value is not deletable, and an edge is not deletable yet
+    /// because taking one away means taking it out of the adjacency its
+    /// table holds it in.
+    fn bind_delete_target(&mut self, name: &str) -> Result<usize> {
+        let Some(&target) = self.scope.get(name) else {
+            return Err(bad_reference(format!(
+                "'{name}' stands for nothing here, and DELETE takes away an element an earlier clause found"
+            )));
+        };
+        match self.variables[target].ty {
+            Type::Node => Ok(target),
+            Type::Rel => Err(not_yet(
+                "DELETE of an edge, which has to come out of the adjacency its table holds it in,",
+            )),
+            ref other => Err(bad_type(format!(
+                "DELETE takes away an element, and '{name}' is {other}"
             ))),
         }
     }

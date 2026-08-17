@@ -32,13 +32,14 @@ pub(crate) struct Part {
 
 /// The write one part ends in.
 ///
-/// The two of them are the two things a write does to a row: make
-/// elements the clauses after it read, or change what elements already
-/// there hold. What they share is the row on either side, which is why
-/// the split is written once over both.
+/// The three of them are the three things a write does to a row: make
+/// elements the clauses after it read, change what elements already
+/// there hold, or take elements away. What they share is the row on
+/// either side, which is why the split is written once over all three.
 pub(crate) enum Write {
     Insert(Insert),
     Set(Set),
+    Delete(Delete),
 }
 
 impl Write {
@@ -49,6 +50,7 @@ impl Write {
         match self {
             Write::Insert(insert) => &insert.carry,
             Write::Set(set) => &set.carry,
+            Write::Delete(delete) => &delete.carry,
         }
     }
 
@@ -58,6 +60,9 @@ impl Write {
         match self {
             Write::Insert(insert) => crate::insert::value_exprs(&insert.nodes, &insert.rels),
             Write::Set(set) => set.items.iter().map(|item| item.value.clone()).collect(),
+            // A delete names the elements it takes away and computes
+            // nothing, so there is nothing behind the row.
+            Write::Delete(_) => Vec::new(),
         }
     }
 
@@ -67,7 +72,7 @@ impl Write {
     fn created(&self) -> &[usize] {
         match self {
             Write::Insert(insert) => &insert.created,
-            Write::Set(_) => &[],
+            Write::Set(_) | Write::Delete(_) => &[],
         }
     }
 }
@@ -94,6 +99,16 @@ pub(crate) struct Set {
     /// The slots the part before the write projects. The values the
     /// assignments take follow them in the same row, one per item in
     /// written order.
+    pub(crate) carry: Vec<usize>,
+}
+
+/// A `DELETE`: the slots it takes away, and the row it carries across
+/// itself unchanged. The slots stay named on the other side, because
+/// GQL leaves a deleted element bound and reading one is 22G11.
+pub(crate) struct Delete {
+    pub(crate) slots: Vec<usize>,
+    /// The slots the part before the write projects. A delete carries
+    /// nothing behind them.
     pub(crate) carry: Vec<usize>,
 }
 
@@ -156,7 +171,10 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
 
 /// Whether a clause is one the statement has to be split at.
 fn is_write(clause: &BoundClause) -> bool {
-    matches!(clause, BoundClause::Insert { .. } | BoundClause::Set { .. })
+    matches!(
+        clause,
+        BoundClause::Insert { .. } | BoundClause::Set { .. } | BoundClause::Delete { .. }
+    )
 }
 
 /// The write a clause [`is_write`] answered for describes.
@@ -174,6 +192,10 @@ fn write_of(clause: &BoundClause) -> Write {
         }),
         BoundClause::Set { items, carry } => Write::Set(Set {
             items: items.clone(),
+            carry: carry.clone(),
+        }),
+        BoundClause::Delete { slots, carry } => Write::Delete(Delete {
+            slots: slots.clone(),
             carry: carry.clone(),
         }),
         _ => unreachable!("the position that matched"),

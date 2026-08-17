@@ -2906,7 +2906,14 @@
       "id": "zu::zu1::algo",
       "kind": "module",
       "name": "algo",
-      "doc": "Whole-graph table function kernels: bfs, pagerank, wcc, sssp,\nlouvain (docs/07 §4, TableFunction). Each kernel runs directly on a\nrel table's CSR through [`GraphReader`], one sequential sweep per\niteration so the per-direction group cache decodes every group once\nper pass, and returns one value per node in dense row order. The\nquery layer surfaces these through CALL; nothing here parses or\nplans.\n\nThe traversal kernels share one frontier: a visited bitmap, rounds\nthat pin a group's CSR once and expand every frontier node in it\nfrom the pinned arrays, and a direction-optimizing switch that goes\nbottom-up when the frontier is about to touch more edges than are\nleft unexplored.\n\nDeterminism: every kernel sweeps nodes in row order with fixed\niteration or convergence rules, so the same file produces the same\noutput on every run and every machine, which is what lets tests and\nthe Graphalytics harness assert exact values. The frontier is no\nexception: a node's level is the round it was first claimed in, and\nrounds are barriers, so which direction a round ran cannot move it."
+      "doc": "Whole-graph table function kernels: bfs, pagerank, wcc, sssp, cdlp,\nlcc, louvain (docs/07 §4, TableFunction). Each kernel runs directly\non a rel table's CSR through [`GraphReader`], one sequential sweep per\niteration so the per-direction group cache decodes every group once\nper pass, and returns one value per node in dense row order. The\nquery layer surfaces these through CALL; nothing here parses or\nplans.\n\nThe traversal kernels share one frontier: a visited bitmap, rounds\nthat pin a group's CSR once and expand every frontier node in it\nfrom the pinned arrays, and a direction-optimizing switch that goes\nbottom-up when the frontier is about to touch more edges than are\nleft unexplored.\n\nDeterminism: every kernel sweeps nodes in row order with fixed\niteration or convergence rules, so the same file produces the same\noutput on every run and every machine, which is what lets tests and\nthe Graphalytics harness assert exact values. The frontier is no\nexception: a node's level is the round it was first claimed in, and\nrounds are barriers, so which direction a round ran cannot move it."
+    },
+    {
+      "id": "zu::zu1::algo::CDLP_ROUNDS",
+      "kind": "constant",
+      "name": "CDLP_ROUNDS",
+      "signature": "usize",
+      "doc": "The round count Graphalytics fixes for CDLP, so two runs of the\nsame graph are the same partition however far propagation has left\nto go."
     },
     {
       "id": "zu::zu1::algo::PAGERANK_DAMPING",
@@ -2947,6 +2954,20 @@
       "name": "bfs",
       "signature": "fn bfs(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, source: u64) -> zu_common::Result<Vec<u64>>",
       "doc": "Breadth-first levels from `source` following stored edge direction,\nthe Graphalytics and Graph500 BFS kernel. Unreachable nodes get\n`u64::MAX`; the source is level zero."
+    },
+    {
+      "id": "zu::zu1::algo::cdlp",
+      "kind": "function",
+      "name": "cdlp",
+      "signature": "fn cdlp(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, rounds: usize) -> zu_common::Result<Vec<u64>>",
+      "doc": "Community detection by label propagation: `rounds` synchronous\nsweeps, each node taking the label most common among its neighbors\nin both directions, a bidirectional pair voting once per direction,\nthe smallest label winning a tie. A node with no neighbors keeps\nwhat it has.\n\nLabels start at the node's original key rather than at its row,\nbecause the tie-break reads label values and a graph loaded with\n`REORDER` has rows the dataset never named. That makes the answer a\nstatement about ids, which is what the caller asked, and it cannot\nbe repaired after the fact the way a component id can: relabeling a\nfinished run would have to undo ties that were already decided the\nwrong way. A file with no key index is its own key space, so rows\nserve."
+    },
+    {
+      "id": "zu::zu1::algo::lcc",
+      "kind": "function",
+      "name": "lcc",
+      "signature": "fn lcc(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader) -> zu_common::Result<Vec<f64>>",
+      "doc": "Local clustering coefficient over the directed graph: for a node\nwhose neighbor set is the union of its out and in neighbors without\nitself, the number of stored edges running from one neighbor to\nanother over `d * (d - 1)`, the count of ordered pairs. Fewer than\ntwo neighbors scores zero, there being no pair to close.\n\nParallel edges count as many times as they are stored, and a self\nloop on a neighbor closes nothing, which is what the Graphalytics\nreference counts."
     },
     {
       "id": "zu::zu1::algo::louvain",
@@ -5078,6 +5099,13 @@
       "of": "zu::zu1::keys::KeyReader",
       "signature": "fn lookup(&mut self, db: &mut Zu1File, key: u64) -> Result<Option<u64>>",
       "doc": "Returns the row stored under `key`, or `None`."
+    },
+    {
+      "id": "zu::zu1::keys::key_by_row",
+      "kind": "function",
+      "name": "key_by_row",
+      "signature": "fn key_by_row(db: &mut zu_zu1::file::Zu1File, index: &KeyIndex) -> zu_common::Result<Vec<u64>>",
+      "doc": "Reads the index back in the shape [`write_key_index`] took it,\n`key_by_row[row]` being the key of that row.\n\nA kernel whose answer is stated in original ids rather than in rows\nneeds every key, and asking for them one at a time costs a fence\nsearch each to learn what two sequential segment scans already say."
     },
     {
       "id": "zu::zu1::keys::verify_key_index",

@@ -453,6 +453,49 @@ pub(crate) enum PostSpec {
     Sort(Vec<SortKey<usize>>),
     Skip(u64),
     Limit(u64),
+    /// A `WITH ... WHERE` over the groups rather than over the rows
+    /// that made them, which is what a HAVING is.
+    Having(PostPred),
+    /// A second grouping over what the step below emitted: the columns
+    /// it groups by, what it accumulates, and where each of the two
+    /// lands in the row it writes. This is how a `count(DISTINCT x)`
+    /// per group answers, the argument having joined the sink's own
+    /// key, and how a clause that aggregates the groups again does.
+    Regroup {
+        keys: Vec<usize>,
+        aggs: Vec<PostAgg>,
+        item_agg: Vec<bool>,
+    },
+    /// The columns the answer is written from, in written order. A
+    /// stage above the sink reads columns the answer does not carry,
+    /// so this is what cuts the row back down to the clause.
+    Emit(Vec<usize>),
+}
+
+/// A HAVING-style predicate over the columns the step below emits.
+///
+/// There are as many groups as the query grouped into and every value
+/// in one is already boxed, so this is a small tree walked per row
+/// rather than another vector program. What it covers is a column
+/// against a constant and the two combinators, which is how a HAVING
+/// is written; anything else falls back.
+pub(crate) enum PostPred {
+    /// `column op constant`, for the orderings and equality. An
+    /// inequality is left out on purpose: this answers "unknown" where
+    /// the two sides do not compare, an unknown drops the group, and
+    /// for every operator here that is what the old engine does too.
+    Cmp(BinaryOp, usize, Value),
+    And(Vec<PostPred>),
+    Or(Vec<PostPred>),
+}
+
+/// An aggregate of a second grouping stage, over the columns the step
+/// below it emitted.
+pub(crate) enum PostAgg {
+    /// `count(*)`, and `count(x)` for the column x names, which counts
+    /// the values that are not null.
+    Count(Option<usize>),
+    Sum(usize),
 }
 
 pub(crate) enum SinkSpec {
@@ -719,6 +762,45 @@ fn drop_pass_through(chain: &mut Vec<&LogicalPlan>) {
                 .all(|item| matches!(item.expr, BoundExpr::Var(slot) if item.slot == Some(slot)));
         !pass_through
     });
+}
+
+/// Whether a node above the sink only narrows the answer the sink
+/// wrote, rather than being a clause of its own over it. A window is
+/// what the sink absorbs; anything else is a stage.
+fn is_window(node: &LogicalPlan) -> bool {
+    matches!(
+        node,
+        LogicalPlan::Distinct { .. }
+            | LogicalPlan::Sort { .. }
+            | LogicalPlan::Skip { .. }
+            | LogicalPlan::Limit { .. }
+    )
+}
+
+/// Whether anything above the sink reads column `at` of the row the
+/// sink writes. Only the stages are asked: a window step indexes the
+/// row the stage below it emitted, which is a different row and a
+/// different numbering.
+fn answers(post: &[PostSpec], at: usize) -> bool {
+    post.iter().any(|step| match step {
+        PostSpec::Having(pred) => pred_reads(pred, at),
+        PostSpec::Emit(cols) => cols.contains(&at),
+        PostSpec::Regroup { keys, aggs, .. } => {
+            keys.contains(&at)
+                || aggs.iter().any(|agg| match agg {
+                    PostAgg::Count(col) => *col == Some(at),
+                    PostAgg::Sum(col) => *col == at,
+                })
+        }
+        _ => false,
+    })
+}
+
+fn pred_reads(pred: &PostPred, at: usize) -> bool {
+    match pred {
+        PostPred::Cmp(_, col, _) => *col == at,
+        PostPred::And(parts) | PostPred::Or(parts) => parts.iter().any(|part| pred_reads(part, at)),
+    }
 }
 
 /// Compiles a plan, `Ok(None)` for any shape not covered yet.
@@ -1569,37 +1651,18 @@ impl Compiler<'_> {
             return Ok(None);
         }
 
-        // The sink and its absorbed post steps.
+        // The sink and everything the query wrote above it. Most of
+        // that is a window on the answer the sink absorbs; a grouped
+        // aggregate can also carry whole clauses above it, and those
+        // are stages over a table the sink already holds.
         let sink_node = it.next();
-        let mut post = Vec::new();
-        for node in it {
-            match node {
-                LogicalPlan::Distinct { .. } => post.push(PostSpec::Distinct),
-                LogicalPlan::Skip { expr, .. } => {
-                    let Some(n) = self.const_count(expr) else {
-                        return Ok(None);
-                    };
-                    post.push(PostSpec::Skip(n));
-                }
-                LogicalPlan::Limit { expr, .. } => {
-                    let Some(n) = self.const_count(expr) else {
-                        return Ok(None);
-                    };
-                    post.push(PostSpec::Limit(n));
-                }
-                LogicalPlan::Sort { keys, .. } => {
-                    let Some(cols) = self.sort_cols(keys) else {
-                        return Ok(None);
-                    };
-                    post.push(PostSpec::Sort(cols));
-                }
-                // HAVING-style filters above the sink still fall back.
-                _ => return Ok(None),
-            }
-        }
+        let tail: Vec<&LogicalPlan> = it.collect();
 
         let mut sink = match sink_node {
             Some(LogicalPlan::Project { items, .. }) => {
+                let Some(post) = self.window_post(&tail)? else {
+                    return Ok(None);
+                };
                 let mut refs = Vec::with_capacity(items.len());
                 for item in items {
                     if item.aggregate {
@@ -1613,9 +1676,6 @@ impl Compiler<'_> {
                 SinkSpec::Rows { items: refs, post }
             }
             Some(LogicalPlan::Aggregate { keys, aggs, .. }) => {
-                let Some(item_agg) = self.item_order(keys, aggs) else {
-                    return Ok(None);
-                };
                 let mut key_refs = Vec::with_capacity(keys.len());
                 for item in keys {
                     let Some(r) = self.item_ref(&item.expr)? else {
@@ -1623,35 +1683,52 @@ impl Compiler<'_> {
                     };
                     key_refs.push(r);
                 }
-                // A distinct count brings its own grouping and answers
-                // out of the table rather than out of an accumulator,
-                // so it is decided before the ordinary aggregate specs.
-                let mut tuple = None;
-                if key_refs.is_empty() && post.is_empty() && aggs.len() == 1 {
-                    tuple = self.distinct_count_keys(&aggs[0].expr)?;
-                }
-                match tuple {
-                    Some(keys) => SinkSpec::CountDistinct { keys },
-                    None => {
-                        let mut agg_specs = Vec::with_capacity(aggs.len());
-                        for item in aggs {
-                            let Some(spec) = self.agg_spec(&item.expr)? else {
-                                return Ok(None);
-                            };
-                            agg_specs.push(spec);
-                        }
-                        if key_refs.is_empty()
-                            && agg_specs.len() == 1
-                            && matches!(agg_specs[0], AggSpec::CountStar | AggSpec::CountRef(_))
-                            && post.is_empty()
-                        {
-                            SinkSpec::Count
-                        } else {
-                            SinkSpec::Agg {
-                                item_agg,
-                                keys: key_refs,
-                                aggs: agg_specs,
-                                post,
+                // A clause of its own above the aggregate reads the
+                // groups rather than the rows under them, and where
+                // one is written the whole answer is built in stages.
+                if tail.iter().any(|node| !is_window(node)) {
+                    let Some(sink) = self.staged_agg(keys, aggs, key_refs, &tail)? else {
+                        return Ok(None);
+                    };
+                    sink
+                } else {
+                    let Some(post) = self.window_post(&tail)? else {
+                        return Ok(None);
+                    };
+                    let Some(item_agg) = self.item_order(keys, aggs) else {
+                        return Ok(None);
+                    };
+                    // A distinct count brings its own grouping and
+                    // answers out of the table rather than out of an
+                    // accumulator, so it is decided before the
+                    // ordinary aggregate specs.
+                    let mut tuple = None;
+                    if key_refs.is_empty() && post.is_empty() && aggs.len() == 1 {
+                        tuple = self.distinct_count_keys(&aggs[0].expr)?;
+                    }
+                    match tuple {
+                        Some(keys) => SinkSpec::CountDistinct { keys },
+                        None => {
+                            let mut agg_specs = Vec::with_capacity(aggs.len());
+                            for item in aggs {
+                                let Some(spec) = self.agg_spec(&item.expr)? else {
+                                    return Ok(None);
+                                };
+                                agg_specs.push(spec);
+                            }
+                            if key_refs.is_empty()
+                                && agg_specs.len() == 1
+                                && matches!(agg_specs[0], AggSpec::CountStar | AggSpec::CountRef(_))
+                                && post.is_empty()
+                            {
+                                SinkSpec::Count
+                            } else {
+                                SinkSpec::Agg {
+                                    item_agg,
+                                    keys: key_refs,
+                                    aggs: agg_specs,
+                                    post,
+                                }
                             }
                         }
                     }
@@ -1673,7 +1750,9 @@ impl Compiler<'_> {
                 SinkSpec::Rows { items, post } => post.iter().all(|p| match p {
                     PostSpec::Distinct => false,
                     PostSpec::Sort(cols) => cols.iter().all(|k| items[k.expr].level() != opt),
-                    PostSpec::Skip(_) | PostSpec::Limit(_) => true,
+                    // A projection carries only the window steps: the
+                    // stages are built over a grouped sink alone.
+                    _ => true,
                 }),
                 SinkSpec::CountDistinct { keys } => keys.iter().all(|k| k.level() != opt),
                 SinkSpec::Agg { keys, aggs, .. } => {
@@ -1704,7 +1783,7 @@ impl Compiler<'_> {
                 SinkSpec::Rows { items, post } => post.iter().all(|p| match p {
                     PostSpec::Distinct => !items.iter().any(reads),
                     PostSpec::Sort(cols) => !cols.iter().any(|k| reads(&items[k.expr])),
-                    PostSpec::Skip(_) | PostSpec::Limit(_) => true,
+                    _ => true,
                 }),
                 SinkSpec::CountDistinct { keys } => !keys.iter().any(reads),
                 SinkSpec::Agg { keys, aggs, .. } => {
@@ -1970,7 +2049,11 @@ impl Compiler<'_> {
         // one at a time, so a level of theirs that ended up with an
         // edge column on it is a shape this executor cannot run.
         for (level, l) in self.levels.iter().enumerate() {
-            if !l.cols.iter().any(|(_, c)| matches!(c, ColSpec::RelStored(..))) {
+            if !l
+                .cols
+                .iter()
+                .any(|(_, c)| matches!(c, ColSpec::RelStored(..)))
+            {
                 continue;
             }
             let walked = ops
@@ -2305,6 +2388,384 @@ impl Compiler<'_> {
             .rposition(|v| v.name == item.name)
     }
 
+    /// The window steps above the sink, in plan order: a dedup, an
+    /// ordering, and a slice of the answer. `None` for anything else,
+    /// which is a clause the sink does not run.
+    fn window_post(&self, tail: &[&LogicalPlan]) -> Result<Option<Vec<PostSpec>>> {
+        let mut post = Vec::with_capacity(tail.len());
+        for node in tail {
+            match node {
+                LogicalPlan::Distinct { .. } => post.push(PostSpec::Distinct),
+                LogicalPlan::Skip { expr, .. } => {
+                    let Some(n) = self.const_count(expr) else {
+                        return Ok(None);
+                    };
+                    post.push(PostSpec::Skip(n));
+                }
+                LogicalPlan::Limit { expr, .. } => {
+                    let Some(n) = self.const_count(expr) else {
+                        return Ok(None);
+                    };
+                    post.push(PostSpec::Limit(n));
+                }
+                LogicalPlan::Sort { keys, .. } => {
+                    let Some(cols) = self.sort_cols(keys) else {
+                        return Ok(None);
+                    };
+                    post.push(PostSpec::Sort(cols));
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(post))
+    }
+
+    /// A grouped aggregate the query did not stop at, with the clauses
+    /// above it compiled into stages over its own table.
+    ///
+    /// The shape covered is the one a `WITH` writes: the aggregate,
+    /// then its `WHERE` over the groups, then the clause that names
+    /// them again or groups them a second time, then the usual window.
+    /// A group count is a fraction of the rows that made it, so every
+    /// stage here walks values rather than vectors.
+    ///
+    /// Whichever way the sink gets there, the stages above it read one
+    /// layout: the keys the query wrote, then one value per aggregate
+    /// item, then the columns a stage asked for off a key. Only the
+    /// last of those three grows while the tail compiles, so a
+    /// position settled early stays where it was put.
+    fn staged_agg(
+        &mut self,
+        keys: &[BoundItem],
+        aggs: &[BoundItem],
+        key_refs: Vec<ScalarRef>,
+        tail: &[&LogicalPlan],
+    ) -> Result<Option<SinkSpec>> {
+        // What the sink itself groups and accumulates. A grouped
+        // `count(DISTINCT x)` has no accumulator: x joins the key, so
+        // the table holds one group per distinct pair, and a second
+        // stage counts the pairs each group of the written keys got.
+        let mut dargs = Vec::new();
+        let mut agg_specs = Vec::new();
+        let mut counts_pairs = false;
+        if aggs.len() == 1
+            && let Some(parts) = self.distinct_count_keys(&aggs[0].expr)?
+        {
+            dargs = parts;
+            counts_pairs = true;
+        } else {
+            for item in aggs {
+                let Some(spec) = self.agg_spec(&item.expr)? else {
+                    return Ok(None);
+                };
+                agg_specs.push(spec);
+            }
+        }
+        let k = keys.len();
+        // One value per aggregate item either way: the pair count
+        // stands in for the distinct count it was lowered from.
+        let base = k + if counts_pairs { 1 } else { agg_specs.len() };
+        let mut hidden: Vec<ScalarRef> = Vec::new();
+        let mut post = Vec::new();
+
+        let mut it = tail.iter();
+        let mut node = it.next();
+        // The clause's own WHERE, which judges the groups and not the
+        // rows under them. One written with an AND in it arrives as
+        // one filter per conjunct, so this takes the whole run.
+        while let Some(LogicalPlan::Filter {
+            expr,
+            bracket: None,
+            ..
+        }) = node
+        {
+            let Some(pred) = self.post_pred(expr, keys, aggs, &key_refs, base, &mut hidden)? else {
+                return Ok(None);
+            };
+            post.push(PostSpec::Having(pred));
+            node = it.next();
+        }
+        // The clause above it, which either names the groups again or
+        // groups them a second time. One of the two has to be there:
+        // the sink's row carries columns these stages asked for and
+        // the answer does not.
+        match node {
+            Some(LogicalPlan::Project { items, .. }) => {
+                let mut cols = Vec::with_capacity(items.len());
+                for item in items {
+                    if item.aggregate {
+                        return Ok(None);
+                    }
+                    let Some(at) =
+                        self.tuple_pos(&item.expr, keys, aggs, &key_refs, base, &mut hidden)?
+                    else {
+                        return Ok(None);
+                    };
+                    cols.push(at);
+                }
+                post.push(PostSpec::Emit(cols));
+            }
+            Some(LogicalPlan::Aggregate {
+                keys: over,
+                aggs: again,
+                ..
+            }) => {
+                // This one is the query's last clause, so the order
+                // its items were written in is the order the answer
+                // wants them in.
+                let Some(item_agg) = self.item_order(over, again) else {
+                    return Ok(None);
+                };
+                let mut cols = Vec::with_capacity(over.len());
+                for item in over {
+                    let Some(at) =
+                        self.tuple_pos(&item.expr, keys, aggs, &key_refs, base, &mut hidden)?
+                    else {
+                        return Ok(None);
+                    };
+                    cols.push(at);
+                }
+                let mut specs = Vec::with_capacity(again.len());
+                for item in again {
+                    let Some(spec) =
+                        self.post_agg(&item.expr, keys, aggs, &key_refs, base, &mut hidden)?
+                    else {
+                        return Ok(None);
+                    };
+                    specs.push(spec);
+                }
+                post.push(PostSpec::Regroup {
+                    keys: cols,
+                    aggs: specs,
+                    item_agg,
+                });
+            }
+            _ => return Ok(None),
+        }
+        // What is left reads the answer's own columns, so it resolves
+        // the way it does over any other sink.
+        let rest: Vec<&LogicalPlan> = it.copied().collect();
+        let Some(mut window) = self.window_post(&rest)? else {
+            return Ok(None);
+        };
+        post.append(&mut window);
+
+        // A node the query grouped by that the answer never carries
+        // out is being asked for its identity and nothing else, and
+        // its row says that on its own: a level holds one table, so
+        // the table word beside the row is the same word for every
+        // group. Dropping it halves that key and leaves the groups
+        // exactly where they were.
+        let mut key_refs = key_refs;
+        for (at, r) in key_refs.iter_mut().enumerate() {
+            if let ScalarRef::Node { level } = *r
+                && !answers(&post, at)
+            {
+                *r = ScalarRef::RowId { level };
+            }
+        }
+
+        // The sink's own row, laid out so the stages above read the
+        // layout they compiled against. The hidden columns sit last
+        // because that is the one part of it that grew.
+        let h = hidden.len();
+        let d = dargs.len();
+        let mut sink_keys = key_refs;
+        sink_keys.extend(hidden);
+        sink_keys.extend(dargs);
+        let item_agg = if counts_pairs {
+            // Nothing accumulated: every column of the sink's row is
+            // a key, and the pair count arrives with the stage below.
+            vec![false; k + h + d]
+        } else {
+            let mut order = vec![false; k];
+            order.extend(std::iter::repeat_n(true, agg_specs.len()));
+            order.extend(std::iter::repeat_n(false, h));
+            order
+        };
+        if counts_pairs {
+            let mut order = vec![false; k];
+            order.push(true);
+            order.extend(std::iter::repeat_n(false, h));
+            post.insert(
+                0,
+                PostSpec::Regroup {
+                    keys: (0..k + h).collect(),
+                    aggs: vec![PostAgg::Count(None)],
+                    item_agg: order,
+                },
+            );
+        }
+        Ok(Some(SinkSpec::Agg {
+            item_agg,
+            keys: sink_keys,
+            aggs: agg_specs,
+            post,
+        }))
+    }
+
+    /// Where a stage above the sink reads an expression from: one of
+    /// the items the aggregate clause wrote, or a property of a node
+    /// that is one of its keys.
+    #[allow(clippy::too_many_arguments)]
+    fn tuple_pos(
+        &mut self,
+        expr: &BoundExpr,
+        keys: &[BoundItem],
+        aggs: &[BoundItem],
+        key_refs: &[ScalarRef],
+        base: usize,
+        hidden: &mut Vec<ScalarRef>,
+    ) -> Result<Option<usize>> {
+        if let Some(at) = keys.iter().position(|item| self.names_item(item, expr)) {
+            return Ok(Some(at));
+        }
+        if let Some(at) = aggs.iter().position(|item| self.names_item(item, expr)) {
+            return Ok(Some(keys.len() + at));
+        }
+        // Something read off a node the query grouped by. Its value is
+        // the same for every row of the group, so grouping by it as
+        // well leaves the groups exactly as they were and puts the
+        // value where this stage can read it. Read off anything else
+        // it is one of many values the group holds and there is no
+        // such column to add.
+        let Some(r) = self.item_ref(expr)? else {
+            return Ok(None);
+        };
+        let pinned = key_refs
+            .iter()
+            .any(|k| matches!(*k, ScalarRef::Node { level } if level == r.level()));
+        if !pinned {
+            return Ok(None);
+        }
+        let at = match hidden.iter().position(|h| same_ref(*h, r)) {
+            Some(at) => at,
+            None => {
+                hidden.push(r);
+                hidden.len() - 1
+            }
+        };
+        Ok(Some(base + at))
+    }
+
+    /// Whether a projected item is what an expression above it names,
+    /// the same rule ORDER BY resolves by: the alias it bound, or the
+    /// expression written again.
+    fn names_item(&self, item: &BoundItem, expr: &BoundExpr) -> bool {
+        item.expr == *expr
+            || matches!(expr, BoundExpr::Var(slot) if self.item_slot(item) == Some(*slot))
+    }
+
+    /// A HAVING over the groups. Covers a column against a constant
+    /// and the two combinators, which is how one is written.
+    #[allow(clippy::too_many_arguments)]
+    fn post_pred(
+        &mut self,
+        expr: &BoundExpr,
+        keys: &[BoundItem],
+        aggs: &[BoundItem],
+        key_refs: &[ScalarRef],
+        base: usize,
+        hidden: &mut Vec<ScalarRef>,
+    ) -> Result<Option<PostPred>> {
+        let BoundExpr::Binary { op, lhs, rhs } = expr else {
+            return Ok(None);
+        };
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            let Some(l) = self.post_pred(lhs, keys, aggs, key_refs, base, hidden)? else {
+                return Ok(None);
+            };
+            let Some(r) = self.post_pred(rhs, keys, aggs, key_refs, base, hidden)? else {
+                return Ok(None);
+            };
+            return Ok(Some(match op {
+                BinaryOp::And => PostPred::And(vec![l, r]),
+                _ => PostPred::Or(vec![l, r]),
+            }));
+        }
+        // The constant may be written either side of the operator, and
+        // moving it to the right turns the operator round with it.
+        let (op, col, want) = match self.const_value(rhs) {
+            Some(v) => (*op, lhs, v),
+            None => {
+                let Some(v) = self.const_value(lhs) else {
+                    return Ok(None);
+                };
+                let Some(op) = flip_cmp(*op) else {
+                    return Ok(None);
+                };
+                (op, rhs, v)
+            }
+        };
+        if !matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        ) {
+            return Ok(None);
+        }
+        let Some(at) = self.tuple_pos(col, keys, aggs, key_refs, base, hidden)? else {
+            return Ok(None);
+        };
+        Ok(Some(PostPred::Cmp(op, at, want)))
+    }
+
+    /// An aggregate of a second grouping stage, over what the stage
+    /// below it emitted.
+    #[allow(clippy::too_many_arguments)]
+    fn post_agg(
+        &mut self,
+        expr: &BoundExpr,
+        keys: &[BoundItem],
+        aggs: &[BoundItem],
+        key_refs: &[ScalarRef],
+        base: usize,
+        hidden: &mut Vec<ScalarRef>,
+    ) -> Result<Option<PostAgg>> {
+        let BoundExpr::Call {
+            func,
+            distinct: false,
+            star,
+            args,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        if *star {
+            return Ok(match func {
+                Func::Count => Some(PostAgg::Count(None)),
+                _ => None,
+            });
+        }
+        let [arg] = args.as_slice() else {
+            return Ok(None);
+        };
+        let Some(at) = self.tuple_pos(arg, keys, aggs, key_refs, base, hidden)? else {
+            return Ok(None);
+        };
+        Ok(match func {
+            Func::Count => Some(PostAgg::Count(Some(at))),
+            Func::Sum => Some(PostAgg::Sum(at)),
+            _ => None,
+        })
+    }
+
+    /// A written constant or a parameter, as the value it stands for.
+    fn const_value(&self, expr: &BoundExpr) -> Option<Value> {
+        match expr {
+            BoundExpr::Literal(Literal::Int(n)) => Some(Value::Int(*n)),
+            BoundExpr::Literal(Literal::Float(f)) => Some(Value::Float(*f)),
+            BoundExpr::Literal(Literal::Str(s)) => Some(Value::Str(s.clone())),
+            BoundExpr::Literal(Literal::Bool(b)) => Some(Value::Bool(*b)),
+            BoundExpr::Param(ix) => match self.params.get(*ix)? {
+                v @ (Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)) => {
+                    Some(v.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The keys a leading UNWIND yields, when the list is written out
     /// or arrives whole as a parameter and every element is a key a
     /// seek could use.
@@ -2353,14 +2814,15 @@ impl Compiler<'_> {
     /// Registers a property column on a level, returning its chunk
     /// vector position.
     fn register_col(&mut self, level: usize, key: &str) -> Result<Option<(usize, ColType)>> {
-        if let Some((ix, ty)) = self.levels[level]
-            .cols
-            .iter()
-            .enumerate()
-            .find_map(|(ix, (k, c))| match c {
-                ColSpec::Stored(_, ty) if k == key => Some((ix, *ty)),
-                _ => None,
-            })
+        if let Some((ix, ty)) =
+            self.levels[level]
+                .cols
+                .iter()
+                .enumerate()
+                .find_map(|(ix, (k, c))| match c {
+                    ColSpec::Stored(_, ty) if k == key => Some((ix, *ty)),
+                    _ => None,
+                })
         {
             return Ok(Some((ix + 1, ty)));
         }
@@ -2384,14 +2846,15 @@ impl Compiler<'_> {
         rel: RelId,
         key: &str,
     ) -> Result<Option<(usize, ColType)>> {
-        if let Some((ix, ty)) = self.levels[level]
-            .cols
-            .iter()
-            .enumerate()
-            .find_map(|(ix, (k, c))| match c {
-                ColSpec::RelStored(_, _, ty) if k == key => Some((ix, *ty)),
-                _ => None,
-            })
+        if let Some((ix, ty)) =
+            self.levels[level]
+                .cols
+                .iter()
+                .enumerate()
+                .find_map(|(ix, (k, c))| match c {
+                    ColSpec::RelStored(_, _, ty) if k == key => Some((ix, *ty)),
+                    _ => None,
+                })
         {
             return Ok(Some((ix + 1, ty)));
         }

@@ -141,6 +141,9 @@ pub(crate) fn run_streamed(
             PostSpec::Distinct | PostSpec::Sort(_) => {
                 unreachable!("a sorted or distinct answer does not stream")
             }
+            PostSpec::Having(_) | PostSpec::Regroup { .. } | PostSpec::Emit(_) => {
+                unreachable!("only a grouped sink carries a stage above it")
+            }
         }
     }
     st.window(skip, limit);
@@ -688,6 +691,10 @@ fn quota_of(post: &[PostSpec]) -> Option<u64> {
             PostSpec::Distinct | PostSpec::Sort(_) => return None,
             PostSpec::Skip(n) => skip = *n,
             PostSpec::Limit(n) => limit = Some(*n),
+            // A whole clause above the sink reads groups the run has
+            // not finished making, so there is nothing to stop early
+            // for either.
+            PostSpec::Having(_) | PostSpec::Regroup { .. } | PostSpec::Emit(_) => return None,
         }
     }
     limit.map(|l| skip.saturating_add(l))
@@ -2773,7 +2780,9 @@ impl<'a> Worker<'a> {
                 // walk carried down beside it.
                 &ColSpec::RelStored(rel, col, _) => {
                     debug_assert_eq!(ords.len(), part.len(), "one edge per row it made");
-                    self.snap.get().gather_rel(rel, col, ords, &mut self.arena)?
+                    self.snap
+                        .get()
+                        .gather_rel(rel, col, ords, &mut self.arena)?
                 }
             };
             chunk.vecs.push(v);

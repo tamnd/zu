@@ -9,7 +9,7 @@ $ zu query --no-such-flag
 # exit 2
 
 $ zu copy --no-such-flag
-! usage: zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1> [--format text|json]
+! usage: zu copy [--reorder degree|bfs|none] [--nodes <nodes.csv>] <edges.txt|csv|parquet> <out.zu1> [--format text|json]
 ! try `zu copy --help` for examples
 # exit 2
 

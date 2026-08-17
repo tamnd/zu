@@ -184,8 +184,9 @@ const NOTES: &[&str] = &[
      with it, and a plain DELETE of an element that still has edges on it is refused with the \
      code the standard gives that rather than leaving a dangling edge",
     "an element is created in the node table whose own name is the label the pattern wrote, \
-     and a table is not created by naming one, so a case that inserts into a label its \
-     fixture did not declare is answered with a reference error",
+     and a label no node table is named by makes one, out of the properties the pattern \
+     writes and under the savepoint the statement holds, so a property written as a value \
+     that has to be worked out first is refused rather than guessed at",
     "a protocol fault, a malformed frame or an unknown op, reports no GQLSTATUS on purpose \
      and is scored on its message",
 ];

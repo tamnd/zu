@@ -26,6 +26,7 @@ pub mod catalog_stmt;
 pub mod convert;
 pub mod dataset;
 pub mod db;
+mod declare;
 mod delete;
 mod deleted;
 #[cfg(test)]

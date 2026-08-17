@@ -971,6 +971,23 @@ pub fn store_props_nullable(
         .node_by_name(node_table)
         .ok_or_else(|| ZuError::InvalidArgument(format!("no node table '{node_table}'")))?;
     let (table_id, node_count) = (table.id, table.node_count);
+    store_props_for(db, table_id, node_count, columns)
+}
+
+/// The same store over a table named by its id, which is what a caller
+/// who has already resolved the name means, and the only way to reach a
+/// table outside the home graph: a name is a name in a graph, and the
+/// store above resolves one in the graph a load writes into.
+///
+/// `node_count` is the row domain the columns have to cover, which is
+/// the table's own count and is nought for a table nothing has written
+/// to yet.
+pub fn store_props_for(
+    db: &mut Zu1File,
+    table_id: u32,
+    node_count: u64,
+    columns: &[PropInput],
+) -> Result<PropsDirectory> {
     check_columns(node_count, columns)?;
     let mut index = TableIndex::load(db)?;
     // Which labels a row carries is not the business of a property

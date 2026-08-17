@@ -1252,6 +1252,45 @@ impl Catalog {
         Ok(id)
     }
 
+    /// Creates an empty node table in one graph and returns its id.
+    ///
+    /// This is `upsert_node` for a caller that says which graph rather
+    /// than meaning the home one, and it creates rather than updating:
+    /// a name the graph already holds is a table the caller meant to
+    /// find, not one to make twice. What it is for is the table an
+    /// `INSERT` names by a label nothing declared, which lands in the
+    /// graph the statement runs against.
+    pub fn create_node_in(&mut self, graph: u32, name: &str) -> Result<u32> {
+        if self.graphs.iter().all(|g| g.id != graph) {
+            return Err(ZuError::InvalidArgument(format!(
+                "no graph with id {graph}"
+            )));
+        }
+        if self.rel_in(graph, name).is_some() {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{name}' is already a rel table"
+            )));
+        }
+        if self.node_in(graph, name).is_some() {
+            return Err(ZuError::InvalidArgument(format!(
+                "'{name}' is already a node table"
+            )));
+        }
+        let id = self.next_id()?;
+        // The table's name is a label like any other, and the one every
+        // row carries, so it is interned before the table exists and
+        // heads the declared set.
+        let primary = self.intern_label(name)?;
+        self.nodes.push(NodeTable {
+            id,
+            name: name.to_string(),
+            graph,
+            node_count: 0,
+            labels: vec![primary],
+        });
+        Ok(id)
+    }
+
     /// Creates or updates a rel table and returns its id. The edges are
     /// directed, which is what a rel table has always held; the
     /// undirected form is `upsert_rel_as`.

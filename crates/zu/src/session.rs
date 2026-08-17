@@ -400,7 +400,15 @@ impl Session {
             }
             None => {}
         }
-        let cached = self.plan_for(source)?;
+        let cached = match self.plan_for(source) {
+            Ok(cached) => cached,
+            // A label under `INSERT` that names no node table is a table
+            // the statement means the graph to have, and there is no
+            // statement in GQL that makes one, so this makes it. It is a
+            // catalog change this statement makes, so it happens under
+            // the savepoint the statement holds and goes back with it.
+            Err(err) => return self.declaring(source, params, err),
+        };
         let args = query::bind_args(&cached.query.params, params)?;
         // A statement that writes runs as the parts it was split into,
         // because the clauses after the write read what it made rather
@@ -682,6 +690,63 @@ impl Session {
             &options,
         )?;
         Ok(profile)
+    }
+
+    /// Runs a statement that did not compile, in case what it wanted was
+    /// a table named by a label nothing has declared.
+    ///
+    /// `failed` is what compiling said and it is handed back untouched
+    /// when there is no such table to make, which is nearly every time
+    /// this is reached: the second parse is paid for by statements that
+    /// were going to raise anyway, and the statements that compile pay
+    /// nothing.
+    fn declaring(
+        &mut self,
+        source: &str,
+        params: &[(&str, Value)],
+        failed: ZuError,
+    ) -> Result<QueryResult> {
+        // Text that will not parse and a `USE` of a graph that is not
+        // there are both what `failed` already says, better than
+        // anything this could add.
+        let Ok(parsed) = zu_query::parser::parse(source) else {
+            return Err(failed);
+        };
+        let Ok(graph) = query::graph_of(self.graph.catalog(), self.working, &parsed) else {
+            return Err(failed);
+        };
+        let wanted = crate::declare::wanted(self.graph.catalog(), graph, &parsed)?;
+        if wanted.is_empty() {
+            return Err(failed);
+        }
+        self.refuse_a_write()?;
+        let held = self.hold()?;
+        let out = self.declared(source, params, graph, &wanted);
+        self.settle(out, held)
+    }
+
+    /// Makes the tables and runs the statement that wanted them, both
+    /// under the savepoint [`Self::declaring`] took.
+    fn declared(
+        &mut self,
+        source: &str,
+        params: &[(&str, Value)],
+        graph: u32,
+        wanted: &[crate::declare::NewTable],
+    ) -> Result<QueryResult> {
+        crate::declare::create(self.graph.file_mut(), graph, wanted)?;
+        // The tables are published now, and the schemas this session
+        // holds describe the catalog from before them.
+        self.refresh()?;
+        let cached = self.plan_for(source)?;
+        let args = query::bind_args(&cached.query.params, params)?;
+        let parts = cached.parts.as_ref().ok_or_else(|| {
+            ZuError::InvalidArgument(
+                "a statement that makes a table writes, and this one compiled as a read"
+                    .to_string(),
+            )
+        })?;
+        self.run_parts(&cached, parts, args)
     }
 
     fn plan_for(&mut self, source: &str) -> Result<Arc<CachedPlan>> {

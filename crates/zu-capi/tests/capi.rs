@@ -15,11 +15,11 @@ use zu::{
     ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
     zu_config_set_z, zu_conn_close, zu_connect, zu_create, zu_create_z, zu_database_close,
     zu_database_create_z, zu_database_open_z, zu_database_path, zu_error_code, zu_error_free,
-    zu_error_message, zu_error_severity, zu_error_status, zu_execute, zu_loader_col_bool,
-    zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str, zu_loader_col_temporal,
-    zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free, zu_loader_table,
-    zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query, zu_query_z,
-    zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
+    zu_error_message, zu_error_position, zu_error_severity, zu_error_status, zu_execute,
+    zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
+    zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
+    zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
+    zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
     zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
     zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
     zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
@@ -424,7 +424,7 @@ fn an_empty_result_is_done_rather_than_an_error() {
 
 /// The fields a binding needs off an error, as fields.
 #[test]
-fn a_refused_statement_carries_a_code_a_severity_and_a_message() {
+fn a_refused_statement_carries_a_code_a_severity_a_place_and_a_message() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("errors.zu1");
     seeded(&path);
@@ -465,6 +465,52 @@ fn a_refused_statement_carries_a_code_a_severity_and_a_message() {
         let code = CStr::from_ptr(code).to_str().expect("utf-8");
         assert_eq!(code_len, code.len());
         assert_eq!(code.len(), 5, "a GQLSTATUS code is five characters");
+
+        // The place, as two numbers rather than as the words the
+        // message also carries. This query is refused at its first
+        // token, and the message still says so.
+        let mut line = 0u32;
+        let mut column = 0u32;
+        assert_eq!(zu_error_position(err, &mut line, &mut column), ZuStatus::Ok);
+        assert_eq!((line, column), (1, 1));
+        assert!(
+            message.starts_with("42001: line 1, column 1: "),
+            "the message stopped saying where: {message}"
+        );
+        // Either half on its own, for a caller that wants one.
+        let mut only = 0u32;
+        assert_eq!(
+            zu_error_position(err, &mut only, ptr::null_mut()),
+            ZuStatus::Ok
+        );
+        assert_eq!(only, 1);
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        // A condition raised while the statement runs happened at no
+        // token, and answers that it has no place rather than pointing
+        // at one it guessed. The out-parameters are left alone.
+        let divide = "RETURN 1 / 0";
+        let mut result: *mut ZuResult = ptr::null_mut();
+        let status = zu_query(
+            conn,
+            divide.as_ptr().cast::<c_char>(),
+            divide.len(),
+            &mut result,
+            &mut err,
+        );
+        assert_eq!(status, ZuStatus::Error);
+        assert!(!err.is_null());
+        let code = CStr::from_ptr(zu_error_code(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert_eq!(code, "22012", "division by zero");
+        let (mut line, mut column) = (7u32, 9u32);
+        assert_eq!(
+            zu_error_position(err, &mut line, &mut column),
+            ZuStatus::Done
+        );
+        assert_eq!((line, column), (7, 9), "an absent place wrote something");
         zu_error_free(err);
         err = ptr::null_mut();
 
@@ -624,6 +670,10 @@ fn null_inputs_are_misuse_and_not_crashes() {
         assert_eq!(zu_error_status(ptr::null()), ZuStatus::Misuse);
         assert!(zu_error_message(ptr::null(), ptr::null_mut()).is_null());
         assert!(zu_error_code(ptr::null(), ptr::null_mut()).is_null());
+        assert_eq!(
+            zu_error_position(ptr::null(), ptr::null_mut(), ptr::null_mut()),
+            ZuStatus::Misuse
+        );
         let mut ints: *const i64 = ptr::null();
         assert_eq!(
             zu_result_col_i64(ptr::null_mut(), 0, &mut ints),

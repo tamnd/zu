@@ -276,7 +276,15 @@
       "kind": "struct",
       "name": "DiagnosticRecord",
       "source": "zu_common::gqlstatus::DiagnosticRecord",
-      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on."
+      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers."
+    },
+    {
+      "id": "zu::DiagnosticRecord::at",
+      "kind": "method",
+      "name": "at",
+      "of": "zu::DiagnosticRecord",
+      "signature": "fn at(status: GqlStatus, position: Position, detail: impl fmt::Display) -> Self",
+      "doc": "The same, raised at a place. The position is written into the\ndetail as well, ahead of it and separated by a colon, which is\nthe form every parser message already had."
     },
     {
       "id": "zu::DiagnosticRecord::detail",
@@ -291,6 +299,14 @@
       "name": "new",
       "of": "zu::DiagnosticRecord",
       "signature": "fn new(status: GqlStatus, detail: impl Into<String>) -> Self"
+    },
+    {
+      "id": "zu::DiagnosticRecord::position",
+      "kind": "field",
+      "name": "position",
+      "of": "zu::DiagnosticRecord",
+      "signature": "Option<Position>",
+      "doc": "Where in the statement, for the conditions that happen somewhere.\nA division by zero happens at runtime and has no token to point\nat, so this is `None` rather than a guess at one."
     },
     {
       "id": "zu::DiagnosticRecord::severity",
@@ -523,6 +539,35 @@
       "doc": "Row index within the table, `group * GROUP_ROWS + row`."
     },
     {
+      "id": "zu::Position",
+      "kind": "struct",
+      "name": "Position",
+      "source": "zu_common::gqlstatus::Position",
+      "doc": "Where in the statement text a condition was raised. Both are 1-based\nand columns count characters rather than bytes, so a line of\nmulti-byte text does not read as wider than it looks.\n\nThis is a pair rather than a byte offset because a byte offset is\nonly useful to something holding the source, and the caller that\nmost wants a position is an editor or a shell that has already\nprinted the line and wants to point under it."
+    },
+    {
+      "id": "zu::Position::column",
+      "kind": "field",
+      "name": "column",
+      "of": "zu::Position",
+      "signature": "u32"
+    },
+    {
+      "id": "zu::Position::line",
+      "kind": "field",
+      "name": "line",
+      "of": "zu::Position",
+      "signature": "u32"
+    },
+    {
+      "id": "zu::Position::of",
+      "kind": "method",
+      "name": "of",
+      "of": "zu::Position",
+      "signature": "fn of(source: &str, offset: usize) -> Self",
+      "doc": "The pair `offset` bytes into `source`. An offset past the end\nlands at the end, which is where an error about a query that\nstopped too early belongs."
+    },
+    {
       "id": "zu::Result",
       "kind": "type-alias",
       "name": "Result",
@@ -688,12 +733,28 @@
       "doc": "Raises `status` with our own account of what happened."
     },
     {
+      "id": "zu::ZuError::gql_at",
+      "kind": "method",
+      "name": "gql_at",
+      "of": "zu::ZuError",
+      "signature": "fn gql_at(status: GqlStatus, position: Position, detail: impl std::fmt::Display) -> Self",
+      "doc": "The same, raised at a place in the statement text. The message\nreads as it did before, with the line and column ahead of the\ndetail, and the pair is also kept as a pair so that a caller can\npoint at the token instead of parsing the sentence."
+    },
+    {
       "id": "zu::ZuError::gqlstatus",
       "kind": "method",
       "name": "gqlstatus",
       "of": "zu::ZuError",
       "signature": "fn gqlstatus(&self) -> Option<GqlStatus>",
       "doc": "The GQLSTATUS value for this error, if it has one. Engine-internal\nerrors return `None` rather than a code that would be a guess."
+    },
+    {
+      "id": "zu::ZuError::position",
+      "kind": "method",
+      "name": "position",
+      "of": "zu::ZuError",
+      "signature": "fn position(&self) -> Option<Position>",
+      "doc": "Where in the statement this was raised, when it was raised\nsomewhere. An engine-internal failure and a runtime condition\nboth answer `None`."
     },
     {
       "id": "zu::append",
@@ -1124,7 +1185,15 @@
       "id": "zu::gqlstatus::DiagnosticRecord",
       "kind": "struct",
       "name": "DiagnosticRecord",
-      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on."
+      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers."
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::at",
+      "kind": "method",
+      "name": "at",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "fn at(status: GqlStatus, position: Position, detail: impl fmt::Display) -> Self",
+      "doc": "The same, raised at a place. The position is written into the\ndetail as well, ahead of it and separated by a colon, which is\nthe form every parser message already had."
     },
     {
       "id": "zu::gqlstatus::DiagnosticRecord::detail",
@@ -1139,6 +1208,14 @@
       "name": "new",
       "of": "zu::gqlstatus::DiagnosticRecord",
       "signature": "fn new(status: GqlStatus, detail: impl Into<String>) -> Self"
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::position",
+      "kind": "field",
+      "name": "position",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "Option<Position>",
+      "doc": "Where in the statement, for the conditions that happen somewhere.\nA division by zero happens at runtime and has no token to point\nat, so this is `None` rather than a guess at one."
     },
     {
       "id": "zu::gqlstatus::DiagnosticRecord::severity",
@@ -1197,6 +1274,34 @@
       "of": "zu::gqlstatus::GqlStatus",
       "signature": "fn standard_text(self) -> String",
       "doc": "The standard's own words for this condition: the class name, and\nthe subclass name after it when there is one. This is the text a\nconformance harness compares against, so zu never paraphrases it.\nAnything zu wants to add goes in [`DiagnosticRecord::detail`]."
+    },
+    {
+      "id": "zu::gqlstatus::Position",
+      "kind": "struct",
+      "name": "Position",
+      "doc": "Where in the statement text a condition was raised. Both are 1-based\nand columns count characters rather than bytes, so a line of\nmulti-byte text does not read as wider than it looks.\n\nThis is a pair rather than a byte offset because a byte offset is\nonly useful to something holding the source, and the caller that\nmost wants a position is an editor or a shell that has already\nprinted the line and wants to point under it."
+    },
+    {
+      "id": "zu::gqlstatus::Position::column",
+      "kind": "field",
+      "name": "column",
+      "of": "zu::gqlstatus::Position",
+      "signature": "u32"
+    },
+    {
+      "id": "zu::gqlstatus::Position::line",
+      "kind": "field",
+      "name": "line",
+      "of": "zu::gqlstatus::Position",
+      "signature": "u32"
+    },
+    {
+      "id": "zu::gqlstatus::Position::of",
+      "kind": "method",
+      "name": "of",
+      "of": "zu::gqlstatus::Position",
+      "signature": "fn of(source: &str, offset: usize) -> Self",
+      "doc": "The pair `offset` bytes into `source`. An offset past the end\nlands at the end, which is where an error about a query that\nstopped too early belongs."
     },
     {
       "id": "zu::gqlstatus::Severity",

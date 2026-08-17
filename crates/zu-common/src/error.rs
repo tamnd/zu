@@ -9,7 +9,7 @@
 //! a file is not a condition the standard has a code for, and inventing
 //! one would be worse than admitting it.
 
-use crate::gqlstatus::{DiagnosticRecord, GqlStatus};
+use crate::gqlstatus::{DiagnosticRecord, GqlStatus, Position};
 
 /// Top-level error for all zu operations.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +39,24 @@ impl ZuError {
     /// Raises `status` with our own account of what happened.
     pub fn gql(status: GqlStatus, detail: impl Into<String>) -> Self {
         ZuError::Gql(Box::new(DiagnosticRecord::new(status, detail)))
+    }
+
+    /// The same, raised at a place in the statement text. The message
+    /// reads as it did before, with the line and column ahead of the
+    /// detail, and the pair is also kept as a pair so that a caller can
+    /// point at the token instead of parsing the sentence.
+    pub fn gql_at(status: GqlStatus, position: Position, detail: impl std::fmt::Display) -> Self {
+        ZuError::Gql(Box::new(DiagnosticRecord::at(status, position, detail)))
+    }
+
+    /// Where in the statement this was raised, when it was raised
+    /// somewhere. An engine-internal failure and a runtime condition
+    /// both answer `None`.
+    pub fn position(&self) -> Option<Position> {
+        match self {
+            ZuError::Gql(record) => record.position,
+            _ => None,
+        }
     }
 
     /// The GQLSTATUS value for this error, if it has one. Engine-internal

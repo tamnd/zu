@@ -307,6 +307,36 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (a:person)-[:knows]->(b)-[:knows]->(c) RETURN sum(a.score) AS s",
         "MATCH (a:person)-[:knows]->(b) RETURN a.age AS age, count(*) AS n \
          ORDER BY n DESC, age LIMIT 5",
+        // Clauses above a grouped aggregate: the WITH's own WHERE over
+        // the groups, a RETURN that reads a property off a node the
+        // query grouped by, and a RETURN that groups the groups again.
+        // The property is not a key the query wrote, so the sink picks
+        // it up as one of its own and the projection reads it there.
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(*) AS n WHERE n > 3 \
+         RETURN a.id AS id, n ORDER BY id LIMIT 20",
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(*) AS n WHERE n > 3 \
+         RETURN a.name AS name, a.age AS age, n ORDER BY name, age, n LIMIT 20",
+        "MATCH (a:person)-[:knows]->(b) WITH a.age AS age, count(*) AS n WHERE n > 100 \
+         RETURN age, n ORDER BY age",
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(*) AS n WHERE n > 3 \
+         RETURN count(a) AS c",
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(*) AS n WHERE n >= 4 AND n <= 8 \
+         RETURN count(*) AS c",
+        "MATCH (a:person)-[:knows]->(b) WITH a.age AS age, count(*) AS n \
+         RETURN sum(n) AS s, count(*) AS c",
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(*) AS n WHERE 3 < n \
+         RETURN a.id AS id ORDER BY id LIMIT 20",
+        // The grouped distinct count, whose argument joins the sink's
+        // own key so the groups hold one row per distinct pair, and a
+        // stage above counts the pairs each group got.
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(DISTINCT b.age) AS n \
+         RETURN a.id AS id, n ORDER BY id LIMIT 20",
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(DISTINCT b.age) AS n WHERE n > 10 \
+         RETURN a.id AS id, n ORDER BY id LIMIT 20",
+        "MATCH (a:person)-[:knows]->(b) WITH a.age AS age, count(DISTINCT b.name) AS n \
+         RETURN age, n ORDER BY age",
+        "MATCH (a:person)-[:knows]->(b) WITH a, count(DISTINCT b.id) AS n WHERE n > 20 \
+         RETURN count(*) AS c",
         // Second pattern branches: a hop off a level the pipeline has
         // already walked past, which is a cross product per source row
         // rather than a chain. Both far ends read so the weight fusion

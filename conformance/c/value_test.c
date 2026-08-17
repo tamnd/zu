@@ -267,7 +267,12 @@ static void the_calendar_holds_from_the_first_day_to_the_last(void) {
     check(first.as.temporal.count == -719162, "the first day is where zu-common puts it");
     check(last.as.temporal.count == 2932896, "and so is the last");
     for (day = first.as.temporal.count; day <= last.as.temporal.count; day += 97) {
-        char text[64], want[64];
+        /* The show of a date is thirty one bytes into the format
+         * below, but gcc sizes the destination against what the
+         * format could write rather than against what a date writes,
+         * and a hand-picked sixty four is a format-truncation error
+         * on the runner where warnings are errors. */
+        char want[64], text[sizeof want + 32];
         cv v;
         cv made;
         made.kind = CV_TEMPORAL;

@@ -36,6 +36,16 @@ static int report(const char *what, zu_status status, zu_error *err) {
   return 1;
 }
 
+/* A host's progress callback with nothing to report to: counts the
+ * calls and lets the statement carry on. Returning 0 here is how a host
+ * stops one, which the Rust test beside this file does. */
+static int ticked(void *user_data, uint64_t rows, uint64_t ms) {
+  (void)rows;
+  (void)ms;
+  *(unsigned long *)user_data += 1;
+  return 1;
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     return fail("usage: smoke <database>");
@@ -523,6 +533,51 @@ int main(int argc, char **argv) {
   }
   zu_error_free(err);
 
+  /* Cancellation and progress, as far as one thread and four nodes can
+   * take them: the symbols are exported, the header's function-pointer
+   * type is the one the library was built with, a period of nothing is
+   * refused, and a statement watched by a callback answers exactly what
+   * the same statement answered unwatched. Stopping one mid-run needs a
+   * second thread and a graph worth the wait, and lives in the Rust
+   * test beside this file. */
+  uint64_t rows_read = 0;
+  unsigned long ticks = 0;
+  const int64_t *watched = NULL;
+  if (zu_conn_set_progress(first, ticked, &ticks, 1) != ZU_OK ||
+      zu_conn_set_progress(first, ticked, &ticks, 0) != ZU_MISUSE ||
+      zu_conn_interrupt(NULL) != ZU_MISUSE) {
+    zu_conn_close(first);
+    return fail("the progress arrangement was made wrongly and taken");
+  }
+  /* An ask raised while nothing is running is dropped when the next
+   * statement starts, which is what keeps a Ctrl-C at a prompt from
+   * ending whatever the user types next. */
+  if (zu_conn_interrupt(first) != ZU_OK) {
+    zu_conn_close(first);
+    return fail("a connection with nothing running refused to be asked");
+  }
+  err = NULL;
+  result = NULL;
+  status = zu_query_z(first, "MATCH (a) RETURN count(a) AS n", &result, &err);
+  if (status != ZU_OK) {
+    zu_conn_close(first);
+    return report("a watched statement failed", status, err);
+  }
+  if (zu_result_col_i64(result, 0, &watched) != ZU_OK || watched == NULL || watched[0] != 4) {
+    zu_result_free(result);
+    zu_conn_close(first);
+    return fail("a watched statement answered something else");
+  }
+  zu_result_free(result);
+  if (zu_conn_rows_read(first, &rows_read) != ZU_OK || rows_read == 0) {
+    zu_conn_close(first);
+    return fail("nothing was read by a statement that read the whole graph");
+  }
+  if (zu_conn_set_progress(first, NULL, NULL, 0) != ZU_OK) {
+    zu_conn_close(first);
+    return fail("a progress arrangement could not be taken back");
+  }
+
   /* A statement that outlives its connection answers rather than
    * following the pointer it still holds, and is still safe to close. */
   zu_stmt *stmt = NULL;
@@ -542,7 +597,7 @@ int main(int argc, char **argv) {
 
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
-      "nested list, one load, one refusal with a place and one without\n",
+      "nested list, one load, one watched statement, one refusal with a place and one without\n",
       version);
   return 0;
 }

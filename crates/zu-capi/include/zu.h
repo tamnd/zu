@@ -49,12 +49,12 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.6 and another
+ * system tests when it has to compile one way against 0.7 and another
  * against what comes next. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.6"
+#define ZU_ABI_VERSION "0.7"
 
 #ifdef __cplusplus
 extern "C" {
@@ -298,6 +298,51 @@ zu_status zu_create(const char *path, size_t path_len, zu_conn **out, zu_error *
 zu_status zu_create_z(const char *path, zu_conn **out, zu_error **err);
 void zu_conn_close(zu_conn *conn);
 void zu_close(zu_conn *conn); /* the old name; goes at the freeze */
+
+/* Cancellation and progress.
+ *
+ * zu_conn_interrupt is the one call here meant to be made from another
+ * thread while a connection is in use, and it does not answer
+ * ZU_MISUSE_CONCURRENT for it: a cancellation that had to wait for the
+ * connection to be free could only arrive after the statement it was
+ * meant to stop. The statement stops at the next boundary the executor
+ * checks, which is a chunk of rows rather than the end of the query,
+ * and answers ZU_INTERRUPTED. Nothing failed: the connection keeps its
+ * plans and its warm caches and runs the next statement normally, which
+ * is the difference between this and closing it.
+ *
+ * An ask raised while nothing is running is dropped when the next
+ * statement starts, so a Ctrl-C at a prompt cannot end whatever the
+ * user types next.
+ *
+ * zu_conn_rows_read is the same watch by polling: how many rows the
+ * statement has read out of storage, counted from zero at each
+ * statement and left at its final value once one ends. Rows read rather
+ * than rows answered, because the statement a user is waiting on is
+ * exactly the one reading a hundred million rows to answer one.
+ *
+ * zu_conn_set_progress asks to be called back every interval_ms while a
+ * statement runs, with the rows read and the milliseconds since it
+ * started; returning 0 from the callback stops the statement exactly as
+ * zu_conn_interrupt would. A NULL callback takes the arrangement back
+ * and ignores interval_ms; a callback with an interval of zero is
+ * ZU_MISUSE, since a period of nothing is not a period. The
+ * arrangement belongs to the connection and covers every statement
+ * after it, and a statement already running keeps the one it started
+ * with.
+ *
+ * The callback runs on a thread of this library's, one per statement,
+ * never two at once and never after the call it belongs to has
+ * returned. It is not called on the thread that asked for the
+ * statement, because that thread is inside the executor; what follows
+ * from that is that user_data has to be usable from another thread, and
+ * that a callback must not call back into this library on the
+ * connection it is reporting on. */
+zu_status zu_conn_interrupt(zu_conn *conn);
+zu_status zu_conn_rows_read(zu_conn *conn, uint64_t *out);
+typedef int (*zu_progress_fn)(void *user_data, uint64_t rows, uint64_t ms);
+zu_status zu_conn_set_progress(zu_conn *conn, zu_progress_fn cb, void *user_data,
+                               uint64_t interval_ms);
 
 /* One-shot statement without parameters. */
 zu_status zu_query(zu_conn *conn, const char *q, size_t q_len, zu_result **out, zu_error **err);

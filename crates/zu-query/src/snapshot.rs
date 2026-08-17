@@ -15,8 +15,14 @@
 
 use std::sync::Arc;
 
-use zu_common::Result;
+use zu_common::{Result, ZuError};
 use zu_vector::{MorselArena, SelVector, ValueVector};
+
+/// What a backend that resolved no edge column says if it is asked to
+/// read one anyway, which is a compiler bug rather than a query error.
+fn no_edge_columns() -> ZuError {
+    ZuError::InvalidArgument("this snapshot reads no edge columns".into())
+}
 
 /// Node table id from the catalog.
 pub type TableId = u32;
@@ -134,6 +140,45 @@ pub trait Snapshot {
     /// Resolves a property column by name, `None` when the table has
     /// no column under it.
     fn resolve_col(&mut self, table: TableId, name: &str) -> Result<Option<(ColId, ColType)>>;
+
+    /// The same for a rel table's edge columns, `None` when the rel
+    /// stores nothing under that name and `None` from a backend with
+    /// no edge columns at all.
+    ///
+    /// Answering `None` is what keeps the other two edge methods
+    /// honest: nothing compiles a plan that reads an edge column
+    /// unless this resolved one, so a backend that does not implement
+    /// them is never asked.
+    fn resolve_rel_col(&mut self, rel: RelId, name: &str) -> Result<Option<(ColId, ColType)>> {
+        let _ = (rel, name);
+        Ok(None)
+    }
+
+    /// Appends the load-order ordinal of every edge of `node`'s list
+    /// in `dir` to `out`, position for position with
+    /// [`Snapshot::list_into`].
+    ///
+    /// An edge's ordinal is the row its properties sit in, and it is
+    /// what a pair with several edges between it needs: the pair alone
+    /// names the first of the run for all of them, and counting the
+    /// list out instead gives every copy its own value.
+    fn list_ords_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {
+        let _ = (rel, node, dir, out);
+        Err(no_edge_columns())
+    }
+
+    /// Gathers an edge column for arbitrary `ords` into one vector in
+    /// argument order, the edge-side [`Snapshot::gather`].
+    fn gather_rel(
+        &mut self,
+        rel: RelId,
+        col: ColId,
+        ords: &[u64],
+        arena: &mut MorselArena,
+    ) -> Result<ValueVector> {
+        let _ = (rel, col, ords, arena);
+        Err(no_edge_columns())
+    }
 
     /// Reads chunk `chunk` of `table`, decoding `cols` in order into
     /// vectors backed by `arena`. `pred` filters on an integer column:

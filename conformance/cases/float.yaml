@@ -1,0 +1,399 @@
+schema: 1
+suite: float
+doc: Binary floating point, which every language has and none of them prints the same way. The value is IEEE 754 and the disagreements are all about what surrounds it: how many digits a client emits, whether it keeps the sign of a zero, what it does with a value no decimal literal spells exactly, and whether the three values that are not numbers survive a round trip at all.
+
+cases:
+  - name: exact-half
+    doc: A half is exact in binary, so it is the value every client agrees on, and a client failing this fails arithmetic rather than floating point.
+    query: RETURN 0.5 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.5"
+
+  - name: a-tenth-is-not-exact
+    doc: A tenth is not a binary fraction, so the value stored is a little more than a tenth, and a client printing the shortest text that reads back as the same double prints 0.1 while one printing seventeen digits prints something else.
+    query: RETURN 0.1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.1"
+
+  - name: a-tenth-and-seven-tenths
+    doc: Two values that are each a little off give a sum that is visibly off, which is the shortest demonstration that these are not decimal numbers and the answer a client that rounds for display hides.
+    query: RETURN 0.1 + 0.7 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.7999999999999999"
+
+  - name: a-whole-number-is-still-a-float
+    doc: Three times two is six point zero and not six, so the type survives an operation whose answer happens to be whole, which a client deciding the type from the digits gets wrong.
+    query: RETURN 3.0 * 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "6.0"
+
+  - name: an-integer-and-a-float-add-as-floats
+    doc: One plus one point five is a float, because the integer widens to the float and not the other way, and the result of the other choice would be two.
+    query: RETURN 1 + 1.5 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.5"
+
+  - name: division-that-does-not-terminate
+    doc: A third has no exact binary or decimal spelling, so what comes back is the nearest double, and a client that shortens it to fifteen digits gives back a number that reads as a different double.
+    query: RETURN 1.0 / 3.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.3333333333333333"
+
+  - name: the-last-integer-a-double-holds
+    doc: Two to the fifty third is exact as a double and every integer below it is, which is the boundary the cases below are on either side of.
+    query: RETURN 9007199254740992.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "9007199254740992.0"
+
+  - name: one-past-the-last-integer-a-double-holds
+    doc: The next integer up has no double, so the literal reads as the one below it, and a client that carried the text through instead of the value gives back the odd number nobody can store.
+    query: RETURN 9007199254740993.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "9007199254740992.0"
+
+  - name: an-integer-compares-equal-to-the-double-it-rounds-to
+    doc: An INT64 that no double holds compares equal to the double next to it, because the comparison is done in floating point, and this is the one place the engine's own answer is the trap the rest of the corpus is written against.
+    query: RETURN 9007199254740993 = 9007199254740992.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: adding-one-to-two-to-the-fifty-third-changes-nothing
+    doc: The gap between doubles at this magnitude is two, so adding one lands back on the same value, which is where a running total in a client silently stops advancing.
+    query: RETURN 1e16 + 1.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1e16"
+
+  - name: adding-two-to-the-same-value-does-not
+    doc: Adding two clears the gap and gives the next double up, which is what says the case above is about the spacing of the values and not about addition being broken.
+    query: RETURN 1e16 + 2.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0000000000000002e16"
+
+  - name: the-smallest-normal-double
+    doc: The smallest double with a full mantissa, below which precision starts being lost a bit at a time, and which a client parsing through a decimal type of its own may not reach.
+    query: RETURN 2.2250738585072014e-308 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.2250738585072014e-308"
+
+  - name: a-subnormal-double
+    doc: A value below the smallest normal, held with fewer bits of precision, which more than one language flushes to zero and which some processors flush to zero depending on a control register.
+    query: RETURN 1e-320 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1e-320"
+
+  - name: the-smallest-subnormal-double
+    doc: The smallest positive double there is, one bit of mantissa, whose literal is not the value it names and whose shortest round trip spelling is a different decimal again.
+    query: RETURN 4.9e-324 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "5e-324"
+
+  - name: negative-zero
+    doc: Negative zero is a value and not a rendering of zero, and a client that dropped the sign passes every arithmetic case in this file and fails this one.
+    query: RETURN -0.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-0.0"
+
+  - name: negative-zero-through-multiplication
+    doc: The same value arrived at rather than written, because a client can carry a literal's sign and still lose the one arithmetic produced.
+    query: RETURN -1.0 * 0.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-0.0"
+
+  - name: overflow-gives-infinity
+    doc: A product too large for a double is infinity rather than a condition, which is IEEE 754 and is the opposite of what integer overflow does, so the two cannot share a code path in a client.
+    query: RETURN 1e308 * 10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "inf"
+
+  - name: negative-infinity
+    doc: Infinity with a sign, which is a distinct value, and a client mapping both to a single out of range marker gives back the same thing for two different answers.
+    query: RETURN -1e308 * 10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-inf"
+
+  - name: infinity-is-larger-than-any-number
+    doc: Infinity compares above every finite value, which is what makes it useful as a starting point for a minimum, and a client that clamped it to the largest double breaks that.
+    query: RETURN 1e308 * 10 > 1e308 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: infinity-minus-infinity-is-not-a-number
+    doc: Subtracting infinities gives NaN, which is the value with no JSON spelling and no decimal spelling, so every client that goes through either has had to decide something here.
+    query: RETURN 1e308 * 10 - 1e308 * 10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "NaN"
+
+  - name: infinity-times-zero-is-not-a-number
+    doc: The other way to arrive at NaN in arithmetic, here because a client that special cased the subtraction and not the product would pass the case above.
+    query: RETURN 1e308 * 10 * 0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "NaN"
+
+  - name: not-a-number-is-not-equal-to-itself
+    doc: NaN compares unequal to everything including itself, so a client comparing by bits gives back true here and a client comparing as IEEE says gives back false.
+    query: RETURN 1e308 * 10 - 1e308 * 10 = 1e308 * 10 - 1e308 * 10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: text-to-infinity
+    doc: Infinity read out of text, which is how a client that has to serialise one gets it back, and the spelling is the one the engine prints.
+    query: RETURN cast('inf' AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "inf"
+
+  - name: text-to-not-a-number
+    doc: NaN read out of text, the other half of the round trip above, and the case that says the two spellings a client emits are the two spellings it can read back.
+    query: RETURN cast('NaN' AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "NaN"
+
+  - name: text-with-an-exponent
+    doc: A float in text written with an exponent, which several strict parsers refuse and every user writes.
+    query: RETURN cast('1e10' AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "10000000000.0"
+
+  - name: text-with-no-leading-digit
+    doc: A fraction with nothing before the point is a float in text even though it is not a float literal in the language, so the two readers are allowed to differ and here they do.
+    query: RETURN cast('.5' AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.5"
+
+  - name: text-that-is-not-a-number
+    doc: Prose is refused rather than read as NaN, which is what more than one language's parser does with anything it fails on.
+    query: RETURN cast('abc' AS FLOAT64) AS n
+    raises: "22018"
+
+  - name: float-to-text-drops-a-trailing-zero
+    doc: A whole float prints without its fraction, so a client round tripping through text and back has to know the type from somewhere other than the text.
+    query: RETURN cast(1.0 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "1"
+
+  - name: negative-zero-to-text-keeps-the-sign
+    doc: The sign of a zero survives being printed even though the digits do not distinguish it, which is what lets a client that round trips through text keep the value it was given.
+    query: RETURN cast(-0.0 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "-0"
+
+  - name: infinity-to-text
+    doc: Infinity printed, which is the spelling a client has to accept back, and it is a word rather than a number so a client writing it into JSON has to quote it or lose it.
+    query: RETURN cast(1e308 * 10 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: inf
+
+  - name: infinity-does-not-cast-to-an-integer
+    doc: Infinity is out of range for every integer, so the cast raises rather than giving back the largest one, and saturating is what a hardware conversion does.
+    query: RETURN cast(1e308 * 10 AS INT64) AS n
+    raises: "22003"
+
+  - name: a-single-holds-fewer-digits
+    doc: A tenth as a FLOAT32 is a different number from a tenth as a FLOAT64, and a client that stored the narrow type in a double has to have narrowed it first or it gives back the wide value.
+    query: RETURN cast(0.1 AS FLOAT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT32
+            value: "0.1"
+
+  - name: a-single-and-a-double-of-the-same-literal-differ
+    doc: The two are not equal, which is the sharpest way to say the narrowing above really happened and is not a label on the same bits.
+    query: RETURN cast(0.1 AS FLOAT32) = 0.1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: a-value-both-widths-hold-exactly
+    doc: One and a half is exact in both, so narrowing changes nothing and the comparison holds, which says the case above is about precision and not about the cast always changing the value.
+    query: RETURN cast(1.5 AS FLOAT32) = 1.5 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-last-integer-a-single-holds
+    doc: Two to the twenty fourth plus one has no FLOAT32, so it narrows to the value below, which is the FLOAT32 version of the double case above and catches a client that checked only the wide type.
+    query: RETURN cast(16777217 AS FLOAT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT32
+            value: "16777216.0"
+
+  - name: a-value-too-small-for-a-single-becomes-zero
+    doc: A value below every FLOAT32 subnormal narrows to zero rather than raising, because underflow is not an error in IEEE 754, and the case above it in this file says overflow is not either.
+    query: RETURN cast(1e-46 AS FLOAT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT32
+            value: "0.0"
+
+  - name: a-value-too-large-for-a-single-raises
+    doc: A value above every FLOAT32 is out of range, which is the engine choosing a condition over the infinity IEEE would give, and a client that let the hardware do the narrowing gives back infinity instead.
+    query: RETURN cast(-1e39 AS FLOAT32) AS n
+    raises: "22003"
+
+  - name: the-largest-single
+    doc: The largest FLOAT32 fits, which is the boundary the case above is one step past, so the two together say where the range ends rather than that casts to FLOAT32 fail.
+    query: RETURN cast(3.4028235e38 AS FLOAT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT32
+            value: "3.4028235e38"
+
+  - name: remainder-of-floats
+    doc: The remainder operator works on floats and keeps the fraction, which a client that routed the operator to an integer implementation loses.
+    query: RETURN 1.5 % 1.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.5"
+
+  - name: remainder-of-a-negative-float
+    doc: The sign follows the left operand as it does for integers, so the two remainders agree about signs while disagreeing about types.
+    query: RETURN -1.5 % 1.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-0.5"
+
+  - name: an-integer-and-a-float-that-are-the-same-number
+    doc: One and one point zero are equal across the types, which is what makes the case earlier in this file about two to the fifty third a trap rather than an inconsistency.
+    query: RETURN 1 = 1.0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true

@@ -1,0 +1,290 @@
+schema: 1
+suite: boolean
+doc: The truth values and the operators over them, with the unknown left to the null suite. What a client gets wrong here is rarely a single answer and usually a shape: an operator implemented with its host language's truthiness, a precedence taken from the language the client is written in rather than from the one it is sending, or a comparison that gives back the host language's boolean instead of the value the engine returned.
+
+cases:
+  - name: and-of-two-truths
+    doc: The one row of the conjunction table that is true, here so that a client failing every case below fails this one first and the report says whether the operator works at all.
+    query: RETURN true AND true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: and-with-a-falsehood
+    doc: One false makes the conjunction false whichever side it is on, and this is the left one so that the case after it can be the right one.
+    query: RETURN false AND true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: and-with-a-falsehood-on-the-right
+    doc: The same answer with the operands swapped, which a client that short circuits on the left and forgets the right gets wrong in the direction nobody tests.
+    query: RETURN true AND false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: or-with-a-truth
+    doc: One true makes the disjunction true, which is the row a client short circuiting on the left gets right for the wrong reason.
+    query: RETURN true OR false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: or-with-a-truth-on-the-right
+    doc: The truth on the far side, so the short circuit has to run out and look, and the answer is the same.
+    query: RETURN false OR true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: or-of-two-falsehoods
+    doc: The one row of the disjunction table that is false, which is the other half of the pair the case above starts.
+    query: RETURN false OR false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: exclusive-or-of-different-values
+    doc: XOR is true when the two differ, and it is an operator several languages spell as a bitwise one, which is where a client sends the wrong thing entirely.
+    query: RETURN true XOR false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: exclusive-or-of-two-truths
+    doc: XOR of two truths is false, which is the row that tells XOR apart from OR, and a client that mapped one to the other passes every other case in this pair.
+    query: RETURN true XOR true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: exclusive-or-of-two-falsehoods
+    doc: XOR of two falsehoods is false, which completes the table and catches a client that implemented the operator as an inequality on something other than booleans.
+    query: RETURN false XOR false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: negation-of-a-truth
+    doc: NOT true is false. It is the shortest statement in this file and it is here because a unary operator is a separate path from a binary one in every parser.
+    query: RETURN NOT true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: negation-of-a-falsehood
+    doc: NOT false is true, the other row, and the pair together says the operator is a negation rather than a constant.
+    query: RETURN NOT false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: two-negations-cancel
+    doc: Negating twice gives the value back, which is worth a case because a client that made NOT return a truthy value rather than a boolean cannot apply it twice.
+    query: RETURN NOT NOT true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: and-binds-tighter-than-or
+    doc: The conjunction is read first, so the whole expression is true because of its right hand side, and a client that read the operators left to right gets false.
+    query: RETURN false AND false OR true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: and-binds-tighter-than-or-on-the-right
+    doc: The same precedence with the conjunction on the other side, which is the arrangement a client with a table for one direction and a branch for the other gets wrong.
+    query: RETURN true OR false AND false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: parentheses-override-precedence
+    doc: The same tokens as the case above with brackets around the disjunction, which changes the answer, and is how a reader can tell the case above is about precedence and not about the constants.
+    query: RETURN (true OR false) AND false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: negation-binds-tighter-than-conjunction
+    doc: NOT applies to the value beside it and not to the whole conjunction, so this is false, and a client giving true has bound the unary operator too loosely.
+    query: RETURN NOT true AND false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: a-comparison-is-a-boolean
+    doc: A comparison returns a value of the same type the literals have, so a client with a separate representation for predicate results has two kinds of true and one of them is wrong.
+    query: RETURN 1 < 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-comparison-can-be-negated
+    doc: The result of a comparison goes straight into a logical operator, which is what says it really is a boolean rather than something that prints like one.
+    query: RETURN NOT (1 < 2) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: booleans-compare-equal
+    doc: Two truths are equal, which is a comparison of booleans rather than a comparison producing one, and those are different code paths in a client with a type switch.
+    query: RETURN true = true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: booleans-compare-unequal
+    doc: True and false are not equal, and a client that compared them after converting to numbers still gets this right, which is why the ordering case below is the one that separates them.
+    query: RETURN true <> false AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: false-is-less-than-true
+    doc: Booleans are ordered and false comes first, so a comparison operator works on them rather than raising, which is what a client that treats them as unordered would do.
+    query: RETURN false < true AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-boolean-is-not-the-number-one
+    doc: True does not equal 1. Every language that stores a boolean as an integer agrees that it does, which is exactly why the corpus says otherwise.
+    query: RETURN true = 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: text-to-boolean-ignores-case
+    doc: The word is read whatever case it is written in, so a client normalising the text before parsing agrees, and one comparing bytes against a lower case literal does not.
+    query: RETURN cast('TRUE' AS BOOL) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: text-to-boolean-refuses-a-word-that-means-yes
+    doc: Only the two words are read, so a client that accepted anything a user might mean has widened the type in a way nothing can take back.
+    query: RETURN cast('yes' AS BOOL) AS n
+    raises: "22018"
+
+  - name: a-boolean-in-a-list
+    doc: Booleans inside a list, because a decoder that special cased the top level value and recursed with a different function has two answers for one type.
+    query: RETURN [true, false] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: BOOL
+                value: true
+              - type: BOOL
+                value: false
+
+  - name: a-condition-selects-rows
+    doc: A boolean used as a condition keeps the rows it is true for, which is the use every client puts the type to and the one where a truthy host value would let extra rows through.
+    query: UNWIND [1, 2, 3] AS n WITH n WHERE n % 2 = 1 RETURN collect(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "3"
+
+  - name: the-largest-boolean
+    doc: A set function over booleans answers true, which says the order the case above declares is the order the aggregate uses and not a separate opinion.
+    query: UNWIND [true, false] AS n RETURN max(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: distinct-booleans
+    doc: Three rows of two values give two rows, which is a client's own equality being used to deduplicate, and a client with two representations of true gives three.
+    query: UNWIND [true, false, true] AS n RETURN DISTINCT n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+      - values:
+          - type: BOOL
+            value: false

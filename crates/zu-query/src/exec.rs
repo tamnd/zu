@@ -2232,6 +2232,19 @@ fn build_stages(
                                 item.name
                             )));
                         };
+                        // A scalar function wrapping a set function, as
+                        // in `size(collect(n))`, is a call and so gets
+                        // this far, but it is a projection over the
+                        // grouped rows rather than an aggregate of its
+                        // own. Refuse it here: without this the spec
+                        // below asks for an accumulator no scalar
+                        // function has.
+                        if !func.is_aggregate() {
+                            return Err(invalid(format!(
+                                "aggregate item '{}' applies a scalar function to a set function, which needs a projection after the grouping and is not implemented yet",
+                                item.name
+                            )));
+                        }
                         let arg = args.first().cloned();
                         let arg_chunk = match &arg {
                             None => None,

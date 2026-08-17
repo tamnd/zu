@@ -65,6 +65,9 @@ typedef struct zu_conn zu_conn;
 typedef struct zu_stmt zu_stmt;
 typedef struct zu_result zu_result;
 typedef struct zu_error zu_error;
+/* One cell of a result, borrowed from it. Not a handle: nothing to
+ * free, and it lives exactly as long as the result does. */
+typedef struct zu_value zu_value;
 
 /* The name a connection had before the database was split out of it.
  * Kept for one release, along with zu_close below, so that code written
@@ -130,6 +133,19 @@ typedef enum zu_status {
 #define ZU_TYPE_PATH 8
 #define ZU_TYPE_TEMPORAL 9
 #define ZU_TYPE_RECORD 10
+
+/* Which temporal a temporal cell is, from zu_value_temporal. The unit
+ * follows the kind: days for a date, months for a year-month duration,
+ * nanoseconds for the other five. One tag rather than a type per arm,
+ * because a host that reads temporals reads all of them and a switch
+ * over seven is the shape it wants. */
+#define ZU_TEMPORAL_DATE 0
+#define ZU_TEMPORAL_LOCAL_TIME 1
+#define ZU_TEMPORAL_ZONED_TIME 2
+#define ZU_TEMPORAL_LOCAL_DATETIME 3
+#define ZU_TEMPORAL_ZONED_DATETIME 4
+#define ZU_TEMPORAL_DURATION_YEAR_MONTH 5
+#define ZU_TEMPORAL_DURATION_DAY_TIME 6
 
 /* Static version string; do not free. */
 const char *zu_version(void);
@@ -306,6 +322,56 @@ zu_status zu_result_chunk_col_valid(zu_result *result, uint64_t chunk, uint32_t 
  * not a string. */
 zu_status zu_result_cell_str(zu_result *result, uint64_t row, uint32_t col, const char **out,
                              size_t *len);
+
+/* Cells one at a time, for the values that have no column to be read
+ * into. A temporal is a count and a unit, a list recurses, a node is a
+ * table and an offset, and none of the three fits an int64_t *. The
+ * columnar accessors above stay the path a bulk read takes; this is the
+ * path a value takes that they cannot express.
+ *
+ * zu_result_cell hands back a pointer into the result's own rows, so it
+ * allocates nothing and stays valid until zu_result_free, exactly like
+ * every other pointer here. There is no zu_value_free.
+ *
+ * These read a value as the type it is and nothing else, which is where
+ * they differ from the columns: zu_result_col_i64 reads bools and nulls
+ * too, because a column is one host array and something has to go in
+ * every slot, while zu_value_i64 on a bool answers ZU_MISUSE. Each
+ * writes its out-parameters on every path, so a caller that ignores the
+ * status reads a zero rather than the call before.
+ *
+ * zu_value_type returns the tag directly, and -1 for a NULL pointer:
+ * every tag is a type a cell can hold, so the failure has to be a value
+ * that is not one of them. zu_value_len is 0 for anything that is not a
+ * list, a path or a record, an empty list included, which is the same
+ * answer zu_result_rows gives and needs no status for the same reason.
+ *
+ * zu_value_str and zu_value_field point into the result's bytes and are
+ * NOT NUL-terminated; the length is the whole of the answer, and their
+ * len parameter may not be NULL. That is the price of not copying, and
+ * a string inside a list has no row and column to be cached under.
+ * zu_result_cell_str above is the NUL-terminated form, for a top-level
+ * cell, and it keeps the copy it makes. */
+zu_status zu_result_cell(const zu_result *result, uint64_t row, uint32_t col,
+                         const zu_value **out);
+int32_t zu_value_type(const zu_value *v);
+zu_status zu_value_bool(const zu_value *v, int32_t *out);
+zu_status zu_value_i64(const zu_value *v, int64_t *out);
+zu_status zu_value_f64(const zu_value *v, double *out);
+zu_status zu_value_str(const zu_value *v, const char **out, size_t *len);
+/* kind and count are required; offset may be NULL for a host with no
+ * zoned type, and is minutes east of UTC, 0 for the five kinds that
+ * carry none. */
+zu_status zu_value_temporal(const zu_value *v, int32_t *kind, int64_t *count, int32_t *offset);
+/* Both parts, because neither identifies a node on its own: two tables
+ * number their rows from zero. Either out-parameter may be NULL. */
+zu_status zu_value_node(const zu_value *v, uint32_t *table, uint64_t *offset);
+zu_status zu_value_rel(const zu_value *v, uint32_t *table, uint64_t *src, uint64_t *dst);
+uint64_t zu_value_len(const zu_value *v);
+zu_status zu_value_at(const zu_value *v, uint64_t i, const zu_value **out);
+/* A record's fields are in name order and a name appears once, which is
+ * what makes two records written in different orders one value. */
+zu_status zu_value_field(const zu_value *v, uint64_t i, const char **out, size_t *len);
 
 void zu_result_free(zu_result *result);
 

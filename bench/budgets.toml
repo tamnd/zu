@@ -1298,6 +1298,22 @@ capi_chunk_scan_ratio = 1.5
 # chunk. Raise this floor, never lower it.
 capi_chunk_early_speedup = 50.0
 
+# cell reads the same column one value at a time through the cell
+# reader, which is the path a temporal, a list and a node's table take
+# because no column holds them. The ratio is against the whole-column
+# read of the same 500000 ints, so it is what a binding would pay for
+# taking the per-value path on a column that has a bulk one.
+#
+# Measured 0.5 on the local M series, which is under 1 rather than over
+# it: a cell is a borrow of the row the result already holds, so the
+# per-value path allocates nothing at all while the whole-column path
+# builds and keeps a 3.9 MB buffer. That is the property this number
+# guards. A cell that copied its value, as the NUL-terminated string
+# accessor beside it has to, would be an allocation per row and would
+# land far above this ceiling rather than just over it. Lower this
+# ceiling, never raise it.
+capi_cell_scan_ratio = 4.0
+
 # What a `zu` invocation costs before it does anything, milliseconds per
 # run, measured end to end on `zu version`
 # (crates/zu-cli/benches/cli.rs). It is mostly fork, exec and the

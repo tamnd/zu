@@ -23,6 +23,7 @@ name = "zu"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+zu-common.workspace = true
 zudb = { package = "zu", path = "../zu" }
 
 [dev-dependencies]

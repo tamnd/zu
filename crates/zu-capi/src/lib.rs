@@ -64,6 +64,13 @@
 //! instead of one buffer per column the length of the result. A host
 //! that reads a million-row answer into its own arrays as it goes, or
 //! that stops early, pays for what it read.
+//!
+//! Not every value has a column of host scalars to be read into, which
+//! is what [`ZuValue`] is for. A temporal is a count and a unit, a list
+//! recurses, a node is a table and an offset, and none of the three
+//! fits an `int64_t *`. A cell pointer borrows from the result rather
+//! than allocating, so the reader costs a pointer per value and the
+//! columnar path stays the one a bulk read uses.
 
 // The pointer contract (what must be valid, who frees what, in which
 // order) is one contract for the whole surface; it lives in the module
@@ -79,6 +86,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use zu_common::{DurationKind, Temporal};
 use zudb::query::{QueryResult, Value};
 use zudb::{Config, Connection, Database, Severity, ZuError as EngineError};
 
@@ -152,6 +160,21 @@ pub const ZU_TYPE_LIST: i32 = 7;
 pub const ZU_TYPE_PATH: i32 = 8;
 pub const ZU_TYPE_TEMPORAL: i32 = 9;
 pub const ZU_TYPE_RECORD: i32 = 10;
+
+/// Which temporal a temporal cell is, on [`zu_value_temporal`].
+///
+/// A temporal value is a count and a meaning, and the meaning is what
+/// picks the unit: days for a date, months for a year-month duration,
+/// nanoseconds for the other five. One tag rather than a type per
+/// arm, because a host that reads temporals reads all of them and a
+/// `switch` over seven is the shape it wants.
+pub const ZU_TEMPORAL_DATE: i32 = 0;
+pub const ZU_TEMPORAL_LOCAL_TIME: i32 = 1;
+pub const ZU_TEMPORAL_ZONED_TIME: i32 = 2;
+pub const ZU_TEMPORAL_LOCAL_DATETIME: i32 = 3;
+pub const ZU_TEMPORAL_ZONED_DATETIME: i32 = 4;
+pub const ZU_TEMPORAL_DURATION_YEAR_MONTH: i32 = 5;
+pub const ZU_TEMPORAL_DURATION_DAY_TIME: i32 = 6;
 
 /// What went wrong, as fields. Opaque to C, read through the
 /// accessors, freed with [`zu_error_free`].
@@ -1658,6 +1681,425 @@ pub unsafe extern "C" fn zu_result_cell_str(
     })
 }
 
+/* ---- cells ---- */
+
+/// One cell of a result, borrowed from the result that holds it.
+///
+/// Opaque to C and read through the `zu_value_*` accessors. It is not
+/// a handle and there is nothing to free: the pointer is into the
+/// result's own rows, so handing one out allocates nothing and it
+/// stays valid for exactly as long as the result does.
+///
+/// The columnar accessors above are the fast path and stay the fast
+/// path: a host reading a million integers wants one buffer, not a
+/// million calls. This is the other question, and before it a C caller
+/// could not ask it at all. A temporal, a list, a node's table, and
+/// anything nested have no column of host scalars to be read into,
+/// which left them readable from Rust and not from C, and a value the
+/// ABI cannot express is a value nine bindings cannot return.
+///
+/// The accessors here read a value as the type it is and nothing else.
+/// That is the difference between them and the columns: `col_i64`
+/// reads bools and nulls too, because a column is one host array and
+/// something has to go in every slot, while `zu_value_i64` on a bool
+/// is the caller asking the wrong question and answers `Misuse`.
+#[repr(transparent)]
+pub struct ZuValue(Value);
+
+/// A borrowed cell, or `None` for a null pointer.
+unsafe fn value_of<'a>(v: *const ZuValue) -> Option<&'a Value> {
+    match v.is_null() {
+        true => None,
+        false => Some(unsafe { &(*v).0 }),
+    }
+}
+
+/// The values inside a composite, in order.
+///
+/// A record's fields are here as well as on [`zu_value_field`],
+/// because a caller that wants the values and not the names should not
+/// have to know which composite it is holding.
+fn parts(v: &Value) -> Option<&[Value]> {
+    match v {
+        // A chain never leaves the pipeline (`settle` turns it into
+        // the edge list first), so there is no walk of one to write.
+        Value::List(items) | Value::Path(items) => Some(items),
+        _ => None,
+    }
+}
+
+fn fields(v: &Value) -> Option<&[(String, Value)]> {
+    match v {
+        Value::Record(f) => Some(f),
+        _ => None,
+    }
+}
+
+/// A pointer to one cell of a result, valid until [`zu_result_free`].
+///
+/// `Misuse` when the row or the column is out of range, which is the
+/// only way this fails: every cell holds a value, and a null cell is a
+/// value too.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_cell(
+    result: *const ZuResult,
+    row: u64,
+    col: u32,
+    out: *mut *const ZuValue,
+) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = std::ptr::null() };
+    if result.is_null() {
+        return ZuStatus::Misuse;
+    }
+    match cell(unsafe { &*result }, row, col) {
+        Some(v) => {
+            unsafe { *out = std::ptr::from_ref(v).cast::<ZuValue>() };
+            ZuStatus::Ok
+        }
+        None => ZuStatus::Misuse,
+    }
+}
+
+/// The `ZU_TYPE_*` tag of a cell, or -1 for a `NULL` pointer.
+///
+/// Returned rather than written through an out-parameter because there
+/// is nothing else this can say: a cell that exists has a type. -1 is
+/// not one of the tags, so a caller that passed `NULL` cannot read the
+/// answer as a type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_type(v: *const ZuValue) -> i32 {
+    match unsafe { value_of(v) } {
+        None => -1,
+        Some(Value::Null) => ZU_TYPE_NULL,
+        Some(Value::Bool(_)) => ZU_TYPE_BOOL,
+        Some(Value::Int(_)) => ZU_TYPE_INT,
+        Some(Value::Float(_)) => ZU_TYPE_FLOAT,
+        Some(Value::Str(_)) => ZU_TYPE_STR,
+        Some(Value::Node { .. }) => ZU_TYPE_NODE,
+        Some(Value::Rel { .. }) => ZU_TYPE_REL,
+        Some(Value::List(_)) => ZU_TYPE_LIST,
+        Some(Value::Path(_) | Value::Chain(_)) => ZU_TYPE_PATH,
+        Some(Value::Temporal(_)) => ZU_TYPE_TEMPORAL,
+        Some(Value::Record(_)) => ZU_TYPE_RECORD,
+    }
+}
+
+/// A bool cell as 0 or 1. `Misuse` for anything else, a null included.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_bool(v: *const ZuValue, out: *mut i32) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0 };
+    match unsafe { value_of(v) } {
+        Some(Value::Bool(b)) => {
+            unsafe { *out = i32::from(*b) };
+            ZuStatus::Ok
+        }
+        _ => ZuStatus::Misuse,
+    }
+}
+
+/// An integer cell. `Misuse` for anything else, a bool included: a
+/// caller who wanted the widening asks the column for it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_i64(v: *const ZuValue, out: *mut i64) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0 };
+    match unsafe { value_of(v) } {
+        Some(Value::Int(i)) => {
+            unsafe { *out = *i };
+            ZuStatus::Ok
+        }
+        _ => ZuStatus::Misuse,
+    }
+}
+
+/// A float cell, bits intact. An integer is not one here, so a host
+/// that reads a float column and finds an integer learns it from the
+/// status rather than from a value that has already been converted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_f64(v: *const ZuValue, out: *mut f64) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0.0 };
+    match unsafe { value_of(v) } {
+        Some(Value::Float(f)) => {
+            unsafe { *out = *f };
+            ZuStatus::Ok
+        }
+        _ => ZuStatus::Misuse,
+    }
+}
+
+/// A string cell as a pointer and a byte length, pointing into the
+/// result's own bytes and **not** NUL-terminated.
+///
+/// That is the one place this differs from [`zu_result_cell_str`], and
+/// it is the difference between borrowing and copying. A string inside
+/// a list has no row and column to be cached under, and a copy per
+/// element is a cost every caller pays so that the ones using `printf`
+/// need not think. A caller who genuinely wants a C string of a
+/// top-level cell asks [`zu_result_cell_str`], which keeps the copy.
+///
+/// `len` may not be `NULL`: without it the answer is unusable, unlike
+/// the NUL-terminated form where it is a convenience.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_str(
+    v: *const ZuValue,
+    out: *mut *const c_char,
+    len: *mut usize,
+) -> ZuStatus {
+    if out.is_null() || len.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe {
+        *out = std::ptr::null();
+        *len = 0;
+    }
+    match unsafe { value_of(v) } {
+        Some(Value::Str(s)) => {
+            unsafe {
+                *out = s.as_ptr().cast::<c_char>();
+                *len = s.len();
+            }
+            ZuStatus::Ok
+        }
+        _ => ZuStatus::Misuse,
+    }
+}
+
+/// A temporal cell as its kind, its count, and its offset from UTC.
+///
+/// The unit follows the kind: days for `ZU_TEMPORAL_DATE`, months for
+/// `ZU_TEMPORAL_DURATION_YEAR_MONTH`, nanoseconds for the rest. A date
+/// counts from 1970-01-01 and a datetime from midnight of it; a time
+/// counts from midnight. The offset is minutes east of UTC and is 0
+/// for the five kinds that carry none, so a caller that ignores it
+/// reads the two zoned kinds as their instant, which is what they are
+/// stored as.
+///
+/// `kind` and `count` may not be `NULL`, since a count with no unit
+/// says nothing. `offset` may be, for a host that has no zoned type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_temporal(
+    v: *const ZuValue,
+    kind: *mut i32,
+    count: *mut i64,
+    offset: *mut i32,
+) -> ZuStatus {
+    if kind.is_null() || count.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe {
+        *kind = -1;
+        *count = 0;
+    }
+    if !offset.is_null() {
+        unsafe { *offset = 0 };
+    }
+    let Some(Value::Temporal(t)) = (unsafe { value_of(v) }) else {
+        return ZuStatus::Misuse;
+    };
+    let (k, n, z) = match *t {
+        Temporal::Date(days) => (ZU_TEMPORAL_DATE, i64::from(days), 0),
+        Temporal::LocalTime(nanos) => (ZU_TEMPORAL_LOCAL_TIME, nanos, 0),
+        Temporal::ZonedTime { nanos, offset } => (ZU_TEMPORAL_ZONED_TIME, nanos, i32::from(offset)),
+        Temporal::LocalDatetime(nanos) => (ZU_TEMPORAL_LOCAL_DATETIME, nanos, 0),
+        Temporal::ZonedDatetime { nanos, offset } => {
+            (ZU_TEMPORAL_ZONED_DATETIME, nanos, i32::from(offset))
+        }
+        Temporal::Duration(DurationKind::YearMonth, months) => {
+            (ZU_TEMPORAL_DURATION_YEAR_MONTH, months, 0)
+        }
+        Temporal::Duration(DurationKind::DayTime, nanos) => {
+            (ZU_TEMPORAL_DURATION_DAY_TIME, nanos, 0)
+        }
+    };
+    unsafe {
+        *kind = k;
+        *count = n;
+    }
+    if !offset.is_null() {
+        unsafe { *offset = z };
+    }
+    ZuStatus::Ok
+}
+
+/// A node cell as the table it belongs to and its row offset in that
+/// table.
+///
+/// Both, because neither identifies a node on its own: two tables
+/// number their rows from zero, and `zu_result_col_node_offset` drops
+/// the table because a column of two tables has no one answer to put
+/// in it. A binding building a node identity wants the pair.
+///
+/// Either out-parameter may be `NULL` for a caller that wants the
+/// other.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_node(
+    v: *const ZuValue,
+    table: *mut u32,
+    offset: *mut u64,
+) -> ZuStatus {
+    if !table.is_null() {
+        unsafe { *table = 0 };
+    }
+    if !offset.is_null() {
+        unsafe { *offset = 0 };
+    }
+    let Some(Value::Node {
+        table: t,
+        offset: o,
+    }) = (unsafe { value_of(v) })
+    else {
+        return ZuStatus::Misuse;
+    };
+    if !table.is_null() {
+        unsafe { *table = *t };
+    }
+    if !offset.is_null() {
+        unsafe { *offset = *o };
+    }
+    ZuStatus::Ok
+}
+
+/// A rel cell as its table and the two row offsets it joins.
+///
+/// The ends are node offsets in the tables the rel table was declared
+/// between, which the catalog names; a rel carries no offset of its
+/// own, because a rel is the pair.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_rel(
+    v: *const ZuValue,
+    table: *mut u32,
+    src: *mut u64,
+    dst: *mut u64,
+) -> ZuStatus {
+    for p in [src, dst] {
+        if !p.is_null() {
+            unsafe { *p = 0 };
+        }
+    }
+    if !table.is_null() {
+        unsafe { *table = 0 };
+    }
+    let Some(Value::Rel {
+        table: t,
+        src: s,
+        dst: d,
+    }) = (unsafe { value_of(v) })
+    else {
+        return ZuStatus::Misuse;
+    };
+    if !table.is_null() {
+        unsafe { *table = *t };
+    }
+    if !src.is_null() {
+        unsafe { *src = *s };
+    }
+    if !dst.is_null() {
+        unsafe { *dst = *d };
+    }
+    ZuStatus::Ok
+}
+
+/// How many values a composite holds: the elements of a list, the
+/// nodes and edges of a path, the fields of a record.
+///
+/// 0 for everything else, an empty list and a `NULL` pointer included,
+/// which is the same answer [`zu_result_rows`] gives and needs no
+/// status for the same reason: there is nothing to read either way,
+/// and the type tag is what tells a caller which of the two it has.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_len(v: *const ZuValue) -> u64 {
+    let Some(v) = (unsafe { value_of(v) }) else {
+        return 0;
+    };
+    match (parts(v), fields(v)) {
+        (Some(items), _) => items.len() as u64,
+        (_, Some(f)) => f.len() as u64,
+        _ => 0,
+    }
+}
+
+/// One value inside a composite, borrowed from the same result and
+/// read with the same accessors, so a list of lists is a walk and not
+/// a special case.
+///
+/// `Misuse` when the value is not a composite or `i` is past its end,
+/// which are the caller's two mistakes and not the engine's.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_at(
+    v: *const ZuValue,
+    i: u64,
+    out: *mut *const ZuValue,
+) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = std::ptr::null() };
+    let Some(v) = (unsafe { value_of(v) }) else {
+        return ZuStatus::Misuse;
+    };
+    let at = match (parts(v), fields(v)) {
+        (Some(items), _) => items.get(i as usize),
+        (_, Some(f)) => f.get(i as usize).map(|(_, v)| v),
+        _ => None,
+    };
+    match at {
+        Some(v) => {
+            unsafe { *out = std::ptr::from_ref(v).cast::<ZuValue>() };
+            ZuStatus::Ok
+        }
+        None => ZuStatus::Misuse,
+    }
+}
+
+/// The name of one field of a record, as a pointer and a byte length,
+/// not NUL-terminated, on the same terms as [`zu_value_str`].
+///
+/// Fields are in name order and a name appears once, which is what
+/// makes two records written in different orders one value. A caller
+/// looking a field up by name therefore gets a binary search rather
+/// than a scan, and a caller comparing two records walks them in step.
+///
+/// `Misuse` when the value is not a record or `i` is past its last
+/// field.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_value_field(
+    v: *const ZuValue,
+    i: u64,
+    out: *mut *const c_char,
+    len: *mut usize,
+) -> ZuStatus {
+    if out.is_null() || len.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe {
+        *out = std::ptr::null();
+        *len = 0;
+    }
+    let Some(name) = (unsafe { value_of(v) })
+        .and_then(fields)
+        .and_then(|f| f.get(i as usize))
+        .map(|(name, _)| name)
+    else {
+        return ZuStatus::Misuse;
+    };
+    unsafe {
+        *out = name.as_ptr().cast::<c_char>();
+        *len = name.len();
+    }
+    ZuStatus::Ok
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_result_free(result: *mut ZuResult) {
     if !result.is_null() {
@@ -1801,6 +2243,243 @@ mod tests {
         );
         cfg.struct_size = 1;
         assert!(unsafe { config_of(&cfg) }.is_err());
+    }
+
+    /// A borrowed cell, which is what `zu_result_cell` hands out and
+    /// what a nested read walks over. Taking the pointer from a
+    /// reference is the whole of the conversion, and it is only sound
+    /// because [`ZuValue`] is `repr(transparent)`.
+    fn cell_of(v: &Value) -> *const ZuValue {
+        std::ptr::from_ref(v).cast::<ZuValue>()
+    }
+
+    /// The seven temporal kinds, their units, and the offset only two
+    /// of them carry. This is the mapping a binding turns into a host
+    /// date, so getting a unit wrong here is a value that is wrong by
+    /// a factor of 86,400,000,000,000 and still looks like a date.
+    #[test]
+    fn every_temporal_kind_reads_as_its_own_count_and_unit() {
+        let cases = [
+            (Temporal::Date(19782), ZU_TEMPORAL_DATE, 19782, 0),
+            (Temporal::LocalTime(3_600), ZU_TEMPORAL_LOCAL_TIME, 3_600, 0),
+            (
+                Temporal::ZonedTime {
+                    nanos: 7,
+                    offset: 420,
+                },
+                ZU_TEMPORAL_ZONED_TIME,
+                7,
+                420,
+            ),
+            (
+                Temporal::LocalDatetime(-9),
+                ZU_TEMPORAL_LOCAL_DATETIME,
+                -9,
+                0,
+            ),
+            (
+                Temporal::ZonedDatetime {
+                    nanos: -9,
+                    offset: -330,
+                },
+                ZU_TEMPORAL_ZONED_DATETIME,
+                -9,
+                -330,
+            ),
+            (
+                Temporal::Duration(DurationKind::YearMonth, 14),
+                ZU_TEMPORAL_DURATION_YEAR_MONTH,
+                14,
+                0,
+            ),
+            (
+                Temporal::Duration(DurationKind::DayTime, i64::MIN),
+                ZU_TEMPORAL_DURATION_DAY_TIME,
+                i64::MIN,
+                0,
+            ),
+        ];
+        for (t, want_kind, want_count, want_offset) in cases {
+            let value = Value::Temporal(t);
+            let (mut kind, mut count, mut offset) = (-1, 0i64, i32::MAX);
+            assert_eq!(
+                unsafe { zu_value_temporal(cell_of(&value), &mut kind, &mut count, &mut offset) },
+                ZuStatus::Ok,
+                "{t:?}"
+            );
+            assert_eq!((kind, count, offset), (want_kind, want_count, want_offset));
+            // The offset is the one part a host with no zoned type can
+            // decline to hear about.
+            assert_eq!(
+                unsafe {
+                    zu_value_temporal(cell_of(&value), &mut kind, &mut count, std::ptr::null_mut())
+                },
+                ZuStatus::Ok
+            );
+        }
+    }
+
+    /// A record reads as fields and values through the same two
+    /// accessors a list uses, and its fields are in name order however
+    /// they were written. No statement produces one yet, which is why
+    /// this is here rather than beside the queries.
+    #[test]
+    fn a_record_reads_as_named_fields_in_name_order() {
+        let value = Value::record(vec![
+            ("z".to_string(), Value::Int(1)),
+            ("a".to_string(), Value::Str("hi".to_string())),
+        ]);
+        let cell = cell_of(&value);
+        assert_eq!(unsafe { zu_value_type(cell) }, ZU_TYPE_RECORD);
+        assert_eq!(unsafe { zu_value_len(cell) }, 2);
+
+        let names: Vec<String> = (0..2)
+            .map(|i| {
+                let (mut out, mut len) = (std::ptr::null(), 0);
+                assert_eq!(
+                    unsafe { zu_value_field(cell, i, &mut out, &mut len) },
+                    ZuStatus::Ok
+                );
+                let bytes = unsafe { std::slice::from_raw_parts(out.cast::<u8>(), len) };
+                String::from_utf8(bytes.to_vec()).expect("utf-8")
+            })
+            .collect();
+        assert_eq!(names, ["a", "z"]);
+
+        let mut first = std::ptr::null();
+        assert_eq!(unsafe { zu_value_at(cell, 0, &mut first) }, ZuStatus::Ok);
+        assert_eq!(unsafe { zu_value_type(first) }, ZU_TYPE_STR);
+
+        // One past the end on either accessor, and a field name asked
+        // of something that has none.
+        let mut out = std::ptr::null();
+        let mut len = 0;
+        assert_eq!(
+            unsafe { zu_value_field(cell, 2, &mut out, &mut len) },
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            unsafe { zu_value_at(cell, 2, &mut first) },
+            ZuStatus::Misuse
+        );
+        let list = Value::List(vec![Value::Int(1)]);
+        assert_eq!(
+            unsafe { zu_value_field(cell_of(&list), 0, &mut out, &mut len) },
+            ZuStatus::Misuse
+        );
+    }
+
+    /// A rel carries the two ends it joins and the table it is in, none
+    /// of which the columnar accessors have anywhere to put. A path is
+    /// its elements, alternating, and reads as a composite.
+    #[test]
+    fn a_rel_and_a_path_read_as_the_parts_they_are_made_of() {
+        let rel = Value::Rel {
+            table: 4,
+            src: 11,
+            dst: 12,
+        };
+        let (mut table, mut src, mut dst) = (0u32, 0u64, 0u64);
+        assert_eq!(
+            unsafe { zu_value_rel(cell_of(&rel), &mut table, &mut src, &mut dst) },
+            ZuStatus::Ok
+        );
+        assert_eq!((table, src, dst), (4, 11, 12));
+        // Asked for one end and nothing else, which is the read a
+        // binding building an adjacency does.
+        assert_eq!(
+            unsafe {
+                zu_value_rel(
+                    cell_of(&rel),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dst,
+                )
+            },
+            ZuStatus::Ok
+        );
+        assert_eq!(dst, 12);
+
+        let path = Value::path(vec![
+            Value::Node {
+                table: 1,
+                offset: 11,
+            },
+            rel,
+            Value::Node {
+                table: 1,
+                offset: 12,
+            },
+        ])
+        .expect("a walk of one edge");
+        let cell = cell_of(&path);
+        assert_eq!(unsafe { zu_value_type(cell) }, ZU_TYPE_PATH);
+        assert_eq!(unsafe { zu_value_len(cell) }, 3);
+        let mut middle = std::ptr::null();
+        assert_eq!(unsafe { zu_value_at(cell, 1, &mut middle) }, ZuStatus::Ok);
+        assert_eq!(unsafe { zu_value_type(middle) }, ZU_TYPE_REL);
+    }
+
+    /// Every accessor asked of the wrong type answers `Misuse` and
+    /// writes its out-parameter anyway, so a caller that ignored the
+    /// status reads a zero rather than whatever the call before left.
+    #[test]
+    fn an_accessor_asked_of_the_wrong_type_refuses_and_still_writes() {
+        let value = Value::Str("not a number".to_string());
+        let cell = cell_of(&value);
+
+        let mut i = 7i64;
+        assert_eq!(unsafe { zu_value_i64(cell, &mut i) }, ZuStatus::Misuse);
+        assert_eq!(i, 0);
+        let mut f = 7.0;
+        assert_eq!(unsafe { zu_value_f64(cell, &mut f) }, ZuStatus::Misuse);
+        assert_eq!(f, 0.0);
+        let mut b = 7i32;
+        assert_eq!(unsafe { zu_value_bool(cell, &mut b) }, ZuStatus::Misuse);
+        assert_eq!(b, 0);
+        let (mut table, mut offset) = (7u32, 7u64);
+        assert_eq!(
+            unsafe { zu_value_node(cell, &mut table, &mut offset) },
+            ZuStatus::Misuse
+        );
+        assert_eq!((table, offset), (0, 0));
+        let (mut kind, mut count) = (7i32, 7i64);
+        assert_eq!(
+            unsafe { zu_value_temporal(cell, &mut kind, &mut count, std::ptr::null_mut()) },
+            ZuStatus::Misuse
+        );
+        assert_eq!((kind, count), (-1, 0));
+
+        // A bool is not an integer here even though a bool column
+        // reads as one, which is the whole difference between the two
+        // paths and is worth pinning rather than describing.
+        let b = Value::Bool(true);
+        assert_eq!(
+            unsafe { zu_value_i64(cell_of(&b), &mut i) },
+            ZuStatus::Misuse
+        );
+        assert_eq!(as_i64(&Value::Bool(true)), Some(1));
+
+        // And a NULL pointer is misuse on every one of them rather
+        // than a crash, since a binding that lost a result will pass
+        // one eventually.
+        let null: *const ZuValue = std::ptr::null();
+        assert_eq!(unsafe { zu_value_type(null) }, -1);
+        assert_eq!(unsafe { zu_value_len(null) }, 0);
+        assert_eq!(unsafe { zu_value_i64(null, &mut i) }, ZuStatus::Misuse);
+        let mut out = std::ptr::null();
+        let mut len = 9;
+        assert_eq!(
+            unsafe { zu_value_str(null, &mut out, &mut len) },
+            ZuStatus::Misuse
+        );
+        assert_eq!(len, 0);
+        // A length that cannot be written is an answer nobody could
+        // read, so the accessor refuses rather than half answering.
+        assert_eq!(
+            unsafe { zu_value_str(cell, &mut out, std::ptr::null_mut()) },
+            ZuStatus::Misuse
+        );
     }
 
     /// A connection is claimed for the length of a call and released

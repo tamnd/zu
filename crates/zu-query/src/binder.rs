@@ -1071,6 +1071,8 @@ pub enum TableFunc {
     SsspWeighted,
     Cdlp,
     Lcc,
+    /// Undirected triangles a node is a corner of. Takes nothing.
+    TriangleCount,
     Louvain,
 }
 
@@ -1084,6 +1086,7 @@ impl TableFunc {
             "sssp_weighted" => TableFunc::SsspWeighted,
             "cdlp" => TableFunc::Cdlp,
             "lcc" => TableFunc::Lcc,
+            "triangle_count" => TableFunc::TriangleCount,
             "louvain" => TableFunc::Louvain,
             _ => return None,
         })
@@ -1099,6 +1102,7 @@ impl TableFunc {
             TableFunc::SsspWeighted => "sssp_weighted",
             TableFunc::Cdlp => "cdlp",
             TableFunc::Lcc => "lcc",
+            TableFunc::TriangleCount => "triangle_count",
             TableFunc::Louvain => "louvain",
         }
     }
@@ -1114,6 +1118,7 @@ impl TableFunc {
             TableFunc::Sssp | TableFunc::SsspWeighted => ("distance", Type::Int),
             TableFunc::Cdlp => ("community", Type::Int),
             TableFunc::Lcc => ("coefficient", Type::Float),
+            TableFunc::TriangleCount => ("triangles", Type::Int),
             TableFunc::Louvain => ("community", Type::Int),
         }
     }
@@ -1571,7 +1576,8 @@ impl Binder<'_> {
         let func = TableFunc::resolve(name).ok_or_else(|| {
             invalid(format!(
                 "unknown table function '{name}', the v0 functions are \
-                 pagerank, wcc, bfs, sssp, sssp_weighted, cdlp, lcc, louvain"
+                 pagerank, wcc, bfs, sssp, sssp_weighted, cdlp, lcc, \
+                 triangle_count, louvain"
             ))
         })?;
         // The rel table must resolve at bind time, so the first

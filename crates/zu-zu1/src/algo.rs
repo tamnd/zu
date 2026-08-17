@@ -1,5 +1,5 @@
 //! Whole-graph table function kernels: bfs, pagerank, wcc, sssp, cdlp,
-//! lcc, louvain (docs/07 §4, TableFunction). Each kernel runs directly
+//! lcc, triangle_count, louvain (docs/07 §4, TableFunction). Each kernel runs directly
 //! on a rel table's CSR through [`GraphReader`], one sequential sweep per
 //! iteration so the per-direction group cache decodes every group once
 //! per pass, and returns one value per node in dense row order. The
@@ -657,6 +657,158 @@ pub fn lcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<f64>> {
     Ok(coeff)
 }
 
+/// A list this many times longer than the one it is being intersected
+/// with is searched rather than walked. A merge costs the sum of the
+/// two lengths and a search costs the short one times the log of the
+/// long one, so the crossover is where the log stops paying, and on a
+/// power law graph the pairing of a hub with a leaf is most of the
+/// work.
+const GALLOP_RATIO: usize = 32;
+
+/// Members two sorted lists of distinct ids have in common. Each one
+/// found adds to its own count, which is the third corner of a triangle
+/// whose other two are the nodes the lists belong to.
+fn intersect(a: &[u32], b: &[u32], counts: &mut [u64]) -> u64 {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.is_empty() {
+        return 0;
+    }
+    let mut hits = 0;
+    if long.len() >= short.len().saturating_mul(GALLOP_RATIO) {
+        // Every search starts where the last one ended, so the whole
+        // pass over the short list walks the long one once at worst and
+        // the log is on what is left rather than on all of it.
+        let mut rest = long;
+        for &x in short {
+            let at = rest.partition_point(|&y| y < x);
+            rest = &rest[at..];
+            match rest.first() {
+                Some(&y) if y == x => {
+                    counts[x as usize] += 1;
+                    hits += 1;
+                    rest = &rest[1..];
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        return hits;
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < short.len() && j < long.len() {
+        match short[i].cmp(&long[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                counts[short[i] as usize] += 1;
+                hits += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    hits
+}
+
+/// Undirected triangles, one count per node: how many triangles that
+/// node is a corner of. The single figure the GAP TC kernel reports is
+/// the sum over nodes divided by three, a triangle being counted once
+/// at each of its corners.
+///
+/// Direction is dropped and a pair joined more than once is still one
+/// adjacency. A triangle is three nodes that all know each other, and
+/// how many stored edges run between two of them does not make more of
+/// them, which is the same rule [`lcc`] closes a neighbor pair by.
+///
+/// The work is the forward algorithm. Every node keeps only the
+/// neighbors above it, so a triangle is looked at from its smallest
+/// corner and found once rather than six times, and the lists being
+/// intersected are half the length. That adjacency is built once into
+/// one flat `u32` array, four bytes a stored edge, because the shape
+/// this kernel wants from the reader is the list of a node somewhere
+/// else in the graph once per edge, and the group the reader decodes to
+/// answer that is thrown away by the question after it. Two sequential
+/// sweeps to build it cost two group decodes each; asking as it goes
+/// would cost one per edge.
+pub fn triangle_count(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
+    let domain = reader.directory().one_domain()?;
+    if domain > u32::MAX as u64 {
+        return Err(zu_common::ZuError::InvalidArgument(format!(
+            "triangle_count holds a node id in 4 bytes and this table has {domain} nodes"
+        )));
+    }
+    let n = domain as usize;
+    let mut counts = vec![0u64; n];
+    if n == 0 {
+        return Ok(counts);
+    }
+
+    // Pass one sizes each node's upward list. A stored edge lands on
+    // one list, its lower endpoint's, so the array is one slot an edge
+    // before the duplicates come out of it.
+    let mut offsets = vec![0u64; n + 1];
+    for v in 0..n {
+        for &d in reader.neighbors_dir(db, v as u64, Direction::Fwd)? {
+            let d = d as usize;
+            if d != v {
+                offsets[v.min(d) + 1] += 1;
+            }
+        }
+    }
+    for v in 0..n {
+        offsets[v + 1] += offsets[v];
+    }
+    let mut adj = vec![0u32; offsets[n] as usize];
+
+    // Pass two fills it. The cursor is the running write position per
+    // node, which is the offsets array again until it has been used up.
+    let mut cursor = offsets[..n].to_vec();
+    for v in 0..n {
+        for &d in reader.neighbors_dir(db, v as u64, Direction::Fwd)? {
+            let d = d as usize;
+            if d == v {
+                continue;
+            }
+            let (lo, hi) = if v < d { (v, d) } else { (d, v) };
+            adj[cursor[lo] as usize] = hi as u32;
+            cursor[lo] += 1;
+        }
+    }
+    drop(cursor);
+
+    // Sorted and without repeats, which is what the intersection reads
+    // and what makes a pair joined twice one adjacency. The unique run
+    // stays at the front of the node's slice and `lens` says how far it
+    // goes, so nothing is copied to close the gaps.
+    let mut lens = vec![0u32; n];
+    for v in 0..n {
+        let list = &mut adj[offsets[v] as usize..offsets[v + 1] as usize];
+        list.sort_unstable();
+        let mut kept = 0;
+        for i in 0..list.len() {
+            if i == 0 || list[i] != list[i - 1] {
+                list[kept] = list[i];
+                kept += 1;
+            }
+        }
+        lens[v] = kept as u32;
+    }
+
+    for v in 0..n {
+        let (vo, vl) = (offsets[v] as usize, lens[v] as usize);
+        let mut corners = 0;
+        for k in 0..vl {
+            let u = adj[vo + k] as usize;
+            let (uo, ul) = (offsets[u] as usize, lens[u] as usize);
+            let shared = intersect(&adj[vo..vo + vl], &adj[uo..uo + ul], &mut counts);
+            counts[u] += shared;
+            corners += shared;
+        }
+        counts[v] += corners;
+    }
+    Ok(counts)
+}
+
 /// Louvain community detection over the undirected view: repeated
 /// local-move sweeps in row order until a full sweep moves nothing,
 /// then one aggregation level, repeated until aggregation stops
@@ -1116,6 +1268,87 @@ mod tests {
     }
 
     #[test]
+    fn triangle_count_finds_one_triangle_from_all_three_corners() {
+        // A closed triple plus a wedge hanging off it. Every corner of
+        // the triangle scores one and nothing else scores at all, so
+        // the sum is three times the one triangle there is.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 2), (2, 3), (3, 4)], 5);
+        let counts = triangle_count(&mut db, &mut reader).expect("tc");
+        assert_eq!(counts, vec![1, 1, 1, 0, 0]);
+        assert_eq!(counts.iter().sum::<u64>() / 3, 1);
+    }
+
+    #[test]
+    fn triangle_count_reads_edges_undirected() {
+        // Stored the three edges run 0 -> 1 -> 2 -> 0, a cycle, and
+        // 0 -> 1, 0 -> 2, 1 -> 2, a DAG. Both are the same triangle
+        // once direction is dropped, which is the graph TC counts.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (1, 2), (2, 0)], 3);
+        assert_eq!(
+            triangle_count(&mut db, &mut reader).expect("tc"),
+            vec![1, 1, 1]
+        );
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 2)], 3);
+        assert_eq!(
+            triangle_count(&mut db, &mut reader).expect("tc"),
+            vec![1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn triangle_count_ignores_self_loops_and_repeated_pairs() {
+        // Neither a loop nor a second copy of an edge is a third node,
+        // so neither makes a triangle and neither makes more of the one
+        // triangle that is there.
+        let (_dir, mut db, mut reader) =
+            open_with(&[(0, 0), (0, 1), (0, 1), (1, 0), (0, 2), (1, 2), (2, 2)], 3);
+        assert_eq!(
+            triangle_count(&mut db, &mut reader).expect("tc"),
+            vec![1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn triangle_count_matches_a_brute_force_pass_over_hubs_and_leaves() {
+        // A hub joined to everyone, a second smaller hub, and a ring
+        // through the rest. The degrees are far enough apart that the
+        // intersection takes the searching path for the hub against a
+        // leaf and the merging path between two leaves, so a mistake on
+        // either side of the threshold shows up as a disagreement with
+        // the reference below.
+        const N: u32 = 60;
+        let mut edges = vec![];
+        for v in 1..N {
+            edges.push((0, v));
+            edges.push((v, v % (N - 1) + 1));
+        }
+        for v in 30..N {
+            edges.push((1, v));
+        }
+        let mut want = vec![0u64; N as usize];
+        let mut nbrs: Vec<std::collections::BTreeSet<u32>> = vec![Default::default(); N as usize];
+        for &(s, d) in &edges {
+            if s != d {
+                nbrs[s as usize].insert(d);
+                nbrs[d as usize].insert(s);
+            }
+        }
+        for v in 0..N as usize {
+            let list: Vec<u32> = nbrs[v].iter().copied().collect();
+            for (i, &a) in list.iter().enumerate() {
+                for &b in &list[i + 1..] {
+                    if nbrs[a as usize].contains(&b) {
+                        want[v] += 1;
+                    }
+                }
+            }
+        }
+        assert!(want.iter().sum::<u64>() > 0, "fixture has no triangles");
+        let (_dir, mut db, mut reader) = open_with(&edges, N as u64);
+        assert_eq!(triangle_count(&mut db, &mut reader).expect("tc"), want);
+    }
+
+    #[test]
     fn empty_graphs_run_every_kernel_cleanly() {
         let (_dir, mut db, mut reader) = open_with(&[], 0);
         assert!(
@@ -1124,6 +1357,11 @@ mod tests {
                 .is_empty()
         );
         assert!(wcc(&mut db, &mut reader).expect("wcc").is_empty());
+        assert!(
+            triangle_count(&mut db, &mut reader)
+                .expect("triangle_count")
+                .is_empty()
+        );
         assert!(sssp(&mut db, &mut reader, 0).expect("sssp").is_empty());
         assert!(bfs(&mut db, &mut reader, 0).expect("bfs").is_empty());
         assert!(

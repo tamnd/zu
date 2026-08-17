@@ -1,5 +1,5 @@
 //! The terminal, in the three calls an interactive shell needs: is a
-//! person there, how wide is the window, and stop the driver from
+//! person there, how big is the window, and stop the driver from
 //! interpreting what they type.
 //!
 //! This is the only platform-specific code in the CLI, and it is here
@@ -64,7 +64,17 @@ pub(crate) fn interactive() -> bool {
 /// listening for the signal that says so is a second mechanism for the
 /// same fact.
 pub(crate) fn width() -> usize {
-    imp::width().unwrap_or(80)
+    imp::size().map_or(80, |(cols, _)| cols)
+}
+
+/// How many rows the window has, or 24 where the answer is unknown.
+///
+/// The fallback is the VT100's, which is the number every terminal that
+/// does not know its own size has pretended to be since 1978, and which
+/// is small enough that guessing it wrong pages an answer that would
+/// have fitted rather than scrolling one away.
+pub(crate) fn height() -> usize {
+    imp::size().map_or(24, |(_, rows)| rows)
 }
 
 /// Writes bytes to the terminal and flushes them.
@@ -235,7 +245,7 @@ mod imp {
         }
     }
 
-    pub(super) fn width() -> Option<usize> {
+    pub(super) fn size() -> Option<(usize, usize)> {
         let mut size = WinSize {
             rows: 0,
             cols: 0,
@@ -244,10 +254,10 @@ mod imp {
         };
         // SAFETY: the request writes a `winsize` and this passes one.
         let ok = unsafe { ioctl(STDIN, TIOCGWINSZ, &raw mut size) } == 0;
-        // A zero column count is what a terminal that does not know its
-        // own size reports, and dividing by it later would be worse
-        // than not asking.
-        (ok && size.cols > 0).then_some(size.cols as usize)
+        // A zero in either is what a terminal that does not know its own
+        // size reports, and dividing by it later would be worse than not
+        // asking.
+        (ok && size.cols > 0 && size.rows > 0).then_some((size.cols as usize, size.rows as usize))
     }
 }
 
@@ -364,7 +374,7 @@ mod imp {
         }
     }
 
-    pub(super) fn width() -> Option<usize> {
+    pub(super) fn size() -> Option<(usize, usize)> {
         let (handle, _) = mode(STD_OUTPUT)?;
         // SAFETY: the call fills the struct it is handed.
         let info = unsafe {
@@ -373,9 +383,10 @@ mod imp {
         };
         // The window rather than the buffer, because a console's buffer
         // is usually taller and sometimes wider than what is on screen,
-        // and wrapping happens at the window.
+        // and both wrapping and paging happen at the window.
         let cols = info.window.right - info.window.left + 1;
-        (cols > 0).then_some(cols as usize)
+        let rows = info.window.bottom - info.window.top + 1;
+        (cols > 0 && rows > 0).then_some((cols as usize, rows as usize))
     }
 }
 
@@ -403,7 +414,7 @@ mod imp {
 
     pub(super) fn restore(_saved: &Saved) {}
 
-    pub(super) fn width() -> Option<usize> {
+    pub(super) fn size() -> Option<(usize, usize)> {
         None
     }
 }

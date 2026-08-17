@@ -27,6 +27,7 @@ mod help;
 mod highlight;
 mod keys;
 mod line;
+mod page;
 mod repl;
 mod scoreboard;
 mod shell;

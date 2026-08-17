@@ -490,7 +490,7 @@ impl Snapshot for Zu1Snapshot<'_> {
         // pagerank is missing on purpose: its rank is a float and a
         // compiled column carries an integer or a string, so that call
         // stays with the old engine until the column does floats.
-        if !matches!(name, "wcc" | "louvain" | "sssp") {
+        if !matches!(name, "wcc" | "louvain" | "bfs" | "sssp") {
             return Ok(None);
         }
         self.ensure_reader(rel)?;
@@ -499,11 +499,17 @@ impl Snapshot for Zu1Snapshot<'_> {
         let (values, null) = match name {
             "wcc" => (algo::wcc(db, reader)?, Vec::new()),
             "louvain" => (algo::louvain(db, reader)?, Vec::new()),
+            // bfs and sssp are the same frontier over a different view
+            // of the rel table, and both mark what they never reached.
             _ => {
                 let Some(&source) = args.first() else {
                     return Ok(None);
                 };
-                let dist = algo::sssp(db, reader, source as u64)?;
+                let dist = if name == "bfs" {
+                    algo::bfs(db, reader, source as u64)?
+                } else {
+                    algo::sssp(db, reader, source as u64)?
+                };
                 let null = dist.iter().map(|&d| d == u64::MAX).collect();
                 (dist, null)
             }

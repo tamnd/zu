@@ -41,7 +41,7 @@ Plans cached by (query text, catalog epoch, param types), LDBC short reads are p
 | VectorTopK | HNSW scan as a MATCH seed (feature `vector`) |
 | FtsScan | BM25 seed (feature `fts`) |
 | HashAggregate / Sort / TopN / Limit / Distinct | factorization-aware; an ORDER BY under a LIMIT of k runs as a bounded buffer per worker, which reads a row's sort keys, drops it against the k it already holds, and only materializes the row when it wins, so the ordered query builds k rows where the unordered one builds the whole fan |
-| TableFunction | `pagerank()`, `wcc()`, `louvain()`, `sssp()` … return relations, composable with MATCH (GraphAlg direction; no Pregel API) |
+| TableFunction | `pagerank()`, `wcc()`, `louvain()`, `bfs()`, `sssp()` … return relations, composable with MATCH (GraphAlg direction; no Pregel API) |
 
 **WCOJ policy** (Umbra/Free Join findings): binary ASPJoins by default; the optimizer marks a subplan for MultiwayIntersect iff the pattern is cyclic (triangle+) *or* estimated intermediate/output ratio exceeds a threshold (default 16×). Sorted CSR gives us the tries for free, no runtime trie build for pure-adjacency intersections (cheaper than Umbra's lazy hash tries).
 
@@ -52,6 +52,7 @@ Plans cached by (query text, catalog epoch, param types), LDBC short reads are p
 - Path returns use **PMR (path multiset representation)**: predecessor DAG per BFS level; paths materialized lazily as `LIST<alternating NodeId/RelId>` only at RETURN (PathFinder design).
 - Unweighted `ANY SHORTEST` between a bound pair: the optimizer absorbs the equality that pins the far end into the expand, and the operator grows a frontier from each end until they meet, which visits two balls of radius d/2 instead of one of radius d. The one-sided hop-level pass stays for the unpinned case and for `ALL SHORTEST`, which has to know every node's minimum hop count before it can enumerate.
 - Weighted `SHORTEST` (`COST` clause): bidirectional Dijkstra on CSR with binary heap; batched variant = Multi-Source Bellman-Ford.
+- The `bfs()` and `sssp()` table functions run the same frontier the recursive operators do: a visited bitmap rather than a distance array, one group pin per group per round so a round decodes each group's CSR once instead of once per node in it, and a direction-optimizing switch decided per round. A round goes bottom-up when the frontier is about to read more edges than are left unexplored (alpha 14) and comes back up when the frontier has thinned below n/24 (beta 24). `bfs()` follows stored edge direction, which is what Graphalytics and Graph500 mean by a level; `sssp()` walks the undirected view under unit weights.
 
 ## 6. Cardinality estimation (no ML)
 

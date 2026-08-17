@@ -18,13 +18,14 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{BoundSetInto, BoundSetItem};
 
 use crate::insert::{cell, describe};
 use crate::query::Value;
 use crate::split::Set;
-use crate::zu1::catalog::Catalog;
+use crate::zu1::catalog::{Catalog, MAX_LABELS};
 use crate::zu1::file::Zu1File;
 use crate::zu1::props::{PropColumn, load_props, load_rel_props};
 use crate::zu1::txn::{Cell, WriteTxn};
@@ -205,7 +206,7 @@ impl<'a> Changes<'a> {
                 table, src, dst, ..
             } => Ok((*table, At::Edge(*src, *dst))),
             other => Err(ZuError::gql(
-                zu_common::gqlstatus::codes::C22G03,
+                codes::C22G03,
                 format!(
                     "SET changes an element, and this one {}",
                     match other {
@@ -232,13 +233,27 @@ impl<'a> Changes<'a> {
     /// the table may hold a label because somebody said it does not.
     ///
     /// An edge is turned away, because an edge carries the one name its
-    /// rel table is and there is no word beside it to hold another.
+    /// rel table is and there is no word beside it to hold another. zu
+    /// therefore declares one as both the most labels an edge may carry
+    /// and the fewest, and the two codes for that are the two things a
+    /// statement can ask of an edge's labels: putting one on exceeds
+    /// the maximum and taking one off falls below the minimum.
     fn mask(&mut self, table: u32, at: &At, labels: &[String], on: bool) -> Result<u64> {
         if matches!(at, At::Edge(..)) {
-            return Err(ZuError::Unsupported {
-                what: "changing the labels of an edge, which carries the name of its table",
-                id: table,
-            });
+            let (status, why) = match on {
+                true => (
+                    codes::C22G0R,
+                    "carries one label, the name of its rel table, which is the most zu holds on an edge",
+                ),
+                false => (
+                    codes::C22G0Q,
+                    "carries one label, the name of its rel table, which is the fewest zu holds on an edge",
+                ),
+            };
+            return Err(ZuError::gql(
+                status,
+                format!("the labels of an edge are not a statement's to change: an edge {why}"),
+            ));
         }
         let node = self.catalog.node_by_id(table).ok_or_else(|| {
             ZuError::InvalidArgument(format!(
@@ -257,6 +272,7 @@ impl<'a> Changes<'a> {
                 (Some(id), _) => id,
                 (None, false) => continue,
                 (None, true) => {
+                    self.room_for(label)?;
                     let id = self.catalog.declare_label(table, label)?;
                     declared |= 1 << id;
                     self.widened = true;
@@ -264,16 +280,52 @@ impl<'a> Changes<'a> {
                 }
             };
             if id == primary {
-                return Err(ZuError::gql(
-                    zu_common::gqlstatus::codes::C22G03,
-                    format!(
-                        "'{label}' is the name of the table the element is in, so every row of it carries that label"
+                // Taking the table's own name off a row would leave the
+                // row with no label at all, and a node carries at least
+                // the one, so that is the minimum said out loud rather
+                // than a type error. Putting it on is a different thing
+                // to be told: the row has it already and always did.
+                return Err(match on {
+                    true => ZuError::gql(
+                        codes::C22G03,
+                        format!(
+                            "'{label}' is the name of the table the element is in, so every row of it carries that label"
+                        ),
                     ),
-                ));
+                    false => ZuError::gql(
+                        codes::C22G0N,
+                        format!(
+                            "'{label}' is the name of the table the element is in, and a node carries at least the one label, so there is no taking it off"
+                        ),
+                    ),
+                });
             }
             mask |= 1 << id;
         }
         Ok(mask)
+    }
+
+    /// Whether the graph's label dictionary has room for a name it has
+    /// not seen.
+    ///
+    /// A node's labels are the bits of one word, so the dictionary is
+    /// 64 names wide and a node carries at most 64 labels: the two
+    /// limits are the same limit, and a statement that needs a
+    /// sixty-fifth name is a statement asking a node to carry more
+    /// labels than zu holds. The catalog would refuse this itself, but
+    /// it refuses it as a storage limit, and what a reader is owed here
+    /// is the standard's code for the limit they hit.
+    fn room_for(&self, label: &str) -> Result<()> {
+        if self.catalog.labels().len() < MAX_LABELS {
+            return Ok(());
+        }
+        Err(ZuError::gql(
+            codes::C22G0P,
+            format!(
+                "'{label}' would be label {} of this graph, and a node's labels are the bits of one word, so zu holds {MAX_LABELS}",
+                MAX_LABELS + 1
+            ),
+        ))
     }
 
     /// What the whole run changes, in written order, and the catalog it
@@ -1392,15 +1444,69 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = open_with_labels(&dir, "primary-label.zu1");
 
-        for source in [
-            "MATCH (p:person) SET p:person",
-            "MATCH (p:person) REMOVE p:person",
+        // The two directions are two different things to be told. The
+        // row has the label already, which is a type error about what
+        // was written; taking it off would leave the row with no label
+        // at all, which is the minimum a node carries.
+        for (source, code) in [
+            ("MATCH (p:person) SET p:person", "22G03"),
+            ("MATCH (p:person) REMOVE p:person", "22G0N"),
         ] {
             let err = session.run(source, &[]).expect_err("the table's own name");
             assert!(
                 err.to_string().contains("name of the table"),
                 "{source}: {err}"
             );
+            assert_eq!(err.gqlstatus().map(|s| s.code()), Some(code), "{source}");
+        }
+    }
+
+    /// A node's labels are the bits of one word, so the graph holds 64
+    /// names and a statement asking for a sixty-fifth is asking a node
+    /// to carry more labels than there are bits. The limit is declared
+    /// rather than unlimited on purpose, so this is the code the
+    /// standard has for hitting a declared one.
+    #[test]
+    fn a_label_past_the_width_of_the_word_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "label-width.zu1");
+
+        // The fixture arrives with a few names in the dictionary
+        // already, table names among them, so the run below asks for
+        // new ones until it is told there is no room rather than
+        // counting on how many were there to start with.
+        let mut refused = None;
+        for n in 0..MAX_LABELS {
+            match session.run(&format!("MATCH (p:person) SET p:L{n}"), &[]) {
+                Ok(_) => continue,
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+            }
+        }
+        let err = refused.expect("the dictionary fills before the run is out of names");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G0P"));
+        assert!(err.to_string().contains("one word"), "got: {err}");
+    }
+
+    /// An edge carries the one name its rel table is, so one is both
+    /// the most labels zu holds on an edge and the fewest, and the two
+    /// ways of asking get the two codes for those two limits.
+    #[test]
+    fn the_labels_of_an_edge_are_a_limit_in_both_directions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "edge-label-limits.zu1");
+
+        for (source, code) in [
+            ("MATCH (p:person)-[k:knows]->(q:person) SET k:Bot", "22G0R"),
+            (
+                "MATCH (p:person)-[k:knows]->(q:person) REMOVE k:knows",
+                "22G0Q",
+            ),
+        ] {
+            let err = session.run(source, &[]).expect_err("an edge has one label");
+            assert_eq!(err.gqlstatus().map(|s| s.code()), Some(code), "{source}");
         }
     }
 
@@ -1627,5 +1733,61 @@ mod tests {
             .explain("MATCH (p:person) SET p.age = 37")
             .expect("explain");
         assert!(listing.contains("Set p.age = 37"), "got: {listing}");
+    }
+    /// An element holds one value per property, so a clause that
+    /// assigns to the same one twice has not said which of the two it
+    /// wants. Two separate `SET` clauses stay last wins, which is what
+    /// running one clause after another means, and this is about the
+    /// one clause.
+    #[test]
+    fn assigning_to_one_property_twice_in_one_clause_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "twice.zu1");
+
+        let err = session
+            .run("MATCH (p:person) SET p.age = 1, p.age = 2", &[])
+            .expect_err("two values for one property");
+        assert_eq!(
+            err.gqlstatus().map(|s| s.code()),
+            Some("22G0M"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("'age'"), "got: {err}");
+    }
+
+    /// The whole record and one property of it are the same assignment
+    /// twice for the same reason, whichever order they come in.
+    #[test]
+    fn assigning_a_record_and_a_property_of_it_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "record-and-property.zu1");
+
+        let err = session
+            .run("MATCH (p:person) SET p = {age: 1}, p.age = 2", &[])
+            .expect_err("the record and a property of it");
+        assert_eq!(
+            err.gqlstatus().map(|s| s.code()),
+            Some("22G0M"),
+            "got: {err}"
+        );
+    }
+
+    /// Two clauses, not one, so the second wins and nothing is
+    /// refused.
+    #[test]
+    fn two_clauses_assigning_to_one_property_stay_last_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "two-clauses.zu1");
+
+        session
+            .run(
+                "MATCH (p:person {name: 'ada'}) SET p.age = 1 SET p.age = 2",
+                &[],
+            )
+            .expect("two clauses in a row");
+        let out = session
+            .run("MATCH (p:person {name: 'ada'}) RETURN p.age AS age", &[])
+            .expect("read it back");
+        assert_eq!(out.rows[0][0], crate::query::Value::Int(2));
     }
 }

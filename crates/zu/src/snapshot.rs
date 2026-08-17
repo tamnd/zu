@@ -542,7 +542,13 @@ impl Snapshot for Zu1Snapshot<'_> {
         reader.neighbors_dir_into(db, node, direction(dir), out)
     }
 
-    fn list_ords_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {
+    fn list_ords_into(
+        &mut self,
+        rel: RelId,
+        node: u64,
+        dir: Dir,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
         self.ensure_reader(rel)?;
         let Self {
             db,
@@ -921,4 +927,3 @@ mod tests {
         assert_eq!(fork.degree_batch(rel, &[0, 1], Dir::Fwd).unwrap(), 3);
     }
 }
-

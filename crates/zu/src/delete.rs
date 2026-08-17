@@ -258,6 +258,17 @@ mod tests {
         Session::open(&path).expect("open")
     }
 
+    /// The strings of the first column of one answer.
+    fn names_of(out: &crate::query::QueryResult) -> Vec<String> {
+        out.rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Str(s) => s.clone(),
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect()
+    }
+
     fn names(session: &mut Session) -> Vec<String> {
         session
             .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
@@ -487,5 +498,41 @@ mod tests {
             Some("42002"),
             "got: {err}"
         );
+    }
+    /// GQL leaves a deleted element bound, so a clause after the delete
+    /// can name it, and what it holds is not there any more. Reading a
+    /// property off one is 22G11 rather than the value the row used to
+    /// hold, which is what the reader would otherwise answer with,
+    /// because the row keeps its place until a vacuum moves it.
+    #[test]
+    fn reading_a_property_off_a_deleted_element_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "read-deleted.zu1");
+
+        let err = session
+            .run(
+                "MATCH (p:person {name: 'ada'}) DETACH DELETE p RETURN p.name AS name",
+                &[],
+            )
+            .expect_err("the element is gone");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G11"));
+        assert!(err.to_string().contains("took away"), "got: {err}");
+    }
+
+    /// The element the statement did not delete reads as it always did,
+    /// so the refusal is about the reference and not about the clause
+    /// order.
+    #[test]
+    fn reading_a_property_off_the_element_beside_it_still_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "read-beside.zu1");
+
+        let out = session
+            .run(
+                "MATCH (p:person {name: 'ada'}), (q:person {name: 'kay'}) DETACH DELETE p RETURN q.name AS name",
+                &[],
+            )
+            .expect("the other element is still there");
+        assert_eq!(names_of(&out), ["kay"]);
     }
 }

@@ -1970,7 +1970,11 @@ impl Compiler<'_> {
         // one at a time, so a level of theirs that ended up with an
         // edge column on it is a shape this executor cannot run.
         for (level, l) in self.levels.iter().enumerate() {
-            if !l.cols.iter().any(|(_, c)| matches!(c, ColSpec::RelStored(..))) {
+            if !l
+                .cols
+                .iter()
+                .any(|(_, c)| matches!(c, ColSpec::RelStored(..)))
+            {
                 continue;
             }
             let walked = ops
@@ -2353,14 +2357,15 @@ impl Compiler<'_> {
     /// Registers a property column on a level, returning its chunk
     /// vector position.
     fn register_col(&mut self, level: usize, key: &str) -> Result<Option<(usize, ColType)>> {
-        if let Some((ix, ty)) = self.levels[level]
-            .cols
-            .iter()
-            .enumerate()
-            .find_map(|(ix, (k, c))| match c {
-                ColSpec::Stored(_, ty) if k == key => Some((ix, *ty)),
-                _ => None,
-            })
+        if let Some((ix, ty)) =
+            self.levels[level]
+                .cols
+                .iter()
+                .enumerate()
+                .find_map(|(ix, (k, c))| match c {
+                    ColSpec::Stored(_, ty) if k == key => Some((ix, *ty)),
+                    _ => None,
+                })
         {
             return Ok(Some((ix + 1, ty)));
         }
@@ -2384,14 +2389,15 @@ impl Compiler<'_> {
         rel: RelId,
         key: &str,
     ) -> Result<Option<(usize, ColType)>> {
-        if let Some((ix, ty)) = self.levels[level]
-            .cols
-            .iter()
-            .enumerate()
-            .find_map(|(ix, (k, c))| match c {
-                ColSpec::RelStored(_, _, ty) if k == key => Some((ix, *ty)),
-                _ => None,
-            })
+        if let Some((ix, ty)) =
+            self.levels[level]
+                .cols
+                .iter()
+                .enumerate()
+                .find_map(|(ix, (k, c))| match c {
+                    ColSpec::RelStored(_, _, ty) if k == key => Some((ix, *ty)),
+                    _ => None,
+                })
         {
             return Ok(Some((ix + 1, ty)));
         }

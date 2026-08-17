@@ -2773,7 +2773,9 @@ impl<'a> Worker<'a> {
                 // walk carried down beside it.
                 &ColSpec::RelStored(rel, col, _) => {
                     debug_assert_eq!(ords.len(), part.len(), "one edge per row it made");
-                    self.snap.get().gather_rel(rel, col, ords, &mut self.arena)?
+                    self.snap
+                        .get()
+                        .gather_rel(rel, col, ords, &mut self.arena)?
                 }
             };
             chunk.vecs.push(v);

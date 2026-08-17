@@ -118,15 +118,20 @@ impl Parser<'_> {
     }
 
     fn error(&self, expected: &str) -> ZuError {
-        let detail = match self.peek() {
-            Some(token) => format!(
-                "{}: expected {expected}, found {}",
+        match self.peek() {
+            Some(token) => ZuError::gql_at(
+                codes::C42001,
                 position(self.source, token.start),
-                token.kind.describe()
+                format_args!("expected {expected}, found {}", token.kind.describe()),
             ),
-            None => format!("unexpected end of query, expected {expected}"),
-        };
-        ZuError::gql(codes::C42001, detail)
+            // The end of the text is a place, but it is not a place any
+            // token is at, so this one says so in words and carries no
+            // pair rather than pointing one character past the query.
+            None => ZuError::gql(
+                codes::C42001,
+                format!("unexpected end of query, expected {expected}"),
+            ),
+        }
     }
 
     /// True when the next token is the given keyword, case-insensitive.
@@ -248,11 +253,11 @@ impl Parser<'_> {
         };
         self.eat(&TokenKind::Semicolon);
         if let Some(token) = self.peek() {
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_at(
                 codes::C42001,
-                format!(
-                    "{}: nothing may follow a catalog statement, found {}",
-                    position(self.source, token.start),
+                position(self.source, token.start),
+                format_args!(
+                    "nothing may follow a catalog statement, found {}",
                     token.kind.describe()
                 ),
             ));
@@ -714,12 +719,10 @@ impl Parser<'_> {
     fn parse_remove_item(&mut self) -> Result<RemoveItem> {
         let target = self.expect_name("a variable after REMOVE")?;
         if self.at(&TokenKind::Colon) || self.at_kw("IS") {
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_at(
                 codes::C42001,
-                format!(
-                    "{}: REMOVE of a label is not implemented yet, an element carries the labels of the table it is in",
-                    position(self.source, self.peek().expect("peeked").start)
-                ),
+                position(self.source, self.peek().expect("peeked").start),
+                "REMOVE of a label is not implemented yet, an element carries the labels of the table it is in",
             ));
         }
         self.expect(&TokenKind::Dot)?;
@@ -738,21 +741,17 @@ impl Parser<'_> {
     fn parse_set_item(&mut self) -> Result<SetItem> {
         let target = self.expect_name("a variable after SET")?;
         if self.at(&TokenKind::Colon) || self.at_kw("IS") {
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_at(
                 codes::C42001,
-                format!(
-                    "{}: SET of a label is not implemented yet, an element carries the labels of the table it is in",
-                    position(self.source, self.peek().expect("peeked").start)
-                ),
+                position(self.source, self.peek().expect("peeked").start),
+                "SET of a label is not implemented yet, an element carries the labels of the table it is in",
             ));
         }
         if self.at(&TokenKind::Eq) {
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_at(
                 codes::C42001,
-                format!(
-                    "{}: SET of a whole record is not implemented yet, which would empty every property the record does not name",
-                    position(self.source, self.peek().expect("peeked").start)
-                ),
+                position(self.source, self.peek().expect("peeked").start),
+                "SET of a whole record is not implemented yet, which would empty every property the record does not name",
             ));
         }
         self.expect(&TokenKind::Dot)?;
@@ -801,12 +800,10 @@ impl Parser<'_> {
                 let detach = self.eat_kw("DETACH");
                 self.expect_kw("DELETE")?;
                 if detach {
-                    return Err(ZuError::gql(
+                    return Err(ZuError::gql_at(
                         codes::C42001,
-                        format!(
-                            "{}: DETACH DELETE is not implemented yet, it takes the edges on an element with it and an edge cannot be deleted yet",
-                            position(self.source, self.peek().expect("peeked").start)
-                        ),
+                        position(self.source, self.peek().expect("peeked").start),
+                        "DETACH DELETE is not implemented yet, it takes the edges on an element with it and an edge cannot be deleted yet",
                     ));
                 }
                 let mut targets = vec![self.parse_delete_target()?];
@@ -854,13 +851,10 @@ impl Parser<'_> {
                 clauses.push(Clause::Return { projection });
                 self.eat(&TokenKind::Semicolon);
                 if let Some(token) = self.peek() {
-                    return Err(ZuError::gql(
+                    return Err(ZuError::gql_at(
                         codes::C42001,
-                        format!(
-                            "{}: nothing may follow RETURN, found {}",
-                            position(self.source, token.start),
-                            token.kind.describe()
-                        ),
+                        position(self.source, token.start),
+                        format_args!("nothing may follow RETURN, found {}", token.kind.describe()),
                     ));
                 }
                 return Ok(Query { use_graph, clauses });
@@ -875,22 +869,22 @@ impl Parser<'_> {
                 // from asked a question and threw the answer away.
                 self.eat(&TokenKind::Semicolon);
                 if let Some(token) = self.peek() {
-                    return Err(ZuError::gql(
+                    return Err(ZuError::gql_at(
                         codes::C42001,
-                        format!(
-                            "{}: nothing may follow the end of a statement, found {}",
-                            position(self.source, token.start),
+                        position(self.source, token.start),
+                        format_args!(
+                            "nothing may follow the end of a statement, found {}",
                             token.kind.describe()
                         ),
                     ));
                 }
                 return Ok(Query { use_graph, clauses });
             } else if let Some(kw) = UNIMPLEMENTED.iter().find(|kw| self.at_kw(kw)) {
-                return Err(ZuError::gql(
+                return Err(ZuError::gql_at(
                     codes::C42001,
-                    format!(
-                        "{}: {kw} is not implemented yet, the v0 core is MATCH, WHERE, CALL, UNWIND, WITH, RETURN",
-                        position(self.source, self.peek().expect("peeked").start)
+                    position(self.source, self.peek().expect("peeked").start),
+                    format_args!(
+                        "{kw} is not implemented yet, the v0 core is MATCH, WHERE, CALL, UNWIND, WITH, RETURN"
                     ),
                 ));
             } else if clauses.is_empty() && self.peek().is_none() {
@@ -909,11 +903,11 @@ impl Parser<'_> {
     fn parse_delete_target(&mut self) -> Result<String> {
         let name = self.expect_name("a variable after DELETE")?;
         if self.at(&TokenKind::Dot) {
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_at(
                 codes::C42001,
-                format!(
-                    "{}: DELETE takes away an element and not a property, and '{name}' is followed by one",
-                    position(self.source, self.peek().expect("peeked").start)
+                position(self.source, self.peek().expect("peeked").start),
+                format_args!(
+                    "DELETE takes away an element and not a property, and '{name}' is followed by one"
                 ),
             ));
         }
@@ -1204,23 +1198,19 @@ impl Parser<'_> {
             left_tilde
         };
         if left_tilde != right_tilde {
-            return Err(ZuError::gql(
+            return Err(ZuError::gql_at(
                 codes::C42001,
-                format!(
-                    "{}: a relationship is undirected at both ends or at neither",
-                    position(self.source, self.tokens[self.pos - 1].start)
-                ),
+                position(self.source, self.tokens[self.pos - 1].start),
+                "a relationship is undirected at both ends or at neither",
             ));
         }
         let outbound = self.eat(&TokenKind::Gt);
         let direction = match (inbound, left_tilde, outbound) {
             (true, true, true) => {
-                return Err(ZuError::gql(
+                return Err(ZuError::gql_at(
                     codes::C42001,
-                    format!(
-                        "{}: an undirected relationship cannot point both ways",
-                        position(self.source, self.tokens[self.pos - 1].start)
-                    ),
+                    position(self.source, self.tokens[self.pos - 1].start),
+                    "an undirected relationship cannot point both ways",
                 ));
             }
             (true, false, false) => RelDirection::In,
@@ -1508,12 +1498,10 @@ impl Parser<'_> {
                 // literal, it just names a value no exact numeric type
                 // here can hold, which is what 22003 is for.
                 let v = i64::try_from(v).map_err(|_| {
-                    ZuError::gql(
+                    ZuError::gql_at(
                         codes::C22003,
-                        format!(
-                            "{}: integer literal out of range",
-                            position(self.source, token.start)
-                        ),
+                        position(self.source, token.start),
+                        "integer literal out of range",
                     )
                 })?;
                 Ok(Expr::Literal(Literal::Int(v)))
@@ -2000,6 +1988,7 @@ fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zu_common::Position;
 
     fn parsed(source: &str) -> Query {
         parse(source).expect("parse")
@@ -3076,6 +3065,47 @@ mod tests {
             parse_err("MATCH (p:person) SET p = {age: 1}").contains("SET of a whole record"),
             "a record replaces every property"
         );
+    }
+
+    /// Every syntax error that names a place carries that place as a
+    /// pair as well as saying it, so a caller can point at the token
+    /// without reading the numbers back out of the sentence.
+    #[test]
+    fn a_syntax_error_carries_its_place_and_still_says_it() {
+        let e = parse("MATCH (n) RETURN n RETURN n").expect_err("should fail");
+        assert_eq!(
+            e.position(),
+            Some(Position {
+                line: 1,
+                column: 20
+            })
+        );
+        assert!(
+            e.to_string().starts_with("42001: line 1, column 20: "),
+            "{e}"
+        );
+
+        // A second line is counted as a second line, and the column
+        // starts over on it.
+        let e = parse("MATCH (n)\n  RETURN n RETURN n").expect_err("should fail");
+        assert_eq!(
+            e.position(),
+            Some(Position {
+                line: 2,
+                column: 12
+            })
+        );
+
+        // The lexer's own failures are positioned the same way, since
+        // a caller cannot tell which half of the front end refused it.
+        let e = parse("RETURN 'unterminated").expect_err("should fail");
+        assert_eq!(e.position(), Some(Position { line: 1, column: 8 }));
+
+        // Running out of text is not a place any token is at, so that
+        // one says so in words and carries no pair.
+        let e = parse("MATCH (n) WHERE").expect_err("should fail");
+        assert_eq!(e.position(), None);
+        assert!(e.to_string().contains("unexpected end of query"), "{e}");
     }
 
     #[test]

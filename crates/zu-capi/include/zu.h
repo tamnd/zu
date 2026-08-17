@@ -153,17 +153,30 @@ typedef enum zu_status {
 const char *zu_version(void);
 
 /* Errors. An error carries the status its call returned, the GQLSTATUS
- * code, the severity, and the message, as fields rather than as one
- * string to parse: the code picks which exception class a binding
- * raises and the severity decides whether it raises at all. The
- * strings live until zu_error_free, and each len out-parameter may be
- * NULL. zu_error_code is NULL for a failure that carries no condition,
- * which a binding mapping codes to classes has to tell from a code it
- * does not know. */
+ * code, the severity, the position, and the message, as fields rather
+ * than as one string to parse: the code picks which exception class a
+ * binding raises and the severity decides whether it raises at all.
+ * The strings live until zu_error_free, and each len out-parameter may
+ * be NULL. zu_error_code is NULL for a failure that carries no
+ * condition, which a binding mapping codes to classes has to tell from
+ * a code it does not know.
+ *
+ * zu_error_position writes the line and column the condition was
+ * raised at, both 1-based, the column counted in characters so a line
+ * of multi-byte text does not read as wider than it looks. It answers
+ * ZU_OK and writes them when there is a position, ZU_DONE and writes
+ * nothing when there is not, and ZU_MISUSE for a NULL error. Not every
+ * failure has one: a division by zero happens while the statement runs
+ * and has no token to point at, and an io error has no statement at
+ * all. Either out-parameter may be NULL. The message says the same
+ * thing in words and keeps saying it, so printing it alone is still a
+ * complete report; this is for a caller that would rather underline
+ * the token than read the numbers back out of the sentence. */
 zu_status zu_error_status(const zu_error *e);
 const char *zu_error_message(const zu_error *e, size_t *len);
 const char *zu_error_code(const zu_error *e, size_t *len);
 int32_t zu_error_severity(const zu_error *e); /* -1 for a NULL error */
+zu_status zu_error_position(const zu_error *e, uint32_t *line, uint32_t *column);
 void zu_error_free(zu_error *e);
 
 /* How a database is opened. The only struct that crosses this boundary

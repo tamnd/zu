@@ -8,7 +8,7 @@
 //! deliberately not tokens: `a < -1` must lex as less-than then minus,
 //! so the parser assembles pattern arrows from the single characters.
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{Position, codes};
 use zu_common::{Result, ZuError};
 
 /// One lexed token with its byte span in the source.
@@ -105,32 +105,20 @@ impl TokenKind {
     }
 }
 
-/// Renders a byte offset as `line L, column C`, both 1-based, counting
+/// The line and column a byte offset falls on, both 1-based, counting
 /// columns in characters so multi-byte text does not skew them.
-pub fn position(source: &str, offset: usize) -> String {
-    let mut line = 1usize;
-    let mut col = 1usize;
-    for (ix, ch) in source.char_indices() {
-        if ix >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    format!("line {line}, column {col}")
+///
+/// This renders as `line L, column C`, which is how every message here
+/// and in the parser begins, and it is also what rides on the error as
+/// a pair for a caller that would rather point than read.
+pub fn position(source: &str, offset: usize) -> Position {
+    Position::of(source, offset)
 }
 
 /// Every failure the lexer can produce is a `42001 invalid syntax`:
 /// the text is not GQL. Anything richer than that is the parser's job.
 fn err(source: &str, offset: usize, detail: &str) -> ZuError {
-    ZuError::gql(
-        codes::C42001,
-        format!("{}: {detail}", position(source, offset)),
-    )
+    ZuError::gql_at(codes::C42001, position(source, offset), detail)
 }
 
 /// Lexes the whole source into tokens.

@@ -77,6 +77,11 @@ tier = 1
 reason = "a node value carries one, so every binding that returns a node returns this"
 
 [[group]]
+prefix = "zu::Position"
+tier = 1
+reason = "where in a statement a condition was raised, which every binding hands on so a caller can point at the token"
+
+[[group]]
 prefix = "zu::Severity"
 tier = 1
 reason = "whether a condition stopped the statement, which decides whether a binding raises or warns"
@@ -140,6 +145,11 @@ reason = "the same type as zu::DiagnosticRecord, which is the path a user types 
 prefix = "zu::gqlstatus::GqlStatus"
 tier = 2
 reason = "the same type as zu::GqlStatus, which is the path a user types and the one a binding owes"
+
+[[group]]
+prefix = "zu::gqlstatus::Position"
+tier = 2
+reason = "the same type as zu::Position, which is the path a user types and the one a binding owes"
 
 [[group]]
 prefix = "zu::gqlstatus::Severity"

@@ -44,6 +44,10 @@ harness = false
 name = "repos"
 harness = false
 
+[[bench]]
+name = "sha256"
+harness = false
+
 [dependencies]
 crc32c.workspace = true
 zstd.workspace = true

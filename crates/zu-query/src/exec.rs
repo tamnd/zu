@@ -108,6 +108,14 @@ pub enum Value {
         table: u32,
         src: u64,
         dst: u64,
+        /// Which edge of `src -> dst` this is: the row its properties
+        /// sit in, which is the edge's place in the load order. The
+        /// endpoints do not name an edge on their own, because a pair
+        /// may run more than once and each copy carries its own values.
+        /// [`Graph::edge_ordinal`] resolves one for an edge that
+        /// arrived as a pair and nothing else, and answers with the
+        /// first of the run.
+        ord: u64,
     },
     List(Vec<Value>),
     /// GV45. A record: named fields, each holding a value. The fields
@@ -134,6 +142,13 @@ pub enum Value {
 }
 
 impl Value {
+    /// The `ord` of an edge that has no row in the stored property
+    /// columns: one a write staged and no fold has landed yet, or one
+    /// a pattern matched over a different rel table. A property read
+    /// off such an edge answers null rather than reading somebody
+    /// else's row.
+    pub const NO_REL_ROW: u64 = u64::MAX;
+
     /// A record out of the fields as they were written.
     ///
     /// The fields are sorted by name here rather than compared by name
@@ -367,6 +382,51 @@ pub trait Graph {
     fn neighbors(&mut self, rel: u32, node: u64, reversed: bool, out: &mut Vec<u64>) -> Result<()>;
     /// Edge probe in storage orientation: does `src` point at `dst`?
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool>;
+    /// The property row of the edge `src -> dst`, `None` when there is
+    /// no such edge. A pair that runs more than once names as many
+    /// edges as it has copies and this answers with the first of them,
+    /// which is all a caller holding nothing but the pair can be told.
+    /// A caller walking a list takes [`Graph::neighbor_ordinals`]
+    /// instead and gets every copy's own row.
+    ///
+    /// The default is the answer for an engine that stores nothing on
+    /// an edge: the probe decides whether there is a row and the row
+    /// number is never read.
+    fn edge_ordinal(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<u64>> {
+        Ok(self.has_edge(rel, src, dst)?.then_some(0))
+    }
+    /// The whole run of `src -> dst`: the row of its first edge and how
+    /// many edges the pair holds, `None` when there is no such edge.
+    ///
+    /// A pattern that binds both of its endpoints matches once per edge
+    /// and not once per pair, so an operator closing onto a bound node
+    /// needs the count as well as the row. The default is one edge per
+    /// pair, which is right for an engine whose adjacency cannot hold a
+    /// pair twice.
+    fn edge_run(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
+        Ok(self.edge_ordinal(rel, src, dst)?.map(|ord| (ord, 1)))
+    }
+    /// Replaces `out` with the property row of every edge
+    /// [`Graph::neighbors`] lists for the same arguments, in the same
+    /// order, so a caller that walked the list holds a row per edge
+    /// rather than a row per pair. `len` is the length of the list the
+    /// caller got, which every implementation has to fill.
+    ///
+    /// The default is the answer for an engine that stores nothing on
+    /// an edge, one row number per neighbor and none of them read.
+    fn neighbor_ordinals(
+        &mut self,
+        rel: u32,
+        node: u64,
+        reversed: bool,
+        len: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let _ = (rel, node, reversed);
+        out.clear();
+        out.resize(len, 0);
+        Ok(())
+    }
     /// Neighbor count without the list. The default reads the list and
     /// counts it; engines whose adjacency stores offsets override this
     /// so a counting expand never touches neighbor values.
@@ -407,12 +467,12 @@ pub trait Graph {
         let _ = (table, offset);
         Ok(0)
     }
-    /// One property of one edge, named by the endpoints a rel value
+    /// One property of one edge, named by the property row a rel value
     /// carries. The default is the answer an engine that stores nothing
     /// on an edge gives, which is the answer every engine gave before
     /// edges could hold anything.
-    fn rel_property(&mut self, rel: u32, src: u64, dst: u64, key: &str) -> Result<Value> {
-        let _ = (rel, src, dst, key);
+    fn rel_property(&mut self, rel: u32, ord: u64, key: &str) -> Result<Value> {
+        let _ = (rel, ord, key);
         Ok(Value::Null)
     }
     /// The rows a `DELETE` took away, read once per query. A delete
@@ -1005,13 +1065,19 @@ pub fn value_order(a: &Value, b: &Value) -> Ordering {
                 table: t1,
                 src: s1,
                 dst: d1,
+                ord: r1,
             },
             Value::Rel {
                 table: t2,
                 src: s2,
                 dst: d2,
+                ord: r2,
             },
-        ) => (t1, s1, d1).cmp(&(t2, s2, d2)),
+            // The row is last and it is what separates two copies of
+            // one pair, so an order over rels is the order over their
+            // endpoints with the copies of a pair kept in load order
+            // inside it.
+        ) => (t1, s1, d1, r1).cmp(&(t2, s2, d2, r2)),
         (Value::List(a), Value::List(b)) | (Value::Path(a), Value::Path(b)) => {
             for (x, y) in a.iter().zip(b) {
                 let ord = value_order(x, y);
@@ -2465,6 +2531,37 @@ impl Chunk {
         }
         self.size = keep.iter().filter(|k| **k).count();
     }
+
+    /// Keeps each position as many times as `times` says, which is a
+    /// filter when every entry is zero or one and a filter that also
+    /// duplicates when one is more.
+    ///
+    /// The fused semijoin needs the second: a pair joined by two edges
+    /// matches twice, and the row it keeps stands for both. Duplicating
+    /// costs a pass and a copy, so a mask that repeats nothing takes
+    /// [`Chunk::retain`], which is every graph whose adjacency holds a
+    /// pair once.
+    fn repeat(&mut self, times: &[usize]) {
+        if times.iter().all(|&n| n <= 1) {
+            let keep: Vec<bool> = times.iter().map(|&n| n == 1).collect();
+            self.retain(&keep);
+            return;
+        }
+        let total: usize = times.iter().sum();
+        for col in &mut self.cols {
+            if col.is_empty() {
+                continue;
+            }
+            let mut out = Vec::with_capacity(total);
+            for (pos, &n) in times.iter().enumerate() {
+                for _ in 0..n {
+                    out.push(col[pos].clone());
+                }
+            }
+            *col = out;
+        }
+        self.size = total;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2510,7 +2607,18 @@ impl std::hash::Hasher for EdgeHasher {
     }
 }
 
-type EdgeSet = std::collections::HashSet<(u64, u64), std::hash::BuildHasherDefault<EdgeHasher>>;
+/// The accumulated edges of one rel step of an ASP join: every pair,
+/// each mapped to the run it names, the property row of its first edge
+/// and how many edges it holds.
+///
+/// The sweep that fills this walks the forward lists source by source,
+/// which is the load order, so the running count is the row, and a pair
+/// that repeats has its copies next to each other in the list so the
+/// count is one increment per copy. That is the same `(row, count)`
+/// pair a storage probe answers with, which is what lets the ASP plan
+/// and the storage-probe plan agree edge for edge.
+type EdgeSet =
+    std::collections::HashMap<(u64, u64), (u64, u64), std::hash::BuildHasherDefault<EdgeHasher>>;
 
 /// One unit of parallel work: a row range of one node table, handed
 /// to the stage's driving scan. Ranges are multiples of the 2048-tuple
@@ -2826,18 +2934,22 @@ fn hop_edges(
 ) -> Result<Vec<(Value, u32, u64)>> {
     let mut hops: Vec<(Value, u32, u64)> = Vec::new();
     let mut nbrs = Vec::new();
+    let mut ords = Vec::new();
     for step in rels {
         let Some(direction) = direction.resolve(step.undirected) else {
             continue;
         };
         if direction.walks_out() && table == step.from_table {
             ctx.graph.neighbors(step.id, offset, false, &mut nbrs)?;
-            for &dst in &nbrs {
+            ctx.graph
+                .neighbor_ordinals(step.id, offset, false, nbrs.len(), &mut ords)?;
+            for (&dst, &ord) in nbrs.iter().zip(&ords) {
                 hops.push((
                     Value::Rel {
                         table: step.id,
                         src: offset,
                         dst,
+                        ord,
                     },
                     step.to_table,
                     dst,
@@ -2846,12 +2958,15 @@ fn hop_edges(
         }
         if direction.walks_in() && table == step.to_table {
             ctx.graph.neighbors(step.id, offset, true, &mut nbrs)?;
-            for &src in &nbrs {
+            ctx.graph
+                .neighbor_ordinals(step.id, offset, true, nbrs.len(), &mut ords)?;
+            for (&src, &ord) in nbrs.iter().zip(&ords) {
                 hops.push((
                     Value::Rel {
                         table: step.id,
                         src,
                         dst: offset,
+                        ord,
                     },
                     step.from_table,
                     src,
@@ -3196,6 +3311,9 @@ fn link(prev: Arc<PathLink>, rel: Value, node: (u32, u64)) -> Arc<PathLink> {
 /// One probe against the accumulated edge sets of an ASP join,
 /// mirroring the direction and endpoint table checks of the storage
 /// probe in `ExpandInto`.
+/// The hit is the whole run the pair names, table and endpoints and
+/// `(row, count)`, because a pattern with both endpoints bound matches
+/// once per edge and a pair can hold several.
 fn asp_hit(
     sets: &[EdgeSet],
     rels: &[RelStep],
@@ -3204,7 +3322,7 @@ fn asp_hit(
     fo: u64,
     tt: u32,
     to_off: u64,
-) -> Option<Value> {
+) -> Option<(u32, u64, u64, (u64, u64))> {
     for (step, set) in rels.iter().zip(sets) {
         let Some(direction) = direction.resolve(step.undirected) else {
             continue;
@@ -3212,27 +3330,32 @@ fn asp_hit(
         if direction.walks_out()
             && ft == step.from_table
             && tt == step.to_table
-            && set.contains(&(fo, to_off))
+            && let Some(&run) = set.get(&(fo, to_off))
         {
-            return Some(Value::Rel {
-                table: step.id,
-                src: fo,
-                dst: to_off,
-            });
+            return Some((step.id, fo, to_off, run));
         }
         if direction.walks_in()
             && ft == step.to_table
             && tt == step.from_table
-            && set.contains(&(to_off, fo))
+            && let Some(&run) = set.get(&(to_off, fo))
         {
-            return Some(Value::Rel {
-                table: step.id,
-                src: to_off,
-                dst: fo,
-            });
+            return Some((step.id, to_off, fo, run));
         }
     }
     None
+}
+
+/// The rel values of one run, in load order: `count` copies of the same
+/// pair, each carrying its own property row.
+fn run_values(table: u32, src: u64, dst: u64, (base, count): (u64, u64)) -> Vec<Value> {
+    (0..count)
+        .map(|k| Value::Rel {
+            table,
+            src,
+            dst,
+            ord: base + k,
+        })
+        .collect()
 }
 
 /// Whether one end of the intersection has stored lists to gallop for
@@ -3269,14 +3392,25 @@ fn near_sides(
 /// The probe side of one intersection, cached per probe node.
 ///
 /// `all` is what the leapfrog walks: the stored list for a fixed
-/// direction, the union of both for an undirected end. `out` is the
-/// forward list on its own, kept only in the undirected case so an
-/// emitted rel can be oriented the way the binary probe would have
-/// oriented it.
+/// direction, both lists merged for an undirected end, keeping every
+/// copy, because a value a list holds twice is two edges rather than
+/// two mentions of one. `ords` is the property row of each entry and
+/// `fwd` says which stored list it came from, so an emitted rel can be
+/// oriented the way the binary probe would have oriented it. Both are
+/// filled only when the plan reads a rel.
+///
+/// `back` is scratch the undirected merge fills with the backward list;
+/// it lives here so a cache miss reuses the allocation.
+#[derive(Default)]
 struct ProbeSide {
     key: (u32, u64),
     all: Vec<u64>,
+    ords: Vec<u64>,
+    fwd: Vec<bool>,
     out: Vec<u64>,
+    out_ords: Vec<u64>,
+    back: Vec<u64>,
+    back_ords: Vec<u64>,
 }
 
 impl ProbeSide {
@@ -3284,37 +3418,64 @@ impl ProbeSide {
     fn empty() -> Self {
         ProbeSide {
             key: (u32::MAX, u64::MAX),
-            all: Vec::new(),
-            out: Vec::new(),
+            ..ProbeSide::default()
         }
     }
-}
 
-/// Union of two ascending lists into `out`, ascending and deduplicated.
-/// The intersection's probe side is an existence check, so a value both
-/// stored lists hold is one entry here and one hit there.
-fn merge_sorted(a: &[u64], b: &[u64], out: &mut Vec<u64>) {
-    out.clear();
-    out.reserve(a.len() + b.len());
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        let v = a[i].min(b[j]);
-        while i < a.len() && a[i] == v {
-            i += 1;
-        }
-        while j < b.len() && b[j] == v {
-            j += 1;
-        }
-        out.push(v);
-    }
-    for &v in &a[i..] {
-        if out.last() != Some(&v) {
-            out.push(v);
-        }
-    }
-    for &v in &b[j..] {
-        if out.last() != Some(&v) {
-            out.push(v);
+    /// Merges the two stored lists of an undirected end into `all`,
+    /// ascending, recording for each entry the list it came from.
+    /// `ords` and `fwd` are filled only when `with_rows` is set, which
+    /// is when something reads the rel.
+    ///
+    /// A neighbor both lists hold is a pair joined in both directions,
+    /// and the undirected close reports the forward one, which is what
+    /// the pair-at-a-time probe in `ExpandInto` reports for the same
+    /// pattern: it asks storage the forward way first and only asks the
+    /// backward way when there is no forward edge. So a value the
+    /// forward list holds contributes its forward copies and nothing
+    /// else, and the backward list only speaks for the neighbors the
+    /// forward one does not have.
+    ///
+    /// Copies inside one list are a different thing and all of them
+    /// stay: those are parallel edges, as many matches as there are
+    /// edges.
+    fn merge(&mut self, with_rows: bool) {
+        self.all.clear();
+        self.all.reserve(self.out.len() + self.back.len());
+        self.ords.clear();
+        self.fwd.clear();
+        let (mut i, mut j) = (0, 0);
+        while i < self.out.len() || j < self.back.len() {
+            let (fwd, at) = match (self.out.get(i), self.back.get(j)) {
+                (Some(a), Some(b)) => (a <= b, *a.min(b)),
+                (Some(a), None) => (true, *a),
+                (None, Some(b)) => (false, *b),
+                (None, None) => break,
+            };
+            let (list, ords) = if fwd {
+                (&self.out, &self.out_ords)
+            } else {
+                (&self.back, &self.back_ords)
+            };
+            let from = if fwd { i } else { j };
+            let run = list[from..].partition_point(|&v| v == at);
+            if with_rows {
+                for &ord in &ords[from..from + run] {
+                    self.all.push(at);
+                    self.ords.push(ord);
+                    self.fwd.push(fwd);
+                }
+            } else {
+                self.all.resize(self.all.len() + run, at);
+            }
+            if fwd {
+                i += run;
+                // The backward list has nothing to add about a
+                // neighbor the forward one already spoke for.
+                j += self.back[j..].partition_point(|&v| v == at);
+            } else {
+                j += run;
+            }
         }
     }
 }
@@ -3334,11 +3495,16 @@ fn gallop(list: &[u64], target: u64, from: usize) -> usize {
 }
 
 /// Leapfrog intersection of two sorted lists, galloping both sides.
-/// Emits one hit per occurrence in `seed`: the seed list is the
-/// replaced expand's output, where a duplicate is a real multi-edge
-/// row, while the probe side is an edge-existence check exactly like
-/// the binary probe it replaces.
-fn leapfrog(seed: &[u64], probe: &[u64], mut emit: impl FnMut(u64)) {
+/// Emits the index into each list of every matching pair.
+///
+/// A value both lists hold once is one hit, the common case and the one
+/// the galloping is for. A value either list holds more than once is a
+/// pair of edges that repeats, and every copy on the seed side joins
+/// every copy on the probe side, because the two lists are two rel
+/// steps of the pattern and each of them matched that many times. That
+/// is the same row count the pair of expands this replaces produces, so
+/// a fused close and an unfused one still agree.
+fn leapfrog(seed: &[u64], probe: &[u64], mut emit: impl FnMut(usize, usize)) {
     let (mut si, mut pi) = (0, 0);
     while si < seed.len() && pi < probe.len() {
         let (sv, pv) = (seed[si], probe[pi]);
@@ -3347,11 +3513,15 @@ fn leapfrog(seed: &[u64], probe: &[u64], mut emit: impl FnMut(u64)) {
         } else if pv < sv {
             pi = gallop(probe, sv, pi);
         } else {
-            while si < seed.len() && seed[si] == sv {
-                emit(sv);
-                si += 1;
+            let se = si + seed[si..].partition_point(|&v| v == sv);
+            let pe = pi + probe[pi..].partition_point(|&v| v == sv);
+            for s in si..se {
+                for p in pi..pe {
+                    emit(s, p);
+                }
             }
-            pi += 1;
+            si = se;
+            pi = pe;
         }
     }
 }
@@ -3593,6 +3763,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let (table, offset) = node_value(v, "expand")?;
             let mut far = Vec::new();
             let mut rel_vals = Vec::new();
+            let mut ords = Vec::new();
             for step in rels {
                 let Some(direction) = direction.resolve(step.undirected) else {
                     continue;
@@ -3601,7 +3772,20 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     ctx.scratch.clear();
                     let mut scratch = std::mem::take(&mut ctx.scratch);
                     ctx.graph.neighbors(step.id, offset, false, &mut scratch)?;
-                    for &dst in &scratch {
+                    // The rows only when something reads them: an
+                    // expand that emits no rel value has no property to
+                    // address and the second storage call would be for
+                    // nothing.
+                    if *emit_rels {
+                        ctx.graph.neighbor_ordinals(
+                            step.id,
+                            offset,
+                            false,
+                            scratch.len(),
+                            &mut ords,
+                        )?;
+                    }
+                    for (i, &dst) in scratch.iter().enumerate() {
                         far.push(Value::Node {
                             table: step.to_table,
                             offset: dst,
@@ -3611,6 +3795,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                                 table: step.id,
                                 src: offset,
                                 dst,
+                                ord: ords[i],
                             });
                         }
                     }
@@ -3620,7 +3805,16 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     ctx.scratch.clear();
                     let mut scratch = std::mem::take(&mut ctx.scratch);
                     ctx.graph.neighbors(step.id, offset, true, &mut scratch)?;
-                    for &src in &scratch {
+                    if *emit_rels {
+                        ctx.graph.neighbor_ordinals(
+                            step.id,
+                            offset,
+                            true,
+                            scratch.len(),
+                            &mut ords,
+                        )?;
+                    }
+                    for (i, &src) in scratch.iter().enumerate() {
                         far.push(Value::Node {
                             table: step.from_table,
                             offset: src,
@@ -3630,6 +3824,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                                 table: step.id,
                                 src,
                                 dst: offset,
+                                ord: ords[i],
                             });
                         }
                     }
@@ -3876,54 +4071,74 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             direction,
             rels,
             chunk,
-        } => loop {
-            if !next(descs, ctx, i - 1)? {
-                return Ok(false);
+        } => {
+            // A pair that repeats is that many edges and matches that
+            // many times, so the run is walked here rather than handed
+            // to a flatten: the operator is the flat one either side of
+            // it expects, and one configuration in still gives one
+            // configuration out per pull.
+            let c = *chunk;
+            if ctx.states[i].active {
+                let pos = ctx.states[i].pos + 1;
+                if pos < ctx.chunks[c].size {
+                    ctx.states[i].pos = pos;
+                    ctx.chunks[c].cur = Some(pos);
+                    return Ok(true);
+                }
+                ctx.states[i].active = false;
             }
-            let fv = value_of(ctx, *from)?;
-            let tv = value_of(ctx, *to)?;
-            if matches!(fv, Value::Null) || matches!(tv, Value::Null) {
-                continue;
-            }
-            let (ft, fo) = node_value(fv, "expand into")?;
-            let (tt, to_off) = node_value(tv, "expand into")?;
-            let mut hit = None;
-            for step in rels {
-                let Some(direction) = direction.resolve(step.undirected) else {
+            loop {
+                if !next(descs, ctx, i - 1)? {
+                    return Ok(false);
+                }
+                let fv = value_of(ctx, *from)?;
+                let tv = value_of(ctx, *to)?;
+                if matches!(fv, Value::Null) || matches!(tv, Value::Null) {
+                    continue;
+                }
+                let (ft, fo) = node_value(fv, "expand into")?;
+                let (tt, to_off) = node_value(tv, "expand into")?;
+                let mut hit = None;
+                for step in rels {
+                    let Some(direction) = direction.resolve(step.undirected) else {
+                        continue;
+                    };
+                    // The run rather than the probe: this needs the rows
+                    // anyway to build the values, and a lookup that
+                    // answers `None` for a missing edge answers the
+                    // probe too.
+                    if direction.walks_out()
+                        && ft == step.from_table
+                        && tt == step.to_table
+                        && let Some(run) = ctx.graph.edge_run(step.id, fo, to_off)?
+                    {
+                        hit = Some((step.id, fo, to_off, run));
+                        break;
+                    }
+                    if direction.walks_in()
+                        && ft == step.to_table
+                        && tt == step.from_table
+                        && let Some(run) = ctx.graph.edge_run(step.id, to_off, fo)?
+                    {
+                        hit = Some((step.id, to_off, fo, run));
+                        break;
+                    }
+                }
+                let Some((table, src, dst, run)) = hit else {
                     continue;
                 };
-                if direction.walks_out()
-                    && ft == step.from_table
-                    && tt == step.to_table
-                    && ctx.graph.has_edge(step.id, fo, to_off)?
-                {
-                    hit = Some(Value::Rel {
-                        table: step.id,
-                        src: fo,
-                        dst: to_off,
-                    });
-                    break;
-                }
-                if direction.walks_in()
-                    && ft == step.to_table
-                    && tt == step.from_table
-                    && ctx.graph.has_edge(step.id, to_off, fo)?
-                {
-                    hit = Some(Value::Rel {
-                        table: step.id,
-                        src: to_off,
-                        dst: fo,
-                    });
-                    break;
-                }
+                let vals = run_values(table, src, dst, run);
+                let c = &mut ctx.chunks[c];
+                c.size = vals.len();
+                c.cols[0] = vals;
+                c.cur = Some(0);
+                ctx.states[i] = OpState {
+                    active: true,
+                    ..OpState::default()
+                };
+                return Ok(true);
             }
-            let Some(rel_val) = hit else { continue };
-            let c = &mut ctx.chunks[*chunk];
-            c.size = 1;
-            c.cols[0] = vec![rel_val];
-            c.cur = Some(0);
-            return Ok(true);
-        },
+        }
         OpDesc::AspJoin {
             from,
             to,
@@ -3941,10 +4156,17 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     let mut set = EdgeSet::default();
                     let count = *ctx.counts.get(&step.from_table).unwrap_or(&0);
                     let StageCtx { graph, scratch, .. } = ctx;
+                    // The sweep is the load order, so the running count
+                    // is each edge's row: the first copy of a pair
+                    // records the row and every later one bumps the
+                    // length of the run.
+                    let mut ord = 0;
                     for src in 0..count {
                         graph.neighbors(step.id, src, false, scratch)?;
                         for &dst in scratch.iter() {
-                            set.insert((src, dst));
+                            let run = set.entry((src, dst)).or_insert((ord, 0));
+                            run.1 += 1;
+                            ord += 1;
                         }
                     }
                     sets.push(set);
@@ -3953,30 +4175,51 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             }
             match retain {
                 // Flat probe, one configuration at a time like
-                // `ExpandInto`.
-                None => loop {
-                    if !next(descs, ctx, i - 1)? {
-                        return Ok(false);
+                // `ExpandInto`, and like it walking the run a repeated
+                // pair names rather than reporting one edge for it.
+                None => {
+                    let c = *chunk;
+                    if ctx.states[i].active {
+                        let pos = ctx.states[i].pos + 1;
+                        if pos < ctx.chunks[c].size {
+                            ctx.states[i].pos = pos;
+                            ctx.chunks[c].cur = Some(pos);
+                            return Ok(true);
+                        }
+                        ctx.states[i].active = false;
                     }
-                    let fv = value_of(ctx, *from)?;
-                    let tv = value_of(ctx, *to)?;
-                    if matches!(fv, Value::Null) || matches!(tv, Value::Null) {
-                        continue;
+                    loop {
+                        if !next(descs, ctx, i - 1)? {
+                            return Ok(false);
+                        }
+                        let fv = value_of(ctx, *from)?;
+                        let tv = value_of(ctx, *to)?;
+                        if matches!(fv, Value::Null) || matches!(tv, Value::Null) {
+                            continue;
+                        }
+                        let (ft, fo) = node_value(fv, "asp join")?;
+                        let (tt, to_off) = node_value(tv, "asp join")?;
+                        let sets = ctx.edge_sets.get(&i).expect("accumulated above");
+                        let Some((table, src, dst, run)) =
+                            asp_hit(sets, rels, *direction, ft, fo, tt, to_off)
+                        else {
+                            continue;
+                        };
+                        let vals = run_values(table, src, dst, run);
+                        let c = &mut ctx.chunks[c];
+                        c.size = vals.len();
+                        c.cols[0] = vals;
+                        c.cur = Some(0);
+                        ctx.states[i] = OpState {
+                            active: true,
+                            ..OpState::default()
+                        };
+                        return Ok(true);
                     }
-                    let (ft, fo) = node_value(fv, "asp join")?;
-                    let (tt, to_off) = node_value(tv, "asp join")?;
-                    let sets = ctx.edge_sets.get(&i).expect("accumulated above");
-                    let Some(rel_val) = asp_hit(sets, rels, *direction, ft, fo, tt, to_off) else {
-                        continue;
-                    };
-                    let c = &mut ctx.chunks[*chunk];
-                    c.size = 1;
-                    c.cols[0] = vec![rel_val];
-                    c.cur = Some(0);
-                    return Ok(true);
-                },
+                }
                 // The fused semijoin: probe the whole unflat neighbor
-                // vector and retain the survivors in place.
+                // vector and keep the survivors in place, each one as
+                // many times as the closing pair holds edges.
                 Some(f) => loop {
                     if !next(descs, ctx, i - 1)? {
                         return Ok(false);
@@ -3993,12 +4236,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         .expect("join into a bound slot");
                     let sets = ctx.edge_sets.get(&i).expect("accumulated above");
                     let source = &ctx.chunks[*f];
-                    let mut keep = Vec::with_capacity(source.size);
+                    let mut times = Vec::with_capacity(source.size);
                     for pos in 0..source.size {
-                        keep.push(match &source.cols[col][pos] {
-                            Value::Null => false,
+                        times.push(match &source.cols[col][pos] {
+                            Value::Null => 0,
                             &Value::Node { table, offset } => {
-                                asp_hit(sets, rels, *direction, ft, fo, table, offset).is_some()
+                                asp_hit(sets, rels, *direction, ft, fo, table, offset)
+                                    .map_or(0, |(_, _, _, (_, count))| count as usize)
                             }
                             other => {
                                 return Err(invalid(format!(
@@ -4007,10 +4251,10 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                             }
                         });
                     }
-                    if !keep.iter().any(|k| *k) {
+                    if times.iter().all(|n| *n == 0) {
                         continue;
                     }
-                    ctx.chunks[*f].retain(&keep);
+                    ctx.chunks[*f].repeat(&times);
                     // The rel column is dead by the fusion's own
                     // precondition; the chunk still pins one null so
                     // downstream sees a nonempty flat result.
@@ -4056,6 +4300,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let mut far = Vec::new();
             let mut seed_rels = Vec::new();
             let mut probe_rels = Vec::new();
+            let mut seed_ords = Vec::new();
             {
                 let StageCtx {
                     graph,
@@ -4068,12 +4313,40 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     match pdirs {
                         [prev] => {
                             graph.neighbors(probe_step.id, po, *prev, &mut cache.all)?;
-                            cache.out.clear();
+                            if *emit_rels {
+                                let len = cache.all.len();
+                                graph.neighbor_ordinals(
+                                    probe_step.id,
+                                    po,
+                                    *prev,
+                                    len,
+                                    &mut cache.ords,
+                                )?;
+                                cache.fwd.clear();
+                                cache.fwd.resize(len, !*prev);
+                            }
                         }
                         _ => {
                             graph.neighbors(probe_step.id, po, false, &mut cache.out)?;
-                            graph.neighbors(probe_step.id, po, true, scratch)?;
-                            merge_sorted(&cache.out, scratch, &mut cache.all);
+                            graph.neighbors(probe_step.id, po, true, &mut cache.back)?;
+                            if *emit_rels {
+                                let (fl, bl) = (cache.out.len(), cache.back.len());
+                                graph.neighbor_ordinals(
+                                    probe_step.id,
+                                    po,
+                                    false,
+                                    fl,
+                                    &mut cache.out_ords,
+                                )?;
+                                graph.neighbor_ordinals(
+                                    probe_step.id,
+                                    po,
+                                    true,
+                                    bl,
+                                    &mut cache.back_ords,
+                                )?;
+                            }
+                            cache.merge(*emit_rels);
                         }
                     }
                     cache.key = (pt, po);
@@ -4086,7 +4359,17 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 // fusion in its input.
                 for &srev in sdirs {
                     graph.neighbors(seed_step.id, so, srev, scratch)?;
-                    leapfrog(scratch, &cache.all, |v| {
+                    if *emit_rels {
+                        graph.neighbor_ordinals(
+                            seed_step.id,
+                            so,
+                            srev,
+                            scratch.len(),
+                            &mut seed_ords,
+                        )?;
+                    }
+                    leapfrog(scratch, &cache.all, |s, p| {
+                        let v = scratch[s];
                         far.push(Value::Node {
                             table: sfar,
                             offset: v,
@@ -4097,20 +4380,18 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                                 table: seed_step.id,
                                 src: ss,
                                 dst: sd,
+                                ord: seed_ords[s],
                             });
                             // The binary probe an undirected close
                             // replaces reports the forward edge when
-                            // there is one, so the merged list asks
-                            // which side the hit came from.
-                            let forward = match pdirs {
-                                [prev] => !prev,
-                                _ => cache.out.binary_search(&v).is_ok(),
-                            };
-                            let (ps, pd) = if forward { (po, v) } else { (v, po) };
+                            // there is one, so the merged list says
+                            // which stored list each entry came from.
+                            let (ps, pd) = if cache.fwd[p] { (po, v) } else { (v, po) };
                             probe_rels.push(Value::Rel {
                                 table: probe_step.id,
                                 src: ps,
                                 dst: pd,
+                                ord: cache.ords[p],
                             });
                         }
                     });
@@ -4433,13 +4714,17 @@ fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
                 table: t1,
                 src: s1,
                 dst: d1,
+                ord: r1,
             },
             Value::Rel {
                 table: t2,
                 src: s2,
                 dst: d2,
+                ord: r2,
             },
-        ) => Some(t1 == t2 && s1 == s2 && d1 == d2),
+            // Two copies of one pair are two edges, and the row is what
+            // says which copy, so it is part of being the same edge.
+        ) => Some(t1 == t2 && s1 == s2 && d1 == d2 && r1 == r2),
         (Value::List(x), Value::List(y)) => {
             if x.len() != y.len() {
                 return Ok(Some(false));
@@ -4913,7 +5198,11 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             // on is one the query declared, and that is what a cast to
             // a record type is for.
             ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
-            Value::Rel { table, src, dst } => ctx.graph.rel_property(table, src, dst, key),
+            // An edge with no stored row reads null here rather than in
+            // every engine, so an engine's `rel_property` only ever
+            // sees a row it holds.
+            Value::Rel { ord, .. } if ord == Value::NO_REL_ROW => Ok(Value::Null),
+            Value::Rel { table, ord, .. } => ctx.graph.rel_property(table, ord, key),
             Value::Null => Ok(Value::Null),
             other => Err(invalid(format!(
                 "property access on {other:?}, expected a node"
@@ -6593,21 +6882,24 @@ mod tests {
         gone: DeletedRows,
     }
 
+    /// The KNOWS edges of the fixture, in load order, which is sorted
+    /// by source and then destination the way a bulk load leaves them.
+    /// An edge's place here is the row its properties would sit in, so
+    /// this is also what `knows` reads to build an expected value.
+    const KNOWS: [(u64, u64); 8] = [
+        (0, 1),
+        (0, 2),
+        (1, 2),
+        (1, 3),
+        (2, 4),
+        (3, 4),
+        (4, 5),
+        (5, 0),
+    ];
+
     fn mock() -> MockGraph {
         let mut edges = BTreeMap::new();
-        edges.insert(
-            2,
-            vec![
-                (0, 1),
-                (0, 2),
-                (1, 2),
-                (1, 3),
-                (2, 4),
-                (3, 4),
-                (4, 5),
-                (5, 0),
-            ],
-        );
+        edges.insert(2, KNOWS.to_vec());
         edges.insert(3, vec![(0, 0), (1, 1), (2, 2), (3, 0), (4, 1), (5, 2)]);
         MockGraph {
             edges,
@@ -6637,6 +6929,50 @@ mod tests {
 
         fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool> {
             Ok(self.edges[&rel].contains(&(src, dst)))
+        }
+
+        /// The mock's edge lists are written in load order, so an
+        /// edge's row is where it sits in one. Answering this honestly
+        /// rather than taking the trait's default is what lets the
+        /// tests that run one query down two plans compare the rel
+        /// values whole: a fused close and the expand pair it replaces
+        /// have to name the same edge, and a row every path calls zero
+        /// would not tell them apart.
+        fn edge_ordinal(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<u64>> {
+            Ok(self.edges[&rel]
+                .iter()
+                .position(|&e| e == (src, dst))
+                .map(|i| i as u64))
+        }
+
+        /// Load order keeps a pair's copies together, so the run is the
+        /// stretch of equal pairs from the first one.
+        fn edge_run(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
+            let list = &self.edges[&rel];
+            let Some(at) = list.iter().position(|&e| e == (src, dst)) else {
+                return Ok(None);
+            };
+            let count = list[at..].iter().take_while(|&&e| e == (src, dst)).count();
+            Ok(Some((at as u64, count as u64)))
+        }
+
+        fn neighbor_ordinals(
+            &mut self,
+            rel: u32,
+            node: u64,
+            reversed: bool,
+            _len: usize,
+            out: &mut Vec<u64>,
+        ) -> Result<()> {
+            out.clear();
+            // The same walk `neighbors` takes over the same list, so
+            // the two line up slot for slot.
+            for (i, &(src, dst)) in self.edges[&rel].iter().enumerate() {
+                if (!reversed && src == node) || (reversed && dst == node) {
+                    out.push(i as u64);
+                }
+            }
+            Ok(())
         }
 
         fn property(&mut self, _table: u32, offset: u64, key: &str) -> Result<Value> {
@@ -6749,6 +7085,17 @@ mod tests {
     }
 
     fn run_opts(source: &str, params: &[(&str, Value)], options: Options) -> QueryResult {
+        run_graph(source, params, options, mock())
+    }
+
+    /// The same run over a graph the caller built, for the shapes whose
+    /// answer depends on edges the shared fixture does not have.
+    fn run_graph(
+        source: &str,
+        params: &[(&str, Value)],
+        options: Options,
+        mut graph: MockGraph,
+    ) -> QueryResult {
         let schema = schema();
         let parsed = crate::parser::parse(source).expect("parse");
         let query = crate::binder::bind(&parsed, &schema).expect("bind");
@@ -6762,7 +7109,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing parameter ${name}"));
             args.push(v.clone());
         }
-        let mut graph = mock();
         execute(&optimized, &query, &schema, &mut graph, &args, &options).expect("execute")
     }
 
@@ -7181,17 +7527,73 @@ mod tests {
     }
 
     #[test]
-    fn leapfrog_emits_one_hit_per_seed_occurrence() {
-        // A duplicate in the seed list is a real multi-edge row and
-        // emits twice; a duplicate in the probe list is only an
-        // existence check and adds nothing.
+    fn leapfrog_pairs_every_copy_with_every_copy() {
+        // A duplicate on either side is another edge, so a value the
+        // seed holds twice and the probe once is two hits, and one both
+        // hold twice is four.
+        let (seed, probe) = ([2u64, 2, 3, 7, 9, 12], [1u64, 2, 7, 7, 8, 12]);
         let mut hits = Vec::new();
-        leapfrog(&[2, 2, 3, 7, 9, 12], &[1, 2, 7, 7, 8, 12], |v| hits.push(v));
-        assert_eq!(hits, [2, 2, 7, 12]);
+        leapfrog(&seed, &probe, |s, p| hits.push((seed[s], s, p)));
+        assert_eq!(
+            hits,
+            [(2, 0, 1), (2, 1, 1), (7, 3, 2), (7, 3, 3), (12, 5, 5),]
+        );
         hits.clear();
-        leapfrog(&[5], &[], |v| hits.push(v));
-        leapfrog(&[], &[5], |v| hits.push(v));
+        leapfrog(&[5], &[], |s, p| hits.push((5, s, p)));
+        leapfrog(&[], &[5], |s, p| hits.push((5, s, p)));
         assert_eq!(hits, []);
+    }
+
+    /// A pair drawn twice is two edges, so a pattern that closes onto
+    /// it matches twice, and the three plans that can close it have to
+    /// say so alike: the fused intersection, the binary pair, and the
+    /// ASP probe that reads its edges out of a swept set instead of out
+    /// of storage.
+    #[test]
+    fn a_close_on_a_repeated_pair_reports_every_copy() {
+        let fixture = || {
+            let mut edges = BTreeMap::new();
+            // The closing leg 0 -> 2 is drawn twice, the other two legs
+            // once, so the triangle matches twice and no other shape in
+            // the graph can account for the second row.
+            edges.insert(2, vec![(0u64, 1u64), (0, 2), (0, 2), (1, 2)]);
+            edges.insert(3, Vec::new());
+            MockGraph {
+                edges,
+                gone: DeletedRows::new(),
+            }
+        };
+        let count = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) \
+                     RETURN count(*) AS n";
+        assert_eq!(int_rows(&run_graph(count, &[], wcoj(), fixture())), [[2]]);
+        assert_eq!(
+            int_rows(&run_graph(count, &[], no_wcoj(), fixture())),
+            [[2]]
+        );
+
+        // And the rows name the two copies rather than the first one
+        // twice, which is what the property read downstream depends on.
+        let rels = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[r:KNOWS]->(c) RETURN r";
+        let fused = run_graph(rels, &[], wcoj(), fixture());
+        let binary = run_graph(rels, &[], no_wcoj(), fixture());
+        assert_eq!(
+            fused.rows,
+            [
+                vec![Value::Rel {
+                    table: 2,
+                    src: 0,
+                    dst: 2,
+                    ord: 1
+                }],
+                vec![Value::Rel {
+                    table: 2,
+                    src: 0,
+                    dst: 2,
+                    ord: 2
+                }],
+            ]
+        );
+        assert_eq!(fused.rows, binary.rows);
     }
 
     #[test]
@@ -8074,7 +8476,15 @@ mod tests {
     }
 
     fn knows(src: u64, dst: u64) -> Value {
-        Value::Rel { table: 2, src, dst }
+        Value::Rel {
+            table: 2,
+            src,
+            dst,
+            ord: KNOWS
+                .iter()
+                .position(|&e| e == (src, dst))
+                .expect("the fixture has this edge") as u64,
+        }
     }
 
     /// The expected path, built through the constructor so the elements
@@ -8417,21 +8827,7 @@ mod tests {
             Value::Rel { dst, .. } => dst,
             _ => u64::MAX,
         });
-        assert_eq!(
-            rows,
-            vec![
-                vec![Value::Rel {
-                    table: 2,
-                    src: 0,
-                    dst: 1
-                }],
-                vec![Value::Rel {
-                    table: 2,
-                    src: 0,
-                    dst: 2
-                }],
-            ]
-        );
+        assert_eq!(rows, vec![vec![knows(0, 1)], vec![knows(0, 2)]]);
     }
 
     #[test]

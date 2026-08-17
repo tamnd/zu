@@ -26,7 +26,7 @@ use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
-use crate::zu1::props::{PropsReader, load_props};
+use crate::zu1::props::{PropsReader, load_props, load_rel_props};
 
 /// Whether every neighbor list is to be read on its own, whatever the
 /// group it sits in costs. Read once: this sits under the walk and the
@@ -189,6 +189,19 @@ impl<'a> Zu1Snapshot<'a> {
         Ok(())
     }
 
+    /// The same for a rel table's edge columns, which hang off its
+    /// group directory rather than off the table index. They share the
+    /// one map because a catalog id names a node table or a rel table
+    /// and never both.
+    fn ensure_rel_props(&mut self, rel: u32) -> Result<()> {
+        if self.props.contains_key(&rel) {
+            return Ok(());
+        }
+        let reader = load_rel_props(&mut self.db, rel)?.map(PropsReader::new);
+        self.props.insert(rel, reader);
+        Ok(())
+    }
+
     /// Reads the deleted set once per snapshot, or per epoch when a
     /// caller carries the cache from one snapshot to the next.
     fn ensure_gone(&mut self) -> Result<&Deleted> {
@@ -259,14 +272,44 @@ fn survivors(
 }
 
 /// The props reader of `table`, which must have properties stored.
+/// A node table and a rel table never share an id, so this reads
+/// either one.
 fn props_of(props: &mut HashMap<u32, Option<PropsReader>>, table: u32) -> Result<&mut PropsReader> {
     props
         .get_mut(&table)
         .expect("just loaded")
         .as_mut()
-        .ok_or_else(|| {
-            ZuError::InvalidArgument(format!("node table {table} has no properties stored"))
-        })
+        .ok_or_else(|| ZuError::InvalidArgument(format!("table {table} has no properties stored")))
+}
+
+/// The column `name` names, as the vector layer would carry it, or
+/// `None` when the reader holds nothing readable under that name.
+///
+/// The vector layer types a column as one of two things, so a column
+/// that is neither is not resolvable and the compiler declines the
+/// plan rather than reading a float or a date as though it were a
+/// count. The row at a time executor reads those, and widening this is
+/// the vector layer's own change (G1, the `PhysType` move).
+///
+/// A vector carries a validity mask of its own, but a scan does not
+/// fill one from storage yet, so a column that holds a null is not
+/// resolvable here either.
+fn vector_col(reader: &PropsReader, name: &str) -> Option<(ColId, ColType)> {
+    reader.col(name).and_then(|ix| {
+        if reader.columns()[ix].validity.is_some() {
+            return None;
+        }
+        let ty = match &reader.columns()[ix].ty {
+            LogicalType::Int {
+                signed: true,
+                bits: IntBits::B64,
+                ..
+            } => ColType::Int,
+            LogicalType::Str { .. } => ColType::Str,
+            _ => return None,
+        };
+        Some((ix as ColId, ty))
+    })
 }
 
 fn check_col(reader: &PropsReader, col: ColId) -> Result<usize> {
@@ -309,32 +352,15 @@ impl Snapshot for Zu1Snapshot<'_> {
         let Some(reader) = self.props.get(&table).expect("just loaded") else {
             return Ok(None);
         };
-        // The vector layer types a column as one of two things, so a
-        // column that is neither is not resolvable here and the
-        // compiler declines the plan rather than reading a float or a
-        // date as though it were a count. The row at a time executor
-        // reads those, and widening this is the vector layer's own
-        // change (G1, the `PhysType` move).
-        Ok(reader.col(name).and_then(|ix| {
-            // A vector carries a validity mask of its own, but a scan
-            // does not fill one from storage yet, so a column that
-            // holds a null is not resolvable here either and the row at
-            // a time executor reads it. Widening this is the same
-            // change as widening the two types below.
-            if reader.columns()[ix].validity.is_some() {
-                return None;
-            }
-            let ty = match &reader.columns()[ix].ty {
-                LogicalType::Int {
-                    signed: true,
-                    bits: IntBits::B64,
-                    ..
-                } => ColType::Int,
-                LogicalType::Str { .. } => ColType::Str,
-                _ => return None,
-            };
-            Some((ix as ColId, ty))
-        }))
+        Ok(vector_col(reader, name))
+    }
+
+    fn resolve_rel_col(&mut self, rel: RelId, name: &str) -> Result<Option<(ColId, ColType)>> {
+        self.ensure_rel_props(rel)?;
+        let Some(reader) = self.props.get(&rel).expect("just loaded") else {
+            return Ok(None);
+        };
+        Ok(vector_col(reader, name))
     }
 
     fn scan(
@@ -516,6 +542,23 @@ impl Snapshot for Zu1Snapshot<'_> {
         reader.neighbors_dir_into(db, node, direction(dir), out)
     }
 
+    fn list_ords_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {
+        self.ensure_reader(rel)?;
+        let Self {
+            db,
+            readers,
+            scratch,
+            ..
+        } = self;
+        let reader = readers.get_mut(&rel).expect("just loaded");
+        // The reader writes a list at a time and the caller collects
+        // several, so the read lands in the snapshot's own buffer and
+        // is copied onto the end of theirs.
+        reader.neighbor_ordinals_into(db, node, direction(dir), scratch)?;
+        out.extend_from_slice(scratch);
+        Ok(())
+    }
+
     fn gather(
         &mut self,
         table: TableId,
@@ -539,6 +582,36 @@ impl Snapshot for Zu1Snapshot<'_> {
             Ok(ValueVector::flat_from(arena, PhysType::Int64, scratch))
         } else {
             reader.gather_str(db, ix, rows, str_bytes, str_ends)?;
+            Ok(str_views(arena, str_bytes, str_ends))
+        }
+    }
+
+    // An edge's row is its ordinal and a node's row is its offset, and
+    // the reader underneath does not know the difference, so the two
+    // gathers differ only in which directory they load.
+    fn gather_rel(
+        &mut self,
+        rel: RelId,
+        col: ColId,
+        ords: &[u64],
+        arena: &mut MorselArena,
+    ) -> Result<ValueVector> {
+        self.ensure_rel_props(rel)?;
+        let Self {
+            db,
+            props,
+            scratch,
+            str_bytes,
+            str_ends,
+            ..
+        } = self;
+        let reader = props_of(props, rel)?;
+        let ix = check_col(reader, col)?;
+        if reader.columns()[ix].is_lane() {
+            reader.gather_int(db, ix, ords, scratch)?;
+            Ok(ValueVector::flat_from(arena, PhysType::Int64, scratch))
+        } else {
+            reader.gather_str(db, ix, ords, str_bytes, str_ends)?;
             Ok(str_views(arena, str_bytes, str_ends))
         }
     }
@@ -848,3 +921,4 @@ mod tests {
         assert_eq!(fork.degree_batch(rel, &[0, 1], Dir::Fwd).unwrap(), 3);
     }
 }
+

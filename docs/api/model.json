@@ -2247,6 +2247,14 @@
       "signature": "List(Vec<Value>)"
     },
     {
+      "id": "zu::query::Value::NO_REL_ROW",
+      "kind": "assoc-const",
+      "name": "NO_REL_ROW",
+      "of": "zu::query::Value",
+      "signature": "u64",
+      "doc": "The `ord` of an edge that has no row in the stored property\ncolumns: one a write staged and no fold has landed yet, or one\na pattern matched over a different rel table. A property read\noff such an edge answers null rather than reading somebody\nelse's row."
+    },
+    {
       "id": "zu::query::Value::Node",
       "kind": "variant",
       "name": "Node",
@@ -2281,7 +2289,7 @@
       "kind": "variant",
       "name": "Rel",
       "of": "zu::query::Value",
-      "signature": "Rel { table: u32, src: u64, dst: u64 }"
+      "signature": "Rel { table: u32, src: u64, dst: u64, ord: u64 }"
     },
     {
       "id": "zu::query::Value::Str",
@@ -5106,7 +5114,15 @@
       "name": "edge_ordinal",
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn edge_ordinal(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>>",
-      "doc": "The row of the edge property columns that `src -> dst` holds,\nand `None` when the edge is not there.\n\nThe ordinal is the edge's place in the load order, which the\nforward CSR lays out group after group and list after list, so\nit is the group's base plus the slot the destination sits in.\nAn edge reached forward could have its ordinal counted out as\nthe expand walks the list, and the vectorized read does exactly\nthat; this is the answer for an edge that arrived any other way,\na backward expand above all, where the slot in the backward\narray says nothing about the forward one.\n\nThis takes the cached-group path [`Self::neighbors_dir`] takes,\nnot the point path [`Self::has_edge`] takes, because an edge\nproperty is read once per edge a pattern matched and those edges\narrive together: the point path decodes an offset chunk and a\nneighbor chunk per call, which measured at about 5us per\nproperty read, against a binary search over a slice the group\ncache already holds. A caller reading one ordinal on its own\npays a group decode for it, which is the same bet the neighbor\nlist makes.\n\nA pair that runs twice names two edges with two ordinals, and a\nlookup given nothing but the pair cannot pick between them: this\nanswers with the first, the earliest of the run in load order.\nThe count is what tells the copies apart and only a walk of the\nlist has it, so a caller that needs each copy's own value takes\n[`Self::out_neighbors_from`] and counts."
+      "doc": "The row of the edge property columns that `src -> dst` holds,\nand `None` when the edge is not there.\n\nThe ordinal is the edge's place in the load order, which the\nforward CSR lays out group after group and list after list, so\nit is the group's base plus the slot the destination sits in.\nAn edge reached forward could have its ordinal counted out as\nthe expand walks the list, and the vectorized read does exactly\nthat; this is the answer for an edge that arrived any other way,\na backward expand above all, where the slot in the backward\narray says nothing about the forward one.\n\nThis takes the cached-group path [`Self::neighbors_dir`] takes,\nnot the point path [`Self::has_edge`] takes, because an edge\nproperty is read once per edge a pattern matched and those edges\narrive together: the point path decodes an offset chunk and a\nneighbor chunk per call, which measured at about 5us per\nproperty read, against a binary search over a slice the group\ncache already holds. A caller reading one ordinal on its own\npays a group decode for it, which is the same bet the neighbor\nlist makes.\n\nA pair that runs twice names two edges with two ordinals, and a\nlookup given nothing but the pair cannot pick between them: this\nanswers with the first, the earliest of the run in load order.\nA caller that wants every copy takes [`Self::edge_run`], which\nis this plus the length of the run."
+    },
+    {
+      "id": "zu::zu1::graph::GraphReader::edge_run",
+      "kind": "method",
+      "name": "edge_run",
+      "of": "zu::zu1::graph::GraphReader",
+      "signature": "fn edge_run(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<(u64, u64)>>",
+      "doc": "The whole run of `src -> dst`: the ordinal of its first edge and\nhow many edges the pair holds, so the copies are `base`,\n`base + 1`, up to `base + count - 1`.\n\nA pattern that binds both endpoints matches once per edge, not\nonce per pair, and this is what lets it. The forward list keeps\na pair's copies next to each other, so the run is one\n`partition_point` for its start and a scan for its end, and the\nscan is over equal values a decoded group already holds."
     },
     {
       "id": "zu::zu1::graph::GraphReader::has_edge",
@@ -5163,6 +5179,14 @@
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn lookup_key(&mut self, db: &mut Zu1File, key: u64) -> Result<Option<u64>>",
       "doc": "Resolves an original id through the primary-key index, or errors\nwhen the file was loaded without one. The key segment's chunk\ndirectory loads on the first call and is reused after, so a\nlookup costs two chunk decodes."
+    },
+    {
+      "id": "zu::zu1::graph::GraphReader::neighbor_ordinals_into",
+      "kind": "method",
+      "name": "neighbor_ordinals_into",
+      "of": "zu::zu1::graph::GraphReader",
+      "signature": "fn neighbor_ordinals_into(&mut self, db: &mut Zu1File, node: u64, dir: Direction, out: &mut Vec<u64>) -> Result<()>",
+      "doc": "Replaces `out` with the load-order ordinal of every edge in\n`node`'s list in `dir`, in list order, so `out[i]` is the\nproperty row of the `i`th neighbor [`Self::neighbors_dir`]\nreports for the same arguments.\n\nThis is what a pattern that reads an edge property wants and\n[`Self::edge_ordinal`] cannot give it. A pair that runs twice is\ntwo edges with two rows, and a lookup holding nothing but the\npair answers with the first of the run for both, so a walk over\na graph where pairs repeat reads one copy's value for every\ncopy. Counting the list out instead is exact, and on the\ngenerated finance graphs a pair repeating is the common case\nrather than the corner one: an account there sends three hundred\ntransfers to a hundred and fifty counterparties.\n\nForward the answer is a range, the group's base plus the list's\nplace in it, which is [`Self::out_neighbors_from`]. Backward the\nslot in the reverse array says nothing about the forward one, so\neach run of one source is looked up once and its copies counted\noff from there. The two directions agree on which copy is which,\nwhich is what makes an edge read forward and the same edge read\nbackward carry the same value: a run of k copies fills k slots\nin each direction and the `i`th backward slot takes the `i`th\nforward ordinal."
     },
     {
       "id": "zu::zu1::graph::GraphReader::neighbors",

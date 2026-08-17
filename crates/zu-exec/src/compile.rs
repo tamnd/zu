@@ -74,6 +74,11 @@ pub(crate) struct Level {
     /// Columns this level materializes; entry i lives at chunk vector
     /// i + 1, vector 0 is always the row id.
     pub cols: Vec<ColSpec>,
+    /// Whether the walk that builds this level has to carry the
+    /// ordinal of every edge it stepped over, which it does when a
+    /// column here reads one. The ordinals cost a second read of the
+    /// list, so a level nothing asks it of does not pay for them.
+    pub ords: bool,
 }
 
 /// One column of a level's chunk: a stored property gathered from the
@@ -87,6 +92,16 @@ pub(crate) struct Level {
 /// this list enough to build the chunk.
 pub(crate) enum ColSpec {
     Stored(ColId, ColType),
+    /// A property of the edge the walk stepped over to reach the row,
+    /// gathered off the rel table by the edge's ordinal rather than
+    /// off the node table by the row.
+    ///
+    /// It sits on the level the walk built because that is where the
+    /// edges are: one per row of it, in the positions the rows landed
+    /// in. A pair with several edges between it walks once per edge,
+    /// so the copies are separate rows here and each reads its own
+    /// value.
+    RelStored(RelId, ColId, ColType),
     Computed(Program),
     /// A value read off a level below, standing for every row of this
     /// one. A correlated predicate like `a.id < b.id` compares a column
@@ -724,6 +739,7 @@ pub(crate) fn compile(
         sip: options.sip,
         levels: Vec::new(),
         slot_level: HashMap::new(),
+        rel_level: HashMap::new(),
         sips: Vec::new(),
         sip_at: HashMap::new(),
         optional_level: None,
@@ -751,6 +767,9 @@ struct LevelBuild {
     /// The property name a stored column answers to, so a second
     /// reader of it reuses the position instead of gathering twice.
     /// Computed columns carry no name: nothing looks them up by one.
+    /// An edge column shares the namespace and is told apart by its
+    /// spec, since a node and the edge that reached it may well both
+    /// have a `ts`.
     cols: Vec<(String, ColSpec)>,
 }
 
@@ -768,6 +787,12 @@ struct Compiler<'a> {
     sip: Sip,
     levels: Vec<LevelBuild>,
     slot_level: HashMap<usize, usize>,
+    /// Where a rel variable's edges are: the level the walk over that
+    /// rel built, and the rel it walked. A property of the variable is
+    /// then a column of that level, gathered by ordinal. Only a plain
+    /// single hop registers one, so every other shape that names an
+    /// edge still declines.
+    rel_level: HashMap<usize, (usize, RelId)>,
     /// The joins that placed, each with the scalar its probe reads.
     /// The filter comes off the table at the end, once the plan is
     /// known to be one this pipeline runs at all.
@@ -1302,6 +1327,12 @@ impl Compiler<'_> {
                         cols: Vec::new(),
                     });
                     self.slot_level.insert(*to, to_level);
+                    // The edges this hop steps over are one per row of
+                    // the level it makes, so a property of the rel
+                    // variable is a column of that level. Registering
+                    // it here is what lets a query that reads
+                    // `t.ts` compile at all.
+                    self.rel_level.insert(*rel, (to_level, rel_id));
                     ops.push(Op::Expand {
                         rel: rel_id,
                         dirs,
@@ -1932,6 +1963,23 @@ impl Compiler<'_> {
 
         fuse_closes(&mut ops);
         batch_walks(&mut ops, &sink, &self.levels);
+        // An edge column is read by the ordinal the walk carried down
+        // beside the row, and only a plain expand carries one. Every
+        // other operator that builds a level, a branch, an
+        // intersection, a join, makes rows the walk did not step to
+        // one at a time, so a level of theirs that ended up with an
+        // edge column on it is a shape this executor cannot run.
+        for (level, l) in self.levels.iter().enumerate() {
+            if !l.cols.iter().any(|(_, c)| matches!(c, ColSpec::RelStored(..))) {
+                continue;
+            }
+            let walked = ops
+                .iter()
+                .any(|op| matches!(op, Op::Expand { to, .. } if *to == level));
+            if !walked {
+                return Ok(None);
+            }
+        }
         // The bracket runs its group one outer row at a time, because
         // whether the group matched is a fact about that row. A
         // batched descent drops the pin and concatenates neighbors
@@ -1957,9 +2005,13 @@ impl Compiler<'_> {
             levels: self
                 .levels
                 .drain(..)
-                .map(|l| Level {
-                    table: l.table,
-                    cols: l.cols.into_iter().map(|(_, spec)| spec).collect(),
+                .map(|l| {
+                    let cols: Vec<ColSpec> = l.cols.into_iter().map(|(_, spec)| spec).collect();
+                    Level {
+                        table: l.table,
+                        ords: cols.iter().any(|c| matches!(c, ColSpec::RelStored(..))),
+                        cols,
+                    }
                 })
                 .collect(),
             columns: self.query.columns.clone(),
@@ -2301,10 +2353,15 @@ impl Compiler<'_> {
     /// Registers a property column on a level, returning its chunk
     /// vector position.
     fn register_col(&mut self, level: usize, key: &str) -> Result<Option<(usize, ColType)>> {
-        if let Some(ix) = self.levels[level].cols.iter().position(|(k, _)| k == key) {
-            let ColSpec::Stored(_, ty) = self.levels[level].cols[ix].1 else {
-                unreachable!("only stored columns carry a name");
-            };
+        if let Some((ix, ty)) = self.levels[level]
+            .cols
+            .iter()
+            .enumerate()
+            .find_map(|(ix, (k, c))| match c {
+                ColSpec::Stored(_, ty) if k == key => Some((ix, *ty)),
+                _ => None,
+            })
+        {
             return Ok(Some((ix + 1, ty)));
         }
         let Some((id, ty)) = self.snap.resolve_col(self.levels[level].table, key)? else {
@@ -2313,6 +2370,37 @@ impl Compiler<'_> {
         self.levels[level]
             .cols
             .push((key.to_string(), ColSpec::Stored(id, ty)));
+        Ok(Some((self.levels[level].cols.len(), ty)))
+    }
+
+    /// The same for a property of the edge a level's walk stepped over,
+    /// which is the rel table's column read by the edge's ordinal.
+    ///
+    /// A node column and an edge column can carry the same name on one
+    /// level, so the match is on the spec as well as the name.
+    fn register_rel_col(
+        &mut self,
+        level: usize,
+        rel: RelId,
+        key: &str,
+    ) -> Result<Option<(usize, ColType)>> {
+        if let Some((ix, ty)) = self.levels[level]
+            .cols
+            .iter()
+            .enumerate()
+            .find_map(|(ix, (k, c))| match c {
+                ColSpec::RelStored(_, _, ty) if k == key => Some((ix, *ty)),
+                _ => None,
+            })
+        {
+            return Ok(Some((ix + 1, ty)));
+        }
+        let Some((id, ty)) = self.snap.resolve_rel_col(rel, key)? else {
+            return Ok(None);
+        };
+        self.levels[level]
+            .cols
+            .push((key.to_string(), ColSpec::RelStored(rel, id, ty)));
         Ok(Some((self.levels[level].cols.len(), ty)))
     }
 
@@ -2815,7 +2903,15 @@ impl Compiler<'_> {
                     return Ok(None);
                 };
                 let Some(&level) = self.slot_level.get(slot) else {
-                    return Ok(None);
+                    // Not a node the walk bound, so it may be the edge
+                    // of a hop, whose properties live on the level that
+                    // hop built.
+                    let Some(&(level, rel)) = self.rel_level.get(slot) else {
+                        return Ok(None);
+                    };
+                    return Ok(self
+                        .register_rel_col(level, rel, key)?
+                        .map(|(vec, ty)| ScalarRef::Col { level, vec, ty }));
                 };
                 match self.register_col(level, key)? {
                     Some((vec, ty)) => Ok(Some(ScalarRef::Col { level, vec, ty })),

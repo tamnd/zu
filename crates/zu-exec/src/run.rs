@@ -904,17 +904,21 @@ struct Parts<'a> {
 const FIRST_PART: usize = 8;
 
 impl<'a> Iterator for Parts<'a> {
-    type Item = &'a [u64];
+    /// The part and where in the run it started, which is what a
+    /// caller carrying a second array in step with the rows needs to
+    /// cut the same piece out of it.
+    type Item = (usize, &'a [u64]);
 
-    fn next(&mut self) -> Option<&'a [u64]> {
+    fn next(&mut self) -> Option<(usize, &'a [u64])> {
         if self.at == self.rows.len() {
             return None;
         }
         let take = self.step.min(self.rows.len() - self.at);
-        let part = &self.rows[self.at..self.at + take];
+        let from = self.at;
+        let part = &self.rows[from..from + take];
         self.at += take;
         self.step = (self.step * 2).min(zu_vector::VECTOR_SIZE);
-        Some(part)
+        Some((from, part))
     }
 }
 
@@ -948,7 +952,8 @@ impl<'a> Worker<'a> {
                     | ColSpec::Func
                     | ColSpec::Mark { .. }
                     | ColSpec::JoinMark { .. }
-                    | ColSpec::GroupMark => None,
+                    | ColSpec::GroupMark
+                    | ColSpec::RelStored(..) => None,
                 })
                 .collect(),
             scratch: Vec::new(),
@@ -1043,7 +1048,7 @@ impl<'a> Worker<'a> {
     fn seek_morsel(&mut self, seed: Option<u64>) -> Result<()> {
         let Some(seed) = seed else { return Ok(()) };
         let plan = self.plan;
-        let level0 = self.make_level(0, &[seed], &[], &[])?;
+        let level0 = self.make_level(0, &[seed], &[], &[], &[])?;
         let mut set = ChunkSet::new(vec![level0]);
         self.run_ops(&plan.ops, &mut set)
     }
@@ -1076,7 +1081,7 @@ impl<'a> Worker<'a> {
             if found.is_empty() {
                 continue;
             }
-            let level0 = self.make_level(0, &found, &[], &hit)?;
+            let level0 = self.make_level(0, &found, &[], &[], &hit)?;
             let mut set = ChunkSet::new(vec![level0]);
             self.run_ops(&plan.ops, &mut set)?;
             if rows_sink && self.stop.quota_met(idx, self.local_rows) {
@@ -1102,7 +1107,7 @@ impl<'a> Worker<'a> {
         (lo, hi): (u64, u64),
     ) -> Result<()> {
         let plan = self.plan;
-        let mut level0 = self.make_level(0, &[seed], &[], &[])?;
+        let mut level0 = self.make_level(0, &[seed], &[], &[], &[])?;
         level0.cur = Some(0);
         let mut set = ChunkSet::new(vec![level0]);
         // One list, and every worker on this seed wants the same one, so
@@ -1118,9 +1123,26 @@ impl<'a> Worker<'a> {
                 &owned
             }
         };
+        // The edges of the same list, when a column above reads one.
+        // The morsel owns a range of the list, so it owns the same
+        // range of the edges: one read of the seed's edges, cut the
+        // same way.
+        let mut ords = self.row_pool.pop().unwrap_or_default();
+        ords.clear();
+        if plan.levels[to].ords {
+            self.snap.get().list_ords_into(rel, seed, dir, &mut ords)?;
+        }
         let mut result = Ok(());
-        for part in list[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
-            let chunk = match self.make_level(to, part, &set.chunks, &[]) {
+        for (at, part) in list[lo as usize..hi as usize]
+            .chunks(zu_vector::VECTOR_SIZE)
+            .enumerate()
+        {
+            let from = lo as usize + at * zu_vector::VECTOR_SIZE;
+            let part_ords = match ords.is_empty() {
+                true => &[][..],
+                false => &ords[from..from + part.len()],
+            };
+            let chunk = match self.make_level(to, part, part_ords, &set.chunks, &[]) {
                 Ok(c) => c,
                 Err(e) => {
                     result = Err(e);
@@ -1139,6 +1161,7 @@ impl<'a> Worker<'a> {
             }
         }
         self.row_pool.push(owned);
+        self.row_pool.push(ords);
         result
     }
 
@@ -1221,6 +1244,13 @@ impl<'a> Worker<'a> {
                         negated,
                     } => self.join_mark_vec(table, *key, *negated, &level0),
                     ColSpec::GroupMark => self.group_mark_vec(sc.rows as usize),
+                    // Level 0's rows came off a scan, not off a walk,
+                    // so there is no edge behind them to read. The
+                    // compiler only registers an edge column on the
+                    // level a hop built.
+                    ColSpec::RelStored(..) => {
+                        unreachable!("the scan level stepped over no edge")
+                    }
                 };
                 level0.vecs.push(v);
             }
@@ -1768,6 +1798,18 @@ impl<'a> Worker<'a> {
             }
             _ => (None, rest),
         };
+        // Whether the level this walk builds reads a property of the
+        // edge it stepped over. When it does, every list the walk takes
+        // is read a second time for the ordinals, and the ordinals
+        // follow the neighbors through the close, the sideways filter
+        // and the batching, so the row that lands carries its own edge
+        // and not the first of the pair's run.
+        let wants_ords = self.plan.levels[to].ords;
+        let mut point_ords = self.row_pool.pop().unwrap_or_default();
+        let mut masked_ords = self.row_pool.pop().unwrap_or_default();
+        let mut sifted_ords = self.row_pool.pop().unwrap_or_default();
+        let mut fill_ords = self.row_pool.pop().unwrap_or_default();
+        fill_ords.clear();
         let mut sifted = self.row_pool.pop().unwrap_or_default();
         let mut keep = self.idx_pool.pop().unwrap_or_default();
         let mut probes = 0u64;
@@ -1877,34 +1919,69 @@ impl<'a> Worker<'a> {
                         &point[..]
                     }
                 };
+                // The edges of the same list, in the same order, read
+                // only where a column above wants one. The neighbors
+                // still come off the pin: this is the second read, not
+                // a different one, and it is what tells two edges
+                // between one pair apart.
+                let ords: &[u64] = if wants_ords {
+                    point_ords.clear();
+                    if let Err(e) = self
+                        .snap
+                        .get()
+                        .list_ords_into(rel, row, dir, &mut point_ords)
+                    {
+                        result = Err(e);
+                        break 'srcs;
+                    }
+                    debug_assert_eq!(point_ords.len(), list.len(), "one edge per neighbor");
+                    &point_ords[..]
+                } else {
+                    &[]
+                };
                 // The close judges the neighbors here, where they are
                 // still a sorted list and nothing has been built for
                 // them. Both lists ascend, so the probe walks forward
                 // and the whole source list costs one merge.
-                let list = if close.is_some() {
+                let (list, ords) = if close.is_some() {
                     masked.clear();
+                    masked_ords.clear();
                     match close_bits.filter(|_| list.len() <= close_len * MASK_RUN) {
+                        // The bitmap path answers position by position
+                        // either way, so the version that carries the
+                        // edges is the same walk with a second push.
+                        Some(bits) if wants_ords => {
+                            for (i, &v) in list.iter().enumerate() {
+                                if in_mask(&self.mask, bits, v) {
+                                    masked.push(v);
+                                    masked_ords.push(ords[i]);
+                                }
+                            }
+                        }
                         Some(bits) => mask_hits(&self.mask, bits, list, &mut masked),
                         None => {
                             let cur = &mut cursors[..close_lists.len()];
                             cur.fill(0);
                             let mut prev = 0;
-                            for &v in list {
+                            for (i, &v) in list.iter().enumerate() {
                                 if member(&close_lists, cur, &mut prev, v) {
                                     masked.push(v);
+                                    if wants_ords {
+                                        masked_ords.push(ords[i]);
+                                    }
                                 }
                             }
                         }
                     }
-                    &masked[..]
+                    (&masked[..], &masked_ords[..])
                 } else {
-                    list
+                    (list, ords)
                 };
                 // Same idea one step further out: the close asks
                 // whether the neighbor closes the cycle, this asks
                 // whether anything on the join's build side could
                 // match it, and both answer before a row exists.
-                let list = match sift {
+                let (list, ords) = match sift {
                     Some((filter, _)) => {
                         keep.clear();
                         keep.resize(list.len(), 0);
@@ -1913,12 +1990,17 @@ impl<'a> Worker<'a> {
                         kept += n as u64;
                         sifted.clear();
                         sifted.extend(keep[..n].iter().map(|&i| list[i as usize]));
-                        &sifted[..]
+                        if wants_ords {
+                            sifted_ords.clear();
+                            sifted_ords.extend(keep[..n].iter().map(|&i| ords[i as usize]));
+                        }
+                        (&sifted[..], &sifted_ords[..])
                     }
-                    None => list,
+                    None => (list, ords),
                 };
                 if batch {
                     let mut tail = list;
+                    let mut tail_ords = ords;
                     while !tail.is_empty() {
                         let take = (zu_vector::VECTOR_SIZE - fill.len()).min(tail.len());
                         fill.extend_from_slice(&tail[..take]);
@@ -1926,11 +2008,16 @@ impl<'a> Worker<'a> {
                             fillw.resize(fill.len(), weight);
                         }
                         tail = &tail[take..];
+                        if wants_ords {
+                            fill_ords.extend_from_slice(&tail_ords[..take]);
+                            tail_ords = &tail_ords[take..];
+                        }
                         if fill.len() == zu_vector::VECTOR_SIZE {
                             self.bwts = std::mem::take(&mut fillw);
-                            let res = self.descend(to, &fill, rest, set);
+                            let res = self.descend(to, &fill, &fill_ords, rest, set);
                             fillw = std::mem::take(&mut self.bwts);
                             fill.clear();
+                            fill_ords.clear();
                             fillw.clear();
                             if let Err(e) = res {
                                 result = Err(e);
@@ -1940,8 +2027,12 @@ impl<'a> Worker<'a> {
                     }
                     continue;
                 }
-                for part in parts(list, stop_early) {
-                    if let Err(e) = self.descend(to, part, rest, set) {
+                for (from, part) in parts(list, stop_early) {
+                    let part_ords = match wants_ords {
+                        true => &ords[from..from + part.len()],
+                        false => &[][..],
+                    };
+                    if let Err(e) = self.descend(to, part, part_ords, rest, set) {
                         result = Err(e);
                         break 'srcs;
                     }
@@ -1979,7 +2070,7 @@ impl<'a> Worker<'a> {
         }
         if result.is_ok() && !fill.is_empty() {
             self.bwts = std::mem::take(&mut fillw);
-            result = self.descend(to, &fill, rest, set);
+            result = self.descend(to, &fill, &fill_ords, rest, set);
             fillw = std::mem::take(&mut self.bwts);
         }
         if let Some(w) = hub {
@@ -2015,6 +2106,11 @@ impl<'a> Worker<'a> {
         self.row_pool.push(fill);
         self.row_pool.push(masked);
         self.row_pool.push(sifted);
+        self.row_pool.push(point);
+        self.row_pool.push(point_ords);
+        self.row_pool.push(masked_ords);
+        self.row_pool.push(sifted_ords);
+        self.row_pool.push(fill_ords);
         result
     }
 
@@ -2060,7 +2156,7 @@ impl<'a> Worker<'a> {
             set.chunks[src].cur = Some(phys);
             for list in &lists {
                 for part in list.chunks(zu_vector::VECTOR_SIZE) {
-                    if let Err(e) = self.descend(to, part, rest, set) {
+                    if let Err(e) = self.descend(to, part, &[], rest, set) {
                         result = Err(e);
                         break 'srcs;
                     }
@@ -2197,8 +2293,8 @@ impl<'a> Worker<'a> {
             // no rows. Under a bracket it is still a source row, and a
             // source row that matched nothing is a miss.
             if let Some(k) = int_key(set, key, phys as usize) {
-                for part in parts(table.lookup(k), stop_early) {
-                    if let Err(e) = self.descend(to, part, rest, set) {
+                for (_, part) in parts(table.lookup(k), stop_early) {
+                    if let Err(e) = self.descend(to, part, &[], rest, set) {
                         result = Err(e);
                         break 'srcs;
                     }
@@ -2233,8 +2329,19 @@ impl<'a> Worker<'a> {
 
     /// Pushes one vector of expanded rows through the rest of the
     /// pipeline as the newest level.
-    fn descend(&mut self, to: usize, part: &[u64], rest: &[Op], set: &mut ChunkSet) -> Result<()> {
-        let chunk = self.make_level(to, part, &set.chunks, &[])?;
+    ///
+    /// `ords` is the edge behind each row, in the same positions, and
+    /// is empty on a level that reads no edge column, which is every
+    /// level until a query names a property of a rel variable.
+    fn descend(
+        &mut self,
+        to: usize,
+        part: &[u64],
+        ords: &[u64],
+        rest: &[Op],
+        set: &mut ChunkSet,
+    ) -> Result<()> {
+        let chunk = self.make_level(to, part, ords, &set.chunks, &[])?;
         set.chunks.push(chunk);
         let res = self.run_ops(rest, set);
         set.chunks.pop();
@@ -2369,7 +2476,7 @@ impl<'a> Worker<'a> {
                     fill.extend_from_slice(&tail[..take]);
                     tail = &tail[take..];
                     if fill.len() == zu_vector::VECTOR_SIZE {
-                        let res = self.descend(to, &fill, rest, set);
+                        let res = self.descend(to, &fill, &[], rest, set);
                         fill.clear();
                         if let Err(e) = res {
                             result = Err(e);
@@ -2379,7 +2486,7 @@ impl<'a> Worker<'a> {
                 }
             } else {
                 for part in hits.chunks(zu_vector::VECTOR_SIZE) {
-                    if let Err(e) = self.descend(to, part, rest, set) {
+                    if let Err(e) = self.descend(to, part, &[], rest, set) {
                         result = Err(e);
                         break 'srcs;
                     }
@@ -2390,7 +2497,7 @@ impl<'a> Worker<'a> {
             }
         }
         if result.is_ok() && !fill.is_empty() {
-            result = self.descend(to, &fill, rest, set);
+            result = self.descend(to, &fill, &[], rest, set);
         }
         set.chunks[src].cur = None;
         self.drop_mask(std::slice::from_ref(&plist), bits);
@@ -2618,6 +2725,7 @@ impl<'a> Worker<'a> {
         &mut self,
         level: usize,
         part: &[u64],
+        ords: &[u64],
         below: &[DataChunk],
         keys: &[u64],
     ) -> Result<DataChunk> {
@@ -2660,6 +2768,13 @@ impl<'a> Worker<'a> {
                     negated,
                 } => self.join_mark_vec(table, *key, *negated, &chunk),
                 ColSpec::GroupMark => self.group_mark_vec(part.len()),
+                // The edge behind the row rather than the row itself,
+                // so the gather reads the rel table by the ordinal the
+                // walk carried down beside it.
+                &ColSpec::RelStored(rel, col, _) => {
+                    debug_assert_eq!(ords.len(), part.len(), "one edge per row it made");
+                    self.snap.get().gather_rel(rel, col, ords, &mut self.arena)?
+                }
             };
             chunk.vecs.push(v);
         }
@@ -3953,6 +4068,7 @@ mod tests {
     fn bare_level() -> Level {
         Level {
             table: 0,
+            ords: false,
             cols: Vec::new(),
         }
     }
@@ -3960,6 +4076,7 @@ mod tests {
     fn age_level() -> Level {
         Level {
             table: 0,
+            ords: false,
             cols: vec![ColSpec::Stored(0, zu_query::snapshot::ColType::Int)],
         }
     }

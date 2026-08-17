@@ -1140,13 +1140,13 @@ fn public_run_uses_the_pipeline_executor_transparently() {
     assert_eq!(r.rows, [[Value::Int(N as i64)]]);
 }
 
-/// An edge property is read off a rel variable, and the pipeline
-/// executor binds slots for node variables only, so the shape falls
-/// back and the row engine answers it. The point of the test is that
-/// the fallback happens rather than the new engine answering null, and
-/// that the answer the public entry point gives is the right one.
+/// An edge property is read off a rel variable, which the pipeline
+/// reads by the ordinal the walk carries down beside the row. The
+/// graph here has pairs joined by more than one edge, so a walk that
+/// named the pair rather than the edge would read the first of the run
+/// for every copy of it and the two engines would disagree.
 #[test]
-fn an_edge_property_falls_back_and_still_answers() {
+fn an_edge_property_runs_on_the_pipeline() {
     use crate::zu1::props::store_rel_props;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1157,6 +1157,17 @@ fn an_edge_property_falls_back_and_still_answers() {
     edges.extend((0..n).map(|i| ((i * 13 + 5) % n, i)));
     edges.sort_unstable();
     edges.dedup();
+    // Parallel edges, three ways: a pair carrying two, a pair carrying
+    // four, and a self loop carrying two. Sorting after keeps the
+    // copies together, which is how the loader wants them.
+    for _ in 0..2 {
+        edges.push((7, 11));
+        edges.push((13, 13));
+    }
+    for _ in 0..4 {
+        edges.push((21, 34));
+    }
+    edges.sort_unstable();
     bulk_load_keyed(&mut db, "person", "knows", N, &edges, None).unwrap();
     let age: Vec<u64> = (0..N).map(|i| (i * 37) % 100).collect();
     store_props(&mut db, "person", &[("age", PropValues::Int(&age))]).unwrap();
@@ -1166,32 +1177,22 @@ fn an_edge_property_falls_back_and_still_answers() {
 
     let mut db = Zu1File::open(&path).unwrap();
     let (catalog, schema) = query::load_schema(&mut db).unwrap();
-    falls_back(
-        &mut db,
-        &catalog,
-        &schema,
+    for source in [
         "MATCH (a:person)-[e:knows]->(b) WHERE e.since > 2020 RETURN count(b) AS n",
-    );
-    falls_back(
-        &mut db,
-        &catalog,
-        &schema,
-        "MATCH (a:person)-[e:knows]->(b) RETURN e.since AS since ORDER BY since LIMIT 3",
-    );
+        "MATCH (b:person)<-[e:knows]-(a) WHERE e.since > 2020 RETURN count(a) AS n",
+        "MATCH (a:person)-[e:knows]->(b) RETURN sum(e.since) AS s",
+        "MATCH (a:person)-[e:knows]->(b) WHERE a.age > 50 AND e.since < 2010 RETURN count(*) AS n",
+        "MATCH (a:person)-[e:knows]->(b) WHERE b.id < 40 RETURN b.id AS id, sum(e.since) AS s \
+         ORDER BY id",
+        "MATCH (a:person {id: 21})-[e:knows]->(b) RETURN e.since AS since ORDER BY since",
+    ] {
+        covered(&mut db, &catalog, &schema, source);
+    }
 
     let late = since.iter().filter(|&&v| v > 2020).count() as i64;
     assert!(late > 0, "the bound has to keep some edges");
     let r = query::run(
         "MATCH (a:person)-[e:knows]->(b) WHERE e.since > 2020 RETURN count(b) AS n",
-        &mut db,
-        &[],
-    )
-    .unwrap();
-    assert_eq!(r.rows, [[Value::Int(late)]]);
-    // The same count reached backward: an edge is the edge its
-    // endpoints name, whichever side the walk started from.
-    let r = query::run(
-        "MATCH (b:person)<-[e:knows]-(a) WHERE e.since > 2020 RETURN count(a) AS n",
         &mut db,
         &[],
     )

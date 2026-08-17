@@ -106,7 +106,19 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<Vec<u64>> {
 /// resolves back into its payload by reading the sealed segments it
 /// names, then every persisted tombstone chain seeds back in at epoch
 /// 0.
-pub fn recover(db: &mut Zu1File, wal: &Wal) -> Result<Mvcc> {
+///
+/// A file with a transaction still open on it is put back first. The
+/// log is cut to what the state going back in had folded, because a
+/// frame above that is a statement of the transaction being taken back
+/// and replaying it would put the transaction back on as an overlay,
+/// and then the kept state is published. Nothing here is a special case
+/// afterwards: the file reads as one whose last statement was the one
+/// before the transaction started.
+pub fn recover(db: &mut Zu1File, wal: &mut Wal) -> Result<Mvcc> {
+    if let Some(open) = db.interrupted() {
+        wal.rollback_above(open.log_floor)?;
+        db.finish_rollback()?;
+    }
     let floor = db.db_header().wal_seq;
     let mut mvcc = Mvcc::recover_with(wal, floor, |table, ptrs| {
         crate::ingest::resolve(db, table, ptrs)
@@ -1234,8 +1246,8 @@ mod tests {
         drop(f.db);
         drop(f.wal);
         let mut db = Zu1File::open(&dir.path().join("fold.zu1")).unwrap();
-        let wal = Wal::open(&dir.path().join("fold.wal")).unwrap();
-        let mvcc = recover(&mut db, &wal).unwrap();
+        let mut wal = Wal::open(&dir.path().join("fold.wal")).unwrap();
+        let mvcc = recover(&mut db, &mut wal).unwrap();
         assert_eq!(mvcc.epoch(), 1);
         assert_eq!(mvcc.appended_rows(f.person, 1), 0);
         assert!(mvcc.is_deleted(f.person, 2, 0));
@@ -1258,7 +1270,7 @@ mod tests {
         checkpoint_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap();
         let mut db = Zu1File::open(&dir.path().join("crash.zu1")).unwrap();
         let mut wal = Wal::open(&dir.path().join("crash.wal")).unwrap();
-        let mut mvcc = recover(&mut db, &wal).unwrap();
+        let mut mvcc = recover(&mut db, &mut wal).unwrap();
         assert_eq!(mvcc.epoch(), 1);
         assert_eq!(mvcc.appended_rows(f.person, 1), 2);
         checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
@@ -1356,7 +1368,7 @@ mod tests {
         assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
         assert_eq!(mvcc.appended_rows(person, mvcc.epoch()), 1);
         assert!(!wal.is_empty(), "the log still holds the txn");
-        let recovered = recover(&mut db, &wal).unwrap();
+        let recovered = recover(&mut db, &mut wal).unwrap();
         assert_eq!(recovered.appended_rows(person, recovered.epoch()), 1);
     }
 

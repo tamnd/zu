@@ -605,7 +605,7 @@ mod tests {
         drop(f.wal);
         let mut db = Zu1File::open(&dir.path().join("ingest.zu1")).unwrap();
         let mut wal = Wal::open(&dir.path().join("ingest.wal")).unwrap();
-        let mut mvcc = recover(&mut db, &wal).unwrap();
+        let mut mvcc = recover(&mut db, &mut wal).unwrap();
         assert_eq!(mvcc.epoch(), 2);
         assert_eq!(mvcc.appended_rows(person, 2), 1);
         assert_eq!(mvcc.cell(person, 4, 4, 0, 2), Some(Cell::Int(50)));

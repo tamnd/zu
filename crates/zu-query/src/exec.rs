@@ -2911,8 +2911,16 @@ fn key_nodes(ctx: &mut StageCtx, key: &BoundExpr, tables: &[u32]) -> Result<Vec<
 /// and the hop that reached it, plus the frontier the next round grows
 /// from. `step` is the rel walked and the node on the other side of it,
 /// which is the parent going forwards and the successor coming back.
+/// A node the search stands on: its table and its row in that table.
+type NodeAt = (u32, u64);
+
+/// How a node was reached: the rel value walked and the node on the
+/// other side of it. The source was reached by nothing, which is the
+/// `None` that ends a path when it is read back.
+type Step = Option<(Value, NodeAt)>;
+
 struct HalfSearch {
-    seen: BTreeMap<(u32, u64), (u64, Option<(Value, (u32, u64))>)>,
+    seen: BTreeMap<NodeAt, (u64, Step)>,
     frontier: Vec<(u32, u64)>,
     depth: u64,
 }
@@ -7104,7 +7112,9 @@ mod tests {
         assert_eq!(int_rows(&r), [[3]]);
         let names = op_names(&p);
         assert!(
-            names.iter().any(|n| n.contains("any shortest") && n.contains("[id = 5]")),
+            names
+                .iter()
+                .any(|n| n.contains("any shortest") && n.contains("[id = 5]")),
             "the endpoint filter was not absorbed: {names:?}"
         );
         assert!(
@@ -7129,8 +7139,10 @@ mod tests {
                     ),
                     &[],
                 );
-                let want: BTreeMap<i64, i64> =
-                    int_rows(&all).into_iter().map(|row| (row[0], row[1])).collect();
+                let want: BTreeMap<i64, i64> = int_rows(&all)
+                    .into_iter()
+                    .map(|row| (row[0], row[1]))
+                    .collect();
                 for dst in 0..6u64 {
                     let one = run(
                         &format!(

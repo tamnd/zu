@@ -17,6 +17,16 @@
 /// entirely one way.
 pub const LEVEL: i32 = 19;
 
+/// The level for an archive that is packed, unpacked once and thrown
+/// away, which is what the install check does with a release of one
+/// platform. Level 19 over a 28 MiB prefix is about two minutes of one
+/// core and buys nothing on a path where the reader is the next command
+/// in the same script; level 3 is about two seconds. Nothing published
+/// is packed at this, and the digest list of a release assembled with it
+/// is over what it actually holds, so it is a slower download rather
+/// than a wrong one.
+pub const FAST: i32 = 3;
+
 /// A tar of these files, in this order, terminated.
 pub fn tar(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -32,7 +42,12 @@ pub fn tar(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
 
 /// The zstd of it, which is what ships.
 pub fn compress(tar: &[u8]) -> Result<Vec<u8>, String> {
-    zstd::bulk::compress(tar, LEVEL).map_err(|e| format!("compressing the archive: {e}"))
+    compress_at(tar, LEVEL)
+}
+
+/// The same, at a level the caller chose.
+pub fn compress_at(tar: &[u8], level: i32) -> Result<Vec<u8>, String> {
+    zstd::bulk::compress(tar, level).map_err(|e| format!("compressing the archive: {e}"))
 }
 
 /// The permission bits an entry unpacks with.

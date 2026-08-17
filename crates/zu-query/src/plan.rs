@@ -183,6 +183,18 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         items: Vec<BoundSetItem>,
     },
+    /// Takes the elements a row holds out of the graph, one row at a
+    /// time, and hands the row on unchanged.
+    ///
+    /// The same shape as [`LogicalPlan::Set`], for the same reason: a
+    /// delete binds nothing, so a row out is the row in, and the slots
+    /// it names stay named. What the reader does with them afterwards
+    /// is the reader's business, and reading a deleted element is
+    /// 22G11.
+    Delete {
+        input: Box<LogicalPlan>,
+        slots: Vec<usize>,
+    },
     /// A table function source: the engine kernel runs once over `rel`
     /// and yields one row per node of its domain, node slot first.
     TableFunction {
@@ -296,6 +308,12 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                 plan = LogicalPlan::Set {
                     input: plan.boxed(),
                     items: items.clone(),
+                };
+            }
+            BoundClause::Delete { slots, .. } => {
+                plan = LogicalPlan::Delete {
+                    input: plan.boxed(),
+                    slots: slots.clone(),
                 };
             }
             BoundClause::Unwind { expr, slot } => {
@@ -659,6 +677,11 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 })
                 .collect();
             let _ = writeln!(out, "{pad}Set {}", written.join(", "));
+            render(input, query, schema, depth + 1, out);
+        }
+        LogicalPlan::Delete { input, slots } => {
+            let taken: Vec<&str> = slots.iter().map(|&s| slot_name(query, s)).collect();
+            let _ = writeln!(out, "{pad}Delete {}", taken.join(", "));
             render(input, query, schema, depth + 1, out);
         }
         LogicalPlan::TableFunction {

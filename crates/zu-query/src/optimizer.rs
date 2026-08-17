@@ -170,6 +170,10 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(lift_close_filters(*input)),
             items,
         },
+        LogicalPlan::Delete { input, slots } => LogicalPlan::Delete {
+            input: Box::new(lift_close_filters(*input)),
+            slots,
+        },
         LogicalPlan::TableFunction {
             input,
             func,
@@ -662,6 +666,17 @@ fn mark_asp_node(
                 est,
             )
         }
+        LogicalPlan::Delete { input, slots } => {
+            // A delete hands its row on too, for the same reason.
+            let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
+            (
+                LogicalPlan::Delete {
+                    input: Box::new(input),
+                    slots,
+                },
+                est,
+            )
+        }
         LogicalPlan::Unwind { input, expr, slot } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // Nothing bounds how wide a list is.
@@ -844,6 +859,10 @@ fn rewrite(
         LogicalPlan::Set { input, items } => Ok(LogicalPlan::Set {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             items,
+        }),
+        LogicalPlan::Delete { input, slots } => Ok(LogicalPlan::Delete {
+            input: Box::new(rewrite(*input, query, schema, notes)?),
+            slots,
         }),
         LogicalPlan::TableFunction {
             input,
@@ -1538,7 +1557,9 @@ fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
             out.extend(rels.iter().map(|rel| rel.slot));
             bound_slots(input, out);
         }
-        LogicalPlan::Set { input, .. } => bound_slots(input, out),
+        LogicalPlan::Set { input, .. } | LogicalPlan::Delete { input, .. } => {
+            bound_slots(input, out)
+        }
         LogicalPlan::TableFunction { input, slots, .. } => {
             out.extend(slots.iter().copied());
             bound_slots(input, out);
@@ -2377,6 +2398,7 @@ mod tests {
                 | LogicalPlan::Unwind { input, .. }
                 | LogicalPlan::Insert { input, .. }
                 | LogicalPlan::Set { input, .. }
+                | LogicalPlan::Delete { input, .. }
                 | LogicalPlan::TableFunction { input, .. }
                 | LogicalPlan::Project { input, .. }
                 | LogicalPlan::Aggregate { input, .. }

@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
-use zu_query::exec::{self, Graph};
+use zu_query::exec::{self, DeletedRows, Graph};
 use zu_query::{optimizer, parser, plan};
 
+use crate::deleted::Deleted;
 use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::{NULL_BLOCK, Zu1File};
@@ -186,6 +187,10 @@ pub struct Zu1Graph<'a> {
     catalog: Catalog,
     readers: HashMap<u32, GraphReader>,
     props: HashMap<u32, Option<PropsReader>>,
+    /// The rows a `DELETE` took away, read on the first query that
+    /// asks and kept for the epoch. `None` is "not read yet", so a
+    /// graph that is only ever written through never pays the read.
+    gone: Option<Deleted>,
 }
 
 impl<'a> Zu1Graph<'a> {
@@ -195,6 +200,7 @@ impl<'a> Zu1Graph<'a> {
             catalog,
             readers: HashMap::new(),
             props: HashMap::new(),
+            gone: None,
         }
     }
 
@@ -209,6 +215,7 @@ impl<'a> Zu1Graph<'a> {
             catalog,
             readers: HashMap::new(),
             props: HashMap::new(),
+            gone: None,
         }
     }
 
@@ -231,6 +238,10 @@ impl<'a> Zu1Graph<'a> {
         self.catalog = catalog;
         self.readers.clear();
         self.props.clear();
+        // A write is what moves the epoch and a delete is a write, so
+        // the deleted set belongs to the epoch as much as the
+        // directories do.
+        self.gone = None;
     }
 
     fn ensure_reader(&mut self, rel: u32) -> Result<()> {
@@ -487,6 +498,13 @@ impl Graph for Zu1Graph<'_> {
         reader.lookup_key(db, key)
     }
 
+    fn deleted(&mut self) -> Result<DeletedRows> {
+        if self.gone.is_none() {
+            self.gone = Some(Deleted::load(&mut self.db)?);
+        }
+        Ok(self.gone.as_ref().expect("just loaded").tables().clone())
+    }
+
     fn fork(&self) -> Option<Box<dyn Graph + Send>> {
         // Data blocks hit the file as they are staged and only the
         // header flip waits for the checkpoint, so a reopen carrying
@@ -500,6 +518,7 @@ impl Graph for Zu1Graph<'_> {
             catalog: self.catalog.clone(),
             readers: HashMap::new(),
             props: HashMap::new(),
+            gone: self.gone.clone(),
         }))
     }
 
@@ -772,11 +791,14 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
     // entry point has neither: it was given a file handle and it hands
     // it back. Saying so here is better than compiling a plan whose
     // written elements nobody made.
-    if query
-        .clauses
-        .iter()
-        .any(|c| matches!(c, zu_query::binder::BoundClause::Insert { .. }))
-    {
+    if query.clauses.iter().any(|c| {
+        matches!(
+            c,
+            zu_query::binder::BoundClause::Insert { .. }
+                | zu_query::binder::BoundClause::Set { .. }
+                | zu_query::binder::BoundClause::Delete { .. }
+        )
+    }) {
         return Err(ZuError::InvalidArgument(
             "a statement that writes needs a session, which owns the log a write goes through: open one with zu::db::Database or zu::session::Session".into(),
         ));

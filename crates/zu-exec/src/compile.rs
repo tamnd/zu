@@ -853,7 +853,10 @@ impl Compiler<'_> {
                 // unwind of a single value, which is exactly the kind
                 // of source the pipeline does not have, so the whole
                 // statement goes back to the old engine.
-                LogicalPlan::Insert { .. } | LogicalPlan::Set { .. } | LogicalPlan::Rows { .. } => {
+                LogicalPlan::Insert { .. }
+                | LogicalPlan::Set { .. }
+                | LogicalPlan::Delete { .. }
+                | LogicalPlan::Rows { .. } => {
                     return Ok(None);
                 }
                 LogicalPlan::ScanNodes { input, .. }
@@ -2762,12 +2765,19 @@ impl Compiler<'_> {
         while let Some(sc) = self.snap.scan(table, chunk, &[col], None, &mut arena)? {
             let vec = &sc.columns[0];
             let vals = vec.values::<i64>();
-            for (i, &v) in vals.iter().enumerate().take(sc.rows as usize) {
-                if !vec.is_valid(i) {
-                    continue;
+            // Through the selection when the scan built one: a chunk a
+            // delete took rows out of hands them back like any other
+            // row, and a build side that read them would answer a probe
+            // with a row the rest of the query cannot see.
+            let mut take = |i: usize| {
+                if vec.is_valid(i) {
+                    keys.push(vals[i] as u64);
+                    payload.push(sc.row_base + i as u64);
                 }
-                keys.push(v as u64);
-                payload.push(sc.row_base + i as u64);
+            };
+            match &sc.sel {
+                Some(sel) => sel.as_slice().iter().for_each(|&i| take(usize::from(i))),
+                None => (0..sc.rows as usize).for_each(take),
             }
             chunk += 1;
             arena.reset();

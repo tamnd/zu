@@ -206,6 +206,19 @@ pub enum Clause {
     Remove {
         items: Vec<RemoveItem>,
     },
+    /// `DELETE n`, the statement that takes an element out of the graph
+    /// (ISO 13.5). The elements are named by variables an earlier clause
+    /// bound, one variable each, because what a delete takes away is an
+    /// element and not a value computed from one.
+    ///
+    /// There is no `detach` flag because `DETACH DELETE` is turned away
+    /// by name: it says the edges on the element go with it, and edges
+    /// are not deletable yet. Without `DETACH`, an element that still
+    /// has edges is an error rather than a way to leave one hanging, so
+    /// what this clause deletes never leaves an edge behind.
+    Delete {
+        targets: Vec<String>,
+    },
     Unwind {
         expr: Expr,
         alias: String,

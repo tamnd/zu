@@ -208,7 +208,7 @@ fn measure(path: &std::path::Path, shape: &str) -> (Vec<f64>, Vec<String>) {
                 if op.bound_violation() {
                     violations.push(format!(
                         "{shape} {name}: {} produced {} rows past a ceiling of {:.0}",
-                        op.name,
+                        op.name(),
                         op.flat,
                         op.bnd.unwrap_or_default()
                     ));
@@ -218,7 +218,7 @@ fn measure(path: &std::path::Path, shape: &str) -> (Vec<f64>, Vec<String>) {
                 };
                 qerrors.push(q);
                 if worst.as_ref().is_none_or(|(w, ..)| q > *w) {
-                    worst = Some((q, op.name.clone(), est, op.flat));
+                    worst = Some((q, op.name(), est, op.flat));
                 }
             }
         }

@@ -830,7 +830,7 @@ fn run_cardinality(
                     violations += 1;
                     println!(
                         "sf1 cardinality {name}: BOUND VIOLATION at {}, ceiling {:.0} vs {} actual",
-                        op.name,
+                        op.name(),
                         op.bnd.unwrap_or_default(),
                         op.flat
                     );
@@ -840,7 +840,7 @@ fn run_cardinality(
                 };
                 all.push(q);
                 if worst.as_ref().is_none_or(|(w, ..)| q > *w) {
-                    worst = Some((q, op.name.clone(), est, op.flat));
+                    worst = Some((q, op.name(), est, op.flat));
                 }
             }
         }

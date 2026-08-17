@@ -192,6 +192,17 @@ const NOTES: &[&str] = &[
      graph type describes is refused with the code the standard gives that, naming the row \
      and the set it would have carried, and a label that names no node table makes no table \
      in such a graph because the type already says what the graph holds",
+    "the limits a write can reach are declared and finite rather than absent, so a statement \
+     that asks for more than one of them is told the standard's answer for hitting that limit \
+     rather than a general failure: a node carries between one label and 64 of them, an edge \
+     carries the one label its rel table is named by, and an element or an edge carries up to \
+     4096 properties",
+    "assigning to the same property of one element twice in one SET is refused, because an \
+     element holds one value per property and the clause has not said which of the two it \
+     wants, while two SET clauses in a row stay last wins",
+    "an element an earlier clause found and a DELETE in the same statement took away is gone \
+     for the clauses after it, so reading a property off it and writing an edge onto it are \
+     both refused by name rather than reading what the row used to hold",
     "a protocol fault, a malformed frame or an unknown op, reports no GQLSTATUS on purpose \
      and is scored on its message",
 ];

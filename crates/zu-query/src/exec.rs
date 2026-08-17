@@ -5191,6 +5191,18 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             other => Err(invalid(format!("label test on {other:?}, expected a node"))),
         },
         BoundExpr::Property { base, key } => match eval(ctx, base)? {
+            // A delete leaves the element bound, so a clause after one
+            // can hold a reference to a row that is no longer there.
+            // Reading it is 22G11 rather than the value the row used to
+            // hold: a scan never hands one out, so a node that is in
+            // the deleted set here arrived across a write of this
+            // statement and nothing else.
+            Value::Node { table, offset } if deleted(ctx.gone, table, offset) => Err(gql(
+                codes::C22G11,
+                format!(
+                    "'{key}' is being read off an element that a DELETE in this statement took away, row {offset} of table {table}"
+                ),
+            )),
             Value::Node { table, offset } => ctx.graph.property(table, offset, key),
             // A field the record does not have is null rather than an
             // error, which is what a property a node does not have

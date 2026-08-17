@@ -66,6 +66,15 @@ pub const MAX_LABELS: usize = 64;
 /// Table ids live in the 14-bit field of `NodeId`.
 pub const MAX_TABLE_ID: u32 = (1 << 14) - 1;
 
+/// The most properties one element holds. Generous and finite rather
+/// than unlimited, for the reason the label dictionary is bounded: a
+/// declared limit is one the encoding can be built on, and an engine
+/// that declares none pays for the possibility on every element of
+/// every graph. The standard has a condition for hitting a declared
+/// limit, and an engine with no limit can never raise it, so declaring
+/// one is also the honest answer to the question the code asks.
+pub const MAX_PROPERTIES: usize = 4096;
+
 const MAX_NAME_LEN: usize = 256;
 
 /// The schema every zu1 file has, and the parent of a graph nobody

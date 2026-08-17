@@ -572,7 +572,9 @@ impl Session {
             let carry = write.carry().len();
             let next = match write {
                 crate::split::Write::Insert(insert) => {
-                    let mut batch = crate::insert::Batch::open(self.graph.file_mut(), insert)?;
+                    let catalog = self.graph.catalog().clone();
+                    let mut batch =
+                        crate::insert::Batch::open(self.graph.file_mut(), insert, catalog)?;
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
                         let (carried, props) = row.split_at(carry);

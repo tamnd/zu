@@ -772,7 +772,12 @@ static void one(run *r, const char *suite, const zy_node *load, const zy_node *n
 
     if (load != NULL) {
         if (apply_load(r, path, load, detail, sizeof detail) != 0) {
-            char whole[1024];
+            /* The prefix is eighteen bytes ahead of a detail that can
+             * fill its own buffer, and gcc sizes the destination
+             * against what the format could write rather than against
+             * what it usually does, so a matching 1024 is a
+             * format-truncation error where warnings are errors. */
+            char whole[sizeof detail + 32];
             snprintf(whole, sizeof whole, "the suite's load: %s", detail);
             report(r, suite, name->text.ptr, node->line, OUT_FAILED, whole);
             cv_arena_reset(r->arena);

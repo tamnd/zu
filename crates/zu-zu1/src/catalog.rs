@@ -339,6 +339,26 @@ impl GraphType {
             .collect()
     }
 
+    /// The element type an element carrying `labels` belongs to, if one
+    /// of them describes it. This is what a closed graph type promises
+    /// of every element it holds (GG02).
+    ///
+    /// Belonging is two things at once: the type's key label set picks
+    /// the element out, and every label the element carries is one the
+    /// type declares. Selection alone would let an element grow a label
+    /// no type mentions and still count as described, which is the
+    /// promise a closed type is there to make.
+    ///
+    /// More than one type may describe it, and the first is answered,
+    /// because what the caller asks is whether any does.
+    pub fn holder(&self, kind: ElementKind, labels: u64) -> Option<&ElementType> {
+        self.elements
+            .iter()
+            .filter(|e| e.kind == kind)
+            .filter(|e| labels & e.selection_mask() == e.selection_mask())
+            .find(|e| labels & !e.label_mask() == 0)
+    }
+
     /// Checks the type against the graph's label dictionary and its own
     /// rules. A closed type has to be self-contained, which is what
     /// makes it worth anything to the optimizer.
@@ -859,6 +879,26 @@ impl Catalog {
 
     pub fn graph_type(&self, name: &str) -> Option<&GraphType> {
         self.graph_types.iter().find(|t| t.name == name)
+    }
+
+    /// The closed graph type one graph is of, which is what a write has
+    /// to keep (GG02).
+    ///
+    /// `None` for a graph created with no type and for one whose type
+    /// is open, because both of those describe rather than promise: an
+    /// open type admits elements it says nothing about, so there is
+    /// nothing a write can break. A named type the file no longer holds
+    /// is `None` too, since a promise nothing states is not one a write
+    /// can be measured against, and the statement that dropped it is
+    /// where that would be caught.
+    pub fn closed_type_of(&self, graph: u32) -> Option<&GraphType> {
+        let of = &self.graph_by_id(graph)?.graph_type;
+        let ty = match of {
+            GraphTypeOf::Open => return None,
+            GraphTypeOf::Named(name) => self.graph_type(name)?,
+            GraphTypeOf::Inline(ty) => ty,
+        };
+        ty.closed.then_some(ty)
     }
 
     /// Adds a graph type, refusing a name the file already holds and a

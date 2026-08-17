@@ -187,6 +187,11 @@ const NOTES: &[&str] = &[
      and a label no node table is named by makes one, out of the properties the pattern \
      writes and under the savepoint the statement holds, so a property written as a value \
      that has to be worked out first is refused rather than guessed at",
+    "a graph with a closed graph type is checked at the write rather than at the read, so a \
+     label change that would leave an element carrying a label set no element type of that \
+     graph type describes is refused with the code the standard gives that, naming the row \
+     and the set it would have carried, and a label that names no node table makes no table \
+     in such a graph because the type already says what the graph holds",
     "a protocol fault, a malformed frame or an unknown op, reports no GQLSTATUS on purpose \
      and is scored on its message",
 ];

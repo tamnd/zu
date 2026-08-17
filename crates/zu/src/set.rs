@@ -1402,6 +1402,92 @@ mod tests {
         }
     }
 
+    /// A graph with a closed type over the same two people, with two
+    /// node types: one for a person and one for a person who is also a
+    /// Manager. Two types keyed differently over one table is what a
+    /// label change moves an element between.
+    fn open_typed(dir: &tempfile::TempDir, name: &str) -> Session {
+        let path = dir.path().join(name);
+        // The fixture with no labels on it, because the graph type
+        // below describes what a row of the copy may carry and a row
+        // that arrives carrying something else is a graph that was
+        // already outside its type before the statement under test.
+        seeded(&path);
+        let mut session = Session::open(&path).expect("open");
+        for source in [
+            "CREATE PROPERTY GRAPH TYPE t {
+               (:person {name :: STRING, age :: INT}),
+               (:person&Manager {name :: STRING, age :: INT})
+             }",
+            "CREATE GRAPH g TYPED t AS COPY OF home",
+        ] {
+            session.run(source, &[]).expect("the graph and its type");
+        }
+        session
+    }
+
+    /// The box this pair is about: a label change moves an element from
+    /// the element type it belonged to into another one, and a closed
+    /// graph type is what says which moves there are. This one lands,
+    /// because the type describes a person who is a Manager.
+    #[test]
+    fn a_label_change_moves_an_element_between_element_types() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_typed(&dir, "moved.zu1");
+
+        session
+            .run("USE g MATCH (p:person {name: 'ada'}) SET p:Manager", &[])
+            .expect("the type describes a person who is a Manager");
+
+        let after = session
+            .run(
+                "USE g MATCH (p:Manager) RETURN p.name AS name ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(strings(&after, 0), ["ada"]);
+    }
+
+    /// The same change with a label the type says nothing about takes
+    /// the element out of every element type the graph has, which is
+    /// the promise a closed type makes, so it is refused with G2000 and
+    /// the message names the element and what it would have carried.
+    #[test]
+    fn a_label_change_that_belongs_to_no_element_type_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_typed(&dir, "unheld.zu1");
+
+        let err = session
+            .run("USE g MATCH (p:person {name: 'ada'}) SET p:Owner", &[])
+            .expect_err("no element type describes a person who is an Owner");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("G2000"));
+        let text = err.to_string();
+        assert!(text.contains("row 0 of 'person'"), "got: {text}");
+        assert!(text.contains("person, Owner"), "got: {text}");
+
+        // The refusal is the statement's, so nothing it did survives:
+        // the declaration the SET would have made is gone with it.
+        let after = session
+            .run(
+                "USE g MATCH (p:person) RETURN p.name AS name ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(strings(&after, 0), ["ada", "kay"]);
+    }
+
+    /// The graph the same file's home is stays open, so the change the
+    /// typed graph refuses is one the untyped graph beside it takes.
+    #[test]
+    fn a_graph_with_no_type_takes_the_change_the_typed_one_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_typed(&dir, "beside.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'ada'}) SET p:Owner", &[])
+            .expect("the home graph promises nothing");
+    }
+
     /// An edge carries the one name its rel table is, and there is no
     /// word beside it to hold another, so a label change on one is
     /// turned away by name.

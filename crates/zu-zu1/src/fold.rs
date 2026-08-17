@@ -26,9 +26,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Epoch, Result, ZuError};
 
-use crate::catalog::{Catalog, RelTable, TableIndex};
+use crate::catalog::{Catalog, ElementKind, GraphType, RelTable, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::fullzip::{read_blob_segment, write_blob_segment};
 use crate::graph::{
@@ -148,17 +149,17 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
         // a label change: a bit outside it would leave a file that says
         // a row carries a label its table never declared.
         let declared = node.label_mask();
+        let (name, graph) = (node.name.clone(), node.graph);
         let appended = mvcc.appended_rows(table, epoch);
         if appended > 0 || mvcc.has_updates(table, epoch) || mvcc.has_label_changes(table, epoch) {
-            changed |= fold_props(
-                db,
-                mvcc,
-                &mut index,
-                table,
-                Labels { primary, declared },
-                base,
-                epoch,
-            )?;
+            let labels_of = Labels {
+                primary,
+                declared,
+                name: &name,
+                graph_type: catalog.closed_type_of(graph),
+                names: catalog.labels(),
+            };
+            changed |= fold_props(db, mvcc, &mut index, table, &labels_of, base, epoch)?;
         }
         if appended > 0 {
             catalog.grow_node(table, base + appended)?;
@@ -303,12 +304,44 @@ impl Validity {
 /// props directory. A table without stored props cannot absorb column
 /// data, and its row count still grows through the catalog alone.
 /// What one table's rows may be called: the label its own name is,
-/// which every row carries, and the mask of every label the table has
-/// declared, which bounds what a change may put on a row.
-#[derive(Debug, Clone, Copy)]
-struct Labels {
+/// which every row carries, the mask of every label the table has
+/// declared, which bounds what a change may put on a row, and what the
+/// graph's type says a row of it may look like.
+#[derive(Debug, Clone)]
+struct Labels<'a> {
     primary: u16,
     declared: u64,
+    /// The table's own name, which is what a refusal calls it: an id
+    /// is what the file addresses a table by and not what anybody
+    /// wrote.
+    name: &'a str,
+    /// The closed graph type the table's graph is of, `None` when the
+    /// graph has none or has an open one. A closed type is a promise
+    /// about every element, so a row that a change would take out of
+    /// every element type is a change that cannot land.
+    graph_type: Option<&'a GraphType>,
+    /// The graph's label dictionary, which is how a refusal says which
+    /// labels a row would have carried rather than printing the word.
+    names: &'a [String],
+}
+
+/// The labels a word holds, written out, which is what a message about
+/// one says: a bitmask names nothing to the person reading it.
+fn spell(word: u64, names: &[String]) -> String {
+    let mut out = String::new();
+    for id in 0..64u16 {
+        if word & 1 << id == 0 {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        match names.get(usize::from(id)) {
+            Some(name) => out.push_str(name),
+            None => out.push_str(&format!("label {id}")),
+        }
+    }
+    out
 }
 
 fn fold_props(
@@ -316,7 +349,7 @@ fn fold_props(
     mvcc: &Mvcc,
     index: &mut TableIndex,
     table: u32,
-    labels_of: Labels,
+    labels_of: &Labels,
     base: u64,
     epoch: Epoch,
 ) -> Result<bool> {
@@ -498,7 +531,7 @@ fn apply_label_changes(
     changes: &BTreeMap<u64, (u64, u64)>,
     words: &mut [u64],
     table: u32,
-    labels_of: Labels,
+    labels_of: &Labels,
 ) -> Result<()> {
     let rows = words.len();
     let primary = 1u64 << labels_of.primary;
@@ -520,7 +553,26 @@ fn apply_label_changes(
                 "a label change names row {offset} of table {table}, which holds {rows} rows"
             ))
         })?;
-        *word = (*word | add) & !remove;
+        let after = (*word | add) & !remove;
+        // A closed graph type is a promise about every element the
+        // graph holds, so it is checked here, where the label set the
+        // row ends with is known. The type an element belongs to is
+        // allowed to change, which is what a key label set change is;
+        // what is not allowed is ending up in none of them.
+        if let Some(ty) = labels_of.graph_type
+            && ty.holder(ElementKind::Node, after).is_none()
+        {
+            return Err(ZuError::gql(
+                codes::CG2000,
+                format!(
+                    "the element at row {offset} of '{}' would carry {} after this change, and no element type of graph type '{}' describes a node carrying that",
+                    labels_of.name,
+                    spell(after, labels_of.names),
+                    ty.name
+                ),
+            ));
+        }
+        *word = after;
     }
     Ok(())
 }

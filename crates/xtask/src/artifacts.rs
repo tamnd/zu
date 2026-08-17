@@ -405,13 +405,19 @@ impl Table {
     }
 
     /// Gathers a release of `version` into `out`, from the tree at
-    /// `root` and the platform builds under `built`.
+    /// `root` and the platform builds under `built`, packing the
+    /// platform archives at `level`.
     ///
     /// What is assembled is the table and nothing else, which is what
     /// makes the table the list. A row nothing makes yet is skipped and
     /// reported rather than silently absent, since "the release has six
     /// files" should be a sentence somebody can check against seven
     /// rows.
+    ///
+    /// The level is the caller's because one caller is not publishing:
+    /// the install check assembles a release of one platform, installs
+    /// from it and deletes it, and [`tarball::LEVEL`] over an install
+    /// prefix costs two minutes for a download that never happens.
     pub fn assemble(
         &self,
         root: &Path,
@@ -419,6 +425,7 @@ impl Table {
         out: &Path,
         version: &str,
         targets: &[String],
+        level: i32,
     ) -> Result<Vec<Shipped>, String> {
         if version.is_empty() || version.contains(['/', '\\', ' ']) {
             return Err(format!("{version:?} is not a version"));
@@ -452,7 +459,7 @@ impl Table {
                         // so the two agree by construction rather than
                         // by a second convention written down here.
                         let prefix = format!("libzu-{target}");
-                        let archive = pack(&built.join(&prefix), &prefix)?;
+                        let archive = pack(&built.join(&prefix), &prefix, level)?;
                         made.push(write(out, &name, &archive, "platform")?);
                     }
                 }
@@ -573,6 +580,37 @@ pub fn tier1(root: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Narrows the tier 1 targets to the ones asked for by name.
+///
+/// A release is every platform, and the only other thing anybody wants
+/// here is one of them: the job that built a platform can assemble that
+/// platform's release out of what it has in hand, which is what the
+/// install check installs from. An empty ask is the whole list rather
+/// than none of it, since that is the release.
+///
+/// A name that is not a tier 1 target is refused rather than dropped,
+/// because a triple with a typo in it would otherwise assemble a release
+/// of no platforms and say nothing about why.
+pub fn only(tier1: &[String], wanted: &[String]) -> Result<Vec<String>, String> {
+    if wanted.is_empty() {
+        return Ok(tier1.to_vec());
+    }
+    for target in wanted {
+        if !tier1.contains(target) {
+            return Err(format!(
+                "{target} is not a tier 1 platform of {}, which has {}",
+                platforms::PATH,
+                tier1.join(", ")
+            ));
+        }
+    }
+    Ok(tier1
+        .iter()
+        .filter(|target| wanted.contains(target))
+        .cloned()
+        .collect())
+}
+
 /// Whether this is a milestone of the two programs, which is what a row
 /// nothing makes yet has to wait for, and what a repository that does
 /// not exist yet is created at.
@@ -603,7 +641,7 @@ fn write(out: &Path, name: &str, bytes: &[u8], kind: &'static str) -> Result<Shi
 /// An empty directory is an error, because a platform that built
 /// nothing is otherwise the cheapest way to publish a release without
 /// it.
-fn pack(dir: &Path, prefix: &str) -> Result<Vec<u8>, String> {
+fn pack(dir: &Path, prefix: &str, level: i32) -> Result<Vec<u8>, String> {
     let mut files = Vec::new();
     walk(dir, dir, &mut files)?;
     if files.is_empty() {
@@ -616,7 +654,7 @@ fn pack(dir: &Path, prefix: &str) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("reading {}: {e}", dir.join(&name).display()))?;
         under.push((format!("{prefix}/{name}"), bytes));
     }
-    tarball::compress(&tarball::tar(&under)?)
+    tarball::compress_at(&tarball::tar(&under)?, level)
 }
 
 /// Every file under `dir`, named relative to `root`, with `/` on every
@@ -711,7 +749,7 @@ mod tests {
         .expect("writes");
         let targets = vec!["x86_64-apple-darwin".to_string()];
         summed()
-            .assemble(&root, &built, &out, "0.5.0", &targets)
+            .assemble(&root, &built, &out, "0.5.0", &targets, tarball::LEVEL)
             .expect("assembles");
         (dir, out, targets)
     }
@@ -844,7 +882,7 @@ mod tests {
 
         let targets = ["x86_64-apple-darwin".to_string()];
         let made = table()
-            .assemble(&root, &built, &out, "0.5.0", &targets)
+            .assemble(&root, &built, &out, "0.5.0", &targets, tarball::LEVEL)
             .expect("assembles");
         assert_eq!(made.len(), 2, "{made:?}");
         assert_eq!(made[0].name, "libzu-x86_64-apple-darwin.tar.zst");
@@ -862,6 +900,29 @@ mod tests {
         let names: Vec<String> = tarball::entries(&tar).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["libzu-x86_64-apple-darwin/libzu.dylib"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The install check assembles the release of the one platform its
+    /// job built, since that is the only platform whose package is on
+    /// that machine. Nothing else about the release changes: the same
+    /// rows, the same packer, and a digest list over what came out.
+    #[test]
+    fn one_platform_is_a_release_of_that_platform_and_the_rest_of_the_rows() {
+        let tier1: Vec<String> = ["x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(only(&tier1, &[]).expect("all of them"), tier1);
+        assert_eq!(
+            only(&tier1, &["x86_64-apple-darwin".to_string()]).expect("one of them"),
+            ["x86_64-apple-darwin"]
+        );
+
+        // A triple with a typo in it would otherwise be a release of
+        // everything but the platform somebody asked for.
+        let err = only(&tier1, &["x86_64-apple-darwn".to_string()]).expect_err("refused");
+        assert!(err.contains("x86_64-apple-darwn"), "{err}");
+        assert!(err.contains("x86_64-apple-darwin"), "it says which: {err}");
     }
 
     #[test]
@@ -914,6 +975,7 @@ mod tests {
                 &dir.join("dist"),
                 "0.5.0",
                 &["x86_64-apple-darwin".to_string()],
+                tarball::LEVEL,
             )
             .expect_err("an empty build directory");
         assert!(error.contains("built nothing"), "{error}");
@@ -926,7 +988,7 @@ mod tests {
         for version in ["", "../etc", "1.0 rc1"] {
             assert!(
                 table()
-                    .assemble(&dir, &dir, &dir.join("dist"), version, &[])
+                    .assemble(&dir, &dir, &dir.join("dist"), version, &[], tarball::LEVEL)
                     .is_err(),
                 "{version:?}"
             );

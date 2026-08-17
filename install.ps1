@@ -59,6 +59,23 @@ function Die($message) {
     exit 1
 }
 
+# One download. The file scheme is here because curl reads it and
+# Invoke-WebRequest does not on every shell this runs in: Windows
+# PowerShell hands it to a FileWebRequest and PowerShell 7 is built on
+# HttpClient, which has no such scheme. ZU_BASE pointing at a directory
+# is how the install check drives this script and how anybody mirroring
+# a release onto a share would, and an installer that works on one of the
+# two shells is the bug this is here to not have.
+function Fetch($uri, $path) {
+    if ($uri.StartsWith('file:')) {
+        $from = ([Uri]$uri).LocalPath
+        if (-not (Test-Path -LiteralPath $from)) { throw "no such file: $from" }
+        Copy-Item -LiteralPath $from -Destination $path -Force
+    } else {
+        Invoke-WebRequest -Uri $uri -OutFile $path -UseBasicParsing
+    }
+}
+
 # The target triple. Windows on Arm reports itself in PROCESSOR_ARCHITECTURE
 # as ARM64 and, when a 32-bit PowerShell is emulating, in the WOW6432
 # variable beside it, so both are read: the machine is what it is even
@@ -95,12 +112,12 @@ try {
     $progress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
-        Invoke-WebRequest -Uri "$Base/SHA256SUMS" -OutFile "$tmp\SHA256SUMS" -UseBasicParsing
+        Fetch "$Base/SHA256SUMS" "$tmp\SHA256SUMS"
     } catch {
         Die "no release at $Base, check the version"
     }
     try {
-        Invoke-WebRequest -Uri "$Base/$archive" -OutFile "$tmp\$archive" -UseBasicParsing
+        Fetch "$Base/$archive" "$tmp\$archive"
     } catch {
         Die "$Target is not a platform this release publishes"
     }

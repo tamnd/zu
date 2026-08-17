@@ -105,10 +105,29 @@ jobs:
         if: "!contains(matrix.container, 'alpine')"
         with:
           key: ${{ matrix.target }}
+      # What install.sh unpacks the archive with where tar cannot. The
+      # manylinux image is RHEL 8, whose tar is 1.30, and `tar --zstd`
+      # arrived in 1.31, so these two rows take the installer's
+      # documented fallback rather than its first choice. That is not a
+      # workaround for CI: it is exactly what a user on RHEL 8 does, and
+      # it is the reason the fallback is in the script at all.
+      - name: zstd, for an unpack on a tar that predates the format
+        if: contains(matrix.container, 'manylinux')
+        run: command -v zstd || dnf install -y zstd
       - name: Build, measure and smoke
         if: "!contains(matrix.container, 'alpine')"
         shell: bash
         run: scripts/libzu-build.sh ${{ matrix.target }} ${{ matrix.smoke }}
+      # The one-liner of dx/12 section 6, on the platform it installs
+      # for. Every other row runs this from inside the build script,
+      # where the two musl rows can reach it in the container their
+      # binaries need; this one is a step because its installer is
+      # PowerShell and Windows PowerShell 5.1 is the floor the script
+      # claims, which is a claim only the shell in the box can settle.
+      - name: Install from a release, the way the README says
+        if: contains(matrix.target, 'windows')
+        shell: powershell
+        run: ./scripts/install-check.ps1 -Target ${{ matrix.target }}
       # The same script, on the system the artifact ships to. A musl
       # shared library links musl's libc and the unwinder beside it,
       # which the runner does not have, so the row would fail to link
@@ -119,7 +138,11 @@ jobs:
       # `cargo xtask pins` reads, and it reads both. cmake and pkgconf
       # go in because the script skips the build system checks on a
       # machine without them, and a row that quietly skipped half of
-      # what it reports is worth less than two packages cost.
+      # what it reports is worth less than two packages cost. zstd goes
+      # in for the install check at the end of it: busybox tar reads no
+      # compression it was not built with, so an Alpine install is the
+      # fallback path of install.sh rather than its first choice, which
+      # is again what a user in this image does.
       - name: Build, measure and smoke inside Alpine
         if: contains(matrix.container, 'alpine')
         shell: bash
@@ -131,7 +154,7 @@ jobs:
             -e CARGO_HOME=/w/.cargo -e RUSTUP_HOME=/w/.rustup \
             -e RUSTFLAGS='-C target-feature=-crt-static' \
             "${{ matrix.container }}" sh -eux -c "
-              apk add --no-cache build-base curl cmake pkgconf
+              apk add --no-cache build-base curl cmake pkgconf zstd
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
                 sh -s -- -y --no-modify-path --profile minimal \
                   --default-toolchain $toolchain

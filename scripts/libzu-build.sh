@@ -21,7 +21,13 @@ smoke="${2:?usage: libzu-build.sh <target> <smoke>}"
 out="target/$target/release"
 stage="dist/libzu-$target"
 
-cargo build --release --target "$target" -p zu-capi -p zu-cli
+# The CLI with parquet in it, because dx/12 section 6 promises that what
+# the one-liner installs reads a Parquet file, and a binary built without
+# the feature answers that with `rebuild with --features arrow`. It is
+# the CLI's feature and not the library's: the C ABI loads columns a
+# caller already has in memory, so an Arrow reader behind it would be
+# weight every embedder pays and nobody calls.
+cargo build --release --target "$target" -p zu-capi -p zu-cli --features zu-cli/arrow
 
 # The dx/14 section 4 ceilings, from the same table as the matrix. Size
 # is a real adoption factor for serverless and mobile targets and it
@@ -283,3 +289,14 @@ EOF
 else
     echo "cmake: not on this machine, so the package config is staged and not exercised"
 fi
+
+# The one-liner, over a release of this platform assembled from the
+# package staged above. It runs here rather than in a job of its own
+# because the two musl rows install what only Alpine can run, and a
+# second container started to hold that would be this row again with a
+# different name. Windows installs from a step of its own, since its
+# installer is PowerShell.
+case "$target" in
+*windows*) echo "install: install.ps1 runs in a step of its own, in the shell it is written for" ;;
+*) scripts/install-check.sh "$target" ;;
+esac

@@ -3152,7 +3152,7 @@
       "kind": "function",
       "name": "wcc",
       "signature": "fn wcc(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader) -> zu_common::Result<Vec<u64>>",
-      "doc": "Weakly connected components over the undirected view of the rel\ntable: union-find over the forward lists, which name every edge\nonce. Each node's component id is the smallest row in it, the\nGraphalytics convention."
+      "doc": "Weakly connected components over the undirected view of the rel\ntable: union-find over the forward lists, which name every edge\nonce. Each node's component id is the smallest id in the component,\nthe Graphalytics convention.\n\nThe smallest id, not the smallest row. A load that reorders rows,\nwhich every load of a real graph does because degree order is what\nmakes the CSR read well, leaves the two unrelated, and the caller\nthat wanted a component id then has to join the answer back to the\nkeys and take a minimum per group. That is a group-by and an unwind\nover the whole node table to repair an answer the kernel already\nhad the parts of."
     },
     {
       "id": "zu::zu1::cache",

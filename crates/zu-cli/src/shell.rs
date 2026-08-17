@@ -23,6 +23,16 @@
 //! `{"error":"..."}` for failures, and an error never kills the loop:
 //! the session and its caches survive a bad statement.
 //!
+//! The first line out is the greeting, before any line has come in:
+//! `{"protocol":1,...}` with the build's versions and the file that was
+//! opened. It is what makes this a protocol rather than an output
+//! format, because a client reads one line and knows whether it is
+//! talking to something it understands; `{"op":"hello"}` asks for the
+//! same object again, for the client that attached to a session already
+//! running. The number moves when a frame or a reply changes meaning,
+//! never when one is added, so a reader that ignores fields it does not
+//! know keeps working across a release.
+//!
 //! Both response shapes carry GQLSTATUS when there is one
 //! (Spec/2064g/gql/plan/07). A successful result leads with the
 //! completion condition, `00000` or `00001` when the statement had no
@@ -40,6 +50,40 @@ use zu::query::Value;
 use zu::session::Session;
 
 use zu_json::{self as json, Json};
+
+/// The version of the wire this file speaks, `dx/12` §5.
+///
+/// It moves when a frame or a reply changes meaning and not when one is
+/// added, because a client that reads the fields it knows and ignores
+/// the rest is a client a release cannot break, and a number that moved
+/// for every addition would make every client demand an exact match.
+const PROTOCOL: u32 = 1;
+
+/// The first line of a session, and the answer to `{"op":"hello"}`.
+///
+/// The build facts are spelled the way `zu version --format json`
+/// spells them, so a caller reading both learns one vocabulary rather
+/// than two, and the file is here because a client that opened a
+/// session through a wrapper script may not know which one it got.
+fn greeting(path: &str) -> String {
+    let strings =
+        |items: &[&str]| Json::Arr(items.iter().map(|s| Json::Str((*s).into())).collect());
+    let features = crate::features();
+    let mut line = Json::Obj(vec![
+        ("protocol".into(), Json::Int(i64::from(PROTOCOL))),
+        ("zu".into(), Json::Str(crate::VERSION.into())),
+        ("c_abi".into(), Json::Str(zu::C_ABI_VERSION.into())),
+        (
+            "format_version".into(),
+            Json::Int(i64::from(zu::zu1::FORMAT_VERSION)),
+        ),
+        ("features".into(), strings(&features)),
+        ("file".into(), Json::Str(path.into())),
+    ])
+    .to_compact();
+    line.push('\n');
+    line
+}
 
 pub(crate) fn shell_command(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
@@ -79,6 +123,11 @@ pub(crate) fn shell_command(args: &[String]) -> ExitCode {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    // Said before anything is asked, so a client that will not speak
+    // this version finds out without having run a statement.
+    if out.write_all(greeting(path).as_bytes()).is_err() || out.flush().is_err() {
+        return ExitCode::SUCCESS;
+    }
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
@@ -88,7 +137,7 @@ pub(crate) fn shell_command(args: &[String]) -> ExitCode {
         if line.is_empty() {
             continue;
         }
-        let (response, quit) = respond(&mut session, line);
+        let (response, quit) = respond(&mut session, path, line);
         if out.write_all(response.as_bytes()).is_err() || out.flush().is_err() {
             // The reader hung up; nothing left to serve.
             break;
@@ -104,7 +153,7 @@ pub(crate) fn shell_command(args: &[String]) -> ExitCode {
 /// whether the loop should end. Every path returns a string ending in
 /// exactly one newline, because the reader on the other side counts
 /// lines, not braces.
-fn respond(session: &mut Session, line: &str) -> (String, bool) {
+fn respond(session: &mut Session, path: &str, line: &str) -> (String, bool) {
     if !line.starts_with('{') {
         let reply = match session.run(&unfold(line), &[]) {
             Ok(r) => crate::render_json(&r),
@@ -165,6 +214,7 @@ fn respond(session: &mut Session, line: &str) -> (String, bool) {
             }
             None => (error_line("close_stmt needs an integer stmt"), false),
         },
+        Some("hello") => (greeting(path), false),
         Some("quit") => ("{\"bye\":true}\n".to_string(), true),
         Some(op) => (error_line(&format!("unknown op {op:?}")), false),
         None => (error_line("frame needs a string op"), false),
@@ -237,26 +287,42 @@ fn frame_params(frame: &Json) -> Result<Vec<(String, Value)>, String> {
     let Json::Obj(fields) = params else {
         return Err("params must be an object".to_string());
     };
-    fields
+    Ok(fields
         .iter()
-        .map(|(name, v)| {
-            let value = match v {
-                Json::Null => Value::Null,
-                Json::Bool(b) => Value::Bool(*b),
-                Json::Int(i) => Value::Int(*i),
-                Json::Float(f) => Value::Float(*f),
-                Json::Str(s) => Value::Str(s.clone()),
-                Json::Arr(_) | Json::Obj(_) => {
-                    return Err(format!("param ${name} has an unsupported type"));
-                }
-            };
-            Ok((name.clone(), value))
-        })
-        .collect()
+        .map(|(name, v)| (name.clone(), param_value(v)))
+        .collect())
+}
+
+/// One parameter, typed the way the engine binds it.
+///
+/// The five scalars are the same in both languages. A JSON array is a
+/// list and a JSON object is a record, which is the mapping the data
+/// model already implies: a record is named fields and an object is
+/// named members, so a client sending the obvious thing gets the
+/// obvious value, nested to whatever depth it wrote. What has no
+/// spelling here is a temporal, because JSON has no date and a string
+/// that looks like one is a string: a statement wanting one calls
+/// `date($text)` on a string parameter, which says which calendar type
+/// was meant instead of leaving the wire to guess.
+fn param_value(v: &Json) -> Value {
+    match v {
+        Json::Null => Value::Null,
+        Json::Bool(b) => Value::Bool(*b),
+        Json::Int(i) => Value::Int(*i),
+        Json::Float(f) => Value::Float(*f),
+        Json::Str(s) => Value::Str(s.clone()),
+        Json::Arr(items) => Value::List(items.iter().map(param_value).collect()),
+        Json::Obj(fields) => Value::record(
+            fields
+                .iter()
+                .map(|(field, item)| (field.clone(), param_value(item)))
+                .collect(),
+        ),
+    }
 }
 
 /// A failure with no GQLSTATUS: a malformed frame, an unknown op, a
-/// parameter the wire cannot type. These are protocol faults, not GQL
+/// `params` that is not an object. These are protocol faults, not GQL
 /// conditions, and giving them a made-up code would be worse than
 /// leaving the field off.
 fn error_line(message: &str) -> String {
@@ -336,7 +402,27 @@ mod tests {
         );
         let none = json::parse(r#"{"op":"query"}"#).expect("frame");
         assert_eq!(frame_params(&none).expect("empty"), []);
-        let bad = json::parse(r#"{"params":{"a":[1]}}"#).expect("frame");
-        assert!(frame_params(&bad).is_err());
+    }
+
+    #[test]
+    fn a_list_parameter_arrives_as_a_list_and_an_object_as_a_record() {
+        let frame = json::parse(r#"{"params":{"a":[1,[2,"x"]],"b":{"y":2,"x":1}}}"#).expect("f");
+        let params = frame_params(&frame).expect("params");
+        assert_eq!(
+            params[0].1,
+            Value::List(vec![
+                Value::Int(1),
+                Value::List(vec![Value::Int(2), Value::Str("x".into())]),
+            ])
+        );
+        // A record's fields are in name order whatever order they were
+        // written in, which is what makes two spellings one value.
+        assert_eq!(
+            params[1].1,
+            Value::record(vec![
+                ("x".to_string(), Value::Int(1)),
+                ("y".to_string(), Value::Int(2)),
+            ])
+        );
     }
 }

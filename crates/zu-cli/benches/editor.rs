@@ -28,11 +28,16 @@
 
 use std::time::Instant;
 
+#[path = "../src/complete.rs"]
+mod complete;
+#[path = "../src/highlight.rs"]
+mod highlight;
 #[path = "../src/keys.rs"]
 mod keys;
 #[path = "../src/line.rs"]
 mod line;
 
+use complete::Names;
 use keys::Decoded;
 use line::Editor;
 
@@ -47,8 +52,9 @@ const LONG: &str = "MATCH (a:Person {city: 'Hanoi'})-[:KNOWS]->(b:Person)\n\
      LIMIT 25";
 
 fn main() {
-    let short = keystroke(SHORT);
-    let long = keystroke(LONG);
+    let short = keystroke(SHORT, false);
+    let long = keystroke(LONG, false);
+    let painted = keystroke(LONG, true);
     println!(
         "keystroke short   {short:8.2} us/key    {} columns",
         SHORT.len()
@@ -57,13 +63,19 @@ fn main() {
         "keystroke long    {long:8.2} us/key    {} lines",
         LONG.lines().count()
     );
+    println!(
+        "keystroke colour  {painted:8.2} us/key    {} lines painted",
+        LONG.lines().count()
+    );
     let scan = completeness();
     println!(
         "completeness      {scan:8.2} us/call   {} bytes",
         LONG.len()
     );
+    let tab = completion();
+    println!("completion        {tab:8.2} us/tab");
 
-    let worst = short.max(long);
+    let worst = short.max(long).max(painted);
     if let Some(ceiling) = budget("cli_keystroke_us")
         && worst > ceiling
     {
@@ -80,7 +92,7 @@ fn main() {
 /// The whole statement is typed per sample rather than one key of it,
 /// so the number is an average over every buffer length up to the full
 /// one and not a measurement of the cheapest position.
-fn keystroke(statement: &str) -> f64 {
+fn keystroke(statement: &str, colour: bool) -> f64 {
     let bytes: Vec<Vec<u8>> = statement
         .chars()
         .map(|c| c.to_string().into_bytes())
@@ -90,7 +102,7 @@ fn keystroke(statement: &str) -> f64 {
     let mut sink = 0usize;
     for _ in 0..20 {
         let start = Instant::now();
-        let mut editor = Editor::default();
+        let mut editor = Editor::new(colour);
         for byte in &bytes {
             let Decoded::Key(key, _) = keys::decode(byte) else {
                 unreachable!("a character decodes as a character")
@@ -119,6 +131,35 @@ fn completeness() -> f64 {
         best = best.min(start.elapsed().as_secs_f64() * 1e6 / 1000.0);
     }
     assert!(sink > 0, "the scans were not thrown away by the optimizer");
+    best
+}
+
+/// Microseconds for one tab, which is the scan for the word under the
+/// cursor plus the walk over every name the file has.
+///
+/// The name lists are the size a real schema reaches rather than the
+/// size a test uses, because the walk is linear in them and a shell
+/// that got slower as a graph grew a hundred labels would be a shell
+/// that got slower as it got useful.
+fn completion() -> f64 {
+    let mut names = Names::default();
+    for i in 0..100 {
+        names.labels.push(format!("Label{i}"));
+        names.tables.push(format!("table_{i}"));
+        names.properties.push(format!("property_{i}"));
+    }
+    names.tidy();
+    let text = "MATCH (a:Lab";
+    let mut best = f64::MAX;
+    let mut sink = 0usize;
+    for _ in 0..20 {
+        let start = Instant::now();
+        for _ in 0..1000 {
+            sink += complete::complete(text, text.len(), &names).list.len();
+        }
+        best = best.min(start.elapsed().as_secs_f64() * 1e6 / 1000.0);
+    }
+    assert!(sink > 0, "the tabs were not thrown away by the optimizer");
     best
 }
 

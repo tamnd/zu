@@ -55,6 +55,14 @@ pub enum ExprOp {
         r: Reg,
         dst: Reg,
     },
+    /// A null test reads the operand's validity, which is the answer
+    /// already: IS NULL is the complement of the validity bitmap, IS
+    /// NOT NULL is the bitmap itself. `negated` carries the NOT.
+    IsNull {
+        src: Reg,
+        negated: bool,
+        dst: Reg,
+    },
     And {
         l: Reg,
         r: Reg,
@@ -117,6 +125,15 @@ impl Program {
                     regs[*dst as usize] = Slot::Bits(bits);
                     last = *dst;
                 }
+                ExprOp::IsNull { src, negated, dst } => {
+                    let mut bits = Bitmap::new_in(arena, count, false);
+                    {
+                        let v = resolve(&regs, *src, chunk)?;
+                        validity_bits(v, *negated, &mut bits);
+                    }
+                    regs[*dst as usize] = Slot::Bits(bits);
+                    last = *dst;
+                }
                 ExprOp::And { l, r, dst } | ExprOp::Or { l, r, dst } => {
                     let is_and = matches!(op, ExprOp::And { .. });
                     let rbits = match std::mem::replace(&mut regs[*r as usize], Slot::Empty) {
@@ -158,6 +175,30 @@ impl Program {
             _ => Err(bad_reg("value program did not end in a vector")),
         }
     }
+}
+
+/// Write a null test into `out`, which arrives cleared. Rows outside
+/// the chunk's selection may land either way: the filter refines the
+/// selection it already has, so a bit off the selection never reaches a
+/// row. Absent validity means every row is valid, the convention the
+/// vector reader keeps, so IS NULL over such a column is empty.
+fn validity_bits(v: &ValueVector, negated: bool, out: &mut Bitmap) {
+    debug_assert_eq!(out.len(), v.len as usize);
+    match (&v.validity, negated) {
+        (None, false) => {}
+        (None, true) => {
+            out.words_mut().fill(!0u64);
+        }
+        (Some(valid), false) => {
+            for (w, o) in out.words_mut().iter_mut().zip(valid.words()) {
+                *w = !o;
+            }
+        }
+        (Some(valid), true) => {
+            out.words_mut().copy_from_slice(valid.words());
+        }
+    }
+    out.mask_tail();
 }
 
 fn bad_reg(what: &str) -> ZuError {
@@ -290,5 +331,65 @@ mod tests {
         };
         let out = p.eval(&chunk, &mut arena).unwrap();
         assert_eq!(out.values::<i64>(), &[15, 25, 35]);
+    }
+
+    /// A kernel that missed a row leaves the value slot alone and
+    /// clears the validity bit, which is what the two null tests read.
+    #[test]
+    fn null_tests_read_the_validity() {
+        let mut arena = MorselArena::new();
+        let mut chunk = chunk_i64(&mut arena, &[7i64, 0, 9, 0, 11]);
+        let mut valid = Bitmap::new_in(&mut arena, 5, true);
+        valid.clear(1);
+        valid.clear(3);
+        chunk.vecs[0].validity = Some(valid);
+
+        let program = |negated| Program {
+            ops: vec![
+                ExprOp::LoadCol { col: 0, dst: 0 },
+                ExprOp::IsNull {
+                    src: 0,
+                    negated,
+                    dst: 1,
+                },
+            ],
+            regs: 2,
+        };
+
+        let bits = program(true).eval_filter(&chunk, &mut arena).unwrap();
+        let sel = SelVector::from_bitmap(&mut arena, &bits);
+        assert_eq!(sel.as_slice(), &[0, 2, 4]);
+
+        let bits = program(false).eval_filter(&chunk, &mut arena).unwrap();
+        let sel = SelVector::from_bitmap(&mut arena, &bits);
+        assert_eq!(sel.as_slice(), &[1, 3]);
+    }
+
+    /// A column with no validity is every row valid, so the tests
+    /// answer all or nothing without reading a bitmap that is not
+    /// there. The tail matters: a length that is not a multiple of the
+    /// word width must not report the padding as rows.
+    #[test]
+    fn a_dense_column_is_null_nowhere() {
+        let mut arena = MorselArena::new();
+        let vals: Vec<i64> = (0..70).collect();
+        let chunk = chunk_i64(&mut arena, &vals);
+
+        let program = |negated| Program {
+            ops: vec![
+                ExprOp::LoadCol { col: 0, dst: 0 },
+                ExprOp::IsNull {
+                    src: 0,
+                    negated,
+                    dst: 1,
+                },
+            ],
+            regs: 2,
+        };
+
+        let bits = program(true).eval_filter(&chunk, &mut arena).unwrap();
+        assert_eq!(bits.count_ones(), 70);
+        let bits = program(false).eval_filter(&chunk, &mut arena).unwrap();
+        assert_eq!(bits.count_ones(), 0);
     }
 }

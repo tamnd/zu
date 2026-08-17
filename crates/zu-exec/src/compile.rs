@@ -671,6 +671,41 @@ fn fuse_closes(ops: &mut Vec<Op>) {
     }
 }
 
+/// Takes the projections that compute nothing out of the chain.
+///
+/// A `WITH n, d` in the middle of a query is not an operator: every
+/// item is a variable the pipeline already carries, and the binder
+/// keeps a projected variable's slot, so the clauses above it read the
+/// same slots the clauses below it wrote. What the clause does do is
+/// narrow what is visible, and that is a rule the binder enforced
+/// before a plan existed. Dropping the node leaves the shape this
+/// pipeline runs where there was a projection standing between an
+/// operator and its sink.
+///
+/// The last node stays whatever it is: that one is the sink, and the
+/// sink is the answer. An item that computes, aggregates or renames
+/// into a fresh slot is a projection in earnest and stays too, which
+/// leaves the query to the old engine.
+fn drop_pass_through(chain: &mut Vec<&LogicalPlan>) {
+    let last = chain.len().saturating_sub(1);
+    let mut i = 0;
+    chain.retain(|node| {
+        let here = i;
+        i += 1;
+        if here == last {
+            return true;
+        }
+        let LogicalPlan::Project { items, .. } = node else {
+            return true;
+        };
+        let pass_through = !items.is_empty()
+            && items
+                .iter()
+                .all(|item| matches!(item.expr, BoundExpr::Var(slot) if item.slot == Some(slot)));
+        !pass_through
+    });
+}
+
 /// Compiles a plan, `Ok(None)` for any shape not covered yet.
 pub(crate) fn compile(
     plan: &LogicalPlan,
@@ -835,6 +870,7 @@ impl Compiler<'_> {
             };
         }
         chain.reverse();
+        drop_pass_through(&mut chain);
         let mut it = chain.iter().copied().peekable();
         if !matches!(it.next(), Some(LogicalPlan::Empty)) {
             return Ok(None);
@@ -2926,6 +2962,36 @@ impl Compiler<'_> {
             && let Some(&(from, vec)) = self.marks.get(slot)
         {
             return self.mark_reg(b, from, vec, level);
+        }
+        // A null test asks a question the column already answers. A
+        // kernel that misses a node writes null there, and the vector
+        // that carries the answer carries a validity bitmap beside it,
+        // so IS NOT NULL is that bitmap and IS NULL is its complement.
+        // Only a column has validity to read: a test over a computed
+        // value, or over a mark, goes back to the old engine.
+        if let BoundExpr::IsNull { expr, negated } = expr {
+            if !matches!(**expr, BoundExpr::Property { .. } | BoundExpr::Var(_)) {
+                return Ok(None);
+            }
+            if let BoundExpr::Var(slot) = &**expr
+                && self.marks.contains_key(slot)
+            {
+                return Ok(None);
+            }
+            // Not `outer`: a level below broadcasts one row into this
+            // one, and the broadcast does not carry that row's validity
+            // with it, so the test would read a bitmap that is not the
+            // column's.
+            let Some(src) = self.value_reg(b, expr, level, false)? else {
+                return Ok(None);
+            };
+            let dst = b.push_type(PhysType::Bool)?;
+            b.ops.push(ExprOp::IsNull {
+                src,
+                negated: *negated,
+                dst,
+            });
+            return Ok(Some(dst));
         }
         let BoundExpr::Binary { op, lhs, rhs } = expr else {
             return Ok(None);

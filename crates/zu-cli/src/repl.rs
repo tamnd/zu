@@ -24,6 +24,7 @@ use zu::session::Session;
 use crate::complete::Names;
 use crate::keys::{self, Decoded};
 use crate::line::{Editor, Step};
+use crate::page::{self, Move, Pager};
 use crate::term::{self, Raw};
 
 /// The prompt, and the one continuation lines get. Both are four
@@ -70,7 +71,11 @@ pub(crate) fn run(session: &mut Session, path: &str) -> ExitCode {
                 if matches!(statement.to_ascii_lowercase().as_str(), "quit" | "exit") {
                     return ExitCode::SUCCESS;
                 }
-                print!("{}", answer(session, &statement));
+                let text = answer(session, &statement);
+                if let Err(e) = show(&text) {
+                    eprintln!("zu shell: {e}");
+                    return ExitCode::from(3);
+                }
                 names = self::names(session);
             }
         }
@@ -138,6 +143,88 @@ fn answer(session: &mut Session, statement: &str) -> String {
             Some(d) => format!("error {} {}\n", d.status.code(), d.detail),
             None => format!("error {e}\n"),
         },
+    }
+}
+
+/// Prints an answer, a screen at a time when it is taller than the
+/// window.
+///
+/// What fits is printed the way it always was, so nothing about a
+/// one-row result changes and nothing waits for a key that a user with
+/// a full screen of answer has no reason to press. What does not fit
+/// goes through the pager, which needs raw mode for the same reason the
+/// editor does: a key at the `--more--` prompt is one key and not one
+/// line. A terminal that will not enter raw mode gets the whole answer
+/// rather than an error, since printing too much is a smaller failure
+/// than printing nothing.
+fn show(text: &str) -> std::io::Result<()> {
+    let mut pager = Pager::new(text, term::width(), term::height());
+    if pager.fits() {
+        print!("{text}");
+        return std::io::Write::flush(&mut std::io::stdout());
+    }
+    let Ok(_raw) = Raw::enter() else {
+        print!("{text}");
+        return std::io::Write::flush(&mut std::io::stdout());
+    };
+    // Reverse video says where the answer stopped and the prompt began
+    // without spending a colour on it, and a terminal that asked for no
+    // colour is a terminal that asked for no styling either.
+    let prompt = if crate::highlight::wanted() {
+        "\x1b[7m--more--\x1b[0m"
+    } else {
+        "--more--"
+    };
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut bytes: Vec<u8> = Vec::with_capacity(16);
+    term::emit(&pager.screen())?;
+    while pager.more() {
+        term::emit(prompt)?;
+        let moved = press(&mut input, &mut bytes)?;
+        // The prompt goes whatever the key meant, so that the rows that
+        // follow it are the answer and nothing else.
+        term::emit("\r\x1b[K")?;
+        match moved {
+            Move::Screen => term::emit(&pager.screen())?,
+            Move::Row => term::emit(&pager.take(1))?,
+            Move::Stop => break,
+            Move::Idle => {}
+        }
+    }
+    Ok(())
+}
+
+/// Waits for a key the pager has a meaning for.
+///
+/// Keys with no meaning are read and dropped rather than ending the
+/// wait, so that an arrow key, which arrives as an escape sequence of
+/// three bytes, does not scroll three screens.
+fn press(input: &mut impl Read, bytes: &mut Vec<u8>) -> std::io::Result<Move> {
+    let mut chunk = [0u8; 16];
+    loop {
+        while !bytes.is_empty() {
+            let (key, taken) = match keys::decode(bytes) {
+                Decoded::Need => break,
+                Decoded::Skip(n) => {
+                    bytes.drain(..n);
+                    continue;
+                }
+                Decoded::Key(key, n) => (key, n),
+            };
+            bytes.drain(..taken);
+            match page::command(key) {
+                Move::Idle => {}
+                moved => return Ok(moved),
+            }
+        }
+        let read = input.read(&mut chunk)?;
+        if read == 0 {
+            // The terminal went away mid-listing, which is not a reason
+            // to keep printing at it.
+            return Ok(Move::Stop);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
     }
 }
 

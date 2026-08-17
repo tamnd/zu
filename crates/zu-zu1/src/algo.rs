@@ -516,7 +516,10 @@ mod tests {
             bfs(&mut db, &mut reader, 0).expect("bfs"),
             [0, 1, u64::MAX, u64::MAX]
         );
-        assert_eq!(sssp(&mut db, &mut reader, 0).expect("sssp"), [0, 1, 2, u64::MAX]);
+        assert_eq!(
+            sssp(&mut db, &mut reader, 0).expect("sssp"),
+            [0, 1, 2, u64::MAX]
+        );
     }
 
     #[test]
@@ -550,7 +553,11 @@ mod tests {
         for v in 0..n as usize {
             let forward = v as u64;
             assert_eq!(out[v], forward, "directed level of {v}");
-            assert_eq!(both[v], forward.min(n as u64 - forward), "undirected level of {v}");
+            assert_eq!(
+                both[v],
+                forward.min(n as u64 - forward),
+                "undirected level of {v}"
+            );
         }
     }
 

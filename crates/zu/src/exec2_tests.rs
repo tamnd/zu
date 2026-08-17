@@ -66,14 +66,15 @@ fn setup(path: &std::path::Path) -> (Zu1File, Catalog, Schema) {
     (db, catalog, schema)
 }
 
-fn run_both(
+/// What the pipeline answers, or `None` where it declines the shape.
+fn run_new(
     db: &mut Zu1File,
     catalog: &Catalog,
     schema: &Schema,
     source: &str,
     threads: usize,
     sip: Sip,
-) -> (Option<exec::QueryResult>, exec::QueryResult) {
+) -> Option<exec::QueryResult> {
     let (query, plan, _) =
         query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
     assert!(query.params.is_empty(), "parity queries take no params");
@@ -82,14 +83,40 @@ fn run_both(
         sip,
         ..Options::default()
     };
-    let new = {
-        let mut snap = Zu1Snapshot::new(db, catalog.clone());
-        zu_exec::try_execute(&plan, &query, schema, &mut snap, &[], &options).unwrap()
+    let mut snap = Zu1Snapshot::new(db, catalog.clone());
+    zu_exec::try_execute(&plan, &query, schema, &mut snap, &[], &options).unwrap()
+}
+
+/// What the oracle answers. Sequential with the sideways filter on,
+/// because the old engine's own options are not what this file is
+/// about and its answer does not move with them.
+fn run_old(
+    db: &mut Zu1File,
+    catalog: &Catalog,
+    schema: &Schema,
+    source: &str,
+) -> exec::QueryResult {
+    let (query, plan, _) =
+        query::compile_parsed(&zu_query::parser::parse(source).unwrap(), schema).unwrap();
+    let options = Options {
+        threads: 1,
+        sip: Sip::On,
+        ..Options::default()
     };
-    let old = {
-        let mut graph = Zu1Graph::new(db, catalog.clone());
-        exec::execute(&plan, &query, schema, &mut graph, &[], &options).unwrap()
-    };
+    let mut graph = Zu1Graph::new(db, catalog.clone());
+    exec::execute(&plan, &query, schema, &mut graph, &[], &options).unwrap()
+}
+
+fn run_both(
+    db: &mut Zu1File,
+    catalog: &Catalog,
+    schema: &Schema,
+    source: &str,
+    threads: usize,
+    sip: Sip,
+) -> (Option<exec::QueryResult>, exec::QueryResult) {
+    let new = run_new(db, catalog, schema, source, threads, sip);
+    let old = run_old(db, catalog, schema, source);
     (new, old)
 }
 
@@ -97,10 +124,18 @@ fn run_both(
 /// exactly, sequential and parallel, and with the sideways filter off
 /// as well as on: a filter that changes an answer is a filter that
 /// dropped a row the join would have matched.
+///
+/// The oracle runs once and the four options run against that one
+/// answer. The old engine is where almost all the time in this file
+/// goes, a cross product being a nested loop over the whole table
+/// there, and asking it the same question four times to get the same
+/// answer four times costs about twenty minutes of every CI run. The
+/// options belong to the executor under test.
 fn covered(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str) {
+    let old = run_old(db, catalog, schema, source);
     for (threads, sip) in [(1, Sip::On), (0, Sip::On), (1, Sip::Off), (0, Sip::Off)] {
-        let (new, old) = run_both(db, catalog, schema, source, threads, sip);
-        let new = new.unwrap_or_else(|| panic!("exec2 should cover: {source}"));
+        let new = run_new(db, catalog, schema, source, threads, sip)
+            .unwrap_or_else(|| panic!("exec2 should cover: {source}"));
         assert_eq!(new.columns, old.columns, "columns for {source}");
         assert_eq!(
             new.rows, old.rows,
@@ -115,11 +150,21 @@ fn falls_back(db: &mut Zu1File, catalog: &Catalog, schema: &Schema, source: &str
     assert!(new.is_none(), "exec2 should fall back on: {source}");
 }
 
-#[test]
-fn covered_shapes_match_the_old_engine() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut db, catalog, schema) = setup(&dir.path().join("parity.zu1"));
-    let covered_queries = [
+/// The shapes the pipeline claims. Run in strides across the tests
+/// below rather than in one.
+///
+/// This file is the slowest thing in the workspace by a wide margin
+/// and almost all of it is the oracle: a couple of dozen of these are
+/// a nested loop over three thousand rows on each side there, and
+/// several of those cost a minute apiece. As one test that is one
+/// thread doing half an hour of work while the rest of the machine
+/// waits on it, so the harness gets eight tests to spread instead.
+///
+/// A stride and not a block, so the expensive family lands one query
+/// per shard whatever order this list ends up in. Adding a shape here
+/// needs nothing else changed.
+fn covered_queries() -> &'static [&'static str] {
+    &[
         // Scans and counts.
         "MATCH (p:person) RETURN count(p) AS n",
         "MATCH (p:person) WHERE p.age > 50 RETURN count(p) AS n",
@@ -748,17 +793,14 @@ fn covered_shapes_match_the_old_engine() {
         "MATCH (a:person)-[:knows]->(b) WHERE a.id < 5 \
          AND (b.id < 100 OR EXISTS { MATCH (c:person) WHERE c.score = b.age AND c.id > 3 }) \
          RETURN count(*) AS n",
-    ];
-    for q in covered_queries {
-        covered(&mut db, &catalog, &schema, q);
-    }
+    ]
 }
 
-#[test]
-fn unclaimed_shapes_fall_back() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut db, catalog, schema) = setup(&dir.path().join("fallback.zu1"));
-    let fallback_queries = [
+/// The shapes the pipeline does not claim, which have to decline so
+/// the caller falls back and then have to answer where it falls back
+/// to. Sharded the same way and for the same reason.
+fn fallback_queries() -> &'static [&'static str] {
+    &[
         // ORDER BY over something the projection does not return has
         // no output column to read, so it stays with the old engine.
         "MATCH (p:person) RETURN p.name AS name ORDER BY p.age",
@@ -912,10 +954,58 @@ fn unclaimed_shapes_fall_back() {
         // whole of the other side, which the probe has no key for.
         "MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age > 90 } \
          RETURN count(a) AS n",
-    ];
-    for q in fallback_queries {
-        falls_back(&mut db, &catalog, &schema, q);
+    ]
+}
+
+/// How many pieces the two lists go out in. Eight because the runners
+/// this has to finish on have four cores and the shards do not come
+/// out the same size, so a few more than cores is what keeps the tail
+/// short.
+const SHARDS: usize = 8;
+
+fn covered_shard(shard: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, catalog, schema) = setup(&dir.path().join("parity.zu1"));
+    for source in covered_queries().iter().skip(shard).step_by(SHARDS) {
+        covered(&mut db, &catalog, &schema, source);
     }
+}
+
+fn fallback_shard(shard: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, catalog, schema) = setup(&dir.path().join("fallback.zu1"));
+    for source in fallback_queries().iter().skip(shard).step_by(SHARDS) {
+        falls_back(&mut db, &catalog, &schema, source);
+    }
+}
+
+/// One test per shard of each list. The harness schedules on names,
+/// so a name per shard is what it takes to get more than one core on
+/// this file, and every body is the same call with a different
+/// stride.
+macro_rules! shard_tests {
+    ($($parity:ident, $decline:ident => $shard:expr;)*) => { $(
+        #[test]
+        fn $parity() {
+            covered_shard($shard);
+        }
+
+        #[test]
+        fn $decline() {
+            fallback_shard($shard);
+        }
+    )* };
+}
+
+shard_tests! {
+    covered_shapes_match_the_old_engine_0, unclaimed_shapes_fall_back_0 => 0;
+    covered_shapes_match_the_old_engine_1, unclaimed_shapes_fall_back_1 => 1;
+    covered_shapes_match_the_old_engine_2, unclaimed_shapes_fall_back_2 => 2;
+    covered_shapes_match_the_old_engine_3, unclaimed_shapes_fall_back_3 => 3;
+    covered_shapes_match_the_old_engine_4, unclaimed_shapes_fall_back_4 => 4;
+    covered_shapes_match_the_old_engine_5, unclaimed_shapes_fall_back_5 => 5;
+    covered_shapes_match_the_old_engine_6, unclaimed_shapes_fall_back_6 => 6;
+    covered_shapes_match_the_old_engine_7, unclaimed_shapes_fall_back_7 => 7;
 }
 
 /// Chunks the scan never decoded, which is what the zone map bought

@@ -30,7 +30,8 @@
 use std::path::{Path, PathBuf};
 
 use zu_common::{Interrupt, Result, ZuError};
-use zu_query::exec;
+use zu_query::exec::{self, Streamed};
+use zu_query::row::{Batch, Flow};
 
 use crate::append::Appender;
 use crate::query::{QueryResult, Value};
@@ -239,6 +240,55 @@ impl Connection {
     pub fn query_with(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.refuse_if_read_only(source)?;
         self.session.run(source, params)
+    }
+
+    /// Runs one statement and hands its rows to `sink` in batches as
+    /// they are made, instead of returning them all.
+    ///
+    /// This is the shape for a result that is too big to want in
+    /// memory, and for a caller that will not read all of it: the sink
+    /// answers [`Flow::Stop`] and the scan under it stops at the next
+    /// boundary, the same boundary an interrupt is answered at. A batch
+    /// borrows the rows for the length of the call, so a caller keeping
+    /// anything past it copies what it wants out.
+    ///
+    /// ```no_run
+    /// use zu::{Database, Flow};
+    ///
+    /// let db = Database::open("social.zu1")?;
+    /// let mut conn = db.connect()?;
+    /// let mut total = 0i64;
+    /// conn.query_stream("MATCH (p:person) RETURN p.id AS id", &[], |batch| {
+    ///     for row in batch.iter() {
+    ///         total += row.get_at::<i64>(0)?;
+    ///     }
+    ///     Ok(Flow::More)
+    /// })?;
+    /// # Ok::<(), zu::ZuError>(())
+    /// ```
+    pub fn query_stream(
+        &mut self,
+        source: &str,
+        params: &[(&str, Value)],
+        sink: impl FnMut(Batch<'_>) -> Result<Flow>,
+    ) -> Result<Streamed> {
+        self.query_stream_batched(source, params, exec::STREAM_BATCH, sink)
+    }
+
+    /// The same, with the batch size named. One vector of rows is the
+    /// default because it is the unit the executor already works in;
+    /// a caller writing batches somewhere with a size of its own, an
+    /// Arrow record batch or an HTTP chunk, says so here.
+    pub fn query_stream_batched(
+        &mut self,
+        source: &str,
+        params: &[(&str, Value)],
+        batch_rows: usize,
+        mut sink: impl FnMut(Batch<'_>) -> Result<Flow>,
+    ) -> Result<Streamed> {
+        self.refuse_if_read_only(source)?;
+        self.session
+            .run_streaming(source, params, batch_rows, &mut sink)
     }
 
     /// Runs a statement for its effect and returns the number of rows

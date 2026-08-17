@@ -25,7 +25,7 @@ use zu_common::{FloatBits, LogicalType, Temporal};
 pub use zu_query::exec::{QueryResult, Value};
 /// The typed view over those rows, from the same crate and for the same
 /// reason.
-pub use zu_query::row::{FromRow, FromValue, Row, RowIter};
+pub use zu_query::row::{Batch, Flow, FromRow, FromValue, Row, RowIter};
 
 /// Builds the binder schema for the home graph, which is the graph a
 /// statement is against when nothing said otherwise.

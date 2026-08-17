@@ -32,9 +32,11 @@ pub mod sip;
 
 use zu_common::Result;
 use zu_query::binder::{BoundQuery, Schema};
-use zu_query::exec::{Options, QueryResult, Value};
+use zu_query::exec::{Options, QueryResult, Streaming, Value};
 use zu_query::plan::LogicalPlan;
 use zu_query::snapshot::Snapshot;
+
+use crate::compile::{PostSpec, SinkSpec};
 
 /// Runs an optimized plan through the pipeline executor when the plan
 /// is a shape it supports, `Ok(None)` when the caller should use the
@@ -55,6 +57,45 @@ pub fn try_execute(
         return Ok(None);
     };
     run::run(&exec_plan, snap, options).map(|(rows, _)| Some(rows))
+}
+
+/// Runs a plan through the pipeline executor handing its rows to `st`
+/// in batches as they are made, `Ok(false)` when this is not a plan it
+/// can stream and the caller should stream it some other way.
+///
+/// Two things have to hold before it says yes. The pipeline has to
+/// cover the plan at all, which is [`try_execute`]'s own question, and
+/// the answer has to be rows in scan order: an aggregate has no row
+/// until its groups close, and ORDER BY and DISTINCT have none until
+/// the last one is read, so those arrive whole through the buffered
+/// entry point and are cut into batches afterwards. SKIP and LIMIT do
+/// stream, spent across the batches by the handoff.
+pub fn try_execute_streaming(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    snap: &mut dyn Snapshot,
+    params: &[Value],
+    options: &Options,
+    st: &mut Streaming,
+) -> Result<bool> {
+    if options.flat {
+        return Ok(false);
+    }
+    let Some(exec_plan) = compile::compile(plan, query, schema, snap, params, options)? else {
+        return Ok(false);
+    };
+    let SinkSpec::Rows { post, .. } = &exec_plan.sink else {
+        return Ok(false);
+    };
+    if post
+        .iter()
+        .any(|p| matches!(p, PostSpec::Distinct | PostSpec::Sort(_)))
+    {
+        return Ok(false);
+    }
+    run::run_streamed(&exec_plan, snap, options, st)?;
+    Ok(true)
 }
 
 /// The same run handing back the decisions it made as well, which is

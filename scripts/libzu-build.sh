@@ -173,7 +173,14 @@ esac
 # `--static` is asked for as well, since Libs.private is the field a
 # generated file is most likely to be quietly wrong in and nothing else
 # here reads it.
-if command -v pkg-config > /dev/null 2>&1; then
+#
+# Asked to run rather than looked for on the PATH, because the Windows
+# runner has Strawberry Perl's `pkg-config` on it and that one cannot
+# start: it dies in its own BEGIN block looking for a module the
+# installation does not have. A tool that is present and cannot answer
+# is the same situation as no tool at all, and finding that out by
+# running it is the only way to tell them apart.
+if pkg-config --version > /dev/null 2>&1; then
     export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
     pkg-config --exists libzu
     echo "pkg-config: $(pkg-config --modversion libzu), $(pkg-config --cflags --libs libzu)"
@@ -201,7 +208,7 @@ if command -v pkg-config > /dev/null 2>&1; then
         ;;
     esac
 else
-    echo "pkg-config: not on this machine, so the .pc is staged and not exercised"
+    echo "pkg-config: none that runs on this machine, so the .pc is staged and not exercised"
 fi
 
 # find_package(zu), which is how the other half of the C world finds it.
@@ -234,6 +241,14 @@ EOF
             echo "cmake: the $name target built nothing"
             exit 1
         fi
+        # Windows looks for a DLL beside the program that needs it and
+        # then on the PATH, and neither of those is a directory CMake
+        # put anything in. Copying it is what a consumer's install step
+        # does, and doing it here rather than adding to the PATH keeps
+        # the two executables independent of the order they run in.
+        case "$target" in
+        *windows*) cp "$prefix/bin/zu.dll" "$(dirname "$exe")/" ;;
+        esac
         "$exe" "$work/smoke.zu1" > /dev/null
         echo "cmake: $name linked through find_package(zu) and ran"
     done

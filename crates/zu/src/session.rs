@@ -22,7 +22,7 @@ use zu_common::{Interrupt, Result, ZuError};
 use zu_query::ast::TxnStmt;
 use zu_query::binder::BoundQuery;
 use zu_query::exec::{self, Streamed};
-use zu_query::plan::LogicalPlan;
+use zu_query::plan::{LogicalPlan, QueryPlan};
 use zu_query::row::{Batch, Flow};
 
 use crate::query::{self, NotAQuery, QueryResult, Value, Zu1Graph};
@@ -684,10 +684,24 @@ impl Session {
     /// on their values, and then a caller would have some reason to
     /// pass the ones it is about to bind.
     pub fn explain(&mut self, source: &str) -> Result<String> {
+        Ok(self.explain_plan(source)?.render())
+    }
+
+    /// The same plan as the operators it is made of, for a caller that
+    /// wants to read it rather than print it.
+    ///
+    /// A plan viewer, a test asserting that a statement reaches an
+    /// index, a tool colouring the expands red: each of those wants the
+    /// tree, and each of them parsing the listing back into one would
+    /// be a parser of a format nothing promised to keep. The listing is
+    /// [`zu_query::plan::QueryPlan::render`] of this, so what a caller
+    /// reads and what a caller prints cannot disagree.
+    pub fn explain_plan(&mut self, source: &str) -> Result<QueryPlan> {
         self.refresh()?;
         let cached = self.plan_for(source)?;
-        let listing = zu_query::plan::explain(&cached.plan, &cached.query, &cached.schema);
-        Ok(query::noted(cached.notes.clone(), listing))
+        let mut described = zu_query::plan::describe(&cached.plan, &cached.query, &cached.schema);
+        described.notes = cached.notes.clone();
+        Ok(described)
     }
 
     /// EXPLAIN ANALYZE through the session: same cache, same options,

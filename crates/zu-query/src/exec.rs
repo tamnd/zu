@@ -507,7 +507,13 @@ pub enum Sip {
 /// One operator line of an EXPLAIN ANALYZE profile.
 #[derive(Debug, Clone)]
 pub struct OpProfile {
-    pub name: String,
+    /// The operator itself, the word a reader groups by.
+    pub kind: &'static str,
+    /// What the operator is working on, rendered the way the statement
+    /// wrote it: the tables a scan reads, the pattern an expand walks,
+    /// the predicate a filter asks. Empty where the operator has no
+    /// arguments to name.
+    pub detail: String,
     /// Successful pulls: how many chunks this operator produced.
     pub pulls: u64,
     /// Values produced across all pulls. Rows over pulls is the
@@ -531,6 +537,15 @@ pub struct OpProfile {
 }
 
 impl OpProfile {
+    /// What the listing calls this operator, the kind and its detail
+    /// joined the way EXPLAIN ANALYZE prints them.
+    pub fn name(&self) -> String {
+        match self.detail.is_empty() {
+            true => self.kind.to_string(),
+            false => format!("{} {}", self.kind, self.detail),
+        }
+    }
+
     /// The q-error of this operator's estimate, `max(est/act, act/est)`
     /// (perf/12 §4). Both sides are floored at one row: a zero actual
     /// against an estimate of 3 is an error of 3, not of infinity, and
@@ -611,8 +626,9 @@ impl Profile {
                 stage.out_rows,
                 fmt_time(stage.nanos)
             ));
-            let width = stage.ops.iter().map(|o| o.name.len()).max().unwrap_or(0);
-            for op in stage.ops.iter().rev() {
+            let names: Vec<String> = stage.ops.iter().map(OpProfile::name).collect();
+            let width = names.iter().map(String::len).max().unwrap_or(0);
+            for (ix, op) in stage.ops.iter().enumerate().rev() {
                 let avg = if op.pulls == 0 {
                     0.0
                 } else {
@@ -631,7 +647,7 @@ impl Profile {
                 };
                 out.push_str(&format!(
                     "  {:width$}  pulls {:>6}  rows {:>8}  flat {:>9}{est}  avg {:>7.1}  self {}{over}\n",
-                    op.name,
+                    names[ix],
                     op.pulls,
                     op.rows,
                     op.flat,
@@ -676,36 +692,41 @@ fn rel_text(
     format!("({from}){left}[:{names}]{right}({to})")
 }
 
-fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema) -> String {
+/// What a profiled operator is and what it is doing, kept apart so a
+/// reader of a profile can group by the operator without cutting the
+/// printed label back up. [`OpProfile::name`] is the two joined, which
+/// is what the listing shows.
+fn op_label(
+    desc: &OpDesc,
+    stage: &StageDef,
+    query: &BoundQuery,
+    schema: &Schema,
+) -> (&'static str, String) {
     let var = |slot: usize| query.variables[slot].name.as_str();
     match desc {
-        OpDesc::Source => "Source".into(),
-        OpDesc::RowSource { chunk } => {
-            format!(
-                "RowSource {}",
-                slot_names(&stage.chunk_slots[*chunk], query)
-            )
-        }
+        OpDesc::Source => ("Source", String::new()),
+        OpDesc::RowSource { chunk } => ("RowSource", slot_names(&stage.chunk_slots[*chunk], query)),
         OpDesc::ArgSource { chunk, .. } => {
+            ("ArgSource", slot_names(&stage.chunk_slots[*chunk], query))
+        }
+        OpDesc::Scan { tables, chunk } => (
+            "Scan",
             format!(
-                "ArgSource {}",
-                slot_names(&stage.chunk_slots[*chunk], query)
-            )
-        }
-        OpDesc::Scan { tables, chunk } => format!(
-            "Scan {}: {}",
-            var(stage.chunk_slots[*chunk][0]),
-            node_tables_text(tables, schema)
+                "{}: {}",
+                var(stage.chunk_slots[*chunk][0]),
+                node_tables_text(tables, schema)
+            ),
         ),
-        OpDesc::IndexLookup { tables, key, chunk } => format!(
-            "IndexLookup {}: {} [id = {}]",
-            var(stage.chunk_slots[*chunk][0]),
-            node_tables_text(tables, schema),
-            expr_text(key, query)
+        OpDesc::IndexLookup { tables, key, chunk } => (
+            "IndexLookup",
+            format!(
+                "{}: {} [id = {}]",
+                var(stage.chunk_slots[*chunk][0]),
+                node_tables_text(tables, schema),
+                expr_text(key, query)
+            ),
         ),
-        OpDesc::Flatten { chunk } => {
-            format!("Flatten {}", slot_names(&stage.chunk_slots[*chunk], query))
-        }
+        OpDesc::Flatten { chunk } => ("Flatten", slot_names(&stage.chunk_slots[*chunk], query)),
         OpDesc::Expand {
             from,
             direction,
@@ -713,16 +734,15 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             chunk,
             degrees,
             ..
-        } => format!(
-            "{} {}",
+        } => (
             if *degrees { "ExpandCount" } else { "Expand" },
             rel_text(
                 var(*from),
                 var(stage.chunk_slots[*chunk][0]),
                 *direction,
                 rels,
-                schema
-            )
+                schema,
+            ),
         ),
         OpDesc::VarExpand {
             from,
@@ -757,15 +777,18 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             let gate = edge_filter.as_ref().map_or(String::new(), |expr| {
                 format!(" where {}", expr_text(expr, query))
             });
-            format!(
-                "VarExpand *{min}..{max}{mode}{sel} {}{pinned}{gate}",
-                rel_text(
-                    var(*from),
-                    var(stage.chunk_slots[*chunk][0]),
-                    *direction,
-                    rels,
-                    schema
-                )
+            (
+                "VarExpand",
+                format!(
+                    "*{min}..{max}{mode}{sel} {}{pinned}{gate}",
+                    rel_text(
+                        var(*from),
+                        var(stage.chunk_slots[*chunk][0]),
+                        *direction,
+                        rels,
+                        schema
+                    )
+                ),
             )
         }
         OpDesc::ExpandInto {
@@ -774,9 +797,9 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             direction,
             rels,
             ..
-        } => format!(
-            "ExpandInto {}",
-            rel_text(var(*from), var(*to), *direction, rels, schema)
+        } => (
+            "ExpandInto",
+            rel_text(var(*from), var(*to), *direction, rels, schema),
         ),
         OpDesc::AspJoin {
             from,
@@ -785,10 +808,13 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             rels,
             retain,
             ..
-        } => format!(
-            "AspJoin{} {}",
-            if retain.is_some() { " (retain)" } else { "" },
-            rel_text(var(*from), var(*to), *direction, rels, schema)
+        } => (
+            "AspJoin",
+            format!(
+                "{}{}",
+                if retain.is_some() { "(retain) " } else { "" },
+                rel_text(var(*from), var(*to), *direction, rels, schema)
+            ),
         ),
         OpDesc::MultiwayIntersect {
             seed,
@@ -801,29 +827,35 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             ..
         } => {
             let close = var(stage.chunk_slots[*chunk][0]);
-            format!(
-                "MultiwayIntersect {} & {}",
-                rel_text(
-                    var(*seed),
-                    close,
-                    *seed_dir,
-                    std::slice::from_ref(seed_step),
-                    schema
+            (
+                "MultiwayIntersect",
+                format!(
+                    "{} & {}",
+                    rel_text(
+                        var(*seed),
+                        close,
+                        *seed_dir,
+                        std::slice::from_ref(seed_step),
+                        schema
+                    ),
+                    rel_text(
+                        var(*probe),
+                        close,
+                        *probe_dir,
+                        std::slice::from_ref(probe_step),
+                        schema
+                    )
                 ),
-                rel_text(
-                    var(*probe),
-                    close,
-                    *probe_dir,
-                    std::slice::from_ref(probe_step),
-                    schema
-                )
             )
         }
-        OpDesc::Filter { expr, .. } => format!("Filter {}", expr_text(expr, query)),
-        OpDesc::Unwind { expr, chunk } => format!(
-            "Unwind {} AS {}",
-            expr_text(expr, query),
-            var(stage.chunk_slots[*chunk][0])
+        OpDesc::Filter { expr, .. } => ("Filter", expr_text(expr, query)),
+        OpDesc::Unwind { expr, chunk } => (
+            "Unwind",
+            format!(
+                "{} AS {}",
+                expr_text(expr, query),
+                var(stage.chunk_slots[*chunk][0])
+            ),
         ),
         OpDesc::TableFunction {
             func, rel, chunk, ..
@@ -833,9 +865,12 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
                 .map(|r| r.name.as_str())
                 .unwrap_or("?");
             let cols: Vec<&str> = stage.chunk_slots[*chunk].iter().map(|&s| var(s)).collect();
-            format!("Call {}({table}) YIELD {}", func.name(), cols.join(", "))
+            (
+                "Call",
+                format!("{}({table}) YIELD {}", func.name(), cols.join(", ")),
+            )
         }
-        OpDesc::BracketBegin => "BracketBegin".into(),
+        OpDesc::BracketBegin => ("BracketBegin", String::new()),
         OpDesc::BracketEnd { chunks, kind, .. } => {
             let slots: Vec<usize> = chunks
                 .iter()
@@ -850,14 +885,13 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
                 // listing says which one that is.
                 BracketKind::Mark { slot, negated } => {
                     let not = if *negated { "not " } else { "" };
-                    return format!(
-                        "Mark {not}{} into {}",
-                        slot_names(&slots, query),
-                        var(*slot)
+                    return (
+                        "Mark",
+                        format!("{not}{} into {}", slot_names(&slots, query), var(*slot)),
                     );
                 }
             };
-            format!("{name} {}", slot_names(&slots, query))
+            (name, slot_names(&slots, query))
         }
     }
 }
@@ -6118,8 +6152,10 @@ fn stage_profile(
             .copied()
             .flatten()
             .filter(|_| counts_rows(&stage.descs[i]));
+        let (kind, detail) = op_label(&stage.descs[i], stage, query, schema);
         ops.push(OpProfile {
-            name: op_name(&stage.descs[i], stage, query, schema),
+            kind,
+            detail,
             pulls: s.pulls,
             rows: s.rows,
             flat: s.flat,
@@ -6493,7 +6529,8 @@ mod tests {
     #[test]
     fn a_ceiling_is_violated_by_a_factor_and_never_by_a_rounding() {
         let op = |flat, bnd| OpProfile {
-            name: "Expand".into(),
+            kind: "Expand",
+            detail: String::new(),
             pulls: 1,
             rows: flat,
             flat,
@@ -6971,7 +7008,7 @@ mod tests {
             no_wcoj(),
         );
         assert_eq!(int_rows(&r), [[1]]);
-        let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
+        let names: Vec<String> = p.stages[0].ops.iter().map(OpProfile::name).collect();
         assert!(
             names.iter().any(|n| n.starts_with("AspJoin (retain)")),
             "got: {names:?}"
@@ -7079,7 +7116,7 @@ mod tests {
         let (r, p) =
             execute_profiled(&plan, &query, &schema, &mut graph, &[], &options).expect("execute");
         assert_eq!(int_rows(&r), [[2]]);
-        let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
+        let names: Vec<String> = p.stages[0].ops.iter().map(OpProfile::name).collect();
         assert!(
             names
                 .iter()
@@ -7099,7 +7136,7 @@ mod tests {
             no_wcoj(),
         );
         assert_eq!(int_rows(&r), [[0, 1, 2]]);
-        let names: Vec<&str> = p.stages[0].ops.iter().map(|o| o.name.as_str()).collect();
+        let names: Vec<String> = p.stages[0].ops.iter().map(OpProfile::name).collect();
         assert!(
             names
                 .iter()
@@ -7122,8 +7159,8 @@ mod tests {
         }
     }
 
-    fn op_names(p: &Profile) -> Vec<&str> {
-        p.stages[0].ops.iter().map(|o| o.name.as_str()).collect()
+    fn op_names(p: &Profile) -> Vec<String> {
+        p.stages[0].ops.iter().map(OpProfile::name).collect()
     }
 
     #[test]
@@ -8294,7 +8331,7 @@ mod tests {
         assert_eq!(stage.sink, "Project");
         assert_eq!(stage.out_rows, 2);
         assert!(stage.nanos > 0);
-        let names: Vec<&str> = stage.ops.iter().map(|o| o.name.as_str()).collect();
+        let names: Vec<String> = stage.ops.iter().map(OpProfile::name).collect();
         assert_eq!(
             names,
             [
@@ -8322,16 +8359,16 @@ mod tests {
         assert_eq!(stage.sink, "Aggregate");
         assert_eq!(stage.out_rows, 1);
         let expand_c = stage.ops.last().expect("ops");
-        assert_eq!(expand_c.name, "ExpandCount (b)-[:KNOWS]->(c)");
+        assert_eq!(expand_c.name(), "ExpandCount (b)-[:KNOWS]->(c)");
         // One pull for the whole absorbed neighbor vector of node 0,
         // reporting three counted paths without materializing a list:
         // the count-to-degree rewrite at work.
         assert_eq!((expand_c.pulls, expand_c.rows), (1, 3));
         // No flatten sits between the two expands anymore.
         assert!(
-            !stage.ops.iter().any(|o| o.name == "Flatten b"),
+            !stage.ops.iter().any(|o| o.name() == "Flatten b"),
             "absorbed source still flattens: {:?}",
-            stage.ops.iter().map(|o| &o.name).collect::<Vec<_>>()
+            stage.ops.iter().map(OpProfile::name).collect::<Vec<_>>()
         );
     }
 
@@ -8456,7 +8493,7 @@ mod tests {
                 .stages
                 .iter()
                 .flat_map(|s| &s.ops)
-                .any(|o| o.name.starts_with("ExpandCount"));
+                .any(|o| o.kind == "ExpandCount");
             assert_eq!(got, want, "query: {q}");
         }
     }
@@ -8478,7 +8515,7 @@ mod tests {
         let scan = p.stages[0]
             .ops
             .iter()
-            .find(|o| o.name.starts_with("Scan"))
+            .find(|o| o.kind == "Scan")
             .expect("scan op");
         assert_eq!((scan.pulls, scan.rows), (1, 6));
     }

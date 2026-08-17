@@ -251,6 +251,21 @@ jobs:
       # it.
       - run: ZU_GATE=1 cargo bench -p zu --bench relprops
 
+  write:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The G3 write gate: what one write statement costs in latency,
+      # throughput, bytes pushed at the disk, bytes the store grew by and
+      # memory, for a SET of one property and an INSERT of one element.
+      # Two of the seven ceilings are ratios between the same statement
+      # at ten thousand rows and at a hundred thousand, so a shared
+      # runner cannot move those; the absolute ones are set for a box
+      # whose fdatasync is several times slower than a laptop's.
+      - run: ZU_GATE=1 cargo bench -p zu --bench write
+
   connect:
     runs-on: ubuntu-latest
     steps:

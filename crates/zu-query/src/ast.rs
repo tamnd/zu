@@ -190,6 +190,13 @@ pub enum Clause {
     Insert {
         patterns: Vec<PathPattern>,
     },
+    /// `SET p.age = 37`, the statement that changes what an element
+    /// already there holds (ISO 13.3). The element is named by a
+    /// variable an earlier clause bound, because a statement changes
+    /// what it found rather than what it can describe.
+    Set {
+        items: Vec<SetItem>,
+    },
     Unwind {
         expr: Expr,
         alias: String,
@@ -210,6 +217,21 @@ pub enum Clause {
     Return {
         projection: Projection,
     },
+}
+
+/// One assignment under `SET`: the element it changes, the property it
+/// writes, and what that property takes.
+///
+/// The value is an expression like any other, so it is evaluated once
+/// for every row the clauses before the `SET` answered and can read
+/// the element it is about to change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetItem {
+    /// The variable standing for the element, which an earlier clause
+    /// bound.
+    pub target: String,
+    pub key: String,
+    pub value: Expr,
 }
 
 /// The shared shape of `WITH` and `RETURN`.

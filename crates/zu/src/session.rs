@@ -312,18 +312,36 @@ impl Session {
                 &options,
             )?
             .rows;
-            let mut batch = crate::insert::Batch::open(self.graph.file_mut(), write)?;
-            let mut next = Vec::with_capacity(rows.len());
-            for row in &rows {
-                // The row holds the slots the write carries across it
-                // and then the property values, which is the order the
-                // projection at the end of this part wrote them in.
-                let (carry, props) = row.split_at(write.carry.len());
-                let made = batch.row(carry, props)?;
-                next.push(Value::List(carry.iter().cloned().chain(made).collect()));
-            }
-            let (new, edges) = batch.staged();
-            self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
+            // The row holds the slots the write carries across it and
+            // then the values it wrote, which is the order the
+            // projection at the end of this part wrote them in.
+            let carry = write.carry().len();
+            let next = match write {
+                crate::split::Write::Insert(insert) => {
+                    let mut batch = crate::insert::Batch::open(self.graph.file_mut(), insert)?;
+                    let mut next = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let (carried, props) = row.split_at(carry);
+                        let made = batch.row(carried, props)?;
+                        next.push(Value::List(carried.iter().cloned().chain(made).collect()));
+                    }
+                    let (new, edges) = batch.staged();
+                    self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
+                    next
+                }
+                crate::split::Write::Set(set) => {
+                    let mut changes = crate::set::Changes::open(set);
+                    let mut next = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let (carried, values) = row.split_at(carry);
+                        changes.row(self.graph.file_mut(), carried, values)?;
+                        next.push(Value::List(carried.to_vec()));
+                    }
+                    let updates = changes.staged();
+                    self.write(|txn| crate::set::stage(txn, &updates))?;
+                    next
+                }
+            };
             carried = Some(Value::List(next));
         }
         unreachable!("the last part of a split statement writes nothing")

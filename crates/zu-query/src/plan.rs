@@ -16,8 +16,8 @@ use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{
-    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, Func,
-    MatchKind, Schema, TableFunc,
+    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetItem,
+    Func, MatchKind, Schema, TableFunc,
 };
 
 /// What a bracket does with an outer row the operators inside it
@@ -170,6 +170,19 @@ pub enum LogicalPlan {
         nodes: Vec<BoundInsertNode>,
         rels: Vec<BoundInsertRel>,
     },
+    /// Changes what the elements a row already holds hold, one row at a
+    /// time, and hands the row on unchanged.
+    ///
+    /// This is the shape of the statement the same way
+    /// [`LogicalPlan::Insert`] is, and the session runs it the same
+    /// way: the operators under it answer the rows the write runs for,
+    /// the write runs once for each of them, and the operators above it
+    /// read the rows back. A row out is the row in, because a statement
+    /// that changes an element binds nothing new.
+    Set {
+        input: Box<LogicalPlan>,
+        items: Vec<BoundSetItem>,
+    },
     /// A table function source: the engine kernel runs once over `rel`
     /// and yields one row per node of its domain, node slot first.
     TableFunction {
@@ -277,6 +290,12 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                     input: plan.boxed(),
                     nodes: nodes.clone(),
                     rels: rels.clone(),
+                };
+            }
+            BoundClause::Set { items, .. } => {
+                plan = LogicalPlan::Set {
+                    input: plan.boxed(),
+                    items: items.clone(),
                 };
             }
             BoundClause::Unwind { expr, slot } => {
@@ -625,6 +644,21 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 )
             }));
             let _ = writeln!(out, "{pad}Insert {}", written.join(", "));
+            render(input, query, schema, depth + 1, out);
+        }
+        LogicalPlan::Set { input, items } => {
+            let written: Vec<String> = items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{}.{} = {}",
+                        slot_name(query, item.target),
+                        item.key,
+                        expr_text(&item.value, query)
+                    )
+                })
+                .collect();
+            let _ = writeln!(out, "{pad}Set {}", written.join(", "));
             render(input, query, schema, depth + 1, out);
         }
         LogicalPlan::TableFunction {

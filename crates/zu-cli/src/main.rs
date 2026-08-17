@@ -680,14 +680,17 @@ fn copy(
     // as some other edge's value.
     //
     // An edge list with no columns sorts its pairs directly, which is
-    // the ingest hot path and has no permutation to report, and drops a
-    // duplicate pair because there the second copy says nothing the
-    // first did not. With columns the duplicate is refused instead: one
+    // the ingest hot path and has no permutation to report. It keeps a
+    // repeated pair: a second copy is a second edge, and dropping it
+    // changes degree, which changes every answer that divides by degree.
+    // The GAP generators emit repeats on purpose and a pagerank over a
+    // file loaded without them is off by 4e-4, outside the tolerance the
+    // LDBC harness compares at. With columns the repeat is refused
+    // instead: the pair is the address of an edge property and one
     // ordinal cannot answer with two values.
     let mut sorted = edges;
     let columns: Vec<zu::zu1::props::OwnedColumn> = if columns.is_empty() {
         sorted.sort_unstable();
-        sorted.dedup();
         Vec::new()
     } else {
         let order = zu::zu1::reorder::load_order(&mut sorted);
@@ -1823,8 +1826,8 @@ mod tests {
 
     /// The pair is the address of an edge property, so a file that
     /// names the same pair twice has two values for one ordinal. A bare
-    /// edge list still drops the duplicate, because there the second
-    /// copy says nothing the first did not.
+    /// edge list keeps both, because two lines are two edges and the
+    /// degree that comes out of them is what a kernel divides by.
     #[cfg(feature = "arrow")]
     #[test]
     fn a_duplicate_edge_with_properties_is_refused() {
@@ -1866,6 +1869,13 @@ mod tests {
             ),
             ExitCode::SUCCESS
         );
+        let mut db = zu::zu1::file::Zu1File::open(&plain_db).expect("open");
+        let mut reader = zu::zu1::graph::GraphReader::load(&mut db).expect("reader");
+        let out = reader
+            .neighbors_dir(&mut db, 1, zu::zu1::graph::Direction::Fwd)
+            .expect("neighbors")
+            .to_vec();
+        assert_eq!(out, [2, 2], "both copies of the pair are stored");
     }
 
     /// A csv rel file written the way a bulk loader is handed one, with

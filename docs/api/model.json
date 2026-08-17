@@ -2961,6 +2961,19 @@
       "signature": "usize"
     },
     {
+      "id": "zu::zu1::algo::PAGERANK_MAX_ITERATIONS",
+      "kind": "constant",
+      "name": "PAGERANK_MAX_ITERATIONS",
+      "signature": "usize"
+    },
+    {
+      "id": "zu::zu1::algo::PAGERANK_TOLERANCE",
+      "kind": "constant",
+      "name": "PAGERANK_TOLERANCE",
+      "signature": "f64",
+      "doc": "Where the converging form stops. The tolerance is the largest a\nsingle rank moves in a round, the cap is what a run costs on a\ngraph that will not settle. A fixed twenty rounds is the right rule\nonly against a published reference produced the same way; asked for\nthe pagerank of a graph with nothing to match, twenty rounds is\nabout 3.4e-4 off the converged answer, which is outside the 1e-4\nthe LDBC harness compares at. These two are what that harness uses\nfor its own reference."
+    },
+    {
       "id": "zu::zu1::algo::Walk",
       "kind": "enum",
       "name": "Walk",
@@ -2999,7 +3012,7 @@
       "kind": "function",
       "name": "lcc",
       "signature": "fn lcc(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader) -> zu_common::Result<Vec<f64>>",
-      "doc": "Local clustering coefficient over the directed graph: for a node\nwhose neighbor set is the union of its out and in neighbors without\nitself, the number of stored edges running from one neighbor to\nanother over `d * (d - 1)`, the count of ordered pairs. Fewer than\ntwo neighbors scores zero, there being no pair to close.\n\nParallel edges count as many times as they are stored, and a self\nloop on a neighbor closes nothing, which is what the Graphalytics\nreference counts."
+      "doc": "Local clustering coefficient over the directed graph: for a node\nwhose neighbor set is the union of its out and in neighbors without\nitself, the number of stored edges running from one neighbor to\nanother over `d * (d - 1)`, the count of ordered pairs. Fewer than\ntwo neighbors scores zero, there being no pair to close.\n\nA pair of neighbors closes the triangle once however many edges run\nbetween them, and a self loop on a neighbor closes nothing. Counting\na parallel edge again would put the coefficient of a node above one,\nwhich is not a thing a coefficient does."
     },
     {
       "id": "zu::zu1::algo::louvain",
@@ -3013,7 +3026,14 @@
       "kind": "function",
       "name": "pagerank",
       "signature": "fn pagerank(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, iterations: usize) -> zu_common::Result<Vec<f64>>",
-      "doc": "PageRank by power iteration over the forward CSR: fixed iteration\ncount, dangling mass redistributed uniformly, ranks summing to one."
+      "doc": "PageRank by power iteration over the forward CSR: fixed iteration\ncount, dangling mass redistributed uniformly, ranks summing to one.\nThis is the form that matches a published Graphalytics reference,\nwhich is itself the same loop run the same number of times."
+    },
+    {
+      "id": "zu::zu1::algo::pagerank_converged",
+      "kind": "function",
+      "name": "pagerank_converged",
+      "signature": "fn pagerank_converged(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader) -> zu_common::Result<Vec<f64>>",
+      "doc": "PageRank run until it settles rather than until a counter runs out:\nstops when no rank moves by more than [`PAGERANK_TOLERANCE`] in a\nround, and gives up at [`PAGERANK_MAX_ITERATIONS`]. This is what a\nquery asking for the pagerank of a graph wants, there being no\nfixed-round reference on the other side of it to match."
     },
     {
       "id": "zu::zu1::algo::sssp",

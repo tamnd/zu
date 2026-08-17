@@ -27,6 +27,7 @@ mod help;
 mod highlight;
 mod keys;
 mod line;
+mod meta;
 mod page;
 mod repl;
 mod scoreboard;
@@ -1363,46 +1364,66 @@ fn render_table(r: &QueryResult) -> String {
         .iter()
         .map(|row| row.iter().map(display_value).collect())
         .collect();
-    let widths: Vec<usize> = r
-        .columns
+    let headers: Vec<&str> = r.columns.iter().map(String::as_str).collect();
+    let mut out = aligned(&headers, &cells);
+    let n = r.rows.len();
+    let _ = writeln!(out, "({n} row{})", if n == 1 { "" } else { "s" });
+    out
+}
+
+/// A header and its rows in columns, two spaces apart, every column as
+/// wide as the widest thing in it.
+///
+/// Width is counted in columns rather than in bytes or in characters,
+/// because a name in Japanese takes two columns per character and a
+/// table aligned by either of the other two counts is a table that only
+/// looks aligned in ASCII. A row ends where its last cell does, padding
+/// and all, so nothing carries trailing space into a pipe or into a
+/// diff.
+///
+/// The backslash commands render through here as well, which is the
+/// reason it is a function: `\d` and a result are the same kind of
+/// thing on a screen and should not be two kinds of thing in the code.
+pub(crate) fn aligned(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let widths: Vec<usize> = headers
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            cells
-                .iter()
+            rows.iter()
                 .filter_map(|row| row.get(i))
-                .map(String::len)
-                .chain(std::iter::once(c.len()))
+                .map(|cell| line::columns(cell))
+                .chain(std::iter::once(line::columns(c)))
                 .max()
                 .unwrap_or(0)
         })
         .collect();
     let mut out = String::new();
-    let line = |out: &mut String, row: &[String]| {
+    let write = |out: &mut String, row: &[&str]| {
+        let mut text = String::new();
         for (i, cell) in row.iter().enumerate() {
             if i > 0 {
-                out.push_str("  ");
+                text.push_str("  ");
             }
             let pad = widths
                 .get(i)
                 .copied()
                 .unwrap_or(0)
-                .saturating_sub(cell.len());
-            out.push_str(cell);
+                .saturating_sub(line::columns(cell));
+            text.push_str(cell);
             if i + 1 < row.len() {
                 for _ in 0..pad {
-                    out.push(' ');
+                    text.push(' ');
                 }
             }
         }
+        out.push_str(text.trim_end());
         out.push('\n');
     };
-    line(&mut out, &r.columns);
-    for row in &cells {
-        line(&mut out, row);
+    write(&mut out, headers);
+    for row in rows {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        write(&mut out, &cells);
     }
-    let n = r.rows.len();
-    let _ = writeln!(out, "({n} row{})", if n == 1 { "" } else { "s" });
     out
 }
 

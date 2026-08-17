@@ -24,6 +24,7 @@ use zu::session::Session;
 use crate::complete::Names;
 use crate::keys::{self, Decoded};
 use crate::line::{Editor, Step};
+use crate::meta::{self, Column, Command};
 use crate::page::{self, Move, Pager};
 use crate::term::{self, Raw};
 
@@ -46,8 +47,13 @@ enum Line {
 /// Runs the interactive shell until the user leaves it.
 pub(crate) fn run(session: &mut Session, path: &str) -> ExitCode {
     let version = crate::VERSION;
-    println!("zu {version}, {path}. Ctrl-J for a new line, quit or Ctrl-D to leave.");
+    println!(
+        "zu {version}, {path}. Ctrl-J for a new line, \\? for the commands, quit or Ctrl-D to leave."
+    );
     let mut editor = Editor::new(crate::highlight::wanted());
+    // Off until asked for, because a time printed under every answer is
+    // a line of noise to everybody who did not want to know.
+    let mut timing = false;
     // Gathered here and again after every statement, since a statement
     // is how a table or a label comes into being and a completion that
     // did not know about the graph just created would be a completion
@@ -71,11 +77,20 @@ pub(crate) fn run(session: &mut Session, path: &str) -> ExitCode {
                 if matches!(statement.to_ascii_lowercase().as_str(), "quit" | "exit") {
                     return ExitCode::SUCCESS;
                 }
-                let text = answer(session, &statement);
+                // A backslash line is answered here and never reaches
+                // the engine, which is why it is asked about first.
+                let text = match meta::parse(&statement) {
+                    Some(Command::Quit) => return ExitCode::SUCCESS,
+                    Some(command) => backslash(session, command, &mut timing),
+                    None => timed(session, &statement, timing).0,
+                };
                 if let Err(e) = show(&text) {
                     eprintln!("zu shell: {e}");
                     return ExitCode::from(3);
                 }
+                // A statement is how a table comes into being and a
+                // file read by `\i` is how a hundred do, so the names
+                // are gathered again after either.
                 names = self::names(session);
             }
         }
@@ -117,6 +132,107 @@ fn names(session: &Session) -> Names {
     names
 }
 
+/// Answers a backslash command, as the text that goes under the prompt.
+///
+/// The catalog is what all but two of them read, and the two that do
+/// not are a toggle and a file. Nothing here can fail in a way that
+/// should end the shell: a file that will not open is a sentence, the
+/// same as a statement that will not parse.
+fn backslash(session: &mut Session, command: Command<'_>, timing: &mut bool) -> String {
+    let catalog = session.catalog();
+    match command {
+        Command::Help => meta::help(),
+        Command::Tables => meta::tables(catalog),
+        Command::Graphs => meta::graphs(catalog),
+        Command::Describe(name) => {
+            let columns = columns(session, name);
+            meta::describe(session.catalog(), name, &columns)
+        }
+        Command::Timing(set) => {
+            *timing = set.unwrap_or(!*timing);
+            format!("timing is {}\n", if *timing { "on" } else { "off" })
+        }
+        Command::Include(path) => include(session, path, *timing),
+        // Handled by the caller, which is the one that can leave.
+        Command::Quit => String::new(),
+        Command::Wrong(message) => format!("{message}\n"),
+    }
+}
+
+/// The columns of one table, as the file stores them.
+///
+/// The property directory rather than the graph type, because the
+/// directory is what the file has: a table loaded from a CSV has
+/// columns and no declared type, and a `\d` that answered from the
+/// declarations alone would tell that user their table is empty. A
+/// table with no properties, and one whose directory will not read,
+/// both come back with nothing, since the shape printed above the
+/// columns is worth having either way.
+fn columns(session: &mut Session, name: &str) -> Vec<Column> {
+    let catalog = session.catalog();
+    let node = catalog.node_by_name(name).map(|t| t.id);
+    let rel = catalog.rel_by_name(name).map(|t| t.id);
+    let db = session.file_mut();
+    let directory = match (node, rel) {
+        (Some(id), _) => zu::zu1::props::load_props(db, id),
+        (_, Some(id)) => zu::zu1::props::load_rel_props(db, id),
+        _ => return Vec::new(),
+    };
+    let Ok(Some(directory)) = directory else {
+        return Vec::new();
+    };
+    directory
+        .columns
+        .iter()
+        .map(|c| Column {
+            name: c.name.clone(),
+            ty: c.ty.to_string(),
+            nullable: c.validity.is_some(),
+        })
+        .collect()
+}
+
+/// Runs the statements in a file and gathers what they answered.
+///
+/// It stops at the first failure and says which statement that was,
+/// because a file is a program: the statement after a failed one was
+/// written expecting it to have worked, and running it anyway turns one
+/// error into a page of them. A statement at the prompt is not a
+/// program and does not stop anything.
+fn include(session: &mut Session, path: &str, timing: bool) -> String {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return format!("cannot read {path}: {e}\n"),
+    };
+    let statements = meta::statements(&text);
+    let total = statements.len();
+    let mut out = String::new();
+    for (i, statement) in statements.iter().enumerate() {
+        let (answered, ok) = timed(session, statement, timing);
+        out.push_str(&answered);
+        if !ok {
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("stopped at statement {} of {total}\n", i + 1),
+            );
+            return out;
+        }
+    }
+    out.push_str(&meta::count(total, "statement"));
+    out
+}
+
+/// Runs one statement, with the time it took underneath when timing is
+/// on, and says whether it worked.
+fn timed(session: &mut Session, statement: &str, timing: bool) -> (String, bool) {
+    let start = std::time::Instant::now();
+    let (mut text, ok) = answer(session, statement);
+    if timing {
+        text.push_str(&meta::took(start.elapsed()));
+    }
+    (text, ok)
+}
+
 /// Runs one statement and renders whatever came back, result or
 /// failure, as the text that goes under the prompt.
 ///
@@ -125,7 +241,7 @@ fn names(session: &Session) -> Names {
 /// the thing they can act on, and neither is a substitute for the
 /// other. Notices print the same way: a statement that succeeded while
 /// raising something should not look like one that raised nothing.
-fn answer(session: &mut Session, statement: &str) -> String {
+fn answer(session: &mut Session, statement: &str) -> (String, bool) {
     match session.run(statement, &[]) {
         Ok(r) => {
             let mut out = String::new();
@@ -137,11 +253,11 @@ fn answer(session: &mut Session, statement: &str) -> String {
                 ));
             }
             out.push_str(&crate::render_table(&r));
-            out
+            (out, true)
         }
         Err(e) => match e.diagnostic() {
-            Some(d) => format!("error {} {}\n", d.status.code(), d.detail),
-            None => format!("error {e}\n"),
+            Some(d) => (format!("error {} {}\n", d.status.code(), d.detail), false),
+            None => (format!("error {e}\n"), false),
         },
     }
 }

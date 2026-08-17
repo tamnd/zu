@@ -4,46 +4,71 @@
 //! specified in `docs/10-api-and-tooling.md` and land with their layers.
 //! Argument parsing is hand-rolled: the surface is small and T7 caps the
 //! binary at 15 MiB, so no clap.
+//!
+//! What every command has in common lives here: the `--format` flag,
+//! read the same way everywhere so a caller does not have to learn a
+//! command's own spelling of it, and the exit codes dx/12 §7 fixes,
+//! derived from the error rather than chosen at the call site. The help
+//! is generated from one table in [`help`], which is also where a usage
+//! line comes from, so the message a wrong command line prints is the
+//! line the documentation gave.
 
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
 use zu::query::{QueryResult, Value};
 use zu::{DiagnosticRecord, Severity};
+use zu_json::Json;
 
 mod conformance;
 mod corpus;
+mod help;
 mod scoreboard;
 mod shell;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const QUERY_USAGE: &str = "zu query <file.zu1> -c <zuQL> [--format table|json] [-p name=value ...]";
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `zu <command> --help` is that command's page, wherever the flag
+    // sits on the line, because someone unsure of the arguments types it
+    // after them as often as before. It is read before the command runs
+    // and not by the command itself, so every command has it and none of
+    // them has to remember to.
+    if let Some(name) = args.first()
+        && args[1..].iter().any(|a| a == "--help" || a == "-h")
+        && let Some(command) = help::find(name)
+    {
+        print!("{}", help::page(command));
+        return ExitCode::SUCCESS;
+    }
     match args.first().map(String::as_str) {
-        Some("--version" | "-V" | "version") => {
+        // One line, because that is what `--version` is for and what a
+        // script greps. The fuller report, with the ABI revision and
+        // what this build supports, is the `version` subcommand, which
+        // is the one dx/12 §1 gives a `--format json`.
+        Some("--version" | "-V") => {
             println!("zu {VERSION}");
             ExitCode::SUCCESS
         }
-        Some("--help" | "-h" | "help") | None => {
-            print_usage();
-            ExitCode::SUCCESS
-        }
+        Some("--help" | "-h" | "help") | None => help_command(&args[1..]),
+        Some("version") => version_command(&args[1..]),
         Some("stat") => stat_command(&args[1..]),
+        // One argument, and a flag is not it. Without the second half a
+        // mistyped flag is opened as a file, and the report is the
+        // operating system's opinion of a filename that starts with two
+        // dashes rather than this command's own synopsis.
         Some("analyze") => match args.get(1) {
-            Some(path) => analyze(std::path::Path::new(path)),
-            None => usage_error("zu analyze <file.zu1>"),
+            Some(path) if args.len() == 2 && !path.starts_with('-') => {
+                analyze(std::path::Path::new(path))
+            }
+            _ => usage_error("analyze"),
         },
         Some("query") => query_command(&args[1..]),
         Some("shell") => shell::shell_command(&args[1..]),
         Some("conformance") => conformance::conformance_command(&args[1..]),
         Some("corpus") => corpus::corpus_command(&args[1..]),
-        Some("verify") => match args.get(1) {
-            Some(path) => verify(std::path::Path::new(path)),
-            None => usage_error("zu verify <file.zu1>"),
-        },
+        Some("verify") => verify_command(&args[1..]),
         Some("neighbors") => {
             let mut rest = &args[1..];
             let mut dir = zu::zu1::graph::Direction::Fwd;
@@ -63,12 +88,12 @@ fn main() -> ExitCode {
                 (Some(path), Some(node)) => {
                     neighbors(std::path::Path::new(path), node, dir, by_key)
                 }
-                _ => usage_error("zu neighbors [--in] [--key] <file.zu1> <node>"),
+                _ => usage_error("neighbors"),
             }
         }
         Some("lookup") => match (args.get(1), args.get(2).and_then(|s| s.parse::<u64>().ok())) {
             (Some(path), Some(key)) => lookup(std::path::Path::new(path), key),
-            _ => usage_error("zu lookup <file.zu1> <key>"),
+            _ => usage_error("lookup"),
         },
         Some("edge") => {
             let mut rest = &args[1..];
@@ -85,82 +110,167 @@ fn main() -> ExitCode {
                 (Some(path), Some(src), Some(dst)) => {
                     edge(std::path::Path::new(path), src, dst, dir)
                 }
-                _ => usage_error("zu edge [--in] <file.zu1> <src> <dst>"),
+                _ => usage_error("edge"),
             }
         }
-        Some("copy") => {
-            let mut reorder = zu::zu1::reorder::Reorder::None;
-            let mut rest = &args[1..];
-            if rest.first().map(String::as_str) == Some("--reorder") {
-                match rest
-                    .get(1)
-                    .and_then(|s| zu::zu1::reorder::Reorder::parse(s))
-                {
-                    Some(r) => reorder = r,
-                    None => {
-                        return usage_error(
-                            "zu copy [--reorder degree|bfs|none] <edges.txt> <out.zu1>",
-                        );
-                    }
-                }
-                rest = &rest[2..];
-            }
-            match (rest.first(), rest.get(1)) {
-                (Some(edges), Some(out)) => copy(
-                    std::path::Path::new(edges),
-                    std::path::Path::new(out),
-                    reorder,
-                ),
-                _ => usage_error(
-                    "zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1>",
-                ),
-            }
+        Some("copy") => copy_command(&args[1..]),
+        Some("convert") => convert_command(&args[1..]),
+        // A command dx/12 §1 specifies and this build does not have yet
+        // says so, rather than sharing the message a typo gets. The two
+        // are different mistakes: one is a user reading ahead of the
+        // implementation and the other is a user reading their own
+        // keyboard, and only the second is helped by the command list.
+        Some(cmd) if help::PLANNED.contains(&cmd) => {
+            eprintln!("zu: `{cmd}` is specified and not in this build yet");
+            ExitCode::from(2)
         }
-        Some("convert") => match (args.get(1), args.get(2)) {
-            (Some(input), Some(output)) => {
-                convert(std::path::Path::new(input), std::path::Path::new(output))
-            }
-            _ => usage_error(
-                "zu convert <edges.txt|csv|parquet|db.zu1|db.db> <out.csv|parquet|db.zu1|db.db>",
-            ),
-        },
         Some(cmd) => {
-            eprintln!("zu: unknown command '{cmd}' (commands arrive with their milestones)");
-            ExitCode::FAILURE
+            eprintln!("zu: unknown command '{cmd}', `zu --help` lists them");
+            ExitCode::from(2)
         }
     }
 }
 
-const STAT_USAGE: &str = "zu stat <file.zu1> [--format text|json]";
+/// How a command was asked to print: for a person, or for whatever is
+/// reading the pipe.
+///
+/// Two variants and not one per name, because `--format table` on
+/// `query` and `--format text` on `stat` are the same intent spelled
+/// for the shape of the output. What names a command answers to is in
+/// its synopsis, which is the one place a user looks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Text,
+    Json,
+}
 
-/// Parses the `stat` argument list.
-fn stat_command(args: &[String]) -> ExitCode {
-    let mut path: Option<&str> = None;
-    let mut json = false;
+/// What the commands that print a plain report answer to.
+const TEXT_OR_JSON: &[(&str, Format)] = &[("text", Format::Text), ("json", Format::Json)];
+
+/// Pulls `--format <name>` out of an argument list and hands back the
+/// positional arguments in order.
+///
+/// `names` is what this command answers to, its first entry the
+/// default, so a format it does not have is a usage error listing the
+/// ones it does rather than a silent fall back to text. Every mistake
+/// comes back as `None`, because every one of them ends at the same
+/// usage line, and that line is where the accepted names are written.
+fn take_format<'a>(args: &'a [String], names: &[(&str, Format)]) -> Option<(Format, Vec<&'a str>)> {
+    let mut format = names.first()?.1;
+    let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--format" | "-f" => match args.get(i + 1).map(String::as_str) {
-                Some("text") => i += 2,
-                Some("json") => {
-                    json = true;
-                    i += 2;
-                }
-                _ => return usage_error(STAT_USAGE),
-            },
-            arg if arg.starts_with('-') => return usage_error(STAT_USAGE),
-            arg if path.is_none() => {
-                path = Some(arg);
+            "--format" | "-f" => {
+                let asked = args.get(i + 1)?.as_str();
+                format = names.iter().find(|(n, _)| *n == asked).map(|(_, f)| *f)?;
+                i += 2;
+            }
+            arg if arg.starts_with('-') => return None,
+            arg => {
+                rest.push(arg);
                 i += 1;
             }
-            _ => return usage_error(STAT_USAGE),
         }
     }
-    let Some(path) = path else {
-        return usage_error(STAT_USAGE);
+    Some((format, rest))
+}
+
+/// `zu --help`, `zu help <command>`, and `zu --help --format json`.
+fn help_command(args: &[String]) -> ExitCode {
+    let Some((format, rest)) = take_format(args, TEXT_OR_JSON) else {
+        return usage_error("help");
     };
-    let path = std::path::Path::new(path);
-    if json { stat_json(path) } else { stat(path) }
+    match (format, rest.first()) {
+        (Format::Json, _) => print!("{}", help::json(VERSION)),
+        (Format::Text, None) => print!("{}", help::overview(VERSION)),
+        (Format::Text, Some(name)) => match help::find(name) {
+            Some(command) => print!("{}", help::page(command)),
+            None => {
+                eprintln!("zu: unknown command '{name}', `zu --help` lists them");
+                return ExitCode::from(2);
+            }
+        },
+    }
+    ExitCode::SUCCESS
+}
+
+/// What this build is, in the four parts dx/12 §1 asks for: the
+/// version, the C ABI revision, the features it was compiled with, and
+/// the engines it can read and write.
+///
+/// A binding or an installer reads this to decide whether the thing it
+/// found on the PATH is the thing it needs, which is why the ABI
+/// revision is here and not only in the header: the header is on disk
+/// for whoever compiles against it, and this is for whoever does not.
+fn version_command(args: &[String]) -> ExitCode {
+    let Some((format, rest)) = take_format(args, TEXT_OR_JSON) else {
+        return usage_error("version");
+    };
+    if !rest.is_empty() {
+        return usage_error("version");
+    }
+    let features: Vec<&str> = if cfg!(feature = "arrow") {
+        vec!["arrow"]
+    } else {
+        Vec::new()
+    };
+    // Both are compiled in rather than optional: zu1 is the format and
+    // sqlite is the other end of `convert`, which needs no feature
+    // because it is a reader and a writer we wrote.
+    let engines = ["zu1", "sqlite"];
+    match format {
+        Format::Text => {
+            println!("zu {VERSION}");
+            println!("c abi {}", zu::C_ABI_VERSION);
+            println!("zu1 format {}", zu::zu1::FORMAT_VERSION);
+            println!(
+                "features: {}",
+                if features.is_empty() {
+                    "none".to_owned()
+                } else {
+                    features.join(", ")
+                }
+            );
+            println!("engines: {}", engines.join(", "));
+        }
+        Format::Json => {
+            let strings =
+                |items: &[&str]| Json::Arr(items.iter().map(|s| Json::Str((*s).into())).collect());
+            println!(
+                "{}",
+                Json::Obj(vec![
+                    ("zu".into(), Json::Str(VERSION.into())),
+                    ("c_abi".into(), Json::Str(zu::C_ABI_VERSION.into())),
+                    (
+                        "format_version".into(),
+                        Json::Int(i64::from(zu::zu1::FORMAT_VERSION)),
+                    ),
+                    ("features".into(), strings(&features)),
+                    ("engines".into(), strings(&engines)),
+                ])
+                .to_compact()
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Parses the `stat` argument list.
+fn stat_command(args: &[String]) -> ExitCode {
+    let Some((format, rest)) = take_format(args, TEXT_OR_JSON) else {
+        return usage_error("stat");
+    };
+    match (rest.first(), rest.len()) {
+        (Some(path), 1) => {
+            let path = std::path::Path::new(path);
+            match format {
+                Format::Text => stat(path),
+                Format::Json => stat_json(path),
+            }
+        }
+        _ => usage_error("stat"),
+    }
 }
 
 /// The size breakdown, as three lines a person reads in the order they
@@ -428,12 +538,52 @@ fn read_edges_with_props(
     }
 }
 
+/// Parses the `copy` argument list.
+///
+/// `--reorder` takes a value and belongs to this command alone, so it
+/// comes off the line first and the shared parse sees what is left. The
+/// alternative is a second spelling of `--format` here, and two
+/// spellings of a flag are two behaviors eventually.
+fn copy_command(args: &[String]) -> ExitCode {
+    let mut reorder = zu::zu1::reorder::Reorder::None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--reorder" {
+            match args
+                .get(i + 1)
+                .and_then(|s| zu::zu1::reorder::Reorder::parse(s))
+            {
+                Some(r) => reorder = r,
+                None => return usage_error("copy"),
+            }
+            i += 2;
+        } else {
+            rest.push(args[i].clone());
+            i += 1;
+        }
+    }
+    let Some((format, positional)) = take_format(&rest, TEXT_OR_JSON) else {
+        return usage_error("copy");
+    };
+    match positional[..] {
+        [edges, out] => copy(
+            std::path::Path::new(edges),
+            std::path::Path::new(out),
+            reorder,
+            format,
+        ),
+        _ => usage_error("copy"),
+    }
+}
+
 /// Bulk-loads an edge list (SNAP text, csv, or parquet, picked by
 /// extension) into a fresh zu1 file and prints the ingest numbers.
 fn copy(
     edges_path: &std::path::Path,
     out_path: &std::path::Path,
     reorder: zu::zu1::reorder::Reorder,
+    format: Format,
 ) -> ExitCode {
     let started = std::time::Instant::now();
     let (mut edges, columns) = match read_edges_with_props(edges_path, true) {
@@ -560,49 +710,111 @@ fn copy(
                 })
                 .unwrap_or(0);
             let per_edge = |bytes: u64| bytes as f64 * 8.0 / d.edge_count as f64;
-            println!(
-                "copied {} edges, {} nodes, {} groups",
-                d.edge_count,
-                d.from_count,
-                d.groups.len()
-            );
-            if !columns.is_empty() {
-                let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-                println!(
-                    "edge properties: {} column(s), {}",
-                    columns.len(),
-                    names.join(", ")
-                );
+            let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+            match format {
+                Format::Text => {
+                    println!(
+                        "copied {} edges, {} nodes, {} groups",
+                        d.edge_count,
+                        d.from_count,
+                        d.groups.len()
+                    );
+                    if !names.is_empty() {
+                        println!(
+                            "edge properties: {} column(s), {}",
+                            names.len(),
+                            names.join(", ")
+                        );
+                    }
+                    if key_bytes > 0 {
+                        println!(
+                            "key index: {} bytes, {:.1} bits/key",
+                            key_bytes,
+                            key_bytes as f64 * 8.0 / d.from_count as f64
+                        );
+                    }
+                    println!(
+                        "parse {:.2}s, encode+write {:.2}s, total {:.2}s",
+                        parsed.as_secs_f64(),
+                        load.as_secs_f64(),
+                        total.as_secs_f64()
+                    );
+                    println!(
+                        "{:.2} M edges/s end to end, {file_bytes} bytes on disk, {:.2} bits/edge fwd, {:.2} bits/edge bwd",
+                        d.edge_count as f64 / total.as_secs_f64() / 1e6,
+                        per_edge(file_bytes - bwd_bytes - key_bytes),
+                        per_edge(bwd_bytes)
+                    );
+                }
+                // The same numbers, and the derived ones with them:
+                // whoever is parsing this is charting a load, and
+                // bits per edge computed from four fields two ways is
+                // two charts that disagree.
+                Format::Json => println!(
+                    "{}",
+                    Json::Obj(vec![
+                        ("file".into(), Json::Str(out_path.display().to_string())),
+                        ("edges".into(), count(d.edge_count)),
+                        ("nodes".into(), count(d.from_count)),
+                        ("groups".into(), count(d.groups.len() as u64)),
+                        ("bytes".into(), count(file_bytes)),
+                        ("key_bytes".into(), count(key_bytes)),
+                        (
+                            "edge_properties".into(),
+                            Json::Arr(names.iter().map(|n| Json::Str((*n).into())).collect()),
+                        ),
+                        ("parse_secs".into(), Json::Float(parsed.as_secs_f64())),
+                        ("encode_secs".into(), Json::Float(load.as_secs_f64())),
+                        ("total_secs".into(), Json::Float(total.as_secs_f64())),
+                        (
+                            "edges_per_sec".into(),
+                            Json::Float(d.edge_count as f64 / total.as_secs_f64()),
+                        ),
+                        (
+                            "fwd_bits_per_edge".into(),
+                            Json::Float(per_edge(file_bytes - bwd_bytes - key_bytes)),
+                        ),
+                        ("bwd_bits_per_edge".into(), Json::Float(per_edge(bwd_bytes))),
+                    ])
+                    .to_compact()
+                ),
             }
-            if key_bytes > 0 {
-                println!(
-                    "key index: {} bytes, {:.1} bits/key",
-                    key_bytes,
-                    key_bytes as f64 * 8.0 / d.from_count as f64
-                );
-            }
-            println!(
-                "parse {:.2}s, encode+write {:.2}s, total {:.2}s",
-                parsed.as_secs_f64(),
-                load.as_secs_f64(),
-                total.as_secs_f64()
-            );
-            println!(
-                "{:.2} M edges/s end to end, {file_bytes} bytes on disk, {:.2} bits/edge fwd, {:.2} bits/edge bwd",
-                d.edge_count as f64 / total.as_secs_f64() / 1e6,
-                per_edge(file_bytes - bwd_bytes - key_bytes),
-                per_edge(bwd_bytes)
-            );
             ExitCode::SUCCESS
         }
         Err(e) => command_error("copy", &e),
     }
 }
 
+/// A count as JSON. Everything counted here is a `u64` and JSON has
+/// only the signed kind, so a number too large to say is said as a
+/// float rather than as a negative one, which is the one answer a
+/// reader cannot recover from.
+fn count(n: u64) -> Json {
+    match i64::try_from(n) {
+        Ok(n) => Json::Int(n),
+        Err(_) => Json::Float(n as f64),
+    }
+}
+
+/// Parses the `convert` argument list.
+fn convert_command(args: &[String]) -> ExitCode {
+    let Some((format, rest)) = take_format(args, TEXT_OR_JSON) else {
+        return usage_error("convert");
+    };
+    match rest[..] {
+        [input, output] => convert(
+            std::path::Path::new(input),
+            std::path::Path::new(output),
+            format,
+        ),
+        _ => usage_error("convert"),
+    }
+}
+
 /// Converts an edge list between the formats copy reads (SNAP text or
 /// csv or parquet in, csv or parquet out) or a whole database between
 /// engines (.zu1 to .db and back), picked by the file extensions.
-fn convert(input: &std::path::Path, output: &std::path::Path) -> ExitCode {
+fn convert(input: &std::path::Path, output: &std::path::Path, format: Format) -> ExitCode {
     let started = std::time::Instant::now();
     let ext = |p: &std::path::Path| p.extension().and_then(|e| e.to_str()).map(str::to_owned);
     let engine = match (ext(input).as_deref(), ext(output).as_deref()) {
@@ -619,12 +831,17 @@ fn convert(input: &std::path::Path, output: &std::path::Path) -> ExitCode {
     if let Some(result) = engine {
         return match result {
             Ok(()) => {
-                println!(
-                    "converted {} to {} in {:.2}s",
-                    input.display(),
-                    output.display(),
-                    started.elapsed().as_secs_f64()
-                );
+                let secs = started.elapsed().as_secs_f64();
+                match format {
+                    Format::Text => println!(
+                        "converted {} to {} in {secs:.2}s",
+                        input.display(),
+                        output.display()
+                    ),
+                    Format::Json => {
+                        println!("{}", converted(input, output, "engine", None, secs));
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => command_error("convert", &e),
@@ -665,16 +882,47 @@ fn convert(input: &std::path::Path, output: &std::path::Path) -> ExitCode {
     };
     match result {
         Ok(()) => {
-            println!(
-                "converted {} edges to {} in {:.2}s",
-                edges.len(),
-                output.display(),
-                started.elapsed().as_secs_f64()
-            );
+            let secs = started.elapsed().as_secs_f64();
+            match format {
+                Format::Text => println!(
+                    "converted {} edges to {} in {secs:.2}s",
+                    edges.len(),
+                    output.display()
+                ),
+                Format::Json => println!(
+                    "{}",
+                    converted(input, output, "edge list", Some(edges.len() as u64), secs)
+                ),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => command_error("convert", &e),
     }
+}
+
+/// What a conversion did, as one object.
+///
+/// `edges` is null for an engine conversion rather than absent, because
+/// the two halves of this command are one command to whoever called it
+/// and a reader should not have to write two shapes to read one answer.
+/// An engine conversion moves a whole database, which is nodes and
+/// properties and a catalog as well as edges, so a count of edges there
+/// would be an answer to a question nobody asked.
+fn converted(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    kind: &str,
+    edges: Option<u64>,
+    secs: f64,
+) -> String {
+    Json::Obj(vec![
+        ("input".into(), Json::Str(input.display().to_string())),
+        ("output".into(), Json::Str(output.display().to_string())),
+        ("kind".into(), Json::Str(kind.into())),
+        ("edges".into(), edges.map_or(Json::Null, count)),
+        ("secs".into(), Json::Float(secs)),
+    ])
+    .to_compact()
 }
 
 /// Prints one node's sorted neighbor list via the point-read path, which
@@ -774,14 +1022,6 @@ fn edge(path: &std::path::Path, src: u64, dst: u64, dir: zu::zu1::graph::Directi
     }
 }
 
-/// How `zu query` prints its rows: a column-aligned table for someone
-/// reading a terminal, or one JSON object for anything parsing it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Format {
-    Table,
-    Json,
-}
-
 /// Parses the `query` argument list and runs the statement.
 ///
 /// Flags may come before or after the file, because a caller building
@@ -791,7 +1031,7 @@ enum Format {
 fn query_command(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
     let mut source: Option<&str> = None;
-    let mut format = Format::Table;
+    let mut format = Format::Text;
     let mut params: Vec<(String, Value)> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -806,28 +1046,28 @@ fn query_command(args: &[String]) -> ExitCode {
         match arg {
             "-c" | "--command" => match next(&mut i) {
                 Some(s) => source = Some(s),
-                None => return usage_error(QUERY_USAGE),
+                None => return usage_error("query"),
             },
             "-p" | "--param" => match next(&mut i).map(parse_param) {
                 Some(Some(p)) => params.push(p),
-                _ => return usage_error(QUERY_USAGE),
+                _ => return usage_error("query"),
             },
             "--format" | "-f" => match next(&mut i) {
                 Some("json") => format = Format::Json,
-                Some("table") => format = Format::Table,
-                _ => return usage_error(QUERY_USAGE),
+                Some("table") => format = Format::Text,
+                _ => return usage_error("query"),
             },
-            _ if arg.starts_with('-') => return usage_error(QUERY_USAGE),
+            _ if arg.starts_with('-') => return usage_error("query"),
             _ if path.is_none() => {
                 path = Some(arg);
                 i += 1;
             }
-            _ => return usage_error(QUERY_USAGE),
+            _ => return usage_error("query"),
         }
     }
     match (path, source) {
         (Some(path), Some(source)) => query(std::path::Path::new(path), source, format, &params),
-        _ => usage_error(QUERY_USAGE),
+        _ => usage_error("query"),
     }
 }
 
@@ -881,7 +1121,7 @@ fn query(
                 "{}",
                 match format {
                     Format::Json => render_json(&r),
-                    Format::Table => render_table(&r),
+                    Format::Text => render_table(&r),
                 }
             );
             ExitCode::SUCCESS
@@ -893,8 +1133,9 @@ fn query(
 /// Renders a result as one JSON object:
 /// `{"gqlstatus":"00000","columns":[...],"rows":[[...]]}`, with a
 /// `"notices"` array when the statement raised a condition it survived.
-/// Hand-rolled because the CLI carries no JSON crate; T7 caps the binary
-/// at 15 MiB and this is the only place that needs one.
+/// Written straight into a string rather than through a value, because
+/// a result is rows and the tree that would hold them before they were
+/// printed is a copy of the whole answer.
 ///
 /// `gqlstatus` is always present, because a statement that succeeded
 /// raised a condition too and a reader should not have to infer which one
@@ -1044,22 +1285,14 @@ fn write_json_value(out: &mut String, v: &Value) {
     }
 }
 
+/// Appends `s` as a quoted JSON string.
+///
+/// The escaping is `zu-json`'s, which the CLI already carries for the
+/// conformance frames and the shell's jsonl session. This is the name
+/// the call sites here use for it rather than a second copy of the
+/// rules, which is what it was until the two disagreed about `\f`.
 fn write_json_str(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    zu_json::escape_into(s, out);
 }
 
 /// Renders a result as an aligned table with a row count underneath.
@@ -1207,43 +1440,90 @@ fn analyze(path: &std::path::Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn verify(path: &std::path::Path) -> ExitCode {
-    match zu::zu1::verify(path) {
-        Ok(bytes) => {
-            println!("{}: ok, {bytes} meta bytes verified", path.display());
-            ExitCode::SUCCESS
-        }
-        Err(e) => command_error("verify", &e),
+/// Parses the `verify` argument list.
+fn verify_command(args: &[String]) -> ExitCode {
+    let Some((format, rest)) = take_format(args, TEXT_OR_JSON) else {
+        return usage_error("verify");
+    };
+    match rest[..] {
+        [path] => verify(std::path::Path::new(path), format),
+        _ => usage_error("verify"),
     }
 }
 
-fn usage_error(usage: &str) -> ExitCode {
-    eprintln!("usage: {usage}");
-    ExitCode::FAILURE
+/// Walks every checksum in the file and cross-checks the structure.
+///
+/// The JSON form puts its verdict on stdout whether the file passed or
+/// not, which is the one place in this CLI where a failure is not a
+/// stderr line. A damaged file is what `verify` was asked about, so it
+/// is the answer rather than a diagnostic about the answer, and an
+/// auditor recording a fleet wants the fault in the same record as the
+/// pass. The exit code says the same thing for a caller that would
+/// rather branch than parse.
+fn verify(path: &std::path::Path, format: Format) -> ExitCode {
+    let result = zu::zu1::verify(path);
+    match (format, &result) {
+        (Format::Text, Ok(bytes)) => {
+            println!("{}: ok, {bytes} meta bytes verified", path.display())
+        }
+        (Format::Text, Err(e)) => return command_error("verify", e),
+        (Format::Json, _) => {
+            let mut fields = vec![
+                ("file".into(), Json::Str(path.display().to_string())),
+                ("ok".into(), Json::Bool(result.is_ok())),
+            ];
+            match &result {
+                Ok(bytes) => fields.push(("meta_bytes".into(), count(*bytes))),
+                Err(e) => fields.push(("error".into(), Json::Str(e.to_string()))),
+            }
+            println!("{}", Json::Obj(fields).to_compact());
+        }
+    }
+    match result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => ExitCode::from(exit_code(&e)),
+    }
 }
 
+/// Exits 2 with the command's synopsis, which lives in `help` because it
+/// is also what `--help` and the reference pages print. One spelling of
+/// a usage line means the message a user gets when they get it wrong is
+/// the message the documentation gave them.
+fn usage_error(command: &str) -> ExitCode {
+    match help::find(command) {
+        Some(c) => {
+            eprint!("{}", help::usage(c));
+            eprintln!("try `zu {command} --help` for examples", command = c.name);
+        }
+        // The top level and `help` itself are not subcommands and have
+        // no entry, so their usage is the line at the top of `zu --help`.
+        None => eprintln!("usage: zu <command> [arguments], `zu --help` lists them"),
+    }
+    ExitCode::from(2)
+}
+
+/// Reports what went wrong and exits with the code dx/12 §7 gives it.
 fn command_error(cmd: &str, err: &zu::ZuError) -> ExitCode {
     eprintln!("zu {cmd}: {err}");
-    ExitCode::FAILURE
+    ExitCode::from(exit_code(err))
 }
 
-fn print_usage() {
-    println!("zu {VERSION}: embedded property-graph database");
-    println!();
-    println!("usage: zu <command> [args]");
-    println!();
-    println!(
-        "commands: shell, query, copy, convert, verify, stat, analyze, neighbors [--in] [--key], edge [--in], lookup, conformance, corpus, bench"
-    );
-    println!("(implemented milestone by milestone, see the repo issues)");
-    println!();
-    println!("{QUERY_USAGE}");
-    println!("zu shell <file.zu1> [--format jsonl]");
-    println!("{STAT_USAGE}");
-    println!("zu conformance --declare [--format toml|json] | --verify <report.json>");
-    println!("zu conformance --tally <report.json> | --scoreboard <tally.json>...");
-    println!("zu conformance --regressed <report.json> <baseline.json>");
-    println!("{}", corpus::USAGE);
+/// Which of dx/12 §7's codes an engine error is.
+///
+/// Derived from the error rather than picked where it is reported, so
+/// the same failure exits the same way out of every command. An
+/// unsupported id joins corruption because both are a file this build
+/// cannot read: one because it was damaged and one because it was
+/// written by something newer, and a caller's next move is the same
+/// either way, which is to look at the message.
+fn exit_code(err: &zu::ZuError) -> u8 {
+    match err {
+        zu::ZuError::Gql(_) => 1,
+        zu::ZuError::InvalidArgument(_) => 2,
+        zu::ZuError::Io(_) => 3,
+        zu::ZuError::Corrupt { .. } | zu::ZuError::Unsupported { .. } => 4,
+        zu::ZuError::Conflict(_) => 5,
+    }
 }
 
 #[cfg(test)]
@@ -1265,7 +1545,12 @@ mod tests {
         std::fs::write(&edges_path, "10 11\n10 12\n10 13\n11 13\n12 13\n13 14\n")
             .expect("write edges");
         assert_eq!(
-            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::Degree),
+            copy(
+                &edges_path,
+                &db_path,
+                zu::zu1::reorder::Reorder::Degree,
+                Format::Text
+            ),
             ExitCode::SUCCESS
         );
 
@@ -1339,7 +1624,12 @@ mod tests {
         )
         .expect("write parquet");
         assert_eq!(
-            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::Degree),
+            copy(
+                &edges_path,
+                &db_path,
+                zu::zu1::reorder::Reorder::Degree,
+                Format::Text
+            ),
             ExitCode::SUCCESS
         );
 
@@ -1391,7 +1681,12 @@ mod tests {
         )
         .expect("write parquet");
         assert_ne!(
-            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::None),
+            copy(
+                &edges_path,
+                &db_path,
+                zu::zu1::reorder::Reorder::None,
+                Format::Text
+            ),
             ExitCode::SUCCESS
         );
 
@@ -1399,7 +1694,12 @@ mod tests {
         let plain_db = dir.path().join("plain.zu1");
         zu::zu1::parquet::write_edge_parquet(&plain, &[(1, 2), (1, 2)]).expect("write parquet");
         assert_eq!(
-            copy(&plain, &plain_db, zu::zu1::reorder::Reorder::None),
+            copy(
+                &plain,
+                &plain_db,
+                zu::zu1::reorder::Reorder::None,
+                Format::Text
+            ),
             ExitCode::SUCCESS
         );
     }
@@ -1420,7 +1720,12 @@ mod tests {
         }
         std::fs::write(&edges_path, text).expect("write csv");
         assert_eq!(
-            copy(&edges_path, &db_path, zu::zu1::reorder::Reorder::Degree),
+            copy(
+                &edges_path,
+                &db_path,
+                zu::zu1::reorder::Reorder::Degree,
+                Format::Text
+            ),
             ExitCode::SUCCESS
         );
 

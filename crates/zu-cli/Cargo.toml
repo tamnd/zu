@@ -21,6 +21,10 @@ zu-json.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[[bench]]
+name = "cli"
+harness = false
+
 [features]
 arrow = ["zu/arrow"]
 

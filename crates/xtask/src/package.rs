@@ -50,6 +50,11 @@ pub const HEADER: &str = "crates/zu-capi/include/zu.h";
 /// the ABI is one thing.
 pub const SOURCE: &str = "crates/zu-capi/src/lib.rs";
 
+/// Where the ABI's revision is written for everything that is not C.
+/// `zu version` reports it from here, so it is the other half of the
+/// check that the ABI's number is one number.
+pub const REVISION: &str = "crates/zu-common/src/lib.rs";
+
 /// The license that ships in the archive (dx/09 §1.3).
 pub const LICENSE: &str = "LICENSE";
 
@@ -84,6 +89,9 @@ pub enum Note {
     /// Declared, and nothing behind it. A caller linking the shared
     /// library finds out at their first call.
     Unimplemented { name: String },
+    /// The header and the workspace name different revisions of the
+    /// same ABI. Whichever is right, something is reading the wrong one.
+    Revision { header: String, workspace: String },
 }
 
 impl std::fmt::Display for Note {
@@ -99,6 +107,12 @@ impl std::fmt::Display for Note {
                 "{HEADER}: {name} is declared and {SOURCE} does not define it, so a caller finds \
                  out at their first call"
             ),
+            Note::Revision { header, workspace } => write!(
+                f,
+                "{HEADER}: ZU_ABI_VERSION is {header} and {REVISION} says {workspace}, so a \
+                 caller compiling against the header and a caller asking `zu version` are told \
+                 different things about one ABI"
+            ),
         }
     }
 }
@@ -111,14 +125,24 @@ pub struct Abi {
     pub declared: Vec<String>,
     /// Every `extern "C"` function the crate defines, sorted.
     pub defined: Vec<String>,
+    /// The revision the header names, and the one the workspace does.
+    pub revision: (String, String),
 }
 
 impl Abi {
     /// Reads the header and the source under `root`.
     pub fn read(root: &Path) -> Result<Abi, String> {
+        let header = read(&root.join(HEADER))?;
+        let revision = read(&root.join(REVISION))?;
         Ok(Abi {
-            declared: declared(&read(&root.join(HEADER))?),
+            declared: declared(&header),
             defined: defined(&read(&root.join(SOURCE))?)?,
+            revision: (
+                quoted_after(&header, "#define ZU_ABI_VERSION")
+                    .ok_or_else(|| format!("{HEADER}: no ZU_ABI_VERSION"))?,
+                quoted_after(&revision, "pub const C_ABI_VERSION: &str =")
+                    .ok_or_else(|| format!("{REVISION}: no C_ABI_VERSION"))?,
+            ),
         })
     }
 
@@ -134,6 +158,13 @@ impl Abi {
             if !self.defined.contains(name) {
                 notes.push(Note::Unimplemented { name: name.clone() });
             }
+        }
+        let (header, workspace) = &self.revision;
+        if header != workspace {
+            notes.push(Note::Revision {
+                header: header.clone(),
+                workspace: workspace.clone(),
+            });
         }
         notes
     }
@@ -199,6 +230,20 @@ fn declared(header: &str) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// The string literal that follows `prefix`, in either language: a C
+/// `#define` and a Rust `const` both write one, and both are read here
+/// by finding the line and taking what is between the first pair of
+/// quotes on it. That is enough because both lines are ours and both
+/// are one short literal, and a parser for either language to read one
+/// version number would be a parser to maintain.
+fn quoted_after(text: &str, prefix: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with(prefix))?;
+    let rest = line.split_once('"')?.1;
+    Some(rest.split_once('"')?.0.to_owned())
 }
 
 /// Every `extern "C"` function the crate exports, read from the source
@@ -622,6 +667,55 @@ mod tests {
         sorted.sort();
         assert_eq!(abi.declared, sorted);
         assert!(abi.declared.iter().all(|n| n.starts_with("zu_")));
+        // dx/02 §8 is the v0.5 restructure, so this is the number the
+        // milestone is about and the one nine bindings will test for.
+        assert_eq!(abi.revision, ("0.5".to_string(), "0.5".to_string()));
+    }
+
+    /// A revision the header and the workspace disagree about is worse
+    /// than either of them being wrong, because a caller compiling
+    /// against the header and a caller asking the binary then take
+    /// different branches over the same installation.
+    #[test]
+    fn a_header_and_a_binary_that_name_different_revisions_are_reported() {
+        let notes = Abi {
+            declared: Vec::new(),
+            defined: Vec::new(),
+            revision: ("0.6".to_string(), "0.5".to_string()),
+        }
+        .check();
+        assert_eq!(
+            notes,
+            [Note::Revision {
+                header: "0.6".to_string(),
+                workspace: "0.5".to_string(),
+            }]
+        );
+        assert!(format!("{}", notes[0]).contains("one ABI"), "{}", notes[0]);
+    }
+
+    /// Both files write the number the same way, as the first quoted
+    /// thing on a line that starts with a fixed prefix, so one reader
+    /// serves both and neither language needs parsing.
+    #[test]
+    fn a_revision_is_read_out_of_either_language() {
+        assert_eq!(
+            quoted_after("#define ZU_ABI_VERSION \"0.5\"\n", "#define ZU_ABI_VERSION"),
+            Some("0.5".to_string())
+        );
+        assert_eq!(
+            quoted_after(
+                "/// A doc line.\npub const C_ABI_VERSION: &str = \"0.5\";\n",
+                "pub const C_ABI_VERSION: &str ="
+            ),
+            Some("0.5".to_string())
+        );
+        // A mention in prose is not a definition, and the prose in both
+        // files talks about the constant more than the constant does.
+        assert_eq!(
+            quoted_after("// see #define ZU_ABI_VERSION for the rule\n", "#define ZU"),
+            None
+        );
     }
 
     #[test]
@@ -629,6 +723,7 @@ mod tests {
         let abi = Abi {
             declared: vec!["zu_version".to_string(), "zu_ghost".to_string()],
             defined: vec!["zu_version".to_string(), "zu_secret".to_string()],
+            revision: ("0.5".to_string(), "0.5".to_string()),
         };
         let notes = abi.check();
         assert!(

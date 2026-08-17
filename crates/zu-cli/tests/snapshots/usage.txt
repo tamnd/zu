@@ -1,0 +1,79 @@
+$ zu shell --no-such-flag
+! usage: zu shell <file.zu1> [--format jsonl]
+! try `zu shell --help` for examples
+# exit 2
+
+$ zu query --no-such-flag
+! usage: zu query <file.zu1> -c <zuQL> [--format table|json] [-p name=value ...]
+! try `zu query --help` for examples
+# exit 2
+
+$ zu copy --no-such-flag
+! usage: zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1> [--format text|json]
+! try `zu copy --help` for examples
+# exit 2
+
+$ zu convert --no-such-flag
+! usage: zu convert <in.txt|csv|parquet> <out.csv|parquet> [--format text|json]
+!        zu convert <in.zu1> <out.db> [--format text|json]
+!        zu convert <in.db> <out.zu1> [--format text|json]
+! try `zu convert --help` for examples
+# exit 2
+
+$ zu verify --no-such-flag
+! usage: zu verify <file.zu1> [--format text|json]
+! try `zu verify --help` for examples
+# exit 2
+
+$ zu stat --no-such-flag
+! usage: zu stat <file.zu1> [--format text|json]
+! try `zu stat --help` for examples
+# exit 2
+
+$ zu analyze --no-such-flag
+! usage: zu analyze <file.zu1>
+! try `zu analyze --help` for examples
+# exit 2
+
+$ zu neighbors --no-such-flag
+! usage: zu neighbors [--in] [--key] <file.zu1> <node>
+! try `zu neighbors --help` for examples
+# exit 2
+
+$ zu lookup --no-such-flag
+! usage: zu lookup <file.zu1> <key>
+! try `zu lookup --help` for examples
+# exit 2
+
+$ zu edge --no-such-flag
+! usage: zu edge [--in] <file.zu1> <src> <dst>
+! try `zu edge --help` for examples
+# exit 2
+
+$ zu conformance --no-such-flag
+! usage: zu conformance --declare [--format toml|json]
+!        zu conformance --verify <report.json>
+!        zu conformance --tally <report.json>
+!        zu conformance --scoreboard <tally.json>...
+!        zu conformance --regressed <report.json> <baseline.json>
+! try `zu conformance --help` for examples
+# exit 2
+
+$ zu corpus --no-such-flag
+! usage: zu corpus <dir> [--strict] [--quiet]
+! try `zu corpus --help` for examples
+# exit 2
+
+$ zu version --no-such-flag
+! usage: zu version [--format text|json]
+! try `zu version --help` for examples
+# exit 2
+
+$ zu no-such-command
+! zu: unknown command 'no-such-command', `zu --help` lists them
+# exit 2
+
+$ zu explain
+! zu: `explain` is specified and not in this build yet
+# exit 2
+

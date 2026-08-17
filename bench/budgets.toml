@@ -1265,3 +1265,23 @@ capi_chunk_scan_ratio = 1.5
 # still fails immediately if a chunked read ever converts more than its
 # chunk. Raise this floor, never lower it.
 capi_chunk_early_speedup = 50.0
+
+# What a `zu` invocation costs before it does anything, milliseconds per
+# run, measured end to end on `zu version`
+# (crates/zu-cli/benches/cli.rs). It is mostly fork, exec and the
+# dynamic loader, so it moves with the machine and with the size of the
+# binary that T7 caps at 15 MiB, and only a little with what the command
+# does. Measured: local M series 4.5, with `zu --help` and `zu --help
+# --format json` inside a millisecond of it because generated help is a
+# print and not a build.
+#
+# The ceiling sits far above that on purpose. A CLI's startup regresses
+# in kind and not by percent: a config file read at launch, a thread
+# pool, a runtime, a lazy table that turned out to be eager, each of
+# which lands in the hundreds of milliseconds and none of which is
+# hiding in the noise of a shared runner. A tighter number here would
+# fail on a busy vCPU and teach everyone to ignore it. The bench also
+# asserts, on every run and on every machine, that no help form costs
+# twice the floor, which is the sensitive half of the check.
+# Lower this ceiling, never raise it.
+cli_startup_ms = 25.0

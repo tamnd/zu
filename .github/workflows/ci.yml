@@ -282,6 +282,20 @@ jobs:
       # sides: a chunked read that converts more than its chunk.
       - run: ZU_GATE=1 cargo bench -p zu-capi --bench result
 
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # What an invocation costs before it does anything, which is the
+      # one number a library bench cannot give because the process is
+      # the unit a user waits for. The ceiling in bench/budgets.toml is
+      # deliberately loose, since startup regresses in kind and not by
+      # percent; the assertion that no help form costs twice the floor
+      # runs on every machine and is the sensitive half.
+      - run: ZU_GATE=1 cargo bench -p zu-cli --bench cli
+
   corpus:
     runs-on: ubuntu-latest
     steps:

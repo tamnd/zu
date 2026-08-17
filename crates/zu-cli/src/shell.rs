@@ -33,8 +33,6 @@ use zu::session::Session;
 
 use zu_json::{self as json, Json};
 
-const SHELL_USAGE: &str = "zu shell <file.zu1> [--format jsonl]";
-
 pub(crate) fn shell_command(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
     let mut i = 0;
@@ -45,18 +43,18 @@ pub(crate) fn shell_command(args: &[String]) -> ExitCode {
             // a future default ever changes.
             "--format" | "-f" => match args.get(i + 1).map(String::as_str) {
                 Some("jsonl") => i += 2,
-                _ => return crate::usage_error(SHELL_USAGE),
+                _ => return crate::usage_error("shell"),
             },
-            arg if arg.starts_with('-') => return crate::usage_error(SHELL_USAGE),
+            arg if arg.starts_with('-') => return crate::usage_error("shell"),
             arg if path.is_none() => {
                 path = Some(arg);
                 i += 1;
             }
-            _ => return crate::usage_error(SHELL_USAGE),
+            _ => return crate::usage_error("shell"),
         }
     }
     let Some(path) = path else {
-        return crate::usage_error(SHELL_USAGE);
+        return crate::usage_error("shell");
     };
     let mut session = match Session::open(std::path::Path::new(path)) {
         Ok(s) => s,

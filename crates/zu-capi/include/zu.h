@@ -48,6 +48,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The revision of this ABI (dx/02 section 8), which is what a build
+ * system tests when it has to compile one way against 0.5 and another
+ * against what comes next. `cargo xtask package` holds it to the
+ * constant the rest of the workspace reports, `zu version` included,
+ * so a header and a binary that disagree is a failed check rather than
+ * a caller's afternoon. */
+#define ZU_ABI_VERSION "0.5"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

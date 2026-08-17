@@ -3,7 +3,7 @@
 ## 1. Rust API (crate `zudb`)
 
 ```rust
-use zudb::{Config, Database, params};
+use zudb::{Config, Database, Flow, params};
 
 let db = Database::open("social.zu1")?;                              // zu1
 // Database::open("social.db?engine=sqlite")                          // sqlite
@@ -22,6 +22,15 @@ for row in rows.iter() {
 let (stmt, wanted) = conn.prepare("MATCH (p:person {id: $id}) RETURN p.name AS name")?;
 let rows = conn.execute_prepared(stmt, &params! { "id" => 7 })?;
 conn.close_prepared(stmt);
+
+// Rows in batches, for the results too big to want in memory
+let mut out = Vec::new();
+conn.query_stream("MATCH (p:person) RETURN p.id AS id", &[], |batch| {
+    for row in batch.iter() {
+        out.push(row.get_at::<i64>(0)?);
+    }
+    Ok(if out.len() < 1_000 { Flow::More } else { Flow::Stop })
+})?;
 
 // Bulk
 let mut people = conn.appender("person")?;
@@ -44,6 +53,12 @@ The two ways a typed read can fail are deliberately different conditions, and th
 Parameters go the other way and `params!` writes them: `&params! { "id" => 42, "ids" => vec![1, 2, 3] }` binds by the names the statement uses, without the `$`, which is the same spelling the C ABI and the JSONL protocol use. It expands to an array literal rather than a `Vec`, so the bindings live on the caller's stack and the `&` is the slice the query methods take, with no allocation for the call itself. Every Rust type that is a value converts with `From`, including lists, options as null, and temporals; a string that means a date does not, because `date($when)` is where the caller says which calendar type it meant and the wire has no business guessing that from the characters.
 
 `crates/zu/benches/rows.rs` gates the claim that the typed layer is free. Tuple destructuring measures 0.97 to 1.12 times the same read written as a `match` on `Value`, and one borrowed string column 1.09 to 1.53 times, both of them under a nanosecond and a half per row on results of a hundred thousand rows. The defect the ceilings exist for is a string that starts being copied, which allocates per row and lands at eight times and up.
+
+`conn.query_stream` is the same statement read a batch at a time instead of all at once (`dx/04` §4). It takes a sink, hands it a `Batch` of rows borrowed for the length of the call, and the sink answers `Flow::More` or `Flow::Stop`; `query_stream_batched` is the same with the batch size named, for a caller writing Arrow record batches or HTTP chunks of a size of its own. It returns a `Streamed` rather than rows, because by then the rows are gone: the column names, how many rows were handed over, whether the caller stopped it, and whether the engine made the rows as it handed them over or had to make them all first. A sink is the shape rather than a cursor because a cursor over this engine would have to hold a borrow of the graph and the operator state across a caller's call, and the crate forbids unsafe, so the honest version of that is the callback that already has both.
+
+Not every statement can answer its first row before it has read its last, and three of them never can: ORDER BY does not know which row sorts first until it has read the last one, DISTINCT is the same argument with a set instead of a sort, and an aggregate has no row at all until its groups close. Those run whole and are cut into batches afterwards, so the caller's loop is the same and `Streamed::streamed` is what says which happened. SKIP and LIMIT do stream, spent across the batches rather than inside each one, so a streamed answer is the buffered answer row for row. `Flow::Stop` and an exhausted LIMIT both stop the scan under it at the next morsel, which is the boundary an interrupt is answered at, and a sink that returns an error returns that error from the call unchanged.
+
+`crates/zu/benches/stream.rs` measures the trade over a scan of two hundred thousand rows. Streaming costs 1.18 to 1.75 times the wall clock of the buffered read, which is real and is the price of interleaving the query with the consumer instead of running two tight loops, and it holds 0.018 times the bytes: one batch and the morsel feeding it against every row of the answer. A caller that reads the first batch and stops pays 0.015 of the whole scan. The bytes are counted by an allocator that records the live heap above where it stood when the statement started, because peak resident set counts every page the block cache touched and both sides touch the same ones.
 
 `conn.interrupt()` hands out the one part of a `Connection` another thread may touch: the handle that stops the statement running on it and counts the rows it has read so far. A statement runs on the thread that asked for it, so stopping one means having taken the handle before the call, which is the shape both callers that want this already have, a shell answering a keystroke and a server answering a client that hung up. Asking is a relaxed store, the answer comes back at the next chunk boundary as `ZuError::Interrupted` and carries no condition code because nothing failed, and the connection runs the next statement as if the stopped one had never been asked for. Clearing the handle is the caller's to do and belongs before the next statement rather than after the stopped one. §2 has what the executors check, what the count is counted in, and what it costs.
 

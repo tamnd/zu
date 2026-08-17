@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu_common::{GROUP_ROWS, Interrupt, Result, ZuError};
-use zu_query::exec::{Options, QueryResult, Value};
+use zu_query::exec::{Options, QueryResult, Streaming, Value};
 use zu_query::plan::BracketKind;
 use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{
@@ -89,6 +89,88 @@ pub(crate) fn run(
         SinkSpec::Rows { post, .. } => Ok(sink::finish_rows(plan.columns.clone(), post, partials)),
     }?;
     Ok((rows, decisions))
+}
+
+/// Runs a compiled pipeline handing each morsel's rows over as it
+/// finishes, instead of stitching them into one answer.
+///
+/// It runs on this thread alone. The parallel driver is what makes the
+/// buffered run fast and it is the wrong shape here: workers finish
+/// morsels out of order and stitch by index at the end, and a consumer
+/// reading rows as they come cannot be handed morsel 7 before morsel 3.
+/// Sequential is also what the consumer is, so the parallelism this
+/// gives up is parallelism its own callback would have serialized.
+///
+/// Everything else is the buffered run unchanged: the same compiled
+/// pipeline, the same morsels in the same order, the same early stop.
+/// Only the ending differs, and morsel order is scan order, so the rows
+/// come out in the order [`run`] would have assembled them in.
+pub(crate) fn run_streamed(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    options: &Options,
+    st: &mut Streaming,
+) -> Result<()> {
+    let SinkSpec::Rows { post, .. } = &plan.sink else {
+        unreachable!("only a plan whose sink is rows is handed here");
+    };
+    let mut sched = match &plan.source {
+        Source::Seek(key) => seek_work(plan, snap, options, *key)?,
+        Source::Seeks(keys) => seeks_work(keys, options),
+        Source::Scan(_) => scan_work(plan, snap, options)?,
+    };
+    // A morsel is the unit the scan advances by before the consumer
+    // hears anything, so on a streamed run it is sized by the batch and
+    // not by the load balance there is no second worker to strike. This
+    // is what keeps what the run holds and what a stop costs down to
+    // the batch the caller asked for. The morsels tile the table, so
+    // the last one's end is the row count and no second read is needed.
+    if matches!(sched.work, Work::Scan)
+        && let Some(&(_, rows)) = sched.morsels.last()
+    {
+        sched.morsels = split_morsels(rows, st.batch() as u64);
+    }
+    // Counted once here and spent by the handoff across the morsels,
+    // which is what the buffered run's `apply_post` does to the whole
+    // answer in one go.
+    let (mut skip, mut limit) = (0usize, None);
+    for p in post {
+        match p {
+            PostSpec::Skip(n) => skip = *n as usize,
+            PostSpec::Limit(n) => limit = Some(*n as usize),
+            PostSpec::Distinct | PostSpec::Sort(_) => {
+                unreachable!("a sorted or distinct answer does not stream")
+            }
+        }
+    }
+    st.window(skip, limit);
+    st.made_them();
+    let stop = StopState::new(
+        quota_of(post),
+        sched.morsels.len(),
+        options.interrupt.clone(),
+    );
+    let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched.work);
+    for (idx, &range) in sched.morsels.iter().enumerate() {
+        if !st.wants_more() || stop.stopped() {
+            break;
+        }
+        stop.read((range.1 - range.0).max(1));
+        if let Err(e) = w.run_morsel(idx, range) {
+            stop.abort();
+            return Err(e);
+        }
+        // Asked between morsels rather than inside the handoff, so an
+        // interrupt lands where a stopped worker already drains: on a
+        // boundary, with a whole morsel's rows either given or not.
+        options.interrupt.check()?;
+        for (_, rows) in w.sink.batches.drain(..) {
+            if !st.feed(rows)? {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a worker does with a morsel. Both kinds split the same way,
@@ -553,13 +635,21 @@ fn intersects(plan: &ExecPlan) -> bool {
 /// traffic starts costing what the shorter tail saves somewhere in
 /// between.
 fn make_morsels(rows: u64, workers: usize) -> Vec<(u64, u64)> {
+    split_morsels(rows, rows / (workers as u64 * 8))
+}
+
+/// The same tiling with the morsel size asked for rather than derived
+/// from a worker count, which is what a streamed run wants: its size is
+/// set by how far ahead of the consumer the scan may run, and there is
+/// no second worker for it to balance against.
+fn split_morsels(rows: u64, want: u64) -> Vec<(u64, u64)> {
     const CHUNK: u64 = SCAN_ROWS as u64;
     const GROUP: u64 = GROUP_ROWS as u64;
     let mut out = Vec::new();
     if rows == 0 {
         return out;
     }
-    let target = (rows / (workers as u64 * 8)).clamp(CHUNK, GROUP) / CHUNK * CHUNK;
+    let target = want.clamp(CHUNK, GROUP) / CHUNK * CHUNK;
     let mut group_lo = 0;
     while group_lo < rows {
         let group_hi = (group_lo + GROUP).min(rows);

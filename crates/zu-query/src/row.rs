@@ -166,6 +166,78 @@ impl<'r> Row<'r> {
     }
 }
 
+/// A batch of rows handed to a streaming caller
+/// ([`crate::exec::execute_streaming`]).
+///
+/// It is the same view a whole result gives, over a piece of one: the
+/// column names and some rows, borrowed for the length of the call. A
+/// caller that wants to keep rows past the call copies what it wants
+/// out of them, which is the trade streaming makes and the reason the
+/// batch cannot outlive the sink.
+#[derive(Debug, Clone, Copy)]
+pub struct Batch<'a> {
+    columns: &'a [String],
+    rows: &'a [Vec<Value>],
+}
+
+impl<'a> Batch<'a> {
+    /// A batch over names and rows that belong together.
+    pub fn new(columns: &'a [String], rows: &'a [Vec<Value>]) -> Batch<'a> {
+        Batch { columns, rows }
+    }
+
+    /// The column names, which are the statement's and so are the same
+    /// for every batch of one run.
+    pub fn columns(&self) -> &'a [String] {
+        self.columns
+    }
+
+    /// How many rows this batch holds. It is never zero: a filter that
+    /// rejected everything it read hands over nothing rather than an
+    /// empty batch.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the batch is empty, which the sink is never handed.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The rows, typed, exactly as a whole result reads them.
+    pub fn iter(&self) -> RowIter<'a> {
+        RowIter {
+            columns: self.columns,
+            rows: self.rows.iter(),
+        }
+    }
+
+    /// The rows, untyped.
+    pub fn rows(&self) -> &'a [Vec<Value>] {
+        self.rows
+    }
+}
+
+impl<'a> IntoIterator for Batch<'a> {
+    type Item = Row<'a>;
+    type IntoIter = RowIter<'a>;
+
+    fn into_iter(self) -> RowIter<'a> {
+        self.iter()
+    }
+}
+
+/// What a streaming caller wants after a batch: the next one, or no
+/// more. Stopping is not a failure and leaves nothing to clean up, so
+/// it is a value rather than an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// Keep going.
+    More,
+    /// Stop the statement here. The rows already handed over stand.
+    Stop,
+}
+
 /// The rows of a result, borrowed one at a time.
 #[derive(Debug, Clone)]
 pub struct RowIter<'r> {
@@ -710,5 +782,26 @@ mod tests {
         assert_eq!(result.iter().len(), 2);
         let last = result.iter().next_back().expect("last");
         assert_eq!(last.get_at::<i64>(1).expect("a count"), 4);
+    }
+
+    #[test]
+    fn a_batch_reads_the_way_a_whole_result_does() {
+        let result = result();
+        let batch = Batch::new(&result.columns, &result.rows[1..]);
+        assert_eq!(batch.len(), 1);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.columns(), result.columns.as_slice());
+        assert_eq!(batch.rows().len(), 1);
+        let (name, n, score): (&str, i64, Option<f64>) = batch
+            .into_iter()
+            .next()
+            .expect("a row")
+            .get()
+            .expect("the three columns");
+        assert_eq!((name, n, score), ("bob", 4, None));
+        // The names travel with the piece, so reading by name works on
+        // a batch that starts halfway through the answer.
+        let row = batch.iter().next().expect("a row");
+        assert_eq!(row.get_by_name::<&str>("name").expect("a name"), "bob");
     }
 }

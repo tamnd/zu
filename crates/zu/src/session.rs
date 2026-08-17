@@ -21,8 +21,9 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Interrupt, Result, ZuError};
 use zu_query::ast::TxnStmt;
 use zu_query::binder::BoundQuery;
-use zu_query::exec;
+use zu_query::exec::{self, Streamed};
 use zu_query::plan::LogicalPlan;
+use zu_query::row::{Batch, Flow};
 
 use crate::query::{self, NotAQuery, QueryResult, Value, Zu1Graph};
 use crate::write::Writer;
@@ -378,6 +379,73 @@ impl Session {
     /// running cannot end the next one.
     pub fn interrupt(&self) -> Interrupt {
         self.options.interrupt.clone()
+    }
+
+    /// Runs one query and hands its rows to `sink` in batches as they
+    /// are made, instead of returning them.
+    ///
+    /// A statement that has to see every row before it can give one,
+    /// which is ORDER BY, DISTINCT and the aggregates, runs whole and is
+    /// handed over in batches afterwards, and so does a statement that
+    /// writes, because a write runs as the parts it was split into and
+    /// the rows come out of the last of them. Which happened is in
+    /// [`Streamed::streamed`], and the caller's loop is the same either
+    /// way.
+    pub fn run_streaming(
+        &mut self,
+        source: &str,
+        params: &[(&str, Value)],
+        batch_rows: usize,
+        sink: &mut dyn FnMut(Batch<'_>) -> Result<Flow>,
+    ) -> Result<Streamed> {
+        self.refresh()?;
+        if query::not_a_query(source)?.is_some() {
+            let result = self.run(source, params)?;
+            return exec::stream_result(result, batch_rows, sink);
+        }
+        let cached = self.plan_for(source)?;
+        let args = query::bind_args(&cached.query.params, params)?;
+        if cached.parts.is_some() {
+            let result = self.run(source, params)?;
+            return exec::stream_result(result, batch_rows, sink);
+        }
+        let options = self.options.clone();
+        let mut st = exec::Streaming::new(sink, &cached.query.columns, batch_rows);
+        // The pipeline executor first, the same way `run` takes it
+        // first, because a streamed statement that fell back to the old
+        // engine would be several times slower than the same statement
+        // read the ordinary way, and a caller would learn to avoid the
+        // streaming API for the wrong reason. It has handed nothing over
+        // when it answers false, so the fallback below starts on a
+        // handoff nothing has been fed through.
+        if query::exec2_enabled() {
+            let catalog = self.graph.catalog().clone();
+            let warm = std::mem::take(&mut self.snap);
+            let mut snap =
+                crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
+            let out = zu_exec::try_execute_streaming(
+                &cached.plan,
+                &cached.query,
+                &cached.schema,
+                &mut snap,
+                &args,
+                &options,
+                &mut st,
+            );
+            self.snap = snap.into_cache();
+            if out? {
+                return Ok(st.done(cached.query.columns.clone(), Vec::new()));
+            }
+        }
+        exec::execute_streaming(
+            &cached.plan,
+            &cached.query,
+            &cached.schema,
+            &mut self.graph,
+            &args,
+            &options,
+            &mut st,
+        )
     }
 
     /// Runs one query, compiling it on the first sighting of this text

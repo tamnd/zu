@@ -121,3 +121,7 @@ harness = false
 [[bench]]
 name = "rows"
 harness = false
+
+[[bench]]
+name = "stream"
+harness = false

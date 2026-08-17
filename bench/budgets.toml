@@ -1528,3 +1528,23 @@ set_write_x = 4.0
 # reaches.
 typed_row_x = 1.25
 typed_str_x = 2.0
+
+# Streaming a result instead of collecting it (dx/04 §4), measured over
+# one scan of 200000 rows on one connection with warm caches, best of
+# five timed passes and one separately counted pass for the bytes.
+# stream_x is the wall clock of the streamed read over the buffered one.
+# It is above 1 and meant to be: the buffered read runs the query and
+# then walks a contiguous answer, two tight loops, where the streamed
+# one interleaves them and pays a callback and a batch drop every 2048
+# rows. Measured 1.18 to 1.75 across runs, so the ceiling catches a
+# streamed read that starts costing twice a buffered one rather than the
+# spread. stream_bytes_x is what the two hold at their highest, live
+# heap above where it stood when the statement started: every row on one
+# side, one batch and the morsel feeding it on the other, measured at
+# 0.018 and stable because it is a count and not a clock. stream_stop_x
+# is a caller that reads the first batch and stops, over the whole scan;
+# it measures about 0.015, which is the morsel it had to finish, and it
+# is the number that says a stopped scan really stops.
+stream_x = 2.0
+stream_bytes_x = 0.05
+stream_stop_x = 0.10

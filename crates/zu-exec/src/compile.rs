@@ -885,12 +885,12 @@ impl Compiler<'_> {
                 };
                 vals.push(v);
             }
-            // sssp is given a node id and walks from the row behind it,
-            // the resolution the old engine does before it calls the
-            // kernel. A key that names no node is an error that engine
-            // owns, so an unresolved one falls back rather than being
-            // answered here.
-            if matches!(func, TableFunc::Sssp) {
+            // A traversal kernel is given a node id and walks from the
+            // row behind it, the resolution the old engine does before
+            // it calls the kernel. A key that names no node is an error
+            // that engine owns, so an unresolved one falls back rather
+            // than being answered here.
+            if matches!(func, TableFunc::Bfs | TableFunc::Sssp) {
                 let Some(row) = self.seek_arg(*table, vals.first().copied())? else {
                     return Ok(None);
                 };

@@ -900,6 +900,7 @@ mod tests {
                 table: 0,
                 src: 0,
                 dst: 1,
+                ord: 0,
             },
             Value::Path(vec![Value::Node {
                 table: 0,

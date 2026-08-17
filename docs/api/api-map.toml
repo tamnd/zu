@@ -237,6 +237,11 @@ tier = 3
 reason = "the same escape hatch under its own module path"
 
 [[entity]]
+id = "zu::query::Value::NO_REL_ROW"
+tier = 3
+reason = "the row an edge with nothing stored on it carries, which is a marker inside a rel value and not a value of its own; a binding hands back an edge as its table and its two endpoints, and the C ABI does not carry the row at all, so there is nothing for this to mark"
+
+[[entity]]
 id = "zu::session::Session::catalog"
 tier = 3
 reason = "the catalog behind the session, which exists so a caller staging a write can turn a label into the table id the transaction wants; a binding never sees a table id"

@@ -2247,6 +2247,14 @@
       "signature": "List(Vec<Value>)"
     },
     {
+      "id": "zu::query::Value::NO_REL_ROW",
+      "kind": "assoc-const",
+      "name": "NO_REL_ROW",
+      "of": "zu::query::Value",
+      "signature": "u64",
+      "doc": "The `ord` of an edge that has no row in the stored property\ncolumns: one a write staged and no fold has landed yet, or one\na pattern matched over a different rel table. A property read\noff such an edge answers null rather than reading somebody\nelse's row."
+    },
+    {
       "id": "zu::query::Value::Node",
       "kind": "variant",
       "name": "Node",
@@ -2281,7 +2289,7 @@
       "kind": "variant",
       "name": "Rel",
       "of": "zu::query::Value",
-      "signature": "Rel { table: u32, src: u64, dst: u64 }"
+      "signature": "Rel { table: u32, src: u64, dst: u64, ord: u64 }"
     },
     {
       "id": "zu::query::Value::Str",
@@ -5163,6 +5171,14 @@
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn lookup_key(&mut self, db: &mut Zu1File, key: u64) -> Result<Option<u64>>",
       "doc": "Resolves an original id through the primary-key index, or errors\nwhen the file was loaded without one. The key segment's chunk\ndirectory loads on the first call and is reused after, so a\nlookup costs two chunk decodes."
+    },
+    {
+      "id": "zu::zu1::graph::GraphReader::neighbor_ordinals_into",
+      "kind": "method",
+      "name": "neighbor_ordinals_into",
+      "of": "zu::zu1::graph::GraphReader",
+      "signature": "fn neighbor_ordinals_into(&mut self, db: &mut Zu1File, node: u64, dir: Direction, out: &mut Vec<u64>) -> Result<()>",
+      "doc": "Replaces `out` with the load-order ordinal of every edge in\n`node`'s list in `dir`, in list order, so `out[i]` is the\nproperty row of the `i`th neighbor [`Self::neighbors_dir`]\nreports for the same arguments.\n\nThis is what a pattern that reads an edge property wants and\n[`Self::edge_ordinal`] cannot give it. A pair that runs twice is\ntwo edges with two rows, and a lookup holding nothing but the\npair answers with the first of the run for both, so a walk over\na graph where pairs repeat reads one copy's value for every\ncopy. Counting the list out instead is exact, and on the\ngenerated finance graphs a pair repeating is the common case\nrather than the corner one: an account there sends three hundred\ntransfers to a hundred and fifty counterparties.\n\nForward the answer is a range, the group's base plus the list's\nplace in it, which is [`Self::out_neighbors_from`]. Backward the\nslot in the reverse array says nothing about the forward one, so\neach run of one source is looked up once and its copies counted\noff from there. The two directions agree on which copy is which,\nwhich is what makes an edge read forward and the same edge read\nbackward carry the same value: a run of k copies fills k slots\nin each direction and the `i`th backward slot takes the `i`th\nforward ordinal."
     },
     {
       "id": "zu::zu1::graph::GraphReader::neighbors",

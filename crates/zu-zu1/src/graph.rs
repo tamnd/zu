@@ -1770,6 +1770,77 @@ impl GraphReader {
     pub fn in_neighbors_into(&self, db: &mut Zu1File, node: u64, out: &mut Vec<u64>) -> Result<()> {
         self.neighbors_dir_into(db, node, Direction::Bwd, out)
     }
+
+    /// Replaces `out` with the load-order ordinal of every edge in
+    /// `node`'s list in `dir`, in list order, so `out[i]` is the
+    /// property row of the `i`th neighbor [`Self::neighbors_dir`]
+    /// reports for the same arguments.
+    ///
+    /// This is what a pattern that reads an edge property wants and
+    /// [`Self::edge_ordinal`] cannot give it. A pair that runs twice is
+    /// two edges with two rows, and a lookup holding nothing but the
+    /// pair answers with the first of the run for both, so a walk over
+    /// a graph where pairs repeat reads one copy's value for every
+    /// copy. Counting the list out instead is exact, and on the
+    /// generated finance graphs a pair repeating is the common case
+    /// rather than the corner one: an account there sends three hundred
+    /// transfers to a hundred and fifty counterparties.
+    ///
+    /// Forward the answer is a range, the group's base plus the list's
+    /// place in it, which is [`Self::out_neighbors_from`]. Backward the
+    /// slot in the reverse array says nothing about the forward one, so
+    /// each run of one source is looked up once and its copies counted
+    /// off from there. The two directions agree on which copy is which,
+    /// which is what makes an edge read forward and the same edge read
+    /// backward carry the same value: a run of k copies fills k slots
+    /// in each direction and the `i`th backward slot takes the `i`th
+    /// forward ordinal.
+    pub fn neighbor_ordinals_into(
+        &mut self,
+        db: &mut Zu1File,
+        node: u64,
+        dir: Direction,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        out.clear();
+        match dir {
+            Direction::Fwd => {
+                let (list, base) = self.out_neighbors_from(db, node)?;
+                let len = list.len() as u64;
+                out.extend(base..base + len);
+            }
+            Direction::Bwd => {
+                // The sources land in `out` first and are rewritten in
+                // place, because the forward lookup below wants the
+                // reader and the backward list borrows it.
+                out.extend_from_slice(self.neighbors_dir(db, node, Direction::Bwd)?);
+                let mut i = 0;
+                while i < out.len() {
+                    let src = out[i];
+                    let mut j = i + 1;
+                    while j < out.len() && out[j] == src {
+                        j += 1;
+                    }
+                    // The backward list holds this edge, so the forward
+                    // one does too, and a missing ordinal means the two
+                    // arrays disagree about the graph.
+                    let base = self.edge_ordinal(db, src, node)?.ok_or_else(|| {
+                        ZuError::Corrupt {
+                            what: "adjacency",
+                            detail: format!(
+                                "the in-list of node {node} holds {src}, and no forward edge does"
+                            ),
+                        }
+                    })?;
+                    for (k, slot) in out[i..j].iter_mut().enumerate() {
+                        *slot = base + k as u64;
+                    }
+                    i = j;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2418,6 +2489,65 @@ mod tests {
         assert_eq!(reader.edge_ordinal(&mut db, 0, 1).unwrap(), Some(0));
         assert_eq!(reader.edge_ordinal(&mut db, 0, 2).unwrap(), Some(3));
         assert_eq!(reader.edge_ordinal(&mut db, 1, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_list_read_either_way_names_the_same_edge_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both.zu1");
+        // Two pairs that run more than once, one of them from a source
+        // that also sends elsewhere, so a run is neither the whole list
+        // nor the start of it in either direction.
+        let edges = [(0u32, 1u32), (0, 1), (0, 1), (0, 2), (3, 1), (3, 1), (4, 1)];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, 5, &edges).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+
+        let mut ords = Vec::new();
+        reader
+            .neighbor_ordinals_into(&mut db, 0, Direction::Fwd, &mut ords)
+            .unwrap();
+        assert_eq!(ords, [0, 1, 2, 3]);
+        reader
+            .neighbor_ordinals_into(&mut db, 3, Direction::Fwd, &mut ords)
+            .unwrap();
+        assert_eq!(ords, [4, 5]);
+
+        // Node 1's in-list is 0,0,0,3,3,4 and the rows it names are the
+        // forward rows of those same edges, so every copy gets its own
+        // and none is named twice.
+        reader
+            .neighbor_ordinals_into(&mut db, 1, Direction::Bwd, &mut ords)
+            .unwrap();
+        assert_eq!(ords, [0, 1, 2, 4, 5, 6]);
+        reader
+            .neighbor_ordinals_into(&mut db, 2, Direction::Bwd, &mut ords)
+            .unwrap();
+        assert_eq!(ords, [3]);
+
+        // Every edge of the graph is named once from each side, which
+        // is the property the property read depends on.
+        let mut forward = Vec::new();
+        for node in 0..5 {
+            reader
+                .neighbor_ordinals_into(&mut db, node, Direction::Fwd, &mut ords)
+                .unwrap();
+            forward.extend_from_slice(&ords);
+        }
+        let mut backward = Vec::new();
+        for node in 0..5 {
+            reader
+                .neighbor_ordinals_into(&mut db, node, Direction::Bwd, &mut ords)
+                .unwrap();
+            backward.extend_from_slice(&ords);
+        }
+        forward.sort_unstable();
+        backward.sort_unstable();
+        assert_eq!(forward, (0..edges.len() as u64).collect::<Vec<_>>());
+        assert_eq!(forward, backward);
     }
 
     #[test]

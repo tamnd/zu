@@ -107,6 +107,14 @@ pub enum Value {
         table: u32,
         src: u64,
         dst: u64,
+        /// Which edge of `src -> dst` this is: the row its properties
+        /// sit in, which is the edge's place in the load order. The
+        /// endpoints do not name an edge on their own, because a pair
+        /// may run more than once and each copy carries its own values.
+        /// [`Graph::edge_ordinal`] resolves one for an edge that
+        /// arrived as a pair and nothing else, and answers with the
+        /// first of the run.
+        ord: u64,
     },
     List(Vec<Value>),
     /// GV45. A record: named fields, each holding a value. The fields
@@ -133,6 +141,13 @@ pub enum Value {
 }
 
 impl Value {
+    /// The `ord` of an edge that has no row in the stored property
+    /// columns: one a write staged and no fold has landed yet, or one
+    /// a pattern matched over a different rel table. A property read
+    /// off such an edge answers null rather than reading somebody
+    /// else's row.
+    pub const NO_REL_ROW: u64 = u64::MAX;
+
     /// A record out of the fields as they were written.
     ///
     /// The fields are sorted by name here rather than compared by name
@@ -366,6 +381,40 @@ pub trait Graph {
     fn neighbors(&mut self, rel: u32, node: u64, reversed: bool, out: &mut Vec<u64>) -> Result<()>;
     /// Edge probe in storage orientation: does `src` point at `dst`?
     fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool>;
+    /// The property row of the edge `src -> dst`, `None` when there is
+    /// no such edge. A pair that runs more than once names as many
+    /// edges as it has copies and this answers with the first of them,
+    /// which is all a caller holding nothing but the pair can be told.
+    /// A caller walking a list takes [`Graph::neighbor_ordinals`]
+    /// instead and gets every copy's own row.
+    ///
+    /// The default is the answer for an engine that stores nothing on
+    /// an edge: the probe decides whether there is a row and the row
+    /// number is never read.
+    fn edge_ordinal(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<u64>> {
+        Ok(self.has_edge(rel, src, dst)?.then_some(0))
+    }
+    /// Replaces `out` with the property row of every edge
+    /// [`Graph::neighbors`] lists for the same arguments, in the same
+    /// order, so a caller that walked the list holds a row per edge
+    /// rather than a row per pair. `len` is the length of the list the
+    /// caller got, which every implementation has to fill.
+    ///
+    /// The default is the answer for an engine that stores nothing on
+    /// an edge, one row number per neighbor and none of them read.
+    fn neighbor_ordinals(
+        &mut self,
+        rel: u32,
+        node: u64,
+        reversed: bool,
+        len: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let _ = (rel, node, reversed);
+        out.clear();
+        out.resize(len, 0);
+        Ok(())
+    }
     /// Neighbor count without the list. The default reads the list and
     /// counts it; engines whose adjacency stores offsets override this
     /// so a counting expand never touches neighbor values.
@@ -406,12 +455,12 @@ pub trait Graph {
         let _ = (table, offset);
         Ok(0)
     }
-    /// One property of one edge, named by the endpoints a rel value
+    /// One property of one edge, named by the property row a rel value
     /// carries. The default is the answer an engine that stores nothing
     /// on an edge gives, which is the answer every engine gave before
     /// edges could hold anything.
-    fn rel_property(&mut self, rel: u32, src: u64, dst: u64, key: &str) -> Result<Value> {
-        let _ = (rel, src, dst, key);
+    fn rel_property(&mut self, rel: u32, ord: u64, key: &str) -> Result<Value> {
+        let _ = (rel, ord, key);
         Ok(Value::Null)
     }
     /// The rows a `DELETE` took away, read once per query. A delete
@@ -962,13 +1011,19 @@ pub fn value_order(a: &Value, b: &Value) -> Ordering {
                 table: t1,
                 src: s1,
                 dst: d1,
+                ord: r1,
             },
             Value::Rel {
                 table: t2,
                 src: s2,
                 dst: d2,
+                ord: r2,
             },
-        ) => (t1, s1, d1).cmp(&(t2, s2, d2)),
+            // The row is last and it is what separates two copies of
+            // one pair, so an order over rels is the order over their
+            // endpoints with the copies of a pair kept in load order
+            // inside it.
+        ) => (t1, s1, d1, r1).cmp(&(t2, s2, d2, r2)),
         (Value::List(a), Value::List(b)) | (Value::Path(a), Value::Path(b)) => {
             for (x, y) in a.iter().zip(b) {
                 let ord = value_order(x, y);
@@ -2467,7 +2522,15 @@ impl std::hash::Hasher for EdgeHasher {
     }
 }
 
-type EdgeSet = std::collections::HashSet<(u64, u64), std::hash::BuildHasherDefault<EdgeHasher>>;
+/// The accumulated edges of one rel step of an ASP join: every pair,
+/// each mapped to the property row of the first edge that runs it.
+///
+/// The sweep that fills this walks the forward lists source by source,
+/// which is the load order, so the running count is the row. A pair
+/// that runs more than once keeps the first, the same copy a probe
+/// holding nothing but the pair would find in storage.
+type EdgeSet =
+    std::collections::HashMap<(u64, u64), u64, std::hash::BuildHasherDefault<EdgeHasher>>;
 
 /// One unit of parallel work: a row range of one node table, handed
 /// to the stage's driving scan. Ranges are multiples of the 2048-tuple
@@ -2779,18 +2842,22 @@ fn hop_edges(
 ) -> Result<Vec<(Value, u32, u64)>> {
     let mut hops: Vec<(Value, u32, u64)> = Vec::new();
     let mut nbrs = Vec::new();
+    let mut ords = Vec::new();
     for step in rels {
         let Some(direction) = direction.resolve(step.undirected) else {
             continue;
         };
         if direction.walks_out() && table == step.from_table {
             ctx.graph.neighbors(step.id, offset, false, &mut nbrs)?;
-            for &dst in &nbrs {
+            ctx.graph
+                .neighbor_ordinals(step.id, offset, false, nbrs.len(), &mut ords)?;
+            for (&dst, &ord) in nbrs.iter().zip(&ords) {
                 hops.push((
                     Value::Rel {
                         table: step.id,
                         src: offset,
                         dst,
+                        ord,
                     },
                     step.to_table,
                     dst,
@@ -2799,12 +2866,15 @@ fn hop_edges(
         }
         if direction.walks_in() && table == step.to_table {
             ctx.graph.neighbors(step.id, offset, true, &mut nbrs)?;
-            for &src in &nbrs {
+            ctx.graph
+                .neighbor_ordinals(step.id, offset, true, nbrs.len(), &mut ords)?;
+            for (&src, &ord) in nbrs.iter().zip(&ords) {
                 hops.push((
                     Value::Rel {
                         table: step.id,
                         src,
                         dst: offset,
+                        ord,
                     },
                     step.from_table,
                     src,
@@ -3146,6 +3216,30 @@ fn link(prev: Arc<PathLink>, rel: Value, node: (u32, u64)) -> Arc<PathLink> {
     })
 }
 
+/// Fills in the property row of rel values an operator built from
+/// endpoints alone, which is what the intersection close leaves behind.
+///
+/// A pair that runs more than once answers with the first of its run,
+/// the same copy every pair-only probe reports.
+fn resolve_rel_ords(ctx: &mut StageCtx, rels: &mut [Value]) -> Result<()> {
+    for rel in rels {
+        let Value::Rel {
+            table,
+            src,
+            dst,
+            ord,
+        } = rel
+        else {
+            continue;
+        };
+        *ord = ctx
+            .graph
+            .edge_ordinal(*table, *src, *dst)?
+            .unwrap_or(Value::NO_REL_ROW);
+    }
+    Ok(())
+}
+
 /// One probe against the accumulated edge sets of an ASP join,
 /// mirroring the direction and endpoint table checks of the storage
 /// probe in `ExpandInto`.
@@ -3165,23 +3259,25 @@ fn asp_hit(
         if direction.walks_out()
             && ft == step.from_table
             && tt == step.to_table
-            && set.contains(&(fo, to_off))
+            && let Some(&ord) = set.get(&(fo, to_off))
         {
             return Some(Value::Rel {
                 table: step.id,
                 src: fo,
                 dst: to_off,
+                ord,
             });
         }
         if direction.walks_in()
             && ft == step.to_table
             && tt == step.from_table
-            && set.contains(&(to_off, fo))
+            && let Some(&ord) = set.get(&(to_off, fo))
         {
             return Some(Value::Rel {
                 table: step.id,
                 src: to_off,
                 dst: fo,
+                ord,
             });
         }
     }
@@ -3534,6 +3630,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let (table, offset) = node_value(v, "expand")?;
             let mut far = Vec::new();
             let mut rel_vals = Vec::new();
+            let mut ords = Vec::new();
             for step in rels {
                 let Some(direction) = direction.resolve(step.undirected) else {
                     continue;
@@ -3542,7 +3639,20 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     ctx.scratch.clear();
                     let mut scratch = std::mem::take(&mut ctx.scratch);
                     ctx.graph.neighbors(step.id, offset, false, &mut scratch)?;
-                    for &dst in &scratch {
+                    // The rows only when something reads them: an
+                    // expand that emits no rel value has no property to
+                    // address and the second storage call would be for
+                    // nothing.
+                    if *emit_rels {
+                        ctx.graph.neighbor_ordinals(
+                            step.id,
+                            offset,
+                            false,
+                            scratch.len(),
+                            &mut ords,
+                        )?;
+                    }
+                    for (i, &dst) in scratch.iter().enumerate() {
                         far.push(Value::Node {
                             table: step.to_table,
                             offset: dst,
@@ -3552,6 +3662,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                                 table: step.id,
                                 src: offset,
                                 dst,
+                                ord: ords[i],
                             });
                         }
                     }
@@ -3561,7 +3672,16 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     ctx.scratch.clear();
                     let mut scratch = std::mem::take(&mut ctx.scratch);
                     ctx.graph.neighbors(step.id, offset, true, &mut scratch)?;
-                    for &src in &scratch {
+                    if *emit_rels {
+                        ctx.graph.neighbor_ordinals(
+                            step.id,
+                            offset,
+                            true,
+                            scratch.len(),
+                            &mut ords,
+                        )?;
+                    }
+                    for (i, &src) in scratch.iter().enumerate() {
                         far.push(Value::Node {
                             table: step.from_table,
                             offset: src,
@@ -3571,6 +3691,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                                 table: step.id,
                                 src,
                                 dst: offset,
+                                ord: ords[i],
                             });
                         }
                     }
@@ -3833,27 +3954,32 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 let Some(direction) = direction.resolve(step.undirected) else {
                     continue;
                 };
+                // The ordinal rather than the probe: this needs the row
+                // anyway to build the value, and a lookup that answers
+                // `None` for a missing edge answers the probe too.
                 if direction.walks_out()
                     && ft == step.from_table
                     && tt == step.to_table
-                    && ctx.graph.has_edge(step.id, fo, to_off)?
+                    && let Some(ord) = ctx.graph.edge_ordinal(step.id, fo, to_off)?
                 {
                     hit = Some(Value::Rel {
                         table: step.id,
                         src: fo,
                         dst: to_off,
+                        ord,
                     });
                     break;
                 }
                 if direction.walks_in()
                     && ft == step.to_table
                     && tt == step.from_table
-                    && ctx.graph.has_edge(step.id, to_off, fo)?
+                    && let Some(ord) = ctx.graph.edge_ordinal(step.id, to_off, fo)?
                 {
                     hit = Some(Value::Rel {
                         table: step.id,
                         src: to_off,
                         dst: fo,
+                        ord,
                     });
                     break;
                 }
@@ -3882,10 +4008,15 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     let mut set = EdgeSet::default();
                     let count = *ctx.counts.get(&step.from_table).unwrap_or(&0);
                     let StageCtx { graph, scratch, .. } = ctx;
+                    // The sweep is the load order, so the running count
+                    // is each edge's row, and `or_insert` leaves a pair
+                    // that repeats holding the first of its run.
+                    let mut ord = 0;
                     for src in 0..count {
                         graph.neighbors(step.id, src, false, scratch)?;
                         for &dst in scratch.iter() {
-                            set.insert((src, dst));
+                            set.entry((src, dst)).or_insert(ord);
+                            ord += 1;
                         }
                     }
                     sets.push(set);
@@ -4034,10 +4165,16 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         });
                         if *emit_rels {
                             let (ss, sd) = if srev { (v, so) } else { (so, v) };
+                            // The row is filled in below: a leapfrog
+                            // over two sorted lists holds the pair and
+                            // not the place either list is at, and the
+                            // reader this needs is borrowed by the
+                            // lists for as long as the walk runs.
                             seed_rels.push(Value::Rel {
                                 table: seed_step.id,
                                 src: ss,
                                 dst: sd,
+                                ord: 0,
                             });
                             // The binary probe an undirected close
                             // replaces reports the forward edge when
@@ -4052,10 +4189,15 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                                 table: probe_step.id,
                                 src: ps,
                                 dst: pd,
+                                ord: 0,
                             });
                         }
                     });
                 }
+            }
+            if *emit_rels {
+                resolve_rel_ords(ctx, &mut seed_rels)?;
+                resolve_rel_ords(ctx, &mut probe_rels)?;
             }
             if far.is_empty() {
                 continue;
@@ -4374,13 +4516,17 @@ fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
                 table: t1,
                 src: s1,
                 dst: d1,
+                ord: r1,
             },
             Value::Rel {
                 table: t2,
                 src: s2,
                 dst: d2,
+                ord: r2,
             },
-        ) => Some(t1 == t2 && s1 == s2 && d1 == d2),
+            // Two copies of one pair are two edges, and the row is what
+            // says which copy, so it is part of being the same edge.
+        ) => Some(t1 == t2 && s1 == s2 && d1 == d2 && r1 == r2),
         (Value::List(x), Value::List(y)) => {
             if x.len() != y.len() {
                 return Ok(Some(false));
@@ -4854,7 +5000,11 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             // on is one the query declared, and that is what a cast to
             // a record type is for.
             ref record @ Value::Record(_) => Ok(record.field(key).cloned().unwrap_or(Value::Null)),
-            Value::Rel { table, src, dst } => ctx.graph.rel_property(table, src, dst, key),
+            // An edge with no stored row reads null here rather than in
+            // every engine, so an engine's `rel_property` only ever
+            // sees a row it holds.
+            Value::Rel { ord, .. } if ord == Value::NO_REL_ROW => Ok(Value::Null),
+            Value::Rel { table, ord, .. } => ctx.graph.rel_property(table, ord, key),
             Value::Null => Ok(Value::Null),
             other => Err(invalid(format!(
                 "property access on {other:?}, expected a node"
@@ -6080,21 +6230,24 @@ mod tests {
         gone: DeletedRows,
     }
 
+    /// The KNOWS edges of the fixture, in load order, which is sorted
+    /// by source and then destination the way a bulk load leaves them.
+    /// An edge's place here is the row its properties would sit in, so
+    /// this is also what `knows` reads to build an expected value.
+    const KNOWS: [(u64, u64); 8] = [
+        (0, 1),
+        (0, 2),
+        (1, 2),
+        (1, 3),
+        (2, 4),
+        (3, 4),
+        (4, 5),
+        (5, 0),
+    ];
+
     fn mock() -> MockGraph {
         let mut edges = BTreeMap::new();
-        edges.insert(
-            2,
-            vec![
-                (0, 1),
-                (0, 2),
-                (1, 2),
-                (1, 3),
-                (2, 4),
-                (3, 4),
-                (4, 5),
-                (5, 0),
-            ],
-        );
+        edges.insert(2, KNOWS.to_vec());
         edges.insert(3, vec![(0, 0), (1, 1), (2, 2), (3, 0), (4, 1), (5, 2)]);
         MockGraph {
             edges,
@@ -6124,6 +6277,39 @@ mod tests {
 
         fn has_edge(&mut self, rel: u32, src: u64, dst: u64) -> Result<bool> {
             Ok(self.edges[&rel].contains(&(src, dst)))
+        }
+
+        /// The mock's edge lists are written in load order, so an
+        /// edge's row is where it sits in one. Answering this honestly
+        /// rather than taking the trait's default is what lets the
+        /// tests that run one query down two plans compare the rel
+        /// values whole: a fused close and the expand pair it replaces
+        /// have to name the same edge, and a row every path calls zero
+        /// would not tell them apart.
+        fn edge_ordinal(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<u64>> {
+            Ok(self.edges[&rel]
+                .iter()
+                .position(|&e| e == (src, dst))
+                .map(|i| i as u64))
+        }
+
+        fn neighbor_ordinals(
+            &mut self,
+            rel: u32,
+            node: u64,
+            reversed: bool,
+            _len: usize,
+            out: &mut Vec<u64>,
+        ) -> Result<()> {
+            out.clear();
+            // The same walk `neighbors` takes over the same list, so
+            // the two line up slot for slot.
+            for (i, &(src, dst)) in self.edges[&rel].iter().enumerate() {
+                if (!reversed && src == node) || (reversed && dst == node) {
+                    out.push(i as u64);
+                }
+            }
+            Ok(())
         }
 
         fn property(&mut self, _table: u32, offset: u64, key: &str) -> Result<Value> {
@@ -7561,7 +7747,15 @@ mod tests {
     }
 
     fn knows(src: u64, dst: u64) -> Value {
-        Value::Rel { table: 2, src, dst }
+        Value::Rel {
+            table: 2,
+            src,
+            dst,
+            ord: KNOWS
+                .iter()
+                .position(|&e| e == (src, dst))
+                .expect("the fixture has this edge") as u64,
+        }
     }
 
     /// The expected path, built through the constructor so the elements
@@ -7902,21 +8096,7 @@ mod tests {
             Value::Rel { dst, .. } => dst,
             _ => u64::MAX,
         });
-        assert_eq!(
-            rows,
-            vec![
-                vec![Value::Rel {
-                    table: 2,
-                    src: 0,
-                    dst: 1
-                }],
-                vec![Value::Rel {
-                    table: 2,
-                    src: 0,
-                    dst: 2
-                }],
-            ]
-        );
+        assert_eq!(rows, vec![vec![knows(0, 1)], vec![knows(0, 2)]]);
     }
 
     #[test]

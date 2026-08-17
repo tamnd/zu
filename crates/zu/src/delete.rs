@@ -101,7 +101,9 @@ impl<'a> Removals<'a> {
                 // that is the whole of it: nothing has to be checked,
                 // because an edge has no edges on it, and nothing else
                 // is staged, because both ends stay.
-                Value::Rel { table, src, dst } => {
+                Value::Rel {
+                    table, src, dst, ..
+                } => {
                     self.edges.insert((*table, *src, *dst));
                     continue;
                 }

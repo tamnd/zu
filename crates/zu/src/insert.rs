@@ -71,6 +71,10 @@ impl NewRel {
             table: self.table,
             src: self.src,
             dst: self.dst,
+            // A staged edge has no row in the stored columns until the
+            // fold lands, so a property read off it answers null, which
+            // is what it answered before an edge carried a row at all.
+            ord: Value::NO_REL_ROW,
         }
     }
 }
@@ -733,6 +737,8 @@ mod tests {
                     .id,
                 src: 3,
                 dst: 2,
+                // Staged, so no stored row yet.
+                ord: Value::NO_REL_ROW,
             }
         );
     }

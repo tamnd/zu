@@ -195,7 +195,9 @@ impl<'a> Changes<'a> {
             })?;
         match value {
             Value::Node { table, offset } => Ok((*table, At::Row(*offset))),
-            Value::Rel { table, src, dst } => Ok((*table, At::Edge(*src, *dst))),
+            Value::Rel {
+                table, src, dst, ..
+            } => Ok((*table, At::Edge(*src, *dst))),
             other => Err(ZuError::gql(
                 zu_common::gqlstatus::codes::C22G03,
                 format!(

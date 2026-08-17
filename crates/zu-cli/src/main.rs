@@ -1452,7 +1452,9 @@ fn write_json_value(out: &mut String, v: &Value) {
         Value::Node { table, offset } => {
             let _ = write!(out, "{{\"table\":{table},\"offset\":{offset}}}");
         }
-        Value::Rel { table, src, dst } => {
+        Value::Rel {
+            table, src, dst, ..
+        } => {
             let _ = write!(out, "{{\"table\":{table},\"src\":{src},\"dst\":{dst}}}");
         }
         Value::List(items) => {
@@ -1589,7 +1591,9 @@ fn display_value(v: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::Str(s) => s.clone(),
         Value::Node { table, offset } => format!("({table}:{offset})"),
-        Value::Rel { table, src, dst } => format!("[{table}:{src}->{dst}]"),
+        Value::Rel {
+            table, src, dst, ..
+        } => format!("[{table}:{src}->{dst}]"),
         Value::List(items) => {
             let parts: Vec<String> = items.iter().map(display_value).collect();
             format!("[{}]", parts.join(", "))
@@ -2369,6 +2373,7 @@ mod tests {
                     table: 1,
                     src: 7,
                     dst: 9,
+                    ord: 0,
                 },
                 Value::List(vec![Value::Int(1), Value::List(vec![Value::Int(2)])]),
             ]],

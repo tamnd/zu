@@ -39,9 +39,12 @@
 //! variable bound to the edge list. The path mode picks the repeat
 //! rule (WALK none, TRAIL no repeated edge, ACYCLIC no repeated node)
 //! and a SHORTEST selector first runs a breadth-first hop-level pass
-//! from the start so only minimum-hop paths enumerate. That is the
-//! correctness-first baseline; wiring the RecursiveBFS frontier engine
-//! underneath is the rest of milestone 4.
+//! from the start so only minimum-hop paths enumerate. An ANY SHORTEST
+//! whose far end is pinned by the filter above it absorbs that filter
+//! and answers as a single-pair search instead, two frontiers growing
+//! towards each other from the two ends. That is the correctness-first
+//! baseline; wiring the RecursiveBFS frontier engine underneath is the
+//! rest of milestone 4.
 //!
 //! OPTIONAL MATCH executes as a left-outer group. Every flatten the
 //! group needs on outer chunks sits below a `BracketBegin` that
@@ -707,6 +710,7 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
             max,
             mode,
             selector,
+            target,
             chunk,
             ..
         } => {
@@ -721,8 +725,11 @@ fn op_name(desc: &OpDesc, stage: &StageDef, query: &BoundQuery, schema: &Schema)
                 Some(Selector::AllShortest) => " all shortest",
                 None => "",
             };
+            let pinned = target.as_ref().map_or(String::new(), |key| {
+                format!(" [id = {}]", expr_text(key, query))
+            });
             format!(
-                "VarExpand *{min}..{max}{mode}{sel} {}",
+                "VarExpand *{min}..{max}{mode}{sel} {}{pinned}",
                 rel_text(
                     var(*from),
                     var(stage.chunk_slots[*chunk][0]),
@@ -1075,6 +1082,11 @@ enum OpDesc {
         /// Candidate tables of the endpoint variable; paths ending
         /// elsewhere are not emitted.
         to_tables: Vec<u32>,
+        /// The key of the one endpoint this expansion is asked about,
+        /// absorbed from the equality filter that followed it. Set only
+        /// under ANY SHORTEST, where it turns the whole operator into a
+        /// single-pair search that meets in the middle.
+        target: Option<BoundExpr>,
         chunk: usize,
     },
     /// Both endpoints bound: an edge probe instead of a list read.
@@ -1619,6 +1631,28 @@ fn compile_match_op(
                         query.variables[*to].name
                     )));
                 }
+                // A shortest search whose far end is pinned by the very
+                // next filter is a single-pair question, and answering
+                // it by levelling the whole reachable component and
+                // throwing all but one endpoint away is the wrong
+                // search. Absorbing the key lets the operator meet in
+                // the middle instead. Only ANY SHORTEST takes it: ALL
+                // SHORTEST has to know the minimum hop count of every
+                // node on both sides before it can enumerate, which the
+                // meeting search deliberately never learns.
+                let target = if v.selector == Some(Selector::AnyShortest) {
+                    lookahead.and_then(|next| match next {
+                        LogicalPlan::Filter {
+                            expr,
+                            bracket: filter_bracket,
+                            ..
+                        } if filter_bracket == bracket => index_key(expr, *to),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                let consumed = target.is_some();
                 let chunk = b.new_chunk(vec![*to, *rel], false);
                 b.push(OpDesc::VarExpand {
                     from: *from,
@@ -1629,9 +1663,11 @@ fn compile_match_op(
                     mode: v.mode,
                     selector: v.selector,
                     to_tables,
+                    target,
                     chunk,
                 });
                 b.produced(chunk);
+                return Ok(consumed);
             } else if *into {
                 let to_chunk = b
                     .slot_loc
@@ -2862,6 +2898,164 @@ fn hop_levels(
     Ok(bfs)
 }
 
+/// The nodes a key expression names, one per candidate table it exists
+/// in, the same resolution `IndexLookup` does. An empty answer is a
+/// miss, not an error: a key of the wrong type, or one nobody carries,
+/// names no node.
+fn key_nodes(ctx: &mut StageCtx, key: &BoundExpr, tables: &[u32]) -> Result<Vec<(u32, u64)>> {
+    let Value::Int(k) = eval(ctx, key)? else {
+        return Ok(Vec::new());
+    };
+    let Ok(k) = u64::try_from(k) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for &table in tables {
+        let Some(offset) = ctx.graph.lookup_key(table, k)? else {
+            continue;
+        };
+        if offset < *ctx.counts.get(&table).unwrap_or(&0) {
+            out.push((table, offset));
+        }
+    }
+    Ok(out)
+}
+
+/// One side of the meeting search: the level every node was reached at
+/// and the hop that reached it, plus the frontier the next round grows
+/// from. `step` is the rel walked and the node on the other side of it,
+/// which is the parent going forwards and the successor coming back.
+/// A node the search stands on: its table and its row in that table.
+type NodeAt = (u32, u64);
+
+/// How a node was reached: the rel value walked and the node on the
+/// other side of it. The source was reached by nothing, which is the
+/// `None` that ends a path when it is read back.
+type Step = Option<(Value, NodeAt)>;
+
+struct HalfSearch {
+    seen: BTreeMap<NodeAt, (u64, Step)>,
+    frontier: Vec<(u32, u64)>,
+    depth: u64,
+}
+
+impl HalfSearch {
+    fn start(at: (u32, u64)) -> Self {
+        let mut seen = BTreeMap::new();
+        seen.insert(at, (0, None));
+        HalfSearch {
+            seen,
+            frontier: vec![at],
+            depth: 0,
+        }
+    }
+}
+
+/// The minimum-hop path between two bound nodes, as a PMR chain rooted
+/// at `src` and ending at `dst`, or `None` when no path within the hop
+/// window joins them.
+///
+/// Two frontiers grow towards each other and the smaller one moves each
+/// round, so the search visits about two balls of radius d/2 where a
+/// one-sided BFS visits one ball of radius d. On a graph where the
+/// neighbourhood grows by a branching factor that is the difference
+/// between b^d and 2*b^(d/2), which is the whole reason a single-pair
+/// question is not answered by the same search that answers "how far is
+/// everything from here".
+///
+/// A round stops growing a side when the other side is empty, when the
+/// hop window is used up, or when the best meeting found so far is no
+/// longer than the two depths together: every path still undiscovered
+/// has to leave both explored balls, so it is at least one hop longer
+/// than their radii add up to, and nothing shorter can turn up later.
+fn pair_shortest(
+    ctx: &mut StageCtx,
+    rels: &[RelStep],
+    direction: RelDirection,
+    max: Option<u64>,
+    src: (u32, u64),
+    dst: (u32, u64),
+) -> Result<Option<Arc<PathLink>>> {
+    if src == dst {
+        return Ok(Some(chain_root(src.0, src.1)));
+    }
+    let back = direction.flip();
+    let mut fwd = HalfSearch::start(src);
+    let mut bwd = HalfSearch::start(dst);
+    let mut best: Option<(u64, (u32, u64))> = None;
+    loop {
+        if best.is_some_and(|(len, _)| len <= fwd.depth + bwd.depth) {
+            break;
+        }
+        if fwd.frontier.is_empty() || bwd.frontier.is_empty() {
+            break;
+        }
+        if max.is_some_and(|m| fwd.depth + bwd.depth + 1 > m) {
+            break;
+        }
+        let forwards = fwd.frontier.len() <= bwd.frontier.len();
+        let (near, far, dir) = if forwards {
+            (&mut fwd, &bwd, direction)
+        } else {
+            (&mut bwd, &fwd, back)
+        };
+        let depth = near.depth + 1;
+        let mut next = Vec::new();
+        for &(t, o) in &std::mem::take(&mut near.frontier) {
+            for (rel_val, nt, no) in hop_edges(ctx, rels, dir, t, o)? {
+                if near.seen.contains_key(&(nt, no)) {
+                    continue;
+                }
+                near.seen.insert((nt, no), (depth, Some((rel_val, (t, o)))));
+                next.push((nt, no));
+                if let Some(&(other, _)) = far.seen.get(&(nt, no)) {
+                    let len = depth + other;
+                    if max.is_none_or(|m| len <= m) && best.is_none_or(|(b, _)| len < b) {
+                        best = Some((len, (nt, no)));
+                    }
+                }
+            }
+        }
+        near.frontier = next;
+        near.depth = depth;
+    }
+    let Some((_, meet)) = best else {
+        return Ok(None);
+    };
+    // Forwards from the source to the meeting node, then onwards to the
+    // target through the hops the backward side recorded.
+    let mut up = Vec::new();
+    let mut cur = meet;
+    while let Some((rel, prev)) = fwd.seen[&cur].1.clone() {
+        up.push((rel, cur));
+        cur = prev;
+    }
+    let mut chain = chain_root(src.0, src.1);
+    for (rel, node) in up.into_iter().rev() {
+        chain = link(chain, rel, node);
+    }
+    let mut cur = meet;
+    while let Some((rel, next)) = bwd.seen[&cur].1.clone() {
+        chain = link(chain, rel, next);
+        cur = next;
+    }
+    Ok(Some(chain))
+}
+
+/// One more hop on a PMR chain.
+fn link(prev: Arc<PathLink>, rel: Value, node: (u32, u64)) -> Arc<PathLink> {
+    let hops = prev.hops + 1;
+    Arc::new(PathLink {
+        prev: Some(prev),
+        rel: Some(rel),
+        node: Value::Node {
+            table: node.0,
+            offset: node.1,
+        },
+        hops,
+    })
+}
+
 /// One probe against the accumulated edge sets of an ASP join,
 /// mirroring the direction and endpoint table checks of the storage
 /// probe in `ExpandInto`.
@@ -3386,6 +3580,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             mode,
             selector,
             to_tables,
+            target,
             chunk,
         } => loop {
             if !next(descs, ctx, i - 1)? {
@@ -3398,6 +3593,37 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             let (table, offset) = node_value(v, "var expand")?;
             let mut far = Vec::new();
             let mut trails = Vec::new();
+            if let Some(key) = target {
+                // The far end is one node, so the search is a meeting
+                // one and the answer is one row. A key that is not an
+                // integer, or names nobody, matches nothing, which is
+                // what the filter this absorbed would have said.
+                let dsts = key_nodes(ctx, key, to_tables)?;
+                for dst in dsts {
+                    let Some(chain) =
+                        pair_shortest(ctx, rels, *direction, *max, (table, offset), dst)?
+                    else {
+                        continue;
+                    };
+                    if chain.hops < *min {
+                        continue;
+                    }
+                    far.push(Value::Node {
+                        table: dst.0,
+                        offset: dst.1,
+                    });
+                    trails.push(Value::Chain(chain));
+                }
+                if far.is_empty() {
+                    continue;
+                }
+                let c = &mut ctx.chunks[*chunk];
+                c.size = far.len();
+                c.cols[0] = far;
+                c.cols[1] = trails;
+                c.cur = None;
+                return Ok(true);
+            }
             match selector {
                 Some(Selector::AnyShortest) => {
                     // Chains build in discovery order, so a node's
@@ -6888,6 +7114,130 @@ mod tests {
             &[],
         );
         assert_eq!(int_rows(&any), int_rows(&trails));
+    }
+
+    #[test]
+    fn a_pinned_endpoint_turns_the_search_into_a_meeting_one() {
+        let (r, p) = profiled(
+            "MATCH ANY SHORTEST (a:Person {id: 0})-[r:KNOWS*]->(b:Person {id: 5}) \
+             RETURN size(r) AS hops",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[3]]);
+        let names = op_names(&p);
+        assert!(
+            names
+                .iter()
+                .any(|n| n.contains("any shortest") && n.contains("[id = 5]")),
+            "the endpoint filter was not absorbed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("Filter")),
+            "the absorbed filter is still being evaluated: {names:?}"
+        );
+    }
+
+    #[test]
+    fn the_meeting_search_answers_every_pair_the_one_sided_one_does() {
+        // The one-sided search over all endpoints is the reference: for
+        // every source it says how far each node is, and the pinned
+        // query has to say the same thing one pair at a time. Both
+        // directed and undirected, so the backward frontier is walked
+        // both ways round.
+        for arrow in ["->", "-"] {
+            for src in 0..6u64 {
+                let all = run(
+                    &format!(
+                        "MATCH ANY SHORTEST (a:Person {{id: {src}}})-[r:KNOWS*]{arrow}(b) \
+                         RETURN b.id AS b, size(r) AS hops ORDER BY b"
+                    ),
+                    &[],
+                );
+                let want: BTreeMap<i64, i64> = int_rows(&all)
+                    .into_iter()
+                    .map(|row| (row[0], row[1]))
+                    .collect();
+                for dst in 0..6u64 {
+                    let one = run(
+                        &format!(
+                            "MATCH ANY SHORTEST (a:Person {{id: {src}}})-[r:KNOWS*]{arrow}\
+                             (b:Person {{id: {dst}}}) RETURN size(r) AS hops"
+                        ),
+                        &[],
+                    );
+                    let got: Vec<i64> = int_rows(&one).into_iter().map(|row| row[0]).collect();
+                    let want: Vec<i64> = want.get(&(dst as i64)).copied().into_iter().collect();
+                    assert_eq!(got, want, "{src} to {dst} over '{arrow}'");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_meeting_search_keeps_the_hop_window() {
+        // 5 sits three hops from 0, so a ceiling under three answers
+        // nothing and one at or over it answers three, exactly as the
+        // unpinned search does. A selector only ever carries a lower
+        // bound of one: the binder refuses to force a minimum-hop path
+        // to be longer than it is.
+        for hops in ["*1..2", "*1..3", "*1..4", "*1.."] {
+            let one = run(
+                &format!(
+                    "MATCH ANY SHORTEST (a:Person {{id: 0}})-[r:KNOWS{hops}]->\
+                     (b:Person {{id: 5}}) RETURN size(r) AS hops"
+                ),
+                &[],
+            );
+            let all = run(
+                &format!(
+                    "MATCH ANY SHORTEST (a:Person {{id: 0}})-[r:KNOWS{hops}]->(b) \
+                     WHERE b.id = 5 AND true RETURN size(r) AS hops"
+                ),
+                &[],
+            );
+            assert_eq!(int_rows(&one), int_rows(&all), "window {hops}");
+        }
+    }
+
+    #[test]
+    fn a_pinned_endpoint_nobody_carries_matches_nothing() {
+        let r = run(
+            "MATCH ANY SHORTEST (a:Person {id: 0})-[r:KNOWS*]->(b:Person {id: 99}) \
+             RETURN size(r) AS hops",
+            &[],
+        );
+        assert!(r.rows.is_empty());
+        // The start again: a shortest path never comes back to it,
+        // because its zero-hop path is under the lower bound of one.
+        let r = run(
+            "MATCH ANY SHORTEST (a:Person {id: 0})-[r:KNOWS*]->(b:Person {id: 0}) \
+             RETURN size(r) AS hops",
+            &[],
+        );
+        assert!(r.rows.is_empty());
+    }
+
+    #[test]
+    fn the_meeting_search_returns_a_path_somebody_can_walk() {
+        // 0 to 5 has one shortest path, 0-2-4-5, and the halves the two
+        // frontiers found have to come back as one chain in order.
+        let r = run(
+            "MATCH p = ANY SHORTEST (a:Person {id: 0})-[r:KNOWS*]->(b:Person {id: 5}) \
+             RETURN p",
+            &[],
+        );
+        assert_eq!(
+            r.rows,
+            [[path(vec![
+                node(0),
+                knows(0, 2),
+                node(2),
+                knows(2, 4),
+                node(4),
+                knows(4, 5),
+                node(5),
+            ])]]
+        );
     }
 
     fn node(offset: u64) -> Value {

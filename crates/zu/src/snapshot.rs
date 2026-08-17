@@ -21,6 +21,7 @@ pub use zu_query::snapshot::{
     ZonePred,
 };
 
+use crate::deleted::Deleted;
 use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
@@ -96,6 +97,11 @@ pub struct Zu1Snapshot<'a> {
     scratch: Vec<u64>,
     str_bytes: Vec<u8>,
     str_ends: Vec<u64>,
+    /// The rows a `DELETE` took away, read on the first scan and kept.
+    /// `None` is "not read yet" and not "nothing is deleted": the read
+    /// costs a table index decode, so a snapshot that never scans a
+    /// node table never pays it.
+    gone: Option<Deleted>,
 }
 
 /// What a snapshot learns while it reads, kept in a value of its own
@@ -119,6 +125,7 @@ pub struct SnapshotCache {
     scratch: Vec<u64>,
     str_bytes: Vec<u8>,
     str_ends: Vec<u64>,
+    gone: Option<Deleted>,
 }
 
 impl<'a> Zu1Snapshot<'a> {
@@ -136,6 +143,7 @@ impl<'a> Zu1Snapshot<'a> {
             scratch: cache.scratch,
             str_bytes: cache.str_bytes,
             str_ends: cache.str_ends,
+            gone: cache.gone,
         }
     }
 
@@ -147,6 +155,7 @@ impl<'a> Zu1Snapshot<'a> {
             scratch: self.scratch,
             str_bytes: self.str_bytes,
             str_ends: self.str_ends,
+            gone: self.gone,
         }
     }
 
@@ -179,6 +188,74 @@ impl<'a> Zu1Snapshot<'a> {
         self.props.insert(table, reader);
         Ok(())
     }
+
+    /// Reads the deleted set once per snapshot, or per epoch when a
+    /// caller carries the cache from one snapshot to the next.
+    fn ensure_gone(&mut self) -> Result<&Deleted> {
+        if self.gone.is_none() {
+            self.gone = Some(Deleted::load(&mut self.db)?);
+        }
+        Ok(self.gone.as_ref().expect("just loaded"))
+    }
+}
+
+/// Walks a chunk's rows against the rows of it a delete took away.
+///
+/// Both sides are ascending, so this is a merge and not a lookup per
+/// row: the cursor only ever moves forward, whatever the chunk's rows
+/// come out of.
+struct Tombstones<'a> {
+    dead: &'a [u64],
+    at: usize,
+    base: u64,
+}
+
+impl Tombstones<'_> {
+    fn gone(&mut self, row: u16) -> bool {
+        let offset = self.base + u64::from(row);
+        while self.at < self.dead.len() && self.dead[self.at] < offset {
+            self.at += 1;
+        }
+        self.at < self.dead.len() && self.dead[self.at] == offset
+    }
+}
+
+/// The rows of one chunk a delete left behind, as a selection.
+///
+/// `dead` holds the chunk's deleted rows and `sel` what the scan had
+/// already selected, identity when it has none. An empty answer means
+/// the whole chunk is gone, which a scan reports the way it reports a
+/// chunk the zone map ruled out.
+fn survivors(
+    dead: &[u64],
+    row_base: u64,
+    rows: usize,
+    sel: Option<&SelVector>,
+    arena: &mut MorselArena,
+) -> SelVector {
+    let mut tombs = Tombstones {
+        dead,
+        at: 0,
+        base: row_base,
+    };
+    let mut out = SelVector::with_capacity(arena, sel.map_or(rows, SelVector::len));
+    match sel {
+        Some(sel) => {
+            for &row in sel.as_slice() {
+                if !tombs.gone(row) {
+                    out.push(row);
+                }
+            }
+        }
+        None => {
+            for row in 0..rows as u16 {
+                if !tombs.gone(row) {
+                    out.push(row);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The props reader of `table`, which must have properties stored.
@@ -276,22 +353,35 @@ impl Snapshot for Zu1Snapshot<'_> {
             if row_base >= total {
                 return Ok(None);
             }
+            let rows = (total - row_base).min(SCAN_ROWS as u64) as u32;
+            let dead = self.ensure_gone()?.span(table, row_base, u64::from(rows));
+            let mut sel = None;
+            if !dead.is_empty() {
+                let alive = survivors(dead, row_base, rows as usize, None, arena);
+                if alive.is_empty() {
+                    return Ok(None);
+                }
+                sel = Some(alive);
+            }
             return Ok(Some(ScanChunk {
                 row_base,
-                rows: (total - row_base).min(SCAN_ROWS as u64) as u32,
-                sel: None,
+                rows,
+                sel,
                 columns: Vec::new(),
             }));
         }
         self.ensure_props(table)?;
+        self.ensure_gone()?;
         let Self {
             db,
             props,
             scratch,
             str_bytes,
             str_ends,
+            gone,
             ..
         } = self;
+        let gone = gone.as_ref().expect("just loaded");
         let reader = props_of(props, table)?;
         let row_base = chunk * SCAN_ROWS as u64;
         if row_base >= reader.rows() {
@@ -344,6 +434,19 @@ impl Snapshot for Zu1Snapshot<'_> {
                 }
                 sel = Some(s);
             }
+        }
+        // What a delete took away is thinned out here rather than left
+        // to a kernel above, because a tombstone is not in the residual
+        // program: nothing further up rechecks it, so the selection is
+        // the only place the row can go missing. It is built whatever
+        // the density, for the same reason.
+        let dead = gone.span(table, row_base, rows as u64);
+        if !dead.is_empty() {
+            let alive = survivors(dead, row_base, rows, sel.as_ref(), arena);
+            if alive.is_empty() {
+                return Ok(None);
+            }
+            sel = Some(alive);
         }
         let mut columns = Vec::with_capacity(cols.len());
         for &c in cols {
@@ -465,7 +568,13 @@ impl Snapshot for Zu1Snapshot<'_> {
             None => Some(key),
         };
         let rows = self.table_rows(table)?;
-        Ok(row.filter(|&r| r < rows))
+        let Some(row) = row.filter(|&r| r < rows) else {
+            return Ok(None);
+        };
+        // A key still names the row it always named after a delete,
+        // because offsets do not move and the index is not rewritten,
+        // so the tombstone is what says the row is gone.
+        Ok((!self.ensure_gone()?.holds(table, row)).then_some(row))
     }
 
     fn degree_batch(&mut self, rel: RelId, nodes: &[u64], dir: Dir) -> Result<u64> {
@@ -536,6 +645,11 @@ impl Snapshot for Zu1Snapshot<'_> {
             scratch: Vec::new(),
             str_bytes: Vec::new(),
             str_ends: Vec::new(),
+            // Read once and shared out: the set describes the epoch
+            // both handles read, and it is the same few words either
+            // way, so a worker starts with it rather than reading the
+            // table index again.
+            gone: self.gone.clone(),
         }))
     }
 }

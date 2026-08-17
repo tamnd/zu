@@ -329,6 +329,19 @@ impl Session {
                     self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
                     next
                 }
+                crate::split::Write::Delete(delete) => {
+                    let catalog = self.graph.catalog().clone();
+                    let mut removals = crate::delete::Removals::open(delete, catalog);
+                    let mut next = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let (carried, _) = row.split_at(carry);
+                        removals.row(self.graph.file_mut(), carried)?;
+                        next.push(Value::List(carried.to_vec()));
+                    }
+                    let rows = removals.staged();
+                    self.write(|txn| crate::delete::stage(txn, &rows))?;
+                    next
+                }
                 crate::split::Write::Set(set) => {
                     let mut changes = crate::set::Changes::open(set);
                     let mut next = Vec::with_capacity(rows.len());

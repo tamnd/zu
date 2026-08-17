@@ -73,8 +73,8 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "DELETE", "DETACH", "MERGE", "FILTER", "LET", "NEXT", "START", "COMMIT", "ROLLBACK",
-    "SESSION", "FINISH", "FOR",
+    "CREATE", "MERGE", "FILTER", "LET", "NEXT", "START", "COMMIT", "ROLLBACK", "SESSION", "FINISH",
+    "FOR",
 ];
 
 /// Parses one zuQL query.
@@ -699,19 +699,14 @@ impl Parser<'_> {
         clauses.iter().any(|c| {
             matches!(
                 c,
-                Clause::Insert { .. } | Clause::Set { .. } | Clause::Remove { .. }
+                Clause::Insert { .. }
+                    | Clause::Set { .. }
+                    | Clause::Remove { .. }
+                    | Clause::Delete { .. }
             )
         })
     }
 
-    /// One item of a `SET`: `p.age = 37`.
-    ///
-    /// The other two forms of the item are named rather than met with a
-    /// syntax error. `SET p = {...}` replaces every property an element
-    /// holds, which is a column the element leaves empty for each one
-    /// the record does not mention, and `SET p:Label` changes which
-    /// labels it carries, which is a catalog change. Both are pieces of
-    /// their own, and a reader who wrote one spelled it correctly.
     /// One `REMOVE` item, which is a property and nothing else. A label
     /// after the variable is the other thing GQL lets `REMOVE` take,
     /// and an element carries the labels of the table it is in, so that
@@ -732,6 +727,14 @@ impl Parser<'_> {
         Ok(RemoveItem { target, key })
     }
 
+    /// One item of a `SET`: `p.age = 37`.
+    ///
+    /// The other two forms of the item are named rather than met with a
+    /// syntax error. `SET p = {...}` replaces every property an element
+    /// holds, which is a column the element leaves empty for each one
+    /// the record does not mention, and `SET p:Label` changes which
+    /// labels it carries, which is a catalog change. Both are pieces of
+    /// their own, and a reader who wrote one spelled it correctly.
     fn parse_set_item(&mut self) -> Result<SetItem> {
         let target = self.expect_name("a variable after SET")?;
         if self.at(&TokenKind::Colon) || self.at_kw("IS") {
@@ -794,6 +797,23 @@ impl Parser<'_> {
                     items.push(self.parse_remove_item()?);
                 }
                 clauses.push(Clause::Remove { items });
+            } else if self.at_kw("DELETE") || self.at_kw("DETACH") {
+                let detach = self.eat_kw("DETACH");
+                self.expect_kw("DELETE")?;
+                if detach {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        format!(
+                            "{}: DETACH DELETE is not implemented yet, it takes the edges on an element with it and an edge cannot be deleted yet",
+                            position(self.source, self.peek().expect("peeked").start)
+                        ),
+                    ));
+                }
+                let mut targets = vec![self.parse_delete_target()?];
+                while self.eat(&TokenKind::Comma) {
+                    targets.push(self.parse_delete_target()?);
+                }
+                clauses.push(Clause::Delete { targets });
             } else if self.eat_kw("CALL") {
                 let name = self.expect_name("a table function name after CALL")?;
                 self.expect(&TokenKind::LParen)?;
@@ -879,6 +899,25 @@ impl Parser<'_> {
                 return Err(self.error("MATCH, OPTIONAL MATCH, CALL, UNWIND, WITH, or RETURN"));
             }
         }
+    }
+
+    /// One element a `DELETE` takes away, which is a variable and not
+    /// an expression. GQL deletes what an earlier clause bound, so a
+    /// property reference here is a syntax error, and it says so rather
+    /// than the clause ending at the name and the dot being what
+    /// nobody expected.
+    fn parse_delete_target(&mut self) -> Result<String> {
+        let name = self.expect_name("a variable after DELETE")?;
+        if self.at(&TokenKind::Dot) {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{}: DELETE takes away an element and not a property, and '{name}' is followed by one",
+                    position(self.source, self.peek().expect("peeked").start)
+                ),
+            ));
+        }
+        Ok(name)
     }
 
     /// A `USE` clause in front of a query, which says which graph the
@@ -2332,8 +2371,7 @@ mod tests {
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
         for (source, kw) in [
-            ("MATCH (p) DELETE p", "DELETE"),
-            ("MATCH (p) DETACH DELETE p", "DETACH"),
+            ("MATCH (p) DETACH DELETE p", "DETACH DELETE"),
             ("START TRANSACTION READ WRITE", "START"),
             ("COMMIT", "COMMIT"),
             ("ROLLBACK", "ROLLBACK"),
@@ -2987,6 +3025,28 @@ mod tests {
         // A REMOVE is a write, so the statement ends without a RETURN
         // the way a SET does.
         assert_eq!(q.clauses.len(), 2);
+    }
+
+    #[test]
+    fn a_delete_carries_the_variables_it_was_written_with() {
+        let q = parsed("MATCH (p:person), (q:person) DELETE p, q");
+        let Clause::Delete { targets } = &q.clauses[1] else {
+            panic!("DELETE");
+        };
+        assert_eq!(targets, &["p".to_string(), "q".to_string()]);
+        // A DELETE is a write, so the statement ends without a RETURN
+        // the way a SET does.
+        assert_eq!(q.clauses.len(), 2);
+    }
+
+    /// DELETE takes a variable and not an expression, so a property
+    /// reference after it is a syntax error and says what it wanted.
+    #[test]
+    fn deleting_something_that_is_not_a_variable_is_refused() {
+        assert!(
+            parse_err("MATCH (p:person) DELETE p.age").contains("an element and not a property")
+        );
+        assert!(parse_err("MATCH (p:person) DELETE").contains("a variable after DELETE"));
     }
 
     /// A label is the other thing GQL lets REMOVE take, and it is named

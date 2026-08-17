@@ -1398,6 +1398,17 @@ set_stmt_us = 250000.0
 insert_stmt_us = 250000.0
 set_stmt_kb = 4096.0
 
+# A DELETE at the same shape, measured 15 ms and 1044 kB at 10000 rows.
+# It is the cheapest of the three because a delete does not compact: the
+# row keeps its offset, so the fold merges one offset into the table's
+# tombstone chain instead of rewriting the property columns the way a
+# SET does. The ceilings are the same as the other two, because what
+# they are here to catch is the same thing, a path that starts rewriting
+# the table or adds another sync. Lower these ceilings, never raise
+# them.
+delete_stmt_us = 250000.0
+delete_stmt_kb = 4096.0
+
 # What a statement that changed nothing added to the store, per
 # statement. A SET that writes back the value it read leaves a table of
 # the same shape, so the fold's new blocks must come out of the free

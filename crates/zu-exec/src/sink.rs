@@ -11,10 +11,10 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use zu_common::{Result, ZuError};
-use zu_query::ast::SortKey;
+use zu_query::ast::{BinaryOp, SortKey};
 use zu_query::exec::{OrdValue, QueryResult, Value};
 
-use crate::compile::{AggSpec, PostSpec};
+use crate::compile::{AggSpec, PostAgg, PostPred, PostSpec};
 use crate::group::{GroupTable, KeyBatch, PartKind};
 
 /// Rows per DISTINCT probe vector, the pipeline's vector width.
@@ -174,9 +174,169 @@ pub(crate) fn apply_post(post: &[PostSpec], mut rows: Vec<Vec<Value>>) -> Vec<Ve
                 rows.drain(..n);
             }
             PostSpec::Limit(n) => rows.truncate(*n as usize),
+            // A group the predicate cannot answer for is a group it
+            // does not keep, which is what a null does to a WHERE.
+            PostSpec::Having(pred) => rows.retain(|row| holds(pred, row) == Some(true)),
+            PostSpec::Regroup {
+                keys,
+                aggs,
+                item_agg,
+            } => rows = regroup(keys, aggs, item_agg, rows),
+            PostSpec::Emit(cols) => {
+                for row in &mut rows {
+                    *row = cols.iter().map(|&c| row[c].clone()).collect();
+                }
+            }
         }
     }
     rows
+}
+
+/// What a HAVING says about one group: true, false, or nothing at all
+/// where the two sides of a comparison do not compare.
+fn holds(pred: &PostPred, row: &[Value]) -> Option<bool> {
+    match pred {
+        PostPred::Cmp(op, at, want) => compares(*op, &row[*at], want),
+        PostPred::And(parts) => {
+            let mut all = Some(true);
+            for p in parts {
+                match holds(p, row) {
+                    Some(false) => return Some(false),
+                    None => all = None,
+                    Some(true) => {}
+                }
+            }
+            all
+        }
+        PostPred::Or(parts) => {
+            let mut any = Some(false);
+            for p in parts {
+                match holds(p, row) {
+                    Some(true) => return Some(true),
+                    None => any = None,
+                    Some(false) => {}
+                }
+            }
+            any
+        }
+    }
+}
+
+/// One comparison of a group's value against the constant the query
+/// wrote. Two values of different kinds do not compare, and neither
+/// does a null, so those answer with nothing.
+fn compares(op: BinaryOp, have: &Value, want: &Value) -> Option<bool> {
+    let ord = match (have, want) {
+        (Value::Int(p), Value::Int(q)) => p.cmp(q),
+        (Value::Float(p), Value::Float(q)) => p.partial_cmp(q)?,
+        (Value::Int(p), Value::Float(q)) => (*p as f64).partial_cmp(q)?,
+        (Value::Float(p), Value::Int(q)) => p.partial_cmp(&(*q as f64))?,
+        (Value::Str(p), Value::Str(q)) => p.cmp(q),
+        (Value::Bool(p), Value::Bool(q)) => p.cmp(q),
+        _ => return None,
+    };
+    Some(match op {
+        BinaryOp::Eq => ord == Ordering::Equal,
+        BinaryOp::Lt => ord == Ordering::Less,
+        BinaryOp::Le => ord != Ordering::Greater,
+        BinaryOp::Gt => ord == Ordering::Greater,
+        BinaryOp::Ge => ord != Ordering::Less,
+        _ => return None,
+    })
+}
+
+/// Groups rows that already came out of the sink a second time.
+///
+/// There are as many of these as the query grouped into, which is a
+/// fraction of the rows that made them, so this sorts and walks the
+/// runs rather than building a second hash table. It costs one compare
+/// per row per key and hands the answer back in ascending key order,
+/// which is the order the sink's own groups arrive in.
+fn regroup(
+    keys: &[usize],
+    aggs: &[PostAgg],
+    item_agg: &[bool],
+    mut rows: Vec<Vec<Value>>,
+) -> Vec<Vec<Value>> {
+    // No key at all is one group over everything, and it answers even
+    // when nothing reached it: a count over no rows is zero.
+    if keys.is_empty() {
+        return vec![staged_row(item_agg, &[], &fold(aggs, &rows))];
+    }
+    let same = |a: &Vec<Value>, b: &Vec<Value>| {
+        keys.iter()
+            .map(|&c| val_cmp(&a[c], &b[c]))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    };
+    rows.sort_by(same);
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < rows.len() {
+        let mut end = at + 1;
+        while end < rows.len() && same(&rows[end], &rows[at]) == Ordering::Equal {
+            end += 1;
+        }
+        let vals = fold(aggs, &rows[at..end]);
+        let keyvals: Vec<Value> = keys.iter().map(|&c| rows[at][c].clone()).collect();
+        out.push(staged_row(item_agg, &keyvals, &vals));
+        at = end;
+    }
+    out
+}
+
+/// One group's keys and accumulators woven back into the order the
+/// clause wrote its items in, the same weave [`finish_agg`] does.
+fn staged_row(item_agg: &[bool], keys: &[Value], aggs: &[Value]) -> Vec<Value> {
+    let mut kit = keys.iter();
+    let mut ait = aggs.iter();
+    item_agg
+        .iter()
+        .map(|&is_agg| {
+            if is_agg { ait.next() } else { kit.next() }
+                .expect("one value per item")
+                .clone()
+        })
+        .collect()
+}
+
+/// The accumulators of one group of already-grouped rows.
+fn fold(aggs: &[PostAgg], rows: &[Vec<Value>]) -> Vec<Value> {
+    aggs.iter()
+        .map(|spec| match spec {
+            PostAgg::Count(None) => Value::Int(rows.len() as i64),
+            PostAgg::Count(Some(c)) => Value::Int(
+                rows.iter()
+                    .filter(|row| !matches!(row[*c], Value::Null))
+                    .count() as i64,
+            ),
+            PostAgg::Sum(c) => sum_of(rows.iter().map(|row| &row[*c])),
+        })
+        .collect()
+}
+
+/// A sum over group values, integer while every value is one and real
+/// once any of them is. Nulls are skipped and a sum of nothing is
+/// zero, which is what the old engine answers.
+fn sum_of<'a>(vals: impl Iterator<Item = &'a Value>) -> Value {
+    let mut ints: i64 = 0;
+    let mut reals = 0f64;
+    let mut any_real = false;
+    for v in vals {
+        match v {
+            Value::Int(n) => ints = ints.wrapping_add(*n),
+            Value::Float(f) => {
+                reals += f;
+                any_real = true;
+            }
+            _ => {}
+        }
+    }
+    if any_real {
+        Value::Float(ints as f64 + reals)
+    } else {
+        Value::Int(ints)
+    }
 }
 
 /// The OrdValue total order taken by reference. Ordering through

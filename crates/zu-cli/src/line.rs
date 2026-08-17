@@ -418,10 +418,12 @@ impl Editor {
 /// Whether a statement is finished, which is the rule return obeys.
 ///
 /// Balanced and unquoted, or ended with a semicolon. Comments are
-/// skipped rather than scanned, because a `--` to the end of a line and
+/// skipped rather than scanned, because a `//` to the end of a line and
 /// a `/* */` block are both places a bracket means nothing, and a shell
 /// that asked for another line because a comment mentioned a
 /// parenthesis would be a shell people stopped writing comments in.
+/// Those two are the language's comments and `--` is not one of them,
+/// whatever a SQL shell would make of it.
 pub(crate) fn finished(text: &str) -> bool {
     let mut depth = 0i32;
     let mut quote: Option<char> = None;
@@ -445,7 +447,7 @@ pub(crate) fn finished(text: &str) -> bool {
             '\'' | '"' | '`' => quote = Some(c),
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
-            '-' if chars.peek().map(|(_, n)| *n) == Some('-') => {
+            '/' if chars.peek().map(|(_, n)| *n) == Some('/') => {
                 for (_, n) in chars.by_ref() {
                     if n == '\n' {
                         break;
@@ -681,7 +683,7 @@ mod tests {
         assert!(finished("RETURN 'it''s'"));
         assert!(!finished("MATCH (n {a: 1}"));
         assert!(finished("MATCH (n {a: 1})"));
-        assert!(finished("RETURN 1 -- a ( comment"));
+        assert!(finished("RETURN 1 // a ( comment"));
         assert!(finished("RETURN 1 /* a ( comment */"));
         assert!(!finished("RETURN 1 /* unclosed ("));
         // A bracket closed that was never opened is the parser's to

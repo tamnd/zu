@@ -26,7 +26,9 @@ pub(crate) enum Kind {
     /// A quoted string, single, double or backtick.
     Text,
     Number,
-    /// A `--` line comment or a `/* */` block.
+    /// A `//` line comment or a `/* */` block, which are the two the
+    /// language has. `--` is a pair of minus signs and is coloured as
+    /// what it is.
     Comment,
     /// `$name`, which is the one thing in a statement a shell user is
     /// most likely to misspell, since nothing checks it until the
@@ -134,6 +136,9 @@ pub(crate) fn kind_at(text: &str, at: usize) -> Kind {
 /// gives the input back. That is what the test checks, and it is the
 /// property that keeps a colouring bug from becoming a lost character.
 pub(crate) fn scan(text: &str) -> Vec<(&str, Kind)> {
+    if let Some(runs) = command(text) {
+        return runs;
+    }
     let mut runs = Vec::new();
     let bytes = text.as_bytes();
     let mut at = 0;
@@ -145,7 +150,7 @@ pub(crate) fn scan(text: &str) -> Vec<(&str, Kind)> {
                 runs.push((&rest[..end], Kind::Text));
                 end
             }
-            b'-' if rest.starts_with("--") => {
+            b'/' if rest.starts_with("//") => {
                 let end = rest.find('\n').unwrap_or(rest.len());
                 runs.push((&rest[..end], Kind::Comment));
                 end
@@ -195,6 +200,42 @@ pub(crate) fn scan(text: &str) -> Vec<(&str, Kind)> {
         at += len;
     }
     runs
+}
+
+/// A backslash line, if this is one: the space in front of it, the
+/// command itself, and everything after, and `None` for the statements
+/// that are everything else.
+///
+/// A backslash line goes to [`crate::meta`] rather than to the engine,
+/// so nothing in it is coloured as the language. `\d node` names a
+/// table, and a `node` painted like a keyword would be the shell
+/// telling the user it had read the line as a statement.
+fn command(text: &str) -> Option<Vec<(&str, Kind)>> {
+    let start = text.len() - text.trim_start().len();
+    if !text[start..].starts_with('\\') {
+        return None;
+    }
+    let after = &text[start + 1..];
+    // The name is a word, except for `\?`, which is a command spelled
+    // in one character that is not one.
+    let name = match word_len(after) {
+        0 => after
+            .chars()
+            .next()
+            .filter(|c| !c.is_whitespace())
+            .map_or(0, char::len_utf8),
+        len => len,
+    };
+    let end = start + 1 + name;
+    let mut runs = Vec::with_capacity(3);
+    if start > 0 {
+        runs.push((&text[..start], Kind::Plain));
+    }
+    runs.push((&text[start..end], Kind::Keyword));
+    if end < text.len() {
+        runs.push((&text[end..], Kind::Plain));
+    }
+    Some(runs)
 }
 
 /// How long a quoted string is, counting its quotes.
@@ -415,11 +456,14 @@ mod tests {
             "MATCH (a:Person {name: 'x'}) RETURN a.age + 1",
             "RETURN 'it''s', \"two\", `three`",
             "RETURN 1.5e-3, 0.25, 42",
-            "-- a comment\nRETURN $p",
+            "// a comment\nRETURN $p",
             "/* block */ RETURN 1",
             "RETURN 'unterminated",
             "/* unterminated",
             "RETURN 中 + '中'",
+            "\\d node",
+            "  \\?",
+            "\\",
             "",
         ] {
             covers(text);
@@ -427,8 +471,28 @@ mod tests {
     }
 
     #[test]
+    fn a_backslash_line_is_a_command_and_not_a_statement() {
+        assert_eq!(
+            scan("\\d node"),
+            [("\\d", Kind::Keyword), (" node", Kind::Plain)]
+        );
+        assert_eq!(scan("\\?"), [("\\?", Kind::Keyword)]);
+        assert_eq!(
+            scan("  \\timing on"),
+            [
+                ("  ", Kind::Plain),
+                ("\\timing", Kind::Keyword),
+                (" on", Kind::Plain)
+            ]
+        );
+        // A backslash inside a statement is not a command, so the
+        // statement is coloured the way it always was.
+        assert!(scan("RETURN 'a\\tb'").contains(&("'a\\tb'", Kind::Text)));
+    }
+
+    #[test]
     fn the_kinds_are_what_the_text_says_they_are() {
-        let runs = scan("MATCH (a:Person) WHERE a.age > 30 RETURN $p, 'x' -- why");
+        let runs = scan("MATCH (a:Person) WHERE a.age > 30 RETURN $p, 'x' // why");
         let kinds: Vec<_> = runs
             .iter()
             .filter(|(run, _)| !run.trim().is_empty())
@@ -440,7 +504,15 @@ mod tests {
         assert!(kinds.contains(&("30", Kind::Number)));
         assert!(kinds.contains(&("$p", Kind::Param)));
         assert!(kinds.contains(&("'x'", Kind::Text)));
-        assert!(kinds.contains(&("-- why", Kind::Comment)));
+        assert!(kinds.contains(&("// why", Kind::Comment)));
+        // Two minus signs are two minus signs: the language's line
+        // comment is the other one, and a shell that dimmed the rest of
+        // the line would be dimming a statement that still runs.
+        assert!(
+            scan("RETURN 1 -- 2")
+                .iter()
+                .all(|(_, k)| *k != Kind::Comment)
+        );
     }
 
     #[test]
@@ -457,7 +529,7 @@ mod tests {
     fn the_cursor_knows_when_it_is_inside_a_string_or_a_comment() {
         assert_eq!(kind_at("RETURN 'x", 9), Kind::Text);
         assert_eq!(kind_at("RETURN 'x' ", 11), Kind::Plain);
-        assert_eq!(kind_at("-- why", 6), Kind::Comment);
+        assert_eq!(kind_at("// why", 6), Kind::Comment);
         assert_eq!(kind_at("/* why", 6), Kind::Comment);
         assert_eq!(kind_at("/* why */ RE", 12), Kind::Plain);
         assert_eq!(kind_at("RETURN", 0), Kind::Plain);
@@ -494,7 +566,7 @@ mod tests {
 
     #[test]
     fn the_painted_text_is_the_text_with_escapes_taken_out() {
-        let text = "MATCH (a:Person {n: 'x'}) -- why\nRETURN a.age, $p, 1.5";
+        let text = "MATCH (a:Person {n: 'x'}) // why\nRETURN a.age, $p, 1.5";
         let painted = lines(text, true).join("\n");
         let mut stripped = String::new();
         let mut rest = painted.as_str();

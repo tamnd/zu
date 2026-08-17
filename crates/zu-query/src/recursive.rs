@@ -6,11 +6,12 @@
 //! dense bitmap, and between top-down expansion and bottom-up scanning
 //! over the reversed adjacency, whenever the frontier grows past a
 //! fixed fraction of the graph. Across BFS runs the hybrid morsel
-//! policy from the spec picks the unit of parallelism: few sources run
-//! one BFS at a time with each level's frontier partitioned into
-//! morsels across threads, many sources run as multi-source morsels,
-//! 64 sources sharing one pass through the adjacency with a bitmask
-//! lane per source.
+//! policy from the spec picks the unit of parallelism: fewer sources
+//! than fill one lane batch run one BFS at a time with each level's
+//! frontier partitioned into morsels across threads, the rest run as
+//! multi-source morsels, 64 sources sharing one pass through the
+//! adjacency with a bitmask lane per source. Where that floor sits is
+//! measured by the sweep in `benches/kernels.rs`.
 //!
 //! Levels are deterministic in every mode: a node's hop count is the
 //! round it is first claimed in, and rounds are barriers, so thread
@@ -25,10 +26,27 @@ use crate::csr::Csr;
 /// Lanes in one multi-source morsel: one bit per source in a `u64`.
 pub const MSBFS_LANES: usize = 64;
 
-/// Below this many sources per thread the hybrid policy runs
-/// frontier-partitioned single BFS; at or above it, multi-source
-/// morsels amortize the adjacency pass across a whole lane batch.
-pub const FEW_SOURCES_PER_THREAD: usize = 8;
+/// Fewer sources than this run one BFS at a time, however many threads
+/// there are. It is one full lane batch, because that is what a lane
+/// batch costs: three arrays the width of the graph and a pass over
+/// the frontier per level, paid whether the 64 lanes are filled or
+/// three of them are.
+///
+/// The number is measured, not read off a paper. `cargo bench -p
+/// zu-query` times both sides of the switch at a spread of source
+/// counts and two hop bounds, and on a 2^18 node graph on ten cores a
+/// full batch is the smallest count that wins at both: 7.8x at two
+/// hops and 1.67x with the bound off. Half a batch is 2.5x ahead at
+/// two hops and 0.69x, a loss, with the bound off, because a deep walk
+/// gives the single BFS side enough frontier to spread over the cores.
+///
+/// DuckPGQ put this floor at 1024 and the sweep does not reproduce
+/// that here, where 1024 sources is already 17.6x. Their single-source
+/// side does not pay for a level array the width of the graph per
+/// source and ours does, so lane batches start paying much earlier.
+/// The cheaper thing would be to fix that side rather than to raise
+/// this floor to hide it.
+pub const MSBFS_MIN_SOURCES: usize = MSBFS_LANES;
 
 /// A frontier larger than `node_count / DENSE_FRACTION` switches to
 /// the dense bitmap and, when a reversed CSR is at hand, to bottom-up
@@ -242,10 +260,10 @@ pub fn multi_source_bfs(
 
 /// Runs one BFS per source under the hybrid morsel policy and calls
 /// `emit(source_index, node, level)` for every (source, node) pair
-/// reached within `max_hops`. Fewer than [`FEW_SOURCES_PER_THREAD`]
-/// sources per thread run one at a time with frontier-partitioned
-/// morsels; more run as lane batches of [`MSBFS_LANES`] distributed
-/// across threads. Emission order is unspecified across pairs.
+/// reached within `max_hops`. Fewer than [`MSBFS_MIN_SOURCES`] sources
+/// run one at a time with frontier-partitioned morsels; the rest run
+/// as lane batches of [`MSBFS_LANES`] distributed across threads.
+/// Emission order is unspecified across pairs.
 pub fn hybrid_bfs(
     csr: &Csr,
     rev: Option<&Csr>,
@@ -255,17 +273,57 @@ pub fn hybrid_bfs(
     emit: &mut impl FnMut(u32, u32, u32),
 ) {
     let threads = effective_threads(threads);
-    if sources.len() < FEW_SOURCES_PER_THREAD * threads {
-        for (si, &s) in sources.iter().enumerate() {
-            let levels = recursive_bfs(csr, rev, &[s], max_hops, threads);
-            for (w, &level) in levels.iter().enumerate() {
-                if level != u32::MAX {
-                    emit(si as u32, w as u32, level);
-                }
+    if multi_source_pays(sources.len()) {
+        multi_source_morsels(csr, sources, max_hops, threads, emit);
+    } else {
+        one_bfs_per_source(csr, rev, sources, max_hops, threads, emit);
+    }
+}
+
+/// Whether `sources` is enough sources to be worth running as
+/// multi-source morsels rather than one BFS at a time.
+///
+/// It is the floor and nothing else. There used to be a second rule
+/// asking for eight sources per thread as well, so that the batches
+/// would fill the cores, and the sweep in the bench says it costs more
+/// than it buys: on ten cores it held out for 80 sources, and by 64 a
+/// lane batch is already several times faster even though it runs on
+/// one thread.
+pub fn multi_source_pays(sources: usize) -> bool {
+    sources >= MSBFS_MIN_SOURCES
+}
+
+/// One BFS at a time, each with its frontier partitioned into morsels
+/// across threads. The side of the switch that suits few sources.
+pub fn one_bfs_per_source(
+    csr: &Csr,
+    rev: Option<&Csr>,
+    sources: &[u32],
+    max_hops: u32,
+    threads: usize,
+    emit: &mut impl FnMut(u32, u32, u32),
+) {
+    for (si, &s) in sources.iter().enumerate() {
+        let levels = recursive_bfs(csr, rev, &[s], max_hops, threads);
+        for (w, &level) in levels.iter().enumerate() {
+            if level != u32::MAX {
+                emit(si as u32, w as u32, level);
             }
         }
-        return;
     }
+}
+
+/// Lane batches of [`MSBFS_LANES`] sources distributed across threads,
+/// each batch one pass through the adjacency per level. The side of
+/// the switch that suits many sources.
+pub fn multi_source_morsels(
+    csr: &Csr,
+    sources: &[u32],
+    max_hops: u32,
+    threads: usize,
+    emit: &mut impl FnMut(u32, u32, u32),
+) {
+    let threads = effective_threads(threads);
     let batches: Vec<&[u32]> = sources.chunks(MSBFS_LANES).collect();
     let cursor = AtomicUsize::new(0);
     let (tx, rx) = mpsc::sync_channel::<Vec<(u32, u32, u32)>>(threads * 2);
@@ -411,9 +469,18 @@ mod tests {
     fn hybrid_policy_agrees_on_both_sides_of_the_threshold() {
         let csr = random_graph(13, 250, 1200);
         let rev = csr.reversed();
-        // 3 sources with 2 threads stays under the threshold, 40 with
-        // 1 thread crosses it; both must match per-source BFS.
-        for (count, threads) in [(3usize, 2usize), (40, 1)] {
+        // Under the floor, one over it, and two lane batches, on one
+        // and on several threads. All of them must match per-source
+        // BFS, since the policy is free to pick either side and the
+        // answer is not allowed to depend on which it picked.
+        assert!(!multi_source_pays(MSBFS_MIN_SOURCES - 1));
+        assert!(multi_source_pays(MSBFS_MIN_SOURCES));
+        for (count, threads) in [
+            (3usize, 2usize),
+            (MSBFS_MIN_SOURCES - 1, 1),
+            (MSBFS_MIN_SOURCES, 1),
+            (MSBFS_LANES + 5, 3),
+        ] {
             let sources: Vec<u32> = (0..count as u32).map(|i| (i * 7) % 250).collect();
             let mut got: Vec<(u32, u32, u32)> = Vec::new();
             hybrid_bfs(&csr, Some(&rev), &sources, 4, threads, &mut |s, w, l| {

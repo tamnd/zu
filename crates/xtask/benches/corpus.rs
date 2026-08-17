@@ -95,8 +95,9 @@ fn fixture(cases: usize) -> PathBuf {
     let suites = 10;
     for suite in 0..suites {
         let mut text = format!(
-            "schema: 1\nsuite: suite-{suite}\ndoc: A suite the packing bench generated, which \
-             exists so the packer has a file to walk and a size to compress.\n\ncases:\n"
+            "schema: {}\nsuite: suite-{suite}\ndoc: A suite the packing bench generated, which \
+             exists so the packer has a file to walk and a size to compress.\n\ncases:\n",
+            zu_corpus::case::SCHEMA
         );
         for n in (suite..cases).step_by(suites) {
             text.push_str(&format!(

@@ -1,4 +1,4 @@
-schema: 1
+schema: 2
 suite: boolean
 doc: The truth values and the operators over them, with the unknown left to the null suite. What a client gets wrong here is rarely a single answer and usually a shape: an operator implemented with its host language's truthiness, a precedence taken from the language the client is written in rather than from the one it is sending, or a comparison that gives back the host language's boolean instead of the value the engine returned.
 

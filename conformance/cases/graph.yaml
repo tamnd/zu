@@ -1,0 +1,405 @@
+schema: 2
+suite: graph
+doc: The shape a load puts into the store, read back by walking it. A client's loader hands over a table of rows and a list of pairs between them, and every case here asks whether the graph that came out is the one that went in, which is a question about direction, about rows nothing points at, and about a row that points at itself. The fixture is small enough that every answer below can be checked by reading the pairs at the top of this file.
+
+load:
+  nodes: person
+  edges: knows
+  count: 5
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+        - di
+        - ed
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+        - "40"
+        - "20"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+    - from: 0
+      to: 2
+    - from: 3
+      to: 3
+
+cases:
+  - name: every-row-of-the-load-is-a-node
+    doc: Five rows went in and five nodes are there, including the one nothing points at, which a loader that counts its nodes from its edges loses.
+    query: MATCH (n:person) RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: every-pair-of-the-load-is-an-edge
+    doc: Four pairs went in and four edges are there, which a loader that stores each edge in both directions doubles.
+    query: MATCH (:person)-[:knows]->(:person) RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: the-edges-come-back-as-they-went-in
+    doc: Every edge named by the rows it joins rather than by any number the store gave them, which is the only description of the graph a client can compare against the pairs it wrote.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS a, b.name AS b ORDER BY a, b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: an-edge-goes-the-way-it-was-written
+    doc: The pair that was written one way round, asked for the other way round, which is nothing, and is the case a loader that sorts each pair before storing it fails.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE a.name = 'bo' AND b.name = 'ann' RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: an-edge-walked-backwards-is-the-same-edge
+    doc: The same four edges reached from the other end, which the store keeps as a second adjacency and which therefore has to agree with the first.
+    query: MATCH (a:person)<-[:knows]-(b:person) RETURN a.name AS a, b.name AS b ORDER BY a, b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: cy
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: cy
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: an-undirected-pattern-walks-both-ways
+    doc: A row with one edge into it and one edge out of it, whose neighbours are both of them, which is the pattern that reads both adjacencies in one go.
+    query: MATCH (a:person)-[:knows]-(b:person) WHERE a.name = 'cy' RETURN b.name AS who ORDER BY who
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-row-nothing-points-at-is-still-a-row
+    doc: The row with no edge at either end, which is present as a node and has no neighbour, so the optional match gives it back with a null beside it rather than dropping it.
+    query: MATCH (a:person) WHERE a.name = 'ed' OPTIONAL MATCH (a)-[:knows]->(b:person) RETURN a.name AS a, b.name AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ed
+          - type: "NULL"
+
+  - name: a-row-can-point-at-itself
+    doc: The pair whose two ends are the same row, which is an edge like any other and which a loader that refuses to join a row to itself never stores.
+    query: MATCH (a:person)-[:knows]->(a) RETURN a.name AS who
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: di
+
+  - name: counting-the-edges-out-of-each-row
+    doc: The out degree of every row that has one, which is the adjacency counted rather than listed and so catches a store that keeps the edges of two rows in one place.
+    query: MATCH (a:person)-[:knows]->(:person) RETURN a.name AS who, count(*) AS n ORDER BY who
+    columns:
+      - who
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "2"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "1"
+
+  - name: two-edges-in-a-row-are-a-path
+    doc: Every pair of edges that meet, which is the shortest join the store has to do and which finds the self loop as well as the chain.
+    query: MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) RETURN a.name AS a, b.name AS b, c.name AS c ORDER BY a, b, c
+    columns:
+      - a
+      - b
+      - c
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: the-row-in-the-middle-need-not-be-named
+    doc: The same two edge join with nothing bound in the middle, which gives the ends alone and is how a client asks for reach rather than for a route.
+    query: MATCH (a:person)-[:knows]->()-[:knows]->(c:person) RETURN a.name AS a, c.name AS c ORDER BY a, c
+    columns:
+      - a
+      - c
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: a-path-of-a-given-length
+    doc: The routes of exactly two edges out of one row, which is the same route the join above found and is reached here by a pattern that says the length instead of writing the edges out.
+    query: MATCH (a:person)-[:knows*2..2]->(:person) WHERE a.name = 'ann' RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-length-no-path-reaches
+    doc: Three edges out of a row whose longest way out is two, which is nothing, and pins that a pattern with a floor above the graph gives no rows rather than the rows it did reach.
+    query: MATCH (a:person)-[:knows*3..3]->(:person) WHERE a.name = 'ann' RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-range-of-lengths-takes-them-all
+    doc: One edge or two out of the row with the most ways out, which is its two neighbours and then the one beyond them, counted as three because a route of two edges is not the route of one it starts with.
+    query: MATCH (a:person)-[:knows*1..2]->(:person) WHERE a.name = 'ann' RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-filter-over-both-ends-of-an-edge
+    doc: Every edge whose two ends were loaded with different numbers in one column, which reads a property of both ends of the join and is where a store that returns the wrong end is caught.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE a.age < b.age RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: counting-the-rows-that-have-an-edge-out
+    doc: Three rows of the five have an edge leaving them, counted with distinct because two of the edges leave the same row.
+    query: MATCH (a:person)-[:knows]->(:person) RETURN count(DISTINCT a.name) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: gathering-the-neighbours-of-a-row
+    doc: The two rows one row points at, gathered into a list in a fixed order, which is the adjacency of a single node in the shape a client is most likely to ask for it.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE a.name = 'ann' WITH b ORDER BY b.name RETURN collect(b.name) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: STRING
+                value: bo
+              - type: STRING
+                value: cy
+
+  - name: the-rows-with-somewhere-to-go
+    doc: The rows an edge leaves, found by asking whether one does rather than by joining, which is the same three rows by a path that never binds the other end.
+    query: MATCH (a:person) WHERE EXISTS { MATCH (a)-[:knows]->(:person) } RETURN a.name AS who ORDER BY who
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+
+  - name: the-rows-with-nowhere-to-go
+    doc: The other two rows, being the one that is only pointed at and the one nothing touches, which is the negation of the case above and has to be the rest of them.
+    query: MATCH (a:person) WHERE NOT EXISTS { MATCH (a)-[:knows]->(:person) } RETURN a.name AS who ORDER BY who
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: ed
+
+  - name: a-pattern-that-matches-nothing-still-answers
+    doc: A count over a join no row satisfies, which is one row holding zero rather than no rows at all, and is the difference between an empty result and an empty group.
+    query: MATCH (a:person)-[:knows]->(:person) WHERE a.name = 'ed' RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: the-ends-of-an-edge-order-by-a-stored-column
+    doc: The edges sorted by a number stored against the row they arrive at, which reads the property through the join rather than through the scan.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS a, b.age AS b ORDER BY b, a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "40"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "40"
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "50"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "50"
+
+  - name: the-neighbours-of-a-row-in-either-direction
+    doc: The degree of every row counted without regard to direction, where the row that points at itself is reached twice because both of its ends are the same row.
+    query: MATCH (a:person)-[:knows]-(:person) RETURN a.name AS who, count(*) AS n ORDER BY who
+    columns:
+      - who
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "2"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "2"
+      - values:
+          - type: STRING
+            value: cy
+          - type: INT64
+            value: "2"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "2"
+
+  - name: an-edge-whose-ends-were-loaded-with-the-same-value
+    doc: The pair whose two ends carry the same stored number, which here is only the self loop, and is a join on a property rather than on the adjacency.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE a.age = b.age RETURN a.name AS a, b.name AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: the-rows-outnumber-the-edges
+    doc: The two counts side by side, taken in one statement so that a client cannot pass by loading the nodes of one fixture and the edges of another.
+    query: MATCH (n:person) WITH count(*) AS a MATCH (:person)-[:knows]->(:person) RETURN a, count(*) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+          - type: INT64
+            value: "4"

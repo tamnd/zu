@@ -10,6 +10,7 @@
 //! condition names the GQLSTATUS code, not the message, because the
 //! code is the contract and the message is prose that will improve.
 
+use crate::load::Load;
 use crate::value;
 use crate::yaml::{self, Node};
 
@@ -18,7 +19,7 @@ use zu::query::Value;
 /// The schema version a file declares. It exists so that a corpus
 /// unpacked from an old release tells a new runner what it is instead
 /// of failing in the middle.
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 
 /// What running a case's statement has to produce.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +57,10 @@ pub struct Suite {
     /// a report so that two suites may both have a `max` case.
     pub name: String,
     pub doc: String,
+    /// The data every case in the file reads back, put in through the
+    /// runner's own bulk load path before the case runs. A suite of
+    /// expressions has none, which is most of them.
+    pub load: Option<Load>,
     pub cases: Vec<Case>,
 }
 
@@ -63,7 +68,10 @@ impl Suite {
     /// A suite, or the first thing in the file that is not one.
     pub fn parse(text: &str) -> Result<Suite, String> {
         let doc = yaml::parse(text)?;
-        if let Some(key) = doc.unknown(&["schema", "suite", "doc", "cases"]).first() {
+        if let Some(key) = doc
+            .unknown(&["schema", "suite", "doc", "load", "cases"])
+            .first()
+        {
             return Err(format!("line {}: a suite has no key {key:?}", doc.line()));
         }
         let schema = doc
@@ -80,6 +88,7 @@ impl Suite {
         }
         let name = field(&doc, "suite")?;
         let doc_text = field(&doc, "doc")?;
+        let load = doc.get("load").map(Load::parse).transpose()?;
         let cases = doc
             .get("cases")
             .ok_or("a suite with no `cases:`")?
@@ -104,6 +113,7 @@ impl Suite {
         Ok(Suite {
             name,
             doc: doc_text,
+            load,
             cases: out,
         })
     }
@@ -254,7 +264,7 @@ fn rows(node: &Node) -> Result<Vec<Vec<Value>>, String> {
 mod tests {
     use super::*;
 
-    const HEAD: &str = "schema: 1\nsuite: int\ndoc: the integer tower\n";
+    const HEAD: &str = "schema: 2\nsuite: int\ndoc: the integer tower\n";
 
     fn suite(cases: &str) -> Result<Suite, String> {
         Suite::parse(&format!("{HEAD}\ncases:\n{cases}"))
@@ -290,6 +300,24 @@ mod tests {
         );
         assert_eq!(case.setup.len(), 2);
         assert!(case.setup[0].starts_with("CREATE NODE TABLE"));
+    }
+
+    #[test]
+    fn a_suite_may_load_a_table_every_case_in_it_reads_back() {
+        let suite = Suite::parse(
+            "schema: 2\nsuite: int\ndoc: d\nload:\n  nodes: person\n  edges: knows\n  count: 1\n  columns:\n    - name: age\n      type: INT64\n      values:\n        - \"30\"\ncases:\n  - name: a\n    doc: d\n    query: MATCH (p:person) RETURN p.age AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"30\"\n",
+        )
+        .expect("parses");
+        let load = suite.load.expect("a load");
+        assert_eq!(load.nodes, "person");
+        assert_eq!(load.columns.len(), 1);
+    }
+
+    #[test]
+    fn a_suite_of_expressions_has_no_load() {
+        let suite = suite("  - name: a\n    doc: d\n    query: RETURN 1\n    raises: 22012\n")
+            .expect("parses");
+        assert!(suite.load.is_none());
     }
 
     #[test]
@@ -368,10 +396,10 @@ mod tests {
 
     #[test]
     fn a_file_from_another_schema_says_so_rather_than_failing_in_the_middle() {
-        let err = Suite::parse("schema: 2\nsuite: int\ndoc: d\ncases:\n  - name: a\n")
+        let err = Suite::parse("schema: 1\nsuite: int\ndoc: d\ncases:\n  - name: a\n")
             .expect_err("refused");
         assert!(
-            err.contains("schema 2 and the runner reads schema 1"),
+            err.contains("schema 1 and the runner reads schema 2"),
             "{err}"
         );
     }

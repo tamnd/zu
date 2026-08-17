@@ -1,4 +1,4 @@
-schema: 1
+schema: 2
 suite: order
 doc: The order values sort in, which is a property of the type system rather than of any one type: values of different types compare, and what they compare to is fixed. A client sorting rows itself, or checking a result against an expectation it sorted itself, has to sort them the same way, and no host language's default comparator does.
 

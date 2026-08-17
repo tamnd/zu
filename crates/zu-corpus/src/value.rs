@@ -82,6 +82,15 @@ pub fn form(ty: &str) -> Option<Form> {
     TYPES.iter().find(|(name, _)| *name == ty).map(|(_, f)| *f)
 }
 
+/// What to say about a name that is not a type, which is one of two
+/// things and worth telling apart.
+fn unknown(ty: &str) -> String {
+    match RESERVED.contains(&ty) {
+        true => format!("{ty} is a type the encoding reserves and the engine has no value for"),
+        false => format!("{ty} is not a type this encoding knows"),
+    }
+}
+
 /// The value a `{type, value}` mapping describes, or what is wrong
 /// with it.
 pub fn decode(node: &Node) -> Result<Value, String> {
@@ -102,12 +111,13 @@ pub fn decode(node: &Node) -> Result<Value, String> {
         .str()
         .ok_or_else(|| at("a `type` that is not a name".to_string()))?;
 
-    let Some(form) = form(ty) else {
-        return Err(at(match RESERVED.contains(&ty) {
-            true => format!("{ty} is a type the encoding reserves and the engine has no value for"),
-            false => format!("{ty} is not a type this encoding knows"),
-        }));
-    };
+    // Checked here as well as in `payload`, because a value whose type
+    // is not a type and which also has no `value` under it should be
+    // told about the type first: that is the mistake, and the missing
+    // payload is a consequence of it.
+    if form(ty).is_none() {
+        return Err(at(unknown(ty)));
+    }
 
     if ty == "NULL" {
         return match node.get("value") {
@@ -118,6 +128,19 @@ pub fn decode(node: &Node) -> Result<Value, String> {
     let value = node
         .get("value")
         .ok_or_else(|| at(format!("a {ty} with no `value`")))?;
+    payload(ty, value)
+}
+
+/// The value a payload spells under a type that has already been read.
+///
+/// A row of a case names its type beside every value. A column of a
+/// load names it once at the top and every value under it is a bare
+/// payload, which is the same encoding with the type factored out, so
+/// it is the same function reading it.
+pub fn payload(ty: &str, value: &Node) -> Result<Value, String> {
+    let Some(form) = form(ty) else {
+        return Err(format!("line {}: {}", value.line(), unknown(ty)));
+    };
 
     if ty == "LIST" {
         // The empty list is a value worth a case and needs a spelling,

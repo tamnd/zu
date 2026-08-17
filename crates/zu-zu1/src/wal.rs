@@ -125,6 +125,12 @@ pub enum WalRecord {
         rel: u32,
         src: Vec<u64>,
         dst: Vec<u64>,
+        /// What the edges carry, one entry per property column the rel
+        /// table stores and one value per edge in the same order as
+        /// `src` and `dst`. Empty for a table that stores nothing on
+        /// its edges, which is every table until a statement writes
+        /// one that does.
+        cols: Vec<WalColumn>,
     },
     Update {
         table: u32,
@@ -179,11 +185,21 @@ impl WalRecord {
                     c.values.encode(out);
                 }
             }
-            WalRecord::RelInsert { rel, src, dst } => {
+            WalRecord::RelInsert {
+                rel,
+                src,
+                dst,
+                cols,
+            } => {
                 out.extend_from_slice(&rel.to_le_bytes());
                 out.extend_from_slice(&(src.len() as u32).to_le_bytes());
                 put_u64s(out, src);
                 put_u64s(out, dst);
+                out.extend_from_slice(&(cols.len() as u32).to_le_bytes());
+                for c in cols {
+                    out.extend_from_slice(&c.col.to_le_bytes());
+                    c.values.encode(out);
+                }
             }
             WalRecord::Update {
                 table,
@@ -239,7 +255,25 @@ impl WalRecord {
                 let count = r.u32()? as usize;
                 let src = u64s(r, count)?;
                 let dst = u64s(r, count)?;
-                WalRecord::RelInsert { rel, src, dst }
+                let col_count = r.u32()? as usize;
+                let mut cols = Vec::with_capacity(col_count.min(r.remaining() / 9));
+                for _ in 0..col_count {
+                    let col = r.u32()?;
+                    let values = WalValues::decode(r)?;
+                    if values.len() != count {
+                        return Err(corrupt(format!(
+                            "rel insert carries {count} edges but {} values for column {col}",
+                            values.len()
+                        )));
+                    }
+                    cols.push(WalColumn { col, values });
+                }
+                WalRecord::RelInsert {
+                    rel,
+                    src,
+                    dst,
+                    cols,
+                }
             }
             4 => {
                 let table = r.u32()?;
@@ -529,6 +563,22 @@ mod tests {
                 rel: 7,
                 src: vec![1, 2, 3],
                 dst: vec![4, 5, 6],
+                cols: Vec::new(),
+            },
+            WalRecord::RelInsert {
+                rel: 8,
+                src: vec![1, 2],
+                dst: vec![3, 4],
+                cols: vec![
+                    WalColumn {
+                        col: 0,
+                        values: WalValues::Int(vec![2020, 2021]),
+                    },
+                    WalColumn {
+                        col: 1,
+                        values: WalValues::Str(vec![b"since".to_vec(), vec![]]),
+                    },
+                ],
             },
             WalRecord::Update {
                 table: 3,

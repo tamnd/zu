@@ -80,7 +80,7 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
         let exprs = carry
             .iter()
             .map(|slot| BoundExpr::Var(*slot))
-            .chain(crate::insert::value_exprs(nodes));
+            .chain(crate::insert::value_exprs(nodes, rels));
         let items: Vec<BoundItem> = exprs.enumerate().map(|(i, expr)| item(expr, i)).collect();
         let columns = (0..items.len()).map(|i| format!("#{i}")).collect();
         clauses.push(BoundClause::Project {

@@ -822,6 +822,8 @@ pub struct BoundInsertRel {
     pub src: usize,
     /// The slot holding the row the edge arrives at.
     pub dst: usize,
+    /// The properties the pattern wrote, in written order.
+    pub props: Vec<(String, BoundExpr)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1802,10 +1804,10 @@ impl Binder<'_> {
     /// Binds one edge written under `INSERT`, between the two slots the
     /// ends of its step landed in.
     ///
-    /// `nodes` is what the clause has made so far, and an end that is
-    /// not in it is an end the write cannot reach: the write runs once
-    /// and runs before the plan, so a row a `MATCH` found is a row that
-    /// is not there yet when the edge would be written.
+    /// `nodes` is what the clause has made so far, which is how an end
+    /// this clause writes is told apart from one an earlier clause
+    /// found: the first is in the table its label named, and the second
+    /// is in whichever tables the match left open.
     fn bind_insert_rel(
         &mut self,
         pat: &RelPattern,
@@ -1816,11 +1818,6 @@ impl Binder<'_> {
         if pat.range.is_some() {
             return Err(invalid(
                 "a hop range asks for a walk of some length, and INSERT writes one edge".into(),
-            ));
-        }
-        if !pat.props.is_empty() {
-            return Err(not_yet(
-                "INSERT of an edge carrying properties, which the log has no record for,",
             ));
         }
         let [name] = pat.types.as_slice() else {
@@ -1895,11 +1892,13 @@ impl Binder<'_> {
             None => self.anon_slot(Type::Rel),
         };
         self.variables[slot].rel_tables = vec![rel.id];
+        let props = self.bind_props(&pat.props)?;
         Ok(BoundInsertRel {
             slot,
             table: rel.id,
             src,
             dst,
+            props,
         })
     }
 
@@ -3564,17 +3563,23 @@ mod tests {
     /// piece it is waiting on rather than with a parse error.
     #[test]
     fn the_parts_of_insert_that_are_not_in_yet_say_which_part() {
-        for (source, what) in [
-            (
-                "INSERT (a:Person)-[k:KNOWS {since: 1}]->(b:Person)",
-                "properties",
-            ),
-            ("INSERT p = (a:Person)", "path"),
-        ] {
-            let e = bind_err(source);
-            assert!(e.contains(what), "{source:?} was refused with {e:?}");
-            assert!(e.contains("not implemented yet"), "got: {e}");
-        }
+        let e = bind_err("INSERT p = (a:Person)");
+        assert!(e.contains("path"), "got: {e}");
+        assert!(e.contains("not implemented yet"), "got: {e}");
+    }
+
+    /// An edge carries what the pattern wrote on it, bound the way an
+    /// element's properties are, so a value there is an expression like
+    /// any other rather than a literal.
+    #[test]
+    fn an_edge_written_under_insert_carries_what_the_pattern_wrote() {
+        let q = bound("INSERT (a:Person)-[k:KNOWS {since: $year}]->(b:Person)");
+        let BoundClause::Insert { rels, .. } = &q.clauses[0] else {
+            panic!("INSERT");
+        };
+        assert_eq!(rels[0].props.len(), 1);
+        assert_eq!(rels[0].props[0].0, "since");
+        assert_eq!(rels[0].props[0].1, BoundExpr::Param(0));
     }
 
     /// An edge written under `INSERT` runs between two elements the

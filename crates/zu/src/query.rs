@@ -526,6 +526,15 @@ impl Graph for Zu1Graph<'_> {
             .edge_ordinal(db, src, dst)
     }
 
+    fn edge_run(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        readers
+            .get_mut(&rel)
+            .expect("just loaded")
+            .edge_run(db, src, dst)
+    }
+
     fn neighbor_ordinals(
         &mut self,
         rel: u32,
@@ -1506,6 +1515,67 @@ mod tests {
             r.rows,
             [[Value::Int(edges.len() as i64), Value::Int(total)]]
         );
+    }
+
+    /// A pattern with both endpoints pinned matches once per edge and
+    /// not once per pair, so a close onto a bound node reports the whole
+    /// run: three rows for a pair joined three times, each carrying its
+    /// own property, and the same rows in the same order as the walk
+    /// that reaches the far node instead of pinning it.
+    #[test]
+    fn a_close_on_a_bound_pair_reports_every_edge_of_it() {
+        use crate::zu1::props::{PropValues, store_rel_props};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("close.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let edges = [(0u32, 1u32), (0, 1), (0, 1), (0, 3), (2, 1), (2, 1), (3, 1)];
+        graph::bulk_load_as(&mut db, "person", "knows", 4, &edges).expect("load");
+        let since: Vec<u64> = (0..edges.len() as u64).map(|i| 2001 + i).collect();
+        store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&since))]).expect("store");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let ints =
+            |vs: &[i64]| -> Vec<Vec<Value>> { vs.iter().map(|&v| vec![Value::Int(v)]).collect() };
+
+        let closed = run(
+            "MATCH (a:person {id: 0})-[e:knows]->(b:person {id: 1}) \
+             RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("closed");
+        assert_eq!(closed.rows, ints(&[2001, 2002, 2003]));
+
+        // The pair that runs once still runs once, and a pair with no
+        // edge still matches nothing.
+        let r = run(
+            "MATCH (a:person {id: 3})-[e:knows]->(b:person {id: 1}) \
+             RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("single");
+        assert_eq!(r.rows, ints(&[2007]));
+        let r = run(
+            "MATCH (a:person {id: 1})-[e:knows]->(b:person {id: 0}) RETURN e.since AS since",
+            &mut db,
+            &[],
+        )
+        .expect("none");
+        assert!(r.rows.is_empty());
+
+        // Reached rather than pinned, which is the expand the close
+        // stands in for, and the two have to agree edge for edge.
+        let walked = run(
+            "MATCH (a:person {id: 0})-[e:knows]->(b:person) WHERE b.id = 1 \
+             RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("walked");
+        assert_eq!(closed.rows, walked.rows);
     }
 
     /// A secondary label is a bit on the row, so a pattern naming one

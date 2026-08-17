@@ -1744,10 +1744,22 @@ impl GraphReader {
     /// A pair that runs twice names two edges with two ordinals, and a
     /// lookup given nothing but the pair cannot pick between them: this
     /// answers with the first, the earliest of the run in load order.
-    /// The count is what tells the copies apart and only a walk of the
-    /// list has it, so a caller that needs each copy's own value takes
-    /// [`Self::out_neighbors_from`] and counts.
+    /// A caller that wants every copy takes [`Self::edge_run`], which
+    /// is this plus the length of the run.
     pub fn edge_ordinal(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>> {
+        Ok(self.edge_run(db, src, dst)?.map(|(base, _)| base))
+    }
+
+    /// The whole run of `src -> dst`: the ordinal of its first edge and
+    /// how many edges the pair holds, so the copies are `base`,
+    /// `base + 1`, up to `base + count - 1`.
+    ///
+    /// A pattern that binds both endpoints matches once per edge, not
+    /// once per pair, and this is what lets it. The forward list keeps
+    /// a pair's copies next to each other, so the run is one
+    /// `partition_point` for its start and a scan for its end, and the
+    /// scan is over equal values a decoded group already holds.
+    pub fn edge_run(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
         let (g, row) = self.locate(src, Direction::Fwd)?;
         let base = self.directory.groups[g].edge_base;
         let idx = Direction::Fwd as usize;
@@ -1762,8 +1774,12 @@ impl GraphReader {
         // destinations has the search landing anywhere inside it, and
         // the first slot of the run is the one answer that does not
         // depend on how the halving went.
-        let slot = nbrs[lo..hi].partition_point(|&n| n < dst);
-        Ok((lo + slot < hi && nbrs[lo + slot] == dst).then(|| base + (lo + slot) as u64))
+        let slot = lo + nbrs[lo..hi].partition_point(|&n| n < dst);
+        if slot >= hi || nbrs[slot] != dst {
+            return Ok(None);
+        }
+        let end = slot + nbrs[slot..hi].partition_point(|&n| n == dst);
+        Ok(Some((base + slot as u64, (end - slot) as u64)))
     }
 
     /// Point access to the in-neighbor list.
@@ -2548,6 +2564,47 @@ mod tests {
         backward.sort_unstable();
         assert_eq!(forward, (0..edges.len() as u64).collect::<Vec<_>>());
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn a_run_reports_its_first_row_and_its_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.zu1");
+        // The same graph the list walk above reads, so the run a pair
+        // names here is the run of rows that walk counts out there.
+        let edges = [(0u32, 1u32), (0, 1), (0, 1), (0, 2), (3, 1), (3, 1), (4, 1)];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, 5, &edges).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+
+        assert_eq!(reader.edge_run(&mut db, 0, 1).unwrap(), Some((0, 3)));
+        // A run that ends the list, and one that is the whole list.
+        assert_eq!(reader.edge_run(&mut db, 0, 2).unwrap(), Some((3, 1)));
+        assert_eq!(reader.edge_run(&mut db, 3, 1).unwrap(), Some((4, 2)));
+        assert_eq!(reader.edge_run(&mut db, 4, 1).unwrap(), Some((6, 1)));
+        // A pair with no edge, and a source with no list at all.
+        assert_eq!(reader.edge_run(&mut db, 0, 3).unwrap(), None);
+        assert_eq!(reader.edge_run(&mut db, 1, 0).unwrap(), None);
+
+        // The first row of the run is what the single-edge lookup
+        // answers with, and the rows the run names are the rows the
+        // forward walk names.
+        let mut ords = Vec::new();
+        for node in 0..5 {
+            reader
+                .neighbor_ordinals_into(&mut db, node, Direction::Fwd, &mut ords)
+                .unwrap();
+            let list = reader.neighbors_dir(&mut db, node, Direction::Fwd).unwrap();
+            let list = list.to_vec();
+            for (i, &dst) in list.iter().enumerate() {
+                let (base, count) = reader.edge_run(&mut db, node, dst).unwrap().unwrap();
+                assert_eq!(reader.edge_ordinal(&mut db, node, dst).unwrap(), Some(base));
+                assert!(ords[i] >= base && ords[i] < base + count, "{node} -> {dst}");
+            }
+        }
     }
 
     #[test]

@@ -50,6 +50,7 @@ Plans cached by (query text, catalog epoch, param types), LDBC short reads are p
 - `RecursiveBFS` implements variable-length and RPQ-style patterns as a frontier fixpoint: per-iteration dense/sparse frontier bitmaps over node groups; **hybrid morsel policy** (arXiv:2508.19379): few sources ⇒ frontier-partitioned morsels; many sources ⇒ multi-source morsels; switch at runtime by frontier statistics.
 - Path semantics (GQL): default `DIFFERENT EDGES` (trail) with **shortest/ bounded-walk fast paths**; unbounded `WALK` requires a selector or explicit upper bound (avoids infinite path sets; standard-compliant). `SIMPLE/TRAIL` general cases use per-path filtering over PMR enumeration with documented exponential worst case (NP-hard territory; LMCS 2023).
 - Path returns use **PMR (path multiset representation)**: predecessor DAG per BFS level; paths materialized lazily as `LIST<alternating NodeId/RelId>` only at RETURN (PathFinder design).
+- Unweighted `ANY SHORTEST` between a bound pair: the optimizer absorbs the equality that pins the far end into the expand, and the operator grows a frontier from each end until they meet, which visits two balls of radius d/2 instead of one of radius d. The one-sided hop-level pass stays for the unpinned case and for `ALL SHORTEST`, which has to know every node's minimum hop count before it can enumerate.
 - Weighted `SHORTEST` (`COST` clause): bidirectional Dijkstra on CSR with binary heap; batched variant = Multi-Source Bellman-Ford.
 
 ## 6. Cardinality estimation (no ML)

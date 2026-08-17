@@ -540,12 +540,13 @@ fn read_edges_with_props(
 
 /// Parses the `copy` argument list.
 ///
-/// `--reorder` takes a value and belongs to this command alone, so it
-/// comes off the line first and the shared parse sees what is left. The
-/// alternative is a second spelling of `--format` here, and two
-/// spellings of a flag are two behaviors eventually.
+/// `--reorder` and `--nodes` take a value and belong to this command
+/// alone, so they come off the line first and the shared parse sees what
+/// is left. The alternative is a second spelling of `--format` here, and
+/// two spellings of a flag are two behaviors eventually.
 fn copy_command(args: &[String]) -> ExitCode {
     let mut reorder = zu::zu1::reorder::Reorder::None;
+    let mut nodes: Option<&str> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -555,6 +556,12 @@ fn copy_command(args: &[String]) -> ExitCode {
                 .and_then(|s| zu::zu1::reorder::Reorder::parse(s))
             {
                 Some(r) => reorder = r,
+                None => return usage_error("copy"),
+            }
+            i += 2;
+        } else if args[i] == "--nodes" {
+            match args.get(i + 1) {
+                Some(path) => nodes = Some(path),
                 None => return usage_error("copy"),
             }
             i += 2;
@@ -571,18 +578,65 @@ fn copy_command(args: &[String]) -> ExitCode {
             std::path::Path::new(edges),
             std::path::Path::new(out),
             reorder,
+            nodes.map(std::path::Path::new),
             format,
         ),
         _ => usage_error("copy"),
     }
 }
 
+/// Reads the highest node id declared by a node file, which is one id
+/// per line in the first field. A first line whose field does not parse
+/// is the header, the shape every LDBC node file has; a later one is an
+/// error naming the line, the contract the edge readers keep.
+///
+/// Only the maximum is kept. The store numbers its nodes densely from
+/// zero, so what the file decides is how far that range reaches, and
+/// carrying every id to say that would be a vector the loader has no
+/// other use for.
+fn highest_node_key(path: &std::path::Path) -> zu::Result<Option<u64>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    let mut highest: Option<u64> = None;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(highest);
+        }
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let field = trimmed.split([',', '\t', ' ']).next().unwrap_or("").trim();
+        match field.parse::<u64>() {
+            Ok(key) => highest = Some(highest.map_or(key, |h: u64| h.max(key))),
+            Err(_) if line_no == 1 => continue,
+            Err(_) => {
+                return Err(zu::ZuError::InvalidArgument(format!(
+                    "line {line_no}: expected a node id in the first field, found '{field}'"
+                )));
+            }
+        }
+    }
+}
+
 /// Bulk-loads an edge list (SNAP text, csv, or parquet, picked by
 /// extension) into a fresh zu1 file and prints the ingest numbers.
+///
+/// `nodes_path` is the node file, and it is optional because an edge
+/// list is a graph on its own. What it adds is the nodes no edge names:
+/// the endpoints only reach as far as the highest one of them, so an
+/// isolated node above that never enters the store and a count over the
+/// store comes back short of what the dataset declared.
 fn copy(
     edges_path: &std::path::Path,
     out_path: &std::path::Path,
     reorder: zu::zu1::reorder::Reorder,
+    nodes_path: Option<&std::path::Path>,
     format: Format,
 ) -> ExitCode {
     let started = std::time::Instant::now();
@@ -590,12 +644,17 @@ fn copy(
         Ok(e) => e,
         Err(e) => return command_error("copy", &e),
     };
+    let declared = match nodes_path.map(highest_node_key).transpose() {
+        Ok(d) => d.flatten().map(|key| key + 1).unwrap_or(0),
+        Err(e) => return command_error("copy", &e),
+    };
     let parsed = started.elapsed();
     let node_count = edges
         .iter()
         .map(|&(s, d)| u64::from(s.max(d)) + 1)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(declared);
     let map = match reorder {
         zu::zu1::reorder::Reorder::None => None,
         zu::zu1::reorder::Reorder::Degree => {
@@ -1549,6 +1608,7 @@ mod tests {
                 &edges_path,
                 &db_path,
                 zu::zu1::reorder::Reorder::Degree,
+                None,
                 Format::Text
             ),
             ExitCode::SUCCESS
@@ -1575,6 +1635,107 @@ mod tests {
             r.rows,
             [[Value::Int(11)], [Value::Int(12)], [Value::Int(13)],]
         );
+    }
+
+    /// An edge list only reaches as far as its highest endpoint, so a
+    /// node that sits above it and touches nothing is a node the store
+    /// never hears about. The node file is what says otherwise, and a
+    /// count over the store is the question that catches it: the graph
+    /// here stops at 4 and the file declares 9.
+    #[test]
+    fn a_node_file_carries_the_nodes_no_edge_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edges_path = dir.path().join("edges.txt");
+        let nodes_path = dir.path().join("nodes.csv");
+        let db_path = dir.path().join("out.zu1");
+        std::fs::write(&edges_path, "0 1\n1 2\n2 3\n3 4\n").expect("write edges");
+        std::fs::write(
+            &nodes_path,
+            "id:ID,:LABEL\n0,node\n1,node\n2,node\n3,node\n4,node\n5,node\n6,node\n7,node\n8,node\n",
+        )
+        .expect("write nodes");
+        assert_eq!(
+            copy(
+                &edges_path,
+                &db_path,
+                zu::zu1::reorder::Reorder::None,
+                Some(&nodes_path),
+                Format::Text
+            ),
+            ExitCode::SUCCESS
+        );
+
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let r = zu::query::run("MATCH (n:node) RETURN count(n) AS n", &mut db, &[]).expect("count");
+        assert_eq!(
+            r.rows,
+            [[Value::Int(9)]],
+            "the isolated nodes never reached the store"
+        );
+
+        // Without the file the store stops where the edges do, which is
+        // what every other caller still gets.
+        let bare_path = dir.path().join("bare.zu1");
+        assert_eq!(
+            copy(
+                &edges_path,
+                &bare_path,
+                zu::zu1::reorder::Reorder::None,
+                None,
+                Format::Text
+            ),
+            ExitCode::SUCCESS
+        );
+        let mut db = zu::zu1::file::Zu1File::open(&bare_path).expect("open");
+        let r = zu::query::run("MATCH (n:node) RETURN count(n) AS n", &mut db, &[]).expect("count");
+        assert_eq!(r.rows, [[Value::Int(5)]]);
+    }
+
+    /// A node file with more ids than the edges need is the case worth
+    /// having; one with fewer says nothing, since an endpoint is a node
+    /// whether or not the file lists it. Neither may lose an edge, and a
+    /// reorder is where a miscounted node population would show up as
+    /// one.
+    #[test]
+    fn a_short_node_file_leaves_the_edges_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edges_path = dir.path().join("edges.txt");
+        let nodes_path = dir.path().join("nodes.csv");
+        let db_path = dir.path().join("out.zu1");
+        std::fs::write(&edges_path, "0 1\n1 2\n2 3\n3 4\n").expect("write edges");
+        std::fs::write(&nodes_path, "id:ID\n0\n1\n").expect("write nodes");
+        assert_eq!(
+            copy(
+                &edges_path,
+                &db_path,
+                zu::zu1::reorder::Reorder::Degree,
+                Some(&nodes_path),
+                Format::Text
+            ),
+            ExitCode::SUCCESS
+        );
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let r = zu::query::run(
+            "MATCH (a:node {id: $id})-[:edge]->(b) RETURN b.id AS id ORDER BY id",
+            &mut db,
+            &[("id", Value::Int(2))],
+        )
+        .expect("one hop");
+        assert_eq!(r.rows, [[Value::Int(3)]]);
+    }
+
+    /// A line that is not a node id is a mistake worth naming, and the
+    /// first line is the exception because that is where a header sits.
+    #[test]
+    fn a_node_file_names_the_line_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nodes.csv");
+        std::fs::write(&path, "id:ID\n0\n1\nnope\n").expect("write nodes");
+        let err = highest_node_key(&path).expect_err("should refuse");
+        assert!(format!("{err}").contains("line 4"), "{err}");
+
+        std::fs::write(&path, "id:ID\n7\n3\n").expect("write nodes");
+        assert_eq!(highest_node_key(&path).expect("read"), Some(7));
     }
 
     /// Reorder renumbers the nodes, which resorts the edges, which
@@ -1628,6 +1789,7 @@ mod tests {
                 &edges_path,
                 &db_path,
                 zu::zu1::reorder::Reorder::Degree,
+                None,
                 Format::Text
             ),
             ExitCode::SUCCESS
@@ -1685,6 +1847,7 @@ mod tests {
                 &edges_path,
                 &db_path,
                 zu::zu1::reorder::Reorder::None,
+                None,
                 Format::Text
             ),
             ExitCode::SUCCESS
@@ -1698,6 +1861,7 @@ mod tests {
                 &plain,
                 &plain_db,
                 zu::zu1::reorder::Reorder::None,
+                None,
                 Format::Text
             ),
             ExitCode::SUCCESS
@@ -1724,6 +1888,7 @@ mod tests {
                 &edges_path,
                 &db_path,
                 zu::zu1::reorder::Reorder::Degree,
+                None,
                 Format::Text
             ),
             ExitCode::SUCCESS

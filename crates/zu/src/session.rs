@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use zu_common::{Result, ZuError};
+use zu_common::{Interrupt, Result, ZuError};
 use zu_query::binder::BoundQuery;
 use zu_query::exec;
 use zu_query::plan::LogicalPlan;
@@ -133,7 +133,10 @@ impl Session {
             plans: HashMap::new(),
             stmts: HashMap::new(),
             next_stmt: 1,
-            options: query::env_options(),
+            options: exec::Options {
+                interrupt: Interrupt::armed(),
+                ..query::env_options()
+            },
             writer: None,
         })
     }
@@ -208,8 +211,32 @@ impl Session {
     /// this; the setter is here because the switches belong to the
     /// session and a caller holding one directly should not have to
     /// reach through the environment to change them.
+    ///
+    /// The interrupt handle survives, whatever the new switches carry.
+    /// It belongs to whoever opened the session rather than to the
+    /// switches it rides in, and a caller changing the thread count
+    /// would otherwise silently take away the only way to stop a
+    /// statement.
     pub fn set_options(&mut self, options: exec::Options) {
-        self.options = options;
+        let interrupt = self.options.interrupt.clone();
+        self.options = exec::Options {
+            interrupt,
+            ..options
+        };
+    }
+
+    /// The handle a statement on this session can be stopped through.
+    ///
+    /// One handle for the life of the session, so a caller can take it
+    /// once and keep it. It is raised from another thread while a
+    /// statement runs, which is the only time it means anything: the
+    /// statement stops at the next boundary the executor checks and
+    /// answers [`ZuError::Interrupted`], and this session is exactly as
+    /// it was, plans and readers included. Clear it before a statement
+    /// rather than after, so a stop that arrived while nothing was
+    /// running cannot end the next one.
+    pub fn interrupt(&self) -> Interrupt {
+        self.options.interrupt.clone()
     }
 
     /// Runs one query, compiling it on the first sighting of this text

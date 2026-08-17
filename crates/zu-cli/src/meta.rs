@@ -408,6 +408,57 @@ pub(crate) fn took(elapsed: std::time::Duration) -> String {
     format!("time: {:.3} ms\n", elapsed.as_secs_f64() * 1000.0)
 }
 
+/// The line a statement that is still running writes over itself.
+///
+/// Seconds with one place, because this is a number a person watches
+/// rather than compares, and a third decimal that changes ten times a
+/// second is a flicker rather than a fact. The rows are the ones the
+/// engine has read out of storage, which is the number that moves on
+/// the statement worth watching: one that reads a hundred million rows
+/// to answer with one. A statement that has read none of them prints
+/// the time alone rather than a zero that never moves.
+pub(crate) fn running(elapsed: std::time::Duration, rows: u64) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if rows == 0 {
+        return format!("running {seconds:.1} s, Ctrl-C stops it");
+    }
+    format!(
+        "running {seconds:.1} s, {} rows read, Ctrl-C stops it",
+        grouped(rows)
+    )
+}
+
+/// What is printed instead of an answer when the user stopped it.
+///
+/// It says what was thrown away and that nothing else was, because the
+/// question somebody asks after pressing `Ctrl-C` is whether they still
+/// have their session.
+pub(crate) fn stopped(elapsed: std::time::Duration, rows: u64) -> String {
+    let seconds = elapsed.as_secs_f64();
+    let read = if rows == 0 {
+        String::new()
+    } else {
+        format!(" after reading {} rows", grouped(rows))
+    };
+    format!("interrupted at {seconds:.1} s{read}. the session is still open\n")
+}
+
+/// A count with a space every three digits, which is what makes eight
+/// figures readable at a glance. A space rather than a comma or a point
+/// because those two mean opposite things to different readers and this
+/// number is read by both.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(digit);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +616,42 @@ mod tests {
             "time: 10000.000 ms\n"
         );
         assert_eq!(took(std::time::Duration::ZERO), "time: 0.000 ms\n");
+    }
+
+    #[test]
+    fn a_progress_line_says_what_moved_and_how_to_stop_it() {
+        use std::time::Duration;
+        assert_eq!(
+            running(Duration::from_millis(1250), 4_300_000),
+            "running 1.2 s, 4 300 000 rows read, Ctrl-C stops it"
+        );
+        // Nothing read yet is the first second of every statement, and
+        // a zero there says less than the time does.
+        assert_eq!(
+            running(Duration::from_millis(400), 0),
+            "running 0.4 s, Ctrl-C stops it"
+        );
+    }
+
+    #[test]
+    fn a_stopped_statement_says_the_session_survived_it() {
+        use std::time::Duration;
+        assert_eq!(
+            stopped(Duration::from_millis(2400), 12_000),
+            "interrupted at 2.4 s after reading 12 000 rows. the session is still open\n"
+        );
+        assert_eq!(
+            stopped(Duration::from_millis(90), 0),
+            "interrupted at 0.1 s. the session is still open\n"
+        );
+    }
+
+    #[test]
+    fn digits_are_grouped_in_threes_from_the_right() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1 000");
+        assert_eq!(grouped(12_345_678), "12 345 678");
     }
 
     #[test]

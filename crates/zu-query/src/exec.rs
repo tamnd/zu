@@ -68,7 +68,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
-use zu_common::{DurationKind, Result, Temporal, ZuError, temporal};
+use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
@@ -464,6 +464,14 @@ pub struct Options {
     /// operators producing its probe side, the sideways pass of
     /// perf/13 §1.
     pub sip: Sip,
+    /// The handle whoever asked for the statement can stop it through,
+    /// and the count of rows it has read so far. Here rather than as a
+    /// parameter of its own because every execution path already
+    /// carries the switches, and a cancellation that only some of them
+    /// were handed would be a cancellation that works on some
+    /// statements. The default is the handle nobody armed, so a caller
+    /// who wants none pays a branch per chunk.
+    pub interrupt: Interrupt,
 }
 
 /// The WCOJ fusion switch. The optimizer marks cyclic closes on the
@@ -2492,6 +2500,10 @@ struct StageCtx<'a> {
     /// Path variable shapes from the binder, the assembly recipe
     /// behind [`assemble_path`]. No operator produces a path slot.
     path_shapes: &'a BTreeMap<usize, Vec<PathPart>>,
+    /// The caller's handle on this run, read at every pull and written
+    /// at every scan. A worker driving a morsel holds the same handle
+    /// the calling thread does, so one ask stops all of them.
+    stop: &'a Interrupt,
     chunks: Vec<Chunk>,
     states: Vec<OpState>,
     rows: Vec<Vec<Value>>,
@@ -3312,7 +3324,15 @@ fn leapfrog(seed: &[u64], probe: &[u64], mut emit: impl FnMut(u64)) {
 /// The pull entry point: a plain `step` normally, a timed and counted
 /// one when the context carries stats. Recursive pulls inside `step`
 /// come back through here, so every operator gets counted.
+///
+/// It is also where a cancellation is answered. Every operator's inner
+/// loop pulls from the one below it through here, so a check on the way
+/// in covers the whole pipeline at chunk granularity, from the top of
+/// the stage down to a filter that has rejected a million rows without
+/// producing one. A run nobody armed a handle for pays a load of a null
+/// pointer for that, next to a chunk of work.
 fn next(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
+    ctx.stop.check()?;
     if ctx.stats.is_empty() {
         return step(descs, ctx, i);
     }
@@ -3451,6 +3471,10 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 ctx.states[i].active = false;
                 continue;
             }
+            // What the caller watching this statement sees move. One
+            // add per chunk of rows, on the operator every long query
+            // ultimately pulls through.
+            ctx.stop.read(vals.len() as u64);
             let c = &mut ctx.chunks[*chunk];
             c.size = vals.len();
             c.cols[0] = vals;
@@ -5620,6 +5644,7 @@ struct StageJob<'a> {
     counts: &'a BTreeMap<u32, u64>,
     gone: &'a DeletedRows,
     params: &'a [Value],
+    stop: &'a Interrupt,
 }
 
 /// The crossbeam work-finding loop: pop the local deque, refill it
@@ -5662,6 +5687,7 @@ fn drive_worker(
         gone: job.gone,
         slot_loc: &stage.slot_loc,
         path_shapes: &job.query.path_shapes,
+        stop: job.stop,
         chunks: Vec::new(),
         states: Vec::new(),
         rows: Vec::new(),
@@ -5769,6 +5795,7 @@ fn run_stage_parallel(
         gone: job.gone,
         slot_loc: &stage.slot_loc,
         path_shapes: &job.query.path_shapes,
+        stop: job.stop,
         chunks: Vec::new(),
         states: Vec::new(),
         rows: Vec::new(),
@@ -5903,6 +5930,7 @@ fn run_stages(
                     counts: &counts,
                     gone: &gone,
                     params,
+                    stop: &options.interrupt,
                 };
                 rows = run_stage_parallel(&job, graph, forks, morsels, &mut notices)?;
                 continue;
@@ -5915,6 +5943,7 @@ fn run_stages(
             gone: &gone,
             slot_loc: &stage.slot_loc,
             path_shapes: &query.path_shapes,
+            stop: &options.interrupt,
             chunks: stage
                 .chunk_slots
                 .iter()
@@ -7717,6 +7746,7 @@ mod tests {
         let slot_loc = BTreeMap::new();
         let shapes = BTreeMap::new();
         let gone = DeletedRows::new();
+        let stop = Interrupt::default();
         let mut graph = mock();
         let mut ctx = StageCtx {
             graph: &mut graph,
@@ -7725,6 +7755,7 @@ mod tests {
             gone: &gone,
             slot_loc: &slot_loc,
             path_shapes: &shapes,
+            stop: &stop,
             chunks: Vec::new(),
             states: Vec::new(),
             rows: Vec::new(),

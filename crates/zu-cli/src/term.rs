@@ -1,6 +1,7 @@
-//! The terminal, in the three calls an interactive shell needs: is a
-//! person there, how big is the window, and stop the driver from
-//! interpreting what they type.
+//! The terminal, in the four calls an interactive shell needs: is a
+//! person there, how big is the window, stop the driver from
+//! interpreting what they type, and tell me when they press `Ctrl-C`
+//! while something is running.
 //!
 //! This is the only platform-specific code in the CLI, and it is here
 //! rather than in a dependency because a line editor is the one part of
@@ -21,6 +22,38 @@
 //! dropped on the way out.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by the handler and read by whoever is watching a statement.
+///
+/// One word, because that is all a signal handler may safely touch: it
+/// runs between two instructions of whatever thread the operating
+/// system picked, so it cannot lock, allocate, or print. Everything
+/// that has to happen because of a `Ctrl-C` happens on a normal thread
+/// that read this.
+static PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Arranges for `Ctrl-C` to set a flag instead of killing the process.
+///
+/// Only worth doing where something can act on it, which is why the
+/// shell calls it and the one-shot commands do not: a `zu query` that
+/// caught the signal and carried on would be a program a user cannot
+/// stop. Calling it twice is calling it once.
+///
+/// This changes nothing about typing. Raw mode clears the driver's
+/// signal characters, so a `Ctrl-C` at the prompt is a byte the editor
+/// reads and never a signal; the handler is for the other half of the
+/// loop, where raw mode is off and a statement is running.
+pub(crate) fn catch_interrupts() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(imp::catch);
+}
+
+/// Whether a `Ctrl-C` has arrived since this was last asked, and takes
+/// it: two waits in a row should not both see one press.
+pub(crate) fn interrupted() -> bool {
+    PRESSED.swap(false, Ordering::Relaxed)
+}
 
 /// What a terminal was set to before this program touched it, and the
 /// promise to put it back.
@@ -197,11 +230,36 @@ mod imp {
         ypixels: u16,
     }
 
+    /// `SIGINT`, which is 2 everywhere a unix runs.
+    const SIGINT: c_int = 2;
+
     unsafe extern "C" {
         fn isatty(fd: c_int) -> c_int;
         fn tcgetattr(fd: c_int, termios: *mut Saved) -> c_int;
         fn tcsetattr(fd: c_int, actions: c_int, termios: *const Saved) -> c_int;
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+        /// The return is the handler that was there, or the error
+        /// value, and this takes neither: a pointer-sized integer
+        /// receives both without ever being called through.
+        fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+    }
+
+    /// All a handler does. Everything else about a `Ctrl-C` is decided
+    /// on the thread that reads this word, because a handler that
+    /// allocated or locked would be a handler that deadlocks whenever
+    /// the signal lands inside the allocator.
+    extern "C" fn on_interrupt(_sig: c_int) {
+        super::PRESSED.store(true, super::Ordering::Relaxed);
+    }
+
+    pub(super) fn catch() {
+        // SAFETY: a function pointer with the signature the call
+        // expects, for a signal every implementation defines. `signal`
+        // on every platform zu supports keeps the handler installed
+        // across deliveries, so this is asked once.
+        unsafe {
+            signal(SIGINT, on_interrupt);
+        }
     }
 
     pub(super) fn is_tty() -> bool {
@@ -314,11 +372,39 @@ mod imp {
         output: u32,
     }
 
+    /// What the console reports for `Ctrl-C`. The other events it can
+    /// report are the window closing and the user logging out, and
+    /// none of those is a statement to stop.
+    const CTRL_C_EVENT: u32 = 0;
+
     unsafe extern "system" {
         fn GetStdHandle(which: u32) -> *mut c_void;
         fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
         fn SetConsoleMode(handle: *mut c_void, mode: u32) -> i32;
         fn GetConsoleScreenBufferInfo(handle: *mut c_void, info: *mut ScreenInfo) -> i32;
+        fn SetConsoleCtrlHandler(handler: unsafe extern "system" fn(u32) -> i32, add: i32) -> i32;
+    }
+
+    /// Windows runs this on a thread of its own rather than between two
+    /// instructions of an existing one, so the rule about what it may
+    /// touch is milder than a unix handler's. It still only sets the
+    /// word, so that both platforms answer a `Ctrl-C` the same way.
+    /// Returning true says it was handled, which is what keeps the
+    /// default handler from ending the process.
+    unsafe extern "system" fn on_interrupt(event: u32) -> i32 {
+        if event != CTRL_C_EVENT {
+            return 0;
+        }
+        super::PRESSED.store(true, super::Ordering::Relaxed);
+        1
+    }
+
+    pub(super) fn catch() {
+        // SAFETY: a function pointer with the signature the call
+        // expects, added to this process's list of handlers.
+        unsafe {
+            SetConsoleCtrlHandler(on_interrupt, 1);
+        }
     }
 
     /// The mode of a standard handle, which is `None` when that handle
@@ -417,4 +503,9 @@ mod imp {
     pub(super) fn size() -> Option<(usize, usize)> {
         None
     }
+
+    /// No handler, so `Ctrl-C` ends the process the way it did before,
+    /// which is the honest behaviour on a platform where the shell has
+    /// no line editor either.
+    pub(super) fn catch() {}
 }

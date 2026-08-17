@@ -50,6 +50,11 @@ pub(crate) fn run(session: &mut Session, path: &str) -> ExitCode {
     println!(
         "zu {version}, {path}. Ctrl-J for a new line, \\? for the commands, quit or Ctrl-D to leave."
     );
+    // From here on a `Ctrl-C` while a statement runs is a flag rather
+    // than the end of the process. At the prompt it is neither: raw
+    // mode has taken the driver's signal characters away and the editor
+    // reads the byte.
+    term::catch_interrupts();
     let mut editor = Editor::new(crate::highlight::wanted());
     // Off until asked for, because a time printed under every answer is
     // a line of noise to everybody who did not want to know.
@@ -226,9 +231,90 @@ fn include(session: &mut Session, path: &str, timing: bool) -> String {
 /// on, and says whether it worked.
 fn timed(session: &mut Session, statement: &str, timing: bool) -> (String, bool) {
     let start = std::time::Instant::now();
-    let (mut text, ok) = answer(session, statement);
+    let (mut text, ok) = watched(session, statement);
     if timing {
         text.push_str(&meta::took(start.elapsed()));
+    }
+    (text, ok)
+}
+
+/// How often the watcher wakes: often enough that a `Ctrl-C` is
+/// answered while the finger is still on the key, rare enough that
+/// waiting on a statement costs nothing measurable. Fifty presses a
+/// second against an executor that checks its flag every chunk puts the
+/// whole round trip well inside the tenth of a second a person reads as
+/// immediate.
+const TICK: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long a statement runs before the shell says it is running.
+///
+/// Nothing a person waits less than this for wants a line about
+/// itself, and every statement in a normal session finishes inside it,
+/// so the usual case prints nothing at all.
+const QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Runs one statement on a thread of its own while this one watches for
+/// `Ctrl-C` and says how far it has got.
+///
+/// The statement has to be somewhere other than here, because the
+/// thread running a query is inside the executor and cannot also be
+/// reading a flag. Where there is no terminal there is nobody to press
+/// anything and nowhere to draw a progress line, so the statement runs
+/// on this thread and a harness driving the shell down a pipe sees
+/// exactly what it saw before.
+///
+/// A press stops the statement rather than the process: the session,
+/// its plans and its warm readers are all still here afterwards, which
+/// is the difference between this and the signal a shell without a
+/// handler would take.
+fn watched(session: &mut Session, statement: &str) -> (String, bool) {
+    if !term::interactive() {
+        return answer(session, statement);
+    }
+    let stop = session.interrupt();
+    // Cleared before rather than after, so a press that arrived while
+    // nothing was running cannot end what is about to.
+    stop.clear();
+    term::interrupted();
+    let start = std::time::Instant::now();
+    let mut drawn = String::new();
+    let (text, ok) = std::thread::scope(|scope| {
+        let running = scope.spawn(|| answer(session, statement));
+        while !running.is_finished() {
+            std::thread::sleep(TICK);
+            if term::interrupted() {
+                stop.stop();
+            }
+            if start.elapsed() >= QUIET {
+                // Written only when it would say something different,
+                // since the poll is faster than either the tenth of a
+                // second or the row count can change and a terminal
+                // handed the same line fifty times a second is fifty
+                // writes buying nothing.
+                let line = meta::running(start.elapsed(), stop.rows());
+                if line != drawn {
+                    // Carriage return, the line, then erase whatever
+                    // the longer line before it left to the right.
+                    let _ = term::emit(&format!("\r{line}\x1b[K"));
+                    drawn = line;
+                }
+            }
+        }
+        running.join().unwrap_or_else(|_| {
+            // A panic in the query path is a bug in the engine, and the
+            // shell's job is to say so and stay open rather than to
+            // unwind through a terminal it has left in raw mode.
+            (
+                "error the engine panicked running that statement\n".to_string(),
+                false,
+            )
+        })
+    });
+    if !drawn.is_empty() {
+        let _ = term::emit("\r\x1b[K");
+    }
+    if stop.stopped() {
+        return (meta::stopped(start.elapsed(), stop.rows()), false);
     }
     (text, ok)
 }

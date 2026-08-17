@@ -3145,7 +3145,14 @@
       "kind": "function",
       "name": "sssp",
       "signature": "fn sssp(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, source: u64) -> zu_common::Result<Vec<u64>>",
-      "doc": "Single-source hop distances over the undirected view. Rel tables\ncarry no edge weights yet, so this is SSSP under unit weights; the\nweighted variant arrives with rel properties. Unreachable nodes get\n`u64::MAX`."
+      "doc": "Single-source hop distances over the undirected view, SSSP under\nunit weights. Unreachable nodes get `u64::MAX`. The weighted form is\n[`sssp_weighted`], which follows stored direction instead, that\nbeing what the GAP and Graph500 kernels measure."
+    },
+    {
+      "id": "zu::zu1::algo::sssp_weighted",
+      "kind": "function",
+      "name": "sssp_weighted",
+      "signature": "fn sssp_weighted(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, source: u64, weights: &[u64]) -> zu_common::Result<Vec<u64>>",
+      "doc": "Weighted single-source shortest paths from `source` following stored\nedge direction, the GAP SSSP and Graph500 K3 kernel. `weights[i]` is\nthe weight of edge `i` of the load order. Unreachable nodes get\n`u64::MAX`.\n\nThe load order is the order the forward lists lay out, group after\ngroup and list after list, so a walk that counts as it goes reads a\nweight at an index and never searches for one. That is also what\nkeeps a parallel edge honest: two edges over the same pair are two\nslots of the list with two weights, and only the count says which is\nwhich.\n\nDirection, not the undirected view, because the reference this is\nmeasured against relaxes out-edges only. The distances come out the\nsame whichever order the frontier settles in, so there is nothing\nhere for a tie to move."
     },
     {
       "id": "zu::zu1::algo::wcc",
@@ -4966,7 +4973,7 @@
       "name": "edge_ordinal",
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn edge_ordinal(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>>",
-      "doc": "The row of the edge property columns that `src -> dst` holds,\nand `None` when the edge is not there.\n\nThe ordinal is the edge's place in the load order, which the\nforward CSR lays out group after group and list after list, so\nit is the group's base plus the slot the destination sits in.\nAn edge reached forward could have its ordinal counted out as\nthe expand walks the list, and the vectorized read does exactly\nthat; this is the answer for an edge that arrived any other way,\na backward expand above all, where the slot in the backward\narray says nothing about the forward one.\n\nThis takes the cached-group path [`Self::neighbors_dir`] takes,\nnot the point path [`Self::has_edge`] takes, because an edge\nproperty is read once per edge a pattern matched and those edges\narrive together: the point path decodes an offset chunk and a\nneighbor chunk per call, which measured at about 5us per\nproperty read, against a binary search over a slice the group\ncache already holds. A caller reading one ordinal on its own\npays a group decode for it, which is the same bet the neighbor\nlist makes.\n\nEdges are unique in a table that stores properties, which\n[`crate::props::store_rel_props`] is what enforces, so the pair\nnames one edge and the ordinal is that edge's."
+      "doc": "The row of the edge property columns that `src -> dst` holds,\nand `None` when the edge is not there.\n\nThe ordinal is the edge's place in the load order, which the\nforward CSR lays out group after group and list after list, so\nit is the group's base plus the slot the destination sits in.\nAn edge reached forward could have its ordinal counted out as\nthe expand walks the list, and the vectorized read does exactly\nthat; this is the answer for an edge that arrived any other way,\na backward expand above all, where the slot in the backward\narray says nothing about the forward one.\n\nThis takes the cached-group path [`Self::neighbors_dir`] takes,\nnot the point path [`Self::has_edge`] takes, because an edge\nproperty is read once per edge a pattern matched and those edges\narrive together: the point path decodes an offset chunk and a\nneighbor chunk per call, which measured at about 5us per\nproperty read, against a binary search over a slice the group\ncache already holds. A caller reading one ordinal on its own\npays a group decode for it, which is the same bet the neighbor\nlist makes.\n\nA pair that runs twice names two edges with two ordinals, and a\nlookup given nothing but the pair cannot pick between them: this\nanswers with the first, the earliest of the run in load order.\nThe count is what tells the copies apart and only a walk of the\nlist has it, so a caller that needs each copy's own value takes\n[`Self::out_neighbors_from`] and counts."
     },
     {
       "id": "zu::zu1::graph::GraphReader::has_edge",
@@ -5055,6 +5062,14 @@
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn neighbors_into(&self, db: &mut Zu1File, node: u64, out: &mut Vec<u64>) -> Result<()>",
       "doc": "Point access to the out-neighbor list."
+    },
+    {
+      "id": "zu::zu1::graph::GraphReader::out_neighbors_from",
+      "kind": "method",
+      "name": "out_neighbors_from",
+      "of": "zu::zu1::graph::GraphReader",
+      "signature": "fn out_neighbors_from(&mut self, db: &mut Zu1File, node: u64) -> Result<(&[u64], u64)>",
+      "doc": "`node`'s forward list together with the ordinal of the first\nedge in it, so the `i`th neighbor is edge `base + i` of the load\norder and an edge property is a slice index rather than a\nsearch.\n\n[`Self::edge_ordinal`] answers the same question for one pair\nand costs a binary search to do it, which is the right trade for\nan edge that arrived from somewhere else. A kernel walking the\nforward lists already knows where it is, and on a graph where a\npair can repeat the count is the only thing that tells the\ncopies apart."
     },
     {
       "id": "zu::zu1::graph::GroupMeta",
@@ -5746,6 +5761,14 @@
       "signature": "fn read_int(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<u64>"
     },
     {
+      "id": "zu::zu1::props::PropsReader::read_int_column",
+      "kind": "method",
+      "name": "read_int_column",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn read_int_column(&mut self, db: &mut Zu1File, col: usize, out: &mut Vec<u64>) -> Result<()>",
+      "doc": "Decodes the whole of an integer column into `out`, chunk after\nchunk through one reusable buffer.\n\nThis is for a caller that wants every value at once and in\norder, which a whole-graph kernel does: an edge weight is read\nin whatever order the frontier settles, so a lazy chunk read\nwould revisit chunks and a gather would want an index vector as\nbig as the answer. Nothing is cached on the reader, so the eight\nbytes an edge stay the caller's to drop."
+    },
+    {
       "id": "zu::zu1::props::PropsReader::read_str",
       "kind": "method",
       "name": "read_str",
@@ -5830,7 +5853,7 @@
       "kind": "function",
       "name": "store_rel_props",
       "signature": "fn store_rel_props(db: &mut zu_zu1::file::Zu1File, rel_table: &str, columns: &[(&str, PropValues)]) -> zu_common::Result<PropsDirectory>",
-      "doc": "Stores the property columns of the rel table `rel_table`, replacing\nany earlier set whole. Every column holds one value per edge, in the\norder the edges were loaded in, which is sorted by source and then by\ndestination: value `i` belongs to edge `i` of that order, and that is\nthe only thing tying a column to an edge, so a caller that hands over\na column in another order has silently mislabeled its graph.\n\nEdges must be unique. The ordinal of an edge is found by searching\nthe forward list for its destination, which two edges with the same\nendpoints would answer the same way, so a table that stores\nproperties may not hold a pair twice and a load that would make one\nis refused here rather than answered wrongly later."
+      "doc": "Stores the property columns of the rel table `rel_table`, replacing\nany earlier set whole. Every column holds one value per edge, in the\norder the edges were loaded in, which is sorted by source and then by\ndestination: value `i` belongs to edge `i` of that order, and that is\nthe only thing tying a column to an edge, so a caller that hands over\na column in another order has silently mislabeled its graph.\n\nA pair may run twice. Two edges over the same endpoints are two\nslots of the forward list and two values of the column, and a walk\nthat counts as it goes has each one's own\n([`crate::graph::GraphReader::out_neighbors_from`]). What such a\ntable cannot do is answer a lookup given nothing but the pair with\nboth values, and `edge_ordinal` says which of the two it picks."
     },
     {
       "id": "zu::zu1::props::store_rel_props_nullable",

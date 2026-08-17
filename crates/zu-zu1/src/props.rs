@@ -1080,11 +1080,12 @@ fn write_props(
 /// the only thing tying a column to an edge, so a caller that hands over
 /// a column in another order has silently mislabeled its graph.
 ///
-/// Edges must be unique. The ordinal of an edge is found by searching
-/// the forward list for its destination, which two edges with the same
-/// endpoints would answer the same way, so a table that stores
-/// properties may not hold a pair twice and a load that would make one
-/// is refused here rather than answered wrongly later.
+/// A pair may run twice. Two edges over the same endpoints are two
+/// slots of the forward list and two values of the column, and a walk
+/// that counts as it goes has each one's own
+/// ([`crate::graph::GraphReader::out_neighbors_from`]). What such a
+/// table cannot do is answer a lookup given nothing but the pair with
+/// both values, and `edge_ordinal` says which of the two it picks.
 pub fn store_rel_props(
     db: &mut Zu1File,
     rel_table: &str,
@@ -1150,7 +1151,6 @@ pub fn store_rel_props_nullable(
         detail: format!("rel table '{rel_table}' has no directory entry"),
     })?;
     let mut directory = crate::graph::Directory::decode(&meta::read_chain(db, root)?)?;
-    reject_duplicate_edges(db, rel_table, &directory)?;
     if directory.props != crate::file::NULL_BLOCK {
         free_props(db, directory.props)?;
     }
@@ -1235,39 +1235,6 @@ pub fn store_labels<S: AsRef<str>>(
     let catalog_root = meta::write_chain(db, &catalog.encode())?;
     db.db_header_mut().catalog_root = catalog_root;
     db.checkpoint()?;
-    Ok(())
-}
-
-/// Errors when any node lists a destination twice.
-///
-/// This walks the forward adjacency once, which is the cost of reading
-/// what is about to be written a column of anyway, and it runs before
-/// anything is written. A list is stored sorted, so a repeat is a
-/// neighbor equal to the one before it and the check is a comparison per
-/// edge with no state.
-fn reject_duplicate_edges(
-    db: &mut Zu1File,
-    name: &str,
-    directory: &crate::graph::Directory,
-) -> Result<()> {
-    let mut values = Vec::new();
-    for (g, group) in directory.groups.iter().enumerate() {
-        let mut offsets = Vec::new();
-        crate::segment::read_segment(db, &group.fwd.offsets, &mut offsets)?;
-        values.clear();
-        crate::segment::read_segment(db, &group.fwd.neighbors, &mut values)?;
-        for row in 0..group.row_count as usize {
-            let list = &values[offsets[row] as usize..offsets[row + 1] as usize];
-            if let Some(w) = list.windows(2).find(|w| w[0] == w[1]) {
-                let node = g as u64 * zu_common::GROUP_ROWS as u64 + row as u64;
-                return Err(ZuError::InvalidArgument(format!(
-                    "rel table '{name}' holds the edge ({node}, {}) twice, which an edge \
-                     property column cannot tell apart",
-                    w[0]
-                )));
-            }
-        }
-    }
     Ok(())
 }
 
@@ -1454,6 +1421,38 @@ impl PropsReader {
         let dir = self.int_dir(db, col)?;
         let meta = &self.directory.columns[col].meta;
         decode_chunk(db, meta, &dir, chunk, out)
+    }
+
+    /// Decodes the whole of an integer column into `out`, chunk after
+    /// chunk through one reusable buffer.
+    ///
+    /// This is for a caller that wants every value at once and in
+    /// order, which a whole-graph kernel does: an edge weight is read
+    /// in whatever order the frontier settles, so a lazy chunk read
+    /// would revisit chunks and a gather would want an index vector as
+    /// big as the answer. Nothing is cached on the reader, so the eight
+    /// bytes an edge stay the caller's to drop.
+    pub fn read_int_column(
+        &mut self,
+        db: &mut Zu1File,
+        col: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let column = &self.directory.columns[col];
+        if !column.is_lane() {
+            return Err(not_lane(column));
+        }
+        let chunks = column.meta.chunk_count();
+        let rows = column.meta.value_count as usize;
+        out.clear();
+        out.reserve(rows);
+        let mut buf = Vec::new();
+        for chunk in 0..chunks {
+            self.scan_int_chunk(db, col, chunk, &mut buf)?;
+            out.extend_from_slice(&buf);
+        }
+        out.truncate(rows);
+        Ok(())
     }
 
     /// Reads the string values of rows `start..end` of `col`, the scan
@@ -2110,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_columns_reject_a_table_that_holds_a_pair_twice() {
+    fn edge_columns_hold_a_value_for_each_copy_of_a_repeated_pair() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("dup.zu1")).unwrap();
         bulk_load_keyed(
@@ -2123,20 +2122,21 @@ mod tests {
         )
         .unwrap();
         let three = [1u64, 2, 3];
-        let err =
-            store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&three))]).unwrap_err();
-        assert!(
-            err.to_string().contains("holds the edge (0, 1) twice"),
-            "{err}"
-        );
-        // The refusal comes before anything is written, so the table is
-        // left as it was rather than half converted.
+        store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&three))]).unwrap();
         let rel = Catalog::load(&mut db)
             .unwrap()
             .rel_by_name("knows")
             .unwrap()
             .id;
-        assert!(load_rel_props(&mut db, rel).unwrap().is_none());
+        let mut reader = PropsReader::new(load_rel_props(&mut db, rel).unwrap().unwrap());
+        let col = reader.col("since").unwrap();
+        let mut values = Vec::new();
+        reader.read_int_column(&mut db, col, &mut values).unwrap();
+        assert_eq!(values, three, "one value an edge, copies included");
+        // The pair alone reaches the first of the two, which is the
+        // ordinal a lookup with nothing else to go on has to answer.
+        let mut graph = crate::graph::GraphReader::load_table(&mut db, "knows").unwrap();
+        assert_eq!(graph.edge_ordinal(&mut db, 0, 1).unwrap(), Some(0));
 
         // A column of the wrong length is counted against edges, not nodes.
         let mut db = setup(dir.path());

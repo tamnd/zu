@@ -550,10 +550,13 @@ fn fold_rel(
         edges.push((src as u32, dst as u32, Came::Overlay(at)));
     }
     edges.sort_unstable_by_key(|&(src, dst, _)| (src, dst));
-    // The ordinal of an edge in a table that stores properties is found
-    // by searching the forward list for its destination, so a pair held
-    // twice would answer that search once and one of the two edges
-    // would have a value nothing can read.
+    // A bulk load can hold a pair twice, because the sort that puts the
+    // copies next to each other is stable and the copies keep file
+    // order. This sort is not: the base edge and the overlay edge over
+    // one pair would land in whichever order the sort left them, and
+    // the column permutation would then be reading a coin toss. Until
+    // the fold sorts by something that separates them, a second edge
+    // over a pair the table already holds is refused.
     if old.props != NULL_BLOCK
         && edges
             .windows(2)
@@ -1493,8 +1496,9 @@ mod tests {
         assert_eq!(reader.read_int(&mut db, col, 1).unwrap(), 2);
     }
 
-    /// A pair the table already holds is an ordinal two edges answer to,
-    /// so a table that stores properties refuses the second one.
+    /// A bulk load keeps both copies of a pair; folding a second one in
+    /// over a table that stores properties does not, because the fold's
+    /// sort would not say which copy came first.
     #[test]
     fn a_second_edge_over_a_pair_is_refused_on_a_table_with_columns() {
         let dir = tempfile::tempdir().unwrap();

@@ -25,6 +25,10 @@ tempfile.workspace = true
 name = "cli"
 harness = false
 
+[[bench]]
+name = "editor"
+harness = false
+
 [features]
 arrow = ["zu/arrow"]
 

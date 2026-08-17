@@ -1,8 +1,16 @@
-//! `zu shell`: a persistent query loop over one file, speaking one
-//! JSON object per line on stdout. This is the process a harness or an
-//! editor keeps alive so the catalog, stats, plan cache, and decoded
-//! block caches pay their cost once instead of once per query; the
-//! one-shot `zu query` path stays for humans and scripts.
+//! `zu shell`: a persistent query loop over one file. This is the
+//! process a harness or an editor keeps alive so the catalog, stats,
+//! plan cache, and decoded block caches pay their cost once instead of
+//! once per query; the one-shot `zu query` path stays for scripts.
+//!
+//! It speaks to whoever is there. A person at a terminal gets the
+//! editor in [`crate::repl`], with a prompt, history and multi-line
+//! statements; a program gets one JSON object per line, which is the
+//! rest of this file. Nothing has to be passed to choose, because the
+//! question "is standard input a terminal" already has the answer, and
+//! `--format jsonl` is there for the harness that wants to say so
+//! anyway, or that runs zu under a pty and would otherwise be handed a
+//! prompt it never asked for.
 //!
 //! Input is line-oriented and comes in two spellings. A line starting
 //! with `{` is a frame: `{"op":"query","q":"...","params":{...}}`,
@@ -35,14 +43,18 @@ use zu_json::{self as json, Json};
 
 pub(crate) fn shell_command(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
+    let mut jsonl = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            // jsonl is the only wire format; the flag exists so a
-            // caller can say what it expects and fail loudly here if
-            // a future default ever changes.
+            // jsonl is the only wire format, and asking for it is how a
+            // caller says it is a program even when it is holding a
+            // terminal open.
             "--format" | "-f" => match args.get(i + 1).map(String::as_str) {
-                Some("jsonl") => i += 2,
+                Some("jsonl") => {
+                    jsonl = true;
+                    i += 2;
+                }
                 _ => return crate::usage_error("shell"),
             },
             arg if arg.starts_with('-') => return crate::usage_error("shell"),
@@ -60,6 +72,9 @@ pub(crate) fn shell_command(args: &[String]) -> ExitCode {
         Ok(s) => s,
         Err(e) => return crate::command_error("shell", &e),
     };
+    if !jsonl && crate::term::interactive() {
+        return crate::repl::run(&mut session, path);
+    }
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

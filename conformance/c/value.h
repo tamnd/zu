@@ -117,6 +117,13 @@ void cv_arena_reset(cv_arena *a);
 /* Frees the arena and everything in it. A no-op on NULL. */
 void cv_arena_free(cv_arena *a);
 
+/* Memory from the arena, aligned for anything in a value, or NULL if
+ * it could not be had. It is here for a caller that builds values
+ * rather than decoding them: the runner turns what the engine gave back
+ * into a cv to compare it, and a list of those needs an array
+ * somewhere that lives exactly as long as the case does. */
+void *cv_alloc(cv_arena *a, size_t bytes);
+
 /* The value a `{type, value}` mapping describes: 0 and a value in out,
  * or -1 and a message in err saying which line is wrong and why. The
  * message reads `line N: ...`, as the reader's do, because a case file

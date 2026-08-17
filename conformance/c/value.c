@@ -73,7 +73,10 @@ void cv_arena_free(cv_arena *a) {
     free(a);
 }
 
-static void *arena_alloc(cv_arena *a, size_t size) {
+/* Also the runner's, which builds values of its own out of what the
+ * engine handed back and wants them to live and die with the case the
+ * decoded ones do. */
+void *cv_alloc(cv_arena *a, size_t size) {
     size_t need = (size + (CV_ALIGN - 1)) & ~(size_t)(CV_ALIGN - 1);
     cv_chunk *c;
     void *p;
@@ -106,7 +109,7 @@ static void *arena_alloc(cv_arena *a, size_t size) {
  * own. A NULL ptr is the allocation having failed. */
 static zy_str arena_str(cv_arena *a, const char *ptr, size_t len) {
     zy_str out;
-    char *p = (char *)arena_alloc(a, len + 1);
+    char *p = (char *)cv_alloc(a, len + 1);
     out.ptr = p;
     out.len = len;
     if (p != NULL) {
@@ -977,7 +980,7 @@ int cv_payload(cv_arena *a, const char *ty, const zy_node *value, cv *out, char 
             return fail(err, err_len, line, "a LIST holds a sequence of values, and this is %s",
                         zy_kind_name(value));
         }
-        cells = count == 0 ? NULL : (cv *)arena_alloc(a, count * sizeof *cells);
+        cells = count == 0 ? NULL : (cv *)cv_alloc(a, count * sizeof *cells);
         if (count > 0 && cells == NULL) {
             return oom(err, err_len);
         }

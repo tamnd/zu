@@ -169,6 +169,34 @@ case "$target" in
     ;;
 esac
 
+# The conformance corpus, run against this package by the reference C
+# runner. The smoke test above proves the artifact links and answers;
+# this proves it agrees with crates/zu-corpus about every case in
+# conformance/cases, through the header and nothing else, which is what
+# a client repository does with the corpus release. It runs per platform
+# rather than once because the answers are what differ between them: a
+# float that prints one digit short on one libc and a date that shifts
+# by a day on another are both a case that fails here and nowhere else.
+#
+# Not `--strict`, because that gate belongs to the corpus job, which
+# runs the same cases on one machine and decides whether the engine has
+# caught up with them. This row is about the platform.
+mkdir -p "$work/corpus"
+case "$target" in
+*windows*)
+    clang -std=c99 -O2 "-I$prefix/include" -o "$work/runner.exe" \
+        conformance/c/yaml.c conformance/c/value.c conformance/c/runner.c \
+        "$prefix/lib/zu.dll.lib"
+    "$work/runner.exe" --dir "$work/corpus" conformance/cases/*.yaml
+    ;;
+*)
+    cc -std=c99 -O2 "-I$prefix/include" -o "$work/runner" \
+        conformance/c/yaml.c conformance/c/value.c conformance/c/runner.c \
+        -L"$prefix/lib" -lzu -Wl,-rpath,"$prefix/lib"
+    "$work/runner" --dir "$work/corpus" conformance/cases/*.yaml
+    ;;
+esac
+
 # pkg-config, which is how a Makefile and a meson.build both find this.
 # `--static` is asked for as well, since Libs.private is the field a
 # generated file is most likely to be quietly wrong in and nothing else

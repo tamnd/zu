@@ -29,6 +29,13 @@ cc -std=c99 -Wall -Wextra -Werror -o value_test conformance/c/yaml.c conformance
 ./value_test conformance/cases/*.yaml         # and every value in them through the C decoder
 ```
 
+```
+cc -std=c99 -Wall -Wextra -Werror -Icrates/zu-capi/include -o runner conformance/c/yaml.c conformance/c/value.c conformance/c/runner.c -Ltarget/release -lzu
+mkdir -p work && ./runner --dir work conformance/cases/*.yaml   # and every case through the C ABI
+```
+
+The C runner is the second of nine and the first one written the way a client repository writes one: it reaches the engine through `zu.h` and nothing else, so a case it cannot run is a case the ABI cannot answer. It takes the scratch directory and the case files as arguments, which is why it needs no directory walk and no platform of its own. It prints what the Rust one prints, line for line, so that a disagreement between two clients is a diff and not a reading exercise. CI diffs the two over every case, and again over `conformance/c/wrong`, which holds cases the engine answers differently from what they say: the corpus passes, which is the point of it and also why it can never show what a runner says when a case fails. The C runner is built under ASan and UBSan on every pull request and again on every tier 1 platform against the staged package.
+
 The Rust runner in `crates/zu-corpus` is the first of nine and the reference for the rest. When a runner in another language disagrees with it about a case, the Rust one is right by definition: the cases and the engine version together are the contract, and this runner is the one compiled against the engine that defines it.
 
 Every case gets a database of its own. Cases are written as if nothing came before them, and the cheapest way to keep that true is to make it true. A case that leaked a table into the next one would be a failure that moves when the file is reordered, which is the worst kind to be handed. A suite with a `load:` gets it applied to each of those databases in turn, for the same reason.

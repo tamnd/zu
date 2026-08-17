@@ -81,6 +81,17 @@ fn locate(node: u64) -> (usize, usize) {
 pub const PAGERANK_DAMPING: f64 = 0.85;
 pub const PAGERANK_ITERATIONS: usize = 20;
 
+/// Where the converging form stops. The tolerance is the largest a
+/// single rank moves in a round, the cap is what a run costs on a
+/// graph that will not settle. A fixed twenty rounds is the right rule
+/// only against a published reference produced the same way; asked for
+/// the pagerank of a graph with nothing to match, twenty rounds is
+/// about 3.4e-4 off the converged answer, which is outside the 1e-4
+/// the LDBC harness compares at. These two are what that harness uses
+/// for its own reference.
+pub const PAGERANK_TOLERANCE: f64 = 1e-12;
+pub const PAGERANK_MAX_ITERATIONS: usize = 100;
+
 /// The round count Graphalytics fixes for CDLP, so two runs of the
 /// same graph are the same partition however far propagation has left
 /// to go.
@@ -88,7 +99,30 @@ pub const CDLP_ROUNDS: usize = 10;
 
 /// PageRank by power iteration over the forward CSR: fixed iteration
 /// count, dangling mass redistributed uniformly, ranks summing to one.
+/// This is the form that matches a published Graphalytics reference,
+/// which is itself the same loop run the same number of times.
 pub fn pagerank(db: &mut Zu1File, reader: &mut GraphReader, iterations: usize) -> Result<Vec<f64>> {
+    power_iteration(db, reader, iterations, 0.0)
+}
+
+/// PageRank run until it settles rather than until a counter runs out:
+/// stops when no rank moves by more than [`PAGERANK_TOLERANCE`] in a
+/// round, and gives up at [`PAGERANK_MAX_ITERATIONS`]. This is what a
+/// query asking for the pagerank of a graph wants, there being no
+/// fixed-round reference on the other side of it to match.
+pub fn pagerank_converged(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<f64>> {
+    power_iteration(db, reader, PAGERANK_MAX_ITERATIONS, PAGERANK_TOLERANCE)
+}
+
+/// The loop both forms share. `stop_at` is the largest per-node move
+/// that counts as settled; a stop of zero never fires, which is how the
+/// fixed-count form spends its whole budget.
+fn power_iteration(
+    db: &mut Zu1File,
+    reader: &mut GraphReader,
+    iterations: usize,
+    stop_at: f64,
+) -> Result<Vec<f64>> {
     let n = reader.directory().one_domain()? as usize;
     if n == 0 {
         return Ok(Vec::new());
@@ -117,7 +151,15 @@ pub fn pagerank(db: &mut Zu1File, reader: &mut GraphReader, iterations: usize) -
                 next[dst as usize] += share;
             }
         }
+        let moved = rank
+            .iter()
+            .zip(&next)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
         std::mem::swap(&mut rank, &mut next);
+        if moved < stop_at {
+            break;
+        }
     }
     Ok(rank)
 }
@@ -401,9 +443,10 @@ pub fn cdlp(db: &mut Zu1File, reader: &mut GraphReader, rounds: usize) -> Result
 /// another over `d * (d - 1)`, the count of ordered pairs. Fewer than
 /// two neighbors scores zero, there being no pair to close.
 ///
-/// Parallel edges count as many times as they are stored, and a self
-/// loop on a neighbor closes nothing, which is what the Graphalytics
-/// reference counts.
+/// A pair of neighbors closes the triangle once however many edges run
+/// between them, and a self loop on a neighbor closes nothing. Counting
+/// a parallel edge again would put the coefficient of a node above one,
+/// which is not a thing a coefficient does.
 pub fn lcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<f64>> {
     let n = reader.directory().one_domain()? as usize;
     let mut coeff = Vec::with_capacity(n);
@@ -432,8 +475,15 @@ pub fn lcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<f64>> {
         }
         let mut links = 0u64;
         for &near in &nbrs {
+            // The list is sorted, so a parallel edge sits next to the
+            // copy before it and skipping a repeat is one comparison.
+            let mut prev = u64::MAX;
             for &far in reader.neighbors_dir(db, near, Direction::Fwd)? {
-                if far != near && member[far as usize] {
+                if far == near || far == prev {
+                    continue;
+                }
+                prev = far;
+                if member[far as usize] {
                     links += 1;
                 }
             }
@@ -617,6 +667,48 @@ mod tests {
     }
 
     #[test]
+    fn pagerank_converged_settles_past_where_twenty_rounds_stops() {
+        // A hub with a long tail off it is slow to settle: twenty
+        // rounds leaves the tail short of where it lands, and the
+        // converging form has to be closer to the fixed point than
+        // that. "Closer" is measured against a run of a thousand
+        // rounds, which is the fixed point for this shape.
+        let mut edges = vec![(0, 1)];
+        for node in 1..63u32 {
+            edges.push((node, node + 1));
+        }
+        let (_dir, mut db, mut reader) = open_with(&edges, 64);
+        let settled = pagerank(&mut db, &mut reader, 1000).expect("pagerank");
+        let twenty = pagerank(&mut db, &mut reader, 20).expect("pagerank");
+        let converged = pagerank_converged(&mut db, &mut reader).expect("pagerank");
+        let off = |run: &[f64]| {
+            run.iter()
+                .zip(&settled)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f64, f64::max)
+        };
+        assert!(
+            off(&converged) < off(&twenty),
+            "converged is {:.3e} off, twenty rounds is {:.3e}",
+            off(&converged),
+            off(&twenty)
+        );
+        // This shape spends the whole cap without the largest move
+        // reaching 1e-12, so what it stops at is the cap rather than
+        // the tolerance. It is 3.5e-11 out, seven orders inside the
+        // 1e-4 the LDBC harness compares at, which is the point.
+        assert!(
+            off(&converged) < 1e-9,
+            "converged is {:.3e} off the fixed point",
+            off(&converged)
+        );
+        assert!(
+            (converged.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "ranks sum to one"
+        );
+    }
+
+    #[test]
     fn wcc_labels_components_by_their_smallest_row() {
         // Two components, 0-1-2 and 3-4, direction ignored.
         let (_dir, mut db, mut reader) = open_with(&[(1, 0), (1, 2), (4, 3)], 5);
@@ -774,6 +866,16 @@ mod tests {
         // as its own neighbor, which the LDBC definition denies.
         let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 1)], 3);
         assert_eq!(lcc(&mut db, &mut reader).expect("lcc")[0], 0.0);
+    }
+
+    #[test]
+    fn lcc_counts_a_pair_of_neighbors_once_however_many_edges_join_them() {
+        // 0 has neighbors 1 and 2, and 1 -> 2 is stored twice. The pair
+        // is closed, not closed twice, so the ordered-pair count is one
+        // out of two. Counting the second copy would score 1.0 on a
+        // neighborhood with one of its two ordered pairs joined.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 2), (1, 2)], 3);
+        assert_eq!(lcc(&mut db, &mut reader).expect("lcc")[0], 0.5);
     }
 
     #[test]

@@ -8,16 +8,21 @@ use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
 use zu::{
-    ZU_SEVERITY_EXCEPTION, ZU_TYPE_INT, ZU_TYPE_NODE, ZU_TYPE_STR, ZuConfig, ZuConn, ZuDatabase,
-    ZuError, ZuResult, ZuStatus, ZuStmt, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
+    ZU_SEVERITY_EXCEPTION, ZU_TEMPORAL_DATE, ZU_TEMPORAL_DURATION_DAY_TIME,
+    ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME, ZU_TEMPORAL_LOCAL_TIME,
+    ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
+    ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuResult,
+    ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
     zu_config_set_z, zu_conn_close, zu_connect, zu_database_close, zu_database_open_z,
     zu_database_path, zu_error_code, zu_error_free, zu_error_message, zu_error_severity,
     zu_error_status, zu_execute, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
-    zu_query_z, zu_result_cell_str, zu_result_cell_type, zu_result_chunk, zu_result_chunk_col_f64,
-    zu_result_chunk_col_i64, zu_result_chunk_col_node_offset, zu_result_chunk_col_valid,
-    zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64, zu_result_col_name,
-    zu_result_col_node_offset, zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_rows,
-    zu_stmt_close, zu_version,
+    zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
+    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
+    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
+    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
+    zu_result_free, zu_result_rows, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64,
+    zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type,
+    zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -100,6 +105,47 @@ unsafe fn col_name<'a>(result: *mut ZuResult, col: u32) -> &'a str {
     let s = unsafe { CStr::from_ptr(out) }.to_str().expect("utf-8");
     assert_eq!(len, s.len(), "the length and the NUL have to agree");
     s
+}
+
+/// One cell, borrowed from the result. Nothing to free, so the tests
+/// below hold as many at once as they like.
+unsafe fn cell(result: *mut ZuResult, row: u64, col: u32) -> *const ZuValue {
+    let mut out: *const ZuValue = ptr::null();
+    assert_eq!(
+        unsafe { zu_result_cell(result, row, col, &mut out) },
+        ZuStatus::Ok,
+        "row {row} column {col}"
+    );
+    assert!(!out.is_null());
+    out
+}
+
+unsafe fn at(v: *const ZuValue, i: u64) -> *const ZuValue {
+    let mut out: *const ZuValue = ptr::null();
+    assert_eq!(
+        unsafe { zu_value_at(v, i, &mut out) },
+        ZuStatus::Ok,
+        "at {i}"
+    );
+    assert!(!out.is_null());
+    out
+}
+
+unsafe fn value_i64(v: *const ZuValue) -> i64 {
+    let mut out = i64::MIN;
+    assert_eq!(unsafe { zu_value_i64(v, &mut out) }, ZuStatus::Ok);
+    out
+}
+
+/// A cell's string, which is a borrow of the result's own bytes and is
+/// not NUL-terminated, so the length is the whole of the answer.
+unsafe fn value_str<'a>(v: *const ZuValue) -> &'a str {
+    let mut out: *const c_char = ptr::null();
+    let mut len = usize::MAX;
+    assert_eq!(unsafe { zu_value_str(v, &mut out, &mut len) }, ZuStatus::Ok);
+    assert!(!out.is_null());
+    let bytes = unsafe { std::slice::from_raw_parts(out.cast::<u8>(), len) };
+    std::str::from_utf8(bytes).expect("utf-8")
 }
 
 unsafe fn cell_type(result: *mut ZuResult, row: u64, col: u32) -> i32 {
@@ -1110,6 +1156,246 @@ fn an_empty_result_has_no_chunks_and_needs_no_done() {
         );
 
         zu_result_free(result);
+        zu_conn_close(conn);
+    }
+}
+
+/// The values a column has nowhere to put. Before the cell reader a C
+/// host could see that a cell was a temporal and read nothing out of
+/// it, which left every temporal type unreachable from eight of the
+/// nine clients.
+#[test]
+fn a_temporal_cell_reads_as_a_kind_a_count_and_an_offset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("temporal.zu1");
+    seeded(&path);
+
+    // Days from the epoch, nanoseconds from midnight, months, and the
+    // offset in minutes. Each written out here rather than computed,
+    // so that a wrong unit disagrees with the test instead of sharing
+    // its arithmetic.
+    let cases: [(&str, i32, i64, i32); 6] = [
+        ("DATE '2024-02-29'", ZU_TEMPORAL_DATE, 19782, 0),
+        (
+            "LOCAL TIME '12:34:56.123456789'",
+            ZU_TEMPORAL_LOCAL_TIME,
+            45_296_123_456_789,
+            0,
+        ),
+        (
+            "ZONED TIME '12:34:56+07:00'",
+            ZU_TEMPORAL_ZONED_TIME,
+            45_296_000_000_000,
+            420,
+        ),
+        (
+            "LOCAL DATETIME '2024-01-01T00:00:00'",
+            ZU_TEMPORAL_LOCAL_DATETIME,
+            1_704_067_200_000_000_000,
+            0,
+        ),
+        ("DURATION 'P1Y2M'", ZU_TEMPORAL_DURATION_YEAR_MONTH, 14, 0),
+        (
+            "DURATION 'PT1H30M'",
+            ZU_TEMPORAL_DURATION_DAY_TIME,
+            5_400_000_000_000,
+            0,
+        ),
+    ];
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        for (text, want_kind, want_count, want_offset) in cases {
+            let result = query(conn, &format!("RETURN {text} AS n"), &mut err);
+            let value = cell(result, 0, 0);
+            assert_eq!(zu_value_type(value), ZU_TYPE_TEMPORAL, "{text}");
+
+            let (mut kind, mut count, mut offset) = (-1, 0i64, i32::MAX);
+            assert_eq!(
+                zu_value_temporal(value, &mut kind, &mut count, &mut offset),
+                ZuStatus::Ok,
+                "{text}"
+            );
+            assert_eq!(
+                (kind, count, offset),
+                (want_kind, want_count, want_offset),
+                "{text}"
+            );
+            zu_result_free(result);
+        }
+
+        // A zoned datetime is stored as the instant and remembers the
+        // offset it was written with, so the two below are one moment
+        // and two offsets. A host that ignored the offset would still
+        // have the right instant, which is why the count is the same.
+        for (text, want_offset) in [
+            ("ZONED DATETIME '2024-01-01T07:00:00+07:00'", 420),
+            ("ZONED DATETIME '2024-01-01T00:00:00+00:00'", 0),
+        ] {
+            let result = query(conn, &format!("RETURN {text} AS n"), &mut err);
+            let (mut kind, mut count, mut offset) = (-1, 0i64, i32::MAX);
+            assert_eq!(
+                zu_value_temporal(cell(result, 0, 0), &mut kind, &mut count, &mut offset),
+                ZuStatus::Ok
+            );
+            assert_eq!(kind, ZU_TEMPORAL_ZONED_DATETIME);
+            assert_eq!(count, 1_704_067_200_000_000_000, "{text}");
+            assert_eq!(offset, want_offset, "{text}");
+            zu_result_free(result);
+        }
+
+        zu_conn_close(conn);
+    }
+}
+
+/// The one composite type, and therefore the one place a decoder has
+/// to recurse. An element is read with the accessors its parent was,
+/// which is what makes a list of lists a walk rather than a second
+/// API.
+#[test]
+fn a_list_cell_reads_element_by_element_and_nests() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("list.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        // Mixed elements, because a list is not typed and a decoder
+        // that assumed the first element's type would pass a test made
+        // of integers.
+        let result = query(conn, "RETURN [1, 'a', true, 2.5] AS n", &mut err);
+        let list = cell(result, 0, 0);
+        assert_eq!(zu_value_type(list), ZU_TYPE_LIST);
+        assert_eq!(zu_value_len(list), 4);
+        assert_eq!(value_i64(at(list, 0)), 1);
+        assert_eq!(value_str(at(list, 1)), "a");
+        let mut b = -1i32;
+        assert_eq!(zu_value_bool(at(list, 2), &mut b), ZuStatus::Ok);
+        assert_eq!(b, 1);
+        let mut f = 0.0;
+        assert_eq!(zu_value_f64(at(list, 3), &mut f), ZuStatus::Ok);
+        assert_eq!(f, 2.5);
+        // One past the end is the caller's mistake and not an empty
+        // answer, because a list that short is a different list.
+        let mut out: *const ZuValue = ptr::null();
+        assert_eq!(zu_value_at(list, 4, &mut out), ZuStatus::Misuse);
+        assert!(out.is_null());
+        zu_result_free(result);
+
+        // Three deep, read by recursion.
+        let result = query(conn, "RETURN [[[1]]] AS n", &mut err);
+        let mut here = cell(result, 0, 0);
+        for depth in 0..3 {
+            assert_eq!(zu_value_type(here), ZU_TYPE_LIST, "depth {depth}");
+            assert_eq!(zu_value_len(here), 1, "depth {depth}");
+            here = at(here, 0);
+        }
+        assert_eq!(value_i64(here), 1);
+        zu_result_free(result);
+
+        // An empty list has a length of zero and is still a list,
+        // which is the pair a returned count could not express on its
+        // own and the reason zu_value_len needs no status.
+        let result = query(conn, "RETURN [[], 1] AS n", &mut err);
+        let list = cell(result, 0, 0);
+        assert_eq!(zu_value_len(list), 2);
+        assert_eq!(zu_value_type(at(list, 0)), ZU_TYPE_LIST);
+        assert_eq!(zu_value_len(at(list, 0)), 0);
+        // A scalar is not a composite, so asking it for an element is
+        // misuse rather than a zero-length answer.
+        assert_eq!(zu_value_len(at(list, 1)), 0);
+        assert_eq!(zu_value_at(at(list, 1), 0, &mut out), ZuStatus::Misuse);
+        zu_result_free(result);
+
+        zu_conn_close(conn);
+    }
+}
+
+/// A node cell carries the table its offset counts in, which
+/// `zu_result_col_node_offset` has nowhere to put: a column of two
+/// tables has no one answer. A string cell borrows the result's own
+/// bytes rather than a copy of them.
+#[test]
+fn a_cell_carries_what_a_column_of_it_could_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cells.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(
+            conn,
+            "MATCH (a:person) RETURN a AS n ORDER BY a.id LIMIT 3",
+            &mut err,
+        );
+        let mut tables = Vec::new();
+        for row in 0..3 {
+            let value = cell(result, row, 0);
+            assert_eq!(zu_value_type(value), ZU_TYPE_NODE);
+            let (mut table, mut offset) = (u32::MAX, u64::MAX);
+            assert_eq!(zu_value_node(value, &mut table, &mut offset), ZuStatus::Ok);
+            assert_eq!(offset, row);
+            tables.push(table);
+        }
+        // One table here, and the point is that the answer exists at
+        // all: it is what a binding needs to tell two nodes apart when
+        // a query returns rows from two tables.
+        assert_eq!(tables[0], tables[1]);
+        assert_eq!(tables[1], tables[2]);
+        zu_result_free(result);
+
+        // A string cell is a pointer into the result and a length, and
+        // the length is the whole of it: there is no NUL to stop at.
+        let result = query(
+            conn,
+            "MATCH (a:person {id: 3}) RETURN 'hi there' AS s",
+            &mut err,
+        );
+        let value = cell(result, 0, 0);
+        assert_eq!(zu_value_type(value), ZU_TYPE_STR);
+        assert_eq!(value_str(value), "hi there");
+
+        // The NUL-terminated form of the same cell says the same
+        // thing, which is what lets a caller pick either.
+        let mut out: *const c_char = ptr::null();
+        let mut len = 0usize;
+        assert_eq!(
+            zu_result_cell_str(result, 0, 0, &mut out, &mut len),
+            ZuStatus::Ok
+        );
+        assert_eq!(CStr::from_ptr(out).to_str().expect("utf-8"), "hi there");
+        assert_eq!(len, 8);
+        zu_result_free(result);
+
+        // A null cell is a value and reads as one, rather than as a
+        // cell that is not there.
+        let result = query(conn, "MATCH (a:person {id: 3}) RETURN null AS n", &mut err);
+        let value = cell(result, 0, 0);
+        assert_eq!(zu_value_type(value), ZU_TYPE_NULL);
+        let mut i = 7i64;
+        assert_eq!(zu_value_i64(value, &mut i), ZuStatus::Misuse);
+        assert_eq!(i, 0);
+
+        // Out of range on either axis, and a NULL result, are the same
+        // misuse the rest of the surface answers with.
+        let mut out: *const ZuValue = ptr::null();
+        assert_eq!(zu_result_cell(result, 1, 0, &mut out), ZuStatus::Misuse);
+        assert!(out.is_null());
+        assert_eq!(zu_result_cell(result, 0, 1, &mut out), ZuStatus::Misuse);
+        assert_eq!(
+            zu_result_cell(ptr::null(), 0, 0, &mut out),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_result_cell(result, 0, 0, ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+        zu_result_free(result);
+
         zu_conn_close(conn);
     }
 }

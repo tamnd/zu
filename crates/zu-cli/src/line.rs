@@ -493,7 +493,7 @@ pub(crate) fn columns(text: &str) -> usize {
 /// larger than this file and would still be a guess about what a
 /// terminal does, since terminals disagree; being right about the
 /// scripts people write statements in is the promise here.
-fn width_of(c: char) -> usize {
+pub(crate) fn width_of(c: char) -> usize {
     let c = c as u32;
     match c {
         0x0300..=0x036f | 0x200b..=0x200f | 0xfe00..=0xfe0f => 0,

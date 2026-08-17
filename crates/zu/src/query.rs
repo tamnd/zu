@@ -23,6 +23,9 @@ use zu_common::{FloatBits, LogicalType, Temporal};
 /// on `zu` alone can bind a parameter and read a row back without also
 /// depending on `zu-query`.
 pub use zu_query::exec::{QueryResult, Value};
+/// The typed view over those rows, from the same crate and for the same
+/// reason.
+pub use zu_query::row::{FromRow, FromValue, Row, RowIter};
 
 /// Builds the binder schema for the home graph, which is the graph a
 /// statement is against when nothing said otherwise.

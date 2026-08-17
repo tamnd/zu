@@ -174,8 +174,11 @@ fn forbidden_named(v: &Value, target: &str) -> ZuError {
 }
 
 /// The name of the type a value has, for the two type names a forbidden
-/// cell owes its diagnostic record.
-fn value_type(v: &Value) -> String {
+/// cell owes its diagnostic record. [`crate::row`] raises the same
+/// condition when a caller reads a column as the wrong Rust type, and
+/// spells the type it found the same way, because a caller comparing
+/// the two messages is looking at one question.
+pub(crate) fn value_type(v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Bool(_) => "BOOL".into(),

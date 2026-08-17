@@ -13,6 +13,8 @@ pub use zu_common::{
     C_ABI_VERSION, DiagnosticRecord, Epoch, GqlStatus, Interrupt, NodeId, Position, Result,
     Severity, ZuError,
 };
+pub use zu_query::params;
+pub use zu_query::row::{FromRow, FromValue, Row, RowIter};
 pub use zu_storage::{CheckpointMode, Direction, GraphStore, Snapshot};
 pub use zu_zu1 as zu1;
 

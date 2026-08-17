@@ -283,9 +283,10 @@ fn build_edge_props(dir: &Path, rows: u64) -> std::path::PathBuf {
 }
 
 /// The same table with a label beyond its own name declared on it,
-/// which is what a `SET` of a label needs: a label the table has not
-/// declared is refused, because declaring one is a catalog change and a
-/// statement cannot make that yet.
+/// which is what a `SET` of a label is measured against: a label the
+/// table has not declared is one the statement declares, and a catalog
+/// written once at the head of a run is not what the per statement cost
+/// of putting a bit on a row is.
 ///
 /// The label goes on and comes straight back off, so the table has
 /// declared it and no row carries it, which is where the run starts.

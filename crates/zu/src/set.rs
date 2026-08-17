@@ -87,8 +87,13 @@ pub(crate) struct Changes<'a> {
     /// match and a match can leave several tables open.
     columns: BTreeMap<u32, Vec<PropColumn>>,
     /// The catalog as the statement started, which is what says which
-    /// bit a label is and which labels a table has declared.
+    /// bit a label is and which labels a table has declared. A `SET` of
+    /// a label a table has not declared declares it here, so this is
+    /// also what the statement publishes when it is done.
     catalog: Catalog,
+    /// Whether any of that happened, which is what says the catalog
+    /// above has to be stored before the changes are staged.
+    widened: bool,
     updates: Vec<Update>,
 }
 
@@ -98,6 +103,7 @@ impl<'a> Changes<'a> {
             write,
             columns: BTreeMap::new(),
             catalog,
+            widened: false,
             updates: Vec::new(),
         }
     }
@@ -118,7 +124,7 @@ impl<'a> Changes<'a> {
             // nothing read out of the table's props and is settled
             // before they are.
             if let BoundSetInto::Labels { labels, on } = &item.into {
-                let mask = self.mask(table, &element, labels)?;
+                let mask = self.mask(table, &element, labels, *on)?;
                 let (add, remove) = match on {
                     true => (mask, 0),
                     false => (0, mask),
@@ -212,13 +218,20 @@ impl<'a> Changes<'a> {
     /// The bits a set of written labels is, against the table the
     /// element sits in.
     ///
-    /// A label a table has not declared is turned away by name. It is
-    /// not that the bit cannot be written: it is that the catalog would
-    /// then say the table cannot hold what the file says one of its rows
-    /// holds, and a catalog change is a piece of its own. An edge is
-    /// turned away too, because an edge carries the one name its rel
-    /// table is and there is no word beside it to hold another.
-    fn mask(&self, table: u32, at: &At, labels: &[String]) -> Result<u64> {
+    /// A label the table has not declared is a catalog change the
+    /// statement makes: `SET p:Manager` says a row of the table carries
+    /// it, and a catalog that did not say the table may hold it would
+    /// then disagree with the file. So the declaration goes onto this
+    /// statement's own copy of the catalog, which is published before
+    /// the changes are staged and undone with them if the statement
+    /// raises. `REMOVE` declares nothing, because a label the table has
+    /// never declared is one no row of it carries and there is nothing
+    /// to take off; widening the catalog to record an absence would say
+    /// the table may hold a label because somebody said it does not.
+    ///
+    /// An edge is turned away, because an edge carries the one name its
+    /// rel table is and there is no word beside it to hold another.
+    fn mask(&mut self, table: u32, at: &At, labels: &[String], on: bool) -> Result<u64> {
         if matches!(at, At::Edge(..)) {
             return Err(ZuError::Unsupported {
                 what: "changing the labels of an edge, which carries the name of its table",
@@ -231,18 +244,22 @@ impl<'a> Changes<'a> {
             ))
         })?;
         let primary = node.primary_label();
-        let declared = node.label_mask();
+        let mut declared = node.label_mask();
         let mut mask = 0u64;
         for label in labels {
-            let id = self
+            let known = self
                 .catalog
                 .label_id(label)
                 .filter(|id| declared & 1 << id != 0);
-            let Some(id) = id else {
-                return Err(ZuError::Unsupported {
-                    what: "changing an element to a label its table has not declared",
-                    id: table,
-                });
+            let id = match (known, on) {
+                (Some(id), _) => id,
+                (None, false) => continue,
+                (None, true) => {
+                    let id = self.catalog.declare_label(table, label)?;
+                    declared |= 1 << id;
+                    self.widened = true;
+                    id
+                }
             };
             if id == primary {
                 return Err(ZuError::gql(
@@ -257,9 +274,16 @@ impl<'a> Changes<'a> {
         Ok(mask)
     }
 
-    /// What the whole run changes, in written order.
-    pub(crate) fn staged(self) -> Vec<Update> {
-        self.updates
+    /// What the whole run changes, in written order, and the catalog it
+    /// widened along the way, which is `None` when it widened none.
+    ///
+    /// The catalog is published before the changes are staged, because
+    /// the fold turns a label change away when the table it lands on has
+    /// not declared the bit, and the fold reads the catalog out of the
+    /// file rather than out of the statement.
+    pub(crate) fn staged(self) -> (Vec<Update>, Option<Catalog>) {
+        let widened = self.widened.then_some(self.catalog);
+        (self.updates, widened)
     }
 }
 
@@ -1212,19 +1236,151 @@ mod tests {
         assert_eq!(after.rows[0][0], Value::Str("kay".into()));
     }
 
-    /// A label the table has not declared cannot be put on one of its
-    /// rows yet: the catalog would then say the table cannot hold what
-    /// the file says a row of it holds, and changing the catalog inside
-    /// a transaction is a piece of its own.
+    /// A label the table has not declared is one the statement declares:
+    /// the catalog says the table may hold it, the row's word carries
+    /// the bit, and a pattern naming it finds the row afterwards. This
+    /// is the catalog change a data statement stages.
     #[test]
-    fn a_label_the_table_has_not_declared_is_turned_away() {
+    fn a_label_the_table_has_not_declared_is_declared_by_the_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = open_with_labels(&dir, "undeclared.zu1");
 
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Manager", &[])
+            .expect("set a label nobody declared");
+
+        let after = session
+            .run("MATCH (p:Manager) RETURN p.name AS name", &[])
+            .expect("read");
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.rows[0][0], Value::Str("ada".into()));
+        // The other row of the table is where it was: the table now
+        // declares the label, which is not the same as carrying it.
+        let all = session
+            .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read");
+        assert_eq!(strings(&all, 0), ["ada", "kay"]);
+    }
+
+    /// The declaration is in the catalog rather than in the session, so
+    /// a reopen reads the label back, both as what the table may hold
+    /// and as what the row carries.
+    #[test]
+    fn a_declared_label_survives_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("declare-reopen.zu1");
+        seeded_with_labels(&path);
+        {
+            let mut session = Session::open(&path).expect("open");
+            session
+                .run("MATCH (p:person) WHERE p.name = 'kay' SET p:Manager", &[])
+                .expect("set");
+        }
+
+        let mut session = Session::open(&path).expect("reopen");
+        assert!(
+            session.catalog().label_id("Manager").is_some(),
+            "the dictionary kept the name"
+        );
+        let after = session
+            .run("MATCH (p:Manager) RETURN p.name AS name", &[])
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Str("kay".into()));
+    }
+
+    /// A table that had no labels beyond its own name stores no bitset
+    /// at all, so the first label put on one of its rows is both a
+    /// catalog change and the segment coming into being.
+    #[test]
+    fn the_first_label_on_a_table_that_had_none_lands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "declare-first.zu1");
+
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Admin", &[])
+            .expect("set the first label");
+
+        let after = session
+            .run("MATCH (p:Admin) RETURN p.name AS name", &[])
+            .expect("read");
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.rows[0][0], Value::Str("ada".into()));
+    }
+
+    /// A statement that declares a label and then raises leaves neither
+    /// behind, because the declaration is published under the same
+    /// savepoint the changes are.
+    #[test]
+    fn a_declaration_is_undone_with_the_statement_that_made_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "declare-undone.zu1");
+
         let err = session
-            .run("MATCH (p:person) SET p:Manager", &[])
-            .expect_err("not declared");
-        assert!(err.to_string().contains("has not declared"), "got: {err}");
+            .run(
+                "MATCH (p:person) WHERE p.name = 'ada' SET p:Manager WITH p RETURN p.age / 0 AS bad",
+                &[],
+            )
+            .expect_err("the clause after the write raises");
+        assert_eq!(
+            err.gqlstatus().map(|s| s.code()),
+            Some("22012"),
+            "the write ran and the clause after it raised, got: {err}"
+        );
+
+        assert!(
+            session.catalog().label_id("Manager").is_none(),
+            "the dictionary is where it was"
+        );
+        let after = session
+            .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read");
+        assert_eq!(strings(&after, 0), ["ada", "kay"]);
+    }
+
+    /// The declaration a statement makes is published where the rows it
+    /// changed are, so a transaction rolled back takes both: the label
+    /// is gone from the dictionary and no row carries the bit.
+    #[test]
+    fn a_rollback_takes_the_declaration_with_the_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "declare-rollback.zu1");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Manager", &[])
+            .expect("set");
+        let inside = session
+            .run("MATCH (p:Manager) RETURN p.name AS name", &[])
+            .expect("read inside the transaction");
+        assert_eq!(inside.rows.len(), 1, "the statement before this one ran");
+        session.run("ROLLBACK", &[]).expect("rollback");
+
+        assert!(
+            session.catalog().label_id("Manager").is_none(),
+            "the dictionary is where it was"
+        );
+        let after = session
+            .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read");
+        assert_eq!(strings(&after, 0), ["ada", "kay"]);
+    }
+
+    /// A label nobody declared is a label no row carries, so taking it
+    /// off one is a statement that changes nothing rather than one that
+    /// widens the catalog to record an absence.
+    #[test]
+    fn removing_a_label_nobody_declared_declares_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_labels(&dir, "remove-undeclared.zu1");
+
+        session
+            .run("MATCH (p:person) REMOVE p:Manager", &[])
+            .expect("nothing to take off");
+
+        assert!(
+            session.catalog().label_id("Manager").is_none(),
+            "the dictionary is where it was"
+        );
     }
 
     /// The name of the table is the label every row of it carries, so

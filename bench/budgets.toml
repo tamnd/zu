@@ -1317,3 +1317,20 @@ capi_chunk_early_speedup = 50.0
 # twice the floor, which is the sensitive half of the check.
 # Lower this ceiling, never raise it.
 cli_startup_ms = 25.0
+
+# SHA-256 throughput in MiB/s at 16 MiB, single core, from the hasher
+# the release writes its digest list with and both install scripts check
+# against. Measured: local M series 231, and flat from 64 KiB up, which
+# is what says the cost per block does not grow with the input.
+#
+# The floor is a third of that, because this is a scalar implementation
+# on purpose (a build tool that pulls a crate to hash ten files has
+# added a supply chain to the thing whose job is to be the trusted end
+# of one) and a shared vCPU runs it at half the speed of a laptop. What
+# it catches is the order of magnitude: a rewrite that allocates per
+# block, or a copy of the input per call, lands at 20 MiB/s and turns a
+# release into a minute of hashing and an install into a pause on the
+# step meant to reassure. The bench also asserts on every machine that
+# 16 MiB runs within a factor of two of 64 KiB, which is the shape half
+# of the check. Raise this floor, never lower it.
+sha256_mibs = 80.0

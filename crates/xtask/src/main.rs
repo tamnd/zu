@@ -17,7 +17,9 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, artifacts, corpus, model, package, pins, platforms, repos, rustdoc, terms};
+use xtask::{
+    apimap, artifacts, corpus, model, package, packaging, pins, platforms, repos, rustdoc, terms,
+};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -76,6 +78,13 @@ cargo xtask artifacts [--table PATH] [--list] [--assemble DIR] [--verify DIR] [-
   --built DIR       where the platform jobs' artifacts were downloaded (default built)
   --version V       the version being released (default this workspace's)
 
+cargo xtask packaging [--check] [--root DIR] [--version V] [--sums PATH]
+
+  --check           render and compare, writing nothing; nonzero on drift
+  --root DIR        the tree to read the tables from and write into (default .)
+  --version V       the version the manifests install (default this workspace's)
+  --sums PATH       the release's SHA256SUMS, which is where the digests come from
+
 cargo xtask repos [--table PATH] [--list]
 
   --table PATH      the repository table (default repos.toml)
@@ -104,6 +113,7 @@ fn main() -> ExitCode {
         Some("platforms") => run(platforms_command(&args[1..])),
         Some("package") => run(package_command(&args[1..])),
         Some("artifacts") => run(artifacts_command(&args[1..])),
+        Some("packaging") => run(packaging_command(&args[1..])),
         Some("repos") => run(repos_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
         Some("--help" | "-h") | None => {
@@ -617,6 +627,82 @@ fn artifacts_command(args: &[String]) -> Result<ExitCode, String> {
             targets.len(),
             table.audited
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn packaging_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut root = PathBuf::from(".");
+    let mut check = false;
+    let mut sums: Option<PathBuf> = None;
+    // The same rule the corpus packer and the release follow: the
+    // version is the build's, so a manifest cannot offer to install a
+    // version that was never cut.
+    let mut version = env!("CARGO_PKG_VERSION").to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--check" => check = true,
+            "--root" => {
+                root = PathBuf::from(args.get(i + 1).ok_or("--root wants a path")?);
+                i += 1;
+            }
+            "--sums" => {
+                sums = Some(PathBuf::from(args.get(i + 1).ok_or("--sums wants a path")?));
+                i += 1;
+            }
+            "--version" => {
+                version = args.get(i + 1).ok_or("--version wants a version")?.clone();
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let targets = artifacts::tier1(&root)?;
+
+    if check {
+        let notes = packaging::check(&root, &targets, &version)?;
+        if !notes.is_empty() {
+            for note in &notes {
+                eprintln!("{note}");
+            }
+            eprintln!(
+                "\n{} to fix. The manifests are rendered from {} rather than maintained, so a \
+                 platform reaches a package manager by being tier 1.",
+                notes.len(),
+                platforms::PATH
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+        println!(
+            "{} and {} install {version} on {} tier 1 targets",
+            packaging::HOMEBREW,
+            packaging::SCOOP,
+            targets.len()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Without a digest list the manifests render with the placeholder,
+    // which is what a commit carries. With one they render installable,
+    // which is what the release publishes to the tap and the bucket.
+    let digests = match &sums {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("reading {}: {e}", path.display()))?;
+            packaging::digests(&text)
+        }
+        None => Default::default(),
+    };
+    for manifest in packaging::render(&targets, &version, &digests)? {
+        let path = root.join(manifest.path);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, &manifest.text)
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+        println!("{}: {version}", path.display());
     }
     Ok(ExitCode::SUCCESS)
 }

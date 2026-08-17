@@ -9,11 +9,18 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# The artifact is libzu.{dylib,so}; the lib target takes the name `zu`,
-# so the facade crate (also `zu`) comes in under its crates.io name.
+# The artifact is libzu.{a,so,dylib} and zu.{lib,dll}; the lib target
+# takes the name `zu`, so the facade crate (also `zu`) comes in under
+# its crates.io name.
+#
+# Both library forms, because dx/09 C-5 ships both and they answer
+# different questions. A shared library is what a package manager
+# installs and what several processes share a copy of. A static archive
+# is what a binding links into itself so that its users install one
+# file, and what a build with no loader at all has to use.
 [lib]
 name = "zu"
-crate-type = ["lib", "cdylib"]
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 zudb = { package = "zu", path = "../zu" }

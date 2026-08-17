@@ -1,6 +1,6 @@
 schema = 1
 doc = "What a release of zu publishes, one table for nine repositories."
-audited = "2026-08-16"
+audited = "2026-08-17"
 
 # A release is a tag on this repository and a run that drives the eight
 # others (dx/14 section 6). Each of them builds against what this one
@@ -28,7 +28,7 @@ audited = "2026-08-16"
 name = "libzu-<target>.tar.zst"
 made = "platform"
 consumers = ["zu-c", "zu-go", "zu-java", "zu-dotnet", "zu-kit"]
-doc = "The shared library, the CLI and the header for one tier 1 target, as the platform's job built them. The five repositories here reach the engine through the C ABI rather than compiling against it, so this archive is the whole of what they link."
+doc = "An install prefix for one tier 1 target, as the platform's job built it: the header, both library forms, the CLI, a pkg-config file, a CMake package config, the export list in each linker's syntax and the license. The five repositories here reach the engine through the C ABI rather than compiling against it, so this archive is the whole of what they link, and it unpacks as a prefix because that is the only shape pkg-config and find_package(zu) can both resolve their paths against (dx/09 C-4, C-5)."
 
 [[artifact]]
 name = "zu.h"

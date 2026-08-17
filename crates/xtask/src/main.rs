@@ -17,7 +17,7 @@
 //! is nightly-only, and `model --check` needs it too. The map check
 //! reads two committed files and needs nothing.
 
-use xtask::{apimap, artifacts, corpus, model, pins, platforms, repos, rustdoc, terms};
+use xtask::{apimap, artifacts, corpus, model, package, pins, platforms, repos, rustdoc, terms};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -56,6 +56,17 @@ cargo xtask platforms [--table PATH] [--list] [--measure DIR --target TARGET]
   --measure DIR     weigh what a build put in DIR against the size budgets
   --target TARGET   the target that build was for, which says what the files are called
 
+cargo xtask package [--stage DIR --built DIR --target TARGET] [--syslibs LIBS] [--version V] [--table PATH]
+
+  --stage DIR       lay one platform's package out under DIR, ready to be packed
+  --built DIR       the release build the libraries and the CLI are in
+  --target TARGET   the target that build was for, which says what the files are called
+  --syslibs LIBS    what a static link needs after the archive, as `rustc --print native-static-libs` prints it
+  --version V       the version the package says it is (default this workspace's)
+  --table PATH      the platform table (default platforms.toml)
+
+  With no --stage, checks that the header and the C ABI crate declare and define the same functions.
+
 cargo xtask artifacts [--table PATH] [--list] [--assemble DIR] [--verify DIR] [--built DIR] [--version V]
 
   --table PATH      the artifact contract (default artifacts.toml)
@@ -91,6 +102,7 @@ fn main() -> ExitCode {
         Some("corpus-pack") => run(corpus_pack_command(&args[1..])),
         Some("pins") => run(pins_command(&args[1..])),
         Some("platforms") => run(platforms_command(&args[1..])),
+        Some("package") => run(package_command(&args[1..])),
         Some("artifacts") => run(artifacts_command(&args[1..])),
         Some("repos") => run(repos_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
@@ -380,6 +392,99 @@ fn platforms_command(args: &[String]) -> Result<ExitCode, String> {
         path.display()
     );
     Ok(ExitCode::FAILURE)
+}
+
+fn package_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut table_path = PathBuf::from(platforms::PATH);
+    let mut stage: Option<PathBuf> = None;
+    let mut built = PathBuf::from("built");
+    let mut target: Option<String> = None;
+    let mut syslibs = String::new();
+    // The workspace version, for the reason the corpus packer takes it
+    // from the build: a package that says which version it is has to be
+    // right about that, and an argument is a place to be wrong.
+    let mut version = env!("CARGO_PKG_VERSION").to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--stage" => {
+                stage = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--stage wants a path")?,
+                ));
+                i += 1;
+            }
+            "--built" => {
+                built = PathBuf::from(args.get(i + 1).ok_or("--built wants a path")?);
+                i += 1;
+            }
+            "--target" => {
+                target = Some(args.get(i + 1).ok_or("--target wants a target")?.clone());
+                i += 1;
+            }
+            "--syslibs" => {
+                syslibs = args.get(i + 1).ok_or("--syslibs wants a list")?.clone();
+                i += 1;
+            }
+            "--version" => {
+                version = args.get(i + 1).ok_or("--version wants a version")?.clone();
+                i += 1;
+            }
+            "--table" => {
+                table_path = PathBuf::from(args.get(i + 1).ok_or("--table wants a path")?);
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+
+    // The table sits at the root of the tree it describes, the same as
+    // every other table here.
+    let root = table_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    let Some(out) = stage else {
+        if target.is_some() {
+            return Err("--target is what --stage is read with".to_string());
+        }
+        let abi = package::Abi::read(&root)?;
+        let notes = abi.check();
+        if notes.is_empty() {
+            println!(
+                "{}: {} functions, every one of them defined in {}",
+                package::HEADER,
+                abi.declared.len(),
+                package::SOURCE
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        for note in &notes {
+            eprintln!("{note}");
+        }
+        eprintln!(
+            "\n{} to fix. The header is the ABI, so a function is in both files or in neither.",
+            notes.len()
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+
+    let table = platforms::Table::load(&table_path)?;
+    // The files are named differently on every platform, so the target
+    // is what says which names to stage, and staging without one is a
+    // question with no answer.
+    let target = target.ok_or("--stage wants the --target it was built for")?;
+    let platform = table
+        .platform(&target)
+        .ok_or_else(|| format!("{target} is not a platform {} has", table_path.display()))?;
+    let staged = package::Package::new(platform, &version, &syslibs).stage(&root, &built, &out)?;
+    for one in &staged {
+        println!("{one}");
+    }
+    println!(
+        "{}: {} files for {target}, a prefix pkg-config and find_package(zu) can both read",
+        out.display(),
+        staged.len()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn artifacts_command(args: &[String]) -> Result<ExitCode, String> {

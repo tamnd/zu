@@ -8,6 +8,7 @@ pub mod corpus;
 pub mod fixture;
 pub mod matrix;
 pub mod model;
+pub mod package;
 pub mod pins;
 pub mod platforms;
 pub mod repos;

@@ -35,6 +35,28 @@ pub fn compress(tar: &[u8]) -> Result<Vec<u8>, String> {
     zstd::bulk::compress(tar, LEVEL).map_err(|e| format!("compressing the archive: {e}"))
 }
 
+/// The permission bits an entry unpacks with.
+///
+/// Decided from the name rather than read off the packing machine, for
+/// the reason every other field here is fixed: a mode taken from the
+/// filesystem is a mode that differs between a CI runner and a laptop,
+/// and the archive would stop being the same bytes from the same
+/// inputs. Names are enough to decide it, because the two things that
+/// have to be executable when a user unpacks a release are the
+/// program in `bin/` and the shared library beside it, and an archive
+/// whose `bin/zu` unpacks unrunnable is the install one-liner failing
+/// at its last step.
+pub fn mode(name: &str) -> u32 {
+    let executable = name.contains("bin/")
+        || name.ends_with(".dll")
+        || name.ends_with(".dylib")
+        || name.contains(".so");
+    match executable {
+        true => 0o755,
+        false => 0o644,
+    }
+}
+
 /// One ustar file header and its content, padded to the block size.
 fn append(out: &mut Vec<u8>, name: &str, body: &[u8]) -> Result<(), String> {
     if name.len() > 99 {
@@ -47,7 +69,7 @@ fn append(out: &mut Vec<u8>, name: &str, body: &[u8]) -> Result<(), String> {
     let mut header = [0u8; 512];
     header[..name.len()].copy_from_slice(name.as_bytes());
     // mode, uid, gid, size, mtime: octal, NUL terminated, fixed.
-    write_octal(&mut header[100..108], 0o644);
+    write_octal(&mut header[100..108], u64::from(mode(name)));
     write_octal(&mut header[108..116], 0);
     write_octal(&mut header[116..124], 0);
     write_octal(&mut header[124..136], body.len() as u64);
@@ -134,6 +156,54 @@ mod tests {
         let tar = tar(&files).expect("a tar of one empty file");
         assert_eq!(tar.len(), 512 + 1024);
         assert_eq!(entries(&tar), files);
+    }
+
+    /// The mode a reader unpacks an entry with, read back out of the
+    /// header, because the install one-liner's last step is running
+    /// what it unpacked.
+    fn mode_of(tar: &[u8], want: &str) -> u32 {
+        let mut i = 0;
+        while i + 512 <= tar.len() {
+            let header = &tar[i..i + 512];
+            let end = header[..100].iter().position(|&b| b == 0).unwrap_or(100);
+            let name = String::from_utf8_lossy(&header[..end]).to_string();
+            let size = String::from_utf8_lossy(&header[124..135]);
+            let size = usize::from_str_radix(size.trim_end_matches('\0').trim(), 8).unwrap_or(0);
+            if name == want {
+                let mode = String::from_utf8_lossy(&header[100..107]);
+                return u32::from_str_radix(mode.trim_end_matches('\0').trim(), 8).expect("octal");
+            }
+            i += 512 + size.div_ceil(512) * 512;
+        }
+        panic!("{want} is not in this tar");
+    }
+
+    #[test]
+    fn what_a_user_has_to_run_unpacks_runnable_and_the_rest_does_not() {
+        let files: Vec<(String, Vec<u8>)> = [
+            "libzu-x/bin/zu",
+            "libzu-x/lib/libzu.so",
+            "libzu-x/lib/libzu.dylib",
+            "libzu-x/lib/libzu.a",
+            "libzu-x/include/zu.h",
+            "libzu-x/LICENSE",
+        ]
+        .iter()
+        .map(|name| (name.to_string(), b"x".to_vec()))
+        .collect();
+        let tar = tar(&files).expect("a tar of a staged package");
+        assert_eq!(mode_of(&tar, "libzu-x/bin/zu"), 0o755);
+        assert_eq!(mode_of(&tar, "libzu-x/lib/libzu.so"), 0o755);
+        assert_eq!(mode_of(&tar, "libzu-x/lib/libzu.dylib"), 0o755);
+        assert_eq!(mode_of(&tar, "libzu-x/lib/libzu.a"), 0o644);
+        assert_eq!(mode_of(&tar, "libzu-x/include/zu.h"), 0o644);
+        assert_eq!(mode_of(&tar, "libzu-x/LICENSE"), 0o644);
+
+        // A versioned soname is still a shared library, and the CLI on
+        // Windows is still the CLI.
+        assert_eq!(mode("libzu-x/lib/libzu.so.0.5"), 0o755);
+        assert_eq!(mode("libzu-x/bin/zu.exe"), 0o755);
+        assert_eq!(mode("libzu-x/bin/zu.dll"), 0o755);
     }
 
     #[test]

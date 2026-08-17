@@ -1509,3 +1509,22 @@ set_peak_rss_mb = 128.0
 # them.
 set_fold_x = 6.0
 set_write_x = 4.0
+
+# The typed row layer (dx/04 §4) over the same read written as a match
+# on Value, both timed in one run against one result of 100000 rows and
+# two columns, best of five passes each. This is the same obligation
+# api_overhead_x states for the connection, one level up: a caller
+# writes `let (id, name): (i64, &str) = row.get()?` instead of a match
+# per column, and that has to cost nothing, because a row layer that
+# taxes the loop is one every serious caller writes around.
+#
+# Measured on the M-series laptop over six runs: 0.965 to 1.124 for the
+# tuple, and 1.09 to 1.53 for the single string column. The second range
+# is wide because both sides of it run under a nanosecond and a fifth of
+# a nanosecond of jitter is 20% of the ratio, so its ceiling is set to
+# catch the defect and not the drift. The defect is a string that
+# started being copied: `String` in place of `&str` on this path
+# allocates per row and measures 8x and up, which no amount of jitter
+# reaches.
+typed_row_x = 1.25
+typed_str_x = 2.0

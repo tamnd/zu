@@ -98,7 +98,7 @@ impl<'a> Changes<'a> {
                 table,
                 offset,
                 col: col as u32,
-                cell: cell(&columns[col].ty, &values[at], &item.key)?,
+                cell: written(&columns[col], &values[at], &item.key)?,
             });
         }
         Ok(())
@@ -155,24 +155,26 @@ pub(crate) fn stage(txn: &mut WriteTxn<'_>, updates: &[Update]) -> Result<u64> {
     Ok(updates.len() as u64)
 }
 
-/// The property columns of a table an element being changed sits in.
+/// The cell one assignment puts in one column.
 ///
-/// A table whose columns may hold a null is refused here rather than in
-/// the fold, because a fold rewrites a column out of its old values and
-/// the cells the overlay holds and an overlay cell is never an absence.
-/// Saying so here costs no log write; reaching the fold would leave a
-/// committed record nothing can apply.
+/// A null is the one value that does not have to fit the column, since
+/// what it says is that the row holds nothing rather than that it holds
+/// something of another type. That is what `REMOVE` writes, and it is
+/// what `SET p.age = null` writes too, because GQL defines the first as
+/// the second.
+fn written(col: &PropColumn, value: &Value, key: &str) -> Result<Cell> {
+    match value {
+        Value::Null => Ok(Cell::Null),
+        other => cell(&col.ty, other, key),
+    }
+}
+
+/// The property columns of a table an element being changed sits in.
 fn columns_of(db: &mut Zu1File, table: u32) -> Result<Vec<PropColumn>> {
     let columns = load_props(db, table)?.map_or_else(Vec::new, |dir| dir.columns);
     if columns.is_empty() {
         return Err(ZuError::Unsupported {
             what: "setting a property on an element of a table that stores none",
-            id: table,
-        });
-    }
-    if columns.iter().any(|col| col.validity.is_some()) {
-        return Err(ZuError::Unsupported {
-            what: "setting a property in a table whose columns may hold a null",
             id: table,
         });
     }
@@ -418,6 +420,186 @@ mod tests {
             )
             .expect_err("not in yet");
         assert!(err.to_string().contains("SET on an edge"), "got: {err}");
+    }
+
+    /// The other half of the milestone line: a property comes off an
+    /// element, and what is there afterwards is a null rather than an
+    /// old value or an error.
+    #[test]
+    fn a_property_is_removed_and_then_reads_as_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove.zu1");
+
+        let out = session
+            .run("MATCH (p:person {name: 'ada'}) REMOVE p.age", &[])
+            .expect("remove");
+        assert!(out.rows.is_empty(), "a write with nothing after it");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Null, "ada holds no age");
+        assert_eq!(after.rows[1][1], Value::Int(20), "kay is where she was");
+    }
+
+    /// A column the statement did not name keeps what it held, which is
+    /// the difference between taking a property off an element and
+    /// taking the element apart.
+    #[test]
+    fn removing_one_property_leaves_the_others() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-one.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'ada'}) REMOVE p.age", &[])
+            .expect("remove");
+
+        let after = session
+            .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read");
+        assert_eq!(strings(&after, 0), ["ada", "kay"]);
+    }
+
+    /// GQL defines REMOVE as writing null, so the assignment spelling
+    /// of it does the same thing. If these two ever disagree, one of
+    /// them is wrong.
+    #[test]
+    fn setting_a_property_to_null_removes_it_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-by-set.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'ada'}) SET p.age = null", &[])
+            .expect("set null");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Null);
+    }
+
+    /// The blob side stores an absence as no bytes at all, and the row
+    /// still has to read back as a null rather than as an empty string.
+    #[test]
+    fn removing_a_string_property_reads_back_as_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-string.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'ada'}) REMOVE p.name", &[])
+            .expect("remove");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.age AS age, p.name AS name ORDER BY age",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Null, "the name is gone");
+        assert_eq!(after.rows[1][1], Value::Str("kay".into()));
+    }
+
+    /// A row that holds nothing can be written to again, which is what
+    /// says the mask is state rather than a decision taken once.
+    #[test]
+    fn a_removed_property_can_be_set_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-then-set.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'ada'}) REMOVE p.age", &[])
+            .expect("remove");
+        session
+            .run("MATCH (p:person {name: 'ada'}) SET p.age = 41", &[])
+            .expect("set");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Int(41));
+    }
+
+    /// Every row of the column can hold nothing, which is the case a
+    /// mask of one word has to get right at both ends.
+    #[test]
+    fn removing_a_property_from_every_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-all.zu1");
+
+        session
+            .run("MATCH (p:person) REMOVE p.age", &[])
+            .expect("remove");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.name AS name, p.age AS age ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Null);
+        assert_eq!(after.rows[1][1], Value::Null);
+    }
+
+    /// A statement that removes one property and writes another runs as
+    /// two writes over one row, and the log carries a run of each kind
+    /// rather than one record that cannot say which it is.
+    #[test]
+    fn a_remove_and_a_set_in_one_statement_both_land() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-and-set.zu1");
+
+        session
+            .run(
+                "MATCH (p:person {name: 'ada'}) SET p.age = 44 REMOVE p.name",
+                &[],
+            )
+            .expect("set then remove");
+
+        let after = session
+            .run(
+                "MATCH (p:person) RETURN p.age AS age, p.name AS name ORDER BY age",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[1][0], Value::Int(44));
+        assert_eq!(after.rows[1][1], Value::Null);
+    }
+
+    /// A label is the other thing GQL lets REMOVE take, and an element
+    /// carries the labels of the table it is in, so it is turned away
+    /// by name rather than by a parse error about a colon.
+    #[test]
+    fn removing_a_label_says_which_part_is_not_in_yet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-label.zu1");
+
+        let err = session
+            .run("MATCH (p:person) REMOVE p:person", &[])
+            .expect_err("not in yet");
+        assert!(err.to_string().contains("REMOVE of a label"), "got: {err}");
+    }
+
+    /// An edge stores its properties in the order its table holds its
+    /// edges, which nothing writes into yet, so REMOVE says so the way
+    /// SET does.
+    #[test]
+    fn removing_a_property_from_an_edge_says_which_part_is_not_in_yet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "remove-edge.zu1");
+
+        let err = session
+            .run("MATCH (a:person)-[k:knows]->(b:person) REMOVE k.since", &[])
+            .expect_err("not in yet");
+        assert!(err.to_string().contains("REMOVE on an edge"), "got: {err}");
     }
 
     /// EXPLAIN prints the statement, not the parts it is run as, so the

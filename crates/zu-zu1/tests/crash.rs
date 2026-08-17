@@ -92,12 +92,12 @@ fn state(db: &mut Zu1File, mvcc: &Mvcc, tables: Tables) -> State {
     for row in 0..total {
         ages.push(match mvcc.cell(person, base_count, row, 0, epoch) {
             Some(Cell::Int(x)) => x,
-            Some(Cell::Str(_)) => unreachable!("age is an int column"),
+            Some(Cell::Str(_) | Cell::Null) => unreachable!("age is an int column nothing removes"),
             None => reader.read_int(db, 0, row).unwrap(),
         });
         names.push(match mvcc.cell(person, base_count, row, 1, epoch) {
             Some(Cell::Str(s)) => s,
-            Some(Cell::Int(_)) => unreachable!("name is a str column"),
+            Some(Cell::Int(_) | Cell::Null) => unreachable!("name is a str column nothing removes"),
             None => {
                 let mut buf = Vec::new();
                 reader.read_str(db, 1, row, &mut buf).unwrap();

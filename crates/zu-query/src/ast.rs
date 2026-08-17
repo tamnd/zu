@@ -197,6 +197,15 @@ pub enum Clause {
     Set {
         items: Vec<SetItem>,
     },
+    /// `REMOVE p.age`, the statement that takes a property off an
+    /// element (ISO 13.4). GQL defines it as setting the property to
+    /// null, so what it does is a `SET` with nothing on the right of
+    /// it; it is its own clause here because it is its own syntax, and
+    /// because what a reader of an EXPLAIN listing wrote is what the
+    /// listing should say back.
+    Remove {
+        items: Vec<RemoveItem>,
+    },
     Unwind {
         expr: Expr,
         alias: String,
@@ -232,6 +241,15 @@ pub struct SetItem {
     pub target: String,
     pub key: String,
     pub value: Expr,
+}
+
+/// One property under `REMOVE`: the element it comes off and which
+/// property it is. There is no value, which is the whole difference
+/// between this and [`SetItem`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoveItem {
+    pub target: String,
+    pub key: String,
 }
 
 /// The shared shape of `WITH` and `RETURN`.

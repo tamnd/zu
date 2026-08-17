@@ -60,6 +60,20 @@ This repository holds the engine, the Rust SDK, the CLI, the C ABI and its gener
 
 If a bug reproduces through the `zu` CLI it belongs here, whichever client you found it through. Every client repository's bug template asks that first, because engine bugs filed in client trackers are the standard way a multi-repository project loses track of them.
 
+## Installing
+
+```
+curl -fsSL https://raw.githubusercontent.com/tamnd/zu/main/install.sh | sh     # macOS, Linux
+irm https://raw.githubusercontent.com/tamnd/zu/main/install.ps1 | iex          # Windows
+brew install tamnd/tap/zu
+scoop install zu
+docker run --rm -v "$PWD:/data" ghcr.io/tamnd/zu stat graph.zu1
+```
+
+Each of these lands the same thing: the release archive for your platform, unpacked as an install prefix, so `bin/zu` arrives with `include/zu.h`, both library forms, the pkg-config file and the CMake package config beside it. Every one of them fetches the release's `SHA256SUMS` first and refuses to unpack an archive that is not what it says it is.
+
+There is no release yet, so none of these fetch anything today. They are here, tested and held to the platform table, because the install path is the first thing a user runs and the last thing anybody wants to be writing on release day.
+
 ## Building
 
 ```

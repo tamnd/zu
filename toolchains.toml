@@ -1,6 +1,6 @@
 schema = 1
 doc = "The versions zu builds against, one table for nine repositories."
-audited = "2026-08-15"
+audited = "2026-08-17"
 
 # One table, referenced rather than restated, so that "which version do
 # we build against" is never a question with two answers. A pinned
@@ -48,6 +48,18 @@ match = "exact"
 component = "rust"
 file = ".github/workflows/release.yml"
 key = "toolchain"
+holds = "pinned"
+match = "exact"
+
+# The container of dx/12 section 6 builds from source, so it names a
+# compiler too, and an image whose base tag drifted would be the one
+# build in the release nothing held to this table. `ARG rust` is the key
+# because a Dockerfile spells an assignment that way and the site reader
+# takes the name as it is written rather than as TOML would write it.
+[[site]]
+component = "rust"
+file = "Dockerfile"
+key = "ARG rust"
 holds = "pinned"
 match = "exact"
 

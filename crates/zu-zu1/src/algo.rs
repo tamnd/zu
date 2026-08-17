@@ -1,6 +1,6 @@
-//! Whole-graph table function kernels: bfs, pagerank, wcc, sssp,
-//! louvain (docs/07 §4, TableFunction). Each kernel runs directly on a
-//! rel table's CSR through [`GraphReader`], one sequential sweep per
+//! Whole-graph table function kernels: bfs, pagerank, wcc, sssp, cdlp,
+//! lcc, louvain (docs/07 §4, TableFunction). Each kernel runs directly
+//! on a rel table's CSR through [`GraphReader`], one sequential sweep per
 //! iteration so the per-direction group cache decodes every group once
 //! per pass, and returns one value per node in dense row order. The
 //! query layer surfaces these through CALL; nothing here parses or
@@ -80,6 +80,11 @@ fn locate(node: u64) -> (usize, usize) {
 /// comparable runs.
 pub const PAGERANK_DAMPING: f64 = 0.85;
 pub const PAGERANK_ITERATIONS: usize = 20;
+
+/// The round count Graphalytics fixes for CDLP, so two runs of the
+/// same graph are the same partition however far propagation has left
+/// to go.
+pub const CDLP_ROUNDS: usize = 10;
 
 /// PageRank by power iteration over the forward CSR: fixed iteration
 /// count, dangling mass redistributed uniformly, ranks summing to one.
@@ -318,6 +323,127 @@ fn scan_round(
         }
     }
     Ok(next)
+}
+
+/// Community detection by label propagation: `rounds` synchronous
+/// sweeps, each node taking the label most common among its neighbors
+/// in both directions, a bidirectional pair voting once per direction,
+/// the smallest label winning a tie. A node with no neighbors keeps
+/// what it has.
+///
+/// Labels start at the node's original key rather than at its row,
+/// because the tie-break reads label values and a graph loaded with
+/// `REORDER` has rows the dataset never named. That makes the answer a
+/// statement about ids, which is what the caller asked, and it cannot
+/// be repaired after the fact the way a component id can: relabeling a
+/// finished run would have to undo ties that were already decided the
+/// wrong way. A file with no key index is its own key space, so rows
+/// serve.
+pub fn cdlp(db: &mut Zu1File, reader: &mut GraphReader, rounds: usize) -> Result<Vec<u64>> {
+    let n = reader.directory().one_domain()? as usize;
+    let index = reader.directory().keys.clone();
+    let mut label = match index {
+        Some(index) => crate::keys::key_by_row(db, &index)?,
+        None => (0..n as u64).collect(),
+    };
+    if label.len() != n {
+        return Err(zu_common::ZuError::Corrupt {
+            what: "key index",
+            detail: format!("{} keys over {n} nodes", label.len()),
+        });
+    }
+    let mut next = label.clone();
+    // One scratch vector for the whole sweep: the votes of one node are
+    // read and forgotten inside its iteration, and a fresh allocation
+    // per node would be the kernel's largest cost on a sparse graph.
+    let mut votes: Vec<u64> = Vec::new();
+    for _ in 0..rounds {
+        for node in 0..n {
+            votes.clear();
+            for dir in [Direction::Fwd, Direction::Bwd] {
+                for &far in reader.neighbors_dir(db, node as u64, dir)? {
+                    votes.push(label[far as usize]);
+                }
+            }
+            if votes.is_empty() {
+                next[node] = label[node];
+                continue;
+            }
+            // Sorting groups equal labels, so the winner is the longest
+            // run. Scanning ascending and taking a new best only on a
+            // strictly longer run is the smallest-label tie-break.
+            votes.sort_unstable();
+            let (mut best, mut best_len) = (votes[0], 0usize);
+            let (mut run, mut run_len) = (votes[0], 0usize);
+            for &v in &votes {
+                if v == run {
+                    run_len += 1;
+                    continue;
+                }
+                if run_len > best_len {
+                    (best, best_len) = (run, run_len);
+                }
+                (run, run_len) = (v, 1);
+            }
+            if run_len > best_len {
+                best = run;
+            }
+            next[node] = best;
+        }
+        std::mem::swap(&mut label, &mut next);
+    }
+    Ok(label)
+}
+
+/// Local clustering coefficient over the directed graph: for a node
+/// whose neighbor set is the union of its out and in neighbors without
+/// itself, the number of stored edges running from one neighbor to
+/// another over `d * (d - 1)`, the count of ordered pairs. Fewer than
+/// two neighbors scores zero, there being no pair to close.
+///
+/// Parallel edges count as many times as they are stored, and a self
+/// loop on a neighbor closes nothing, which is what the Graphalytics
+/// reference counts.
+pub fn lcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<f64>> {
+    let n = reader.directory().one_domain()? as usize;
+    let mut coeff = Vec::with_capacity(n);
+    let mut nbrs: Vec<u64> = Vec::new();
+    // Membership as a dense flag array rather than a search of the
+    // neighbor list: the inner loop asks the question once per edge out
+    // of the neighborhood, and the array is cleared through the same
+    // list that set it, so the cost stays with the node's degree rather
+    // than with the graph.
+    let mut member = vec![false; n];
+    for node in 0..n {
+        nbrs.clear();
+        for dir in [Direction::Fwd, Direction::Bwd] {
+            nbrs.extend_from_slice(reader.neighbors_dir(db, node as u64, dir)?);
+        }
+        nbrs.retain(|&far| far != node as u64);
+        nbrs.sort_unstable();
+        nbrs.dedup();
+        let d = nbrs.len();
+        if d < 2 {
+            coeff.push(0.0);
+            continue;
+        }
+        for &far in &nbrs {
+            member[far as usize] = true;
+        }
+        let mut links = 0u64;
+        for &near in &nbrs {
+            for &far in reader.neighbors_dir(db, near, Direction::Fwd)? {
+                if far != near && member[far as usize] {
+                    links += 1;
+                }
+            }
+        }
+        for &far in &nbrs {
+            member[far as usize] = false;
+        }
+        coeff.push(links as f64 / (d as f64 * (d as f64 - 1.0)));
+    }
+    Ok(coeff)
 }
 
 /// Louvain community detection over the undirected view: repeated
@@ -588,6 +714,69 @@ mod tests {
     }
 
     #[test]
+    fn cdlp_settles_a_clique_on_its_smallest_label() {
+        // A 4-clique and an isolated node: every member sees the same
+        // three labels once each, so the tie-break decides, and after
+        // one round of that the whole clique agrees on 0. The isolate
+        // has nobody to hear from and stays itself.
+        let mut edges = Vec::new();
+        for i in 0u32..4 {
+            for j in i + 1..4 {
+                edges.push((i, j));
+            }
+        }
+        let (_dir, mut db, mut reader) = open_with(&edges, 5);
+        let labels = cdlp(&mut db, &mut reader, CDLP_ROUNDS).expect("cdlp");
+        assert_eq!(labels, [0, 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn cdlp_counts_a_bidirectional_pair_once_per_direction() {
+        // 1 -> 0 and 0 -> 1 sit on both of 0's lists, so label 1 votes
+        // twice against 2's single vote from 2 -> 0, and 0 takes 1
+        // rather than the smaller label a single count would hand it.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (1, 0), (2, 0)], 3);
+        let labels = cdlp(&mut db, &mut reader, 1).expect("cdlp");
+        assert_eq!(labels[0], 1);
+    }
+
+    #[test]
+    fn cdlp_propagates_the_keys_a_reordered_load_stored() {
+        // Rows 0..3 hold keys 30, 10, 20, 40: the clique 0-1-2 agrees
+        // on the smallest key among them, 10, which is no row's number.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Zu1File::create(&dir.path().join("keyed.zu1")).expect("create");
+        let edges = [(0u32, 1u32), (0, 2), (1, 2)];
+        crate::graph::bulk_load_keyed(&mut db, "n", "e", 4, &edges, Some(&[30, 10, 20, 40]))
+            .expect("load");
+        let mut reader = GraphReader::load(&mut db).expect("reader");
+        let labels = cdlp(&mut db, &mut reader, CDLP_ROUNDS).expect("cdlp");
+        assert_eq!(labels, [10, 10, 10, 40]);
+    }
+
+    #[test]
+    fn lcc_scores_a_closed_triangle_one_and_an_open_wedge_zero() {
+        // 0's neighbors are 1 and 2 in both graphs; the edge 1 -> 2
+        // closes one of the two ordered pairs in the first and none in
+        // the second. Nodes 3 and 4 have too few neighbors to score.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 2), (3, 4)], 5);
+        let coeff = lcc(&mut db, &mut reader).expect("lcc");
+        assert_eq!(coeff[0], 0.5);
+        assert_eq!(coeff[3], 0.0);
+        assert_eq!(coeff[4], 0.0);
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2)], 3);
+        assert_eq!(lcc(&mut db, &mut reader).expect("lcc")[0], 0.0);
+    }
+
+    #[test]
+    fn lcc_ignores_a_self_loop_on_a_neighbor() {
+        // 1 -> 1 runs between two neighbors of 0 only if a node counts
+        // as its own neighbor, which the LDBC definition denies.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (0, 2), (1, 1)], 3);
+        assert_eq!(lcc(&mut db, &mut reader).expect("lcc")[0], 0.0);
+    }
+
+    #[test]
     fn empty_graphs_run_every_kernel_cleanly() {
         let (_dir, mut db, mut reader) = open_with(&[], 0);
         assert!(
@@ -598,6 +787,12 @@ mod tests {
         assert!(wcc(&mut db, &mut reader).expect("wcc").is_empty());
         assert!(sssp(&mut db, &mut reader, 0).expect("sssp").is_empty());
         assert!(bfs(&mut db, &mut reader, 0).expect("bfs").is_empty());
+        assert!(
+            cdlp(&mut db, &mut reader, CDLP_ROUNDS)
+                .expect("cdlp")
+                .is_empty()
+        );
+        assert!(lcc(&mut db, &mut reader).expect("lcc").is_empty());
         assert!(louvain(&mut db, &mut reader).expect("louvain").is_empty());
     }
 }

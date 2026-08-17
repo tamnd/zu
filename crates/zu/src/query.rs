@@ -550,6 +550,25 @@ impl Graph for Zu1Graph<'_> {
                     })
                     .collect())
             }
+            "cdlp" => {
+                let rounds = match args.first() {
+                    Some(Value::Int(rounds)) if *rounds >= 0 => *rounds as usize,
+                    Some(other) => {
+                        return Err(ZuError::InvalidArgument(format!(
+                            "cdlp's round count must be a non-negative integer, got {other:?}"
+                        )));
+                    }
+                    None => algo::CDLP_ROUNDS,
+                };
+                Ok(algo::cdlp(db, reader, rounds)?
+                    .into_iter()
+                    .map(|label| vec![Value::Int(label as i64)])
+                    .collect())
+            }
+            "lcc" => Ok(algo::lcc(db, reader)?
+                .into_iter()
+                .map(|coeff| vec![Value::Float(coeff)])
+                .collect()),
             "louvain" => Ok(algo::louvain(db, reader)?
                 .into_iter()
                 .map(|label| vec![Value::Int(label as i64)])
@@ -1932,6 +1951,70 @@ mod tests {
         )
         .expect("compose");
         assert_eq!(r.rows, [[Value::Int(1)]]);
+    }
+
+    #[test]
+    fn cdlp_and_lcc_run_through_call_on_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cdlp.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // A triangle 0-1-2 with a pendant 3 hanging off 2.
+        let edges: [(u32, u32); 4] = [(0, 1), (0, 2), (1, 2), (2, 3)];
+        graph::bulk_load_as(&mut db, "person", "follows", 4, &edges).expect("load");
+        drop(db);
+        let mut db = Zu1File::open(&path).expect("open");
+
+        // Two rounds carry label 0 across the triangle and out to the
+        // pendant, and the remaining eight leave it there.
+        let r = run(
+            "CALL cdlp('follows') YIELD node, community \
+             RETURN node.id AS id, community ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("cdlp");
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Int(0)],
+                [Value::Int(1), Value::Int(0)],
+                [Value::Int(2), Value::Int(0)],
+                [Value::Int(3), Value::Int(0)],
+            ]
+        );
+
+        // One round stops earlier, which is what makes the round count
+        // worth spelling.
+        let r = run(
+            "CALL cdlp('follows', 1) YIELD node, community \
+             RETURN count(DISTINCT community) AS communities",
+            &mut db,
+            &[],
+        )
+        .expect("cdlp rounds");
+        assert_eq!(r.rows, [[Value::Int(3)]]);
+
+        // 0 and 1 each have two neighbors closed by one directed edge,
+        // 2 has three neighbors and the same single edge among them,
+        // and 3 has nobody to pair with.
+        let r = run(
+            "CALL lcc('follows') YIELD node, coefficient \
+             RETURN node.id AS id, coefficient ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("lcc");
+        let got: Vec<f64> = r
+            .rows
+            .iter()
+            .map(|row| match row[1] {
+                Value::Float(v) => v,
+                ref other => panic!("expected a float, got {other:?}"),
+            })
+            .collect();
+        for (got, want) in got.iter().zip([0.5, 0.5, 1.0 / 6.0, 0.0]) {
+            assert!((got - want).abs() < 1e-12, "{got} against {want}");
+        }
     }
 
     /// The morsel scheduler over a real zu1 file: workers fork their

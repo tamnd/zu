@@ -1383,6 +1383,7 @@ fn input_of(plan: &LogicalPlan) -> Option<&LogicalPlan> {
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Unwind { input, .. }
         | LogicalPlan::Insert { input, .. }
+        | LogicalPlan::Set { input, .. }
         | LogicalPlan::TableFunction { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
@@ -2173,7 +2174,7 @@ fn build_stages(
                 });
                 b.produced(chunk);
             }
-            LogicalPlan::Insert { .. } => {
+            LogicalPlan::Insert { .. } | LogicalPlan::Set { .. } => {
                 // A write is not an operator here. The session splits
                 // the statement at it, runs the clauses before it,
                 // writes once for each row they answered, and runs the
@@ -2181,7 +2182,7 @@ fn build_stages(
                 // executor reads through a graph and a graph reads.
                 // Nothing else runs a plan holding one of these.
                 return Err(invalid(
-                    "an INSERT is run by the session that owns the log, not by the executor".into(),
+                    "a write is run by the session that owns the log, not by the executor".into(),
                 ));
             }
             LogicalPlan::TableFunction {

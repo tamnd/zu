@@ -26,6 +26,7 @@ mod insert;
 pub mod list_text;
 pub mod query;
 pub mod session;
+mod set;
 pub mod snapshot;
 mod split;
 pub mod sqlite;

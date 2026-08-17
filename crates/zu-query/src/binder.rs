@@ -19,7 +19,7 @@ use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
     self, BinaryOp, Clause, Expr, LabelExpr, Literal, NodePattern, PathMode, Projection,
-    RelDirection, RelPattern, Selector, SortKey, UnaryOp,
+    RelDirection, RelPattern, Selector, SetItem, SortKey, UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
@@ -746,6 +746,16 @@ pub enum BoundClause {
         /// carries across the write.
         carry: Vec<usize>,
     },
+    /// `SET`, the assignments the statement makes to elements earlier
+    /// clauses found.
+    Set {
+        items: Vec<BoundSetItem>,
+        /// The slots in scope where the write runs, the same thing
+        /// [`BoundClause::Insert::carry`] holds. A `SET` creates
+        /// nothing, so the row on the other side of it is this and
+        /// nothing more.
+        carry: Vec<usize>,
+    },
     Unwind {
         expr: BoundExpr,
         slot: usize,
@@ -824,6 +834,23 @@ pub struct BoundInsertRel {
     pub dst: usize,
     /// The properties the pattern wrote, in written order.
     pub props: Vec<(String, BoundExpr)>,
+}
+
+/// One assignment a `SET` makes.
+///
+/// The element is a slot rather than a table and a row, because which
+/// element it is differs per row and the row is what says. Which column
+/// the key names is settled where the write runs, for the same reason
+/// an inserted element's columns are: the columns are in the file
+/// rather than in the schema the binder is given.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSetItem {
+    /// The slot holding the element the assignment changes.
+    pub target: usize,
+    /// The property key it writes.
+    pub key: String,
+    /// What the property takes, evaluated once per row.
+    pub value: BoundExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1307,23 +1334,7 @@ impl Binder<'_> {
                 // so that what the run carries across the write is the
                 // rows the clauses before it answered and nothing the
                 // write itself made.
-                let mut carry: Vec<usize> = self.scope.values().copied().collect();
-                // A path variable is assembled from the slots of its
-                // walk, and the ones the query never named are in no
-                // scope, so they come along by way of the shape.
-                let parts: Vec<usize> = carry
-                    .iter()
-                    .filter_map(|slot| self.path_shapes.get(slot))
-                    .flatten()
-                    .map(|part| match part {
-                        PathPart::Node(slot) | PathPart::Rel(slot) | PathPart::VarRel(slot) => {
-                            *slot
-                        }
-                    })
-                    .collect();
-                carry.extend(parts);
-                carry.sort_unstable();
-                carry.dedup();
+                let carry = self.carried();
                 let mut nodes = Vec::new();
                 let mut rels = Vec::new();
                 for path in patterns {
@@ -1345,6 +1356,17 @@ impl Binder<'_> {
                     }
                 }
                 Ok(BoundClause::Insert { nodes, rels, carry })
+            }
+            Clause::Set { items } => {
+                let carry = self.carried();
+                let mut bound = Vec::with_capacity(items.len());
+                for item in items {
+                    bound.push(self.bind_set_item(item)?);
+                }
+                Ok(BoundClause::Set {
+                    items: bound,
+                    carry,
+                })
             }
             Clause::Unwind { expr, alias } => {
                 let mut ctx = ExprCtx::new(false);
@@ -1799,6 +1821,68 @@ impl Binder<'_> {
             )));
         }
         Ok(slot)
+    }
+
+    /// The slots a write carries across itself, which is everything in
+    /// scope where it sits.
+    ///
+    /// A write runs once for every row the clauses before it answered
+    /// and the clauses after it read those rows rather than the store,
+    /// so every slot they might read has to come along.
+    fn carried(&self) -> Vec<usize> {
+        let mut carry: Vec<usize> = self.scope.values().copied().collect();
+        // A path variable is assembled from the slots of its walk, and
+        // the ones the query never named are in no scope, so they come
+        // along by way of the shape.
+        let parts: Vec<usize> = carry
+            .iter()
+            .filter_map(|slot| self.path_shapes.get(slot))
+            .flatten()
+            .map(|part| match part {
+                PathPart::Node(slot) | PathPart::Rel(slot) | PathPart::VarRel(slot) => *slot,
+            })
+            .collect();
+        carry.extend(parts);
+        carry.sort_unstable();
+        carry.dedup();
+        carry
+    }
+
+    /// Binds one assignment under `SET`.
+    ///
+    /// The element has to be in scope, because a statement changes what
+    /// it found: a name no clause bound stands for nothing to change.
+    /// An edge is refused by name rather than by type, because its
+    /// properties are stored in the order its table holds its edges and
+    /// nothing writes into that order yet.
+    fn bind_set_item(&mut self, item: &SetItem) -> Result<BoundSetItem> {
+        let Some(&target) = self.scope.get(&item.target) else {
+            return Err(bad_reference(format!(
+                "'{}' stands for nothing here, and SET changes an element an earlier clause found",
+                item.target
+            )));
+        };
+        match self.variables[target].ty {
+            Type::Node => {}
+            Type::Rel => {
+                return Err(not_yet(
+                    "SET on an edge, whose properties are stored in the order its table holds its edges,",
+                ));
+            }
+            ref other => {
+                return Err(bad_type(format!(
+                    "SET changes an element, and '{}' is {other}",
+                    item.target
+                )));
+            }
+        }
+        let mut ctx = ExprCtx::new(false);
+        let (value, _) = self.bind_expr(&item.value, &mut ctx)?;
+        Ok(BoundSetItem {
+            target,
+            key: item.key.clone(),
+            value,
+        })
     }
 
     /// Binds one edge written under `INSERT`, between the two slots the

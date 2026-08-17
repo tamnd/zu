@@ -1265,3 +1265,61 @@ capi_chunk_scan_ratio = 1.5
 # still fails immediately if a chunked read ever converts more than its
 # chunk. Raise this floor, never lower it.
 capi_chunk_early_speedup = 50.0
+
+# What one write statement costs, in each of the resources it spends
+# (crates/zu/benches/write.rs). A `SET` of one property of one element
+# and an `INSERT` of one element, each its own statement and so each its
+# own commit, run against a two column table of 10000 rows.
+#
+# The write path folds after every commit that changed something,
+# because a reader reads the sealed file and nothing else, so a change
+# that is not folded is a change the next MATCH cannot see. That costs
+# four fdatasyncs per statement rather than the one a commit needs (the
+# WAL commit frame, two inside the header flip, and the WAL truncate),
+# and it rewrites every column of the table the statement touched. Both
+# of those are in these numbers and neither is meant to stay.
+#
+# Measured on the local M series, where an fdatasync is 3.9 ms: 39 to 42
+# ms and 1556 kB written per SET at 10000 rows, 45 ms and 2835 kB per
+# INSERT, no growth in the store for a SET that puts back what it found,
+# and 19 MB of peak resident growth across a 200 statement run. The
+# ceilings are set for a box whose syncs are several times slower, and
+# what they exist to catch is a regression that adds another sync or
+# another rewrite, which lands multiples above rather than just over.
+# Lower these ceilings, never raise them.
+set_stmt_us = 250000.0
+insert_stmt_us = 250000.0
+set_stmt_kb = 4096.0
+
+# What a statement that changed nothing added to the store, per
+# statement. A SET that writes back the value it read leaves a table of
+# the same shape, so the fold's new blocks must come out of the free
+# list the old ones went onto and the file must not grow at all;
+# measured 0 everywhere. A block is 256 kB, so this ceiling fails on a
+# path that leaks even one block every four statements, which is the
+# defect it is here for. Lower this ceiling, never raise it.
+set_stmt_growth_b = 65536.0
+
+# Peak resident growth across a 200 statement run, MB. A write of one
+# cell holds one cell, and the fold holds the columns it is rebuilding,
+# so this is bounded by the table rather than by the statement count;
+# measured 19 MB. A path that kept a copy per statement would climb
+# with the loop and clear this immediately. Lower this ceiling, never
+# raise it.
+set_peak_rss_mb = 128.0
+
+# How much of a one cell write is the table it sits in: the same SET
+# timed at 10000 rows and at 100000 rows, in time and in bytes written.
+# Both are ratios measured in one run, so a slow box moves neither. A
+# write path that did not read the table to change one cell of it would
+# hold both at 1, and folding per statement means neither is at 1;
+# measured 2.1 to 2.5 in time and 1.3 in bytes, well under the 10 a
+# fully linear fold would give because four syncs and a header flip are
+# the same size at either row count. The ceilings sit between what is
+# measured and that 10, so a fold that starts rewriting more than the
+# table it touched fails here. These are the two numbers that should
+# fall to 1 when the read path learns to consult overlays and the fold
+# becomes a background checkpoint. Lower these ceilings, never raise
+# them.
+set_fold_x = 6.0
+set_write_x = 4.0

@@ -12,9 +12,9 @@
 //! The rest of a row is what the workflow needs to build it: the runner
 //! that has that machine, the container the two gnu targets build in so
 //! that the glibc they link against is the floor rather than whatever
-//! the runner happens to have, the name the artifact comes out under,
-//! and whether the runner can run what it built. Those are checked too,
-//! because a row nothing reads is a row that drifts.
+//! the runner happens to have, the names the three artifacts come out
+//! under, and whether the runner can run what it built. Those are
+//! checked too, because a row nothing reads is a row that drifts.
 //!
 //! The budgets are the other half of the file. A size ceiling per
 //! artifact, gated on every platform, because binary size only ever
@@ -29,7 +29,7 @@ use crate::toml::Doc;
 
 /// The table's schema version, which moves when the shape of the file
 /// changes and not when the platforms do.
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 
 /// Where the table is.
 pub const PATH: &str = "platforms.toml";
@@ -55,6 +55,10 @@ pub struct Platform {
     /// the glibc they promise rather than the runner's own.
     pub container: Option<String>,
     pub lib: String,
+    /// The static archive beside the shared library, which dx/09 C-5
+    /// ships as well and which a binding that wants its users to
+    /// install one file links instead.
+    pub staticlib: String,
     pub exe: String,
     /// Whether the runner can execute what it built. A cross compiled
     /// row is measured and not exercised, and saying so is the
@@ -219,6 +223,7 @@ impl Table {
                     "runner",
                     "container",
                     "lib",
+                    "staticlib",
                     "exe",
                     "smoke",
                     "doc",
@@ -256,6 +261,12 @@ impl Table {
                 .str("lib")
                 .ok_or_else(|| format!("line {line}: {target} builds libzu under no name"))?
                 .to_string();
+            let staticlib = table
+                .str("staticlib")
+                .ok_or_else(|| {
+                    format!("line {line}: {target} builds the static libzu under no name")
+                })?
+                .to_string();
             let exe = table
                 .str("exe")
                 .ok_or_else(|| format!("line {line}: {target} builds the CLI under no name"))?
@@ -275,6 +286,7 @@ impl Table {
                 runner,
                 container,
                 lib,
+                staticlib,
                 exe,
                 smoke,
                 doc,
@@ -420,6 +432,7 @@ impl Table {
                 ("runner", platform.runner.clone().unwrap_or_default()),
                 ("container", platform.container.clone().unwrap_or_default()),
                 ("lib", platform.lib.clone()),
+                ("staticlib", platform.staticlib.clone()),
                 ("exe", platform.exe.clone()),
                 ("smoke", platform.smoke.to_string()),
             ] {
@@ -458,7 +471,7 @@ mod tests {
     use super::*;
 
     const TABLE: &str = concat!(
-        "schema = 1\n",
+        "schema = 2\n",
         "doc = \"The platforms zu builds for.\"\n",
         "audited = \"2026-08-15\"\n",
         "\n",
@@ -468,6 +481,7 @@ mod tests {
         "runner = \"ubuntu-latest\"\n",
         "container = \"quay.io/pypa/manylinux_2_28_x86_64:2026.08.15-1\"\n",
         "lib = \"libzu.so\"\n",
+        "staticlib = \"libzu.a\"\n",
         "exe = \"zu\"\n",
         "smoke = true\n",
         "doc = \"The default Linux server.\"\n",
@@ -477,6 +491,7 @@ mod tests {
         "tier = 1\n",
         "runner = \"macos-latest\"\n",
         "lib = \"libzu.dylib\"\n",
+        "staticlib = \"libzu.a\"\n",
         "exe = \"zu\"\n",
         "smoke = false\n",
         "doc = \"Intel Macs, cross compiled.\"\n",
@@ -485,6 +500,7 @@ mod tests {
         "target = \"wasm32-wasip1\"\n",
         "tier = 2\n",
         "lib = \"zu.wasm\"\n",
+        "staticlib = \"libzu.a\"\n",
         "exe = \"zu.wasm\"\n",
         "doc = \"WASI, built by the repositories that ship it.\"\n",
         "\n",
@@ -507,11 +523,13 @@ mod tests {
         "            runner: ubuntu-latest\n",
         "            container: quay.io/pypa/manylinux_2_28_x86_64:2026.08.15-1\n",
         "            lib: libzu.so\n",
+        "            staticlib: libzu.a\n",
         "            exe: zu\n",
         "            smoke: true\n",
         "          - target: x86_64-apple-darwin\n",
         "            runner: macos-latest\n",
         "            lib: libzu.dylib\n",
+        "            staticlib: libzu.a\n",
         "            exe: zu\n",
         "            smoke: false\n",
         "    runs-on: ${{ matrix.runner }}\n",
@@ -676,6 +694,23 @@ mod tests {
     }
 
     #[test]
+    fn a_platform_that_names_only_one_library_form_is_refused() {
+        let text = TABLE.replace("staticlib = \"libzu.a\"\n", "");
+        let error = Table::parse(&text).expect_err("a row with no static archive");
+        assert!(error.contains("static libzu under no name"), "{error}");
+    }
+
+    #[test]
+    fn a_row_that_forgot_the_static_archive_is_reported() {
+        let matrix = MATRIX.replace("            staticlib: libzu.a\n", "");
+        let notes = check(&matrix);
+        assert!(
+            notes.iter().any(|n| n.contains("has staticlib \"\"")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
     fn a_tier_that_does_not_exist_is_refused() {
         let error = Table::parse(&TABLE.replace("tier = 2", "tier = 4")).expect_err("tier 4");
         assert!(error.contains("there are three"), "{error}");
@@ -690,8 +725,8 @@ mod tests {
 
     #[test]
     fn a_schema_this_reader_does_not_read_is_refused() {
-        let error = Table::parse(&TABLE.replace("schema = 1", "schema = 2")).expect_err("schema 2");
-        assert!(error.contains("reads schema 1"), "{error}");
+        let error = Table::parse(&TABLE.replace("schema = 2", "schema = 3")).expect_err("schema 3");
+        assert!(error.contains("reads schema 2"), "{error}");
     }
 
     #[test]

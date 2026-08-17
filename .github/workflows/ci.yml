@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -42,7 +42,7 @@ jobs:
       # main on somebody else's release schedule, and the generator
       # refuses a format it was not taught precisely so that a bump is
       # a deliberate change to model.rs and not a silent partial read.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: nightly-2026-08-14
       - uses: Swatinem/rust-cache@v2
@@ -125,7 +125,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The CLI bin and the C API cdylib are both called zu, so on MSVC
       # they want the same zu.pdb and whichever link gets there second
@@ -152,7 +152,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p zu-cli
       # The G6 budget is 32 MiB total for an embedded reader. The build
@@ -172,8 +172,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/rust-toolchain
         with:
+          toolchain: nightly
           components: miri
       - uses: Swatinem/rust-cache@v2
       # The interpreter is a few thousand times slower than native, so
@@ -191,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The perf/11 tier 1 gate: every hot kernel that relies on
       # auto-vectorization must actually vectorize on this toolchain.
@@ -202,7 +203,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The perf/12 section 6 gate. Builds its own graphs, so unlike
       # the LDBC bench it needs no dataset and runs here. Holds the
@@ -214,7 +215,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The G0 gate from gql plan/08 section 1.2: saying no has to cost
       # less than saying yes. Builds its own graph like the cardinality
@@ -227,7 +228,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The perf/05 tail gate: the p99 of a point seeded read against
       # the p50 of the same stream, on uniform data and on power law
@@ -241,7 +242,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The G2 edge property gate: a property read off every edge of a
       # two million edge graph against the same walk reading a column
@@ -255,7 +256,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The G3 write gate: what one write statement costs in latency,
       # throughput, bytes pushed at the disk, bytes the store grew by and
@@ -270,7 +271,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The dx/04 section 9 gate on the public API: what a connection
       # costs to take, and what a statement costs through Connection
@@ -284,7 +285,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The dx/04 section 6 gate on the bulk-load appender: what
       # buffering one row costs, and what batching buys over committing
@@ -298,7 +299,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The dx/02 section 3 gate on the C ABI's two read paths: what a
       # chunked scan costs over a whole-column one, and what reading a
@@ -312,7 +313,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # What an invocation costs before it does anything, which is the
       # one number a library bench cannot give because the process is
@@ -326,7 +327,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       # The cases themselves run as a test in the matrix above, on all
       # three platforms, which is what makes them fire on the machine
@@ -499,7 +500,7 @@ jobs:
         with:
           repository: tamnd/zu-web
           path: zu-web
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p xtask -- terms
       # A prose check that costs seconds is a check that runs here and
@@ -513,7 +514,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz

@@ -1,0 +1,66 @@
+name: Rust toolchain
+description: Installs a rust toolchain and makes it the default.
+
+# Every job in this repo needs a compiler, so whatever installs it runs
+# about twenty five times a push. A third party action is a tarball the
+# runner fetches from codeload once per job, and a burst that wide gets
+# 429 Too Many Requests often enough to redden a run that has nothing
+# wrong with it. An action that lives in the repo comes with the
+# checkout, so it costs no request at all. The work itself is two rustup
+# lines, and rustup is already on every hosted image.
+
+inputs:
+  toolchain:
+    description: Toolchain to install and default to, such as stable or 1.97.1.
+    required: false
+    default: stable
+  components:
+    description: Comma separated rustup components, such as clippy,rustfmt.
+    required: false
+    default: ""
+  targets:
+    description: Comma separated target triples to add.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+        COMPONENTS: ${{ inputs.components }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        set -eu
+
+        # Hosted runners ship rustup. A job container usually does not,
+        # and the manylinux rows of libzu.yml are the ones that do not,
+        # so bring it in from upstream rather than assuming it.
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 --retry 3 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+        fi
+
+        args=""
+        # Comma separated in, one flag each out, because that is what a
+        # workflow wants to write and what rustup wants to read.
+        if [ -n "$COMPONENTS" ]; then
+          for c in $(echo "$COMPONENTS" | tr ',' ' '); do
+            args="$args --component $c"
+          done
+        fi
+        if [ -n "$TARGETS" ]; then
+          for t in $(echo "$TARGETS" | tr ',' ' '); do
+            args="$args --target $t"
+          done
+        fi
+
+        # minimal, not default: nothing here wants docs, and the ones
+        # that want clippy or rustfmt name it.
+        rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update $args
+        rustup default "$TOOLCHAIN"
+        rustc --version
+        cargo --version

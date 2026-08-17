@@ -96,7 +96,7 @@ jobs:
       # The rows that build on the runner get the pinned compiler and a
       # cache here. The Alpine rows get both inside the image, where the
       # cache would be a directory this action cannot prune afterwards.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/rust-toolchain
         if: "!contains(matrix.container, 'alpine')"
         with:
           toolchain: 1.97.1

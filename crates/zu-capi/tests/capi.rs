@@ -6,6 +6,7 @@
 
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use zu::{
     ZU_SEVERITY_EXCEPTION, ZU_TEMPORAL_DATE, ZU_TEMPORAL_DURATION_DAY_TIME,
@@ -13,14 +14,15 @@ use zu::{
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
     ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
     ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
-    zu_config_set_z, zu_conn_close, zu_connect, zu_create, zu_create_z, zu_database_close,
-    zu_database_create_z, zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url,
-    zu_error_excerpt, zu_error_free, zu_error_message, zu_error_offset, zu_error_position,
-    zu_error_retryable, zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute,
-    zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
-    zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
-    zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
-    zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
+    zu_config_set_z, zu_conn_close, zu_conn_interrupt, zu_conn_rows_read, zu_conn_set_progress,
+    zu_connect, zu_create, zu_create_z, zu_database_close, zu_database_create_z,
+    zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt,
+    zu_error_free, zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable,
+    zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute, zu_loader_col_bool,
+    zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str, zu_loader_col_temporal,
+    zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free, zu_loader_table,
+    zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query, zu_query_z,
+    zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
     zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
     zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
     zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
@@ -2048,5 +2050,215 @@ fn a_database_is_created_where_there_was_none() {
         );
         assert!(conn.is_null() && !err.is_null());
         zu_error_free(err);
+    }
+}
+
+/// A pointer this test hands to another thread on purpose.
+///
+/// dx/02 §5 says a connection may not be used from two threads at
+/// once, and stopping one is the one call exempt from that, so a test
+/// of it has to do the thing the rest of the surface forbids.
+struct Handed(*mut ZuConn);
+
+// SAFETY: the second thread calls only zu_conn_interrupt and
+// zu_conn_rows_read on it, which are the two calls documented as safe
+// to make while the first thread is inside one.
+unsafe impl Send for Handed {}
+
+/// A query with enough work in it that a stop lands while it is
+/// running rather than after it: every edge against every edge, which
+/// is tens of millions of row visits and answers one number.
+const LONG: &str = "MATCH (a:person)-[:follows]->(b:person), \
+                    (c:person)-[:follows]->(d:person) RETURN count(*) AS n";
+
+/// The nodes behind that query. Enough that the statement takes
+/// seconds if nothing stops it, so a stop that never arrived fails the
+/// assertion rather than passing by finishing first.
+const CROSS_NODES: u32 = 6000;
+
+#[test]
+fn a_statement_stopped_from_another_thread_leaves_the_connection_warm() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("stop.zu1");
+    seeded_wide(&path, CROSS_NODES);
+    unsafe {
+        let conn = open(&path);
+        let handed = Handed(conn);
+        let stopped = std::thread::scope(|scope| {
+            let asking = scope.spawn(move || {
+                // Waits for the statement to be reading rather than
+                // sleeping for a guessed interval, so the ask lands
+                // inside the run on a slow machine and a fast one.
+                let handed = handed;
+                let mut rows = 0u64;
+                let start = std::time::Instant::now();
+                while rows == 0 && start.elapsed() < std::time::Duration::from_secs(30) {
+                    assert_eq!(zu_conn_rows_read(handed.0, &mut rows), ZuStatus::Ok);
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                assert!(rows > 0, "the statement never started reading");
+                assert_eq!(zu_conn_interrupt(handed.0), ZuStatus::Ok);
+                rows
+            });
+            let mut result: *mut ZuResult = ptr::null_mut();
+            let mut err: *mut ZuError = ptr::null_mut();
+            let status = zu_query(
+                conn,
+                LONG.as_ptr().cast::<c_char>(),
+                LONG.len(),
+                &mut result,
+                &mut err,
+            );
+            let seen = asking.join().expect("the asking thread");
+            (status, result, err, seen)
+        });
+        let (status, result, err, seen) = stopped;
+        assert_eq!(status, ZuStatus::Interrupted, "the statement was stopped");
+        assert!(result.is_null(), "a stopped statement has no result");
+        // Stopping is not failing, but it is still reported as an
+        // error handle, and what it says is that it stopped.
+        assert!(!err.is_null());
+        assert_eq!(zu_error_status(err), ZuStatus::Interrupted);
+        zu_error_free(err);
+
+        // How far it got is still readable after the call returned,
+        // which is what a host prints beside "cancelled".
+        let mut rows = 0u64;
+        assert_eq!(zu_conn_rows_read(conn, &mut rows), ZuStatus::Ok);
+        assert!(rows >= seen, "the count only goes up within a statement");
+
+        // And the connection is exactly as it was: same plans, same
+        // caches, next statement runs.
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(conn, "MATCH (p:person) RETURN count(*) AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [i64::from(CROSS_NODES)]);
+        zu_result_free(result);
+
+        // The count restarted with that statement rather than carrying
+        // the stopped one's total forward.
+        let mut rows = 0u64;
+        assert_eq!(zu_conn_rows_read(conn, &mut rows), ZuStatus::Ok);
+        assert!(
+            rows <= u64::from(CROSS_NODES),
+            "{rows} rows is the count from the statement before"
+        );
+        zu_conn_close(conn);
+    }
+}
+
+/// What a host's callback records: how many times it was called, and
+/// the arguments of the first call.
+#[derive(Default)]
+struct Reports {
+    calls: std::sync::atomic::AtomicU64,
+    rows: std::sync::atomic::AtomicU64,
+    keep_going: AtomicBool,
+}
+
+unsafe extern "C" fn report(user: *mut std::ffi::c_void, rows: u64, _ms: u64) -> std::ffi::c_int {
+    let reports = unsafe { &*user.cast::<Reports>() };
+    reports.calls.fetch_add(1, Ordering::Relaxed);
+    reports.rows.store(rows, Ordering::Relaxed);
+    i32::from(reports.keep_going.load(Ordering::Relaxed))
+}
+
+#[test]
+fn a_host_that_asked_to_be_told_can_stop_the_statement_from_the_callback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("progress.zu1");
+    seeded_wide(&path, CROSS_NODES);
+    let reports = Reports::default();
+    unsafe {
+        let conn = open(&path);
+        let user: *mut std::ffi::c_void = std::ptr::from_ref(&reports)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+        assert_eq!(
+            zu_conn_set_progress(conn, Some(report), user, 1),
+            ZuStatus::Ok
+        );
+
+        let mut result: *mut ZuResult = ptr::null_mut();
+        let mut err: *mut ZuError = ptr::null_mut();
+        let status = zu_query(
+            conn,
+            LONG.as_ptr().cast::<c_char>(),
+            LONG.len(),
+            &mut result,
+            &mut err,
+        );
+        assert_eq!(status, ZuStatus::Interrupted, "the callback said stop");
+        assert!(result.is_null());
+        assert!(!err.is_null());
+        zu_error_free(err);
+        assert!(
+            reports.calls.load(Ordering::Relaxed) >= 1,
+            "the host was never told anything"
+        );
+
+        // A callback that lets the statement run sees it through, and
+        // what it is told is the rows the statement read.
+        reports.keep_going.store(true, Ordering::Relaxed);
+        reports.calls.store(0, Ordering::Relaxed);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let result = query(conn, "MATCH (p:person) RETURN count(*) AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [i64::from(CROSS_NODES)]);
+        zu_result_free(result);
+
+        // Taking the arrangement back stops the reports, and the
+        // statement after it runs with nothing watching.
+        assert_eq!(
+            zu_conn_set_progress(conn, None, ptr::null_mut(), 0),
+            ZuStatus::Ok
+        );
+        reports.calls.store(0, Ordering::Relaxed);
+        let result = query(conn, "MATCH (p:person) RETURN count(*) AS n", &mut err);
+        zu_result_free(result);
+        assert_eq!(
+            reports.calls.load(Ordering::Relaxed),
+            0,
+            "a callback that was taken back was still called"
+        );
+        zu_conn_close(conn);
+    }
+}
+
+#[test]
+fn the_ways_of_asking_wrongly_are_all_answered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("misuse.zu1");
+    seeded(&path);
+    unsafe {
+        let mut rows = 12u64;
+        assert_eq!(zu_conn_interrupt(ptr::null_mut()), ZuStatus::Misuse);
+        assert_eq!(
+            zu_conn_rows_read(ptr::null_mut(), &mut rows),
+            ZuStatus::Misuse
+        );
+        assert_eq!(rows, 0, "the out-parameter is written on every path");
+        let conn = open(&path);
+        assert_eq!(zu_conn_rows_read(conn, ptr::null_mut()), ZuStatus::Misuse);
+        assert_eq!(
+            zu_conn_set_progress(ptr::null_mut(), Some(report), ptr::null_mut(), 10),
+            ZuStatus::Misuse
+        );
+        // A period of nothing is not a period, and reading it as one
+        // would be a thread calling a host as fast as it can.
+        assert_eq!(
+            zu_conn_set_progress(conn, Some(report), ptr::null_mut(), 0),
+            ZuStatus::Misuse
+        );
+        // Taking the arrangement back needs no period at all.
+        assert_eq!(
+            zu_conn_set_progress(conn, None, ptr::null_mut(), 0),
+            ZuStatus::Ok
+        );
+
+        // Asking about a connection that is not running anything is
+        // not a mistake: nothing is stopped and nothing has been read.
+        assert_eq!(zu_conn_interrupt(conn), ZuStatus::Ok);
+        assert_eq!(zu_conn_rows_read(conn, &mut rows), ZuStatus::Ok);
+        assert_eq!(rows, 0);
+        zu_conn_close(conn);
     }
 }

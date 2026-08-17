@@ -87,19 +87,20 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::mem::{offset_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use zu_common::{DurationKind, Temporal};
 use zudb::query::{QueryResult, Value};
 use zudb::zu1::file::Zu1File;
 use zudb::zu1::graph::bulk_load_keyed;
 use zudb::zu1::props::{PropValues, store_props};
-use zudb::{Config, Connection, Database, Position, Severity, ZuError as EngineError};
+use zudb::{Config, Connection, Database, Interrupt, Position, Severity, ZuError as EngineError};
 
 /// What a call answers, which is control flow and nothing else.
 ///
@@ -599,6 +600,18 @@ unsafe fn conn_of<'a>(conn: *mut ZuConn) -> &'a mut Connection {
     unsafe { &mut (*conn).conn }
 }
 
+/// The word a running statement reads, cloned so the caller holds no
+/// borrow. This is the one field a second thread touches on purpose
+/// while the first is inside a call.
+unsafe fn conn_stop(conn: *mut ZuConn) -> Interrupt {
+    unsafe { (*conn).stop.clone() }
+}
+
+/// Where a connection keeps what it was asked to report progress to.
+unsafe fn conn_progress<'a>(conn: *mut ZuConn) -> &'a Mutex<Option<Hook>> {
+    unsafe { &(*conn).progress }
+}
+
 /// The state a statement shares with the connection it belongs to.
 unsafe fn stmt_state(stmt: *mut ZuStmt) -> Arc<ConnState> {
     Arc::clone(unsafe { &(*stmt).state })
@@ -619,19 +632,33 @@ pub struct ZuDatabase {
 
 /// One connection, with its own file handle, caches, and plan cache.
 /// Opaque to C, and not thread-safe: see [`ConnState`].
+///
+/// The two fields beside the connection are the ones another thread
+/// reads while this one is inside a call, which is what cancellation
+/// is: `stop` is the word the running statement checks, and `progress`
+/// is what the watcher of that statement was asked to report through.
+/// Both are separate fields rather than state reached through
+/// `Connection`, because reaching through it would mean forming a
+/// reference covering the same bytes as the `&mut Connection` the
+/// thread inside the call is holding.
 pub struct ZuConn {
     conn: Connection,
     state: Arc<ConnState>,
+    stop: Interrupt,
+    progress: Mutex<Option<Hook>>,
 }
 
 impl ZuConn {
     fn new(conn: Connection) -> ZuConn {
+        let stop = conn.interrupt();
         ZuConn {
             conn,
             state: Arc::new(ConnState {
                 alive: AtomicBool::new(true),
                 busy: AtomicBool::new(false),
             }),
+            stop,
+            progress: Mutex::new(None),
         }
     }
 
@@ -1191,6 +1218,220 @@ pub unsafe extern "C" fn zu_close(conn: *mut ZuConn) {
     unsafe { zu_conn_close(conn) }
 }
 
+/* ---- cancellation and progress ---- */
+
+/// What a host is called back on while its statement runs: how many
+/// rows have been read out of storage and how long the statement has
+/// been going, answering zero to stop it and anything else to let it
+/// carry on.
+///
+/// Nullable, because passing no callback is how a host takes one back.
+pub type ZuProgressFn =
+    Option<unsafe extern "C" fn(user: *mut c_void, rows: u64, ms: u64) -> c_int>;
+
+/// A registered callback, its opaque argument, and how often to call
+/// it.
+///
+/// `Send` is asserted rather than derived, because the pointer is the
+/// host's and Rust has no way to know what is behind it. The header
+/// says what that assertion is: the callback runs on a thread of this
+/// library's, so whatever the pointer names has to be usable from one.
+/// It is the same promise every C library with a worker thread asks
+/// for, and it is stated where a host will read it rather than left to
+/// be discovered.
+#[derive(Clone, Copy)]
+struct Hook {
+    call: unsafe extern "C" fn(*mut c_void, u64, u64) -> c_int,
+    user: *mut c_void,
+    every: Duration,
+}
+
+unsafe impl Send for Hook {}
+
+/// The thread that reports on a statement while it runs.
+///
+/// A statement runs on the thread that asked for it and that thread is
+/// inside the executor, so somebody else has to do the reporting. It
+/// is a thread rather than a hook the executor calls for two reasons:
+/// the executor's boundaries belong to the query rather than to the
+/// clock, so a host asking for a report every 100 ms would get one per
+/// chunk instead, and a callback raised from a worker of a parallel
+/// stage would reach a host on a thread it never gave us and possibly
+/// several at once. This way the host's function is called on one
+/// thread, never re-entering the engine, at the period it asked for.
+///
+/// It costs a thread per statement, and only for a host that asked for
+/// progress at all. That is tens of microseconds against a statement
+/// somebody is sitting watching, which is the only statement anybody
+/// asks to be told about.
+struct Watcher {
+    done: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watcher {
+    fn start(hook: Hook, stop: Interrupt) -> Watcher {
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let waiting = Arc::clone(&done);
+        let thread = std::thread::spawn(move || {
+            // Named here so the closure captures the whole hook, which
+            // is the thing that is `Send`, rather than capturing the
+            // host's pointer out of it on its own, which is not.
+            let hook = hook;
+            let start = Instant::now();
+            let (lock, wake) = &*waiting;
+            loop {
+                let finished = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let (finished, timing) = wake
+                    .wait_timeout_while(finished, hook.every, |done| !*done)
+                    .unwrap_or_else(|e| e.into_inner());
+                // Woken rather than timed out means the statement is
+                // over, and a report after it ended is a report about
+                // nothing.
+                if !timing.timed_out() {
+                    break;
+                }
+                drop(finished);
+                let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                // SAFETY: the host gave us this function and this
+                // pointer together and promised both outlive the call
+                // that registered them.
+                if unsafe { (hook.call)(hook.user, stop.rows(), ms) } == 0 {
+                    stop.stop();
+                }
+            }
+        });
+        Watcher {
+            done,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watcher {
+    /// Ends the watch and waits for it, so the host's callback is
+    /// never running once the call it belongs to has returned.
+    ///
+    /// Waking it rather than letting the sleep expire is why the
+    /// condition variable is here: a statement that took a millisecond
+    /// under a callback asking for a report every second should return
+    /// in a millisecond.
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.done;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            // A panic in a host's callback has already unwound to the
+            // watcher's own boundary; there is nothing here to add to
+            // it and nothing to abort the statement for.
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Runs one statement with the connection's cancellation word cleared
+/// and its progress watch running.
+///
+/// Cleared on the way in rather than on the way out, so an ask that
+/// arrived while nothing was running cannot end the statement about to
+/// run, and so the row count a watcher reports starts at zero for each
+/// statement rather than accumulating over a session.
+unsafe fn watched<T>(conn: *mut ZuConn, run: impl FnOnce() -> T) -> T {
+    let stop = unsafe { conn_stop(conn) };
+    stop.clear();
+    let hook = *unsafe { conn_progress(conn) }
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _watcher = hook.map(|hook| Watcher::start(hook, stop));
+    run()
+}
+
+/// Asks the statement running on this connection to stop.
+///
+/// The one call meant to be made from another thread while a
+/// connection is in use, which is why it takes no claim: a
+/// cancellation that had to wait for the connection to be free could
+/// only ever arrive after the statement it was meant to stop.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_interrupt(conn: *mut ZuConn) -> ZuStatus {
+    if conn.is_null() {
+        return ZuStatus::Misuse;
+    }
+    let state = unsafe { conn_state(conn) };
+    if !state.alive.load(Ordering::Acquire) {
+        return ZuStatus::MisuseClosed;
+    }
+    unsafe { conn_stop(conn) }.stop();
+    ZuStatus::Ok
+}
+
+/// How many rows the statement running on this connection has read out
+/// of storage, for a host that would rather poll than be called back.
+///
+/// Rows read rather than rows answered, because the number is there to
+/// show a person that something is happening, and the statement they
+/// are waiting on is exactly the one that reads a hundred million rows
+/// to answer one. It starts at zero at each statement and holds its
+/// last value once one ends, so a host that polls after the call
+/// returns reads what the statement cost rather than a zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_rows_read(conn: *mut ZuConn, out: *mut u64) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0 };
+    if conn.is_null() {
+        return ZuStatus::Misuse;
+    }
+    let state = unsafe { conn_state(conn) };
+    if !state.alive.load(Ordering::Acquire) {
+        return ZuStatus::MisuseClosed;
+    }
+    unsafe { *out = conn_stop(conn).rows() };
+    ZuStatus::Ok
+}
+
+/// Asks to be called back every `interval_ms` while a statement runs
+/// on this connection, and to be able to stop it from there.
+///
+/// A `NULL` callback takes the arrangement back, which is the only way
+/// to, and `interval_ms` is then ignored. An interval of zero with a
+/// callback is [`ZuStatus::Misuse`]: a period of nothing is not a
+/// period, and reading it as one would be a thread calling a host as
+/// fast as it can.
+///
+/// The arrangement belongs to the connection rather than to a
+/// statement, so it is made once and covers every statement after it.
+/// A statement already running keeps the arrangement it started with.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_set_progress(
+    conn: *mut ZuConn,
+    cb: ZuProgressFn,
+    user: *mut c_void,
+    interval_ms: u64,
+) -> ZuStatus {
+    if conn.is_null() {
+        return ZuStatus::Misuse;
+    }
+    let state = unsafe { conn_state(conn) };
+    if !state.alive.load(Ordering::Acquire) {
+        return ZuStatus::MisuseClosed;
+    }
+    let hook = match cb {
+        None => None,
+        Some(_) if interval_ms == 0 => return ZuStatus::Misuse,
+        Some(call) => Some(Hook {
+            call,
+            user,
+            every: Duration::from_millis(interval_ms),
+        }),
+    };
+    *unsafe { conn_progress(conn) }
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = hook;
+    ZuStatus::Ok
+}
+
 /// Claims a connection for one call, or says why it cannot be had.
 unsafe fn claim_conn(conn: *mut ZuConn) -> Result<Claim, ZuStatus> {
     if conn.is_null() {
@@ -1228,7 +1469,7 @@ pub unsafe extern "C" fn zu_query(
             Err(status) => return Ok(status),
         };
         let q = unsafe { counted(q, q_len, "query") }?;
-        let result = unsafe { conn_of(conn) }.query(q)?;
+        let result = unsafe { watched(conn, || conn_of(conn).query(q)) }?;
         unsafe { *out = Box::into_raw(Box::new(ZuResult::new(result))) };
         Ok(ZuStatus::Ok)
     })
@@ -1415,7 +1656,7 @@ pub unsafe extern "C" fn zu_execute(
             .map(|(n, v)| (n.as_str(), v.clone()))
             .collect();
         let (conn, id) = unsafe { ((*stmt).conn, (*stmt).id) };
-        let result = unsafe { conn_of(conn) }.execute_prepared(id, &borrowed)?;
+        let result = unsafe { watched(conn, || conn_of(conn).execute_prepared(id, &borrowed)) }?;
         unsafe { *out = Box::into_raw(Box::new(ZuResult::new(result))) };
         Ok(ZuStatus::Ok)
     })

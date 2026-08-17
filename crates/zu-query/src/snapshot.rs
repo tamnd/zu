@@ -162,7 +162,13 @@ pub trait Snapshot {
     /// what a pair with several edges between it needs: the pair alone
     /// names the first of the run for all of them, and counting the
     /// list out instead gives every copy its own value.
-    fn list_ords_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {
+    fn list_ords_into(
+        &mut self,
+        rel: RelId,
+        node: u64,
+        dir: Dir,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
         let _ = (rel, node, dir, out);
         Err(no_edge_columns())
     }

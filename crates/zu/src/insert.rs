@@ -20,11 +20,14 @@
 
 use std::collections::BTreeMap;
 
-use zu_common::{FloatBits, LogicalType, Result, Temporal, ZuError};
+use zu_common::gqlstatus::codes;
+use zu_common::{FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
+use crate::deleted::Deleted;
 use crate::query::Value;
 use crate::split::Insert;
+use crate::zu1::catalog::{Catalog, MAX_PROPERTIES};
 use crate::zu1::file::Zu1File;
 use crate::zu1::props::{PropColumn, load_props, load_rel_props};
 use crate::zu1::txn::{Cell, WriteTxn};
@@ -92,6 +95,16 @@ impl NewRel {
 /// no log write and no fold.
 pub(crate) struct Batch<'a> {
     write: &'a Insert,
+    /// The catalog as the statement started, which is what says which
+    /// graph a table is in and which two node tables a rel table runs
+    /// between. Owned for the reason [`crate::delete::Removals`] owns
+    /// one: the file it came out of is handed in a row at a time.
+    catalog: Catalog,
+    /// The rows the file has lost, which is what says an endpoint an
+    /// earlier clause found is one a `DELETE` has since taken away. A
+    /// statement's own delete is in here because a write folds as it is
+    /// staged, so the part after it reads a file the tombstone is in.
+    gone: Deleted,
     /// The property columns of each node table being written to, read
     /// once.
     columns: BTreeMap<u32, Vec<PropColumn>>,
@@ -107,10 +120,11 @@ pub(crate) struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn open(db: &mut Zu1File, write: &'a Insert) -> Result<Self> {
+    pub(crate) fn open(db: &mut Zu1File, write: &'a Insert, catalog: Catalog) -> Result<Self> {
         let mut columns = BTreeMap::new();
         let mut next = BTreeMap::new();
         for node in &write.nodes {
+            room_for(&node.props, "element", codes::C22G0S)?;
             if columns.contains_key(&node.table) {
                 continue;
             }
@@ -119,13 +133,23 @@ impl<'a> Batch<'a> {
         }
         let mut rel_columns = BTreeMap::new();
         for rel in &write.rels {
+            room_for(&rel.props, "edge", codes::C22G0T)?;
             if rel_columns.contains_key(&rel.table) {
                 continue;
             }
             rel_columns.insert(rel.table, rel_columns_of(db, rel.table)?);
         }
+        // Read once per statement rather than per row, and not at all
+        // by a statement that writes no edges, which is where the
+        // endpoint questions are asked.
+        let gone = match write.rels.is_empty() {
+            true => Deleted::default(),
+            false => Deleted::load(db)?,
+        };
         Ok(Self {
             write,
+            catalog,
+            gone,
             columns,
             rel_columns,
             next,
@@ -163,8 +187,18 @@ impl<'a> Batch<'a> {
             let values = &props[at..at + rel.props.len()];
             at += rel.props.len();
             let cols = edge_row(rel, &self.rel_columns[&rel.table], values)?;
-            let ends = [(rel.src, "leaves"), (rel.dst, "arrives at")];
-            let [src, dst] = ends.map(|(slot, side)| self.end(slot, side, carried, &made));
+            let table = self.catalog.rel_by_id(rel.table).ok_or_else(|| {
+                ZuError::InvalidArgument(format!(
+                    "the edge is going in unknown table {}",
+                    rel.table
+                ))
+            })?;
+            let ends = [
+                (rel.src, "leaves", table.from),
+                (rel.dst, "arrives at", table.to),
+            ];
+            let [src, dst] =
+                ends.map(|(slot, side, want)| self.end(slot, side, want, carried, &made));
             let new = NewRel {
                 table: rel.table,
                 src: src?,
@@ -182,8 +216,19 @@ impl<'a> Batch<'a> {
     ///
     /// A found one is checked here rather than by the binder, because
     /// what the binder knows about it is which tables the match left
-    /// open and what decides is the row.
-    fn end(&self, slot: usize, side: &str, carried: &[Value], made: &[Value]) -> Result<u64> {
+    /// open and what decides is the row. `want` is the node table the
+    /// rel table declares at this end, and there are three ways a row
+    /// can fail to be one of its rows: it is in a table of another
+    /// graph, it is in the wrong table of this one, or it is in the
+    /// right table and a `DELETE` has taken it away.
+    fn end(
+        &self,
+        slot: usize,
+        side: &str,
+        want: u32,
+        carried: &[Value],
+        made: &[Value],
+    ) -> Result<u64> {
         let value = self
             .write
             .created
@@ -204,9 +249,23 @@ impl<'a> Batch<'a> {
                 )
             })?;
         match value {
-            Value::Node { offset, .. } => Ok(*offset),
+            Value::Node { table, offset } if *table == want => {
+                if self.gone.holds(*table, *offset) {
+                    return Err(ZuError::gql(
+                        codes::CG1002,
+                        format!(
+                            "an edge {side} row {offset} of '{}', which a DELETE has taken away",
+                            name_of(&self.catalog, *table)
+                        ),
+                    ));
+                }
+                Ok(*offset)
+            }
+            Value::Node { table, offset } => {
+                Err(wrong_end(&self.catalog, *table, *offset, want, side))
+            }
             other => Err(ZuError::gql(
-                zu_common::gqlstatus::codes::C22G03,
+                codes::C22G03,
                 format!(
                     "an edge {side} an element, and this one {}",
                     match other {
@@ -245,6 +304,63 @@ pub(crate) fn stage(txn: &mut WriteTxn<'_>, new: &[NewNode], edges: &[NewRel]) -
         rows += 1;
     }
     Ok(rows)
+}
+
+/// The condition an endpoint in the wrong table is.
+///
+/// Which one it is turns on the graph. A row of another graph is not an
+/// element of the graph being written at all, and the standard has a
+/// code saying exactly that. A row of this graph in a table the rel
+/// table does not run between is an element of the right graph and the
+/// wrong type, which is the other code. The binder turns away every
+/// case it can see, but a slot a match left open over several tables is
+/// one only the row settles.
+fn wrong_end(catalog: &Catalog, table: u32, offset: u64, want: u32, side: &str) -> ZuError {
+    let graph_of = |id: u32| catalog.node_by_id(id).map(|t| t.graph);
+    if graph_of(table) != graph_of(want) {
+        return ZuError::gql(
+            codes::CG1003,
+            format!(
+                "an edge {side} row {offset} of '{}', which is not in the graph the edge is being written in",
+                name_of(catalog, table)
+            ),
+        );
+    }
+    ZuError::gql(
+        codes::C22G0W,
+        format!(
+            "an edge {side} an element of '{}', and row {offset} is in '{}'",
+            name_of(catalog, want),
+            name_of(catalog, table)
+        ),
+    )
+}
+
+/// A node table's name, for a message that has to say which table a row
+/// is in.
+fn name_of(catalog: &Catalog, table: u32) -> &str {
+    catalog.node_by_id(table).map_or("?", |t| t.name.as_str())
+}
+
+/// Refuses a pattern writing more properties than an element holds.
+///
+/// zu declares a finite limit rather than calling itself unlimited,
+/// because a declared limit is a limit an encoding can be built on, and
+/// this is the one the plan writes down (plan/07 §2.4). The count is
+/// the pattern's own, so it is settled once per statement and before
+/// any column is read: a pattern this wide is refused whatever the
+/// table holds.
+fn room_for(props: &[(String, BoundExpr)], noun: &str, status: GqlStatus) -> Result<()> {
+    if props.len() <= MAX_PROPERTIES {
+        return Ok(());
+    }
+    Err(ZuError::gql(
+        status,
+        format!(
+            "the {noun} carries {} properties, and zu holds {MAX_PROPERTIES} on one",
+            props.len()
+        ),
+    ))
 }
 
 /// The property columns of a node table, empty for a table that stores
@@ -1057,6 +1173,138 @@ mod tests {
             err.to_string()
                 .contains("profiling a statement that writes"),
             "says what it will not do: {err}"
+        );
+    }
+    /// An element carries at most what zu declares it carries, and the
+    /// limit is declared rather than absent so that a statement asking
+    /// for more is told the standard's answer for hitting one. The
+    /// count is the pattern's own, so this is settled before a column
+    /// is read and the table it names never matters.
+    #[test]
+    fn an_element_carrying_more_properties_than_zu_holds_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "wide-element.zu1");
+
+        let props: Vec<String> = (0..=MAX_PROPERTIES).map(|n| format!("p{n}: {n}")).collect();
+        let err = session
+            .run(&format!("INSERT (x:person {{{}}})", props.join(", ")), &[])
+            .expect_err("wider than an element goes");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G0S"));
+        assert!(err.to_string().contains("4096"), "got: {err}");
+    }
+
+    /// The same limit on an edge, which the standard gives its own code
+    /// because an engine can hold different numbers on the two.
+    #[test]
+    fn an_edge_carrying_more_properties_than_zu_holds_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "wide-edge.zu1");
+
+        let props: Vec<String> = (0..=MAX_PROPERTIES).map(|n| format!("p{n}: {n}")).collect();
+        let err = session
+            .run(
+                &format!(
+                    "MATCH (a:person {{name: 'ada'}}), (b:person {{name: 'kay'}}) INSERT (a)-[e:knows {{{}}}]->(b)",
+                    props.join(", ")
+                ),
+                &[],
+            )
+            .expect_err("wider than an edge goes");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G0T"));
+        assert!(err.to_string().contains("4096"), "got: {err}");
+    }
+
+    /// A delete leaves the element bound, so the same statement can go
+    /// on to write an edge onto it. The row is not there any more, and
+    /// an edge to a row that is not there is an edge no reader can
+    /// resolve, so it is refused by the code the standard has for
+    /// exactly that rather than written into the neighbour lists.
+    #[test]
+    fn an_edge_onto_an_element_a_delete_took_away_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "deleted-end.zu1");
+
+        let err = session
+            .run(
+                "MATCH (a:person {name: 'ada'}), (b:person {name: 'kay'}) DETACH DELETE b INSERT (a)-[e:knows]->(b)",
+                &[],
+            )
+            .expect_err("the far end is gone");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("G1002"));
+        assert!(err.to_string().contains("taken away"), "got: {err}");
+    }
+
+    /// A rel table runs between two node tables and a statement can
+    /// name an element in neither of them. Where the binder can see
+    /// which table an endpoint is bound over it settles it there, and
+    /// this is that case.
+    #[test]
+    fn an_edge_onto_an_element_of_another_table_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "wrong-table.zu1");
+
+        session
+            .run("INSERT (c:city {name: 'oslo'})", &[])
+            .expect("a second table");
+        let err = session
+            .run(
+                "MATCH (a:person {name: 'ada'}), (c:city) INSERT (a)-[e:knows]->(c)",
+                &[],
+            )
+            .expect_err("the far end is the wrong table");
+        assert_eq!(
+            err.gqlstatus().map(|s| s.code()),
+            Some("42002"),
+            "got: {err}"
+        );
+    }
+
+    /// The write asks the same question again, because a slot the
+    /// binder left open over several tables is only one table by the
+    /// time a row of it is in hand. Which of the two answers comes
+    /// back turns on whether the element is in the graph being written
+    /// in at all: another table of the same graph is a type question,
+    /// and another graph is a reference to something the statement is
+    /// not working on.
+    #[test]
+    fn the_write_names_the_table_and_the_graph_an_endpoint_missed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "ends.zu1");
+
+        session
+            .run("INSERT (c:city {name: 'oslo'})", &[])
+            .expect("a second table of the same graph");
+        session
+            .run("CREATE GRAPH other AS COPY OF home", &[])
+            .expect("a second graph");
+        let catalog = session.catalog().clone();
+
+        let person = catalog.node_by_name("person").expect("person").id;
+        let city = catalog.node_by_name("city").expect("city").id;
+        let elsewhere = catalog
+            .node_tables()
+            .iter()
+            .find(|t| t.name == "person" && t.id != person)
+            .expect("the copy")
+            .id;
+
+        let same = wrong_end(&catalog, city, 0, person, "arrives at");
+        assert_eq!(
+            same.gqlstatus().map(|s| s.code()),
+            Some("22G0W"),
+            "got: {same}"
+        );
+        assert!(same.to_string().contains("city"), "got: {same}");
+
+        let across = wrong_end(&catalog, elsewhere, 0, person, "leaves");
+        assert_eq!(
+            across.gqlstatus().map(|s| s.code()),
+            Some("G1003"),
+            "got: {across}"
+        );
+        assert!(
+            across.to_string().contains("not in the graph"),
+            "got: {across}"
         );
     }
 }

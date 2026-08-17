@@ -72,6 +72,43 @@ fn bad_type(detail: String) -> ZuError {
     ZuError::gql(codes::C22G03, detail)
 }
 
+/// Refuses a clause that assigns to one property of one element twice.
+///
+/// `SET n.a = 1, n.a = 2` names an element that holds two values for
+/// `a` afterwards, which is not an element, and the standard has a code
+/// for saying so rather than an order of evaluation to lean on. The
+/// whole record is the same assignment written the other way round, so
+/// `SET n = {a: 1}, n.a = 2` is refused too, and a second whole record
+/// is the plainest case there is.
+///
+/// The check is per clause. Two `SET` clauses one after the other are
+/// two assignments in sequence, and the second reading what the first
+/// wrote is the whole point of writing them that way.
+fn once_each(verb: &str, items: &[BoundSetItem]) -> Result<()> {
+    for (at, item) in items.iter().enumerate() {
+        let clash = items[..at].iter().find(|before| {
+            before.target == item.target
+                && match (&before.into, &item.into) {
+                    (BoundSetInto::Labels { .. }, _) | (_, BoundSetInto::Labels { .. }) => false,
+                    (BoundSetInto::Record, _) | (_, BoundSetInto::Record) => true,
+                    (BoundSetInto::Property(a), BoundSetInto::Property(b)) => a == b,
+                }
+        });
+        let Some(clash) = clash else { continue };
+        let what = match (&clash.into, &item.into) {
+            (BoundSetInto::Property(key), BoundSetInto::Property(_)) => {
+                format!("property '{key}' of one element twice")
+            }
+            _ => "one element's whole record and a property of it".to_string(),
+        };
+        return Err(ZuError::gql(
+            codes::C22G0M,
+            format!("this {verb} assigns to {what}, and an element holds one value per property"),
+        ));
+    }
+    Ok(())
+}
+
 /// One existence block lifted out of a WHERE, with the NOT in front of
 /// it folded in: `NOT EXISTS { ... }` is the same match asked the other
 /// way round, and asking it the other way round is one flag rather than
@@ -1440,6 +1477,7 @@ impl Binder<'_> {
                 for item in items {
                     bound.push(self.bind_set_item(item)?);
                 }
+                once_each("SET", &bound)?;
                 Ok(BoundClause::Set {
                     items: bound,
                     carry,
@@ -1451,6 +1489,7 @@ impl Binder<'_> {
                 for item in items {
                     bound.push(self.bind_remove_item(item)?);
                 }
+                once_each("REMOVE", &bound)?;
                 Ok(BoundClause::Set {
                     items: bound,
                     carry,

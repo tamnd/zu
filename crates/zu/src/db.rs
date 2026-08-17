@@ -145,6 +145,38 @@ impl Database {
         Ok(db)
     }
 
+    /// Creates a database at `path` and opens it, with the default
+    /// configuration.
+    ///
+    /// The path must not exist. A create that found a database there
+    /// and opened it instead would be the call that quietly writes into
+    /// data somebody else put there, and the caller who wanted either
+    /// one has [`Database::open`] to fall back to and a decision to make
+    /// about which.
+    ///
+    /// What it makes is a valid database with nothing in it: a file
+    /// header, a database header, and no tables. Statements make the
+    /// tables, and until v0 grows one that does, a bulk load is what
+    /// puts rows in.
+    pub fn create(path: impl AsRef<Path>) -> Result<Database> {
+        Database::create_with(path, Config::default())
+    }
+
+    /// [`Database::create`] with a configuration.
+    pub fn create_with(path: impl AsRef<Path>, config: Config) -> Result<Database> {
+        if config.read_only {
+            return Err(ZuError::InvalidArgument(
+                "a database created read-only is one nothing could ever put a row in".to_string(),
+            ));
+        }
+        // Created and closed again, so that what comes back is a
+        // database opened the same way `open` opens one, rather than a
+        // second path through this module that a caller could tell from
+        // the first.
+        drop(Zu1File::create(path.as_ref())?);
+        Database::open_with(path, config)
+    }
+
     /// Where this database lives.
     pub fn path(&self) -> &Path {
         &self.path
@@ -316,6 +348,48 @@ mod tests {
         let db = Database::open(&path).expect("open");
         assert_eq!(db.path(), path);
         assert_eq!(db.config(), &Config::default());
+    }
+
+    #[test]
+    fn a_database_is_created_empty_and_statements_run_against_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fresh.zu1");
+        let db = Database::create(&path).expect("create");
+        assert!(path.exists(), "the file is on disk when create returns");
+        let mut conn = db.connect().expect("connect");
+        let rows = conn.query("RETURN 1 AS n").expect("query");
+        assert_eq!(rows.rows.len(), 1);
+        // Empty is empty: a table nobody made is a table nothing finds.
+        assert!(conn.query("MATCH (p:person) RETURN p").is_err());
+        // And what create wrote is what open reads, rather than a file
+        // only the handle that made it can use.
+        Database::open(&path).expect("open");
+    }
+
+    #[test]
+    fn creating_a_database_where_one_is_already_refuses_rather_than_adding_to_it() {
+        let (_dir, path) = scratch("taken.zu1");
+        let err = Database::create(&path).expect_err("refused");
+        assert!(matches!(err, ZuError::Io(_)), "{err}");
+        // And the database that was there is untouched.
+        let mut conn = Database::open(&path).expect("open").connect().expect("c");
+        assert_eq!(
+            conn.query("MATCH (p:person) RETURN p")
+                .expect("query")
+                .rows
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn a_read_only_create_is_a_contradiction_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("frozen.zu1");
+        let err =
+            Database::create_with(&path, Config::default().read_only(true)).expect_err("refused");
+        assert!(err.to_string().contains("read-only"), "{err}");
+        assert!(!path.exists(), "and nothing was written");
     }
 
     #[test]

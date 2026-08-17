@@ -826,6 +826,49 @@ pub unsafe extern "C" fn zu_database_open_z(
     unsafe { zu_database_open(path, zlen(path), cfg, out, err) }
 }
 
+/// Creates a database and opens it. `cfg` may be NULL for the
+/// defaults.
+///
+/// The path must not exist. A create that opened what it found there
+/// would be the call that quietly writes into somebody else's data, and
+/// a host that wants either one has [`zu_database_open`] to fall back
+/// to and a decision to make about which.
+///
+/// What it makes is a valid database with nothing in it. That is the
+/// entry point a C host had no way to reach before: bulk load makes a
+/// database with a table in it, and a host wanting an empty one to run
+/// statements against had nowhere to start.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_database_create(
+    path: *const c_char,
+    path_len: usize,
+    cfg: *const ZuConfig,
+    out: *mut *mut ZuDatabase,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let path = unsafe { counted(path, path_len, "path") }?;
+        let db = Database::create_with(Path::new(path), unsafe { config_of(cfg) }?)?;
+        let stored = c_message(path);
+        unsafe { *out = Box::into_raw(Box::new(ZuDatabase { db, path: stored })) };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_database_create_z(
+    path: *const c_char,
+    cfg: *const ZuConfig,
+    out: *mut *mut ZuDatabase,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_database_create(path, zlen(path), cfg, out, err) }
+}
+
 /// The path this database was opened with, valid until it is closed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_database_path(
@@ -920,6 +963,37 @@ pub unsafe extern "C" fn zu_open_z(
     err: *mut *mut ZuError,
 ) -> ZuStatus {
     unsafe { zu_open(path, zlen(path), out, err) }
+}
+
+/// Creates a database and one connection on it, for the host that
+/// wants exactly one. [`zu_open`] for a database that is already there,
+/// [`zu_database_create`] for a configuration or a second connection.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_create(
+    path: *const c_char,
+    path_len: usize,
+    out: *mut *mut ZuConn,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let path = unsafe { counted(path, path_len, "path") }?;
+        let conn = Database::create(Path::new(path))?.connect()?;
+        unsafe { *out = ZuConn::new(conn).into_raw() };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_create_z(
+    path: *const c_char,
+    out: *mut *mut ZuConn,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_create(path, zlen(path), out, err) }
 }
 
 /// Closes a connection. Statements prepared on it can still be closed

@@ -31,11 +31,28 @@ fn one_process_serves_statements_frames_and_errors() {
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let mut lines = stdout.lines();
+    // The greeting comes before anything is asked, which is how a
+    // client learns whether it speaks this version at all.
+    let hello = lines.next().expect("a greeting").expect("read");
+    assert!(
+        hello.starts_with("{\"protocol\":1,\"zu\":\""),
+        "got {hello}"
+    );
+    assert!(hello.contains("\"c_abi\":"), "got {hello}");
+    assert!(hello.contains("\"features\":["), "got {hello}");
+    // The name only: a path is spelled with backslashes on Windows and
+    // JSON escapes those, so the whole string is not the same string.
+    assert!(hello.contains("\"file\":\""), "got {hello}");
+    assert!(hello.contains("shell.zu1"), "got {hello}");
     let mut ask = |line: &str| -> String {
         writeln!(stdin, "{line}").expect("write");
         stdin.flush().expect("flush");
         lines.next().expect("a response line").expect("read")
     };
+
+    // And asking for it again gives the same object, for the client
+    // that attached to a session somebody else started.
+    assert_eq!(ask(r#"{"op":"hello"}"#), hello);
 
     // A bare statement, folded onto one line the way a client sends it.
     let r = ask(r"MATCH (a:person {id: 3})-[:follows]->(b)\nRETURN count(b) AS n");
@@ -112,6 +129,22 @@ fn one_process_serves_statements_frames_and_errors() {
         r,
         "{\"gqlstatus\":\"00000\",\"columns\":[\"n\"],\"rows\":[[97]]}"
     );
+
+    // A list parameter goes in as a list, which is what makes the
+    // corpus's IN predicates expressible over the wire.
+    let r = ask(
+        r#"{"op":"query","q":"MATCH (a:person) WHERE a.id IN $ids RETURN count(a) AS n","params":{"ids":[1,2,3]}}"#,
+    );
+    assert_eq!(
+        r,
+        "{\"gqlstatus\":\"00000\",\"columns\":[\"n\"],\"rows\":[[3]]}"
+    );
+
+    // An unknown op is a protocol fault and says so without inventing a
+    // condition code for it.
+    let r = ask(r#"{"op":"sing"}"#);
+    assert!(r.contains("unknown op"), "got {r}");
+    assert!(!r.contains("gqlstatus"), "got {r}");
 
     let r = ask(r#"{"op":"quit"}"#);
     assert_eq!(r, "{\"bye\":true}");

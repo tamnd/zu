@@ -36,6 +36,18 @@ mod term;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The optional parts this build was compiled with, in one place
+/// because two commands answer with them and a build that reported
+/// different features to `zu version` and to a protocol greeting would
+/// be a bug nobody could see from either one alone.
+pub(crate) fn features() -> Vec<&'static str> {
+    if cfg!(feature = "arrow") {
+        vec!["arrow"]
+    } else {
+        Vec::new()
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `zu <command> --help` is that command's page, wherever the flag
@@ -218,11 +230,7 @@ fn version_command(args: &[String]) -> ExitCode {
     if !rest.is_empty() {
         return usage_error("version");
     }
-    let features: Vec<&str> = if cfg!(feature = "arrow") {
-        vec!["arrow"]
-    } else {
-        Vec::new()
-    };
+    let features = features();
     // Both are compiled in rather than optional: zu1 is the format and
     // sqlite is the other end of `convert`, which needs no feature
     // because it is a reader and a writer we wrote.

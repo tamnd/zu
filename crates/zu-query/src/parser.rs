@@ -18,7 +18,7 @@ use crate::ast::{
     PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
     RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, Statement, TxnStmt, UnaryOp,
 };
-use crate::lexer::{Token, TokenKind, lex, position};
+use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
 
 /// A name written where a value type belongs and spelling none.
@@ -126,9 +126,10 @@ impl Parser<'_> {
 
     fn error(&self, expected: &str) -> ZuError {
         match self.peek() {
-            Some(token) => ZuError::gql_at(
+            Some(token) => ZuError::gql_in(
                 codes::C42001,
-                position(self.source, token.start),
+                self.source,
+                token.start,
                 format_args!("expected {expected}, found {}", token.kind.describe()),
             ),
             // The end of the text is a place, but it is not a place any
@@ -258,9 +259,10 @@ impl Parser<'_> {
         };
         self.eat(&TokenKind::Semicolon);
         if let Some(token) = self.peek() {
-            return Err(ZuError::gql_at(
+            return Err(ZuError::gql_in(
                 codes::C42001,
-                position(self.source, token.start),
+                self.source,
+                token.start,
                 format_args!(
                     "nothing may follow a transaction statement, found {}",
                     token.kind.describe()
@@ -321,9 +323,10 @@ impl Parser<'_> {
         };
         self.eat(&TokenKind::Semicolon);
         if let Some(token) = self.peek() {
-            return Err(ZuError::gql_at(
+            return Err(ZuError::gql_in(
                 codes::C42001,
-                position(self.source, token.start),
+                self.source,
+                token.start,
                 format_args!(
                     "nothing may follow a catalog statement, found {}",
                     token.kind.describe()
@@ -932,9 +935,10 @@ impl Parser<'_> {
                 clauses.push(Clause::Return { projection });
                 self.eat(&TokenKind::Semicolon);
                 if let Some(token) = self.peek() {
-                    return Err(ZuError::gql_at(
+                    return Err(ZuError::gql_in(
                         codes::C42001,
-                        position(self.source, token.start),
+                        self.source,
+                        token.start,
                         format_args!("nothing may follow RETURN, found {}", token.kind.describe()),
                     ));
                 }
@@ -950,9 +954,10 @@ impl Parser<'_> {
                 // from asked a question and threw the answer away.
                 self.eat(&TokenKind::Semicolon);
                 if let Some(token) = self.peek() {
-                    return Err(ZuError::gql_at(
+                    return Err(ZuError::gql_in(
                         codes::C42001,
-                        position(self.source, token.start),
+                        self.source,
+                        token.start,
                         format_args!(
                             "nothing may follow the end of a statement, found {}",
                             token.kind.describe()
@@ -961,9 +966,10 @@ impl Parser<'_> {
                 }
                 return Ok(Query { use_graph, clauses });
             } else if let Some(kw) = UNIMPLEMENTED.iter().find(|kw| self.at_kw(kw)) {
-                return Err(ZuError::gql_at(
+                return Err(ZuError::gql_in(
                     codes::C42001,
-                    position(self.source, self.peek().expect("peeked").start),
+                    self.source,
+                    self.peek().expect("peeked").start,
                     format_args!(
                         "{kw} is not implemented yet, the v0 core is MATCH, WHERE, CALL, UNWIND, WITH, RETURN"
                     ),
@@ -984,9 +990,10 @@ impl Parser<'_> {
     fn parse_delete_target(&mut self) -> Result<String> {
         let name = self.expect_name("a variable after DELETE")?;
         if self.at(&TokenKind::Dot) {
-            return Err(ZuError::gql_at(
+            return Err(ZuError::gql_in(
                 codes::C42001,
-                position(self.source, self.peek().expect("peeked").start),
+                self.source,
+                self.peek().expect("peeked").start,
                 format_args!(
                     "DELETE takes away an element and not a property, and '{name}' is followed by one"
                 ),
@@ -1289,18 +1296,20 @@ impl Parser<'_> {
             left_tilde
         };
         if left_tilde != right_tilde {
-            return Err(ZuError::gql_at(
+            return Err(ZuError::gql_in(
                 codes::C42001,
-                position(self.source, self.tokens[self.pos - 1].start),
+                self.source,
+                self.tokens[self.pos - 1].start,
                 "a relationship is undirected at both ends or at neither",
             ));
         }
         let outbound = self.eat(&TokenKind::Gt);
         let direction = match (inbound, left_tilde, outbound) {
             (true, true, true) => {
-                return Err(ZuError::gql_at(
+                return Err(ZuError::gql_in(
                     codes::C42001,
-                    position(self.source, self.tokens[self.pos - 1].start),
+                    self.source,
+                    self.tokens[self.pos - 1].start,
                     "an undirected relationship cannot point both ways",
                 ));
             }
@@ -1590,9 +1599,10 @@ impl Parser<'_> {
                 // literal, it just names a value no exact numeric type
                 // here can hold, which is what 22003 is for.
                 let v = i64::try_from(v).map_err(|_| {
-                    ZuError::gql_at(
+                    ZuError::gql_in(
                         codes::C22003,
-                        position(self.source, token.start),
+                        self.source,
+                        token.start,
                         "integer literal out of range",
                     )
                 })?;
@@ -3325,15 +3335,17 @@ mod tests {
         assert!(parse_err("MATCH (p:person) REMOVE p:").contains("a label"));
     }
 
-    /// Every syntax error that names a place carries that place as a
-    /// pair as well as saying it, so a caller can point at the token
+    /// Every syntax error that names a place carries that place as
+    /// fields as well as saying it, so a caller can point at the token
     /// without reading the numbers back out of the sentence.
     #[test]
     fn a_syntax_error_carries_its_place_and_still_says_it() {
-        let e = parse("MATCH (n) RETURN n RETURN n").expect_err("should fail");
+        let source = "MATCH (n) RETURN n RETURN n";
+        let e = parse(source).expect_err("should fail");
         assert_eq!(
             e.position(),
             Some(Position {
+                offset: 19,
                 line: 1,
                 column: 20
             })
@@ -3342,27 +3354,43 @@ mod tests {
             e.to_string().starts_with("42001: line 1, column 20: "),
             "{e}"
         );
+        // The offset is the same place counted the way a program reads
+        // it, so the token the message is about can be sliced out.
+        assert_eq!(&source[19..], "RETURN n");
 
         // A second line is counted as a second line, and the column
-        // starts over on it.
+        // starts over on it while the offset keeps counting.
         let e = parse("MATCH (n)\n  RETURN n RETURN n").expect_err("should fail");
         assert_eq!(
             e.position(),
             Some(Position {
+                offset: 21,
                 line: 2,
                 column: 12
             })
         );
+        // And the line it is on comes back with it, so whatever prints
+        // this does not need the query to show where it went wrong.
+        assert_eq!(e.excerpt(), Some("  RETURN n RETURN n"));
 
         // The lexer's own failures are positioned the same way, since
         // a caller cannot tell which half of the front end refused it.
         let e = parse("RETURN 'unterminated").expect_err("should fail");
-        assert_eq!(e.position(), Some(Position { line: 1, column: 8 }));
+        assert_eq!(
+            e.position(),
+            Some(Position {
+                offset: 7,
+                line: 1,
+                column: 8
+            })
+        );
+        assert_eq!(e.excerpt(), Some("RETURN 'unterminated"));
 
         // Running out of text is not a place any token is at, so that
-        // one says so in words and carries no pair.
+        // one says so in words and carries no place and no line.
         let e = parse("MATCH (n) WHERE").expect_err("should fail");
         assert_eq!(e.position(), None);
+        assert_eq!(e.excerpt(), None);
         assert!(e.to_string().contains("unexpected end of query"), "{e}");
     }
 

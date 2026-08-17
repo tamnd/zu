@@ -272,6 +272,58 @@ impl<'a> Zu1Graph<'a> {
     /// group directory rather than off the table index. They share the
     /// one map because a catalog id names a node table or a rel table
     /// and never both.
+    /// The weighted shortest-path kernel, which needs the rel's CSR and
+    /// the rel's property columns at once and so does not fit the
+    /// borrow the other table functions share.
+    fn sssp_weighted(&mut self, rel: u32, args: &[Value]) -> Result<Vec<Vec<Value>>> {
+        let (Some(Value::Int(source)), Some(Value::Str(column))) = (args.first(), args.get(1))
+        else {
+            return Err(ZuError::InvalidArgument(
+                "sssp_weighted needs a source node offset and a weight column name".into(),
+            ));
+        };
+        self.ensure_rel_props(rel)?;
+        let Self {
+            db, readers, props, ..
+        } = self;
+        let Some(reader) = props.get_mut(&rel).expect("just loaded") else {
+            return Err(ZuError::InvalidArgument(format!(
+                "rel table {rel} stores no edge properties, so it has no column '{column}'"
+            )));
+        };
+        let Some(col) = reader.col(column) else {
+            return Err(ZuError::InvalidArgument(format!(
+                "no edge property column '{column}'"
+            )));
+        };
+        let mut weights = Vec::new();
+        reader.read_int_column(db, col, &mut weights)?;
+        // Dijkstra settles a node once and never looks at it again,
+        // which is only right when no edge can shorten a path that
+        // already reached it. A negative weight is that edge, so it is
+        // refused rather than answered with a distance that is not the
+        // shortest one.
+        if let Some(bad) = weights.iter().position(|&w| (w as i64) < 0) {
+            return Err(ZuError::InvalidArgument(format!(
+                "edge {bad} weighs {}, and a shortest path is not defined over a negative weight",
+                weights[bad] as i64
+            )));
+        }
+        let graph = readers
+            .get_mut(&rel)
+            .expect("the props load read the reader in");
+        Ok(algo::sssp_weighted(db, graph, *source as u64, &weights)?
+            .into_iter()
+            .map(|dist| {
+                vec![if dist == u64::MAX {
+                    Value::Null
+                } else {
+                    Value::Int(dist as i64)
+                }]
+            })
+            .collect())
+    }
+
     fn ensure_rel_props(&mut self, rel: u32) -> Result<()> {
         if self.props.contains_key(&rel) {
             return Ok(());
@@ -523,6 +575,9 @@ impl Graph for Zu1Graph<'_> {
     }
 
     fn table_function(&mut self, name: &str, rel: u32, args: &[Value]) -> Result<Vec<Vec<Value>>> {
+        if name == "sssp_weighted" {
+            return self.sssp_weighted(rel, args);
+        }
         self.ensure_reader(rel)?;
         let Self { db, readers, .. } = self;
         let reader = readers.get_mut(&rel).expect("just loaded");
@@ -1973,6 +2028,76 @@ mod tests {
         )
         .expect("compose");
         assert_eq!(r.rows, [[Value::Int(1)]]);
+    }
+
+    #[test]
+    fn sssp_weighted_runs_through_call_over_a_stored_weight_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("weighted.zu1");
+        use crate::zu1::props::{PropValues, store_rel_props};
+
+        let mut db = Zu1File::create(&path).expect("create");
+        // 0 -> 1 direct and expensive, 0 -> 2 -> 1 round the back and
+        // cheap, and 0 -> 1 a second time cheaper than the first. Node
+        // 3 is only reachable against the arrows, which a weighted run
+        // does not follow.
+        let edges: [(u32, u32); 5] = [(0, 1), (0, 1), (0, 2), (2, 1), (3, 0)];
+        graph::bulk_load_as(&mut db, "person", "follows", 4, &edges).expect("load");
+        store_rel_props(
+            &mut db,
+            "follows",
+            &[("w", PropValues::Int(&[10, 6, 1, 2, 1]))],
+        )
+        .expect("weights");
+        drop(db);
+        let mut db = Zu1File::open(&path).expect("open");
+
+        let r = run(
+            "CALL sssp_weighted('follows', 0, 'w') YIELD node, distance \
+             RETURN node.id AS id, distance ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("sssp_weighted");
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Int(0)],
+                [Value::Int(1), Value::Int(3)],
+                [Value::Int(2), Value::Int(1)],
+                [Value::Int(3), Value::Null],
+            ]
+        );
+
+        // Hop counting over the same table is a different answer: it
+        // walks both ways and every edge costs one.
+        let r = run(
+            "CALL sssp('follows', 0) YIELD node, distance \
+             RETURN node.id AS id, distance ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("sssp");
+        assert_eq!(
+            r.rows,
+            [
+                [Value::Int(0), Value::Int(0)],
+                [Value::Int(1), Value::Int(1)],
+                [Value::Int(2), Value::Int(1)],
+                [Value::Int(3), Value::Int(1)],
+            ]
+        );
+
+        let err = run(
+            "CALL sssp_weighted('follows', 0, 'nope') YIELD node, distance RETURN distance",
+            &mut db,
+            &[],
+        )
+        .expect_err("unknown column");
+        assert!(
+            err.to_string().contains("no edge property column 'nope'"),
+            "got: {err}"
+        );
     }
 
     #[test]

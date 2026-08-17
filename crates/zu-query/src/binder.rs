@@ -779,7 +779,8 @@ pub enum BoundClause {
         rel: u32,
         /// The rel's node table, the type of the `node` column.
         table: u32,
-        /// Arguments after the rel name, the sssp source key.
+        /// Arguments after the rel name: the sssp source key, and the
+        /// weight column's name where the kernel takes one.
         args: Vec<BoundExpr>,
         /// One slot per YIELD column, node first.
         slots: Vec<usize>,
@@ -1065,6 +1066,9 @@ pub enum TableFunc {
     Bfs,
     /// Hop levels over the undirected view. Takes a source.
     Sssp,
+    /// Shortest paths over an edge weight column, following stored
+    /// edge direction. Takes a source and the column's name.
+    SsspWeighted,
     Cdlp,
     Lcc,
     Louvain,
@@ -1077,6 +1081,7 @@ impl TableFunc {
             "wcc" => TableFunc::Wcc,
             "bfs" => TableFunc::Bfs,
             "sssp" => TableFunc::Sssp,
+            "sssp_weighted" => TableFunc::SsspWeighted,
             "cdlp" => TableFunc::Cdlp,
             "lcc" => TableFunc::Lcc,
             "louvain" => TableFunc::Louvain,
@@ -1091,6 +1096,7 @@ impl TableFunc {
             TableFunc::Wcc => "wcc",
             TableFunc::Bfs => "bfs",
             TableFunc::Sssp => "sssp",
+            TableFunc::SsspWeighted => "sssp_weighted",
             TableFunc::Cdlp => "cdlp",
             TableFunc::Lcc => "lcc",
             TableFunc::Louvain => "louvain",
@@ -1105,7 +1111,7 @@ impl TableFunc {
             TableFunc::Pagerank => ("rank", Type::Float),
             TableFunc::Wcc => ("component", Type::Int),
             TableFunc::Bfs => ("level", Type::Int),
-            TableFunc::Sssp => ("distance", Type::Int),
+            TableFunc::Sssp | TableFunc::SsspWeighted => ("distance", Type::Int),
             TableFunc::Cdlp => ("community", Type::Int),
             TableFunc::Lcc => ("coefficient", Type::Float),
             TableFunc::Louvain => ("community", Type::Int),
@@ -1565,7 +1571,7 @@ impl Binder<'_> {
         let func = TableFunc::resolve(name).ok_or_else(|| {
             invalid(format!(
                 "unknown table function '{name}', the v0 functions are \
-                 pagerank, wcc, bfs, sssp, cdlp, lcc, louvain"
+                 pagerank, wcc, bfs, sssp, sssp_weighted, cdlp, lcc, louvain"
             ))
         })?;
         // The rel table must resolve at bind time, so the first
@@ -1607,6 +1613,29 @@ impl Binder<'_> {
                         "{name}'s source must be a node id, got {}",
                         bound_args[0].1
                     )));
+                }
+            }
+            TableFunc::SsspWeighted => {
+                // The weight column is named rather than assumed: a rel
+                // table can carry several numeric columns and which one
+                // is a distance is the caller's to say.
+                if bound_args.len() != 2 {
+                    return Err(invalid(
+                        "sssp_weighted takes the rel table, a source node id, and the name of \
+                         the weight column"
+                            .into(),
+                    ));
+                }
+                if !matches!(bound_args[0].1, Type::Int | Type::Any) {
+                    return Err(invalid(format!(
+                        "sssp_weighted's source must be a node id, got {}",
+                        bound_args[0].1
+                    )));
+                }
+                if !matches!(args[2], Expr::Literal(Literal::Str(_))) {
+                    return Err(invalid(
+                        "sssp_weighted's weight column must be a string literal".into(),
+                    ));
                 }
             }
             TableFunc::Cdlp => {

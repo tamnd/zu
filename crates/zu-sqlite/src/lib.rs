@@ -880,7 +880,10 @@ impl SqliteStore {
         for col in columns {
             sql.push_str(&format!(", p_{}", ident(col)?));
         }
-        sql.push_str(&format!(" FROM r_{table} ORDER BY src, dst"));
+        // rowid breaks the tie a repeated pair leaves, so two edges
+        // over one pair come back in the order they were inserted and
+        // the ordinals they take on the other side are that order.
+        sql.push_str(&format!(" FROM r_{table} ORDER BY src, dst, rowid"));
         let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
         let rows = stmt
             .query_map([], |row| {

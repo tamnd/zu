@@ -260,8 +260,8 @@ mod tests {
         assert_eq!(order, vec![2, 1, 0, 3]);
         // Every input position appears once, which is what makes it
         // safe to move a property column by it, and the pair that
-        // appears twice keeps input order so the two stay adjacent for
-        // whoever refuses them.
+        // appears twice keeps input order, so the copy written first in
+        // the file is the copy the first of the two slots gets.
         let mut seen = order.clone();
         seen.sort_unstable();
         assert_eq!(seen, vec![0, 1, 2, 3]);

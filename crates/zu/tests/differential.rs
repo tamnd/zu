@@ -147,8 +147,8 @@ fn run_seed(seed: u64) {
         ],
     )
     .unwrap();
-    let wal = Wal::open(&wal_path).unwrap();
-    let mvcc = recover(&mut db, &wal).unwrap();
+    let mut wal = Wal::open(&wal_path).unwrap();
+    let mvcc = recover(&mut db, &mut wal).unwrap();
     let catalog = Catalog::load(&mut db).unwrap();
     let person = catalog.node_by_name("person").unwrap().id;
     let knows = catalog.rel_by_name("knows").unwrap().id;
@@ -281,8 +281,8 @@ fn run_seed(seed: u64) {
     // A cold zu1 reopen must land on the same answers the oracle holds.
     drop(zu.mvcc);
     let mut db = Zu1File::open(&db_path).unwrap();
-    let wal = Wal::open(&wal_path).unwrap();
-    let mvcc = recover(&mut db, &wal).unwrap();
+    let mut wal = Wal::open(&wal_path).unwrap();
+    let mvcc = recover(&mut db, &mut wal).unwrap();
     let mut zu = Zu1Side {
         db,
         wal,

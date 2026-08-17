@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use zu_common::{Result, ZuError};
+use zu_common::{Epoch, Result, ZuError};
 
 use crate::cache::{BlockCache, CacheStats, DecodedPool, PinnedBlock};
 use crate::segment::ChunkDirectory;
@@ -65,6 +65,36 @@ pub const DB_HEADER_SIZE: usize = 4096;
 
 /// Serialized DatabaseHeader body length; the crc32c follows immediately.
 const DB_HEADER_BODY: usize = 56;
+
+/// Where the state an open transaction is holding is kept, which is a
+/// third slot of the same shape as the two the checkpoint flips
+/// between, in the header block after them.
+///
+/// It is in the database file rather than beside it for two reasons. A
+/// file of its own would need its directory entry to be durable before
+/// the first write of the transaction, which is a sync nothing else
+/// here pays, and the crash harness builds its images out of the writes
+/// to the database and the log, so a third file would be a piece of the
+/// commit protocol no image ever shows. The region was zeroed in every
+/// file ever written, and a zeroed slot fails its crc, so a file from
+/// before this reads as one with no transaction open, which is what it
+/// is.
+const TXN_SLOT: u64 = (FILE_HEADER_SIZE + 2 * DB_HEADER_SIZE) as u64;
+
+/// Where the log floor sits inside the marker slot, after the header
+/// and its crc, with a crc of its own over everything before it.
+///
+/// The floor is the newest epoch the log held when the transaction
+/// began, and it is what says which frames are the transaction's own.
+/// It cannot be read off the kept header, whose `wal_seq` is only as
+/// new as the last fold: a rollback cutting the log back to that would
+/// take frames with it that were committed before the transaction and
+/// belong to whoever committed them. A marker whose floor does not
+/// check out reads as no marker at all, which is the right reading of
+/// a torn one: the write that puts it down returns before the first
+/// commit inside the transaction reaches the log, so a transaction
+/// caught mid marker has nothing durable to take back.
+const TXN_FLOOR: usize = 64;
 
 /// Write-once identity of a zu1 file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +234,37 @@ impl DatabaseHeader {
     }
 }
 
+/// What a transaction the process died inside left on a file.
+///
+/// Both halves are needed to take it back. The file has to be published
+/// past what the crash left, or the header the transaction wrote wins
+/// the next open by being the newer of the two slots, and the log has
+/// to be cut back to where it stood when the transaction began, or
+/// replay puts what the transaction committed back as overlays over the
+/// header that went back in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interrupted {
+    /// The epoch the crash left published.
+    pub published: Epoch,
+    /// The newest epoch the log held before the transaction started.
+    pub log_floor: Epoch,
+}
+
+/// Reads a marker slot: the state a transaction was holding and the
+/// floor it began at, or nothing when either crc says these are not
+/// bytes someone finished writing.
+fn decode_marker(buf: &[u8]) -> Option<(DatabaseHeader, Epoch)> {
+    let held = DatabaseHeader::decode(buf)?;
+    let stored = u32::from_le_bytes(buf[TXN_FLOOR + 8..TXN_FLOOR + 12].try_into().ok()?);
+    if crc32c::crc32c(&buf[..TXN_FLOOR + 8]) != stored {
+        return None;
+    }
+    Some((
+        held,
+        Epoch::from_le_bytes(buf[TXN_FLOOR..TXN_FLOOR + 8].try_into().ok()?),
+    ))
+}
+
 /// What a file looked like before a transaction started.
 ///
 /// A statement commits by folding and flipping the header, so by the
@@ -222,6 +283,23 @@ struct Savepoint {
     /// state a rollback goes back to as well, so whatever the
     /// transaction leaves in them is garbage in a block nothing reads.
     reusable: HashSet<BlockPtr>,
+    /// The newest epoch the log held when the transaction began. What
+    /// it committed sits above this, and a rollback cuts the log back
+    /// here rather than back to what the file had folded.
+    log_floor: Epoch,
+    /// Whether the kept state is on disk. Until it is, a crash leaves
+    /// whatever the transaction has published with nothing on the file
+    /// to say it was meant to be taken back.
+    marked: bool,
+    /// Whether the marker has to be down before the first publish
+    /// rather than before the second. An explicit transaction promises
+    /// across statements, so its first published statement is already
+    /// something a crash has to take back; a statement promises only
+    /// about itself, and one publish is one header flip, which a crash
+    /// either leaves whole or does not leave at all.
+    across_statements: bool,
+    /// Whether anything has been published under this savepoint.
+    published: bool,
 }
 
 /// An open zu1 file: block I/O, the free list, and the header flip.
@@ -281,6 +359,13 @@ pub struct Zu1File {
     /// already free when it began, because a block the transaction
     /// frees is a block the state being kept still reads.
     savepoint: Option<Savepoint>,
+    /// The epoch a crash left published, when this handle opened a file
+    /// with a transaction still open on it. The header in hand is the
+    /// one that transaction was holding, so every read is already of
+    /// the state going back in; what is left is to publish it, which
+    /// [`Self::finish_rollback`] does once the log has been cut back to
+    /// match.
+    interrupted: Option<Interrupted>,
 }
 
 impl Zu1File {
@@ -314,6 +399,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            interrupted: None,
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             writable: true,
@@ -367,12 +453,37 @@ impl Zu1File {
                 });
             }
         };
+        // A transaction was open when the process went away if the
+        // third slot holds a header, and the state it was holding is
+        // the state to read: the one in the slot the checkpoint last
+        // flipped to is the middle of that transaction. A slot naming
+        // an epoch the file never reached is not a state to go back to,
+        // so it is left alone and reported nowhere.
+        let mut kept = [0u8; DB_HEADER_SIZE];
+        let holding = match file.len()? >= TXN_SLOT + DB_HEADER_SIZE as u64 {
+            true => {
+                file.read_exact_at(&mut kept, TXN_SLOT)?;
+                decode_marker(&kept).filter(|(held, _)| held.epoch <= db.epoch)
+            }
+            false => None,
+        };
+        let (db, interrupted) = match holding {
+            Some((held, log_floor)) => (
+                held,
+                Some(Interrupted {
+                    published: db.epoch,
+                    log_floor,
+                }),
+            ),
+            None => (db, None),
+        };
         let mut this = Self {
             file,
             path: path.to_path_buf(),
             file_header,
             db,
             active_slot,
+            interrupted,
             free: Vec::new(),
             pending_free: Vec::new(),
             free_chain: Vec::new(),
@@ -432,6 +543,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            interrupted: None,
             pin_memo: None,
             forks: Some(Arc::clone(pool)),
             writable: self.writable,
@@ -500,7 +612,27 @@ impl Zu1File {
     ///
     /// One savepoint at a time. Nested transactions are not a thing GQL
     /// has, and a second one here would quietly become the first.
-    pub fn begin_savepoint(&mut self) -> Result<()> {
+    ///
+    /// `across_statements` says whether what is being kept has to
+    /// survive the process going away, which is what an explicit
+    /// transaction needs and a single statement does not: a statement
+    /// that publishes once publishes in one header flip, and a crash
+    /// either leaves that flip whole or leaves the state before it. See
+    /// [`Self::keep_savepoint`] for what a savepoint that has to
+    /// survive costs.
+    ///
+    /// A transaction starts from a folded file, because what is kept
+    /// here is the file's roots and a rollback publishes them again:
+    /// whatever the log has not folded into them is not in them, and
+    /// would go back along with the transaction. Callers fold first,
+    /// which is what opening a writer does.
+    ///
+    /// `log_floor` is where the log stands as this is called, which is
+    /// the newest epoch anything committed before the transaction. A
+    /// rollback cuts the log back to it, so a caller handing over a
+    /// floor older than what the log holds is asking for those frames
+    /// to be dropped along with the transaction.
+    pub fn begin_savepoint(&mut self, across_statements: bool, log_floor: Epoch) -> Result<()> {
         self.check_writable("a transaction")?;
         if self.savepoint.is_some() {
             return Err(ZuError::InvalidArgument(format!(
@@ -513,6 +645,10 @@ impl Zu1File {
             free: self.free.clone(),
             free_chain: self.free_chain.clone(),
             reusable: self.free.iter().copied().collect(),
+            log_floor,
+            marked: false,
+            across_statements,
+            published: false,
         });
         // Blocks freed before the transaction and not published yet are
         // referenced by the header it keeps, so they go straight into
@@ -530,12 +666,99 @@ impl Zu1File {
     /// Ends the transaction by keeping what it did. Everything it wrote
     /// is already published, so this only drops what was being held and
     /// lets allocation reuse free blocks again.
-    pub fn release_savepoint(&mut self) {
-        self.savepoint = None;
+    ///
+    /// A transaction whose kept state reached the file has one more
+    /// thing to do, which is to say it is over. The state is published
+    /// before the saying, so a crash in between takes the transaction
+    /// back, which is the right way round: the word that ends it had
+    /// not returned yet.
+    pub fn release_savepoint(&mut self) -> Result<()> {
+        let held = self.savepoint.take();
         // What it freed is free for good now, so it goes back into the
         // list allocation draws from. The next checkpoint publishes it
         // as free either way; this is about reuse, not about the list.
         self.free.append(&mut self.frozen);
+        match held.is_some_and(|held| held.marked) {
+            true => self.forget_kept(),
+            false => Ok(()),
+        }
+    }
+
+    /// Puts the state a savepoint is keeping on the file, so that a
+    /// process that goes away before the transaction ends leaves
+    /// something that says where to go back to.
+    ///
+    /// This runs before the write it protects reaches the log, which is
+    /// where a change becomes something a recovery would bring back,
+    /// rather than before the publish behind it: a commit is durable at
+    /// its log sync and the fold that publishes it comes after, so a
+    /// marker written at the fold leaves that window uncovered. Every
+    /// path that commits calls this first, and the checkpoint calls it
+    /// too, for the publishes that reach the file without a frame.
+    ///
+    /// The two syncs are what it costs: one here and one at the word
+    /// that ends the transaction. A statement pays neither until it
+    /// commits a second time, because one commit and the fold behind it
+    /// are one header flip, which a crash either leaves whole or does
+    /// not leave at all.
+    pub fn keep_savepoint(&mut self) -> Result<()> {
+        let due = self
+            .savepoint
+            .as_ref()
+            .is_some_and(|held| !held.marked && (held.across_statements || held.published));
+        if !due {
+            return Ok(());
+        }
+        let held = self.savepoint.as_ref().expect("checked just above");
+        let mut kept = held.db.encode();
+        kept[TXN_FLOOR..TXN_FLOOR + 8].copy_from_slice(&held.log_floor.to_le_bytes());
+        let crc = crc32c::crc32c(&kept[..TXN_FLOOR + 8]);
+        kept[TXN_FLOOR + 8..TXN_FLOOR + 12].copy_from_slice(&crc.to_le_bytes());
+        self.file.write_all_at(&kept, TXN_SLOT)?;
+        self.file.sync_all()?;
+        self.savepoint.as_mut().expect("checked just above").marked = true;
+        Ok(())
+    }
+
+    /// Clears what [`Self::keep_savepoint`] wrote, which is what says no
+    /// transaction is open on this file any more.
+    fn forget_kept(&mut self) -> Result<()> {
+        self.file.write_all_at(&[0u8; DB_HEADER_SIZE], TXN_SLOT)?;
+        self.file.sync_all()
+    }
+
+    /// What a transaction the process died inside left behind, if this
+    /// handle opened a file with one open on it.
+    ///
+    /// The header this handle is reading is already the one that
+    /// transaction was holding, so a reader needs nothing else. A
+    /// writer owes the file a publish, which is what
+    /// [`Self::finish_rollback`] is, and owes the log a cut back to the
+    /// floor, which is the one thing it cannot do itself.
+    pub fn interrupted(&self) -> Option<Interrupted> {
+        self.interrupted
+    }
+
+    /// Publishes the state a transaction the process died inside was
+    /// holding, and says the transaction is over.
+    ///
+    /// Nothing is put back in memory, because opening a file with a
+    /// transaction open on it reads the kept state to begin with. What
+    /// is left is the file: the kept header goes in with an epoch past
+    /// the one the crash left, so the next open reads it rather than
+    /// the middle of the transaction, and only then is the kept state
+    /// cleared. A crash anywhere in here leaves the marker down and the
+    /// next open does the same thing again.
+    pub fn finish_rollback(&mut self) -> Result<()> {
+        let Some(open) = self.interrupted.take() else {
+            return Ok(());
+        };
+        self.check_writable("the rollback a crash left behind")?;
+        if open.published > self.db.epoch {
+            self.db.epoch = open.published;
+            self.checkpoint()?;
+        }
+        self.forget_kept()
     }
 
     /// Ends the transaction by putting the file back where it started
@@ -574,10 +797,17 @@ impl Zu1File {
         // every statement holds the file for the length of itself, and
         // most of them do not write.
         if !published {
-            return Ok(());
+            return match saved.marked {
+                true => self.forget_kept(),
+                false => Ok(()),
+            };
         }
         self.db.epoch = epoch;
-        self.checkpoint()
+        self.checkpoint()?;
+        match saved.marked {
+            true => self.forget_kept(),
+            false => Ok(()),
+        }
     }
 
     /// Takes the committed-free list out of allocation, forcing every
@@ -732,6 +962,11 @@ impl Zu1File {
     /// crash between the two syncs leaves the previous epoch intact.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.check_writable("checkpoint")?;
+        // A transaction that is about to have something of it published
+        // puts what it is holding on the file first, so that a crash
+        // between here and the word that ends the transaction is the
+        // rollback the transaction was promised.
+        self.keep_savepoint()?;
         // Everything already free, everything freed this transaction, and
         // the old free-list chain itself are all unreferenced once this
         // checkpoint publishes, so they form the new list. Chain storage
@@ -788,9 +1023,10 @@ impl Zu1File {
         // Inside one the list splits: what was free before it began is
         // allocatable, and what it freed on the way is not, because the
         // state a rollback goes back to still reads it.
-        match &self.savepoint {
+        match &mut self.savepoint {
             Some(saved) => {
                 let (free, frozen) = all.into_iter().partition(|p| saved.reusable.contains(p));
+                saved.published = true;
                 self.free = free;
                 self.frozen = frozen;
             }
@@ -1080,7 +1316,7 @@ mod tests {
         db.checkpoint().unwrap();
         let epoch = db.db_header().epoch;
 
-        db.begin_savepoint().unwrap();
+        db.begin_savepoint(false, 0).unwrap();
         assert!(db.in_savepoint());
         for fill in [8u8, 9] {
             let root = db.allocate_block();
@@ -1121,14 +1357,14 @@ mod tests {
         db.db_header_mut().catalog_root = first;
         db.checkpoint().unwrap();
 
-        db.begin_savepoint().unwrap();
+        db.begin_savepoint(false, 0).unwrap();
         let second = db.allocate_block();
         db.write_block(second, &vec![8; BLOCK_SIZE as usize])
             .unwrap();
         db.free_block(first).unwrap();
         db.db_header_mut().catalog_root = second;
         db.checkpoint().unwrap();
-        db.release_savepoint();
+        db.release_savepoint().unwrap();
 
         assert_eq!(db.db_header().catalog_root, second);
         assert_eq!(
@@ -1140,6 +1376,111 @@ mod tests {
         assert_eq!(reopened.db_header().catalog_root, second);
     }
 
+    /// What a savepoint costs a statement, which is nothing until the
+    /// statement publishes twice. One publish is one header flip and a
+    /// crash either leaves it or does not, so there is nothing for a
+    /// marker to say; two publishes is a state a crash can land in the
+    /// middle of, and from there on the file carries where to go back
+    /// to.
+    #[test]
+    fn a_statement_writes_the_marker_only_once_it_has_published_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let kept = db.db_header().clone();
+
+        db.begin_savepoint(false, 4).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(marker(&path), None, "one publish needs no marker");
+
+        db.checkpoint().unwrap();
+        assert_eq!(
+            marker(&path),
+            Some((kept, 4)),
+            "the second publish is one a crash could land before"
+        );
+
+        db.release_savepoint().unwrap();
+        assert_eq!(marker(&path), None, "and the word at the end clears it");
+    }
+
+    /// An explicit transaction pays at the first publish instead,
+    /// because a statement of it that has published is already
+    /// something a crash has to take back.
+    #[test]
+    fn a_transaction_writes_the_marker_before_it_publishes_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let kept = db.db_header().clone();
+
+        db.begin_savepoint(true, 7).unwrap();
+        assert_eq!(marker(&path), None, "nothing published, nothing to keep");
+        db.checkpoint().unwrap();
+        assert_eq!(marker(&path), Some((kept, 7)));
+
+        db.rollback_savepoint().unwrap();
+        assert_eq!(marker(&path), None, "and the rollback clears it too");
+    }
+
+    /// Opening a file a transaction was open on reads the state that
+    /// transaction was holding rather than the middle of it, and says
+    /// which epoch the crash left so a writer can publish over it.
+    #[test]
+    fn opening_a_file_with_a_transaction_open_on_it_reads_what_it_was_holding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut db = Zu1File::create(&path).unwrap();
+        let first = db.allocate_block();
+        db.write_block(first, &vec![7; BLOCK_SIZE as usize])
+            .unwrap();
+        db.db_header_mut().catalog_root = first;
+        db.checkpoint().unwrap();
+        let kept = db.db_header().clone();
+
+        db.begin_savepoint(true, 3).unwrap();
+        let second = db.allocate_block();
+        db.write_block(second, &vec![8; BLOCK_SIZE as usize])
+            .unwrap();
+        db.db_header_mut().catalog_root = second;
+        db.checkpoint().unwrap();
+        let died_at = db.db_header().epoch;
+        // The process stops here: no rollback, no release, and the
+        // handle never gets to do anything about it.
+        std::mem::forget(db);
+
+        let mut crashed = Zu1File::open(&path).unwrap();
+        assert_eq!(crashed.db_header().catalog_root, first);
+        assert_eq!(
+            crashed.interrupted(),
+            Some(Interrupted {
+                published: died_at,
+                log_floor: 3,
+            }),
+        );
+        assert_eq!(crashed.read_block(first).unwrap()[0], 7);
+
+        crashed.finish_rollback().unwrap();
+        assert_eq!(crashed.interrupted(), None);
+        assert!(
+            crashed.db_header().epoch > died_at,
+            "the state going back in is published over the one the crash left"
+        );
+        assert_eq!(marker(&path), None);
+
+        let reopened = Zu1File::open(&path).unwrap();
+        assert_eq!(reopened.db_header().catalog_root, kept.catalog_root);
+        assert_eq!(reopened.interrupted(), None);
+    }
+
+    /// The state an open transaction is holding and the floor it began
+    /// at, read off the file the way the next open reads them.
+    fn marker(path: &Path) -> Option<(DatabaseHeader, Epoch)> {
+        let bytes = std::fs::read(path).unwrap();
+        let at = TXN_SLOT as usize;
+        decode_marker(&bytes[at..at + DB_HEADER_SIZE])
+    }
+
     /// One transaction at a time, and a rollback outside one is a
     /// caller mistake rather than a checkpoint.
     #[test]
@@ -1148,10 +1489,10 @@ mod tests {
         let path = temp_path(&dir);
         let mut db = Zu1File::create(&path).unwrap();
         assert!(db.rollback_savepoint().is_err());
-        db.begin_savepoint().unwrap();
-        assert!(db.begin_savepoint().is_err());
+        db.begin_savepoint(false, 0).unwrap();
+        assert!(db.begin_savepoint(false, 0).is_err());
         db.rollback_savepoint().unwrap();
-        db.begin_savepoint().unwrap();
+        db.begin_savepoint(false, 0).unwrap();
     }
 
     /// A block freed inside a transaction is not handed out inside it,
@@ -1164,11 +1505,11 @@ mod tests {
         let a = db.allocate_block();
         db.write_block(a, &vec![1; BLOCK_SIZE as usize]).unwrap();
         db.checkpoint().unwrap();
-        db.begin_savepoint().unwrap();
+        db.begin_savepoint(false, 0).unwrap();
         db.free_block(a).unwrap();
         db.checkpoint().unwrap();
         assert_ne!(db.allocate_block(), a, "still held for the rollback");
-        db.release_savepoint();
+        db.release_savepoint().unwrap();
         assert_eq!(db.allocate_block(), a, "and free once it is not");
     }
 
@@ -1192,7 +1533,7 @@ mod tests {
         db.checkpoint().unwrap();
         let watermark = db.db_header().block_count;
 
-        db.begin_savepoint().unwrap();
+        db.begin_savepoint(false, 0).unwrap();
         let got = db.allocate_block();
         assert!(got == a || got == b, "free before, so free to write");
         db.write_block(got, &vec![2; BLOCK_SIZE as usize]).unwrap();

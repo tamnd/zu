@@ -572,6 +572,34 @@ impl Wal {
         Ok(())
     }
 
+    /// Drops the frames of a transaction the process died inside, which
+    /// are the ones committed after it began: the marker it left says
+    /// where the log stood then, so everything above that floor is the
+    /// transaction's own and goes with it.
+    ///
+    /// Epochs only go up along the log, so this is a prefix cut rather
+    /// than a rewrite. Frames at or below the floor were committed
+    /// before the transaction and stay, whether the base file has
+    /// folded them already or replay is about to bring them back.
+    pub fn rollback_above(&mut self, floor: Epoch) -> Result<()> {
+        let mut bytes = vec![0u8; self.len as usize];
+        self.file.read_exact_at(&mut bytes, 0)?;
+        let mut end = 0u64;
+        while let Some((body, next)) = next_frame(&bytes, end) {
+            if u64::from_le_bytes(body[..8].try_into().unwrap()) > floor {
+                break;
+            }
+            end = next;
+        }
+        if end == self.len {
+            return Ok(());
+        }
+        self.file.set_len(end)?;
+        self.file.sync_data()?;
+        self.len = end;
+        Ok(())
+    }
+
     /// Empties the log after a checkpoint has folded and published
     /// everything it held.
     pub fn truncate(&mut self) -> Result<()> {
@@ -766,6 +794,45 @@ mod tests {
         })
         .unwrap();
         out
+    }
+
+    /// The frames of a transaction the process died inside go, and the
+    /// ones committed before it stay: the floor is where the log stood
+    /// when the transaction began, and epochs only go up along the
+    /// log, so the cut is where the first frame above it starts.
+    #[test]
+    fn a_rollback_cuts_the_log_back_to_where_the_transaction_began() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut.wal");
+        let mut wal = Wal::open(&path).unwrap();
+        for epoch in 1..=3 {
+            wal.append(epoch, &WalRecord::TxnBegin).unwrap();
+            wal.append(
+                epoch,
+                &WalRecord::Delete {
+                    table: 1,
+                    ids: vec![epoch],
+                },
+            )
+            .unwrap();
+            wal.commit(epoch).unwrap();
+        }
+
+        wal.rollback_above(1).unwrap();
+
+        let mut seen = Vec::new();
+        wal.replay(0, |epoch, rec| {
+            if let WalRecord::Delete { ids, .. } = rec {
+                seen.push((epoch, ids[0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, [(1, 1)], "epochs 2 and 3 went with the transaction");
+
+        // And the cut is on the file, not in this handle.
+        let reopened = Wal::open(&path).unwrap();
+        assert_eq!(reopened.len(), wal.len());
     }
 
     /// One committed txn holding every payload kind survives the trip

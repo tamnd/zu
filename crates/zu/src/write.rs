@@ -96,8 +96,8 @@ impl Writer {
     pub fn open(db: &mut Zu1File) -> Result<Writer> {
         writable(db)?;
         let path = sidecar(db.path());
-        let wal = Wal::open(&path)?;
-        let mvcc = recover(db, &wal)?;
+        let mut wal = Wal::open(&path)?;
+        let mvcc = recover(db, &mut wal)?;
         let mut writer = Writer { wal, mvcc, path };
         writer.fold(db)?;
         Ok(writer)
@@ -131,6 +131,13 @@ impl Writer {
         let mut txn = self.mvcc.begin();
         let value = stage(&mut txn)?;
         let staged = !txn.is_empty();
+        // A savepoint holding a state to go back to puts it on the file
+        // before this frame reaches the log, because from the log sync
+        // on there is a change a recovery would bring back, and
+        // something has to say it was meant to be taken away again.
+        if staged {
+            db.keep_savepoint()?;
+        }
         let epoch = txn.commit(&mut self.wal)?;
         if staged {
             self.fold(db)?;
@@ -341,7 +348,7 @@ mod tests {
                 .expect("person")
                 .id;
             let mut wal = Wal::open(&sidecar(&path)).expect("wal");
-            let mut mvcc = recover(&mut db, &wal).expect("recover");
+            let mut mvcc = recover(&mut db, &mut wal).expect("recover");
             let mut txn = mvcc.begin();
             txn.insert_nodes(
                 person,

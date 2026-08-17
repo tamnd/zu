@@ -2906,7 +2906,7 @@
       "id": "zu::zu1::algo",
       "kind": "module",
       "name": "algo",
-      "doc": "Whole-graph table function kernels: pagerank, wcc, sssp, louvain\n(docs/07 §4, TableFunction). Each kernel runs directly on a rel\ntable's CSR through [`GraphReader`], one sequential sweep per\niteration so the per-direction group cache decodes every group once\nper pass, and returns one value per node in dense row order. The\nquery layer surfaces these through CALL; nothing here parses or\nplans.\n\nDeterminism: every kernel sweeps nodes in row order with fixed\niteration or convergence rules, so the same file produces the same\noutput on every run and every machine, which is what lets tests and\nthe Graphalytics harness assert exact values."
+      "doc": "Whole-graph table function kernels: bfs, pagerank, wcc, sssp,\nlouvain (docs/07 §4, TableFunction). Each kernel runs directly on a\nrel table's CSR through [`GraphReader`], one sequential sweep per\niteration so the per-direction group cache decodes every group once\nper pass, and returns one value per node in dense row order. The\nquery layer surfaces these through CALL; nothing here parses or\nplans.\n\nThe traversal kernels share one frontier: a visited bitmap, rounds\nthat pin a group's CSR once and expand every frontier node in it\nfrom the pinned arrays, and a direction-optimizing switch that goes\nbottom-up when the frontier is about to touch more edges than are\nleft unexplored.\n\nDeterminism: every kernel sweeps nodes in row order with fixed\niteration or convergence rules, so the same file produces the same\noutput on every run and every machine, which is what lets tests and\nthe Graphalytics harness assert exact values. The frontier is no\nexception: a node's level is the round it was first claimed in, and\nrounds are barriers, so which direction a round ran cannot move it."
     },
     {
       "id": "zu::zu1::algo::PAGERANK_DAMPING",
@@ -2920,6 +2920,33 @@
       "kind": "constant",
       "name": "PAGERANK_ITERATIONS",
       "signature": "usize"
+    },
+    {
+      "id": "zu::zu1::algo::Walk",
+      "kind": "enum",
+      "name": "Walk",
+      "doc": "Which adjacency a traversal walks. `Out` follows stored edge\ndirection, which is what BFS levels mean on a directed graph.\n`Both` treats the rel table as undirected."
+    },
+    {
+      "id": "zu::zu1::algo::Walk::Both",
+      "kind": "variant",
+      "name": "Both",
+      "of": "zu::zu1::algo::Walk",
+      "signature": "Both"
+    },
+    {
+      "id": "zu::zu1::algo::Walk::Out",
+      "kind": "variant",
+      "name": "Out",
+      "of": "zu::zu1::algo::Walk",
+      "signature": "Out"
+    },
+    {
+      "id": "zu::zu1::algo::bfs",
+      "kind": "function",
+      "name": "bfs",
+      "signature": "fn bfs(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, source: u64) -> zu_common::Result<Vec<u64>>",
+      "doc": "Breadth-first levels from `source` following stored edge direction,\nthe Graphalytics and Graph500 BFS kernel. Unreachable nodes get\n`u64::MAX`; the source is level zero."
     },
     {
       "id": "zu::zu1::algo::louvain",
@@ -2940,7 +2967,7 @@
       "kind": "function",
       "name": "sssp",
       "signature": "fn sssp(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader, source: u64) -> zu_common::Result<Vec<u64>>",
-      "doc": "Single-source hop distances over the undirected view, a frontier\nBFS. Rel tables carry no edge weights yet, so this is SSSP under\nunit weights, which is also exactly the Graphalytics BFS kernel;\nthe weighted variant arrives with rel properties. Unreachable\nnodes get `u64::MAX`."
+      "doc": "Single-source hop distances over the undirected view. Rel tables\ncarry no edge weights yet, so this is SSSP under unit weights; the\nweighted variant arrives with rel properties. Unreachable nodes get\n`u64::MAX`."
     },
     {
       "id": "zu::zu1::algo::wcc",

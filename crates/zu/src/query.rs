@@ -516,6 +516,23 @@ impl Graph for Zu1Graph<'_> {
                 .into_iter()
                 .map(|label| vec![Value::Int(label as i64)])
                 .collect()),
+            "bfs" => {
+                let Some(Value::Int(source)) = args.first() else {
+                    return Err(ZuError::InvalidArgument(
+                        "bfs needs a source node offset".into(),
+                    ));
+                };
+                Ok(algo::bfs(db, reader, *source as u64)?
+                    .into_iter()
+                    .map(|level| {
+                        vec![if level == u64::MAX {
+                            Value::Null
+                        } else {
+                            Value::Int(level as i64)
+                        }]
+                    })
+                    .collect())
+            }
             "sssp" => {
                 let Some(Value::Int(source)) = args.first() else {
                     return Err(ZuError::InvalidArgument(
@@ -1853,6 +1870,27 @@ mod tests {
             ints(&r),
             [
                 [Value::Int(0), Value::Int(1)],
+                [Value::Int(1), Value::Int(0)],
+                [Value::Int(2), Value::Int(1)],
+                [Value::Int(3), Value::Null],
+                [Value::Int(4), Value::Null],
+            ]
+        );
+
+        // The directed kernel over the same chain: from row 1 the
+        // arrows only reach 2, so 0 joins the other component in the
+        // nulls. That is the whole difference between bfs and sssp.
+        let r = run(
+            "CALL bfs('follows', 1) YIELD node, level \
+             RETURN node.id AS id, level ORDER BY id",
+            &mut db,
+            &[],
+        )
+        .expect("bfs");
+        assert_eq!(
+            ints(&r),
+            [
+                [Value::Int(0), Value::Null],
                 [Value::Int(1), Value::Int(0)],
                 [Value::Int(2), Value::Int(1)],
                 [Value::Int(3), Value::Null],

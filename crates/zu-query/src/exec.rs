@@ -73,6 +73,7 @@ use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
 use crate::plan::{Bracket, BracketKind, LogicalPlan, expr_text};
+use crate::row::{Batch, Flow};
 
 /// Vector width of one chunk fill.
 pub const VECTOR_SIZE: usize = 2048;
@@ -5594,6 +5595,262 @@ fn run_stage(stage: &StageDef, query: &BoundQuery, ctx: &mut StageCtx) -> Result
 }
 
 // ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+/// The state a streamed statement carries across batches: where the
+/// rows go, how many go at a time, and what SKIP and LIMIT have spent
+/// so far.
+///
+/// SKIP and LIMIT live here rather than in [`apply_post`] because they
+/// are prefix operations on the whole answer and a batch is a piece of
+/// it. Spending them across batches is what makes streaming give the
+/// same rows as buffering, one batch at a time.
+///
+/// Both executors hand rows over through this one object, so a caller
+/// cannot tell which of them ran its statement from the batches it
+/// sees, which is the only way the two engines can stay one API.
+pub struct Streaming<'s> {
+    sink: &'s mut dyn FnMut(Batch<'_>) -> Result<Flow>,
+    columns: &'s [String],
+    batch: usize,
+    skip: usize,
+    limit: Option<usize>,
+    rows: u64,
+    stopped: bool,
+    /// Whether the rows were handed over as they were made. A statement
+    /// that had to see every row before it could give one arrives whole
+    /// and is handed over afterwards, and this is what tells them apart.
+    streamed: bool,
+}
+
+impl<'s> Streaming<'s> {
+    /// A handoff of `batch` rows at a time into `sink`, under the column
+    /// names the statement projected.
+    pub fn new(
+        sink: &'s mut dyn FnMut(Batch<'_>) -> Result<Flow>,
+        columns: &'s [String],
+        batch: usize,
+    ) -> Streaming<'s> {
+        Streaming {
+            sink,
+            columns,
+            batch: batch.max(1),
+            skip: 0,
+            limit: None,
+            rows: 0,
+            stopped: false,
+            streamed: false,
+        }
+    }
+
+    /// The window the statement asked for, once, before any of it is
+    /// spent. An executor that has already evaluated SKIP and LIMIT to
+    /// counts hands them over here instead of applying them per batch,
+    /// which would make every batch its own answer.
+    pub fn window(&mut self, skip: usize, limit: Option<usize>) {
+        self.skip = skip;
+        self.limit = limit;
+    }
+
+    /// Rows the caller asked to be handed at a time, which is also how
+    /// far ahead of the consumer an executor should let itself run.
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
+    /// Whether there is any row left to want: false once LIMIT is spent
+    /// or the caller has stopped, which is what ends a scan early.
+    pub fn wants_more(&self) -> bool {
+        !self.stopped && self.limit != Some(0)
+    }
+
+    /// Records that these rows were made and handed over rather than
+    /// collected first.
+    pub fn made_them(&mut self) {
+        self.streamed = true;
+    }
+
+    /// Spends the window on one piece of the answer and hands what
+    /// survives over, in batches of the size the caller asked for.
+    /// Answers [`Streaming::wants_more`] afterwards, so a driver stops
+    /// on `false` without asking twice.
+    pub fn feed(&mut self, mut rows: Vec<Vec<Value>>) -> Result<bool> {
+        let n = self.skip.min(rows.len());
+        rows.drain(..n);
+        self.skip -= n;
+        if let Some(left) = &mut self.limit {
+            let n = (*left).min(rows.len());
+            rows.truncate(n);
+            *left -= n;
+        }
+        for chunk in rows.chunks(self.batch) {
+            if matches!(self.hand_over(chunk)?, Flow::Stop) {
+                break;
+            }
+        }
+        Ok(self.wants_more())
+    }
+
+    /// Hands one batch over, or nothing when the batch is empty: a
+    /// caller counting batches must not have to ignore empty ones,
+    /// which a filter that rejected a whole batch would otherwise
+    /// produce.
+    fn hand_over(&mut self, values: &[Vec<Value>]) -> Result<Flow> {
+        if values.is_empty() {
+            return Ok(Flow::More);
+        }
+        self.rows += values.len() as u64;
+        let columns = self.columns;
+        let flow = (self.sink)(Batch::new(columns, values))?;
+        if matches!(flow, Flow::Stop) {
+            self.stopped = true;
+        }
+        Ok(flow)
+    }
+
+    /// Hands a whole result over in batches of the size the caller
+    /// asked for, for the statements that could not be streamed. The
+    /// window is spent already, by whatever produced the rows.
+    pub fn hand_over_all(&mut self, rows: &[Vec<Value>]) -> Result<()> {
+        for chunk in rows.chunks(self.batch) {
+            if matches!(self.hand_over(chunk)?, Flow::Stop) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// What the run did, for the caller that asked for it.
+    pub fn done(self, columns: Vec<String>, notices: Vec<DiagnosticRecord>) -> Streamed {
+        Streamed {
+            columns,
+            rows: self.rows,
+            stopped: self.stopped,
+            streamed: self.streamed,
+            notices,
+        }
+    }
+}
+
+/// Whether a stage can hand its rows over as it makes them.
+///
+/// Sorting cannot: the first row of an ordered answer is not known
+/// until the last row has been read, so a statement with ORDER BY
+/// buffers whatever this does. Neither can DISTINCT, which is the same
+/// argument with a set instead of a sort, or an aggregate, whose rows
+/// do not exist until its groups are closed. Everything else is row at
+/// a time work over a pull pipeline that was already producing rows
+/// one at a time, so streaming it is a matter of not collecting them.
+fn streamable(sink: &SinkDef) -> bool {
+    if sink.aggregate {
+        return false;
+    }
+    // A filter after a window would have to be applied before the
+    // window that precedes it, and the handoff spends the window last,
+    // so that order is refused here rather than answered wrongly there.
+    // No clause produces it today: WHERE binds before SKIP and LIMIT.
+    let mut windowed = false;
+    for op in &sink.post {
+        match op {
+            PostOp::Filter(_) if windowed => return false,
+            PostOp::Filter(_) => {}
+            PostOp::Skip(_) | PostOp::Limit(_) => windowed = true,
+            PostOp::Sort(_) | PostOp::Distinct => return false,
+        }
+    }
+    true
+}
+
+/// Applies the post operators a streamable stage may have to one batch
+/// and hands the survivors over. Answers whether to keep pulling, which
+/// is false once the caller has said stop or LIMIT has been spent.
+fn stream_batch(
+    sink: &SinkDef,
+    ctx: &mut StageCtx,
+    mut rows: Vec<Row>,
+    st: &mut Streaming,
+) -> Result<bool> {
+    for op in &sink.post {
+        match op {
+            PostOp::Filter(expr) => {
+                let mut kept = Vec::with_capacity(rows.len());
+                for mut row in rows {
+                    std::mem::swap(&mut ctx.overlay, &mut row.extra);
+                    let pass = truthy(&eval(ctx, expr)?);
+                    std::mem::swap(&mut ctx.overlay, &mut row.extra);
+                    if pass {
+                        kept.push(row);
+                    }
+                }
+                rows = kept;
+            }
+            // The window is spent by the handoff, across batches
+            // rather than inside each one.
+            PostOp::Skip(_) | PostOp::Limit(_) => {}
+            PostOp::Sort(_) | PostOp::Distinct => {
+                unreachable!("streamable refuses sorting and DISTINCT")
+            }
+        }
+    }
+    st.feed(rows.into_iter().map(|r| r.values).collect())
+}
+
+/// Drives a streamable stage, handing rows over as they are made.
+///
+/// The buffer never holds more than a batch and the chunk being read
+/// into it, which is the whole point: a scan of ten million rows costs
+/// the caller that much memory instead of ten million rows of it, and a
+/// caller that stops after the first batch stops the scan with it.
+fn run_stage_stream(
+    stage: &StageDef,
+    query: &BoundQuery,
+    ctx: &mut StageCtx,
+    st: &mut Streaming,
+) -> Result<()> {
+    let top = stage.descs.len() - 1;
+    let sink = &stage.sink;
+    // Counts rather than per row expressions, so they are evaluated
+    // once here and spent across the batches below.
+    let mut skip = 0usize;
+    let mut limit = None;
+    for op in &sink.post {
+        match op {
+            PostOp::Skip(expr) => skip = count_expr(ctx, expr, "SKIP")?,
+            PostOp::Limit(expr) => limit = Some(count_expr(ctx, expr, "LIMIT")?),
+            _ => {}
+        }
+    }
+    st.window(skip, limit);
+    st.made_them();
+    if !st.wants_more() {
+        return Ok(());
+    }
+    let batch = st.batch;
+    let mut buf: Vec<Row> = Vec::with_capacity(batch);
+    while next(&stage.descs, ctx, top)? {
+        // One pull fills a whole chunk, which is a vector of rows and
+        // not a batch of them, so the buffer is drained a batch at a
+        // time here rather than once per pull: the caller asked for a
+        // batch size and gets it, whatever the chunk size is.
+        each_config(ctx, &stage.unflat, &mut |ctx| {
+            buf.push(materialize(sink, query, ctx)?);
+            Ok(())
+        })?;
+        while buf.len() >= batch {
+            let piece = buf.drain(..batch).collect();
+            if !stream_batch(sink, ctx, piece, st)? {
+                return Ok(());
+            }
+        }
+    }
+    if !buf.is_empty() {
+        stream_batch(sink, ctx, buf, st)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Morsel scheduler
 // ---------------------------------------------------------------------------
 
@@ -5879,6 +6136,17 @@ fn stage_profile(
     }
 }
 
+/// What a run owes its caller besides the rows: the per operator
+/// counters EXPLAIN ANALYZE asked for, and the handoff a streaming
+/// caller is reading through. Both are absent on the ordinary path and
+/// they travel together because each of them is a reason this run is
+/// not the ordinary one.
+#[derive(Default)]
+struct Extras<'a, 's> {
+    profile: Option<&'a mut Profile>,
+    stream: Option<&'a mut Streaming<'s>>,
+}
+
 fn run_stages(
     plan: &LogicalPlan,
     query: &BoundQuery,
@@ -5886,8 +6154,12 @@ fn run_stages(
     graph: &mut dyn Graph,
     params: &[Value],
     options: &Options,
-    mut profile: Option<&mut Profile>,
+    extras: Extras<'_, '_>,
 ) -> Result<QueryResult> {
+    let Extras {
+        mut profile,
+        mut stream,
+    } = extras;
     let stages = build_stages(plan, query, schema, graph, params, options)?;
     let counts: BTreeMap<u32, u64> = schema
         .nodes()
@@ -5912,8 +6184,16 @@ fn run_stages(
     let mut forks: Option<Vec<Box<dyn Graph + Send>>> = None;
     let mut rows = Vec::new();
     let mut notices = Vec::new();
-    for stage in &stages {
-        if threads > 1
+    let last = stages.len() - 1;
+    for (ix, stage) in stages.iter().enumerate() {
+        // Only the last stage can stream, because every earlier one is
+        // read by the stage above it rather than by the caller, and a
+        // stage that streams cannot be split into morsels: the rows go
+        // out in the order they are made, and workers make them in
+        // whatever order they finish.
+        let streaming = stream.is_some() && ix == last && streamable(&stage.sink);
+        if !streaming
+            && threads > 1
             && profile.is_none()
             && !options.flat
             && let Some(morsels) = plan_morsels(stage, &counts, options.morsel_rows)
@@ -5972,7 +6252,13 @@ fn run_stages(
             notices: Vec::new(),
         };
         let started = Instant::now();
-        rows = run_stage(stage, query, &mut ctx)?;
+        if streaming {
+            let st = stream.as_deref_mut().expect("streaming was checked above");
+            run_stage_stream(stage, query, &mut ctx, st)?;
+            rows = Vec::new();
+        } else {
+            rows = run_stage(stage, query, &mut ctx)?;
+        }
         notices.append(&mut ctx.notices);
         if let Some(p) = profile.as_deref_mut() {
             p.stages.push(stage_profile(
@@ -6010,7 +6296,15 @@ pub fn execute(
     params: &[Value],
     options: &Options,
 ) -> Result<QueryResult> {
-    run_stages(plan, query, schema, graph, params, options, None)
+    run_stages(
+        plan,
+        query,
+        schema,
+        graph,
+        params,
+        options,
+        Extras::default(),
+    )
 }
 
 /// Runs an optimized plan with per-operator counters and returns the
@@ -6033,15 +6327,168 @@ pub fn execute_profiled(
         graph,
         params,
         options,
-        Some(&mut profile),
+        Extras {
+            profile: Some(&mut profile),
+            ..Extras::default()
+        },
     )?;
     Ok((result, profile))
+}
+
+/// Runs an optimized plan and hands the rows to `st` in batches as they
+/// are made, rather than returning them all (`dx/04` §4).
+///
+/// The point is memory and the first row. A caller reading ten million
+/// rows to write them somewhere else holds one batch instead of the
+/// answer, and a caller that has seen enough returns [`Flow::Stop`] and
+/// the scan under it stops with it, which is the same boundary an
+/// interrupt is answered at and costs the same nothing.
+///
+/// A statement that cannot answer its first row before it has read its
+/// last one is run whole and handed over in batches anyway, so a
+/// caller's loop is the same either way and the difference is what it
+/// costs. [`Streamed::streamed`] says which happened, and ORDER BY,
+/// DISTINCT and the aggregates are the three that cannot.
+pub fn execute_streaming(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+    st: &mut Streaming<'_>,
+) -> Result<Streamed> {
+    let result = run_stages(
+        plan,
+        query,
+        schema,
+        graph,
+        params,
+        options,
+        Extras {
+            stream: Some(st),
+            ..Extras::default()
+        },
+    )?;
+    if !st.streamed && !st.stopped {
+        st.hand_over_all(&result.rows)?;
+    }
+    Ok(Streamed {
+        columns: result.columns,
+        rows: st.rows,
+        stopped: st.stopped,
+        streamed: st.streamed,
+        notices: result.notices,
+    })
+}
+
+/// The batch size a caller gets when it does not pick one: one vector,
+/// the unit the executor already works in, which is large enough that
+/// the per batch call is nothing beside the rows in it and small enough
+/// that holding one is not holding the answer.
+pub const STREAM_BATCH: usize = VECTOR_SIZE;
+
+/// Hands a result that was produced whole over to a streaming sink, in
+/// batches, for the statements a session runs some other way and a
+/// streaming caller asked for anyway. It reports `streamed: false`,
+/// because it did not.
+pub fn stream_result(
+    result: QueryResult,
+    batch_rows: usize,
+    sink: &mut dyn FnMut(Batch<'_>) -> Result<Flow>,
+) -> Result<Streamed> {
+    let mut st = Streaming::new(sink, &result.columns, batch_rows);
+    st.hand_over_all(&result.rows)?;
+    let (rows, stopped) = (st.rows, st.stopped);
+    Ok(Streamed {
+        columns: result.columns,
+        rows,
+        stopped,
+        streamed: false,
+        notices: result.notices,
+    })
+}
+
+/// What a streamed statement did, once its rows have all been handed
+/// over. The rows themselves are gone by now, which is the point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Streamed {
+    /// The column names, the one part of a result a streaming caller
+    /// still wants after the fact.
+    pub columns: Vec<String>,
+    /// How many rows were handed over, which is fewer than the
+    /// statement would have returned when the caller stopped early.
+    pub rows: u64,
+    /// Whether the caller stopped it.
+    pub stopped: bool,
+    /// Whether the rows were made and handed over in batches, rather
+    /// than buffered whole and cut into batches afterwards.
+    pub streamed: bool,
+    /// Conditions raised without stopping the statement, as on any
+    /// other result.
+    pub notices: Vec<DiagnosticRecord>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::binder::{NodeDef, RelDef};
+
+    /// The handoff is what both executors stream through, so what it
+    /// does with a window and with an empty piece is checked here once
+    /// rather than through either of them.
+    #[test]
+    fn the_handoff_spends_one_window_across_the_pieces_it_is_fed() {
+        let columns = vec!["id".to_string()];
+        let piece = |from: i64, to: i64| -> Vec<Vec<Value>> {
+            (from..to).map(|i| vec![Value::Int(i)]).collect()
+        };
+        let mut seen: Vec<Vec<i64>> = Vec::new();
+        let mut sink = |batch: Batch<'_>| {
+            seen.push(
+                batch
+                    .rows()
+                    .iter()
+                    .map(|row| match row[0] {
+                        Value::Int(i) => i,
+                        _ => unreachable!("the test feeds integers"),
+                    })
+                    .collect(),
+            );
+            Ok(Flow::More)
+        };
+        let mut st = Streaming::new(&mut sink, &columns, 4);
+        st.window(3, Some(9));
+        // The skip is longer than the first piece, so it carries into
+        // the second one instead of restarting there.
+        assert!(st.feed(piece(0, 2)).expect("fed"));
+        assert!(st.feed(piece(2, 10)).expect("fed"));
+        // The limit runs out inside this piece, which is what ends the
+        // scan: nothing after it is wanted.
+        assert!(!st.feed(piece(10, 20)).expect("fed"));
+        assert!(!st.wants_more());
+        let out = st.done(columns.clone(), Vec::new());
+        assert_eq!(seen, vec![vec![3, 4, 5, 6], vec![7, 8, 9], vec![10, 11]]);
+        assert_eq!(out.rows, 9);
+        assert!(!out.stopped, "the limit ended it, not the caller");
+        assert!(!out.streamed, "nothing said it made these as it went");
+
+        // An empty piece is not a batch. A caller that counts batches
+        // would otherwise have to know which of its filters rejected a
+        // whole morsel.
+        let mut calls = 0;
+        let mut sink = |_: Batch<'_>| {
+            calls += 1;
+            Ok(Flow::Stop)
+        };
+        let mut st = Streaming::new(&mut sink, &columns, 4);
+        assert!(st.feed(Vec::new()).expect("fed"));
+        // And a caller that stops is a caller nothing else is handed:
+        // one batch of the hundred rows fed here, not twenty five.
+        assert!(!st.feed(piece(0, 100)).expect("fed"));
+        assert_eq!(st.done(columns.clone(), Vec::new()).rows, 4);
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn a_ceiling_is_violated_by_a_factor_and_never_by_a_rounding() {

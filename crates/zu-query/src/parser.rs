@@ -730,14 +730,19 @@ impl Parser<'_> {
         Ok(RemoveItem { target, key })
     }
 
-    /// One item of a `SET`: `p.age = 37`.
+    /// One item of a `SET`: `p.age = 37`, or `p = {age: 37}`, which is
+    /// every property of the element rather than one of them.
     ///
-    /// The other two forms of the item are named rather than met with a
-    /// syntax error. `SET p = {...}` replaces every property an element
-    /// holds, which is a column the element leaves empty for each one
-    /// the record does not mention, and `SET p:Label` changes which
-    /// labels it carries, which is a catalog change. Both are pieces of
-    /// their own, and a reader who wrote one spelled it correctly.
+    /// The right hand side of the second form is a record written out
+    /// rather than any expression that has a record for a value, which is
+    /// what the grammar says: the fields are in the statement the way an
+    /// `INSERT`'s are. Each field's value is still an expression, so it
+    /// can read the element the record is about to replace.
+    ///
+    /// The third form of the item is named rather than met with a syntax
+    /// error. `SET p:Label` changes which labels an element carries,
+    /// which is a catalog change and a piece of its own, and a reader who
+    /// wrote it spelled it correctly.
     fn parse_set_item(&mut self) -> Result<SetItem> {
         let target = self.expect_name("a variable after SET")?;
         if self.at(&TokenKind::Colon) || self.at_kw("IS") {
@@ -747,18 +752,23 @@ impl Parser<'_> {
                 "SET of a label is not implemented yet, an element carries the labels of the table it is in",
             ));
         }
-        if self.at(&TokenKind::Eq) {
-            return Err(ZuError::gql_at(
-                codes::C42001,
-                position(self.source, self.peek().expect("peeked").start),
-                "SET of a whole record is not implemented yet, which would empty every property the record does not name",
-            ));
+        if self.eat(&TokenKind::Eq) {
+            let props = self.parse_property_map()?;
+            return Ok(SetItem {
+                target,
+                key: None,
+                value: Expr::Map(props),
+            });
         }
         self.expect(&TokenKind::Dot)?;
         let key = self.expect_name("a property name after the dot")?;
         self.expect(&TokenKind::Eq)?;
         let value = self.parse_expr()?;
-        Ok(SetItem { target, key, value })
+        Ok(SetItem {
+            target,
+            key: Some(key),
+            value,
+        })
     }
 
     fn parse_query(&mut self) -> Result<Query> {
@@ -2995,8 +3005,47 @@ mod tests {
         };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].target, "p");
-        assert_eq!(items[0].key, "age");
-        assert_eq!(items[1].key, "name");
+        assert_eq!(items[0].key.as_deref(), Some("age"));
+        assert_eq!(items[1].key.as_deref(), Some("name"));
+    }
+
+    /// The whole record form names no key and carries the fields as the
+    /// record they were written as, so what tells the two forms apart
+    /// downstream is the missing key and nothing else.
+    #[test]
+    fn a_set_of_a_whole_record_names_no_key_and_carries_the_fields() {
+        let q = parsed("MATCH (p:person) SET p = {age: 37, name: 'zoe'}");
+        let Clause::Set { items } = &q.clauses[1] else {
+            panic!("SET");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].target, "p");
+        assert_eq!(items[0].key, None);
+        let Expr::Map(fields) = &items[0].value else {
+            panic!("a record");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0, "age");
+        assert_eq!(fields[1].0, "name");
+    }
+
+    /// An empty record is the way to say that an element holds nothing,
+    /// and it parses rather than being a special case.
+    #[test]
+    fn a_set_of_an_empty_record_parses() {
+        let q = parsed("MATCH (p:person) SET p = {}");
+        let Clause::Set { items } = &q.clauses[1] else {
+            panic!("SET");
+        };
+        assert_eq!(items[0].value, Expr::Map(Vec::new()));
+    }
+
+    /// The right hand side of the whole record form is a record written
+    /// out, so anything else is a syntax error and says so.
+    #[test]
+    fn a_set_of_a_whole_record_wants_a_record() {
+        let err = parse_err("MATCH (p:person) SET p = 37");
+        assert!(err.contains('{'), "{err}");
     }
 
     #[test]
@@ -3073,21 +3122,17 @@ mod tests {
         }
     }
 
-    /// The two forms of the item that are not in yet are named rather
-    /// than met with a syntax error, because a reader who wrote one
-    /// spelled it correctly.
+    /// The form of the item that is not in yet is named rather than met
+    /// with a syntax error, because a reader who wrote it spelled it
+    /// correctly.
     #[test]
-    fn the_forms_of_set_that_are_not_in_yet_say_which_one() {
+    fn the_form_of_set_that_is_not_in_yet_says_which_one() {
         for source in [
             "MATCH (p:person) SET p:Manager",
             "MATCH (p:person) SET p IS Manager",
         ] {
             assert!(parse_err(source).contains("SET of a label"), "{source}");
         }
-        assert!(
-            parse_err("MATCH (p:person) SET p = {age: 1}").contains("SET of a whole record"),
-            "a record replaces every property"
-        );
     }
 
     /// Every syntax error that names a place carries that place as a

@@ -865,8 +865,10 @@ pub struct BoundInsertRel {
 pub struct BoundSetItem {
     /// The slot holding the element the assignment changes.
     pub target: usize,
-    /// The property key it writes.
-    pub key: String,
+    /// The property key it writes, or nothing when it writes every
+    /// property of the element and the value is the record they come
+    /// out of.
+    pub key: Option<String>,
     /// What the property takes, evaluated once per row.
     pub value: BoundExpr,
 }
@@ -1986,7 +1988,10 @@ impl Binder<'_> {
     /// it found: a name no clause bound stands for nothing to change.
     /// A node and an edge are both elements here, and which column the
     /// key names is settled where the table's columns are, which is the
-    /// file rather than the schema the binder is given.
+    /// file rather than the schema the binder is given. An item that
+    /// names no key writes the whole record, and which columns that
+    /// covers is a question about the same file, so it is settled in the
+    /// same place.
     fn bind_set_item(&mut self, item: &SetItem) -> Result<BoundSetItem> {
         let target = self.write_target("SET", &item.target)?;
         let mut ctx = ExprCtx::new(false);
@@ -2009,7 +2014,7 @@ impl Binder<'_> {
         let (value, _) = self.bind_expr(&Expr::Literal(Literal::Null), &mut ctx)?;
         Ok(BoundSetItem {
             target,
-            key: item.key.clone(),
+            key: Some(item.key.clone()),
             value,
         })
     }

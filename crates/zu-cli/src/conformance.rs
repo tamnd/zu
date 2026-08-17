@@ -160,9 +160,9 @@ const NOTES: &[&str] = &[
     "driven through `zu shell --format jsonl`, one long-lived process per session",
     "loaded through `zu convert`, which reads a SQLite database in zu's schema",
     "the evaluator is MATCH WHERE CALL UNWIND WITH RETURN, plus INSERT of node patterns and \
-     of edges between the elements a statement has in scope and SET of a property of an element \
-     one of them bound, so a case that writes anything else is answered with an error rather \
-     than a skip",
+     of edges between the elements a statement has in scope, SET and REMOVE of properties, and \
+     DELETE and DETACH DELETE of elements, so a case that writes anything else is answered with \
+     an error rather than a skip",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",
@@ -170,8 +170,15 @@ const NOTES: &[&str] = &[
      every column its table stores, and an edge written into a table that stores none on its \
      edges is refused by name rather than dropping what it carried",
     "a SET changes what an element an earlier clause found holds, one row at a time, and the \
-     clauses after it read the new value, while SET of a label, SET of a whole record and SET \
-     on an edge are each refused by name",
+     clauses after it read the new value; a property of a node, a property of an edge and the \
+     whole record of either are all reachable, and the record form empties every property it \
+     does not name, while SET of a label is refused by name because an element carries the \
+     labels of the table it is in",
+    "a REMOVE is the assignment of a null the standard says it is, so it and SET of a null are \
+     one write and a column holds the absence as a clear validity bit",
+    "a DELETE takes away the element an earlier clause found, a DETACH DELETE takes its edges \
+     with it, and a plain DELETE of an element that still has edges on it is refused with the \
+     code the standard gives that rather than leaving a dangling edge",
     "an element is created in the node table whose own name is the label the pattern wrote, \
      and a table is not created by naming one, so a case that inserts into a label its \
      fixture did not declare is answered with a reference error",

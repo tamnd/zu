@@ -1,0 +1,247 @@
+{
+  "help_version": 1,
+  "zu": "<version>",
+  "commands": [
+    {
+      "name": "shell",
+      "summary": "open an interactive session on a file",
+      "synopsis": [
+        "zu shell <file.zu1> [--format jsonl]"
+      ],
+      "examples": [
+        "zu shell graph.zu1",
+        "zu shell graph.zu1 --format jsonl < frames.jsonl"
+      ],
+      "see_also": [
+        "query",
+        "stat"
+      ]
+    },
+    {
+      "name": "query",
+      "summary": "run one statement and print the result",
+      "synopsis": [
+        "zu query <file.zu1> -c <zuQL> [--format table|json] [-p name=value ...]"
+      ],
+      "examples": [
+        "zu query graph.zu1 -c 'MATCH (n:node) RETURN count(n) AS n'",
+        "zu query graph.zu1 -c 'MATCH (n:node {id: $id}) RETURN n.id' -p id=10 --format json"
+      ],
+      "see_also": [
+        "shell",
+        "explain",
+        "stat"
+      ]
+    },
+    {
+      "name": "copy",
+      "summary": "bulk load an edge list into a new file",
+      "synopsis": [
+        "zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1> [--format text|json]"
+      ],
+      "examples": [
+        "zu copy edges.txt graph.zu1",
+        "zu copy --reorder degree edges.parquet graph.zu1 --format json"
+      ],
+      "see_also": [
+        "convert",
+        "stat",
+        "verify"
+      ]
+    },
+    {
+      "name": "convert",
+      "summary": "rewrite an edge list in another format, or a database in another engine",
+      "synopsis": [
+        "zu convert <in.txt|csv|parquet> <out.csv|parquet> [--format text|json]",
+        "zu convert <in.zu1> <out.db> [--format text|json]",
+        "zu convert <in.db> <out.zu1> [--format text|json]"
+      ],
+      "examples": [
+        "zu convert edges.txt edges.parquet",
+        "zu convert graph.zu1 graph.db --format json"
+      ],
+      "see_also": [
+        "copy",
+        "verify"
+      ]
+    },
+    {
+      "name": "verify",
+      "summary": "walk every checksum and cross-check the structure",
+      "synopsis": [
+        "zu verify <file.zu1> [--format text|json]"
+      ],
+      "examples": [
+        "zu verify graph.zu1",
+        "zu verify graph.zu1 --format json"
+      ],
+      "see_also": [
+        "stat",
+        "analyze"
+      ]
+    },
+    {
+      "name": "stat",
+      "summary": "print the size breakdown: schema, free space, and data",
+      "synopsis": [
+        "zu stat <file.zu1> [--format text|json]"
+      ],
+      "examples": [
+        "zu stat graph.zu1",
+        "zu stat graph.zu1 --format json"
+      ],
+      "see_also": [
+        "verify",
+        "analyze"
+      ]
+    },
+    {
+      "name": "analyze",
+      "summary": "rebuild every rel table's optimizer summary",
+      "synopsis": [
+        "zu analyze <file.zu1>"
+      ],
+      "examples": [
+        "zu analyze graph.zu1"
+      ],
+      "see_also": [
+        "stat",
+        "query"
+      ]
+    },
+    {
+      "name": "neighbors",
+      "summary": "print one node's neighbor list, in either direction",
+      "synopsis": [
+        "zu neighbors [--in] [--key] <file.zu1> <node>"
+      ],
+      "examples": [
+        "zu neighbors graph.zu1 42",
+        "zu neighbors --in --key graph.zu1 42"
+      ],
+      "see_also": [
+        "edge",
+        "lookup",
+        "query"
+      ]
+    },
+    {
+      "name": "lookup",
+      "summary": "resolve an original id through the primary-key index",
+      "synopsis": [
+        "zu lookup <file.zu1> <key>"
+      ],
+      "examples": [
+        "zu lookup graph.zu1 42"
+      ],
+      "see_also": [
+        "neighbors",
+        "edge"
+      ]
+    },
+    {
+      "name": "edge",
+      "summary": "ask whether one edge exists, without decoding the list",
+      "synopsis": [
+        "zu edge [--in] <file.zu1> <src> <dst>"
+      ],
+      "examples": [
+        "zu edge graph.zu1 10 42",
+        "zu edge --in graph.zu1 42 10"
+      ],
+      "see_also": [
+        "neighbors",
+        "lookup"
+      ]
+    },
+    {
+      "name": "conformance",
+      "summary": "declare, verify, tally, and score conformance reports",
+      "synopsis": [
+        "zu conformance --declare [--format toml|json]",
+        "zu conformance --verify <report.json>",
+        "zu conformance --tally <report.json>",
+        "zu conformance --scoreboard <tally.json>...",
+        "zu conformance --regressed <report.json> <baseline.json>"
+      ],
+      "examples": [
+        "zu conformance --declare --format json > report.json",
+        "zu conformance --regressed report.json baseline.json"
+      ],
+      "see_also": [
+        "corpus"
+      ]
+    },
+    {
+      "name": "corpus",
+      "summary": "run the shared corpus cases against this build",
+      "synopsis": [
+        "zu corpus <dir> [--strict] [--quiet]"
+      ],
+      "examples": [
+        "zu corpus corpus/",
+        "zu corpus corpus/ --strict"
+      ],
+      "see_also": [
+        "conformance",
+        "query"
+      ]
+    },
+    {
+      "name": "version",
+      "summary": "print the version, the C ABI revision, and what this build supports",
+      "synopsis": [
+        "zu version [--format text|json]"
+      ],
+      "examples": [
+        "zu version",
+        "zu version --format json"
+      ],
+      "see_also": [
+        "stat"
+      ]
+    }
+  ],
+  "planned": [
+    "exec",
+    "explain",
+    "profile",
+    "bench",
+    "s3",
+    "serve",
+    "mcp",
+    "docs",
+    "completions"
+  ],
+  "exit_codes": [
+    {
+      "code": 0,
+      "meaning": "success"
+    },
+    {
+      "code": 1,
+      "meaning": "query error"
+    },
+    {
+      "code": 2,
+      "meaning": "usage error"
+    },
+    {
+      "code": 3,
+      "meaning": "file or io error"
+    },
+    {
+      "code": 4,
+      "meaning": "corruption"
+    },
+    {
+      "code": 5,
+      "meaning": "conflict"
+    },
+    {
+      "code": 130,
+      "meaning": "interrupted"
+    }
+  ]
+}

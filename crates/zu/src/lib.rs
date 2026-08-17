@@ -9,7 +9,9 @@
 //! Published on crates.io as `zudb` (the name `zu` is taken).
 
 pub use zu_common::gqlstatus;
-pub use zu_common::{DiagnosticRecord, Epoch, GqlStatus, NodeId, Result, Severity, ZuError};
+pub use zu_common::{
+    C_ABI_VERSION, DiagnosticRecord, Epoch, GqlStatus, NodeId, Result, Severity, ZuError,
+};
 pub use zu_storage::{CheckpointMode, Direction, GraphStore, Snapshot};
 pub use zu_zu1 as zu1;
 

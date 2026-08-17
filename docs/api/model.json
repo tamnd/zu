@@ -52,6 +52,14 @@
       "doc": "Writes every buffered row and makes it readable.\n\nOne commit, whatever the buffer holds: the values are sealed\ninto the data file as segments, one frame naming them is\nappended and synced to the log, which is the commit point, and\nthe fold that follows seals them into the base every query\nreads. On return the buffer is empty and the rows are there.\n\nA flush with nothing buffered touches no file and returns, so a\nloader can flush on a timer without writing empty commits."
     },
     {
+      "id": "zu::C_ABI_VERSION",
+      "kind": "constant",
+      "name": "C_ABI_VERSION",
+      "signature": "&str",
+      "source": "zu_common::C_ABI_VERSION",
+      "doc": "The revision of the C ABI this workspace publishes (dx/02 §8).\n\nHere rather than in `zu-capi` because the two things that report it\nare the header, which is the ABI's specification, and `zu version`,\nwhich is how a binding asks a build on the PATH what it is. Neither\nshould have to depend on the other to say one number, and a CLI that\nlinked the C ABI to read a string would export the whole of it.\n`cargo xtask package` holds `ZU_ABI_VERSION` in the header to this."
+    },
+    {
       "id": "zu::CheckpointMode",
       "kind": "enum",
       "name": "CheckpointMode",

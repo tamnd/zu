@@ -1,0 +1,147 @@
+$ zu shell --help
+zu shell: open an interactive session on a file
+
+usage: zu shell <file.zu1> [--format jsonl]
+
+examples:
+  zu shell graph.zu1
+  zu shell graph.zu1 --format jsonl < frames.jsonl
+
+see also: query, stat
+
+$ zu query --help
+zu query: run one statement and print the result
+
+usage: zu query <file.zu1> -c <zuQL> [--format table|json] [-p name=value ...]
+
+examples:
+  zu query graph.zu1 -c 'MATCH (n:node) RETURN count(n) AS n'
+  zu query graph.zu1 -c 'MATCH (n:node {id: $id}) RETURN n.id' -p id=10 --format json
+
+see also: shell, explain, stat
+
+$ zu copy --help
+zu copy: bulk load an edge list into a new file
+
+usage: zu copy [--reorder degree|bfs|none] <edges.txt|csv|parquet> <out.zu1> [--format text|json]
+
+examples:
+  zu copy edges.txt graph.zu1
+  zu copy --reorder degree edges.parquet graph.zu1 --format json
+
+see also: convert, stat, verify
+
+$ zu convert --help
+zu convert: rewrite an edge list in another format, or a database in another engine
+
+usage: zu convert <in.txt|csv|parquet> <out.csv|parquet> [--format text|json]
+       zu convert <in.zu1> <out.db> [--format text|json]
+       zu convert <in.db> <out.zu1> [--format text|json]
+
+examples:
+  zu convert edges.txt edges.parquet
+  zu convert graph.zu1 graph.db --format json
+
+see also: copy, verify
+
+$ zu verify --help
+zu verify: walk every checksum and cross-check the structure
+
+usage: zu verify <file.zu1> [--format text|json]
+
+examples:
+  zu verify graph.zu1
+  zu verify graph.zu1 --format json
+
+see also: stat, analyze
+
+$ zu stat --help
+zu stat: print the size breakdown: schema, free space, and data
+
+usage: zu stat <file.zu1> [--format text|json]
+
+examples:
+  zu stat graph.zu1
+  zu stat graph.zu1 --format json
+
+see also: verify, analyze
+
+$ zu analyze --help
+zu analyze: rebuild every rel table's optimizer summary
+
+usage: zu analyze <file.zu1>
+
+examples:
+  zu analyze graph.zu1
+
+see also: stat, query
+
+$ zu neighbors --help
+zu neighbors: print one node's neighbor list, in either direction
+
+usage: zu neighbors [--in] [--key] <file.zu1> <node>
+
+examples:
+  zu neighbors graph.zu1 42
+  zu neighbors --in --key graph.zu1 42
+
+see also: edge, lookup, query
+
+$ zu lookup --help
+zu lookup: resolve an original id through the primary-key index
+
+usage: zu lookup <file.zu1> <key>
+
+examples:
+  zu lookup graph.zu1 42
+
+see also: neighbors, edge
+
+$ zu edge --help
+zu edge: ask whether one edge exists, without decoding the list
+
+usage: zu edge [--in] <file.zu1> <src> <dst>
+
+examples:
+  zu edge graph.zu1 10 42
+  zu edge --in graph.zu1 42 10
+
+see also: neighbors, lookup
+
+$ zu conformance --help
+zu conformance: declare, verify, tally, and score conformance reports
+
+usage: zu conformance --declare [--format toml|json]
+       zu conformance --verify <report.json>
+       zu conformance --tally <report.json>
+       zu conformance --scoreboard <tally.json>...
+       zu conformance --regressed <report.json> <baseline.json>
+
+examples:
+  zu conformance --declare --format json > report.json
+  zu conformance --regressed report.json baseline.json
+
+see also: corpus
+
+$ zu corpus --help
+zu corpus: run the shared corpus cases against this build
+
+usage: zu corpus <dir> [--strict] [--quiet]
+
+examples:
+  zu corpus corpus/
+  zu corpus corpus/ --strict
+
+see also: conformance, query
+
+$ zu version --help
+zu version: print the version, the C ABI revision, and what this build supports
+
+usage: zu version [--format text|json]
+
+examples:
+  zu version
+  zu version --format json
+
+see also: stat
+

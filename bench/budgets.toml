@@ -1420,6 +1420,18 @@ delete_stmt_kb = 4096.0
 detach_stmt_us = 250000.0
 detach_stmt_kb = 8192.0
 
+# A SET of one property of one edge, measured 20 to 34 ms and 2580 kB at
+# 10000 rows and 10000 edges. It is the same statement as the node SET
+# against a column of a different shape: a node column is in row order,
+# so a change lands in one place in it, while an edge column is dense
+# over the edges in the order the table holds them and the change names
+# the pair of rows the edge runs between instead of an offset. The fold
+# therefore rewrites the column through the edge order it rebuilds,
+# which is why the bytes sit near the DETACH DELETE number rather than
+# the node SET one. Lower these ceilings, never raise them.
+set_edge_stmt_us = 250000.0
+set_edge_stmt_kb = 8192.0
+
 # What a statement that changed nothing added to the store, per
 # statement. A SET that writes back the value it read leaves a table of
 # the same shape, so the fold's new blocks must come out of the free

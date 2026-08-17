@@ -24,7 +24,7 @@
 //! granularity is the whole table; group-local rebuilds with slack
 //! arrive with the updatable CSR work.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use zu_common::{Epoch, Result, ZuError};
 
@@ -239,6 +239,17 @@ impl Validity {
             }
         }
         Ok(Self { words, rows })
+    }
+
+    /// A mask over `rows` rows that all hold a value, which is where a
+    /// rebuilt rel table's column starts: an edge order the fold just
+    /// built has no old mask to widen, so every bit is put there by what
+    /// the fold reads or writes into each slot.
+    fn full(rows: u64) -> Self {
+        Self {
+            words: vec![u64::MAX; rows.div_ceil(64) as usize],
+            rows,
+        }
     }
 
     fn set(&mut self, offset: u64) {
@@ -498,7 +509,10 @@ fn fold_rel(
         .collect();
     // An edge carries a value only where there is a column to put it
     // in, and what columns a rel table has is the table's own answer.
-    if old.props == NULL_BLOCK && overlay.iter().any(|(_, _, cols)| !cols.is_empty()) {
+    if old.props == NULL_BLOCK
+        && (overlay.iter().any(|(_, _, cols)| !cols.is_empty())
+            || mvcc.has_edge_updates(rel.id, epoch))
+    {
         return Err(ZuError::Unsupported {
             what: "writing a property onto an edge of a table that stores none on its edges",
             id: rel.id,
@@ -598,7 +612,10 @@ fn fold_rel(
         .collect();
     let props = match old.props {
         NULL_BLOCK => NULL_BLOCK,
-        root => fold_rel_props(db, rel, root, &order, &overlay)?,
+        root => {
+            let changed = mvcc.edge_updates(rel.id, epoch);
+            fold_rel_props(db, rel, root, &order, &edges, &overlay, &changed)?
+        }
     };
     let directory = Directory {
         from_count: new_from,
@@ -635,12 +652,21 @@ type AddedEdge = (u64, u64, Vec<(u32, Cell)>);
 /// moves every edge behind it, so this is a rewrite of the whole column
 /// rather than an append to it. The old blocks are freed once their
 /// values are read.
+///
+/// `order` says where each edge of the new order came from and `pairs`
+/// says which rows it runs between, in the same order, which is what
+/// lets a statement that wrote onto an edge be found: an edge is named
+/// by its pair, so `changed` is keyed by the pair and the column rather
+/// than by a place in a column that the fold is in the middle of
+/// deciding.
 fn fold_rel_props(
     db: &mut Zu1File,
     rel: &RelTable,
     props: BlockPtr,
     order: &[Came],
+    pairs: &[(u32, u32)],
     overlay: &[AddedEdge],
+    changed: &BTreeMap<(u64, u64, u32), Cell>,
 ) -> Result<BlockPtr> {
     let dir = load_props_at(db, props)?;
     let missing = |name: &str| {
@@ -657,16 +683,6 @@ fn fold_rel_props(
     };
     let mut columns = Vec::with_capacity(dir.columns.len());
     for (ci, col) in dir.columns.iter().enumerate() {
-        // An overlay cell is a value and never an absence, so there is
-        // no way to say here whether an added edge holds one. Saying so
-        // is what the write statement does; the fold refuses rather
-        // than deciding for it.
-        if col.validity.is_some() {
-            return Err(ZuError::Unsupported {
-                what: "folding an added edge into a column that holds a null",
-                id: rel.id,
-            });
-        }
         let cell = |at: usize| {
             overlay[at]
                 .2
@@ -675,19 +691,53 @@ fn fold_rel_props(
                 .map(|(_, cell)| cell)
                 .ok_or_else(|| missing(&col.name))
         };
+        // What a statement wrote onto the edge in this slot, which
+        // stands in for whatever the slot would otherwise have held:
+        // an edge the base held keeps its old value only where nothing
+        // has been written over it.
+        let written = |slot: usize| {
+            let (src, dst) = pairs[slot];
+            changed.get(&(u64::from(src), u64::from(dst), ci as u32))
+        };
+        // A column holds a null as a clear bit beside a placeholder, the
+        // way a node column does. The mask starts full because the edge
+        // order is new: a base edge brings its old bit along and every
+        // other slot is a value until a `REMOVE` says otherwise.
+        let mut valid = Validity::full(order.len() as u64);
+        let mut was = Vec::new();
+        if let Some(meta) = &col.validity {
+            read_segment(db, meta, &mut was)?;
+        }
+        let held = |at: usize| was.is_empty() || was[at / 64] & (1u64 << (at % 64)) != 0;
         // The fold splits on the lane against the blob, because that is
         // what it rewrites, and the column's type says which of the two
-        // an added edge's cell must be.
+        // a cell going into it must be.
         let meta = if col.is_lane() {
             let mut old = Vec::with_capacity(order.len());
             read_segment(db, &col.meta, &mut old)?;
             let mut values = Vec::with_capacity(order.len());
-            for came in order {
-                values.push(match came {
-                    Came::Base(at) => old[*at],
-                    Came::Overlay(at) => match cell(*at)? {
-                        Cell::Int(x) => *x,
-                        Cell::Str(_) | Cell::Null => return Err(mismatch(&col.name)),
+            for (slot, came) in order.iter().enumerate() {
+                values.push(match written(slot) {
+                    Some(Cell::Int(x)) => *x,
+                    // The lane keeps a word where the value was, since
+                    // it is fixed width and a reader told the bit is
+                    // clear never looks at what is under it.
+                    Some(Cell::Null) => {
+                        valid.clear(slot as u64);
+                        0
+                    }
+                    Some(Cell::Str(_)) => return Err(mismatch(&col.name)),
+                    None => match came {
+                        Came::Base(at) => {
+                            if !held(*at) {
+                                valid.clear(slot as u64);
+                            }
+                            old[*at]
+                        }
+                        Came::Overlay(at) => match cell(*at)? {
+                            Cell::Int(x) => *x,
+                            Cell::Str(_) | Cell::Null => return Err(mismatch(&col.name)),
+                        },
                     },
                 });
             }
@@ -702,12 +752,29 @@ fn fold_rel_props(
                 start = end as usize;
             }
             let mut values: Vec<&[u8]> = Vec::with_capacity(order.len());
-            for came in order {
-                values.push(match came {
-                    Came::Base(at) => old[*at],
-                    Came::Overlay(at) => match cell(*at)? {
-                        Cell::Str(s) => s.as_slice(),
-                        Cell::Int(_) | Cell::Null => return Err(mismatch(&col.name)),
+            for (slot, came) in order.iter().enumerate() {
+                values.push(match written(slot) {
+                    Some(Cell::Str(s)) => s.as_slice(),
+                    // The blob side says the absence with no bytes at
+                    // all, which costs the edge nothing: a blob is
+                    // addressed by its ends and two equal ends are
+                    // empty.
+                    Some(Cell::Null) => {
+                        valid.clear(slot as u64);
+                        &[]
+                    }
+                    Some(Cell::Int(_)) => return Err(mismatch(&col.name)),
+                    None => match came {
+                        Came::Base(at) => {
+                            if !held(*at) {
+                                valid.clear(slot as u64);
+                            }
+                            old[*at]
+                        }
+                        Came::Overlay(at) => match cell(*at)? {
+                            Cell::Str(s) => s.as_slice(),
+                            Cell::Int(_) | Cell::Null => return Err(mismatch(&col.name)),
+                        },
                     },
                 });
             }
@@ -717,7 +784,7 @@ fn fold_rel_props(
             name: col.name.clone(),
             ty: col.ty.clone(),
             meta,
-            validity: None,
+            validity: valid.write(db)?,
         });
     }
     free_props_keeping_labels(db, props)?;
@@ -1229,6 +1296,166 @@ mod tests {
             assert_eq!(got, text.as_bytes(), "{src} to {dst}");
         }
         let path = dir.path().join("relcut.zu1");
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A value written onto an edge that was already there lands on the
+    /// pair it names, wherever the rebuilt order puts that pair, and the
+    /// edges beside it keep what they held.
+    #[test]
+    fn a_value_written_onto_an_edge_lands_on_the_pair_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relset.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        let notes: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        crate::props::store_rel_props(
+            &mut db,
+            "knows",
+            &[
+                ("since", PropValues::Int(&[1, 2, 3])),
+                ("note", PropValues::Str(&notes)),
+            ],
+        )
+        .unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("relset.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_rel(knows, 1, 2, 0, Cell::Int(20));
+        txn.update_rel(knows, 1, 2, 1, Cell::Str(b"changed".to_vec()));
+        // (0, 0) sorts in front of everything, so the pair the values
+        // were written onto is not where it was when they were staged.
+        txn.insert_rel_carrying(
+            knows,
+            0,
+            0,
+            vec![(0, Cell::Int(9)), (1, Cell::Str(b"new".to_vec()))],
+        );
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let (since, note) = (reader.col("since").unwrap(), reader.col("note").unwrap());
+        let mut graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        for (src, dst, year, text) in [
+            (0u64, 0u64, 9u64, "new"),
+            (0, 1, 1, "one"),
+            (1, 2, 20, "changed"),
+            (2, 3, 3, "three"),
+        ] {
+            let row = graph.edge_ordinal(&mut db, src, dst).unwrap().unwrap();
+            assert_eq!(reader.read_int(&mut db, since, row).unwrap(), year);
+            let mut got = Vec::new();
+            reader.read_str(&mut db, note, row, &mut got).unwrap();
+            assert_eq!(got, text.as_bytes(), "{src} to {dst}");
+        }
+        let path = dir.path().join("relset.zu1");
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// An absence written onto an edge is a clear bit in the column's
+    /// mask, and the edges beside it are left holding a value, which is
+    /// what says the mask was built over the new edge order and not
+    /// copied word for word out of the old one.
+    #[test]
+    fn an_absence_written_onto_an_edge_clears_its_bit_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relnull.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        let notes: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        crate::props::store_rel_props(
+            &mut db,
+            "knows",
+            &[
+                ("since", PropValues::Int(&[1, 2, 3])),
+                ("note", PropValues::Str(&notes)),
+            ],
+        )
+        .unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("relnull.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_rel(knows, 1, 2, 0, Cell::Null);
+        txn.update_rel(knows, 1, 2, 1, Cell::Null);
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let (since, note) = (reader.col("since").unwrap(), reader.col("note").unwrap());
+        let mut graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        let gone = graph.edge_ordinal(&mut db, 1, 2).unwrap().unwrap();
+        assert!(!reader.is_valid(&mut db, since, gone).unwrap());
+        assert!(!reader.is_valid(&mut db, note, gone).unwrap());
+        for (src, dst, year, text) in [(0u64, 1u64, 1u64, "one"), (2, 3, 3, "three")] {
+            let row = graph.edge_ordinal(&mut db, src, dst).unwrap().unwrap();
+            assert!(reader.is_valid(&mut db, since, row).unwrap());
+            assert_eq!(reader.read_int(&mut db, since, row).unwrap(), year);
+            let mut got = Vec::new();
+            reader.read_str(&mut db, note, row, &mut got).unwrap();
+            assert_eq!(got, text.as_bytes(), "{src} to {dst}");
+        }
+        let path = dir.path().join("relnull.zu1");
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A bit the last fold cleared stays clear through the next one,
+    /// which is the half of the mask that comes out of the old column
+    /// rather than out of the overlay.
+    #[test]
+    fn an_absence_on_an_edge_survives_the_next_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relnull2.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).unwrap();
+        crate::props::store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1, 2, 3]))])
+            .unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("relnull2.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update_rel(knows, 1, 2, 0, Cell::Null);
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        let mut txn = mvcc.begin();
+        txn.update_rel(knows, 2, 3, 0, Cell::Int(30));
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let since = reader.col("since").unwrap();
+        let mut graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        let gone = graph.edge_ordinal(&mut db, 1, 2).unwrap().unwrap();
+        assert!(!reader.is_valid(&mut db, since, gone).unwrap());
+        let changed = graph.edge_ordinal(&mut db, 2, 3).unwrap().unwrap();
+        assert_eq!(reader.read_int(&mut db, since, changed).unwrap(), 30);
+        let path = dir.path().join("relnull2.zu1");
         drop(db);
         crate::verify(&path).unwrap();
     }

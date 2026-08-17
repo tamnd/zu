@@ -1,0 +1,26 @@
+$ zu --help
+zu <version>: embedded property-graph database
+
+usage: zu <command> [arguments]
+
+  shell        open an interactive session on a file
+  query        run one statement and print the result
+  copy         bulk load an edge list into a new file
+  convert      rewrite an edge list in another format, or a database in another engine
+  verify       walk every checksum and cross-check the structure
+  stat         print the size breakdown: schema, free space, and data
+  analyze      rebuild every rel table's optimizer summary
+  neighbors    print one node's neighbor list, in either direction
+  lookup       resolve an original id through the primary-key index
+  edge         ask whether one edge exists, without decoding the list
+  conformance  declare, verify, tally, and score conformance reports
+  corpus       run the shared corpus cases against this build
+  version      print the version, the C ABI revision, and what this build supports
+
+not in this build yet, and refused rather than ignored: exec, explain, profile, bench, s3, serve, mcp, docs, completions
+
+exit codes: 0 success, 1 query error, 2 usage error, 3 file or io error, 4 corruption, 5 conflict, 130 interrupted
+
+run `zu <command> --help` for the synopsis, examples, and related commands
+or `zu --help --format json` for all of it at once
+

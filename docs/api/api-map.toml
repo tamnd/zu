@@ -197,6 +197,11 @@ tier = 3
 reason = "the storage engine: blocks, segments, catalog, WAL. A binding talks to a session, and a session talks to this."
 
 [[entity]]
+id = "zu::C_ABI_VERSION"
+tier = 2
+reason = "the revision of the C ABI this build publishes, which a binding reporting what it is linked against wants beside its own version, and which every binding on the C ABI can also read as ZU_ABI_VERSION out of the header it compiled with"
+
+[[entity]]
 id = "zu::Connection::session_mut"
 tier = 3
 reason = "the escape hatch to the engine's own session, which exists for the paths this API has not grown yet and which no binding reproduces"

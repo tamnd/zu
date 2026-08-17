@@ -44,6 +44,15 @@ try {
     # run this way has no file on disk, so anything reading $PSScriptRoot
     # or its own source works when run as a file and not here.
     #
+    # In a shell of its own, because `iex` runs the text in the caller's
+    # scope and a user's caller is an empty prompt while this one is a
+    # script with variables in it. PowerShell is case insensitive about
+    # those, so the `$prefix` below would be the `$Prefix` the installer
+    # declares a parameter for, and a compiled scope refuses to have one
+    # of its slots rebound from outside. Starting a shell is also the
+    # closer copy of what a user does, and it means the installer's own
+    # exit code is what this reads rather than an exception from `exit`.
+    #
     # file:// rather than a server, since the release is on this disk and
     # what is under test is the installer. The target is not passed,
     # which makes the fetch a check on Get-Target: name the platform
@@ -51,7 +60,10 @@ try {
     $prefix = Join-Path $work 'prefix'
     $env:ZU_BASE = 'file:///' + ($release -replace '\\', '/')
     $env:ZU_PREFIX = $prefix
-    Get-Content (Join-Path $root 'install.ps1') -Raw | Invoke-Expression
+    $installer = Join-Path $root 'install.ps1'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -Command "Get-Content -Raw '$installer' | Invoke-Expression"
+    if ($LASTEXITCODE -ne 0) { throw 'the one-liner did not install anything' }
 
     # The whole prefix and not just the CLI, because dx/12 section 6
     # installs a package: a user who takes the one-liner today compiles

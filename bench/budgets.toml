@@ -1355,6 +1355,24 @@ capi_load_ratio = 2.0
 # Lower this ceiling, never raise it.
 cli_startup_ms = 25.0
 
+# What one keystroke costs in the interactive shell, microseconds,
+# measured over the whole path a key travels
+# (crates/zu-cli/benches/editor.rs): the bytes are decoded, the editor
+# applies the key, and the escape sequence that shows the result is
+# built. The write is not in it, because that is the terminal's time and
+# the link's. Measured: local M series 0.21 to 0.46 on a one-line
+# statement and 0.47 to 1.03 on a six-line one, since every key rebuilds
+# the whole buffer, the spread being what else the machine was doing.
+#
+# The ceiling is 50, which is two orders above the measurement and still
+# two orders below the millisecond where typing starts to feel like it
+# is being answered rather than echoed. A redraw that allocated per
+# character, or a completeness scan that reparsed the statement, would
+# land well above it on the long line and stay under it on the short
+# one, which is why the gate takes the worse of the two.
+# Lower this ceiling, never raise it.
+cli_keystroke_us = 50.0
+
 # SHA-256 throughput in MiB/s at 16 MiB, single core, from the hasher
 # the release writes its digest list with and both install scripts check
 # against. Measured: local M series 231, and flat from 64 KiB up, which

@@ -62,6 +62,15 @@ rm -rf "$stage"
 cargo run -q -p xtask -- package --stage "$stage" --built "$out" --target "$target" \
     --syslibs "$syslibs"
 
+# From here on it is what the package says rather than what rustc said,
+# which are the same list in at most a different spelling: MSVC's
+# options arrive from rustc with the slash MSVC documents and are
+# staged with a dash, since a leading slash is the start of a path to
+# CMake and to the shell git bash runs. Reading it back means the
+# static smoke link below is a check on Libs.private itself, and means
+# this rule is written once, where there are tests on it.
+syslibs="$(sed -n 's/^Libs.private: //p' "$stage/lib/pkgconfig/libzu.pc")"
+
 # What the shared library exports, which dx/09 C-5 says is the header
 # and nothing else. `cargo xtask package` proves the header and the
 # crate declare and define the same functions; this proves the library
@@ -136,8 +145,17 @@ case "$target" in
     clang -O2 "-I$prefix/include" "$smoke_c" -o "$work/shared.exe" "$prefix/lib/zu.dll.lib"
     cp "$prefix/bin/zu.dll" "$work/"
     "$work/shared.exe" "$work/smoke.zu1"
+    # The list rustc printed is linker input rather than files a driver
+    # opens: `kernel32.lib` is a name the linker resolves and not a path
+    # clang can find, and `-defaultlib:msvcrt` is an option. `-Wl,`
+    # hands each one straight to the linker, which is also what the
+    # package tells a consumer's build system to do with them.
+    linkargs=""
+    for lib in $syslibs; do
+        linkargs="$linkargs -Wl,$lib"
+    done
     # shellcheck disable=SC2086
-    clang -O2 "-I$prefix/include" "$smoke_c" -o "$work/static.exe" "$prefix/lib/zu.lib" $syslibs
+    clang -O2 "-I$prefix/include" "$smoke_c" -o "$work/static.exe" "$prefix/lib/zu.lib" $linkargs
     "$work/static.exe" "$work/smoke.zu1"
     ;;
 *)
@@ -159,10 +177,11 @@ if command -v pkg-config > /dev/null 2>&1; then
     export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
     pkg-config --exists libzu
     echo "pkg-config: $(pkg-config --modversion libzu), $(pkg-config --cflags --libs libzu)"
-    # Libs.private is what `--static` adds and nothing else here reads,
-    # so it is checked as text. It cannot be checked by linking: with
-    # both forms in one directory a linker takes the shared one, and
-    # naming the archive by path instead is not what the field says.
+    # That every one of them survives the trip, which is the failure
+    # where a token is spelled in a way pkgconf drops rather than
+    # passes on. It cannot be checked by linking: with both forms in
+    # one directory a linker takes the shared one, and naming the
+    # archive by path instead is not what the field says.
     for lib in $syslibs; do
         case " $(pkg-config --libs --static libzu) " in
         *" $lib "*) ;;

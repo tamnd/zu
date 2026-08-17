@@ -266,6 +266,22 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
+/// A linker option written with a dash rather than a slash.
+///
+/// rustc prints the MSVC list with the spelling MSVC's own linker
+/// documents, so `/defaultlib:msvcrt` arrives among the `.lib` names.
+/// Both linkers that read it take either spelling, and everything that
+/// carries it to them reads a leading slash as the start of a path: to
+/// CMake an absolute one, and to the shell git bash runs on Windows a
+/// path to rewrite before the compiler ever sees it. So the slash goes
+/// once, here, rather than in each of the files this writes.
+fn dashed(option: &str) -> String {
+    match option.strip_prefix('/') {
+        Some(rest) => format!("-{rest}"),
+        None => option.to_string(),
+    }
+}
+
 /// One platform's package, laid out and written.
 #[derive(Debug, Clone)]
 pub struct Package<'a> {
@@ -281,7 +297,7 @@ impl<'a> Package<'a> {
         Package {
             platform,
             version: version.to_string(),
-            syslibs: syslibs.split_whitespace().map(str::to_string).collect(),
+            syslibs: syslibs.split_whitespace().map(dashed).collect(),
         }
     }
 
@@ -384,9 +400,10 @@ impl<'a> Package<'a> {
             "    IMPORTED_LOCATION \"{prefix}/lib/{}\"\n",
             self.platform.staticlib
         ));
-        // Written verbatim, because a link item CMake does not
-        // recognize is passed through as written, and what rustc printed
-        // is already the flag the linker wants on every platform.
+        // As rustc printed them, up to the spelling `dashed` fixes,
+        // because a link item CMake does not recognize is passed through
+        // as written and what rustc printed is already the flag the
+        // linker wants on every platform.
         out.push_str(&format!(
             "    INTERFACE_LINK_LIBRARIES \"{}\"\n",
             self.syslibs.join(";")
@@ -675,6 +692,41 @@ mod tests {
         assert!(cmake.contains("bin/zu.dll"), "{cmake}");
         assert!(cmake.contains("lib/zu.lib"), "{cmake}");
         assert!(package.pkg_config().contains("-lzu.dll"));
+    }
+
+    #[test]
+    fn a_linker_option_that_looks_like_a_path_is_not_left_looking_like_one() {
+        let (table, target) = package("x86_64-pc-windows-msvc");
+        let platform = table.platform(&target).expect("a row");
+        // What rustc prints for this target, which is library names and
+        // one option that starts where an absolute path starts.
+        let windows = Package::new(
+            platform,
+            "0.5.0",
+            "kernel32.lib ntdll.lib /defaultlib:msvcrt",
+        );
+        assert_eq!(
+            windows.syslibs,
+            ["kernel32.lib", "ntdll.lib", "-defaultlib:msvcrt"]
+        );
+        assert!(
+            windows
+                .cmake_config()
+                .contains("INTERFACE_LINK_LIBRARIES \"kernel32.lib;ntdll.lib;-defaultlib:msvcrt\"")
+        );
+        assert!(
+            windows
+                .pkg_config()
+                .contains("Libs.private: kernel32.lib ntdll.lib -defaultlib:msvcrt\n")
+        );
+        // The library names themselves are not options and are left
+        // alone, on this platform and on the ones that use -l.
+        let (elf, elf_target) = package("x86_64-unknown-linux-gnu");
+        let elf = elf.platform(&elf_target).expect("a row");
+        assert_eq!(
+            Package::new(elf, "0.5.0", "-lgcc_s -lc").syslibs,
+            ["-lgcc_s", "-lc"]
+        );
     }
 
     #[test]

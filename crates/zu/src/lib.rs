@@ -21,6 +21,7 @@ pub use db::{Config, Connection, Database};
 pub mod append;
 pub mod catalog_stmt;
 pub mod convert;
+pub mod dataset;
 pub mod db;
 mod delete;
 mod deleted;

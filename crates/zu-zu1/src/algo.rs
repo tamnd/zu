@@ -1,19 +1,80 @@
-//! Whole-graph table function kernels: pagerank, wcc, sssp, louvain
-//! (docs/07 §4, TableFunction). Each kernel runs directly on a rel
-//! table's CSR through [`GraphReader`], one sequential sweep per
+//! Whole-graph table function kernels: bfs, pagerank, wcc, sssp,
+//! louvain (docs/07 §4, TableFunction). Each kernel runs directly on a
+//! rel table's CSR through [`GraphReader`], one sequential sweep per
 //! iteration so the per-direction group cache decodes every group once
 //! per pass, and returns one value per node in dense row order. The
 //! query layer surfaces these through CALL; nothing here parses or
 //! plans.
 //!
+//! The traversal kernels share one frontier: a visited bitmap, rounds
+//! that pin a group's CSR once and expand every frontier node in it
+//! from the pinned arrays, and a direction-optimizing switch that goes
+//! bottom-up when the frontier is about to touch more edges than are
+//! left unexplored.
+//!
 //! Determinism: every kernel sweeps nodes in row order with fixed
 //! iteration or convergence rules, so the same file produces the same
 //! output on every run and every machine, which is what lets tests and
-//! the Graphalytics harness assert exact values.
+//! the Graphalytics harness assert exact values. The frontier is no
+//! exception: a node's level is the round it was first claimed in, and
+//! rounds are barriers, so which direction a round ran cannot move it.
 
 use crate::file::Zu1File;
 use crate::graph::{Direction, GraphReader};
-use zu_common::Result;
+use zu_common::{GROUP_ROWS, Result};
+
+/// A frontier about to touch more than this fraction of the edges
+/// still unexplored is cheaper scanned from the other end. GAP's
+/// alpha: the classic direction-optimizing tuning constant, and the
+/// one docs/06 fixes.
+const ALPHA: u64 = 14;
+
+/// Coming back the other way is a separate decision with its own
+/// constant: a frontier holding under `n / BETA` nodes is sparse
+/// enough that scanning every unvisited node again would waste the
+/// pass. GAP's beta.
+const BETA: u64 = 24;
+
+/// Which adjacency a traversal walks. `Out` follows stored edge
+/// direction, which is what BFS levels mean on a directed graph.
+/// `Both` treats the rel table as undirected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk {
+    Out,
+    Both,
+}
+
+impl Walk {
+    /// The directions a top-down round expands.
+    fn forward(self) -> &'static [Direction] {
+        match self {
+            Walk::Out => &[Direction::Fwd],
+            Walk::Both => &[Direction::Fwd, Direction::Bwd],
+        }
+    }
+
+    /// The directions a bottom-up round scans, which is the reverse of
+    /// what it would have expanded: a node is claimed this round when
+    /// an edge that would have arrived at it starts in the frontier.
+    fn backward(self) -> &'static [Direction] {
+        match self {
+            Walk::Out => &[Direction::Bwd],
+            Walk::Both => &[Direction::Fwd, Direction::Bwd],
+        }
+    }
+}
+
+fn word_and_bit(node: u64) -> (usize, u64) {
+    ((node / 64) as usize, 1u64 << (node % 64))
+}
+
+/// The group a row sits in and its offset inside that group.
+fn locate(node: u64) -> (usize, usize) {
+    (
+        (node / GROUP_ROWS as u64) as usize,
+        (node % GROUP_ROWS as u64) as usize,
+    )
+}
 
 /// The damping factor and iteration count Graphalytics fixes for
 /// comparable runs.
@@ -86,38 +147,177 @@ pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
     Ok((0..n as u64).map(|x| find(&mut parent, x)).collect())
 }
 
-/// Single-source hop distances over the undirected view, a frontier
-/// BFS. Rel tables carry no edge weights yet, so this is SSSP under
-/// unit weights, which is also exactly the Graphalytics BFS kernel;
-/// the weighted variant arrives with rel properties. Unreachable
-/// nodes get `u64::MAX`.
+/// Single-source hop distances over the undirected view. Rel tables
+/// carry no edge weights yet, so this is SSSP under unit weights; the
+/// weighted variant arrives with rel properties. Unreachable nodes get
+/// `u64::MAX`.
 pub fn sssp(db: &mut Zu1File, reader: &mut GraphReader, source: u64) -> Result<Vec<u64>> {
+    levels(db, reader, source, Walk::Both)
+}
+
+/// Breadth-first levels from `source` following stored edge direction,
+/// the Graphalytics and Graph500 BFS kernel. Unreachable nodes get
+/// `u64::MAX`; the source is level zero.
+pub fn bfs(db: &mut Zu1File, reader: &mut GraphReader, source: u64) -> Result<Vec<u64>> {
+    levels(db, reader, source, Walk::Out)
+}
+
+/// The frontier both traversal kernels run on: a visited bitmap, one
+/// group pin per group per round, and a per-round choice between
+/// expanding the frontier and scanning for it.
+///
+/// The bitmap is the memory story. Claiming through `dist` would mean
+/// eight bytes a node in the hot set; a bit a node is sixty four times
+/// less, which is the difference between a working set that fits in
+/// cache on a ten million node graph and one that does not.
+fn levels(db: &mut Zu1File, reader: &mut GraphReader, source: u64, walk: Walk) -> Result<Vec<u64>> {
     let n = reader.directory().one_domain()?;
     let mut dist = vec![u64::MAX; n as usize];
     if source >= n {
         return Ok(dist);
     }
+    let words = (n as usize).div_ceil(64);
+    let mut visited = vec![0u64; words];
+    let (word, bit) = word_and_bit(source);
+    visited[word] |= bit;
     dist[source as usize] = 0;
+
+    // The unexplored edge count the alpha rule compares against. Every
+    // stored edge is one traversal in Out and two in Both, which is
+    // what makes the same rule fit both walks.
+    let stored = reader.directory().edge_count;
+    let mut unexplored = match walk {
+        Walk::Out => stored,
+        Walk::Both => stored * 2,
+    };
+
     let mut frontier = vec![source];
+    let mut frontier_bits: Vec<u64> = Vec::new();
     let mut depth = 0u64;
+    let mut bottom_up = false;
     while !frontier.is_empty() {
         depth += 1;
-        let mut next = Vec::new();
-        for &node in &frontier {
-            for dir in [Direction::Fwd, Direction::Bwd] {
-                for &far in reader.neighbors_dir(db, node, dir)? {
-                    if dist[far as usize] == u64::MAX {
-                        dist[far as usize] = depth;
+        // The switch is decided per round, from this round's frontier.
+        // Going down: the frontier is about to read mf edges and only
+        // mu are left to find anything in, so scanning from the other
+        // end reads less. Coming back up: the frontier has thinned to
+        // where a full scan costs more than the expansion.
+        frontier.sort_unstable();
+        if bottom_up {
+            bottom_up = (frontier.len() as u64) > n / BETA;
+        } else {
+            let mut mf = 0u64;
+            for &dir in walk.forward() {
+                mf += reader.degree_batch(db, &frontier, dir)?;
+            }
+            bottom_up = mf > unexplored / ALPHA;
+        }
+        let next = if bottom_up {
+            frontier_bits.clear();
+            frontier_bits.resize(words, 0);
+            for &v in &frontier {
+                let (word, bit) = word_and_bit(v);
+                frontier_bits[word] |= bit;
+            }
+            scan_round(db, reader, n, &frontier_bits, &mut visited, walk)?
+        } else {
+            expand_round(db, reader, &frontier, &mut visited, walk, &mut unexplored)?
+        };
+        for &v in &next {
+            dist[v as usize] = depth;
+        }
+        frontier = next;
+    }
+    Ok(dist)
+}
+
+/// One top-down round. The frontier arrives sorted, so nodes of the
+/// same group are one run: the run pins that group's CSR once and
+/// reads every list in it out of the pinned arrays, rather than
+/// letting each node decode a group of its own.
+fn expand_round(
+    db: &mut Zu1File,
+    reader: &mut GraphReader,
+    frontier: &[u64],
+    visited: &mut [u64],
+    walk: Walk,
+    unexplored: &mut u64,
+) -> Result<Vec<u64>> {
+    let mut next = Vec::new();
+    for &dir in walk.forward() {
+        let mut at = 0;
+        while at < frontier.len() {
+            let (group, _) = locate(frontier[at]);
+            let mut end = at + 1;
+            while end < frontier.len() && locate(frontier[end]).0 == group {
+                end += 1;
+            }
+            let (offsets, nbrs) = reader.csr_group(db, group, dir)?;
+            for &v in &frontier[at..end] {
+                let (_, row) = locate(v);
+                let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
+                *unexplored = unexplored.saturating_sub((hi - lo) as u64);
+                for &far in &nbrs[lo..hi] {
+                    let (word, bit) = word_and_bit(far);
+                    if visited[word] & bit == 0 {
+                        visited[word] |= bit;
                         next.push(far);
                     }
                 }
             }
+            at = end;
         }
-        next.sort_unstable();
-        next.dedup();
-        frontier = next;
     }
-    Ok(dist)
+    Ok(next)
+}
+
+/// One bottom-up round: every unvisited node scans the edges arriving
+/// at it and stops at the first one that starts in the frontier. On a
+/// round where the frontier holds most of the graph this reads a
+/// fraction of the lists a top-down round would, because a node needs
+/// one hit and not the whole list.
+///
+/// Groups are the unit here too, in row order, so the pass decodes
+/// each group's arrays once and node order stays the file's.
+fn scan_round(
+    db: &mut Zu1File,
+    reader: &mut GraphReader,
+    n: u64,
+    frontier_bits: &[u64],
+    visited: &mut [u64],
+    walk: Walk,
+) -> Result<Vec<u64>> {
+    let mut next = Vec::new();
+    let groups = (n as usize).div_ceil(GROUP_ROWS as usize);
+    let dirs = walk.backward();
+    let mut pinned = Vec::with_capacity(dirs.len());
+    for group in 0..groups {
+        pinned.clear();
+        for &dir in dirs {
+            pinned.push(reader.csr_group(db, group, dir)?);
+        }
+        let first = group as u64 * GROUP_ROWS as u64;
+        let rows = (n - first).min(GROUP_ROWS as u64) as usize;
+        for row in 0..rows {
+            let node = first + row as u64;
+            let (word, bit) = word_and_bit(node);
+            if visited[word] & bit != 0 {
+                continue;
+            }
+            let hit = pinned.iter().any(|(offsets, nbrs)| {
+                let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
+                nbrs[lo..hi].iter().any(|&near| {
+                    let (w, b) = word_and_bit(near);
+                    frontier_bits[w] & b != 0
+                })
+            });
+            if hit {
+                visited[word] |= bit;
+                next.push(node);
+            }
+        }
+    }
+    Ok(next)
 }
 
 /// Louvain community detection over the undirected view: repeated
@@ -308,6 +508,53 @@ mod tests {
     }
 
     #[test]
+    fn bfs_follows_edge_direction_where_sssp_ignores_it() {
+        // 0 -> 1 <- 2: following the arrows from 0 stops at 1, while
+        // the undirected view walks back out of 1 and reaches 2.
+        let (_dir, mut db, mut reader) = open_with(&[(0, 1), (2, 1)], 4);
+        assert_eq!(
+            bfs(&mut db, &mut reader, 0).expect("bfs"),
+            [0, 1, u64::MAX, u64::MAX]
+        );
+        assert_eq!(sssp(&mut db, &mut reader, 0).expect("sssp"), [0, 1, 2, u64::MAX]);
+    }
+
+    #[test]
+    fn the_scan_round_finds_what_the_expand_round_would_have() {
+        // A star with a hub big enough that the round after the hub
+        // has a frontier over the alpha threshold, so this graph takes
+        // the bottom-up path and has to agree with the levels a plain
+        // expansion gives: hub at one, every other spoke at two.
+        let mut edges = vec![(0u32, 1u32)];
+        for spoke in 2..600u32 {
+            edges.push((1, spoke));
+        }
+        let (_dir, mut db, mut reader) = open_with(&edges, 600);
+        let got = sssp(&mut db, &mut reader, 0).expect("sssp");
+        assert_eq!(got[0], 0);
+        assert_eq!(got[1], 1);
+        assert!(got[2..].iter().all(|&d| d == 2), "{:?}", &got[2..10]);
+    }
+
+    #[test]
+    fn a_ring_levels_the_same_both_ways_round() {
+        // Every node of a ring is reachable in both directions, so the
+        // undirected levels are the distance to the nearer arc and the
+        // directed ones go the whole way around. Neither is allowed to
+        // depend on which round switched direction.
+        let n = 400u32;
+        let edges: Vec<(u32, u32)> = (0..n).map(|v| (v, (v + 1) % n)).collect();
+        let (_dir, mut db, mut reader) = open_with(&edges, n as u64);
+        let both = sssp(&mut db, &mut reader, 0).expect("sssp");
+        let out = bfs(&mut db, &mut reader, 0).expect("bfs");
+        for v in 0..n as usize {
+            let forward = v as u64;
+            assert_eq!(out[v], forward, "directed level of {v}");
+            assert_eq!(both[v], forward.min(n as u64 - forward), "undirected level of {v}");
+        }
+    }
+
+    #[test]
     fn sssp_from_an_out_of_range_source_reaches_nothing() {
         let (_dir, mut db, mut reader) = open_with(&[(0, 1)], 2);
         let dist = sssp(&mut db, &mut reader, 9).expect("sssp");
@@ -343,6 +590,7 @@ mod tests {
         );
         assert!(wcc(&mut db, &mut reader).expect("wcc").is_empty());
         assert!(sssp(&mut db, &mut reader, 0).expect("sssp").is_empty());
+        assert!(bfs(&mut db, &mut reader, 0).expect("bfs").is_empty());
         assert!(louvain(&mut db, &mut reader).expect("louvain").is_empty());
     }
 }

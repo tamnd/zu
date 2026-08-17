@@ -4000,12 +4000,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             for arg in args {
                 vals.push(eval(ctx, arg)?);
             }
-            // The sssp source arrives as a user-facing id; resolve it
-            // to the dense offset the kernel walks.
-            if *func == TableFunc::Sssp {
+            // A traversal source arrives as a user-facing id; resolve
+            // it to the dense offset the kernel walks.
+            if matches!(func, TableFunc::Bfs | TableFunc::Sssp) {
+                let name = func.name();
                 let Some(Value::Int(key)) = vals.first() else {
                     return Err(invalid(format!(
-                        "sssp's source must be a node id, got {:?}",
+                        "{name}'s source must be a node id, got {:?}",
                         vals.first()
                     )));
                 };
@@ -4013,7 +4014,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     .ok()
                     .and_then(|k| ctx.graph.lookup_key(*table, k).transpose())
                     .transpose()?
-                    .ok_or_else(|| invalid(format!("sssp source {key} names no node")))?;
+                    .ok_or_else(|| invalid(format!("{name} source {key} names no node")))?;
                 vals[0] = Value::Int(offset as i64);
             }
             let rows = ctx.graph.table_function(func.name(), *rel, &vals)?;

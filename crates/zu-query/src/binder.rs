@@ -1022,6 +1022,9 @@ pub struct BoundRel {
 pub enum TableFunc {
     Pagerank,
     Wcc,
+    /// Hop levels following stored edge direction. Takes a source.
+    Bfs,
+    /// Hop levels over the undirected view. Takes a source.
     Sssp,
     Louvain,
 }
@@ -1031,6 +1034,7 @@ impl TableFunc {
         Some(match name.to_ascii_lowercase().as_str() {
             "pagerank" => TableFunc::Pagerank,
             "wcc" => TableFunc::Wcc,
+            "bfs" => TableFunc::Bfs,
             "sssp" => TableFunc::Sssp,
             "louvain" => TableFunc::Louvain,
             _ => return None,
@@ -1042,6 +1046,7 @@ impl TableFunc {
         match self {
             TableFunc::Pagerank => "pagerank",
             TableFunc::Wcc => "wcc",
+            TableFunc::Bfs => "bfs",
             TableFunc::Sssp => "sssp",
             TableFunc::Louvain => "louvain",
         }
@@ -1054,6 +1059,7 @@ impl TableFunc {
         match self {
             TableFunc::Pagerank => ("rank", Type::Float),
             TableFunc::Wcc => ("component", Type::Int),
+            TableFunc::Bfs => ("level", Type::Int),
             TableFunc::Sssp => ("distance", Type::Int),
             TableFunc::Louvain => ("community", Type::Int),
         }
@@ -1497,7 +1503,7 @@ impl Binder<'_> {
     ) -> Result<BoundClause> {
         let func = TableFunc::resolve(name).ok_or_else(|| {
             invalid(format!(
-                "unknown table function '{name}', the v0 functions are pagerank, wcc, sssp, louvain"
+                "unknown table function '{name}', the v0 functions are pagerank, wcc, bfs, sssp, louvain"
             ))
         })?;
         // The rel table must resolve at bind time, so the first
@@ -1527,15 +1533,16 @@ impl Binder<'_> {
             bound_args.push((expr, ty));
         }
         match func {
-            TableFunc::Sssp => {
+            TableFunc::Bfs | TableFunc::Sssp => {
+                let name = func.name();
                 if bound_args.len() != 1 {
-                    return Err(invalid(
-                        "sssp takes the rel table and a source node id".into(),
-                    ));
+                    return Err(invalid(format!(
+                        "{name} takes the rel table and a source node id"
+                    )));
                 }
                 if !matches!(bound_args[0].1, Type::Int | Type::Any) {
                     return Err(invalid(format!(
-                        "sssp's source must be a node id, got {}",
+                        "{name}'s source must be a node id, got {}",
                         bound_args[0].1
                     )));
                 }

@@ -8,10 +8,11 @@
 //! and it leaves the names it took away named.
 //!
 //! What a delete cannot do is leave an edge pointing at nothing. Every
-//! edge in the file names its endpoints by row offset, so an element
-//! that still has edges is refused with G1001 rather than deleted, and
-//! `DETACH DELETE`, which is the way GQL says take the edges too, is a
-//! piece of its own that waits on an edge being deletable at all.
+//! edge in the file names its endpoints by row offset, so a plain
+//! `DELETE` of an element that still has edges is refused with G1001,
+//! and `DETACH DELETE` is the form that takes the edges away first. An
+//! edge the statement named itself is deleted either way: it has no
+//! edges on it, and the rows it ran between stay where they were.
 //!
 //! A delete does not compact either: the row keeps its offset and the
 //! fold writes that offset into the table's tombstone chain, which is
@@ -29,6 +30,13 @@ use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
 use crate::zu1::txn::WriteTxn;
+
+/// One element a delete takes away: the table it is in and its offset.
+type Row = (u32, u64);
+
+/// One edge a detach takes away: the rel table it is in and the two
+/// rows it runs between, which is the only name an edge has.
+type Edge = (u32, u64, u64);
 
 /// The elements one delete is taking away, filled a row at a time.
 ///
@@ -51,7 +59,12 @@ pub(crate) struct Removals<'a> {
     /// turn up in, and a slot the write names is bound by a match that
     /// can leave several tables open.
     readers: HashMap<u32, GraphReader>,
-    rows: BTreeSet<(u32, u64)>,
+    rows: BTreeSet<Row>,
+    /// The edges a `DETACH` is taking away, as the rel table and the two
+    /// rows each one runs between. A set for the same reason the rows
+    /// are: both ends of an edge can be deleted by the same statement,
+    /// and an edge on a loop is read once forward and once backward.
+    edges: BTreeSet<Edge>,
 }
 
 impl<'a> Removals<'a> {
@@ -61,6 +74,7 @@ impl<'a> Removals<'a> {
             catalog,
             readers: HashMap::new(),
             rows: BTreeSet::new(),
+            edges: BTreeSet::new(),
         }
     }
 
@@ -83,6 +97,14 @@ impl<'a> Removals<'a> {
                 })?;
             let (table, offset) = match value {
                 Value::Node { table, offset } => (*table, *offset),
+                // An edge is named by the rows it runs between, and
+                // that is the whole of it: nothing has to be checked,
+                // because an edge has no edges on it, and nothing else
+                // is staged, because both ends stay.
+                Value::Rel { table, src, dst } => {
+                    self.edges.insert((*table, *src, *dst));
+                    continue;
+                }
                 // An OPTIONAL MATCH that found nothing binds null, and
                 // taking nothing away is what the statement asked for.
                 Value::Null => continue,
@@ -96,21 +118,22 @@ impl<'a> Removals<'a> {
                     ));
                 }
             };
-            self.detached(db, table, offset)?;
+            self.detach(db, table, offset)?;
             self.rows.insert((table, offset));
         }
         Ok(())
     }
 
-    /// Raises unless the element has no edges left on it.
+    /// Takes the edges on the element away, or raises if the statement
+    /// did not say to and there are any.
     ///
     /// Every rel table that starts or ends in the element's table is a
     /// place an edge on it can be, and an undirected table is both, so
-    /// each one is asked for the degree of the row in the direction it
-    /// could hold it. `DELETE` without `DETACH` is defined to refuse an
-    /// element that still has one (G1001), and the message names a table
-    /// the edges are in so the reader knows what to detach or delete.
-    fn detached(&mut self, db: &mut Zu1File, table: u32, offset: u64) -> Result<()> {
+    /// each one is asked in the direction it could hold one. A `DETACH`
+    /// stages what it finds; a plain `DELETE` is defined to refuse an
+    /// element that still has an edge (G1001), and its message names a
+    /// table the edges are in so the reader knows what to detach.
+    fn detach(&mut self, db: &mut Zu1File, table: u32, offset: u64) -> Result<()> {
         let rels: Vec<(u32, bool, bool)> = self
             .catalog
             .rel_tables()
@@ -121,6 +144,23 @@ impl<'a> Removals<'a> {
         for (rel, out, back) in rels {
             self.ensure_reader(db, rel)?;
             let reader = self.readers.get(&rel).expect("just loaded");
+            if self.write.detach {
+                // Read out rather than counted, because what the edges
+                // are is what has to be staged, and the count of them
+                // is only interesting to the statement that refuses.
+                let mut ends = Vec::new();
+                if out {
+                    reader.neighbors_dir_into(db, offset, Direction::Fwd, &mut ends)?;
+                    self.edges
+                        .extend(ends.drain(..).map(|dst| (rel, offset, dst)));
+                }
+                if back {
+                    reader.neighbors_dir_into(db, offset, Direction::Bwd, &mut ends)?;
+                    self.edges
+                        .extend(ends.drain(..).map(|src| (rel, src, offset)));
+                }
+                continue;
+            }
             let mut edges = 0;
             if out {
                 edges += reader.degree_of(db, offset, Direction::Fwd)?;
@@ -156,9 +196,13 @@ impl<'a> Removals<'a> {
         Ok(())
     }
 
-    /// What the whole run takes away, by table and then by row.
-    pub(crate) fn staged(self) -> Vec<(u32, u64)> {
-        self.rows.into_iter().collect()
+    /// What the whole run takes away: the rows, by table and then by
+    /// row, and the edges a `DETACH` is taking with them.
+    pub(crate) fn staged(self) -> (Vec<Row>, Vec<Edge>) {
+        (
+            self.rows.into_iter().collect(),
+            self.edges.into_iter().collect(),
+        )
     }
 }
 
@@ -166,7 +210,13 @@ impl<'a> Removals<'a> {
 ///
 /// The rows arrive deduplicated, so the count is the number of elements
 /// the statement took away and not the number of times it named them.
-pub(crate) fn stage(txn: &mut WriteTxn<'_>, rows: &[(u32, u64)]) -> Result<u64> {
+/// The edges go first, which is the order the log wants them in as
+/// well: a row that is gone must never be the endpoint of an edge that
+/// is still there, on either side of a crash.
+pub(crate) fn stage(txn: &mut WriteTxn<'_>, rows: &[Row], edges: &[Edge]) -> Result<u64> {
+    for &(rel, src, dst) in edges {
+        txn.delete_rel(rel, src, dst);
+    }
     for &(table, offset) in rows {
         txn.delete(table, offset);
     }
@@ -319,6 +369,105 @@ mod tests {
 
         let mut session = Session::open(&path).expect("reopen");
         assert_eq!(names(&mut session), ["ada", "kay"]);
+    }
+
+    /// An edge the statement named itself goes, and the two elements it
+    /// ran between stay. Nothing about that needs DETACH: what DETACH
+    /// says is that the edges on an element go too, and an edge has
+    /// none on it.
+    #[test]
+    fn an_edge_the_statement_named_is_taken_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-edge.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'ada'})-[k:knows]->(b:person) DELETE k",
+                &[],
+            )
+            .expect("delete the edge");
+
+        assert_eq!(names(&mut session), ["ada", "kay", "zoe"]);
+        let edges = session
+            .run(
+                "MATCH (a:person)-[:knows]->(b:person) RETURN count(*) AS n",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(edges.rows[0][0], Value::Int(0));
+        // Both ends are edge free now, so a plain DELETE takes either.
+        session
+            .run("MATCH (p:person {name: 'ada'}) DELETE p", &[])
+            .expect("ada has nothing on her now");
+        assert_eq!(names(&mut session), ["kay", "zoe"]);
+    }
+
+    /// The edges on an element go with it when the statement says
+    /// DETACH, and the element goes with them.
+    #[test]
+    fn a_detach_delete_takes_the_edges_with_the_element() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "detach.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'ada'}) DETACH DELETE p", &[])
+            .expect("detach delete");
+
+        assert_eq!(names(&mut session), ["kay", "zoe"]);
+        // The edge ada knew kay by is gone too, so the end it left
+        // behind has nothing on it.
+        let edges = session
+            .run(
+                "MATCH (a:person)-[:knows]->(b:person) RETURN count(*) AS n",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(edges.rows[0][0], Value::Int(0));
+    }
+
+    /// The end an edge arrived at detaches the same way the end it left
+    /// does, which is what reading the backward direction is for.
+    #[test]
+    fn detaching_the_far_end_of_an_edge_works_the_same_way() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "detach-back.zu1");
+
+        session
+            .run("MATCH (p:person {name: 'kay'}) DETACH DELETE p", &[])
+            .expect("detach delete");
+
+        assert_eq!(names(&mut session), ["ada", "zoe"]);
+        // ada is now edge free, so a plain DELETE takes her, which is
+        // the check that the edge went rather than being hidden.
+        session
+            .run("MATCH (p:person {name: 'ada'}) DELETE p", &[])
+            .expect("ada has nothing on her now");
+        assert_eq!(names(&mut session), ["zoe"]);
+    }
+
+    /// The fold rebuilds the CSR without the edge, so what a detach took
+    /// away is gone from the file and not only from a reader.
+    #[test]
+    fn a_detached_edge_stays_away_after_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("detach-reopen.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person {name: 'ada'}) DETACH DELETE p", &[])
+            .expect("detach delete");
+        drop(session);
+
+        let mut session = Session::open(&path).expect("reopen");
+        assert_eq!(names(&mut session), ["kay", "zoe"]);
+        let edges = session
+            .run(
+                "MATCH (a:person)-[:knows]->(b:person) RETURN count(*) AS n",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(edges.rows[0][0], Value::Int(0));
     }
 
     /// A name no clause bound stands for nothing to take away, and the

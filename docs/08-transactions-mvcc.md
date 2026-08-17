@@ -24,11 +24,12 @@ Redo-only, logical-physiological records; one format for all engines (zu1 sideca
 WalRecord { len u32 | crc32c u32 | epoch u64 | kind u8 | payload }
 kinds: TxnBegin, NodeInsert{table, rows(columnar)}, RelInsert{...},
        Update{table, group, col, offsets, values}, Delete{ids},
-       DdlCatalog{delta}, TxnCommit{epoch}, IngestRef{sealed group ptrs},
-       CheckpointNote{epoch}
+       RelDelete{rel, src, dst}, DdlCatalog{delta}, TxnCommit{epoch},
+       IngestRef{sealed group ptrs}, CheckpointNote{epoch}
 ```
 
 - Commit = append records + fsync (zu1: `fdatasync` per commit, group-commit window 1 ms when writers queue; s3: durability per §06 modes).
+- `RelDelete` names the rows an edge runs between rather than an offset, because an edge has none: the fold drops the pair out of the CSR it rebuilds, so there is nothing for a reader to filter by afterwards.
 - `IngestRef` is the DuckDB trick: bulk loads write sealed segments directly to free blocks/objects, WAL only references them, no double write.
 - Replay: idempotent by epoch (records ≤ checkpointed epoch skipped); stops at first CRC failure (torn tail = uncommitted).
 

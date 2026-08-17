@@ -767,6 +767,11 @@ pub enum BoundClause {
         /// GQL leaves a deleted element bound, and a clause after the
         /// delete that reads one gets 22G11.
         carry: Vec<usize>,
+        /// Whether the edges on the element go with it, which is what
+        /// `DETACH` says. Without it an element that still has edges is
+        /// refused, so the flag is the difference between taking the
+        /// edges away and being told they are there.
+        detach: bool,
     },
     Unwind {
         expr: BoundExpr,
@@ -1405,13 +1410,17 @@ impl Binder<'_> {
                     carry,
                 })
             }
-            Clause::Delete { targets } => {
+            Clause::Delete { targets, detach } => {
                 let carry = self.carried();
                 let mut slots = Vec::with_capacity(targets.len());
                 for name in targets {
                     slots.push(self.bind_delete_target(name)?);
                 }
-                Ok(BoundClause::Delete { slots, carry })
+                Ok(BoundClause::Delete {
+                    slots,
+                    carry,
+                    detach: *detach,
+                })
             }
             Clause::Unwind { expr, alias } => {
                 let mut ctx = ExprCtx::new(false);
@@ -1979,10 +1988,11 @@ impl Binder<'_> {
             )));
         };
         match self.variables[target].ty {
-            Type::Node => Ok(target),
-            Type::Rel => Err(not_yet(
-                "DELETE of an edge, which has to come out of the adjacency its table holds it in,",
-            )),
+            // An edge is deletable the same way an element is, and it
+            // is the one thing a plain DELETE never has to refuse: an
+            // edge has no edges on it, so taking it away leaves both
+            // the rows it ran between standing.
+            Type::Node | Type::Rel => Ok(target),
             ref other => Err(bad_type(format!(
                 "DELETE takes away an element, and '{name}' is {other}"
             ))),

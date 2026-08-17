@@ -71,6 +71,9 @@ fn a_matched_path_is_a_path_and_not_a_list_of_the_same_elements() {
                 table: 1,
                 src: 0,
                 dst: 1,
+                // The fixture runs each pair once, so the first edge
+                // of the load order is the one this walk takes.
+                ord: 0,
             },
             Value::Node {
                 table: 0,

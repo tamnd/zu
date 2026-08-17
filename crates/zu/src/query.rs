@@ -504,30 +504,60 @@ impl Graph for Zu1Graph<'_> {
         Ok(word.unwrap_or(primary))
     }
 
-    fn rel_property(&mut self, rel: u32, src: u64, dst: u64, key: &str) -> Result<Value> {
+    fn rel_property(&mut self, rel: u32, ord: u64, key: &str) -> Result<Value> {
         self.ensure_rel_props(rel)?;
-        let Self {
-            db, props, readers, ..
-        } = self;
+        let Self { db, props, .. } = self;
         let Some(reader) = props.get_mut(&rel).expect("just loaded") else {
             return Ok(Value::Null);
         };
         let Some(col) = reader.col(key) else {
             return Ok(Value::Null);
         };
-        // The value's row is the edge's place in the load order, which
-        // the forward CSR is what knows. An edge the caller holds and
-        // the graph does not have no row and no value, which is the
-        // answer rather than an error: a pattern can be matched over
-        // one rel table and a property read off another.
-        let Some(row) = readers
+        // The row arrived with the value: the operator that matched the
+        // edge counted it out of the adjacency list, so a pair that
+        // runs more than once reads each copy's own column entry rather
+        // than the first one's for all of them.
+        column_value(db, reader, col, ord, key)
+    }
+
+    fn edge_ordinal(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<u64>> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        readers
             .get_mut(&rel)
-            .expect("the ordinal's reader is loaded")
-            .edge_ordinal(db, src, dst)?
-        else {
-            return Ok(Value::Null);
+            .expect("just loaded")
+            .edge_ordinal(db, src, dst)
+    }
+
+    fn edge_run(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        readers
+            .get_mut(&rel)
+            .expect("just loaded")
+            .edge_run(db, src, dst)
+    }
+
+    fn neighbor_ordinals(
+        &mut self,
+        rel: u32,
+        node: u64,
+        reversed: bool,
+        len: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let _ = len;
+        self.ensure_reader(rel)?;
+        let dir = if reversed {
+            Direction::Bwd
+        } else {
+            Direction::Fwd
         };
-        column_value(db, reader, col, row, key)
+        let Self { db, readers, .. } = self;
+        readers
+            .get_mut(&rel)
+            .expect("just loaded")
+            .neighbor_ordinals_into(db, node, dir, out)
     }
 
     fn lookup_key(&mut self, table: u32, key: u64) -> Result<Option<u64>> {
@@ -1369,9 +1399,9 @@ mod tests {
         assert_eq!(r.rows, [[Value::Int(people), Value::Int(matched)]]);
     }
 
-    /// A property read off a rel variable finds the edge by its
-    /// endpoints, which the pattern names the same way whichever
-    /// direction it was walked in.
+    /// A property read off a rel variable finds the edge's own row,
+    /// which is the same row whichever direction the pattern walked it
+    /// in.
     #[test]
     fn reads_an_edge_property_walking_either_way() {
         use crate::zu1::props::{PropValues, store_rel_props};
@@ -1408,8 +1438,8 @@ mod tests {
         assert_eq!(r.rows, expected);
 
         // Reached backward the edge is the same edge, so it answers
-        // the same value: the ordinal comes from the endpoints, not
-        // from the direction the expand ran in.
+        // the same value: the row a walk counts out of the in-list is
+        // the row the out-list would have given it.
         let r = run(
             "MATCH (b:person)<-[e:knows]-(a) \
              RETURN a.id AS a, b.id AS b, e.since AS since ORDER BY a, b",
@@ -1442,6 +1472,134 @@ mod tests {
         )
         .expect("missing key");
         assert_eq!(r.rows, [[Value::Null], [Value::Null]]);
+    }
+
+    /// A pair that runs more than once is that many edges, each with
+    /// its own row of the property columns, and a walk that reaches
+    /// them reads each one's own value rather than the first one's for
+    /// all of them.
+    ///
+    /// This is the shape the generated finance graphs have and the
+    /// LDBC ones do not: an account there sends three hundred
+    /// transfers to a hundred and fifty counterparties, so every sum
+    /// over a transfer amount is wrong by whatever the copies differ
+    /// by until each copy answers for itself.
+    #[test]
+    fn reads_each_copy_of_a_pair_that_runs_more_than_once() {
+        use crate::zu1::props::{PropValues, store_rel_props};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("copies.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // 0 -> 1 three times, 2 -> 1 twice, and single edges either
+        // side of them, so a run is neither the whole list nor the
+        // start of one in either direction.
+        let edges = [(0u32, 1u32), (0, 1), (0, 1), (0, 3), (2, 1), (2, 1), (3, 1)];
+        graph::bulk_load_as(&mut db, "person", "knows", 4, &edges).expect("load");
+        let since: Vec<u64> = (0..edges.len() as u64).map(|i| 2001 + i).collect();
+        store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&since))]).expect("store");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let ints =
+            |vs: &[i64]| -> Vec<Vec<Value>> { vs.iter().map(|&v| vec![Value::Int(v)]).collect() };
+
+        // Out of 0: the three copies of 0 -> 1 carry rows 0, 1 and 2,
+        // and each answers with its own.
+        let r = run(
+            "MATCH (a:person {id: 0})-[e:knows]->(b) RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("out");
+        assert_eq!(r.rows, ints(&[2001, 2002, 2003, 2004]));
+
+        // Into 1: the same three copies plus the two of 2 -> 1 and the
+        // single 3 -> 1, every one of them read backward and every one
+        // of them its own row.
+        let r = run(
+            "MATCH (a:person)-[e:knows]->(b:person {id: 1}) RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("in");
+        assert_eq!(r.rows, ints(&[2001, 2002, 2003, 2005, 2006, 2007]));
+
+        // The sum over the whole table is the sum of what was stored,
+        // which is the check a benchmark makes and the one that fails
+        // when a run of copies reads the first copy's value.
+        let total: i64 = since.iter().map(|&v| v as i64).sum();
+        let r = run(
+            "MATCH (:person)-[e:knows]->(:person) RETURN count(e) AS n, sum(e.since) AS total",
+            &mut db,
+            &[],
+        )
+        .expect("total");
+        assert_eq!(
+            r.rows,
+            [[Value::Int(edges.len() as i64), Value::Int(total)]]
+        );
+    }
+
+    /// A pattern with both endpoints pinned matches once per edge and
+    /// not once per pair, so a close onto a bound node reports the whole
+    /// run: three rows for a pair joined three times, each carrying its
+    /// own property, and the same rows in the same order as the walk
+    /// that reaches the far node instead of pinning it.
+    #[test]
+    fn a_close_on_a_bound_pair_reports_every_edge_of_it() {
+        use crate::zu1::props::{PropValues, store_rel_props};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("close.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        let edges = [(0u32, 1u32), (0, 1), (0, 1), (0, 3), (2, 1), (2, 1), (3, 1)];
+        graph::bulk_load_as(&mut db, "person", "knows", 4, &edges).expect("load");
+        let since: Vec<u64> = (0..edges.len() as u64).map(|i| 2001 + i).collect();
+        store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&since))]).expect("store");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        let ints =
+            |vs: &[i64]| -> Vec<Vec<Value>> { vs.iter().map(|&v| vec![Value::Int(v)]).collect() };
+
+        let closed = run(
+            "MATCH (a:person {id: 0})-[e:knows]->(b:person {id: 1}) \
+             RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("closed");
+        assert_eq!(closed.rows, ints(&[2001, 2002, 2003]));
+
+        // The pair that runs once still runs once, and a pair with no
+        // edge still matches nothing.
+        let r = run(
+            "MATCH (a:person {id: 3})-[e:knows]->(b:person {id: 1}) \
+             RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("single");
+        assert_eq!(r.rows, ints(&[2007]));
+        let r = run(
+            "MATCH (a:person {id: 1})-[e:knows]->(b:person {id: 0}) RETURN e.since AS since",
+            &mut db,
+            &[],
+        )
+        .expect("none");
+        assert!(r.rows.is_empty());
+
+        // Reached rather than pinned, which is the expand the close
+        // stands in for, and the two have to agree edge for edge.
+        let walked = run(
+            "MATCH (a:person {id: 0})-[e:knows]->(b:person) WHERE b.id = 1 \
+             RETURN e.since AS since ORDER BY since",
+            &mut db,
+            &[],
+        )
+        .expect("walked");
+        assert_eq!(closed.rows, walked.rows);
     }
 
     /// A secondary label is a bit on the row, so a pattern naming one

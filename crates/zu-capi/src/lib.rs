@@ -2128,6 +2128,7 @@ pub unsafe extern "C" fn zu_value_rel(
         table: t,
         src: s,
         dst: d,
+        ..
     }) = (unsafe { value_of(v) })
     else {
         return ZuStatus::Misuse;
@@ -3074,6 +3075,7 @@ mod tests {
             table: 4,
             src: 11,
             dst: 12,
+            ord: 3,
         };
         let (mut table, mut src, mut dst) = (0u32, 0u64, 0u64);
         assert_eq!(

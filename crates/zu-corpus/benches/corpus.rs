@@ -89,7 +89,11 @@ fn main() {
 /// A suite of the given size, with the fields a real case carries so
 /// the reader does the same work per case that it does on the corpus.
 fn suite(cases: usize) -> String {
-    let mut text = String::from("schema: 1\nsuite: generated\n");
+    // The schema is read off the reader rather than written down here.
+    // A bump moves one constant and every suite in the tree with it,
+    // and a bench holding a literal is the one file that gets left on
+    // the old number and only says so on CI.
+    let mut text = format!("schema: {}\nsuite: generated\n", zu_corpus::case::SCHEMA);
     text.push_str(
         "doc: A suite the bench generates, which is not a suite anybody runs.\n\ncases:\n",
     );

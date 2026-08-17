@@ -303,9 +303,16 @@ fn type_name(ty: &LogicalType) -> &'static str {
 /// itself and a case asserting `NaN` has to pass, and `0.0` is equal to
 /// `-0.0` and a case asserting `-0.0` has to fail on `0.0`, because the
 /// sign of zero is exactly the sort of thing that survives one binding
-/// and not another. Comparing the bits answers both.
+/// and not another. Comparing the bits answers the second.
+///
+/// It does not answer the first, because a NaN is a family of bit
+/// patterns rather than one. `inf - inf` is a NaN with the sign bit set
+/// on x86-64 and clear on aarch64, and neither of those is the constant
+/// a case that writes `NaN` decodes to. The sign and the payload of a
+/// NaN are the hardware's business, so every NaN is the same NaN here.
 pub fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        (Value::Float(x), Value::Float(y)) if x.is_nan() && y.is_nan() => true,
         (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b))
@@ -403,6 +410,17 @@ mod tests {
         let minus = ok("type: FLOAT64\nvalue: \"-0.0\"\n");
         assert!(!same(&minus, &Value::Float(0.0)));
         assert!(same(&minus, &Value::Float(-0.0)));
+    }
+
+    #[test]
+    fn a_nan_matches_a_nan_whatever_the_hardware_put_in_its_sign_and_payload() {
+        let want = ok("type: FLOAT64\nvalue: \"NaN\"\n");
+        let negative = Value::Float(f64::from_bits(f64::NAN.to_bits() | 1 << 63));
+        let payload = Value::Float(f64::from_bits(f64::NAN.to_bits() | 7));
+        assert!(same(&want, &Value::Float(f64::NAN)));
+        assert!(same(&want, &negative));
+        assert!(same(&want, &payload));
+        assert!(!same(&want, &Value::Float(0.0)));
     }
 
     #[test]

@@ -348,3 +348,377 @@ cases:
     doc: The operator that joins two strings does not join two lists, and asks for numbers instead. A client offering list concatenation on this spelling has invented syntax the engine will not accept.
     query: RETURN [1, 2] + [3] AS n
     raises: "22G03"
+
+  - name: a-null-inside-a-list
+    doc: A list holds a null like any other element, so the container is not the thing that says whether a value is missing.
+    query: RETURN [null] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: NULL
+
+  - name: a-null-is-counted
+    doc: The length of a list with one null in it is one, because the null is an element and not an absence of one.
+    query: RETURN size([null]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-null-element-makes-a-comparison-unknown
+    doc: Two lists that differ where one holds a null compare to a null rather than to false, which is the three valued logic of the elements reaching the container.
+    query: RETURN [1] = [null] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: two-nulls-in-the-same-place-are-still-unknown
+    doc: A null does not equal a null inside a list any more than it does outside one, so this is unknown and not true.
+    query: RETURN [null] = [null] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: a-list-is-not-null
+    doc: The empty list is a value, which is the case a client mapping an absent list and an empty one onto one host value fails.
+    query: RETURN [] IS NULL AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: cardinality-is-size-by-another-name
+    doc: The standard gives the element count two names and they answer the same, so a client implementing one and forwarding the other is right by construction.
+    query: RETURN cardinality([1, 2, 3]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: cardinality-counts-elements-not-leaves
+    doc: A list of two lists has two elements whatever is inside them, the same statement the size case makes, and both names are pinned because a client may implement them apart.
+    query: RETURN cardinality([[1], [2]]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: cardinality-refuses-a-string
+    doc: The element count is a list function only, so it raises on text where size answers, which is the one place the two names differ.
+    query: RETURN cardinality('abc') AS n
+    raises: "22G03"
+
+  - name: size-refuses-a-number
+    doc: A number has no length, so this raises rather than counting digits, which a client with a permissive fallback would happily do.
+    query: RETURN size(1) AS n
+    raises: "22G03"
+
+  - name: lengths-add
+    doc: Two lengths go into arithmetic as ordinary integers, which says the result of the function is a value and not a handle a client has to unwrap.
+    query: RETURN size([1, 2]) + size([3]) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: nothing-is-in-the-empty-list
+    doc: Membership of an empty list is false and not unknown, even for a null, which is the one place a null in a membership test has a definite answer.
+    query: RETURN null IN [] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: the-empty-list-is-a-value-to-look-for
+    doc: An empty list found inside a list of lists is a hit, so the search compares elements by value and does not treat the empty one as nothing.
+    query: RETURN [] IN [[]] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: inequality-of-lists
+    doc: The unequal operator over lists, separate from equality in a client that wrote one and negated it somewhere else.
+    query: RETURN [1, 2] <> [1, 3] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-is-not-strict
+    doc: A list is greater than or equal to itself, so all four ordering operators are defined over the type and not only the two the sort uses.
+    query: RETURN [1, 2] >= [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-first-difference-decides-regardless-of-length
+    doc: A shorter list with a larger first element is the greater one, which says length is a tie break and not the first thing compared.
+    query: RETURN [2] > [1, 9] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: order-inside-a-list-is-part-of-the-value
+    doc: The same three numbers in another order are another list, so a client comparing lists as sets or as multisets says true where the engine says false.
+    query: RETURN [1, 2, 3] = [3, 2, 1] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: the-two-zeroes-are-equal-inside-a-list
+    doc: Negative zero equals zero as an element, the same as it does alone, which is worth saying because the float suite pins that they are still two different values.
+    query: RETURN [0.0] = [-0.0] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-of-strings-past-the-first-element
+    doc: Lists of strings order by the first element that differs and by the string order, not by length, which is two rules in one case.
+    query: RETURN ['a', 'A'] < ['a', 'a'] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: negative-numbers-order-inside-a-list
+    doc: Elements compare by value and not by anything the encoding does to a sign, which a client comparing the encoded bytes gets backwards.
+    query: RETURN [-1] < [0] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: nested-lists-compare-by-value
+    doc: Two lists of lists built separately are equal, which says the comparison goes all the way down rather than comparing identity at the top.
+    query: RETURN [[1], [2]] = [[1], [2]] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: booleans-in-a-list
+    doc: A list of truth values, because a client packing booleans into bits inside a container is one of the two ways this type is stored.
+    query: RETURN [true, false] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: BOOL
+                value: true
+              - type: BOOL
+                value: false
+
+  - name: floats-in-a-list
+    doc: Floats keep their type inside a list, which the mixed case above says and this one says for the type most likely to be widened on the way through a container.
+    query: RETURN [1.5, 2.5] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: FLOAT64
+                value: "1.5"
+              - type: FLOAT64
+                value: "2.5"
+
+  - name: temporal-values-in-a-list
+    doc: A date inside a list, which is where a client that renders temporal values at the top level and recurses with a plain encoder loses the type.
+    query: RETURN [DATE '2024-01-01'] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: DATE
+                value: "2024-01-01"
+
+  - name: a-list-does-not-cast-to-text
+    doc: There is no rendering of a list as a string, so a client offering one has picked a separator and a bracket style the engine never agreed to.
+    query: RETURN cast([1] AS STRING) AS n
+    raises: "22G03"
+
+  - name: a-list-casts-to-a-list-type
+    doc: A list cast to a list of a type it already holds comes back unchanged, which is the cast that checks rather than converts.
+    query: RETURN cast([1, 2] AS LIST<INT>) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+
+  - name: a-list-of-one-type-is-typed-as-that-list
+    doc: The type test over a list looks at the elements, so a client answering from the container alone cannot tell the two cases here apart.
+    query: RETURN [1, 2] IS TYPED LIST<INT> AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-mixed-list-is-not-typed-as-one-of-them
+    doc: One element of another type is enough for the test to answer false, which is the other half of the pair above.
+    query: RETURN [1, 'a'] IS TYPED LIST<INT> AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: unwinding-twice-flattens
+    doc: A second unwind over the rows of the first is how a nested list is flattened, since the first one does not do it, and the result is the whole of both lists in order.
+    query: UNWIND [[1, 2], [3]] AS r UNWIND r AS n RETURN collect(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+              - type: INT64
+                value: "3"
+
+  - name: unwind-gives-a-row-holding-a-null
+    doc: A null element becomes a row whose value is a null, so the row count follows the length of the list and not the number of values in it.
+    query: UNWIND [null] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: rows-collect-into-a-list
+    doc: The fold from rows back into one list is the other direction of unwind, and the pair of them is how a client's list encoding is checked in both directions.
+    query: UNWIND [1, 2] AS n RETURN collect(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+
+  - name: collecting-no-rows-gives-an-empty-list
+    doc: A fold over nothing is the empty list and not a null, which is the answer a client that starts its accumulator as absent gives instead.
+    query: UNWIND [] AS n RETURN collect(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+
+  - name: collecting-drops-nulls
+    doc: A null row does not reach the list, because set functions ignore nulls, so the list is shorter than the number of rows that went in.
+    query: UNWIND [1, null, 2] AS n RETURN collect(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+
+  - name: collecting-distinct-rows
+    doc: The fold takes a duplicate free argument, which is a second path through the same accumulator and one a client rendering the result has to decode the same way.
+    query: UNWIND [1, 2] AS n RETURN collect(DISTINCT n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+
+  - name: lists-order
+    doc: Sorting rows whose values are lists uses the list ordering the comparison cases pin, rather than an order the sort makes up for a container.
+    query: UNWIND [[2], [1]] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "2"
+
+  - name: the-smallest-list
+    doc: A set function over lists answers with a list, which is the same order again and the last place a client with a separate comparison for aggregates can differ.
+    query: UNWIND [[2], [1]] AS n RETURN min(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"

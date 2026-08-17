@@ -437,6 +437,7 @@ fn unescape(body: &str, line: usize) -> Result<String, String> {
             Some('"') => out.push('"'),
             Some('\\') => out.push('\\'),
             Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
             Some('0') => out.push('\0'),
             Some(other) => return Err(format!("line {line}: \\{other} is not an escape")),
@@ -544,6 +545,15 @@ mod tests {
         let doc = ok("a: \"say \\\"no\\\"\"\nb: 'say ''no'''\n");
         assert_eq!(doc.get("a").and_then(Node::str), Some("say \"no\""));
         assert_eq!(doc.get("b").and_then(Node::str), Some("say 'no'"));
+    }
+
+    #[test]
+    fn the_control_characters_a_query_can_hold_all_have_an_escape() {
+        let doc = ok("a: \"one\\ntwo\\rthree\\tfour\\0five\"\n");
+        assert_eq!(
+            doc.get("a").and_then(Node::str),
+            Some("one\ntwo\rthree\tfour\0five")
+        );
     }
 
     #[test]

@@ -60,6 +60,9 @@ cases:
 | Suite | What it pins |
 | --- | --- |
 | `scalar` | The values that cross a language boundary badly: the integer edges, the floats no double holds, the empty and the absent. |
+| `integer` | The tower width by width, because GQL has ten integer types, most host languages have four, and the declared type is the contract even where a value fits something narrower. |
+| `float` | IEEE 754 and everything around it: the digits a client prints, the sign of a zero, and the three values that are not numbers. |
+| `boolean` | The truth values and the operators over them, where what goes wrong is a precedence or a host language's truthiness rather than a single answer. |
 | `temporal` | Dates, times and durations, where the type is right and the timezone, the precision or the calendar is not. |
 | `numeric` | Arithmetic, and the places two languages doing the same sum disagree: integer division, the sign of a remainder, the edge of a type. |
 | `string` | What a character is, how many of them a string has, and whether two strings that look identical are the same string. |

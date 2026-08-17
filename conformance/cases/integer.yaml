@@ -1,0 +1,478 @@
+schema: 1
+suite: integer
+doc: The integer tower, width by width. GQL has ten integer types and most host languages have four, so every case here is a place a client has to decide what to give back, and the ones at the edges are the places where deciding badly still looks right. The declared type is the contract even where a value fits something narrower, because a client with an int8 has somewhere to put INT8 and something to get wrong.
+
+cases:
+  - name: int8-max
+    doc: The largest INT8. A client mapping the narrow types onto a signed byte has one value here and it is this one, so a client that reads the type as unsigned still passes and the case below catches it.
+    query: RETURN cast(127 AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 127
+
+  - name: int8-min
+    doc: The smallest INT8, which is one further from zero than the largest, and the value a client that negates the maximum gets wrong by one.
+    query: RETURN cast(-128 AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: -128
+
+  - name: int8-above-the-range
+    doc: One past the top of INT8, which wraps to -128 in C and in every language that inherited its conversions, and raises here.
+    query: RETURN cast(128 AS INT8) AS n
+    raises: "22003"
+
+  - name: int8-below-the-range
+    doc: One past the bottom, which is the same defect with the other sign and passes in a client that only range-checked the top.
+    query: RETURN cast(-129 AS INT8) AS n
+    raises: "22003"
+
+  - name: int16-max
+    doc: The largest INT16, which is the width a client is most likely to have skipped, since few languages name it and most widen it to a machine word.
+    query: RETURN cast(32767 AS INT16) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT16
+            value: 32767
+
+  - name: int16-min
+    doc: The smallest INT16, here for the same reason its INT8 counterpart is: the asymmetry of two's complement is where an off by one lives.
+    query: RETURN cast(-32768 AS INT16) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT16
+            value: -32768
+
+  - name: int16-above-the-range
+    doc: One past the top of INT16. A client that checks ranges with a table rather than per type gets every width right or every width wrong, and this is the second of the four that says which.
+    query: RETURN cast(32768 AS INT16) AS n
+    raises: "22003"
+
+  - name: int32-max
+    doc: The largest INT32, which is the widest integer several host languages have by default and therefore the boundary a client silently stops at.
+    query: RETURN cast(2147483647 AS INT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT32
+            value: 2147483647
+
+  - name: int32-min
+    doc: The smallest INT32, whose absolute value does not fit INT32, which is the trap in any client that converts through an absolute value and a sign.
+    query: RETURN cast(-2147483648 AS INT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT32
+            value: -2147483648
+
+  - name: int32-above-the-range
+    doc: One past the top of INT32, the overflow a 32 bit client hits first and the one a test suite written on a 64 bit machine never reaches.
+    query: RETURN cast(2147483648 AS INT32) AS n
+    raises: "22003"
+
+  - name: int64-round-trip
+    doc: The largest INT64 through a cast rather than as a literal, so that a client doing the range check as floating point arithmetic fails here even though it passes on the literal.
+    query: RETURN cast(9223372036854775807 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9223372036854775807"
+
+  - name: uint8-max
+    doc: The largest UINT8, which is out of range for a signed byte, so a client that mapped the unsigned tower onto signed host types fails here and nowhere below.
+    query: RETURN cast(255 AS UINT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT8
+            value: 255
+
+  - name: uint8-above-the-range
+    doc: One past the top of UINT8, which is where a client that widened the type to a signed 16 bit integer and forgot to narrow the check stops raising.
+    query: RETURN cast(256 AS UINT8) AS n
+    raises: "22003"
+
+  - name: uint8-refuses-a-negative
+    doc: A negative into an unsigned type raises rather than wrapping to 255, and wrapping is what two's complement gives a client that casts before it checks.
+    query: RETURN cast(-1 AS UINT8) AS n
+    raises: "22003"
+
+  - name: uint16-max
+    doc: The largest UINT16, which is a value a client holding unsigned types in a signed int16 gives back as -1.
+    query: RETURN cast(65535 AS UINT16) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT16
+            value: 65535
+
+  - name: uint16-above-the-range
+    doc: One past the top of UINT16, the third of the four unsigned edges, here so the range table is checked at every width rather than at the convenient ones.
+    query: RETURN cast(65536 AS UINT16) AS n
+    raises: "22003"
+
+  - name: uint32-max
+    doc: The largest UINT32, which does not fit a signed 32 bit host type and is the value a client on one gives back as -1.
+    query: RETURN cast(4294967295 AS UINT32) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT32
+            value: 4294967295
+
+  - name: uint32-above-the-range
+    doc: One past the top of UINT32, which is 2 to the 32, a number a client is likely to have written as a shift and got wrong by one.
+    query: RETURN cast(4294967296 AS UINT32) AS n
+    raises: "22003"
+
+  - name: uint64-zero
+    doc: Zero as a UINT64, which is the value a client can hold whatever it chose for the type, so a failure here is a failure of the type name and not of the number.
+    query: RETURN cast(0 AS UINT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT64
+            value: "0"
+
+  - name: uint64-at-the-top-of-the-signed-range
+    doc: The largest INT64 asked for as a UINT64. It is half of what UINT64 holds, and it is as far as this engine goes, because the value it carries the number in is signed.
+    query: RETURN cast(9223372036854775807 AS UINT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT64
+            value: "9223372036854775807"
+
+  - name: uint64-above-the-signed-range
+    doc: A number above the signed range has no literal spelling this engine reads, and it says so with a range condition rather than wrapping into a negative, which is what makes it a case rather than a gap.
+    query: RETURN cast(18446744073709551615 AS UINT64) AS n
+    raises: "22003"
+
+  - name: smallint-is-int16
+    doc: SMALLINT is a second spelling of INT16 and not a type of its own, so the same value comes back and a client keeping a table of type names has one row for both.
+    query: RETURN cast(32767 AS SMALLINT) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT16
+            value: 32767
+
+  - name: integer-is-int32
+    doc: INTEGER is INT32 under the name most of SQL uses, which is the spelling a client ported from a SQL driver is most likely to send.
+    query: RETURN cast(2147483647 AS INTEGER) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT32
+            value: 2147483647
+
+  - name: bigint-is-int64
+    doc: BIGINT is INT64, and it matters that the range check moves with the spelling rather than with the word, because the two names have different ranges in more than one product.
+    query: RETURN cast(9223372036854775807 AS BIGINT) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9223372036854775807"
+
+  - name: declared-digits-are-part-of-the-type
+    doc: An integer with a declared digit count holds numbers of that many digits, so the largest one with nine of them fits, and a client treating the argument as decoration agrees with this case and not with the one below it.
+    query: RETURN cast(999999999 AS INT(9)) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT32
+            value: 999999999
+
+  - name: declared-digits-are-a-range-of-their-own
+    doc: One digit more than the type declares is out of range even though the number fits the width the type is carried in, which is the whole difference between a digit count and a width.
+    query: RETURN cast(1000000000 AS INT(9)) AS n
+    raises: "22003"
+
+  - name: not-null-accepts-a-value
+    doc: A cast target that says NOT NULL takes a value unchanged, which is the half of the feature a client notices, and the case below is the half it does not.
+    query: RETURN cast(1 AS INT8 NOT NULL) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: not-null-refuses-a-null
+    doc: A null cast to a NOT NULL type raises 22004 rather than passing the null through, which is a different condition from the range one above and a different one again from succeeding.
+    query: RETURN cast(null AS INT8 NOT NULL) AS n
+    raises: "22004"
+
+  - name: a-null-casts-to-a-null
+    doc: The same cast without NOT NULL gives a null back, so the two cases together say the constraint and not the cast is what refused.
+    query: RETURN cast(null AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: hexadecimal-literal
+    doc: A hexadecimal literal is an integer and not text, and a client reading the statement rather than the value has to have handled the three radix forms the language has.
+    query: RETURN 0x10 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "16"
+
+  - name: binary-literal
+    doc: A binary literal, the second radix form, whose digits are the ones a careless lexer takes for the start of an identifier.
+    query: RETURN 0b101 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: octal-literal
+    doc: An octal literal, which is written with an o and not with a leading zero, so that 017 is seventeen and never fifteen.
+    query: RETURN 0o17 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "15"
+
+  - name: a-leading-zero-is-decimal
+    doc: A decimal with a leading zero is decimal, which is the opposite of what C and several languages after it decided, and a client that reformats a statement can change its meaning here.
+    query: RETURN 017 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "17"
+
+  - name: text-to-integer
+    doc: The plain conversion, here so that a client failing the awkward ones below fails this first and the report says whether reading text as a number works at all.
+    query: RETURN cast('42' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: text-to-integer-keeps-a-sign
+    doc: A negative in text, which is the case a client that parsed digits and multiplied gets right and a client that trusted an unsigned parser does not.
+    query: RETURN cast('-42' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-42"
+
+  - name: text-to-integer-refuses-a-radix-prefix
+    doc: A hexadecimal prefix in text is not read as a radix, because the statement's own literals are one language and the contents of a string are another, and C's strtol conflates them.
+    query: RETURN cast('0x10' AS INT64) AS n
+    raises: "22018"
+
+  - name: text-to-integer-refuses-trailing-text
+    doc: Digits followed by anything else is refused rather than read up to the first non-digit, which is what atoi does and what makes it the wrong function to reach for.
+    query: RETURN cast('42abc' AS INT64) AS n
+    raises: "22018"
+
+  - name: text-to-integer-refuses-a-lone-sign
+    doc: A sign with no digits after it is not zero, and a client returning zero here gives back a value the user never wrote.
+    query: RETURN cast('-' AS INT64) AS n
+    raises: "22018"
+
+  - name: text-to-integer-at-the-top-of-the-range
+    doc: The largest INT64 read out of text, which is where a client parsing through a double loses the low bits and gives back a number one larger.
+    query: RETURN cast('9223372036854775807' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9223372036854775807"
+
+  - name: text-to-integer-past-the-top-of-the-range
+    doc: One past the largest INT64 in text, which is out of range rather than saturating at the maximum, and saturating is what more than one standard library does quietly.
+    query: RETURN cast('9223372036854775808' AS INT64) AS n
+    raises: "22003"
+
+  - name: float-to-integer-truncates-towards-zero
+    doc: A positive fraction loses its fraction and does not round, so nine point nine is nine and a client using its language's round is out by one.
+    query: RETURN cast(9.9 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9"
+
+  - name: float-to-integer-truncates-towards-zero-when-negative
+    doc: The negative of the case above, which floor gets wrong in the other direction, so a client using floor passes one of these two and fails this one.
+    query: RETURN cast(-9.9 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-9"
+
+  - name: float-to-integer-past-the-range
+    doc: A float larger than any INT64 raises rather than saturating, and saturating is what the hardware conversion instruction does on more than one architecture.
+    query: RETURN cast(9223372036854775807.0 AS INT64) AS n
+    raises: "22003"
+
+  - name: float-to-a-narrow-integer
+    doc: A float into INT8 has to survive both steps, the truncation and the range check, and a client doing them in the other order accepts 127.9 and refuses this.
+    query: RETURN cast(127.9 AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 127
+
+  - name: boolean-to-integer
+    doc: True is one, which is the only value it can be, and the case exists so that the false one below is not the only evidence a client handled booleans at all.
+    query: RETURN cast(true AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: integer-to-boolean-refuses-anything-else
+    doc: Two is not true. Every language that treats a nonzero integer as true disagrees with this, which is exactly why it is written down.
+    query: RETURN cast(2 AS BOOL) AS n
+    raises: "22003"
+
+  - name: integer-division-truncates
+    doc: Five over two is two and not two and a half, because both operands are integers, and a client that promoted to a double before dividing gives back the half.
+    query: RETURN 5 / 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: integer-division-of-a-negative-truncates-towards-zero
+    doc: Minus five over two is minus two, not minus three, which is where Python and every language that floors divides differently from this one.
+    query: RETURN -5 / 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-2"
+
+  - name: remainder-takes-the-sign-of-the-left-operand
+    doc: Minus five modulo two is minus one, which follows from truncating division, and is the opposite sign from the answer a language with a floored modulus gives.
+    query: RETURN -5 % 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-1"
+
+  - name: remainder-ignores-the-sign-of-the-right-operand
+    doc: Five modulo minus two is one, so the sign of the divisor does not reach the answer, and a client implementing the operator as a subtraction loop gets this wrong.
+    query: RETURN 5 % -2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: division-by-zero-raises
+    doc: Dividing by zero is a condition and not an infinity, because these are integers, and a client that converted to floating point to divide gives back a value instead of raising.
+    query: RETURN 1 / 0 AS n
+    raises: "22012"
+
+  - name: remainder-by-zero-raises
+    doc: The same for the remainder, which is a separate code path in every implementation and therefore a separate case here.
+    query: RETURN 1 % 0 AS n
+    raises: "22012"
+
+  - name: one-below-the-largest
+    doc: The largest INT64 less one, which is a value only exact 64 bit arithmetic gives back and every double gives back as the largest.
+    query: RETURN 9223372036854775807 - 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9223372036854775806"
+
+  - name: the-smallest-divided-by-one
+    doc: The smallest INT64 divided by one, which is the value whose negation overflows, so a client dividing by way of an absolute value fails here and only here.
+    query: RETURN (-9223372036854775807 - 1) / 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-9223372036854775808"
+
+  - name: widths-compare-by-value
+    doc: An INT8 one and an INT64 one are the same number, so a comparison across the tower answers on the value and not on the declared width.
+    query: RETURN cast(1 AS INT8) = cast(1 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: signed-and-unsigned-compare-by-value
+    doc: A UINT8 one and an INT8 one are equal, which a client comparing the bit patterns of its host types after a widening conversion can get wrong for negative values and right here.
+    query: RETURN cast(1 AS UINT8) = cast(1 AS INT8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: arithmetic-across-widths-keeps-the-value
+    doc: Adding an INT8 to an INT64 gives the sum and not a narrowed one, so a client that computed in the narrower of the two types would wrap and this says it may not.
+    query: RETURN cast(127 AS INT8) + cast(1 AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "128"

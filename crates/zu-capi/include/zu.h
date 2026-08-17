@@ -205,6 +205,19 @@ zu_status zu_database_open(const char *path, size_t path_len, const zu_config *c
                            zu_database **out, zu_error **err);
 zu_status zu_database_open_z(const char *path, const zu_config *cfg, zu_database **out,
                              zu_error **err);
+/* Creates a database and opens it. The path must not exist: a create
+ * that opened what it found there would be the call that quietly writes
+ * into somebody else's data, and a host that wants either one has
+ * zu_database_open to fall back to and a decision to make about which.
+ *
+ * What it makes is a valid database with nothing in it, which is what a
+ * host has to start from to run any statement at all. Bulk load below
+ * makes a database with a table in it, and until this call there was no
+ * other way for a C host to have one. */
+zu_status zu_database_create(const char *path, size_t path_len, const zu_config *cfg,
+                             zu_database **out, zu_error **err);
+zu_status zu_database_create_z(const char *path, const zu_config *cfg, zu_database **out,
+                               zu_error **err);
 zu_status zu_database_path(const zu_database *db, const char **out, size_t *len);
 void zu_database_close(zu_database *db);
 
@@ -224,6 +237,10 @@ void zu_database_close(zu_database *db);
 zu_status zu_connect(zu_database *db, zu_conn **out, zu_error **err);
 zu_status zu_open(const char *path, size_t path_len, zu_conn **out, zu_error **err);
 zu_status zu_open_z(const char *path, zu_conn **out, zu_error **err);
+/* The same convenience over a database that is not there yet:
+ * zu_database_create and one connection on it. */
+zu_status zu_create(const char *path, size_t path_len, zu_conn **out, zu_error **err);
+zu_status zu_create_z(const char *path, zu_conn **out, zu_error **err);
 void zu_conn_close(zu_conn *conn);
 void zu_close(zu_conn *conn); /* the old name; goes at the freeze */
 

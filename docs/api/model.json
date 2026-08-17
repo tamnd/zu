@@ -232,6 +232,22 @@
       "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds."
     },
     {
+      "id": "zu::Database::create",
+      "kind": "method",
+      "name": "create",
+      "of": "zu::Database",
+      "signature": "fn create(path: impl AsRef<Path>) -> Result<Database>",
+      "doc": "Creates a database at `path` and opens it, with the default\nconfiguration.\n\nThe path must not exist. A create that found a database there\nand opened it instead would be the call that quietly writes into\ndata somebody else put there, and the caller who wanted either\none has [`Database::open`] to fall back to and a decision to make\nabout which.\n\nWhat it makes is a valid database with nothing in it: a file\nheader, a database header, and no tables. Statements make the\ntables, and until v0 grows one that does, a bulk load is what\nputs rows in."
+    },
+    {
+      "id": "zu::Database::create_with",
+      "kind": "method",
+      "name": "create_with",
+      "of": "zu::Database",
+      "signature": "fn create_with(path: impl AsRef<Path>, config: Config) -> Result<Database>",
+      "doc": "[`Database::create`] with a configuration."
+    },
+    {
       "id": "zu::Database::open",
       "kind": "method",
       "name": "open",
@@ -1019,6 +1035,22 @@
       "of": "zu::db::Database",
       "signature": "fn connect(&self) -> Result<Connection>",
       "doc": "A new connection: its own file handle, its own caches, its own\nplan cache. Costs an open and a catalog load, which on the\n11 GB file of the B7 gate is tens of microseconds."
+    },
+    {
+      "id": "zu::db::Database::create",
+      "kind": "method",
+      "name": "create",
+      "of": "zu::db::Database",
+      "signature": "fn create(path: impl AsRef<Path>) -> Result<Database>",
+      "doc": "Creates a database at `path` and opens it, with the default\nconfiguration.\n\nThe path must not exist. A create that found a database there\nand opened it instead would be the call that quietly writes into\ndata somebody else put there, and the caller who wanted either\none has [`Database::open`] to fall back to and a decision to make\nabout which.\n\nWhat it makes is a valid database with nothing in it: a file\nheader, a database header, and no tables. Statements make the\ntables, and until v0 grows one that does, a bulk load is what\nputs rows in."
+    },
+    {
+      "id": "zu::db::Database::create_with",
+      "kind": "method",
+      "name": "create_with",
+      "of": "zu::db::Database",
+      "signature": "fn create_with(path: impl AsRef<Path>, config: Config) -> Result<Database>",
+      "doc": "[`Database::create`] with a configuration."
     },
     {
       "id": "zu::db::Database::open",

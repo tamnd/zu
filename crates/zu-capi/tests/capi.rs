@@ -13,18 +13,19 @@ use zu::{
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
     ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
     ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
-    zu_config_set_z, zu_conn_close, zu_connect, zu_database_close, zu_database_open_z,
-    zu_database_path, zu_error_code, zu_error_free, zu_error_message, zu_error_severity,
-    zu_error_status, zu_execute, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64,
-    zu_loader_col_str, zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish,
-    zu_loader_free, zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare,
-    zu_prepare_z, zu_query, zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type,
-    zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
-    zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
-    zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
-    zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_rows, zu_stmt_close,
-    zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64, zu_value_len, zu_value_node,
-    zu_value_str, zu_value_temporal, zu_value_type, zu_version,
+    zu_config_set_z, zu_conn_close, zu_connect, zu_create, zu_create_z, zu_database_close,
+    zu_database_create_z, zu_database_open_z, zu_database_path, zu_error_code, zu_error_free,
+    zu_error_message, zu_error_severity, zu_error_status, zu_execute, zu_loader_col_bool,
+    zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str, zu_loader_col_temporal,
+    zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free, zu_loader_table,
+    zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query, zu_query_z,
+    zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
+    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
+    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
+    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
+    zu_result_free, zu_result_rows, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64,
+    zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type,
+    zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -1857,5 +1858,81 @@ fn a_finished_loader_is_spent() {
             zu_error_free(err);
         }
         zu_conn_close(conn);
+    }
+}
+
+/// The database a C host starts from when there is no file yet.
+///
+/// Before this call the only way in was a bulk load, which builds a
+/// database with a table in it, so a host that wanted an empty one to
+/// run statements against had nowhere to begin. It is the gap building
+/// a client found, which is what dx/02 §8 says building one is for.
+#[test]
+fn a_database_is_created_where_there_was_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("made.zu1");
+    unsafe {
+        let cpath = c(path.to_str().expect("utf-8 path"));
+        let mut db: *mut ZuDatabase = ptr::null_mut();
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(
+            zu_database_create_z(cpath.as_ptr(), ptr::null(), &mut db, &mut err),
+            ZuStatus::Ok
+        );
+        assert!(!db.is_null() && err.is_null());
+        assert!(path.exists(), "the file is on disk when the call returns");
+
+        let mut conn: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_connect(db, &mut conn, &mut err), ZuStatus::Ok);
+        let result = query(conn, "RETURN 1 AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [1]);
+        zu_result_free(result);
+        zu_conn_close(conn);
+        zu_database_close(db);
+
+        // Creating over it again is refused, and what is there is left
+        // alone: a create that opened what it found would be the call
+        // that quietly writes into somebody else's data.
+        let mut second: *mut ZuDatabase = ptr::null_mut();
+        assert_ne!(
+            zu_database_create_z(cpath.as_ptr(), ptr::null(), &mut second, &mut err),
+            ZuStatus::Ok
+        );
+        assert!(second.is_null() && !err.is_null());
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        // And the convenience beside it, which is zu_open's other half.
+        let fresh = dir.path().join("made-too.zu1");
+        let cfresh = c(fresh.to_str().expect("utf-8 path"));
+        let mut conn: *mut ZuConn = ptr::null_mut();
+        assert_eq!(
+            zu_create_z(cfresh.as_ptr(), &mut conn, &mut err),
+            ZuStatus::Ok
+        );
+        assert!(!conn.is_null() && err.is_null());
+        let result = query(conn, "RETURN 2 AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [2]);
+        zu_result_free(result);
+        zu_conn_close(conn);
+
+        // The counted form is the one a binding calls, and a create in
+        // a directory that is not there is the operating system's
+        // refusal carried back as one, rather than a handle left
+        // behind.
+        let missing = dir.path().join("no-such-directory").join("x.zu1");
+        let missing = missing.to_str().expect("utf-8 path");
+        let mut conn: *mut ZuConn = ptr::null_mut();
+        assert_eq!(
+            zu_create(
+                missing.as_ptr().cast::<c_char>(),
+                missing.len(),
+                &mut conn,
+                &mut err
+            ),
+            ZuStatus::Io
+        );
+        assert!(conn.is_null() && !err.is_null());
+        zu_error_free(err);
     }
 }

@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use zu_common::{Epoch, Result, ZuError};
 
 use crate::catalog::{Catalog, RelTable, TableIndex};
-use crate::file::{NULL_BLOCK, Zu1File};
+use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
 use crate::fullzip::{read_blob_segment, write_blob_segment};
 use crate::graph::{
     Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain,
@@ -37,7 +37,7 @@ use crate::graph::{
 };
 use crate::keys::write_key_index;
 use crate::meta;
-use crate::props::{PropsDirectory, free_props};
+use crate::props::{PropsDirectory, free_props, free_props_keeping_labels, load_props_at};
 use crate::segment::{read_segment, write_segment};
 use crate::txn::{Cell, Mvcc};
 use crate::wal::Wal;
@@ -384,35 +384,57 @@ fn fold_rel(
     }
     let mut reader = GraphReader::load_table(db, &rel.name)?;
     let old = reader.directory().clone();
-    let overlay: Vec<(u64, u64)> = mvcc.edges(rel.id, epoch).collect();
-    // An edge property column is in load order, and a rebuild that only
-    // widens the row domain leaves that order alone: the same edges come
-    // back out of the forward CSR in the same sequence, so the columns
-    // carry over untouched. An edge the overlay adds does change the
-    // order, and it arrives with no value for any column, which a dense
-    // column has no way to hold. Rather than invent one the fold refuses;
-    // the write statements of G3 are what has to answer it.
-    if old.props != NULL_BLOCK && !overlay.is_empty() {
+    let overlay: Vec<AddedEdge> = mvcc
+        .edge_cells(rel.id, epoch)
+        .map(|(src, dst, cols)| (src, dst, cols.to_vec()))
+        .collect();
+    // An edge carries a value only where there is a column to put it
+    // in, and what columns a rel table has is the table's own answer.
+    if old.props == NULL_BLOCK && overlay.iter().any(|(_, _, cols)| !cols.is_empty()) {
         return Err(ZuError::Unsupported {
-            what: "folding an overlay edge into a rel table that stores edge properties",
+            what: "writing a property onto an edge of a table that stores none on its edges",
             id: rel.id,
         });
     }
-    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(old.edge_count as usize + overlay.len());
+    // An edge property column is in load order, so the fold has to say
+    // where every edge of the new order came from: an edge the base
+    // already held keeps the value at its old place, and one the
+    // overlay adds takes the value it was written with.
+    let mut edges: Vec<(u32, u32, Came)> =
+        Vec::with_capacity(old.edge_count as usize + overlay.len());
+    let mut ordinal = 0usize;
     for node in 0..old.from_count {
         for &dst in reader.neighbors_dir(db, node, Direction::Fwd)? {
-            edges.push((node as u32, dst as u32));
+            edges.push((node as u32, dst as u32, Came::Base(ordinal)));
+            ordinal += 1;
         }
     }
-    for (src, dst) in overlay {
+    for (at, (src, dst, _)) in overlay.iter().enumerate() {
+        let (src, dst) = (*src, *dst);
         if src >= new_from || dst >= new_to {
             return Err(ZuError::InvalidArgument(format!(
                 "overlay edge ({src}, {dst}) references a row outside 0..{new_from} and 0..{new_to}"
             )));
         }
-        edges.push((src as u32, dst as u32));
+        edges.push((src as u32, dst as u32, Came::Overlay(at)));
     }
-    edges.sort_unstable();
+    edges.sort_unstable_by_key(|&(src, dst, _)| (src, dst));
+    // The ordinal of an edge in a table that stores properties is found
+    // by searching the forward list for its destination, so a pair held
+    // twice would answer that search once and one of the two edges
+    // would have a value nothing can read.
+    if old.props != NULL_BLOCK
+        && edges
+            .windows(2)
+            .any(|w| (w[0].0, w[0].1) == (w[1].0, w[1].1))
+    {
+        return Err(ZuError::Unsupported {
+            what: "a second edge over a pair a table that stores edge properties already holds",
+            id: rel.id,
+        });
+    }
+    let order: Vec<Came> = edges.iter().map(|&(_, _, came)| came).collect();
+    let edges: Vec<(u32, u32)> = edges.into_iter().map(|(src, dst, _)| (src, dst)).collect();
     // A keyed table's index survives only while the row domain holds
     // still; growing it takes the key allocation the constraint slice
     // brings, so appending to a keyed table is refused for now.
@@ -457,6 +479,10 @@ fn fold_rel(
             bwd,
         })
         .collect();
+    let props = match old.props {
+        NULL_BLOCK => NULL_BLOCK,
+        root => fold_rel_props(db, rel, root, &order, &overlay)?,
+    };
     let directory = Directory {
         from_count: new_from,
         to_count: new_to,
@@ -464,11 +490,126 @@ fn fold_rel(
         keys: key_by_row
             .map(|keys| write_key_index(db, &keys))
             .transpose()?,
-        props: old.props,
+        props,
         groups,
     };
     index.set(rel.id, meta::write_chain(db, &directory.encode())?);
     Ok(directory.edge_count)
+}
+
+/// Where one edge of a rebuilt rel table came from, which is what says
+/// where its property values are: an edge the base held keeps the value
+/// at its place in the old load order, and one the overlay adds takes
+/// the value it was written with.
+#[derive(Debug, Clone, Copy)]
+enum Came {
+    Base(usize),
+    Overlay(usize),
+}
+
+/// One edge a fold is adding to a rel table: the row it leaves, the row
+/// it arrives at, and the cell it holds in each column of the table.
+type AddedEdge = (u64, u64, Vec<(u32, Cell)>);
+
+/// Rewrites a rel table's property columns into the edge order the fold
+/// just built, and answers the new props root.
+///
+/// A column is dense over the edges in load order, and an added edge
+/// moves every edge behind it, so this is a rewrite of the whole column
+/// rather than an append to it. The old blocks are freed once their
+/// values are read.
+fn fold_rel_props(
+    db: &mut Zu1File,
+    rel: &RelTable,
+    props: BlockPtr,
+    order: &[Came],
+    overlay: &[AddedEdge],
+) -> Result<BlockPtr> {
+    let dir = load_props_at(db, props)?;
+    let missing = |name: &str| {
+        ZuError::InvalidArgument(format!(
+            "the new edge carries no value for column '{name}' of '{}', and every edge of a table that stores properties holds one",
+            rel.name
+        ))
+    };
+    let mismatch = |name: &str| {
+        ZuError::InvalidArgument(format!(
+            "the new edge's value for column '{name}' of '{}' does not match its stored type",
+            rel.name
+        ))
+    };
+    let mut columns = Vec::with_capacity(dir.columns.len());
+    for (ci, col) in dir.columns.iter().enumerate() {
+        // An overlay cell is a value and never an absence, so there is
+        // no way to say here whether an added edge holds one. Saying so
+        // is what the write statement does; the fold refuses rather
+        // than deciding for it.
+        if col.validity.is_some() {
+            return Err(ZuError::Unsupported {
+                what: "folding an added edge into a column that holds a null",
+                id: rel.id,
+            });
+        }
+        let cell = |at: usize| {
+            overlay[at]
+                .2
+                .iter()
+                .find(|(c, _)| *c == ci as u32)
+                .map(|(_, cell)| cell)
+                .ok_or_else(|| missing(&col.name))
+        };
+        // The fold splits on the lane against the blob, because that is
+        // what it rewrites, and the column's type says which of the two
+        // an added edge's cell must be.
+        let meta = if col.is_lane() {
+            let mut old = Vec::with_capacity(order.len());
+            read_segment(db, &col.meta, &mut old)?;
+            let mut values = Vec::with_capacity(order.len());
+            for came in order {
+                values.push(match came {
+                    Came::Base(at) => old[*at],
+                    Came::Overlay(at) => match cell(*at)? {
+                        Cell::Int(x) => *x,
+                        Cell::Str(_) => return Err(mismatch(&col.name)),
+                    },
+                });
+            }
+            write_segment(db, &values)?
+        } else {
+            let (mut bytes, mut ends) = (Vec::new(), Vec::new());
+            read_blob_segment(db, &col.meta, &mut bytes, &mut ends)?;
+            let mut old: Vec<&[u8]> = Vec::with_capacity(ends.len());
+            let mut start = 0usize;
+            for &end in &ends {
+                old.push(&bytes[start..end as usize]);
+                start = end as usize;
+            }
+            let mut values: Vec<&[u8]> = Vec::with_capacity(order.len());
+            for came in order {
+                values.push(match came {
+                    Came::Base(at) => old[*at],
+                    Came::Overlay(at) => match cell(*at)? {
+                        Cell::Str(s) => s.as_slice(),
+                        Cell::Int(_) => return Err(mismatch(&col.name)),
+                    },
+                });
+            }
+            write_blob_segment(db, &values)?
+        };
+        columns.push(crate::props::PropColumn {
+            name: col.name.clone(),
+            ty: col.ty.clone(),
+            meta,
+            validity: None,
+        });
+    }
+    free_props_keeping_labels(db, props)?;
+    let new = PropsDirectory {
+        node_count: order.len() as u64,
+        columns,
+        labels: dir.labels,
+    };
+    meta::write_chain(db, &new.encode())
 }
 
 #[cfg(test)]
@@ -830,11 +971,72 @@ mod tests {
         crate::verify(&path).unwrap();
     }
 
-    /// An overlay edge arrives with no value for a column that has one
-    /// per edge, so folding it into a table that stores edge properties
-    /// is refused whole, with the log left holding the txn.
+    /// A column is dense over the edges in load order, so an edge added
+    /// in front of the ones the base held moves every one of them, and
+    /// the values move with them.
     #[test]
-    fn an_overlay_edge_on_a_table_with_edge_columns_is_refused() {
+    fn an_added_edge_moves_the_columns_into_the_new_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relprops.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2)]).unwrap();
+        let notes: Vec<&[u8]> = vec![b"one", b"two"];
+        crate::props::store_rel_props(
+            &mut db,
+            "knows",
+            &[
+                ("since", PropValues::Int(&[1, 2])),
+                ("note", PropValues::Str(&notes)),
+            ],
+        )
+        .unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("relprops.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        // (0, 0) sorts in front of both stored edges, so nothing keeps
+        // the ordinal it had.
+        txn.insert_rel_carrying(
+            knows,
+            0,
+            0,
+            vec![(0, Cell::Int(3)), (1, Cell::Str(b"new".to_vec()))],
+        );
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let (since, note) = (reader.col("since").unwrap(), reader.col("note").unwrap());
+        let mut graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        for (src, dst, year, text) in [
+            (0u64, 0u64, 3u64, "new"),
+            (0, 1, 1, "one"),
+            (1, 2, 2, "two"),
+        ] {
+            let row = graph.edge_ordinal(&mut db, src, dst).unwrap().unwrap();
+            assert_eq!(reader.read_int(&mut db, since, row).unwrap(), year);
+            let mut got = Vec::new();
+            reader.read_str(&mut db, note, row, &mut got).unwrap();
+            assert_eq!(got, text.as_bytes(), "{src} to {dst}");
+        }
+        let path = dir.path().join("relprops.zu1");
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// An edge added to a table that stores properties has to carry a
+    /// value for every column, because a column is dense and there is
+    /// nothing for it to hold otherwise. The fold refuses whole, with
+    /// the log left holding the txn.
+    #[test]
+    fn an_added_edge_with_no_value_for_a_column_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("relrefuse.zu1")).unwrap();
         bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2)]).unwrap();
@@ -851,7 +1053,7 @@ mod tests {
         txn.insert_rel(knows, 3, 0);
         txn.commit(&mut wal).unwrap();
         let err = checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap_err();
-        assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
+        assert!(err.to_string().contains("'since'"), "{err}");
         assert!(!wal.is_empty(), "the log still holds the txn");
         let mut reader = PropsReader::new(
             crate::props::load_rel_props(&mut db, knows)
@@ -860,6 +1062,50 @@ mod tests {
         );
         let col = reader.col("since").unwrap();
         assert_eq!(reader.read_int(&mut db, col, 1).unwrap(), 2);
+    }
+
+    /// A pair the table already holds is an ordinal two edges answer to,
+    /// so a table that stores properties refuses the second one.
+    #[test]
+    fn a_second_edge_over_a_pair_is_refused_on_a_table_with_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("reldup.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2)]).unwrap();
+        crate::props::store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1, 2]))])
+            .unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("reldup.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.insert_rel_carrying(knows, 0, 1, vec![(0, Cell::Int(9))]);
+        txn.commit(&mut wal).unwrap();
+        let err = checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap_err();
+        assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
+    }
+
+    /// A table that stores nothing on its edges has nowhere to put a
+    /// value, and says so rather than dropping it.
+    #[test]
+    fn a_value_on_an_edge_of_a_table_without_columns_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("relnone.zu1")).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1)]).unwrap();
+        let knows = Catalog::load(&mut db)
+            .unwrap()
+            .rel_by_name("knows")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("relnone.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.insert_rel_carrying(knows, 3, 0, vec![(0, Cell::Int(9))]);
+        txn.commit(&mut wal).unwrap();
+        let err = checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap_err();
+        assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
     }
 
     /// A rel table nobody touched keeps its directory root: the fold

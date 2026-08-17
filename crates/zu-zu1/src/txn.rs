@@ -53,7 +53,19 @@ struct TableOverlay {
 /// Committed overlay edges of one rel table, in commit order.
 #[derive(Debug, Default)]
 struct RelOverlay {
-    edges: Vec<(Epoch, u64, u64)>,
+    edges: Vec<OverlayEdge>,
+}
+
+/// One committed edge the base does not hold yet: the rows it runs
+/// between and what it carries.
+#[derive(Debug)]
+struct OverlayEdge {
+    epoch: Epoch,
+    src: u64,
+    dst: u64,
+    /// Column position in the rel table's props directory and the cell
+    /// this edge holds there, one entry per column the table stores.
+    cols: Vec<(u32, Cell)>,
 }
 
 /// The payload of one resolved or freshly written ingest: the sealed
@@ -90,6 +102,7 @@ enum Op {
         rel: u32,
         src: u64,
         dst: u64,
+        cols: Vec<(u32, Cell)>,
     },
     Update {
         table: u32,
@@ -213,9 +226,34 @@ impl Mvcc {
                         });
                     Ok(())
                 }
-                WalRecord::RelInsert { rel, src, dst } => {
+                WalRecord::RelInsert {
+                    rel,
+                    src,
+                    dst,
+                    cols,
+                } => {
                     let edges = &mut mvcc.rels.entry(*rel).or_default().edges;
-                    edges.extend(src.iter().zip(dst).map(|(s, d)| (epoch, *s, *d)));
+                    // A logged column runs across the record's edges, and
+                    // an overlay edge carries its own cells, so the read
+                    // back turns the columns on their side: edge `i`
+                    // takes value `i` of every column.
+                    for (i, (s, d)) in src.iter().zip(dst).enumerate() {
+                        edges.push(OverlayEdge {
+                            epoch,
+                            src: *s,
+                            dst: *d,
+                            cols: cols
+                                .iter()
+                                .map(|c| {
+                                    let cell = match &c.values {
+                                        WalValues::Int(v) => Cell::Int(v[i]),
+                                        WalValues::Str(v) => Cell::Str(v[i].clone()),
+                                    };
+                                    (c.col, cell)
+                                })
+                                .collect(),
+                        });
+                    }
                     Ok(())
                 }
                 WalRecord::Update {
@@ -324,14 +362,14 @@ impl Mvcc {
     /// facade's concern; the overlay stores edges as committed.
     pub fn neighbors(&self, rel: u32, node: u64, reversed: bool, epoch: Epoch, out: &mut Vec<u64>) {
         if let Some(overlay) = self.rels.get(&rel) {
-            for &(e, src, dst) in &overlay.edges {
-                if e > epoch {
+            for edge in &overlay.edges {
+                if edge.epoch > epoch {
                     continue;
                 }
-                if !reversed && src == node {
-                    out.push(dst);
-                } else if reversed && dst == node {
-                    out.push(src);
+                if !reversed && edge.src == node {
+                    out.push(edge.dst);
+                } else if reversed && edge.dst == node {
+                    out.push(edge.src);
                 }
             }
         }
@@ -339,12 +377,22 @@ impl Mvcc {
 
     /// Overlay edges of `rel` visible at `epoch`, for checkpoint folds.
     pub fn edges(&self, rel: u32, epoch: Epoch) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.edge_cells(rel, epoch).map(|(src, dst, _)| (src, dst))
+    }
+
+    /// The same edges with what they carry, which is what a fold of a
+    /// rel table that stores edge properties has to write.
+    pub fn edge_cells(
+        &self,
+        rel: u32,
+        epoch: Epoch,
+    ) -> impl Iterator<Item = (u64, u64, &[(u32, Cell)])> + '_ {
         self.rels
             .get(&rel)
             .into_iter()
             .flat_map(|o| &o.edges)
-            .filter(move |(e, _, _)| *e <= epoch)
-            .map(|&(_, s, d)| (s, d))
+            .filter(move |edge| edge.epoch <= epoch)
+            .map(|edge| (edge.src, edge.dst, edge.cols.as_slice()))
     }
 
     /// Node tables holding any overlay state, sorted so a fold walks
@@ -424,7 +472,12 @@ impl Mvcc {
             }
             IngestPayload::Edges { src, dst } => {
                 let edges = &mut self.rels.entry(table).or_default().edges;
-                edges.extend(src.into_iter().zip(dst).map(|(s, d)| (epoch, s, d)));
+                edges.extend(src.into_iter().zip(dst).map(|(src, dst)| OverlayEdge {
+                    epoch,
+                    src,
+                    dst,
+                    cols: Vec::new(),
+                }));
             }
         }
         self.ingests.push((epoch, root));
@@ -452,12 +505,18 @@ impl Mvcc {
                         .appended
                         .push(AppendBatch { epoch, cols, rows });
                 }
-                Op::InsertRel { rel, src, dst } => {
-                    self.rels
-                        .entry(rel)
-                        .or_default()
-                        .edges
-                        .push((epoch, src, dst));
+                Op::InsertRel {
+                    rel,
+                    src,
+                    dst,
+                    cols,
+                } => {
+                    self.rels.entry(rel).or_default().edges.push(OverlayEdge {
+                        epoch,
+                        src,
+                        dst,
+                        cols,
+                    });
                 }
                 Op::Update {
                     table,
@@ -510,9 +569,22 @@ impl WriteTxn<'_> {
         Ok(rows)
     }
 
-    /// Stages one new edge.
+    /// Stages one new edge carrying nothing, which is every edge in a
+    /// table that stores no properties on its edges.
     pub fn insert_rel(&mut self, rel: u32, src: u64, dst: u64) {
-        self.ops.push(Op::InsertRel { rel, src, dst });
+        self.insert_rel_carrying(rel, src, dst, Vec::new());
+    }
+
+    /// Stages one new edge and the cells it holds: a column's position
+    /// in the rel table's props directory and the value this edge takes
+    /// there, one entry per column the table stores.
+    pub fn insert_rel_carrying(&mut self, rel: u32, src: u64, dst: u64, cols: Vec<(u32, Cell)>) {
+        self.ops.push(Op::InsertRel {
+            rel,
+            src,
+            dst,
+            cols,
+        });
     }
 
     /// Stages one cell update.
@@ -570,10 +642,26 @@ fn build_records(ops: &[Op]) -> Vec<WalRecord> {
                 table: *table,
                 cols: cols.clone(),
             }),
-            Op::InsertRel { rel, src, dst } => out.push(WalRecord::RelInsert {
+            Op::InsertRel {
+                rel,
+                src,
+                dst,
+                cols,
+            } => out.push(WalRecord::RelInsert {
                 rel: *rel,
                 src: vec![*src],
                 dst: vec![*dst],
+                // One cell is one value of one type, so the lowering
+                // that can disagree with itself over a batch cannot
+                // here.
+                cols: cols
+                    .iter()
+                    .map(|(col, cell)| WalColumn {
+                        col: *col,
+                        values: cell_values(std::slice::from_ref(cell))
+                            .expect("one staged cell is one type"),
+                    })
+                    .collect(),
             }),
             Op::Update {
                 table,

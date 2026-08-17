@@ -165,8 +165,9 @@ const NOTES: &[&str] = &[
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",
-    "an edge carrying properties is refused by name because the log has no record that holds \
-     them, and that is the next piece of the write surface rather than a case that is scored",
+    "an edge carries properties the way an element does, so a written edge holds one value for \
+     every column its table stores, and an edge written into a table that stores none on its \
+     edges is refused by name rather than dropping what it carried",
     "an element is created in the node table whose own name is the label the pattern wrote, \
      and a table is not created by naming one, so a case that inserts into a label its \
      fixture did not declare is answered with a reference error",

@@ -1,4 +1,4 @@
-schema: 1
+schema: 2
 suite: temporal
 doc: Dates, times and durations, which every language already has a type for and no two of those types mean the same thing. A client mapping these onto the host language's own date is where a zone, a precision or a sign quietly goes missing.
 

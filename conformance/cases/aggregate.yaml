@@ -1,4 +1,4 @@
-schema: 1
+schema: 2
 suite: aggregate
 doc: The set functions, which are where a type changes on the way through: a count is an integer whatever it counted, an average is a float whatever it averaged, and a sum is neither reliably. They are also the one place in the language where a null does not propagate, and the empty input is where each of them chooses separately between zero and null.
 

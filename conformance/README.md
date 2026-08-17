@@ -21,12 +21,12 @@ cargo run -p xtask -- corpus-pack --check   # pack and report, writing nothing
 
 The Rust runner in `crates/zu-corpus` is the first of nine and the reference for the rest. When a runner in another language disagrees with it about a case, the Rust one is right by definition: the cases and the engine version together are the contract, and this runner is the one compiled against the engine that defines it.
 
-Every case gets a database of its own. Cases are written as if nothing came before them, and the cheapest way to keep that true is to make it true. A case that leaked a table into the next one would be a failure that moves when the file is reordered, which is the worst kind to be handed.
+Every case gets a database of its own. Cases are written as if nothing came before them, and the cheapest way to keep that true is to make it true. A case that leaked a table into the next one would be a failure that moves when the file is reordered, which is the worst kind to be handed. A suite with a `load:` gets it applied to each of those databases in turn, for the same reason.
 
 ## What a case looks like
 
 ```yaml
-schema: 1
+schema: 2
 suite: scalar
 doc: The values that cross a language boundary badly.
 
@@ -44,9 +44,10 @@ cases:
 
 | Key | Where | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema` | file | yes | Moves when the shape of a case file changes, not when the cases do. It is `1`. |
+| `schema` | file | yes | Moves when the shape of a case file changes, not when the cases do. It is `2`, which is where `load` arrived. |
 | `suite` | file | yes | The suite's name, which must equal the file's stem. Two places to write one thing, checked against each other rather than one of them ignored. |
 | `doc` | file and case | yes | Why this is here, in a sentence somebody wrote. A test enforces length and a full stop, which is a floor on effort and not on quality. |
+| `load` | file | no | A table of typed columns and the edges between its rows, put into every case's database through the runner's own bulk load path before the case runs. Most suites have none. |
 | `cases` | file | yes | The cases, in the order they run. |
 | `name` | case | yes | Lower case and dashes, unique within the suite. It is what a report names the case by, so it is stable. |
 | `setup` | case | no | Statements run before `query`, against the case's own empty database. |
@@ -54,6 +55,41 @@ cases:
 | `columns` | case | with `rows` | The projected names, in order. The names are part of the answer. |
 | `rows` | case | with `columns` | The rows, in order. Written as `rows:` with nothing under it when the case expects none, which is a real expectation and needs a spelling. |
 | `raises` | case | no | A GQLSTATUS code the statement must raise. Mutually exclusive with `columns`. |
+
+## What a load looks like
+
+Every other case is an expression, and an expression says what a value means on the way out and nothing about how it got in. Half of what a client does is put values in, and a client that decodes a date correctly and encodes it a day early passes every expression case there is. A `load:` is the other half.
+
+```yaml
+load:
+  nodes: person
+  edges: knows
+  count: 3
+  columns:
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+  pairs:
+    - from: 0
+      to: 1
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `nodes` | yes | The node table the rows go into, which is the label the cases match on. |
+| `edges` | yes | The rel table the pairs go into, which is the type the cases traverse. |
+| `count` | yes | How many rows the table has. Written down rather than counted from the columns, so a column with a value missing is an error in the file and not a shorter table. |
+| `columns` | yes | The columns, each a name, the type every value in it has, and the values in row order. |
+| `pairs` | no | The edges, each a `from` and a `to` row index. Sorted and deduplicated by the reader, because the loader wants them that way and asking the file to do it is one more thing a case can get wrong silently. |
+
+A column names its type once and its values are bare payloads under it, which is the row encoding with the type factored out. The quoting rule is the same one and for the same reason.
+
+A load belongs to the file rather than to the case, and it is applied to every case's own fresh database. Cases stay independent; writing the fixture once is a property of the file and not of the run.
+
+It is bulk load rather than a statement because in v0 that is the only way in: `CREATE` and `INSERT` need a table and no statement makes one. Every client already has to expose a loader, so every runner has something to implement this with. The types a column can hold are the types the v0 property store keeps, which is `INT64`, `STRING`, `BOOL`, `FLOAT64`, `DATE`, `LOCALTIME`, `LOCALDATETIME` and both kinds of `DURATION`. The two zoned types are refused with a message, because the store has nowhere to keep an offset, and so is a null, because a loaded column has no way to spell one yet.
 
 ## What is in it
 
@@ -71,8 +107,10 @@ cases:
 | `cast` | Conversion, where truncation towards zero, a range check and a refusal each contradict at least one popular language. |
 | `order` | The order values sort in, including across types, which no host comparator gets right by accident. |
 | `aggregate` | The set functions, where a type changes on the way through and a null stops propagating. |
+| `stored` | Values put in through a client's own loader and read back out through a query, so the value crosses the boundary twice and by two different mechanisms. |
+| `graph` | The shape a load puts into the store, read back by walking it: direction, a row nothing points at, and a row that points at itself. |
 
-A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. Cases that store a value and read it back wait on `CREATE`, which the v0 core does not implement yet.
+A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. The two suites that store a value first do it through `load:` rather than through a statement, because the v0 core does not implement `CREATE` yet.
 
 ## The artifact
 

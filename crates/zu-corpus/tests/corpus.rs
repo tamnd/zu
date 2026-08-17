@@ -97,11 +97,32 @@ fn the_corpus_holds_more_than_one_suite_and_they_load_in_a_fixed_order() {
 }
 
 #[test]
+fn some_of_the_corpus_stores_a_value_before_it_reads_one_back() {
+    // The expression cases would all still pass with the load path
+    // broken, or deleted, or never applied, because none of them reads
+    // anything back. This is the assertion that the other half of the
+    // question is still being asked at all.
+    let suites = suites();
+    let loaded: Vec<&str> = suites
+        .iter()
+        .filter(|s| s.load.is_some())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(!loaded.is_empty(), "no suite has a `load:`");
+    let cases: usize = suites
+        .iter()
+        .filter(|s| s.load.is_some())
+        .map(|s| s.cases.len())
+        .sum();
+    assert!(cases > 20, "{loaded:?} hold {cases} cases between them");
+}
+
+#[test]
 fn a_file_whose_name_and_suite_disagree_is_refused_rather_than_reported_under_one_of_them() {
     let temp = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
         temp.path().join("named.yaml"),
-        "schema: 1\nsuite: other\ndoc: a suite whose file says one name and whose text says another\ncases:\n  - name: a\n    doc: a case, which this test never gets as far as running\n    query: RETURN 1 AS n\n    raises: \"22012\"\n",
+        "schema: 2\nsuite: other\ndoc: a suite whose file says one name and whose text says another\ncases:\n  - name: a\n    doc: a case, which this test never gets as far as running\n    query: RETURN 1 AS n\n    raises: \"22012\"\n",
     )
     .expect("writing the fixture");
     let err = load(temp.path()).expect_err("refused");

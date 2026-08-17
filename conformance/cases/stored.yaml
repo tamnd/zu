@@ -1,0 +1,619 @@
+schema: 2
+suite: stored
+doc: Values put in through a client's bulk load path and read back out through a query. Every other suite asks what a value means on the way out, which is half the question, because a client that decodes a date correctly and encodes it a day early is still wrong and no expression can catch that. Here the value crosses the boundary twice and by two different mechanisms, so a client passes only if its loader and its reader agree with each other and with this file.
+
+load:
+  nodes: person
+  edges: knows
+  count: 4
+  columns:
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+        - "40"
+    - name: big
+      type: INT64
+      values:
+        - "9223372036854775807"
+        - "-9223372036854775808"
+        - "0"
+        - "-1"
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+        - di
+    - name: tag
+      type: STRING
+      values:
+        - ""
+        - "héllo"
+        - "a\tb"
+        - "🙂"
+    - name: ok
+      type: BOOL
+      values:
+        - true
+        - false
+        - true
+        - false
+    - name: score
+      type: FLOAT64
+      values:
+        - "0.1"
+        - "-0.0"
+        - "3.141592653589793"
+        - "1e308"
+    - name: born
+      type: DATE
+      values:
+        - "0001-01-01"
+        - "9999-12-31"
+        - "2000-02-29"
+        - "1970-01-01"
+    - name: wake
+      type: LOCALTIME
+      values:
+        - "00:00:00"
+        - "12:34:56.789"
+        - "23:59:59.999999999"
+        - "06:00:00"
+    - name: seen
+      type: LOCALDATETIME
+      values:
+        - "1970-01-01T00:00:00"
+        - "2000-02-29T12:00:00"
+        - "2024-12-31T23:59:59.5"
+        - "1999-12-31T23:59:59"
+    - name: took
+      type: DURATION
+      values:
+        - "PT1S"
+        - "PT1H30M"
+        - "P1D"
+        - "PT0S"
+    - name: span
+      type: DURATION
+      values:
+        - "P1Y"
+        - "P2M"
+        - "P1Y6M"
+        - "P3Y"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+    - from: 0
+      to: 2
+
+cases:
+  - name: every-row-of-the-load-is-a-node
+    doc: The count of the rows, which is the first thing a loader can get wrong and the one that makes every case below meaningless if it is wrong.
+    query: MATCH (n:person) RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: an-integer-column-comes-back-in-the-order-it-went-in
+    doc: The whole integer column, gathered in the order the rows were written, so that a loader that permutes its input fails here rather than passing every single value case by accident.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.age) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "30"
+              - type: INT64
+                value: "40"
+              - type: INT64
+                value: "50"
+              - type: INT64
+                value: "40"
+
+  - name: the-integer-extremes-survive-the-store
+    doc: The two ends of the signed 64 bit range and the two values next to zero, which is where a loader that hands its values over as unsigned turns the smallest into the largest.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.big) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "9223372036854775807"
+              - type: INT64
+                value: "-9223372036854775808"
+              - type: INT64
+                value: "0"
+              - type: INT64
+                value: "-1"
+
+  - name: a-string-column-comes-back-byte-for-byte
+    doc: Four strings a client has to hand over as bytes, being an empty one, one with a two byte code point, one with a tab in it, and one outside the basic plane, which between them catch a loader that measures length in the wrong unit.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.tag) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: STRING
+                value: ""
+              - type: STRING
+                value: "héllo"
+              - type: STRING
+                value: "a\tb"
+              - type: STRING
+                value: "🙂"
+
+  - name: a-stored-empty-string-is-a-value-and-not-a-missing-one
+    doc: The empty string read back on its own and asked whether it is null, which is the question a client that keeps strings as pointers and treats the null pointer as absent gets wrong.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n.tag AS a, n.tag IS NULL AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+          - type: BOOL
+            value: false
+
+  - name: a-boolean-column-comes-back
+    doc: The truth values in row order, which a client storing them as one byte per row and reading them back as a bit set gets wrong in a way no single value catches.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.ok) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: BOOL
+                value: true
+              - type: BOOL
+                value: false
+              - type: BOOL
+                value: true
+              - type: BOOL
+                value: false
+
+  - name: a-float-column-comes-back-bit-for-bit
+    doc: Four doubles that are each their own hazard, being one that no decimal writes exactly, a negative zero, the closest double to pi, and one near the top of the range.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.score) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: FLOAT64
+                value: "0.1"
+              - type: FLOAT64
+                value: "-0.0"
+              - type: FLOAT64
+                value: "3.141592653589793"
+              - type: FLOAT64
+                value: "1e308"
+
+  - name: a-stored-negative-zero-keeps-its-sign
+    doc: Negative zero read back on its own, which compares equal to zero everywhere and so survives every comparison a client might check itself with, leaving the sign bit as the only evidence.
+    query: MATCH (n:person) WHERE n.name = 'bo' RETURN n.score AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-0.0"
+
+  - name: a-date-column-comes-back
+    doc: Four dates including both ends of the range and a leap day, which is the column a client with a day count and an epoch of its own has to translate in both directions.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.born) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: DATE
+                value: "0001-01-01"
+              - type: DATE
+                value: "9999-12-31"
+              - type: DATE
+                value: "2000-02-29"
+              - type: DATE
+                value: "1970-01-01"
+
+  - name: the-ends-of-the-date-range-survive-the-store
+    doc: The earliest and latest stored dates found by aggregating the column, which is the same two values reached by a path that compares them rather than one that lists them.
+    query: MATCH (n:person) RETURN min(n.born) AS a, max(n.born) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: DATE
+            value: "0001-01-01"
+          - type: DATE
+            value: "9999-12-31"
+
+  - name: a-localtime-column-keeps-every-digit
+    doc: Times at both ends of the day, one with three fraction digits and one with nine, which a client keeping the time in milliseconds cannot hold and has to say so rather than round.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.wake) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: LOCALTIME
+                value: "00:00:00"
+              - type: LOCALTIME
+                value: "12:34:56.789000000"
+              - type: LOCALTIME
+                value: "23:59:59.999999999"
+              - type: LOCALTIME
+                value: "06:00:00"
+
+  - name: a-localdatetime-column-comes-back
+    doc: Datetimes on either side of the epoch, one of them a leap day and one of them the last second of a year, which is where a client that stores the date and the time apart loses the carry.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.seen) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: LOCALDATETIME
+                value: "1970-01-01T00:00:00"
+              - type: LOCALDATETIME
+                value: "2000-02-29T12:00:00"
+              - type: LOCALDATETIME
+                value: "2024-12-31T23:59:59.500000000"
+              - type: LOCALDATETIME
+                value: "1999-12-31T23:59:59"
+
+  - name: a-day-time-duration-column-comes-back
+    doc: Durations counted in seconds, including a zero and one written in a unit larger than the one it is kept in, which pins the normal form a client reads back rather than the text it wrote.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.took) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: DURATION
+                value: "PT1S"
+              - type: DURATION
+                value: "PT1H30M"
+              - type: DURATION
+                value: "P1D"
+              - type: DURATION
+                value: "PT0S"
+
+  - name: a-year-month-duration-column-comes-back
+    doc: Durations counted in months, which are the other kind and are kept in a different column even though they are written with the same letters, so a loader with one duration type fails here.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.span) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: DURATION
+                value: "P1Y"
+              - type: DURATION
+                value: "P2M"
+              - type: DURATION
+                value: "P1Y6M"
+              - type: DURATION
+                value: "P3Y"
+
+  - name: the-columns-of-one-row-belong-to-that-row
+    doc: Five columns of a single row read together, which is the case that catches a loader that gets every column right and puts one of them in against the wrong row.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN n.age AS a, n.ok AS b, n.born AS c, n.wake AS d, n.took AS e
+    columns:
+      - a
+      - b
+      - c
+      - d
+      - e
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+          - type: BOOL
+            value: true
+          - type: DATE
+            value: "2000-02-29"
+          - type: LOCALTIME
+            value: "23:59:59.999999999"
+          - type: DURATION
+            value: "P1D"
+
+  - name: filtering-on-a-stored-integer
+    doc: A comparison against a stored column, which is the value going the other way through the boundary because the engine reads it where the client wrote it.
+    query: MATCH (n:person) WHERE n.age > 35 RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: filtering-on-a-stored-string
+    doc: A stored string compared with a literal, which fails for a loader that wrote a length prefix the reader does not expect or a terminator it does not strip.
+    query: MATCH (n:person) WHERE n.name = 'di' RETURN n.age AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "40"
+
+  - name: filtering-on-a-stored-boolean
+    doc: A stored truth value used as a condition without being compared to anything, which is where a client that wrote something other than zero and one for false and true is found out.
+    query: MATCH (n:person) WHERE n.ok RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: filtering-on-a-stored-date
+    doc: A stored date compared with a date literal, which is the comparison a client that stored the date as text passes and a client that stored it in the wrong epoch fails.
+    query: MATCH (n:person) WHERE n.born < DATE '1980-01-01' RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: ordering-by-a-stored-column
+    doc: The rows sorted by a stored number with the name breaking the tie, which pins both the order and the tie rather than leaving the equal pair free to fall either way.
+    query: MATCH (n:person) RETURN n.name AS who ORDER BY n.age, n.name
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: ordering-descending-by-a-stored-column
+    doc: The same sort the other way round, which a client that reverses the comparison rather than the result gets wrong on the tie.
+    query: MATCH (n:person) RETURN n.name AS who ORDER BY n.age DESC, n.name DESC
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: ann
+
+  - name: the-aggregates-of-a-stored-column
+    doc: The four aggregates over the stored numbers at once, where the average comes back as a double even though every value in the column is an integer.
+    query: MATCH (n:person) RETURN min(n.age) AS a, max(n.age) AS b, sum(n.age) AS c, avg(n.age) AS d
+    columns:
+      - a
+      - b
+      - c
+      - d
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "50"
+          - type: INT64
+            value: "160"
+          - type: FLOAT64
+            value: "40.0"
+
+  - name: counting-the-distinct-values-of-a-stored-column
+    doc: Three distinct numbers in four rows, which counts the values and not the rows and so catches a reader that compares the rows by their position.
+    query: MATCH (n:person) RETURN count(DISTINCT n.age) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: collecting-a-stored-column-over-no-rows
+    doc: A filter no stored row satisfies, which gathers an empty list rather than a null and rather than no row at all.
+    query: MATCH (n:person) WHERE n.age > 1000 RETURN collect(n.age) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+
+  - name: arithmetic-over-a-stored-column
+    doc: A stored number in an expression, which is the value being read into the engine's own numeric type rather than handed straight back to the client.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n.age * 2 + 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "61"
+
+  - name: a-stored-integer-casts-to-text
+    doc: A stored number turned into a string, which is the same conversion a client applies when it prints a row and so pins the digits rather than the client's own formatter.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN cast(n.age AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "30"
+
+  - name: a-stored-string-has-a-size
+    doc: The code points of every stored string added up, which is nine because the empty one contributes nothing and the emoji contributes one rather than four.
+    query: MATCH (n:person) RETURN sum(size(n.tag)) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9"
+
+  - name: a-duration-added-to-a-stored-date
+    doc: A stored leap day with a day added to it, which lands in March and is the arithmetic a client that stored the date as a month and a day cannot do.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN n.born + DURATION 'P1D' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2000-03-01"
+
+  - name: a-stored-duration-added-to-a-stored-date
+    doc: Two stored columns of two different types in one expression, which is the strongest form of the round trip because both operands crossed the boundary and neither was written in the query.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN n.born + n.took AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2000-03-01"
+
+  - name: a-stored-value-goes-into-a-list
+    doc: Stored values gathered into a list by the query rather than by an aggregate, which puts a value that came out of the store back into a container on the way out.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN [n.age, n.big] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "30"
+              - type: INT64
+                value: "9223372036854775807"
+
+  - name: a-stored-value-compares-with-another-stored-value
+    doc: Two columns of one row compared against each other, which is a comparison the query never sees the operands of and so tests the store rather than the reader.
+    query: MATCH (n:person) WHERE n.age > n.big RETURN n.name AS who ORDER BY who
+    columns:
+      - who
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-stored-string-orders-by-code-point
+    doc: The stored strings sorted, where the empty one comes first and the emoji last, which is the order of the code points and not of any locale.
+    query: MATCH (n:person) RETURN n.tag AS n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+      - values:
+          - type: STRING
+            value: "a\tb"
+      - values:
+          - type: STRING
+            value: "héllo"
+      - values:
+          - type: STRING
+            value: "🙂"
+
+  - name: stored-temporals-order-by-their-instant
+    doc: The stored datetimes sorted, which is the order of the moments they name and not of the text they were written in, though here the two happen to agree.
+    query: MATCH (n:person) RETURN n.seen AS n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "1970-01-01T00:00:00"
+      - values:
+          - type: LOCALDATETIME
+            value: "1999-12-31T23:59:59"
+      - values:
+          - type: LOCALDATETIME
+            value: "2000-02-29T12:00:00"
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-12-31T23:59:59.500000000"
+
+  - name: stored-durations-order-by-length
+    doc: The stored day time durations sorted, which puts the zero first and the day last and is the order a client that compares them as text gets wrong.
+    query: MATCH (n:person) RETURN n.took AS n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0S"
+      - values:
+          - type: DURATION
+            value: "PT1S"
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+      - values:
+          - type: DURATION
+            value: "P1D"
+
+  - name: a-stored-value-groups-the-rows
+    doc: The rows grouped by a stored column, which reaches the value through the grouping key rather than through the projection and so tests a third path out of the store.
+    query: MATCH (n:person) RETURN n.age AS a, count(*) AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "40"
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "50"
+          - type: INT64
+            value: "1"

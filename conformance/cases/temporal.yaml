@@ -112,3 +112,650 @@ cases:
       - values:
           - type: DURATION
             value: "-PT1H"
+
+  - name: the-earliest-date
+    doc: The first day the type holds, which is the bottom of the range and the value a client with a signed day count and an epoch in the middle is most likely to sign extend wrongly.
+    query: RETURN DATE '0001-01-01' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "0001-01-01"
+
+  - name: the-latest-date
+    doc: The last day the type holds, four digits of year and no more, which is the top of the range and the other end a client has to reach.
+    query: RETURN DATE '9999-12-31' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "9999-12-31"
+
+  - name: a-century-year-divisible-by-four-hundred-is-a-leap-year
+    doc: The year 2000 has a twenty ninth of February because the rule has three parts and not one, and a client with the first part only refuses this date.
+    query: RETURN DATE '2000-02-29' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2000-02-29"
+
+  - name: a-century-year-is-otherwise-not-a-leap-year
+    doc: The year 1900 has no twenty ninth of February, which is the second part of the same rule, and the case above and this one only pass together.
+    query: RETURN DATE '1900-02-29' AS n
+    raises: "22007"
+
+  - name: a-day-a-month-does-not-have
+    doc: February in an ordinary year stops at the twenty eighth, so this is not a date, and a client checking only that the number is under thirty two accepts it.
+    query: RETURN DATE '2023-02-29' AS n
+    raises: "22007"
+
+  - name: a-month-that-does-not-exist
+    doc: There is no thirteenth month, and a client validating the day but not the month has half a calendar.
+    query: RETURN DATE '2024-13-01' AS n
+    raises: "22007"
+
+  - name: a-date-is-written-with-every-digit
+    doc: The fields are padded to their width, so a date with single digit parts is not read at all, which keeps one spelling for one value.
+    query: RETURN DATE '2024-1-1' AS n
+    raises: "22007"
+
+  - name: a-time-carries-a-single-nanosecond
+    doc: The smallest amount a time of day can differ by, which is the value a client on a microsecond clock rounds away to midnight and reports as a success.
+    query: RETURN LOCAL TIME '12:34:56.000000001' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "12:34:56.000000001"
+
+  - name: a-short-fraction-is-filled-out
+    doc: One digit after the point means a tenth of a second and it comes back with all nine digits, because the precision is the type's and not the literal's.
+    query: RETURN LOCAL TIME '12:34:56.1' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "12:34:56.100000000"
+
+  - name: a-time-with-no-seconds
+    doc: Hours and minutes are enough to write a time and the seconds are zero, so a client that requires all three fields cannot read what the engine accepts.
+    query: RETURN LOCAL TIME '12:34' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "12:34:00"
+
+  - name: an-hour-that-does-not-exist
+    doc: The day ends before twenty four, so midnight at the far end is written as the start of the next day and not as this.
+    query: RETURN LOCAL TIME '24:00:00' AS n
+    raises: "22007"
+
+  - name: a-minute-that-does-not-exist
+    doc: Sixty minutes is the next hour, which is worth its own case because a client reading the fields as numbers and not as a time lets it through.
+    query: RETURN LOCAL TIME '12:60:00' AS n
+    raises: "22007"
+
+  - name: a-leap-second-is-not-a-time
+    doc: The sixty first second of a minute is a real thing that has happened and it is not a value of this type, so a client carrying one has to fail here rather than round it.
+    query: RETURN LOCAL TIME '23:59:60' AS n
+    raises: "22007"
+
+  - name: the-zero-offset-is-written-with-a-letter
+    doc: An offset of nothing comes back as Z rather than as plus zero zero, so a client comparing the rendered text has one spelling to expect and not two.
+    query: RETURN ZONED TIME '12:00:00+00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:00:00Z"
+
+  - name: an-offset-of-half-an-hour
+    doc: Offsets are minutes and not hours, which several zones in use today depend on, and a client storing whole hours loses the value rather than the format.
+    query: RETURN ZONED TIME '12:00:00+07:30' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:00:00+07:30"
+
+  - name: an-offset-past-the-zones-in-use
+    doc: The offset is a number and not the name of a place, so one larger than any zone in use is still a value, and a client validating against a zone table refuses it.
+    query: RETURN ZONED TIME '12:00:00+15:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:00:00+15:00"
+
+  - name: two-offsets-can-name-the-same-time
+    doc: Noon at the meridian and one in the afternoon an hour ahead are the same moment of the day, so the comparison is on the instant and not on the fields.
+    query: RETURN ZONED TIME '12:00:00+00:00' = ZONED TIME '13:00:00+01:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-datetime-can-be-written-with-a-space
+    doc: A space stands in for the letter between the date and the time, which is the spelling most of the world's tools emit, and it means the same value.
+    query: RETURN LOCAL DATETIME '2024-01-01 00:00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-01-01T00:00:00"
+
+  - name: a-datetime-fraction-is-filled-out
+    doc: Half a second written with one digit comes back with nine of them, for the same reason the time of day case gives, and both are here because they are separate parsers.
+    query: RETURN LOCAL DATETIME '2024-01-01T00:00:00.5' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-01-01T00:00:00.500000000"
+
+  - name: zoned-datetimes-compare-by-instant
+    doc: Seven in the morning seven hours ahead is midnight at the meridian, so these are one moment written two ways and the comparison says so.
+    query: RETURN ZONED DATETIME '2024-01-01T07:00:00+07:00' = ZONED DATETIME '2024-01-01T00:00:00Z' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-same-clock-reading-in-two-zones-is-two-instants
+    doc: The same digits with different offsets are different moments, which is the case that stops a client from passing the one above by ignoring the zone.
+    query: RETURN ZONED DATETIME '2024-01-01T00:00:00+07:00' = ZONED DATETIME '2024-01-01T00:00:00Z' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: a-week-is-seven-days
+    doc: A duration written in weeks comes back in days, because the normal form has no week field, and a client keeping the text it sent reports something the engine never said.
+    query: RETURN DURATION 'P1W' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P7D"
+
+  - name: a-fraction-of-an-hour
+    doc: An hour and a half written as a fraction is read into hours and minutes, so the fields a client gets back are not the fields it sent.
+    query: RETURN DURATION 'PT1.5H' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+
+  - name: minutes-carry-into-hours
+    doc: Ninety minutes is an hour and thirty, the same value as the case above by another spelling, which is what makes the normal form worth having.
+    query: RETURN DURATION 'PT90M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+
+  - name: hours-carry-into-days
+    doc: A day and twenty four hours is two days, so the carry goes all the way up the day time side, and a client with a fixed field layout has to run the same carry.
+    query: RETURN DURATION 'P1DT24H' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P2D"
+
+  - name: an-empty-duration-is-zero-seconds
+    doc: A duration of no years is written as no seconds, because zero has one spelling and it is on the day time side.
+    query: RETURN DURATION 'P0Y' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0S"
+
+  - name: a-fraction-of-a-second
+    doc: Half a second keeps all nine digits after the point, which is where a client on a millisecond duration type quietly loses the value.
+    query: RETURN DURATION 'PT0.5S' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0.500000000S"
+
+  - name: months-carry-into-years
+    doc: Thirteen months is a year and one, so the year month side carries too, and the two sides carry independently for the reason the next case gives.
+    query: RETURN DURATION 'P1Y13M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P2Y1M"
+
+  - name: a-duration-holds-one-kind-or-the-other
+    doc: A month and two days cannot be written as one duration, because the number of days a month comes to is not known until it starts, and the type refuses to pretend otherwise.
+    query: RETURN DURATION 'P1M2D' AS n
+    raises: "22007"
+
+  - name: a-day-and-twenty-four-hours-are-equal
+    doc: On the day time side a day is exactly twenty four hours, so these compare equal, and a client keeping the fields apart has to compare the total.
+    query: RETURN DURATION 'P1D' = DURATION 'PT24H' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-year-and-twelve-months-are-equal
+    doc: On the year month side a year is exactly twelve months, which is the same statement as the case above on the other side of the type.
+    query: RETURN DURATION 'P1Y' = DURATION 'P12M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: durations-are-ordered
+    doc: One duration can be less than another, so the type has an order and not only an equality, which a client mapping it to an opaque record has to supply.
+    query: RETURN DURATION 'PT1H' < DURATION 'PT2H' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-two-kinds-of-duration-do-not-add
+    doc: A year and a day have no sum, because the answer would depend on which year, and this is the error that says the two kinds are two types wearing one name.
+    query: RETURN DURATION 'P1Y' + DURATION 'P1D' AS n
+    raises: "22G14"
+
+  - name: a-date-has-nowhere-to-put-an-hour
+    doc: Adding a time of day to a date raises rather than reading it as a day and a fraction, so a client normalising durations to nanoseconds before sending them turns this error into a wrong answer.
+    query: RETURN DATE '2024-01-01' + DURATION 'PT1H' AS n
+    raises: "22G14"
+
+  - name: a-date-and-a-number-do-not-add
+    doc: A number is not a duration, so this raises, which matters because every language that stores a date as a day count lets a client write it by accident.
+    query: RETURN DATE '2024-01-01' + 1 AS n
+    raises: "22G03"
+
+  - name: adding-a-month-clamps-to-the-end-of-the-month
+    doc: The thirty first of January plus a month is the last day of February and not the second of March, which is the single most common disagreement between date libraries.
+    query: RETURN DATE '2024-01-31' + DURATION 'P1M' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-02-29"
+
+  - name: adding-a-year-clamps-a-leap-day
+    doc: A leap day plus a year is the twenty eighth, because the day is clamped to the month it lands in, and a client adding to a day count gives the first of March.
+    query: RETURN DATE '2024-02-29' + DURATION 'P1Y' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2025-02-28"
+
+  - name: four-years-later-the-leap-day-is-there
+    doc: The same day plus four years needs no clamping, which is here so that the case above reads as a rule about months and not as a rule about leap days.
+    query: RETURN DATE '2024-02-29' + DURATION 'P4Y' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2028-02-29"
+
+  - name: adding-a-day-crosses-a-year
+    doc: The last day of the year plus one day is the first of the next, which is a carry through three fields and the place an off by one shows itself.
+    query: RETURN DATE '2024-12-31' + DURATION 'P1D' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2025-01-01"
+
+  - name: subtracting-a-duration-from-a-date
+    doc: The first of March less a day is the leap day, so subtraction runs the calendar backwards and is not addition of a negated duration.
+    query: RETURN DATE '2024-03-01' - DURATION 'P1D' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-02-29"
+
+  - name: a-duration-and-a-date-add-either-way-round
+    doc: The duration on the left gives the same date as the duration on the right, which is one more operator arrangement a client with a table for one direction misses.
+    query: RETURN DURATION 'P1D' + DATE '2024-01-01' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-01-02"
+
+  - name: the-difference-of-two-dates-is-a-duration
+    doc: Subtracting a later date from an earlier one gives a negative duration in days, so the sign is carried and the result is not a number of seconds.
+    query: RETURN DATE '2024-01-01' - DATE '2024-12-31' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "-P365D"
+
+  - name: no-difference-is-zero-seconds
+    doc: A date less itself is the zero duration written on the day time side, which is the same spelling of zero the empty duration case gives.
+    query: RETURN DATE '2024-01-01' - DATE '2024-01-01' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0S"
+
+  - name: the-difference-of-two-datetimes
+    doc: Two instants an hour apart give an hour, which says the subtraction keeps the time of day and does not truncate to whole days.
+    query: RETURN LOCAL DATETIME '2024-01-01T01:00:00' - LOCAL DATETIME '2024-01-01T00:00:00' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H"
+
+  - name: a-time-of-day-wraps-forwards
+    doc: Half past eleven at night plus an hour is half past midnight, because a time of day has no date to carry into and goes round instead.
+    query: RETURN LOCAL TIME '23:30:00' + DURATION 'PT1H' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "00:30:00"
+
+  - name: a-time-of-day-wraps-backwards
+    doc: Midnight less a second is the last second of the day, the same wrap in the other direction, and a client with an unsigned nanosecond count underflows here.
+    query: RETURN LOCAL TIME '00:00:00' - DURATION 'PT1S' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "23:59:59"
+
+  - name: a-duration-times-a-number
+    doc: A duration scales by a number and the result is a duration, which is the one place a number and a temporal value do combine.
+    query: RETURN DURATION 'PT1H' * 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT2H"
+
+  - name: a-number-times-a-duration
+    doc: The number on the left gives the same duration, and both arrangements are here because a client dispatching on the left operand only has one of them.
+    query: RETURN 2 * DURATION 'PT1H' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT2H"
+
+  - name: a-year-month-duration-scales-too
+    doc: Scaling works on the other kind as well and stays on that kind, so two years is not seven hundred and thirty days.
+    query: RETURN DURATION 'P1Y' * 2 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P2Y"
+
+  - name: a-duration-divided-into-a-fraction
+    doc: A second divided by four is a quarter of a second, which says the division is exact in nanoseconds rather than truncated to whole seconds.
+    query: RETURN DURATION 'PT1S' / 4 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0.250000000S"
+
+  - name: a-duration-times-zero
+    doc: Any duration scaled by nothing is the zero duration, which is worth pinning because it is the answer a client returns when the scale is lost.
+    query: RETURN DURATION 'P1D' * 0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0S"
+
+  - name: opposite-durations-cancel
+    doc: A day back and a day forward come to nothing, which is where a client keeping the sign beside the fields rather than on the whole value gives two days.
+    query: RETURN DURATION '-P1D' + DURATION 'P1D' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0S"
+
+  - name: zero-has-one-value-on-either-side
+    doc: No seconds and no days are the same duration, so the two spellings of nothing compare equal rather than being two zeroes of different kinds.
+    query: RETURN DURATION 'PT0S' = DURATION 'P0D' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-date-casts-to-midnight
+    doc: A date widened to a datetime takes the start of the day, which is a choice the standard makes and not the only one a client might have made.
+    query: RETURN cast(DATE '2024-01-01' AS LOCAL DATETIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-01-01T00:00:00"
+
+  - name: a-date-casts-to-a-zoned-datetime-at-the-meridian
+    doc: Adding a zone where there was none gives the zero offset rather than the machine's own, so the answer does not depend on where the client is running.
+    query: RETURN cast(DATE '2024-01-01' AS ZONED DATETIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-01T00:00:00Z"
+
+  - name: a-datetime-casts-to-its-date
+    doc: Narrowing to a date drops the time of day, which is the direction that loses information and does so without raising.
+    query: RETURN cast(LOCAL DATETIME '2024-01-01T05:00:00' AS DATE) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-01-01"
+
+  - name: a-datetime-casts-to-its-time
+    doc: The other half of the same narrowing, which a client with one conversion function and a flag tends to get right in one direction only.
+    query: RETURN cast(LOCAL DATETIME '2024-01-01T05:00:00' AS LOCAL TIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "05:00:00"
+
+  - name: dropping-a-zone-keeps-the-clock-reading
+    doc: Five in the morning seven hours ahead becomes five in the morning with no zone, so the cast removes the offset rather than applying it, and a client shifting to the meridian first gives ten at night the day before.
+    query: RETURN cast(ZONED DATETIME '2024-01-01T05:00:00+07:00' AS LOCAL DATETIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-01-01T05:00:00"
+
+  - name: a-local-time-casts-to-the-zero-offset
+    doc: A time with no zone gains the zero offset and not the machine's own, which is the same reasoning as the date case and matters for the same reason.
+    query: RETURN cast(LOCAL TIME '12:00:00' AS ZONED TIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:00:00Z"
+
+  - name: text-to-a-date
+    doc: The text spelling of a date reads back as the date, which is the path a client takes when it has a string and no literal to put it in.
+    query: RETURN cast('2024-01-01' AS DATE) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-01-01"
+
+  - name: text-that-is-not-a-date
+    doc: Text the type cannot read raises rather than giving a date near it, so a client falling back to a permissive parser disagrees here first.
+    query: RETURN cast('bad' AS DATE) AS n
+    raises: "22007"
+
+  - name: a-number-does-not-cast-to-a-date
+    doc: There is no cast from an integer to a date, so a client offering one has invented an epoch the engine never agreed to.
+    query: RETURN cast(1 AS DATE) AS n
+    raises: "22G03"
+
+  - name: text-to-a-zoned-datetime
+    doc: The offset comes through the text cast the same way it comes through a literal, which a client assembling queries from strings depends on.
+    query: RETURN cast('2024-01-01T00:00:00+07:00' AS ZONED DATETIME) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-01T00:00:00+07:00"
+
+  - name: text-to-a-duration
+    doc: A duration reads from its own spelling, and the result is the value rather than the text, as the normal form case below shows.
+    query: RETURN cast('P1D' AS DURATION) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1D"
+
+  - name: a-date-casts-to-text
+    doc: A date rendered as text uses the same spelling the literal takes, so a value can go out of one client and into another through a string without changing.
+    query: RETURN cast(DATE '2024-01-01' AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "2024-01-01"
+
+  - name: a-duration-casts-to-text-in-its-normal-form
+    doc: Ninety minutes rendered as text is an hour and thirty, which proves the normalisation happened at the value and is not a rendering the client can choose.
+    query: RETURN cast(DURATION 'PT90M' AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "PT1H30M"
+
+  - name: a-duration-does-not-cast-to-a-number
+    doc: There is no cast from a duration to an integer, because the unit would have to be chosen, and a client offering total seconds has chosen it without saying so.
+    query: RETURN cast(DURATION 'P1D' AS INT64) AS n
+    raises: "22G03"
+
+  - name: dates-in-a-list
+    doc: Temporal values nest inside a list like any other, which is a second decoding path in a client that handled the top level with a special case.
+    query: RETURN [DATE '2024-01-01', DATE '2024-01-02'] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: DATE
+                value: "2024-01-01"
+              - type: DATE
+                value: "2024-01-02"
+
+  - name: dates-order
+    doc: Sorting puts the earlier date first, which is the engine's order over the type and the one a client's own comparison has to agree with.
+    query: UNWIND [DATE '2024-01-02', DATE '2024-01-01'] AS n RETURN n ORDER BY n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-01-01"
+      - values:
+          - type: DATE
+            value: "2024-01-02"
+
+  - name: the-shortest-duration
+    doc: A set function over durations answers with the shorter one, which says the order the comparison case declares is the one the aggregate uses.
+    query: UNWIND [DURATION 'PT2H', DURATION 'PT1H'] AS n RETURN min(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H"
+
+  - name: distinct-dates
+    doc: Two rows of one date give one row, which is equality over the type used to deduplicate rather than only to answer a comparison.
+    query: UNWIND [DATE '2024-01-01', DATE '2024-01-01'] AS n RETURN DISTINCT n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-01-01"

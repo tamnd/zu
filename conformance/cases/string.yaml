@@ -235,3 +235,392 @@ cases:
     doc: Text that is not a number raises 22018 rather than giving zero, which is what several host languages' own parsers do and is the defect this case exists to catch.
     query: RETURN cast('abc' AS INT64) AS n
     raises: "22018"
+
+  - name: carriage-return-escape
+    doc: A carriage return written as an escape, which is the character a client running on a system that ends lines with two of them is most likely to add or drop.
+    query: RETURN 'a\rb' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a\rb"
+
+  - name: a-quote-escaped-inside-its-own-quotes
+    doc: A single quote escaped inside a single quoted string, which is one of two spellings the engine takes and the one a client building queries by hand forgets.
+    query: RETURN 'a\'b' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a'b"
+
+  - name: a-double-quote-escaped-inside-its-own-quotes
+    doc: The same escape on the other quote, because the two literal forms are two paths through a lexer and a client that tested one has not tested the other.
+    query: RETURN "a\"b" AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a\"b"
+
+  - name: a-string-of-one-backslash
+    doc: Two characters in the query and one in the value, which is the shortest statement of what an escape is and the case a client doubling backslashes on the way out breaks.
+    query: RETURN '\\' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "\\"
+
+  - name: an-escape-is-one-character
+    doc: A newline written as two characters counts as one, so length is measured on the value and not on the text that produced it.
+    query: RETURN size('\n') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: size-answers-a-wide-integer
+    doc: A length goes into arithmetic as a sixty four bit integer, so a client giving back the narrowest type that holds the number disagrees about the type while agreeing about the value.
+    query: RETURN size('abc') + 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: size-counts-spaces
+    doc: Whitespace is part of the string, which is here so that no client is tempted to trim on the way in or on the way out.
+    query: RETURN size('  ') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: size-counts-every-code-point-of-a-joined-emoji
+    doc: A family emoji is three pictures and two joiners and it counts as five, because the unit is the code point and not the thing a reader sees.
+    query: RETURN size('👨‍👩‍👧') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: concatenation-chains
+    doc: Three pieces join into one, which says the operator returns a string that can be an operand again rather than a builder a client has to finish.
+    query: RETURN 'a' + 'b' + 'c' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "abc"
+
+  - name: concatenation-of-two-empties
+    doc: Nothing joined to nothing is the empty string and not a null, which a client representing the empty string as an absent value gets wrong.
+    query: RETURN '' + '' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+
+  - name: a-string-and-a-number-do-not-add
+    doc: Plus over a string and an integer raises rather than rendering the number, so a client borrowing its host language's overloading sends something the engine refuses.
+    query: RETURN 'abc' + 1 AS n
+    raises: "22G03"
+
+  - name: a-number-and-a-string-do-not-add
+    doc: The same refusal with the operands the other way round, which is the arrangement a client that checks only its left operand lets through.
+    query: RETURN 1 + 'abc' AS n
+    raises: "22G03"
+
+  - name: a-string-does-not-multiply
+    doc: There is no repetition operator on strings, a thing two popular languages do have, and a client offering it has added an operator to the language.
+    query: RETURN 'abc' * 2 AS n
+    raises: "22G03"
+
+  - name: ordering-by-the-last-character
+    doc: Two strings alike until their end order by the character where they differ, which is the ordinary case the prefix and code point cases sit either side of.
+    query: RETURN 'abc' < 'abd' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: ordering-is-not-strict
+    doc: A string is less than or equal to itself, so the ordering operators are the four a client has to supply and not two of them.
+    query: RETURN 'abc' <= 'abc' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: every-upper-case-letter-sorts-before-every-lower-case-one
+    doc: The last upper case letter comes before the first lower case one, because the order is on code points and not on what a reader of a dictionary expects.
+    query: RETURN 'Z' < 'a' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-tab-sorts-before-a-letter
+    doc: A control character is below the printable ones in the same order, which a client comparing with a collation rather than with code points can get wrong.
+    query: RETURN '\t' < 'a' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: inequality
+    doc: Two different strings are unequal, the operator being separate from equality in more clients than one would think.
+    query: RETURN 'abc' <> 'abd' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: case-matters
+    doc: A letter is not the same string as its capital, so nothing case folds anywhere, and a client comparing case insensitively agrees with a user and not with the engine.
+    query: RETURN 'a' = 'A' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: a-sharp-s-is-not-two-letters
+    doc: The German letter does not equal the two letters it uppercases to, which is the case folding a client that reached for a locale aware comparison performs.
+    query: RETURN 'ß' = 'SS' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: comparing-with-a-null-is-a-null
+    doc: A string against a null is neither true nor false, so a comparison on this type answers three ways and a client with a boolean return type has nowhere to put the third.
+    query: RETURN 'abc' > null AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: cast-from-boolean
+    doc: A truth value rendered as text is the lower case word, which is one of several spellings a client might have picked and the only one the engine uses.
+    query: RETURN cast(true AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "true"
+
+  - name: cast-from-float
+    doc: A float rendered as text keeps the point, so the text says what type it came from, which the float suite goes into in more detail.
+    query: RETURN cast(3.5 AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "3.5"
+
+  - name: cast-from-null-is-null
+    doc: Casting a null to a string gives a null and not the word null, which a client rendering with its host language's string conversion gets wrong in the quietest way available.
+    query: RETURN cast(null AS STRING) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: cast-to-integer-ignores-surrounding-space
+    doc: Space either side of the digits is skipped, so the text a user pastes reads as a number, and a client validating the text itself before sending refuses what the engine takes.
+    query: RETURN cast('  42  ' AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: cast-to-integer-refuses-a-fraction
+    doc: A number with a point is not an integer even though it names one nearby, so the cast raises rather than truncating.
+    query: RETURN cast('42.5' AS INT64) AS n
+    raises: "22018"
+
+  - name: cast-to-float
+    doc: Digits with no point read as a float and come back with one, because the type of the result is the type asked for and not the shape of the text.
+    query: RETURN cast('42' AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "42.0"
+
+  - name: cast-to-float-with-an-exponent
+    doc: Exponent notation reads, which is the spelling a client is likeliest to receive from another system and to have to pass through unchanged.
+    query: RETURN cast('1e3' AS FLOAT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1000.0"
+
+  - name: a-declared-length-that-fits
+    doc: A string cast to a type wide enough for it comes back unchanged, which is the half of the pair that says the length is checked and not applied.
+    query: RETURN cast('a' AS STRING(1)) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a"
+
+  - name: a-declared-length-that-does-not-fit
+    doc: One character too many raises rather than truncating, so a client shortening the value to fit has lost data and reported success.
+    query: RETURN cast('ab' AS STRING(1)) AS n
+    raises: "22001"
+
+  - name: a-string-that-cannot-be-null
+    doc: A null cast to a type that refuses one raises, which is the same rule the integer suite states and it holds on every type that has it.
+    query: RETURN cast(null AS STRING NOT NULL) AS n
+    raises: "22004"
+
+  - name: a-varying-length-type-does-not-pad
+    doc: A string shorter than the type it is cast to keeps its length, which is what varying means and is the difference the case below turns on.
+    query: RETURN cast('abc' AS VARCHAR(10)) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "abc"
+
+  - name: a-fixed-length-type-pads-with-spaces
+    doc: The same string cast to a fixed length comes back with spaces on the end, so the type changed the value, and a client trimming what it receives loses the difference between the two casts.
+    query: RETURN cast('abc' AS CHAR(5)) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "abc  "
+
+  - name: a-fixed-length-type-of-the-exact-length
+    doc: Nothing is added when the string already fills the type, which is here so the case above reads as padding and not as a suffix.
+    query: RETURN cast('abc' AS CHAR(3)) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "abc"
+
+  - name: a-string-is-not-null
+    doc: The empty string is a value and the test says so, which is the case a client mapping absent and empty onto one host value fails.
+    query: RETURN '' IS NULL AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: a-string-is-in-a-list
+    doc: Membership uses the same equality the comparison cases pin, so a client with one equality for values and another for lists has two answers here.
+    query: RETURN 'abc' IN ['abc', 'd'] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: strings-in-a-list
+    doc: Strings nest inside a list, which is a second decoding path for the type and one where the length prefix is easiest to read from the wrong place.
+    query: RETURN ['a', 'b'] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: STRING
+                value: "a"
+              - type: STRING
+                value: "b"
+
+  - name: the-smallest-string
+    doc: A set function over strings uses the order the comparison cases declare rather than an order of its own.
+    query: UNWIND ['b', 'a'] AS s RETURN min(s) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "a"
+
+  - name: the-length-of-the-longest-string
+    doc: A length inside an aggregate, which is a function applied per row and then folded, and is how a client finds out whether it decoded every row or only the first.
+    query: UNWIND ['a', 'bb', 'ccc'] AS s RETURN max(size(s)) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: strings-collect-into-a-list
+    doc: Rows folded into one list value, which puts the type inside a container that the client built rather than one the query wrote.
+    query: UNWIND ['a', 'b'] AS s RETURN collect(s) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: STRING
+                value: "a"
+              - type: STRING
+                value: "b"
+
+  - name: distinct-strings
+    doc: Three rows of two strings give two rows, which is the client's equality used to deduplicate and the last place a normalising client differs from the engine.
+    query: UNWIND ['b', 'a', 'b'] AS n RETURN DISTINCT n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "b"
+      - values:
+          - type: STRING
+            value: "a"

@@ -227,3 +227,23 @@ fn list_is_still_a_name_where_a_name_is_what_is_wanted() {
                   LIMIT 1";
     assert_eq!(one(&mut db, source), Value::Int(2));
 }
+
+/// `size(collect(n))` is a call, so the optimizer takes it for an
+/// aggregate and then asks for an accumulator that only the set
+/// functions have. It is a projection over the grouped rows and the
+/// executor has no place to put one yet, so it has to say so: an
+/// unimplemented shape is an error and never a panic, because a client
+/// on the other side of the socket cannot tell a crash from a hang.
+#[test]
+fn a_scalar_function_over_a_set_function_is_refused_rather_than_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    for source in [
+        "UNWIND [1, 2] AS n RETURN size(collect(n)) AS v",
+        "UNWIND [[1], [2]] AS n RETURN cardinality(collect(n)) AS v",
+    ] {
+        let err = run(source, &mut db, &[]).expect_err(source);
+        let text = err.to_string();
+        assert!(text.contains("not implemented yet"), "{source}: {text}");
+    }
+}

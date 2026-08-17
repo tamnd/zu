@@ -529,7 +529,17 @@ impl Session {
                         changes.row(self.graph.file_mut(), carried, values)?;
                         next.push(Value::List(carried.to_vec()));
                     }
-                    let updates = changes.staged();
+                    let (updates, widened) = changes.staged();
+                    // A label the table had not declared is a catalog
+                    // change this statement makes, and it goes in first:
+                    // the fold turns away a label change onto a table
+                    // that has not declared the bit, and what it reads
+                    // to decide that is the catalog in the file. The
+                    // statement holds a savepoint, so a change that
+                    // fails after this takes the declaration with it.
+                    if let Some(catalog) = widened {
+                        catalog.store(self.graph.file_mut())?;
+                    }
                     self.write(|txn| crate::set::stage(txn, &updates))?;
                     next
                 }

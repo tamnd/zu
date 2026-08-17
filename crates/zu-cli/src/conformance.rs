@@ -174,10 +174,10 @@ const NOTES: &[&str] = &[
      whole record of either are all reachable, and the record form empties every property it \
      does not name",
     "SET and REMOVE of a label change the bit the label is in the row's label word, so a \
-     pattern naming that label finds the row afterwards; the label has to be one the row's \
-     table has already declared, because declaring one is a catalog change and a statement \
-     cannot make that yet, and the name of the table is the label every row of it carries \
-     rather than one a statement puts on or takes off",
+     pattern naming that label finds the row afterwards; a label the row's table has not \
+     declared is declared by the SET that puts it on, published with the rows the statement \
+     changed and undone with them, while the name of the table is the label every row of it \
+     carries rather than one a statement puts on or takes off",
     "a REMOVE is the assignment of a null the standard says it is, so it and SET of a null are \
      one write and a column holds the absence as a clear validity bit",
     "a DELETE takes away the element an earlier clause found, a DETACH DELETE takes its edges \

@@ -1603,6 +1603,10 @@ fn exit_code(err: &zu::ZuError) -> u8 {
         zu::ZuError::Io(_) => 3,
         zu::ZuError::Corrupt { .. } | zu::ZuError::Unsupported { .. } => 4,
         zu::ZuError::Conflict(_) => 5,
+        // The number a shell reports for a process killed by `SIGINT`,
+        // which is what a statement stopped by one amounts to whether
+        // the signal ended the process or only the query.
+        zu::ZuError::Interrupted => 130,
     }
 }
 

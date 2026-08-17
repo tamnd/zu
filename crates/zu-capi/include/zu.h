@@ -82,10 +82,10 @@ typedef zu_conn zu_session;
  * inserted.
  *
  * The gaps that remain are held for the rest of the set dx/02 §6 names
- * and nothing produces yet: 1 for ZU_ROW, 7 for ZU_INTERRUPTED, and 12
- * for ZU_OOM. Reserving the numbers is free, and it is what lets those
- * land beside the value they belong with instead of at the end because
- * the end was where there was room. */
+ * and nothing produces yet: 1 for ZU_ROW and 12 for ZU_OOM. Reserving
+ * the numbers is free, and it is what lets those land beside the value
+ * they belong with instead of at the end because the end was where
+ * there was room. */
 typedef enum zu_status {
   /* The call did what it was asked and wrote its out-parameter. */
   ZU_OK = 0,
@@ -106,6 +106,9 @@ typedef enum zu_status {
   /* A statement was used after its connection closed. Nothing was
    * done; the statement handle is still safe to close. */
   ZU_MISUSE_CLOSED = 6,
+  /* The caller stopped the statement while it was running. Nothing is
+   * wrong with the connection and the next call on it runs normally. */
+  ZU_INTERRUPTED = 7,
   /* A write lost to a concurrent one. */
   ZU_CONFLICT = 8,
   /* The file says something that cannot be true. */

@@ -33,6 +33,14 @@ pub enum ZuError {
     /// A compare-and-swap or ownership check lost to a concurrent writer.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The caller asked the statement to stop and it did, at the next
+    /// boundary the executor checks ([`crate::Interrupt`]). No condition
+    /// code, because the standard has none for this and the statement
+    /// did not fail: it was stopped, which is a fact about the caller
+    /// rather than about the query.
+    #[error("interrupted")]
+    Interrupted,
 }
 
 impl ZuError {

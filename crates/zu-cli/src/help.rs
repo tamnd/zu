@@ -190,10 +190,11 @@ pub(crate) const PLANNED: &[&str] = &[
 ///
 /// One table, because these are a contract with whatever script is
 /// branching on them and a code invented at a call site is a contract
-/// nobody wrote down. 130 is not produced here: a terminated process
-/// reports the signal that killed it and a shell renders that as 128
-/// plus the number, which for `SIGINT` is already 130, so the value in
-/// the table is what a caller sees rather than what this code returns.
+/// nobody wrote down. 130 arrives two ways that agree: a terminated
+/// process reports the signal that killed it and a shell renders that
+/// as 128 plus the number, which for `SIGINT` is already 130, and a
+/// statement stopped through an interrupt returns a condition this maps
+/// to the same number.
 pub(crate) const EXIT_CODES: &[(u8, &str)] = &[
     (0, "success"),
     (1, "query error"),

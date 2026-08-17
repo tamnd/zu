@@ -1,17 +1,16 @@
 //! Running an `INSERT`: the values the statement wrote, the rows they
 //! become, and the elements the clauses after it read.
 //!
-//! The write happens before the plan runs, which is the seam
-//! [`zu_query::plan::LogicalPlan::Insert`] describes from the plan's
-//! side. The reason is
+//! The write sits between two plans rather than inside one, which is
+//! what [`crate::split`] does to a statement that writes. The reason is
 //! that the executor reads through [`zu_query::exec::Graph`] and every
 //! method on that trait reads, while appending a row needs the file, so
-//! for now the session does the writing and the plan reads what came
+//! the session does the writing and the plan after it reads what came
 //! of it. Everything in here is what has to happen in between: work out
 //! what each column of each new row holds, work out which rows the
-//! edges between them run between, stage all of it in one transaction,
-//! and hand the created elements to the plan as arguments past the last
-//! declared parameter.
+//! edges between them run between and what those carry, stage all of it
+//! in one transaction, and hand the created elements to the next plan
+//! as arguments past the last declared parameter.
 //!
 //! What a column takes is decided here rather than by the binder,
 //! because a node table's property columns are not in the schema the
@@ -22,12 +21,12 @@
 use std::collections::BTreeMap;
 
 use zu_common::{FloatBits, LogicalType, Result, Temporal, ZuError};
-use zu_query::binder::{BoundExpr, BoundInsertNode};
+use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
 use crate::query::Value;
 use crate::split::Write;
 use crate::zu1::file::Zu1File;
-use crate::zu1::props::{PropColumn, load_props};
+use crate::zu1::props::{PropColumn, load_props, load_rel_props};
 use crate::zu1::txn::{Cell, WriteTxn};
 
 /// One node about to be created: which table, what every column of it
@@ -53,12 +52,16 @@ impl NewNode {
     }
 }
 
-/// One edge about to be created: which table, and the two rows it runs
-/// between.
+/// One edge about to be created: which table, the two rows it runs
+/// between, and what it carries.
 pub(crate) struct NewRel {
     pub(crate) table: u32,
     pub(crate) src: u64,
     pub(crate) dst: u64,
+    /// Column position in the table's props directory and its cell, one
+    /// entry per column of the table, in column order. Empty for a
+    /// table that stores nothing on its edges.
+    pub(crate) cols: Vec<(u32, Cell)>,
 }
 
 impl NewRel {
@@ -85,8 +88,13 @@ impl NewRel {
 /// no log write and no fold.
 pub(crate) struct Batch<'a> {
     write: &'a Write,
-    /// The property columns of each table being written to, read once.
+    /// The property columns of each node table being written to, read
+    /// once.
     columns: BTreeMap<u32, Vec<PropColumn>>,
+    /// The property columns of each rel table being written to, read
+    /// once. A rel table stores nothing on its edges until something is
+    /// stored there, and then this is empty for it.
+    rel_columns: BTreeMap<u32, Vec<PropColumn>>,
     /// Where the next row of each table lands, which is the count it
     /// holds plus the rows this statement has added to it so far.
     next: BTreeMap<u32, u64>,
@@ -105,9 +113,17 @@ impl<'a> Batch<'a> {
             columns.insert(node.table, columns_of(db, node.table)?);
             next.insert(node.table, rows_in(db, node.table)?);
         }
+        let mut rel_columns = BTreeMap::new();
+        for rel in &write.rels {
+            if rel_columns.contains_key(&rel.table) {
+                continue;
+            }
+            rel_columns.insert(rel.table, rel_columns_of(db, rel.table)?);
+        }
         Ok(Self {
             write,
             columns,
+            rel_columns,
             next,
             nodes: Vec::new(),
             edges: Vec::new(),
@@ -140,12 +156,16 @@ impl<'a> Batch<'a> {
             self.nodes.push(new);
         }
         for rel in &self.write.rels {
+            let values = &props[at..at + rel.props.len()];
+            at += rel.props.len();
+            let cols = edge_row(rel, &self.rel_columns[&rel.table], values)?;
             let ends = [(rel.src, "leaves"), (rel.dst, "arrives at")];
             let [src, dst] = ends.map(|(slot, side)| self.end(slot, side, carried, &made));
             let new = NewRel {
                 table: rel.table,
                 src: src?,
                 dst: dst?,
+                cols,
             };
             made.push(new.value());
             self.edges.push(new);
@@ -217,7 +237,7 @@ pub(crate) fn stage(txn: &mut WriteTxn<'_>, new: &[NewNode], edges: &[NewRel]) -
         rows += txn.insert_nodes(node.table, cols)?;
     }
     for edge in edges {
-        txn.insert_rel(edge.table, edge.src, edge.dst);
+        txn.insert_rel_carrying(edge.table, edge.src, edge.dst, edge.cols.clone());
         rows += 1;
     }
     Ok(rows)
@@ -227,6 +247,12 @@ pub(crate) fn stage(txn: &mut WriteTxn<'_>, new: &[NewNode], edges: &[NewRel]) -
 /// none.
 fn columns_of(db: &mut Zu1File, table: u32) -> Result<Vec<PropColumn>> {
     Ok(load_props(db, table)?.map_or_else(Vec::new, |dir| dir.columns))
+}
+
+/// The property columns of a rel table, empty for a table that stores
+/// nothing on its edges, which is most of them.
+fn rel_columns_of(db: &mut Zu1File, rel: u32) -> Result<Vec<PropColumn>> {
+    Ok(load_rel_props(db, rel)?.map_or_else(Vec::new, |dir| dir.columns))
 }
 
 /// How many rows the table holds now, which is where the next one goes.
@@ -254,6 +280,46 @@ fn row(
             id: node.table,
         });
     }
+    fill(node.table, "element", &node.props, columns, values)
+}
+
+/// One edge: every column its table stores, in column order, filled
+/// from the properties the pattern wrote.
+///
+/// A rel table that stores nothing on its edges is the ordinary case
+/// rather than a refusal, because an edge is a pair of rows in the
+/// neighbour lists and needs no column to exist. Writing a value onto
+/// one of those edges is what there is nowhere to put, and the fold
+/// says the same thing about a log record that reaches it.
+fn edge_row(
+    rel: &BoundInsertRel,
+    columns: &[PropColumn],
+    values: &[Value],
+) -> Result<Vec<(u32, Cell)>> {
+    if columns.is_empty() {
+        if rel.props.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(ZuError::Unsupported {
+            what: "writing a property onto an edge of a table that stores none on its edges",
+            id: rel.table,
+        });
+    }
+    fill(rel.table, "edge", &rel.props, columns, values)
+}
+
+/// The cells of one new row of one table: every column of it, in column
+/// order, filled from the properties the pattern wrote.
+///
+/// `noun` is what is being written, which is all that separates the
+/// message an element gets from the one an edge gets.
+fn fill(
+    table: u32,
+    noun: &str,
+    props: &[(String, BoundExpr)],
+    columns: &[PropColumn],
+    values: &[Value],
+) -> Result<Vec<(u32, Cell)>> {
     let mut cells = Vec::with_capacity(columns.len());
     for (ci, col) in columns.iter().enumerate() {
         // A fold rewrites a column out of its old values and the cells
@@ -264,25 +330,24 @@ fn row(
         if col.validity.is_some() {
             return Err(ZuError::Unsupported {
                 what: "creating an element in a table whose columns may hold a null",
-                id: node.table,
+                id: table,
             });
         }
-        let written = node
-            .props
+        let written = props
             .iter()
             .position(|(key, _)| *key == col.name)
             .ok_or_else(|| {
                 ZuError::InvalidArgument(format!(
-                    "the element carries no value for column '{}', and every column of a new row has to hold one",
+                    "the {noun} carries no value for column '{}', and every column of a new row has to hold one",
                     col.name
                 ))
             })?;
         cells.push((ci as u32, cell(&col.ty, &values[written], &col.name)?));
     }
-    for (key, _) in &node.props {
+    for (key, _) in props {
         if !columns.iter().any(|col| col.name == *key) {
             return Err(ZuError::InvalidArgument(format!(
-                "the element carries '{key}', which is not a column of the table it is created in"
+                "the {noun} carries '{key}', which is not a column of the table it is created in"
             )));
         }
     }
@@ -362,11 +427,14 @@ fn describe(value: &Value) -> &'static str {
 }
 
 /// The property expressions of one insert clause, flattened in the
-/// order [`plan_rows`] reads them back.
-pub(crate) fn value_exprs(nodes: &[BoundInsertNode]) -> Vec<BoundExpr> {
-    nodes
-        .iter()
-        .flat_map(|node| node.props.iter().map(|(_, expr)| expr.clone()))
+/// order [`Batch::row`] reads them back, which is every node's in
+/// written order and then every edge's.
+pub(crate) fn value_exprs(nodes: &[BoundInsertNode], rels: &[BoundInsertRel]) -> Vec<BoundExpr> {
+    let node_values = nodes.iter().flat_map(|node| node.props.iter());
+    let rel_values = rels.iter().flat_map(|rel| rel.props.iter());
+    node_values
+        .chain(rel_values)
+        .map(|(_, expr)| expr.clone())
         .collect()
 }
 
@@ -812,6 +880,138 @@ mod tests {
             )
             .expect("walk");
         assert_eq!(strings(&after, 0), ["two"]);
+    }
+
+    /// Two people, one edge, and a year stored on that edge. A rel
+    /// table stores its columns over the edges in load order, so this
+    /// is the fixture for a write that has to slot a value into that
+    /// order rather than append to the end of it.
+    fn seeded_with_edge_props(path: &Path) {
+        let mut db = Zu1File::create(path).expect("create");
+        bulk_load_as(&mut db, "person", "knows", 2, &[(0, 1)]).expect("load");
+        let names: Vec<&[u8]> = vec![b"ada", b"kay"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .expect("props");
+        crate::zu1::props::store_rel_props(
+            &mut db,
+            "knows",
+            &[("since", PropValues::Int(&[1990]))],
+        )
+        .expect("edge props");
+    }
+
+    fn open_with_edge_props(dir: &tempfile::TempDir, name: &str) -> Session {
+        let path = dir.path().join(name);
+        seeded_with_edge_props(&path);
+        Session::open(&path).expect("open")
+    }
+
+    /// The case the milestone line is about: an edge is written
+    /// carrying a value, and the value is there to read afterwards.
+    #[test]
+    fn an_edge_is_written_carrying_a_property() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_edge_props(&dir, "edge-props.zu1");
+
+        session
+            .run(
+                "INSERT (x:person {age: 30, name: 'zoe'})-[:knows {since: 2020}]->(y:person {age: 40, name: 'raj'})",
+                &[],
+            )
+            .expect("insert an edge carrying a year");
+
+        let out = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS from, k.since AS since ORDER BY from",
+                &[],
+            )
+            .expect("read the years back");
+        assert_eq!(strings(&out, 0), ["ada", "zoe"]);
+        assert_eq!(
+            out.rows[0][1],
+            Value::Int(1990),
+            "the seeded edge is where it was"
+        );
+        assert_eq!(
+            out.rows[1][1],
+            Value::Int(2020),
+            "and the written one holds what it was written with"
+        );
+    }
+
+    /// The value is an expression evaluated per row, so a write after a
+    /// match writes a different year on every edge it makes.
+    #[test]
+    fn an_edge_property_is_an_expression_per_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_edge_props(&dir, "edge-props-rows.zu1");
+
+        session
+            .run(
+                "MATCH (a:person) INSERT (a)-[:knows {since: a.age + 2000}]->(b:person {age: 1, name: 'new'})",
+                &[],
+            )
+            .expect("one edge per person found");
+
+        let out = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) WHERE b.name = 'new' RETURN a.name AS from, k.since AS since ORDER BY from",
+                &[],
+            )
+            .expect("read them back");
+        assert_eq!(strings(&out, 0), ["ada", "kay"]);
+        assert_eq!(out.rows[0][1], Value::Int(2010));
+        assert_eq!(out.rows[1][1], Value::Int(2020));
+    }
+
+    /// A column of a rel table holds one value per edge, so an edge
+    /// written without one has nothing to put there, and the message
+    /// names the column.
+    #[test]
+    fn an_edge_leaving_a_column_out_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_edge_props(&dir, "edge-missing.zu1");
+
+        let err = session
+            .run(
+                "INSERT (x:person {age: 30, name: 'zoe'})-[:knows]->(y:person {age: 40, name: 'raj'})",
+                &[],
+            )
+            .expect_err("the year was left out");
+        assert!(err.to_string().contains("'since'"), "got: {err}");
+
+        let after = session.run("MATCH (p:person) RETURN count(*) AS n", &[]);
+        assert_eq!(
+            after.expect("read").rows[0][0],
+            Value::Int(2),
+            "nothing was written"
+        );
+    }
+
+    /// A table that stores nothing on its edges has nowhere to put a
+    /// value, and says so rather than dropping it.
+    #[test]
+    fn a_property_on_an_edge_of_a_bare_table_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "edge-nowhere.zu1");
+
+        let err = session
+            .run(
+                "INSERT (x:person {age: 30, name: 'zoe'})-[:knows {since: 2020}]->(y:person {age: 40, name: 'raj'})",
+                &[],
+            )
+            .expect_err("the table stores nothing on its edges");
+        assert!(
+            err.to_string().contains("stores none on its edges"),
+            "got: {err}"
+        );
     }
 
     /// EXPLAIN prints the statement, not the parts it is run as. The

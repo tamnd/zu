@@ -6268,6 +6268,14 @@
       "doc": "The newest overlay value of one cell at `epoch`: an update chain\nentry first, then an appended row's stored column. `base_count`\nis the row count of the sealed file, where appended offsets\nstart. Returns `None` when the base file holds the answer."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::edge_cells",
+      "kind": "method",
+      "name": "edge_cells",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn edge_cells(&self, rel: u32, epoch: Epoch) -> impl Iterator",
+      "doc": "The same edges with what they carry, which is what a fold of a\nrel table that stores edge properties has to write."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc::edges",
       "kind": "method",
       "name": "edges",
@@ -6407,7 +6415,15 @@
       "name": "insert_rel",
       "of": "zu::zu1::txn::WriteTxn",
       "signature": "fn insert_rel(&mut self, rel: u32, src: u64, dst: u64)",
-      "doc": "Stages one new edge."
+      "doc": "Stages one new edge carrying nothing, which is every edge in a\ntable that stores no properties on its edges."
+    },
+    {
+      "id": "zu::zu1::txn::WriteTxn::insert_rel_carrying",
+      "kind": "method",
+      "name": "insert_rel_carrying",
+      "of": "zu::zu1::txn::WriteTxn",
+      "signature": "fn insert_rel_carrying(&mut self, rel: u32, src: u64, dst: u64, cols: Vec<(u32, Cell)>)",
+      "doc": "Stages one new edge and the cells it holds: a column's position\nin the rel table's props directory and the value this edge takes\nthere, one entry per column the table stores."
     },
     {
       "id": "zu::zu1::txn::WriteTxn::is_empty",
@@ -6732,7 +6748,7 @@
       "kind": "variant",
       "name": "RelInsert",
       "of": "zu::zu1::wal::WalRecord",
-      "signature": "RelInsert { rel: u32, src: Vec<u64>, dst: Vec<u64> }"
+      "signature": "RelInsert { rel: u32, src: Vec<u64>, dst: Vec<u64>, cols: Vec<WalColumn> }"
     },
     {
       "id": "zu::zu1::wal::WalRecord::TxnBegin",

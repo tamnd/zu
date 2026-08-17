@@ -32,6 +32,13 @@ conn.query_stream("MATCH (p:person) RETURN p.id AS id", &[], |batch| {
     Ok(if out.len() < 1_000 { Flow::More } else { Flow::Stop })
 })?;
 
+// Plans and counters as structures rather than as text
+let plan = conn.explain_plan("MATCH (p:person) RETURN p.id AS id")?;
+let root = plan.root.as_ref().expect("a statement with operators");
+root.walk(&mut |op, depth| println!("{}{} {}", "  ".repeat(depth), op.op, op.detail));
+let profile = conn.profile("MATCH (p:person) RETURN p.id AS id", &[])?;
+let slowest = profile.stages[0].ops.iter().max_by_key(|op| op.nanos);
+
 // Bulk
 let mut people = conn.appender("person")?;
 people.append_row((1i64, "Ada"))?;
@@ -59,6 +66,10 @@ Parameters go the other way and `params!` writes them: `&params! { "id" => 42, "
 Not every statement can answer its first row before it has read its last, and three of them never can: ORDER BY does not know which row sorts first until it has read the last one, DISTINCT is the same argument with a set instead of a sort, and an aggregate has no row at all until its groups close. Those run whole and are cut into batches afterwards, so the caller's loop is the same and `Streamed::streamed` is what says which happened. SKIP and LIMIT do stream, spent across the batches rather than inside each one, so a streamed answer is the buffered answer row for row. `Flow::Stop` and an exhausted LIMIT both stop the scan under it at the next morsel, which is the boundary an interrupt is answered at, and a sink that returns an error returns that error from the call unchanged.
 
 `crates/zu/benches/stream.rs` measures the trade over a scan of two hundred thousand rows. Streaming costs 1.18 to 1.75 times the wall clock of the buffered read, which is real and is the price of interleaving the query with the consumer instead of running two tight loops, and it holds 0.018 times the bytes: one batch and the morsel feeding it against every row of the answer. A caller that reads the first batch and stops pays 0.015 of the whole scan. The bytes are counted by an allocator that records the live heap above where it stood when the statement started, because peak resident set counts every page the block cache touched and both sides touch the same ones.
+
+A plan comes back as operators and a profile comes back as counters, both of them structures a program reads rather than text a program parses (`dx/04` §4). `conn.explain_plan` gives a `QueryPlan`: the operator tree, the columns the statement answers with, the parameters it wants bound, and whatever the optimizer wanted said about the plan that the tree does not carry. A `PlanNode` says what the operator is in `op`, what it is working on in `detail`, which bracket group it belongs to, which variables it introduces, and which tables it touches, so a viewer colouring the expands or a test asserting that a scan reached an index asks a field rather than a substring. `conn.explain` is `QueryPlan::render` and nothing else, which is what keeps the listing and the structure from ever describing different plans.
+
+`conn.profile` runs the statement with the counters on and returns a `Profile`: one `StageProfile` per stage with its sink, its row count and its wall time, and one `OpProfile` per operator with pulls, rows, the flattened row count, the optimizer's estimate and ceiling where there was one, and self time with the children's time taken out. The operator's kind and its detail are separate fields there too, so grouping a hundred profiles by operator is a comparison rather than a parse, and `qerror` and `bound_violation` are the two derived numbers worth asking for by name: how far the estimate was out, and whether the count passed a ceiling the optimizer promised, which is a bug rather than a number. Profiling costs the execution, so a caller that wants a plan beside a latency it measured elsewhere wants `explain_plan`, which compiles and renders and runs nothing. A statement that writes is refused, because it runs as the parts it was split at its write into rather than as the one plan a profile describes.
 
 `conn.interrupt()` hands out the one part of a `Connection` another thread may touch: the handle that stops the statement running on it and counts the rows it has read so far. A statement runs on the thread that asked for it, so stopping one means having taken the handle before the call, which is the shape both callers that want this already have, a shell answering a keystroke and a server answering a client that hung up. Asking is a relaxed store, the answer comes back at the next chunk boundary as `ZuError::Interrupted` and carries no condition code because nothing failed, and the connection runs the next statement as if the stopped one had never been asked for. Clearing the handle is the caller's to do and belongs before the next statement rather than after the stopped one. §2 has what the executors check, what the count is counted in, and what it costs.
 

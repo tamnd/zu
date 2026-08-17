@@ -528,57 +528,200 @@ fn prop_filters(
     plan
 }
 
+/// One operator of a plan, with the operators feeding it underneath.
+///
+/// This is the tree EXPLAIN prints, before it is printed. `op` is what
+/// the operator is and `detail` is what the listing writes after it,
+/// which is the operator's arguments rendered the way the statement
+/// wrote them. They are separate fields because a caller grouping
+/// operators by kind, or drawing them, should not have to cut a printed
+/// line back apart to find out what it is holding, and a listing is a
+/// rendering of this rather than the other way around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanNode {
+    pub op: &'static str,
+    /// The bracket group this operator belongs to, `None` for a plain
+    /// match. It prints in front of the operator, so an OPTIONAL MATCH
+    /// expand is [`PlanNode::name`] `OptionalExpand` and `op` `Expand`.
+    pub bracket: Option<Bracket>,
+    pub detail: String,
+    /// The variables this operator introduces, in the order it binds
+    /// them, and empty for the operators that only pass rows through.
+    pub binds: Vec<String>,
+    /// The tables this operator touches: node tables for a scan, rel
+    /// tables for an expand, both for an insert. Empty elsewhere.
+    pub tables: Vec<String>,
+    pub children: Vec<PlanNode>,
+}
+
+impl PlanNode {
+    /// What the listing calls this operator, the bracket prefix
+    /// included.
+    pub fn name(&self) -> String {
+        match self.bracket {
+            Some(b) => format!("{}{}", b.prefix(), self.op),
+            None => self.op.to_string(),
+        }
+    }
+
+    /// The one line this operator prints, without its children and
+    /// without the indent its depth would give it.
+    pub fn line(&self) -> String {
+        match self.detail.is_empty() {
+            true => self.name(),
+            false => format!("{} {}", self.name(), self.detail),
+        }
+    }
+
+    /// The subtree as EXPLAIN prints it, this operator first and one
+    /// child per line under it, indented by depth.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        self.write(0, &mut out);
+        out
+    }
+
+    fn write(&self, depth: usize, out: &mut String) {
+        let _ = writeln!(out, "{}{}", "  ".repeat(depth), self.line());
+        for child in &self.children {
+            child.write(depth + 1, out);
+        }
+    }
+
+    /// Every operator of the subtree with its depth, this one first,
+    /// which is the order the listing prints them in.
+    pub fn walk(&self, visit: &mut impl FnMut(&PlanNode, usize)) {
+        self.walk_from(0, visit);
+    }
+
+    fn walk_from(&self, depth: usize, visit: &mut impl FnMut(&PlanNode, usize)) {
+        visit(self, depth);
+        for child in &self.children {
+            child.walk_from(depth + 1, visit);
+        }
+    }
+
+    /// How many operators the subtree holds, this one counted.
+    pub fn count(&self) -> usize {
+        let mut n = 0;
+        self.walk(&mut |_, _| n += 1);
+        n
+    }
+}
+
+/// A compiled statement described without being run: its operators,
+/// the columns it answers with, and the parameters it wants bound.
+///
+/// `notes` is what the optimizer wants said about the plan that the
+/// tree does not carry, and the caller filling it in is the session,
+/// which is where compiling raised them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueryPlan {
+    /// The top operator, `None` for the plan with no operators at all,
+    /// which is the one row a statement with no clauses runs over.
+    pub root: Option<PlanNode>,
+    pub columns: Vec<String>,
+    pub params: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+impl QueryPlan {
+    /// The listing EXPLAIN prints, notes first and the tree under them.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for note in &self.notes {
+            let _ = writeln!(out, "note: {note}");
+        }
+        if let Some(root) = &self.root {
+            root.write(0, &mut out);
+        }
+        out
+    }
+}
+
+/// Describes a compiled statement: the operator tree with the columns
+/// and parameter names that go with it.
+pub fn describe(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> QueryPlan {
+    QueryPlan {
+        root: tree(plan, query, schema),
+        columns: query.columns.clone(),
+        params: query.params.clone(),
+        notes: Vec::new(),
+    }
+}
+
+/// Builds the operator tree, top operator first. `None` where the plan
+/// is the single starting row, which prints as nothing.
+pub fn tree(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanNode> {
+    node(plan, query, schema)
+}
+
 /// Renders a plan as the indented tree EXPLAIN prints, top operator
 /// first, one child per line under it.
+///
+/// This is [`tree`] printed, so the listing and the structure a caller
+/// reads cannot say different things about the same statement.
 pub fn explain(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> String {
-    let mut out = String::new();
-    render(plan, query, schema, 0, &mut out);
-    out
+    tree(plan, query, schema).map_or(String::new(), |root| root.render())
 }
 
 fn slot_name(query: &BoundQuery, slot: usize) -> &str {
     &query.variables[slot].name
 }
 
-fn node_tables(query: &BoundQuery, schema: &Schema, slot: usize) -> String {
-    let names: Vec<&str> = query.variables[slot]
+fn node_table_names(query: &BoundQuery, schema: &Schema, slot: usize) -> Vec<String> {
+    query.variables[slot]
         .node_tables
         .iter()
-        .filter_map(|id| schema.node_by_id(*id).map(|n| n.name.as_str()))
-        .collect();
-    names.join("|")
+        .filter_map(|id| schema.node_by_id(*id).map(|n| n.name.clone()))
+        .collect()
 }
 
-fn rel_tables(query: &BoundQuery, schema: &Schema, slot: usize) -> String {
-    let names: Vec<&str> = query.variables[slot]
+fn rel_table_names(query: &BoundQuery, schema: &Schema, slot: usize) -> Vec<String> {
+    query.variables[slot]
         .rel_tables
         .iter()
-        .filter_map(|id| schema.rel_by_id(*id).map(|r| r.name.as_str()))
-        .collect();
-    names.join("|")
+        .filter_map(|id| schema.rel_by_id(*id).map(|r| r.name.clone()))
+        .collect()
 }
 
-fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize, out: &mut String) {
-    let pad = "  ".repeat(depth);
-    match plan {
-        LogicalPlan::Empty => {}
+/// The operator for one plan node, its children built underneath it.
+/// `None` for the single starting row, which holds nothing to say.
+fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanNode> {
+    // Every operator but the sources has one input, and an input that
+    // is the starting row contributes no child.
+    let under = |input: &LogicalPlan| node(input, query, schema).into_iter().collect::<Vec<_>>();
+    let plain = |op: &'static str, detail: String, children: Vec<PlanNode>| PlanNode {
+        op,
+        bracket: None,
+        detail,
+        binds: Vec::new(),
+        tables: Vec::new(),
+        children,
+    };
+    let named = |slot: usize| slot_name(query, slot).to_string();
+    Some(match plan {
+        LogicalPlan::Empty => return None,
         LogicalPlan::Rows { slots, .. } => {
-            let names: Vec<&str> = slots.iter().map(|slot| slot_name(query, *slot)).collect();
-            let _ = writeln!(out, "{pad}Rows {}", names.join(", "));
+            let names: Vec<String> = slots.iter().map(|slot| named(*slot)).collect();
+            PlanNode {
+                binds: names.clone(),
+                ..plain("Rows", names.join(", "), Vec::new())
+            }
         }
         LogicalPlan::ScanNodes {
             input,
             slot,
             bracket,
         } => {
-            let opt = bracket.map_or("", |b| b.prefix());
-            let _ = writeln!(
-                out,
-                "{pad}{opt}ScanNodes {}: {}",
-                slot_name(query, *slot),
-                node_tables(query, schema, *slot)
-            );
-            render(input, query, schema, depth + 1, out);
+            let tables = node_table_names(query, schema, *slot);
+            PlanNode {
+                bracket: *bracket,
+                binds: vec![named(*slot)],
+                detail: format!("{}: {}", named(*slot), tables.join("|")),
+                tables,
+                ..plain("ScanNodes", String::new(), under(input))
+            }
         }
         LogicalPlan::Expand {
             input,
@@ -618,42 +761,51 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 }
             };
             let (open, close) = direction.spelling();
-            let opt = bracket.map_or("", |b| b.prefix());
-            let kind = if *asp {
+            let op = if *asp {
                 "AspJoin"
             } else if *into {
                 "ExpandInto"
             } else {
                 "Expand"
             };
-            let _ = writeln!(
-                out,
-                "{pad}{opt}{kind} ({}){open}[{}:{}{hops}]{close}({})",
-                slot_name(query, *from),
-                slot_name(query, *rel),
-                rel_tables(query, schema, *rel),
-                slot_name(query, *to),
-            );
-            render(input, query, schema, depth + 1, out);
+            let tables = rel_table_names(query, schema, *rel);
+            // An expand that joins into a bound node binds the rel and
+            // nothing else; one that introduces the far node binds both,
+            // in the order the pattern names them.
+            let binds = match *into || *asp {
+                true => vec![named(*rel)],
+                false => vec![named(*rel), named(*to)],
+            };
+            PlanNode {
+                bracket: *bracket,
+                binds,
+                detail: format!(
+                    "({}){open}[{}:{}{hops}]{close}({})",
+                    named(*from),
+                    named(*rel),
+                    tables.join("|"),
+                    named(*to),
+                ),
+                tables,
+                ..plain(op, String::new(), under(input))
+            }
         }
         LogicalPlan::Filter {
             input,
             expr,
             bracket,
-        } => {
-            let opt = bracket.map_or("", |b| b.prefix());
-            let _ = writeln!(out, "{pad}{opt}Filter {}", expr_text(expr, query));
-            render(input, query, schema, depth + 1, out);
-        }
-        LogicalPlan::Unwind { input, expr, slot } => {
-            let _ = writeln!(
-                out,
-                "{pad}Unwind {} AS {}",
-                expr_text(expr, query),
-                slot_name(query, *slot)
-            );
-            render(input, query, schema, depth + 1, out);
-        }
+        } => PlanNode {
+            bracket: *bracket,
+            ..plain("Filter", expr_text(expr, query), under(input))
+        },
+        LogicalPlan::Unwind { input, expr, slot } => PlanNode {
+            binds: vec![named(*slot)],
+            ..plain(
+                "Unwind",
+                format!("{} AS {}", expr_text(expr, query), named(*slot)),
+                under(input),
+            )
+        },
         LogicalPlan::Insert { input, nodes, rels } => {
             let mut written: Vec<String> = nodes
                 .iter()
@@ -668,12 +820,8 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                         .map(|(key, expr)| format!("{key}: {}", expr_text(expr, query)))
                         .collect();
                     match props.is_empty() {
-                        true => format!("({}:{table})", slot_name(query, node.slot)),
-                        false => format!(
-                            "({}:{table} {{{}}})",
-                            slot_name(query, node.slot),
-                            props.join(", ")
-                        ),
+                        true => format!("({}:{table})", named(node.slot)),
+                        false => format!("({}:{table} {{{}}})", named(node.slot), props.join(", ")),
                     }
                 })
                 .collect();
@@ -687,19 +835,34 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                     .unwrap_or("?");
                 format!(
                     "({})-[{}:{table}]->({})",
-                    slot_name(query, rel.src),
-                    slot_name(query, rel.slot),
-                    slot_name(query, rel.dst)
+                    named(rel.src),
+                    named(rel.slot),
+                    named(rel.dst)
                 )
             }));
-            let _ = writeln!(out, "{pad}Insert {}", written.join(", "));
-            render(input, query, schema, depth + 1, out);
+            let tables = nodes
+                .iter()
+                .filter_map(|n| schema.node_by_id(n.table).map(|d| d.name.clone()))
+                .chain(
+                    rels.iter()
+                        .filter_map(|r| schema.rel_by_id(r.table).map(|d| d.name.clone())),
+                )
+                .collect();
+            PlanNode {
+                binds: nodes
+                    .iter()
+                    .map(|n| named(n.slot))
+                    .chain(rels.iter().map(|r| named(r.slot)))
+                    .collect(),
+                tables,
+                ..plain("Insert", written.join(", "), under(input))
+            }
         }
         LogicalPlan::Set { input, items } => {
             let written: Vec<String> = items
                 .iter()
                 .map(|item| {
-                    let name = slot_name(query, item.target);
+                    let name = named(item.target);
                     // The listing reads the way the statement was
                     // written: a record form has nothing to put after
                     // the dot, and a label form has nothing to put
@@ -719,18 +882,16 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                     }
                 })
                 .collect();
-            let _ = writeln!(out, "{pad}Set {}", written.join(", "));
-            render(input, query, schema, depth + 1, out);
+            plain("Set", written.join(", "), under(input))
         }
         LogicalPlan::Delete {
             input,
             slots,
             detach,
         } => {
-            let taken: Vec<&str> = slots.iter().map(|&s| slot_name(query, s)).collect();
-            let word = if *detach { "DetachDelete" } else { "Delete" };
-            let _ = writeln!(out, "{pad}{word} {}", taken.join(", "));
-            render(input, query, schema, depth + 1, out);
+            let taken: Vec<String> = slots.iter().map(|&s| named(s)).collect();
+            let op = if *detach { "DetachDelete" } else { "Delete" };
+            plain(op, taken.join(", "), under(input))
         }
         LogicalPlan::TableFunction {
             input,
@@ -743,39 +904,34 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                 .rel_by_id(*rel)
                 .map(|r| r.name.as_str())
                 .unwrap_or("?");
-            let cols: Vec<&str> = slots.iter().map(|&s| slot_name(query, s)).collect();
-            let _ = writeln!(
-                out,
-                "{pad}Call {}({rel_name}) YIELD {}",
-                func.name(),
-                cols.join(", ")
-            );
-            render(input, query, schema, depth + 1, out);
+            let cols: Vec<String> = slots.iter().map(|&s| named(s)).collect();
+            PlanNode {
+                detail: format!("{}({rel_name}) YIELD {}", func.name(), cols.join(", ")),
+                tables: vec![rel_name.to_string()],
+                binds: cols,
+                ..plain("Call", String::new(), under(input))
+            }
         }
         LogicalPlan::Project { input, items } => {
             let rendered: Vec<String> = items.iter().map(|i| item_text(i, query)).collect();
-            let _ = writeln!(out, "{pad}Project {}", rendered.join(", "));
-            render(input, query, schema, depth + 1, out);
+            PlanNode {
+                binds: items.iter().map(|i| i.name.clone()).collect(),
+                ..plain("Project", rendered.join(", "), under(input))
+            }
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
             let rendered: Vec<String> = aggs.iter().map(|i| item_text(i, query)).collect();
             let grouped: Vec<String> = keys.iter().map(|i| item_text(i, query)).collect();
-            if grouped.is_empty() {
-                let _ = writeln!(out, "{pad}Aggregate {}", rendered.join(", "));
-            } else {
-                let _ = writeln!(
-                    out,
-                    "{pad}Aggregate {} BY {}",
-                    rendered.join(", "),
-                    grouped.join(", ")
-                );
+            let detail = match grouped.is_empty() {
+                true => rendered.join(", "),
+                false => format!("{} BY {}", rendered.join(", "), grouped.join(", ")),
+            };
+            PlanNode {
+                binds: keys.iter().chain(aggs).map(|i| i.name.clone()).collect(),
+                ..plain("Aggregate", detail, under(input))
             }
-            render(input, query, schema, depth + 1, out);
         }
-        LogicalPlan::Distinct { input } => {
-            let _ = writeln!(out, "{pad}Distinct");
-            render(input, query, schema, depth + 1, out);
-        }
+        LogicalPlan::Distinct { input } => plain("Distinct", String::new(), under(input)),
         LogicalPlan::Sort { input, keys } => {
             let rendered: Vec<String> = keys
                 .iter()
@@ -792,18 +948,11 @@ fn render(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema, depth: usize,
                     )
                 })
                 .collect();
-            let _ = writeln!(out, "{pad}Sort {}", rendered.join(", "));
-            render(input, query, schema, depth + 1, out);
+            plain("Sort", rendered.join(", "), under(input))
         }
-        LogicalPlan::Skip { input, expr } => {
-            let _ = writeln!(out, "{pad}Skip {}", expr_text(expr, query));
-            render(input, query, schema, depth + 1, out);
-        }
-        LogicalPlan::Limit { input, expr } => {
-            let _ = writeln!(out, "{pad}Limit {}", expr_text(expr, query));
-            render(input, query, schema, depth + 1, out);
-        }
-    }
+        LogicalPlan::Skip { input, expr } => plain("Skip", expr_text(expr, query), under(input)),
+        LogicalPlan::Limit { input, expr } => plain("Limit", expr_text(expr, query), under(input)),
+    })
 }
 
 fn item_text(item: &BoundItem, query: &BoundQuery) -> String {
@@ -1214,5 +1363,106 @@ mod tests {
             !text.contains("Path"),
             "a path variable assembles at eval time, got:\n{text}"
         );
+    }
+
+    fn described(source: &str) -> QueryPlan {
+        let (plan, query) = planned(source);
+        describe(&plan, &query, &schema())
+    }
+
+    /// The tree is what the listing is made of, so every line of one is
+    /// an operator of the other, in the same order and at the same
+    /// depth.
+    #[test]
+    fn the_tree_and_the_listing_are_the_same_plan() {
+        for source in [
+            "MATCH (a:Person {id: $src})-[:KNOWS]->(b) RETURN b.id AS friend ORDER BY friend LIMIT 10",
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:IS_LOCATED_IN]->(p) RETURN a, p",
+            "UNWIND [1, 2] AS x MATCH (a:Person)-[r:KNOWS]->(b) WHERE r.since = x RETURN DISTINCT a.id AS id",
+            "MATCH (a:Person) RETURN count(a) AS n, a.id AS id",
+        ] {
+            let described = described(source);
+            let text = explained(source);
+            assert_eq!(described.render(), text, "{source}");
+            let mut lines = Vec::new();
+            described
+                .root
+                .as_ref()
+                .expect("a statement with operators")
+                .walk(&mut |node, depth| {
+                    lines.push(format!("{}{}", "  ".repeat(depth), node.line()))
+                });
+            assert_eq!(lines.join("\n") + "\n", text, "{source}");
+        }
+    }
+
+    /// What is in the tree that is not in a line of text: which
+    /// variables an operator introduces and which tables it touches,
+    /// both of which a reader of the listing would otherwise be
+    /// recovering by parsing the detail back apart.
+    #[test]
+    fn an_operator_names_what_it_binds_and_what_it_reads() {
+        let plan = described("MATCH (a:Person)-[r:KNOWS]->(b) RETURN b.id AS friend");
+        assert_eq!(plan.columns, ["friend"]);
+        assert!(plan.params.is_empty());
+        let root = plan.root.expect("a statement with operators");
+        assert_eq!(root.count(), 3);
+        assert_eq!(root.op, "Project");
+        assert_eq!(root.binds, ["friend"]);
+        assert!(root.tables.is_empty(), "a projection reads no table");
+
+        let expand = &root.children[0];
+        assert_eq!(expand.op, "Expand");
+        assert_eq!(expand.name(), "Expand");
+        assert_eq!(expand.binds, ["r", "b"], "the far node was not bound yet");
+        assert_eq!(expand.tables, ["KNOWS"]);
+
+        let scan = &expand.children[0];
+        assert_eq!(scan.op, "ScanNodes");
+        assert_eq!(scan.binds, ["a"]);
+        assert_eq!(scan.tables, ["Person"]);
+        assert!(scan.children.is_empty(), "the starting row is no operator");
+
+        // An expand that closes onto a bound variable introduces the rel
+        // and nothing else, and the parameters come back in the order
+        // the binder assigned them.
+        let plan = described(
+            "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE a.id = $src AND b.id = $dst RETURN r",
+        );
+        assert_eq!(plan.params, ["src", "dst"]);
+        let mut binds = Vec::new();
+        plan.root
+            .expect("a statement with operators")
+            .walk(&mut |node, _| binds.push((node.op, node.binds.clone())));
+        assert!(
+            binds.contains(&("Expand", vec!["r".to_string(), "b".to_string()])),
+            "{binds:?}"
+        );
+    }
+
+    /// A bracketed operator prints under a name it does not have: the
+    /// prefix belongs to the group, and the tree keeps the two apart so
+    /// a caller can ask which group an operator is in without reading
+    /// the first word of a line.
+    #[test]
+    fn a_bracket_is_a_field_and_a_prefix() {
+        let plan =
+            described("MATCH (a:Person) OPTIONAL MATCH (a)-[:IS_LOCATED_IN]->(p) RETURN a, p");
+        let mut found = Vec::new();
+        plan.root
+            .expect("a statement with operators")
+            .walk(&mut |node, _| found.push((node.op, node.name(), node.bracket)));
+        let expand = found.iter().find(|f| f.0 == "Expand").expect("an expand");
+        assert_eq!(expand.1, "OptionalExpand");
+        assert!(matches!(
+            expand.2,
+            Some(Bracket {
+                kind: BracketKind::Optional,
+                ..
+            })
+        ));
+        let scan = found.iter().find(|f| f.0 == "ScanNodes").expect("a scan");
+        assert_eq!(scan.1, "ScanNodes");
+        assert_eq!(scan.2, None);
     }
 }

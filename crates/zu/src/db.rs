@@ -30,7 +30,8 @@
 use std::path::{Path, PathBuf};
 
 use zu_common::{Interrupt, Result, ZuError};
-use zu_query::exec::{self, Streamed};
+use zu_query::exec::{self, Profile, Streamed};
+use zu_query::plan::QueryPlan;
 use zu_query::row::{Batch, Flow};
 
 use crate::append::Appender;
@@ -320,6 +321,50 @@ impl Connection {
     /// without running it.
     pub fn explain(&mut self, source: &str) -> Result<String> {
         self.session.explain(source)
+    }
+
+    /// The same plan as operators rather than as text: the tree, the
+    /// columns the statement answers with, the parameters it wants, and
+    /// the notes compiling it raised.
+    ///
+    /// A caller that reads a plan is asking a question about it, and
+    /// every one of those questions is easier to ask of a tree than of
+    /// a listing: whether the scan reaches an index, how deep the
+    /// expands go, which tables are touched. [`QueryPlan::render`] is
+    /// what [`Self::explain`] returns, so the two are one thing printed
+    /// two ways rather than two renderings that can drift.
+    ///
+    /// ```no_run
+    /// use zu::Database;
+    ///
+    /// let db = Database::open("social.zu1")?;
+    /// let mut conn = db.connect()?;
+    /// let plan = conn.explain_plan("MATCH (p:person) RETURN p.id AS id")?;
+    /// let root = plan.root.as_ref().expect("a statement with operators");
+    /// assert_eq!(root.op, "Project");
+    /// assert_eq!(plan.columns, ["id"]);
+    /// # Ok::<(), zu::ZuError>(())
+    /// ```
+    pub fn explain_plan(&mut self, source: &str) -> Result<QueryPlan> {
+        self.session.explain_plan(source)
+    }
+
+    /// Runs `source` with the counters on and hands back what it
+    /// observed, one entry per operator per stage.
+    ///
+    /// This costs the execution, so it is the tool a caller reaches for
+    /// when a statement is slower than the plan says it should be: the
+    /// rows an operator really produced sit next to what the optimizer
+    /// expected, and the self time says which one of them the wall
+    /// clock went into. [`Profile::render`] prints it the way
+    /// `EXPLAIN ANALYZE` does in the shell.
+    ///
+    /// A statement that writes is refused, because it runs as the parts
+    /// it was split at its write into rather than as the one plan a
+    /// profile describes, and profiling it would apply the write.
+    pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<Profile> {
+        self.refuse_if_read_only(source)?;
+        self.session.profile(source, params)
     }
 
     /// Opens an appender on `table`, the bulk-load path of dx/04 §6.

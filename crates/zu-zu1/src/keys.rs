@@ -104,6 +104,38 @@ impl KeyReader {
     }
 }
 
+/// Reads the index back in the shape [`write_key_index`] took it,
+/// `key_by_row[row]` being the key of that row.
+///
+/// A kernel whose answer is stated in original ids rather than in rows
+/// needs every key, and asking for them one at a time costs a fence
+/// search each to learn what two sequential segment scans already say.
+pub fn key_by_row(db: &mut Zu1File, index: &KeyIndex) -> Result<Vec<u64>> {
+    let corrupt = |detail: String| ZuError::Corrupt {
+        what: "key index",
+        detail,
+    };
+    let mut keys = Vec::with_capacity(index.keys.value_count as usize);
+    read_segment(db, &index.keys, &mut keys)?;
+    let mut rows = Vec::with_capacity(index.rows.value_count as usize);
+    read_segment(db, &index.rows, &mut rows)?;
+    if keys.len() != rows.len() {
+        return Err(corrupt(format!(
+            "index holds {} keys against {} rows",
+            keys.len(),
+            rows.len()
+        )));
+    }
+    let mut by_row = vec![0u64; rows.len()];
+    for (&key, &row) in keys.iter().zip(&rows) {
+        let slot = by_row
+            .get_mut(row as usize)
+            .ok_or_else(|| corrupt(format!("row {row} out of 0..{}", rows.len())))?;
+        *slot = key;
+    }
+    Ok(by_row)
+}
+
 /// Full check for `zu verify`: both segments decode clean (crc and zone
 /// included via the scan path), the counts match the node domain, the
 /// keys ascend strictly, and the rows are a permutation of it.

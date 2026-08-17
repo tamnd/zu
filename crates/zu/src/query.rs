@@ -845,15 +845,24 @@ pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Ve
     Ok(args)
 }
 
-/// The catalog statement this source is, `None` when it is a query.
+/// A statement that is not a query, which is a statement with no
+/// binding table and no plan.
+pub(crate) enum NotAQuery {
+    /// One that changes what the file declares.
+    Catalog(zu_query::ast::CatalogStmt),
+    /// One that says where a transaction begins or ends.
+    Transaction(zu_query::ast::TxnStmt),
+}
+
+/// What this source is when it is not a query, `None` when it is one.
 ///
-/// Every entry point that takes statement text checks this first: a
-/// catalog statement has no binding table and no plan, so a caller that
-/// sent one and got "expected MATCH" back would be told the wrong
-/// thing.
-pub(crate) fn catalog_statement(source: &str) -> Result<Option<zu_query::ast::CatalogStmt>> {
+/// Every entry point that takes statement text checks this first: these
+/// statements have no binding table and no plan, so a caller that sent
+/// one and got "expected MATCH" back would be told the wrong thing.
+pub(crate) fn not_a_query(source: &str) -> Result<Option<NotAQuery>> {
     match zu_query::parser::parse_statement(source)? {
-        zu_query::ast::Statement::Catalog(stmt) => Ok(Some(stmt)),
+        zu_query::ast::Statement::Catalog(stmt) => Ok(Some(NotAQuery::Catalog(stmt))),
+        zu_query::ast::Statement::Transaction(stmt) => Ok(Some(NotAQuery::Transaction(stmt))),
         zu_query::ast::Statement::Query(_) => Ok(None),
     }
 }
@@ -899,9 +908,21 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 /// environment overrides the count, `ZU_THREADS=1` forces sequential
 /// execution.
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
-    if let Some(stmt) = catalog_statement(source)? {
-        crate::catalog_stmt::apply(db, &stmt)?;
-        return Ok(QueryResult::new(Vec::new(), Vec::new()));
+    match not_a_query(source)? {
+        Some(NotAQuery::Catalog(stmt)) => {
+            crate::catalog_stmt::apply(db, &stmt)?;
+            return Ok(QueryResult::new(Vec::new(), Vec::new()));
+        }
+        // A transaction is several statements held together, and this
+        // entry point runs one statement against a file handle it hands
+        // straight back, so there is nothing here for the next
+        // statement to be held together with.
+        Some(NotAQuery::Transaction(_)) => {
+            return Err(ZuError::InvalidArgument(
+                "a transaction runs across statements, which needs a session: open one with zu::db::Database or zu::session::Session".into(),
+            ));
+        }
+        None => {}
     }
     let p = prepare(source, db, params)?;
     let options = env_options();

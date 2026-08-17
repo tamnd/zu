@@ -138,8 +138,8 @@ const ENGINE: &[Declared] = &[
     },
     Declared {
         key: "transactions",
-        supported: false,
-        why: "no START TRANSACTION, COMMIT or ROLLBACK yet; milestone G6",
+        supported: true,
+        why: "START TRANSACTION, COMMIT and ROLLBACK run across statements on a session",
     },
     Declared {
         key: "multiple-statements",
@@ -552,7 +552,7 @@ mod tests {
         let toml = render();
         assert!(toml.contains("name = \"zu\""));
         assert!(toml.contains("gqlstatus = true"));
-        assert!(toml.contains("transactions = false"));
+        assert!(toml.contains("transactions = true"));
         assert!(toml.contains("float-values = true"));
         assert!(toml.contains("self-loops = true"));
         // The reason rides along on the same line as the value, so a

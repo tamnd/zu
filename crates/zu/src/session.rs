@@ -17,12 +17,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use zu_common::gqlstatus::codes;
 use zu_common::{Interrupt, Result, ZuError};
+use zu_query::ast::TxnStmt;
 use zu_query::binder::BoundQuery;
 use zu_query::exec;
 use zu_query::plan::LogicalPlan;
 
-use crate::query::{self, QueryResult, Value, Zu1Graph};
+use crate::query::{self, NotAQuery, QueryResult, Value, Zu1Graph};
 use crate::write::Writer;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
@@ -81,6 +83,21 @@ struct CachedPlan {
     notes: Vec<String>,
 }
 
+/// The explicit transaction a session is inside, from the
+/// `START TRANSACTION` that opened it to the `COMMIT` or `ROLLBACK`
+/// that ends it.
+///
+/// A statement written outside one already runs in a transaction of its
+/// own, so this is not what makes writes atomic. What it holds is the
+/// span: several statements are one unit, and the file is holding the
+/// state they started from until one of the two words that end them.
+#[derive(Debug)]
+struct Explicit {
+    /// `START TRANSACTION READ ONLY`, which is refused at the statement
+    /// that would write rather than at the block it would have written.
+    read_only: bool,
+}
+
 pub struct Session {
     graph: Zu1Graph<'static>,
     /// The graph a statement is against when it does not say, which is
@@ -109,6 +126,8 @@ pub struct Session {
     /// the file goes out on loan. Opening it costs a log open and a
     /// recovery pass, which a session that only reads should not pay.
     writer: Option<Writer>,
+    /// The explicit transaction running here, if a statement opened one.
+    txn: Option<Explicit>,
 }
 
 impl Session {
@@ -138,6 +157,7 @@ impl Session {
                 ..query::env_options()
             },
             writer: None,
+            txn: None,
         })
     }
 
@@ -202,6 +222,127 @@ impl Session {
         Ok(written.value)
     }
 
+    /// Whether an explicit transaction is running on this session.
+    pub fn in_transaction(&self) -> bool {
+        self.txn.is_some()
+    }
+
+    /// Runs one of the three statements that say where a transaction
+    /// begins and ends (GT01).
+    ///
+    /// The work is in the two words that end one. A statement commits by
+    /// folding what it staged into new segments and flipping the header,
+    /// so by the time the next statement of the same transaction runs,
+    /// the previous one is published and there is nothing in memory left
+    /// to drop. Undoing it is therefore a file matter: the first
+    /// statement that writes has the file keep the state it is about to
+    /// publish over, `COMMIT` lets go of it, and `ROLLBACK` publishes it
+    /// again.
+    fn transaction(&mut self, stmt: TxnStmt) -> Result<QueryResult> {
+        match stmt {
+            TxnStmt::Start { read_only } => {
+                if self.txn.is_some() {
+                    return Err(ZuError::gql(
+                        codes::C25G01,
+                        "a transaction is already running on this session, and one does not start inside another".to_string(),
+                    ));
+                }
+                self.txn = Some(Explicit { read_only });
+            }
+            TxnStmt::Commit | TxnStmt::Rollback => {
+                let ending = if matches!(stmt, TxnStmt::Commit) {
+                    "commit"
+                } else {
+                    "roll back"
+                };
+                if self.txn.take().is_none() {
+                    return Err(ZuError::gql(
+                        codes::C2D000,
+                        format!("there is no transaction running on this session to {ending}"),
+                    ));
+                }
+                // A transaction that only read, or that wrote nothing
+                // yet, never had the file keep anything, so both words
+                // end it the same way and neither costs an epoch.
+                if self.graph.file().in_savepoint() {
+                    if matches!(stmt, TxnStmt::Commit) {
+                        self.graph.file_mut().release_savepoint();
+                    } else {
+                        self.undo()?;
+                    }
+                }
+            }
+        }
+        Ok(QueryResult::new(Vec::new(), Vec::new()))
+    }
+
+    /// Refuses a statement that writes inside a transaction that was
+    /// started `READ ONLY` (GT02), before the statement is compiled and
+    /// before anything is staged.
+    fn refuse_a_write(&self) -> Result<()> {
+        if self.txn.as_ref().is_some_and(|txn| txn.read_only) {
+            return Err(ZuError::gql(
+                codes::C25G03,
+                "this transaction was started READ ONLY and this statement writes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Has the file keep the state a statement is about to write over,
+    /// and says whether this statement is the one that will let go of
+    /// it.
+    ///
+    /// Outside an explicit transaction the statement owns what it takes,
+    /// which is what makes an implicit transaction whole: a statement
+    /// that raises halfway through leaves the file as it found it even
+    /// when its earlier parts had already committed. Inside one, the
+    /// first statement to write takes it and the transaction owns it,
+    /// because the unit that can be taken back is then the transaction.
+    fn hold(&mut self) -> Result<bool> {
+        if self.graph.file().in_savepoint() {
+            return Ok(false);
+        }
+        crate::write::writable(self.graph.file())?;
+        self.graph.file_mut().begin_savepoint()?;
+        Ok(self.txn.is_none())
+    }
+
+    /// Ends what [`Self::hold`] took: a statement that answered keeps
+    /// what it wrote, one that raised has it undone.
+    fn settle<T>(&mut self, out: Result<T>, held: bool) -> Result<T> {
+        if !held {
+            return out;
+        }
+        match out {
+            Ok(value) => {
+                self.graph.file_mut().release_savepoint();
+                Ok(value)
+            }
+            // The rollback is reported over the error that caused it
+            // when it fails, because a statement that raised and was
+            // undone leaves a database a caller can carry on with, and
+            // one that raised and could not be undone does not.
+            Err(err) => {
+                self.undo()?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Publishes the state the file was keeping, and drops everything
+    /// that describes the epochs going away with it.
+    ///
+    /// The writer goes first. It holds the log and the overlay store for
+    /// epochs that are about to stop existing, and its next commit would
+    /// number itself off them; opening a fresh one costs a log open and
+    /// a recovery pass over a log the last fold truncated.
+    fn undo(&mut self) -> Result<()> {
+        self.writer = None;
+        self.graph.file_mut().rollback_savepoint()?;
+        self.refresh()
+    }
+
     /// The execution switches this session runs statements under.
     pub fn options(&self) -> &exec::Options {
         &self.options
@@ -243,14 +384,21 @@ impl Session {
     /// and reusing the cached plan afterwards.
     pub fn run(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.refresh()?;
-        // A catalog statement publishes a new epoch, and the plans and
-        // readers this session holds describe the old one. Refreshing
-        // after it is what drops them, so the next query compiles
-        // against the catalog the statement just wrote.
-        if let Some(stmt) = query::catalog_statement(source)? {
-            crate::catalog_stmt::apply(self.graph.file_mut(), &stmt)?;
-            self.refresh()?;
-            return Ok(QueryResult::new(Vec::new(), Vec::new()));
+        match query::not_a_query(source)? {
+            Some(NotAQuery::Transaction(stmt)) => return self.transaction(stmt),
+            // A catalog statement publishes a new epoch, and the plans
+            // and readers this session holds describe the old one.
+            // Refreshing after it is what drops them, so the next query
+            // compiles against the catalog the statement just wrote.
+            Some(NotAQuery::Catalog(stmt)) => {
+                self.refuse_a_write()?;
+                let held = self.hold()?;
+                let out = crate::catalog_stmt::apply(self.graph.file_mut(), &stmt);
+                self.settle(out, held)?;
+                self.refresh()?;
+                return Ok(QueryResult::new(Vec::new(), Vec::new()));
+            }
+            None => {}
         }
         let cached = self.plan_for(source)?;
         let args = query::bind_args(&cached.query.params, params)?;
@@ -258,7 +406,10 @@ impl Session {
         // because the clauses after the write read what it made rather
         // than reading the store again.
         if let Some(parts) = &cached.parts {
-            return self.run_parts(&cached, parts, args);
+            self.refuse_a_write()?;
+            let held = self.hold()?;
+            let out = self.run_parts(&cached, parts, args);
+            return self.settle(out, held);
         }
         let options = self.options.clone();
         if query::exec2_enabled() {
@@ -584,6 +735,20 @@ impl Session {
     }
 }
 
+/// A session that goes away with a transaction still running on it has
+/// not committed one, so the transaction is rolled back rather than
+/// left published. Nothing here can report a failure to do that, which
+/// is the reason to end a transaction with a statement and not with a
+/// drop: the statement says what went wrong.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.txn.is_some() && self.graph.file().in_savepoint() {
+            self.writer = None;
+            let _ = self.graph.file_mut().rollback_savepoint();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +762,276 @@ mod tests {
         edges.dedup();
         graph::bulk_load_as(&mut db, "person", "follows", 97, &edges).expect("load");
         edges
+    }
+
+    /// Two people with a name, which is what a statement in a
+    /// transaction writes and what the statement after it counts.
+    fn people(path: &Path) {
+        let mut db = Zu1File::create(path).expect("create");
+        graph::bulk_load_as(&mut db, "person", "knows", 2, &[(0, 1)]).expect("load");
+        let names: Vec<&[u8]> = vec![b"ada", b"kay"];
+        crate::zu1::props::store_props(
+            &mut db,
+            "person",
+            &[("name", crate::zu1::props::PropValues::Str(&names))],
+        )
+        .expect("props");
+    }
+
+    fn count(session: &mut Session, source: &str) -> i64 {
+        match &session.run(source, &[]).expect("count").rows[0][0] {
+            Value::Int(n) => *n,
+            other => panic!("expected a count, got {other:?}"),
+        }
+    }
+
+    const PEOPLE: &str = "MATCH (p:person) RETURN count(p) AS n";
+
+    /// The statement the milestone is about: two statements are one
+    /// transaction, and the word at the end unmakes both of them even
+    /// though each of them published an epoch of its own on the way.
+    #[test]
+    fn a_rollback_unmakes_every_statement_of_its_transaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rollback.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+        assert_eq!(count(&mut session, PEOPLE), 2);
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        assert!(session.in_transaction());
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("first");
+        session
+            .run("INSERT (p:person {name: 'raj'})", &[])
+            .expect("second");
+        // Read your own writes: each statement committed, so the next
+        // one reads what it wrote.
+        assert_eq!(count(&mut session, PEOPLE), 4);
+
+        session.run("ROLLBACK", &[]).expect("rollback");
+        assert!(!session.in_transaction());
+        assert_eq!(count(&mut session, PEOPLE), 2);
+        drop(session);
+
+        // And it is the file that was put back, not a view of it.
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert_eq!(count(&mut reopened, PEOPLE), 2);
+        let names = reopened
+            .run("MATCH (p:person) RETURN p.name AS name ORDER BY name", &[])
+            .expect("names");
+        assert_eq!(names.rows.len(), 2);
+    }
+
+    #[test]
+    fn a_commit_keeps_every_statement_of_its_transaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("commit.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("insert");
+        session
+            .run("MATCH (p:person {name: 'ada'}) SET p.name = 'ada2'", &[])
+            .expect("set");
+        session.run("COMMIT", &[]).expect("commit");
+        assert!(!session.in_transaction());
+        assert_eq!(count(&mut session, PEOPLE), 3);
+        drop(session);
+
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert_eq!(count(&mut reopened, PEOPLE), 3);
+        assert_eq!(
+            count(
+                &mut reopened,
+                "MATCH (p:person {name: 'ada2'}) RETURN count(p) AS n"
+            ),
+            1,
+            "the committed transaction kept what its second statement wrote"
+        );
+    }
+
+    /// A transaction that only reads holds nothing, so neither word
+    /// that ends one costs an epoch.
+    #[test]
+    fn a_transaction_that_reads_costs_nothing_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("readonly.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+        let epoch = session.epoch();
+
+        for ending in ["COMMIT", "ROLLBACK"] {
+            session
+                .run("START TRANSACTION READ ONLY", &[])
+                .expect("start");
+            assert_eq!(count(&mut session, PEOPLE), 2);
+            session.run(ending, &[]).expect(ending);
+            assert_eq!(session.epoch(), epoch, "{ending} published an epoch");
+        }
+    }
+
+    /// READ ONLY is enforced rather than advisory, and it is enforced
+    /// at the statement rather than at the block it would have written.
+    #[test]
+    fn a_read_only_transaction_turns_a_write_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mode.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        session
+            .run("START TRANSACTION READ ONLY", &[])
+            .expect("start");
+        let err = session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect_err("a write in a read only transaction");
+        assert_eq!(err.gqlstatus(), Some(codes::C25G03));
+        assert!(err.to_string().contains("started READ ONLY"), "{err}");
+        let err = session
+            .run("CREATE GRAPH TYPE t { (:person) }", &[])
+            .expect_err("a catalog statement writes too");
+        assert_eq!(err.gqlstatus(), Some(codes::C25G03));
+        session.run("ROLLBACK", &[]).expect("rollback");
+
+        // The same statement in the mode that is implied when none is
+        // written is a statement that runs.
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("read write");
+        session.run("COMMIT", &[]).expect("commit");
+        assert_eq!(count(&mut session, PEOPLE), 3);
+    }
+
+    #[test]
+    fn a_transaction_does_not_nest_and_neither_word_ends_one_that_is_not_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nesting.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        for ending in ["COMMIT", "ROLLBACK"] {
+            let err = session.run(ending, &[]).expect_err("nothing to end");
+            assert_eq!(err.gqlstatus(), Some(codes::C2D000));
+            assert!(err.to_string().contains("no transaction running"), "{err}");
+        }
+        session.run("START TRANSACTION", &[]).expect("start");
+        let err = session
+            .run("START TRANSACTION", &[])
+            .expect_err("already running");
+        assert_eq!(err.gqlstatus(), Some(codes::C25G01));
+        session.run("COMMIT", &[]).expect("commit");
+    }
+
+    /// GP18, catalog and data statements in one transaction: the graph
+    /// a `CREATE` made is there for the statements after it, and a
+    /// rollback unmakes the graph and the rows written into it
+    /// together.
+    #[test]
+    fn a_catalog_statement_and_a_write_are_one_transaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mixing.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("CREATE GRAPH TYPE social { (:person) }", &[])
+            .expect("create");
+        assert!(
+            session.graph.catalog().graph_type("social").is_some(),
+            "the statements after it see what it declared"
+        );
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("insert");
+        session.run("ROLLBACK", &[]).expect("rollback");
+
+        assert!(session.graph.catalog().graph_type("social").is_none());
+        assert_eq!(count(&mut session, PEOPLE), 2);
+        drop(session);
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert!(reopened.graph.catalog().graph_type("social").is_none());
+        assert_eq!(count(&mut reopened, PEOPLE), 2);
+    }
+
+    /// GT03, several graphs in one transaction. A session is one file
+    /// and a file is one catalog, so the graphs of a transaction are
+    /// graphs of one catalog and the single writer commits them
+    /// together; there is no second catalog here for a transaction to
+    /// span.
+    #[test]
+    fn two_graphs_change_and_are_undone_in_one_transaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("graphs.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("CREATE GRAPH other ANY AS COPY OF home", &[])
+            .expect("a second graph to write into");
+        assert_eq!(count(&mut session, PEOPLE), 2);
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("into the working graph");
+        session
+            .run("USE other INSERT (p:person {name: 'raj'})", &[])
+            .expect("into the other one");
+        assert_eq!(count(&mut session, PEOPLE), 3);
+        assert_eq!(count(&mut session, &format!("USE other {PEOPLE}")), 3);
+
+        session.run("ROLLBACK", &[]).expect("rollback");
+        assert_eq!(count(&mut session, PEOPLE), 2);
+        assert_eq!(count(&mut session, &format!("USE other {PEOPLE}")), 2);
+    }
+
+    /// A statement outside a transaction is one anyway, and this is
+    /// the part of that which needed the file to keep something: a
+    /// statement that writes and then raises had already committed the
+    /// write, because the clauses after a write read what it wrote.
+    #[test]
+    fn a_statement_that_raises_after_it_wrote_leaves_the_file_as_it_found_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("implicit.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        let err = session
+            .run(
+                "INSERT (p:person {name: 'zoe'}) WITH p RETURN p.name / 0 AS bad",
+                &[],
+            )
+            .expect_err("the clause after the write raises");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(count(&mut session, PEOPLE), 2, "the row went with it");
+        drop(session);
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert_eq!(count(&mut reopened, PEOPLE), 2);
+    }
+
+    /// A session that goes away with a transaction open has not
+    /// committed it.
+    #[test]
+    fn a_session_dropped_mid_transaction_rolls_it_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dropped.zu1");
+        people(&path);
+        {
+            let mut session = Session::open(&path).expect("open");
+            session.run("START TRANSACTION", &[]).expect("start");
+            session
+                .run("INSERT (p:person {name: 'zoe'})", &[])
+                .expect("insert");
+            assert_eq!(count(&mut session, PEOPLE), 3);
+        }
+        let mut reopened = Session::open(&path).expect("reopen");
+        assert_eq!(count(&mut reopened, PEOPLE), 2);
     }
 
     #[test]

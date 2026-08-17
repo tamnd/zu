@@ -1185,6 +1185,35 @@ impl Catalog {
         }
     }
 
+    /// Grows the row domain of the table with this id.
+    ///
+    /// A fold knows which table it appended to, and the name is not
+    /// enough to say which one that is: two graphs in one file each
+    /// hold their own `person`, so growing by name would grow the home
+    /// graph's table however far from home the rows landed.
+    pub fn grow_node(&mut self, id: u32, node_count: u64) -> Result<()> {
+        let table = self
+            .nodes
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or_else(|| ZuError::InvalidArgument(format!("no node table has id {id}")))?;
+        table.node_count = table.node_count.max(node_count);
+        Ok(())
+    }
+
+    /// Records how many edges the table with this id holds, which a
+    /// fold knows because it just rebuilt it. By id for the same reason
+    /// as [`Self::grow_node`].
+    pub fn set_edge_count(&mut self, id: u32, edge_count: u64) -> Result<()> {
+        let table = self
+            .rels
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or_else(|| ZuError::InvalidArgument(format!("no rel table has id {id}")))?;
+        table.edge_count = edge_count;
+        Ok(())
+    }
+
     /// Creates or updates a node table and returns its id. The row
     /// domain only grows: a load declaring fewer nodes than an earlier
     /// one leaves the count alone, so rel tables already built over the

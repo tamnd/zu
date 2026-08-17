@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn a_statement_the_engine_does_not_implement_is_its_own_outcome() {
         let report = run_cases(
-            "  - name: ahead\n    doc: a case written ahead of the engine, which is allowed on purpose\n    query: START TRANSACTION\n    columns:\n      - n\n    rows:\n",
+            "  - name: ahead\n    doc: a case written ahead of the engine, which is allowed on purpose\n    query: MERGE (n:person)\n    columns:\n      - n\n    rows:\n",
         );
         assert_eq!(
             report.ran[0].outcome,

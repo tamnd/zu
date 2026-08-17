@@ -162,6 +162,17 @@ pub enum WalRecord {
         src: Vec<u64>,
         dst: Vec<u64>,
     },
+    /// What one txn changed on edges that were already there, named the
+    /// way a removed edge is: by the rows the edge runs between. One
+    /// record carries one column, so the values run beside the pairs the
+    /// way a node update's run beside its offsets.
+    RelUpdate {
+        rel: u32,
+        col: u32,
+        src: Vec<u64>,
+        dst: Vec<u64>,
+        values: WalValues,
+    },
     DdlCatalog {
         delta: Vec<u8>,
     },
@@ -186,6 +197,7 @@ impl WalRecord {
             WalRecord::IngestRef { .. } => 8,
             WalRecord::CheckpointNote => KIND_CHECKPOINT_NOTE,
             WalRecord::RelDelete { .. } => 10,
+            WalRecord::RelUpdate { .. } => 11,
         }
     }
 
@@ -245,6 +257,20 @@ impl WalRecord {
                 out.extend_from_slice(&(src.len() as u32).to_le_bytes());
                 put_u64s(out, src);
                 put_u64s(out, dst);
+            }
+            WalRecord::RelUpdate {
+                rel,
+                col,
+                src,
+                dst,
+                values,
+            } => {
+                out.extend_from_slice(&rel.to_le_bytes());
+                out.extend_from_slice(&col.to_le_bytes());
+                out.extend_from_slice(&(src.len() as u32).to_le_bytes());
+                put_u64s(out, src);
+                put_u64s(out, dst);
+                values.encode(out);
             }
             WalRecord::DdlCatalog { delta } => out.extend_from_slice(delta),
             WalRecord::IngestRef { table, ptrs } => {
@@ -351,6 +377,27 @@ impl WalRecord {
                     rel,
                     src: u64s(r, count)?,
                     dst: u64s(r, count)?,
+                }
+            }
+            11 => {
+                let rel = r.u32()?;
+                let col = r.u32()?;
+                let count = r.u32()? as usize;
+                let src = u64s(r, count)?;
+                let dst = u64s(r, count)?;
+                let values = WalValues::decode(r)?;
+                if values.len() != count {
+                    return Err(corrupt(format!(
+                        "rel update names {count} edges but carries {} values",
+                        values.len()
+                    )));
+                }
+                WalRecord::RelUpdate {
+                    rel,
+                    col,
+                    src,
+                    dst,
+                    values,
                 }
             }
             other => return Err(corrupt(format!("unknown record kind {other}"))),
@@ -630,6 +677,20 @@ mod tests {
                 rel: 5,
                 src: vec![1, 7],
                 dst: vec![3, 9],
+            },
+            WalRecord::RelUpdate {
+                rel: 5,
+                col: 1,
+                src: vec![0, 4],
+                dst: vec![1, 6],
+                values: WalValues::Str(vec![b"met once".to_vec(), Vec::new()]),
+            },
+            WalRecord::RelUpdate {
+                rel: 5,
+                col: 0,
+                src: vec![2],
+                dst: vec![3],
+                values: WalValues::Null(1),
             },
             WalRecord::DdlCatalog {
                 delta: vec![0xAB; 100],

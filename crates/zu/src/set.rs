@@ -25,18 +25,28 @@ use crate::insert::{cell, describe};
 use crate::query::Value;
 use crate::split::Set;
 use crate::zu1::file::Zu1File;
-use crate::zu1::props::{PropColumn, load_props};
+use crate::zu1::props::{PropColumn, load_props, load_rel_props};
 use crate::zu1::txn::{Cell, WriteTxn};
 
-/// One cell about to change: which table, which row of it, which
+/// One cell about to change: which table, which element of it, which
 /// column, and what the column takes.
 pub(crate) struct Update {
     pub(crate) table: u32,
-    pub(crate) offset: u64,
+    pub(crate) at: At,
     /// The column's position in the table's props directory, which is
     /// what the fold reads a staged cell back by.
     pub(crate) col: u32,
     pub(crate) cell: Cell,
+}
+
+/// Which element of a table a change lands on.
+///
+/// A row is named by its offset and an edge by the rows it runs between,
+/// which is the only name an edge has: its values sit in the order its
+/// table holds its edges, and a fold rebuilds that order.
+pub(crate) enum At {
+    Row(u64),
+    Edge(u64, u64),
 }
 
 /// The changes one write is making, filled a row at a time.
@@ -80,10 +90,10 @@ impl<'a> Changes<'a> {
         values: &[Value],
     ) -> Result<()> {
         for (at, item) in self.write.items.iter().enumerate() {
-            let (table, offset) = self.element(item, carried)?;
+            let (table, element) = self.element(item, carried)?;
             let columns = match self.columns.entry(table) {
                 Entry::Occupied(held) => held.into_mut(),
-                Entry::Vacant(empty) => empty.insert(columns_of(db, table)?),
+                Entry::Vacant(empty) => empty.insert(columns_of(db, table, &element)?),
             };
             let col = columns
                 .iter()
@@ -96,7 +106,7 @@ impl<'a> Changes<'a> {
                 })?;
             self.updates.push(Update {
                 table,
-                offset,
+                at: element,
                 col: col as u32,
                 cell: written(&columns[col], &values[at], &item.key)?,
             });
@@ -110,7 +120,7 @@ impl<'a> Changes<'a> {
     /// A `SET` changes what it found, so the element is always one the
     /// row carries, and a row that found nothing there has nothing to
     /// change.
-    fn element(&self, item: &BoundSetItem, carried: &[Value]) -> Result<(u32, u64)> {
+    fn element(&self, item: &BoundSetItem, carried: &[Value]) -> Result<(u32, At)> {
         let value = self
             .write
             .carry
@@ -123,7 +133,8 @@ impl<'a> Changes<'a> {
                 )
             })?;
         match value {
-            Value::Node { table, offset } => Ok((*table, *offset)),
+            Value::Node { table, offset } => Ok((*table, At::Row(*offset))),
+            Value::Rel { table, src, dst } => Ok((*table, At::Edge(*src, *dst))),
             other => Err(ZuError::gql(
                 zu_common::gqlstatus::codes::C22G03,
                 format!(
@@ -150,7 +161,14 @@ impl<'a> Changes<'a> {
 /// one written is the one the column ends up holding.
 pub(crate) fn stage(txn: &mut WriteTxn<'_>, updates: &[Update]) -> Result<u64> {
     for update in updates {
-        txn.update(update.table, update.offset, update.col, update.cell.clone());
+        match update.at {
+            At::Row(offset) => {
+                txn.update(update.table, offset, update.col, update.cell.clone());
+            }
+            At::Edge(src, dst) => {
+                txn.update_rel(update.table, src, dst, update.col, update.cell.clone());
+            }
+        }
     }
     Ok(updates.len() as u64)
 }
@@ -170,8 +188,17 @@ fn written(col: &PropColumn, value: &Value, key: &str) -> Result<Cell> {
 }
 
 /// The property columns of a table an element being changed sits in.
-fn columns_of(db: &mut Zu1File, table: u32) -> Result<Vec<PropColumn>> {
-    let columns = load_props(db, table)?.map_or_else(Vec::new, |dir| dir.columns);
+///
+/// A rel table keeps its columns inside its group directory rather than
+/// in the table index, because they are in edge order and the directory
+/// is what holds that order, so which of the two is read comes from what
+/// the element is.
+fn columns_of(db: &mut Zu1File, table: u32, at: &At) -> Result<Vec<PropColumn>> {
+    let dir = match at {
+        At::Row(_) => load_props(db, table)?,
+        At::Edge(..) => load_rel_props(db, table)?,
+    };
+    let columns = dir.map_or_else(Vec::new, |dir| dir.columns);
     if columns.is_empty() {
         return Err(ZuError::Unsupported {
             what: "setting a property on an element of a table that stores none",
@@ -187,7 +214,7 @@ mod tests {
 
     use crate::session::Session;
     use crate::zu1::graph::bulk_load_as;
-    use crate::zu1::props::{PropValues, store_props};
+    use crate::zu1::props::{PropValues, store_props, store_rel_props};
 
     use super::*;
 
@@ -212,6 +239,68 @@ mod tests {
     fn open(dir: &tempfile::TempDir, name: &str) -> Session {
         let path = dir.path().join(name);
         seeded(&path);
+        Session::open(&path).expect("open")
+    }
+
+    /// The same two people with a year stored on the edge between them.
+    /// A rel table keeps its columns over the edges in load order, so a
+    /// change to one has to be put back into that order rather than at
+    /// an offset of its own.
+    fn seeded_with_edge_props(path: &Path) {
+        let mut db = Zu1File::create(path).expect("create");
+        bulk_load_as(&mut db, "person", "knows", 2, &[(0, 1)]).expect("load");
+        let names: Vec<&[u8]> = vec![b"ada", b"kay"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .expect("props");
+        store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1990]))])
+            .expect("edge props");
+    }
+
+    fn open_with_edge_props(dir: &tempfile::TempDir, name: &str) -> Session {
+        let path = dir.path().join(name);
+        seeded_with_edge_props(&path);
+        Session::open(&path).expect("open")
+    }
+
+    /// Three people in a chain and one more edge back to the start,
+    /// each edge carrying a year and a note. Two columns of two kinds
+    /// over three edges is what says a change landed on the edge it
+    /// named: the two beside it are there to still hold what they held.
+    fn seeded_with_three_edges(path: &Path) {
+        let mut db = Zu1File::create(path).expect("create");
+        bulk_load_as(&mut db, "person", "knows", 3, &[(0, 1), (1, 2), (2, 0)]).expect("load");
+        let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20, 30])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .expect("props");
+        let notes: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        store_rel_props(
+            &mut db,
+            "knows",
+            &[
+                ("since", PropValues::Int(&[1990, 1991, 1992])),
+                ("note", PropValues::Str(&notes)),
+            ],
+        )
+        .expect("edge props");
+    }
+
+    fn open_with_three_edges(dir: &tempfile::TempDir, name: &str) -> Session {
+        let path = dir.path().join(name);
+        seeded_with_three_edges(&path);
         Session::open(&path).expect("open")
     }
 
@@ -405,21 +494,126 @@ mod tests {
         );
     }
 
-    /// An edge stores its properties in the order its table holds its
-    /// edges, and nothing writes into that order yet, so this is
-    /// refused by name rather than by type.
+    /// The other element a property can be set on. An edge keeps its
+    /// values in the order its table holds its edges, so the change is
+    /// named by the rows the edge runs between and the fold puts it
+    /// back into that order.
     #[test]
-    fn setting_a_property_on_an_edge_says_which_part_is_not_in_yet() {
+    fn a_property_on_an_edge_is_set_and_then_read_back() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = open(&dir, "set-edge.zu1");
+        let mut session = open_with_edge_props(&dir, "set-edge.zu1");
+
+        let out = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) SET k.since = 1991",
+                &[],
+            )
+            .expect("set on an edge");
+        assert!(out.rows.is_empty(), "a write with nothing after it");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN k.since AS since",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Int(1991));
+    }
+
+    /// One edge of a table changes and the others keep what they held,
+    /// which is what says the change landed on a pair rather than on a
+    /// place in the column.
+    #[test]
+    fn setting_one_edge_leaves_the_other_edges_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_three_edges(&dir, "set-edge-one.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'kay'})-[k:knows]->(b:person) SET k.since = 2000",
+                &[],
+            )
+            .expect("set the middle edge");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS name, k.since AS since ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(strings(&after, 0), ["ada", "joe", "kay"]);
+        assert_eq!(after.rows[0][1], Value::Int(1990), "ada is where she was");
+        assert_eq!(after.rows[1][1], Value::Int(1992), "joe is where he was");
+        assert_eq!(after.rows[2][1], Value::Int(2000));
+    }
+
+    /// A string column on an edge is the blob side of the store, which
+    /// a change rewrites rather than overwrites in place, and the
+    /// rewrite is over the whole table's edges.
+    #[test]
+    fn setting_a_string_property_on_an_edge_rewrites_the_blob_side() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_three_edges(&dir, "set-edge-string.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'ada'})-[k:knows]->(b:person) SET k.note = $to",
+                &[("to", Value::Str("met at work".into()))],
+            )
+            .expect("set a note");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS name, k.note AS note ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(strings(&after, 1), ["met at work", "three", "two"]);
+    }
+
+    /// An edge property is in the file after the write, not just in the
+    /// overlay the statement left behind.
+    #[test]
+    fn an_edge_property_stays_set_after_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("set-edge-reopen.zu1");
+        seeded_with_edge_props(&path);
+        {
+            let mut session = Session::open(&path).expect("open");
+            session
+                .run(
+                    "MATCH (a:person)-[k:knows]->(b:person) SET k.since = 1991",
+                    &[],
+                )
+                .expect("set");
+        }
+
+        let mut session = Session::open(&path).expect("reopen");
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN k.since AS since",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][0], Value::Int(1991));
+    }
+
+    /// A table that stores nothing on its edges has no column for a
+    /// value to land in, and there is no column to make: what columns a
+    /// table has is a matter for the catalog and not for a statement
+    /// that writes one value.
+    #[test]
+    fn setting_a_property_on_an_edge_of_a_bare_table_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "set-edge-bare.zu1");
 
         let err = session
             .run(
                 "MATCH (a:person)-[k:knows]->(b:person) SET k.since = 1990",
                 &[],
             )
-            .expect_err("not in yet");
-        assert!(err.to_string().contains("SET on an edge"), "got: {err}");
+            .expect_err("the table stores nothing on its edges");
+        assert!(err.to_string().contains("stores none"), "got: {err}");
     }
 
     /// The other half of the milestone line: a property comes off an
@@ -588,18 +782,116 @@ mod tests {
         assert!(err.to_string().contains("REMOVE of a label"), "got: {err}");
     }
 
-    /// An edge stores its properties in the order its table holds its
-    /// edges, which nothing writes into yet, so REMOVE says so the way
-    /// SET does.
+    /// A property comes off an edge the way it comes off a node, and
+    /// what is there afterwards is a null. An edge column holds an
+    /// absence the way a row column does, as a clear bit beside a
+    /// placeholder nothing reads.
     #[test]
-    fn removing_a_property_from_an_edge_says_which_part_is_not_in_yet() {
+    fn a_property_is_removed_from_an_edge_and_then_reads_as_null() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut session = open(&dir, "remove-edge.zu1");
+        let mut session = open_with_three_edges(&dir, "remove-edge.zu1");
 
-        let err = session
-            .run("MATCH (a:person)-[k:knows]->(b:person) REMOVE k.since", &[])
-            .expect_err("not in yet");
-        assert!(err.to_string().contains("REMOVE on an edge"), "got: {err}");
+        session
+            .run(
+                "MATCH (a:person {name: 'kay'})-[k:knows]->(b:person) REMOVE k.since",
+                &[],
+            )
+            .expect("remove");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS name, k.since AS since ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Int(1990), "ada is where she was");
+        assert_eq!(after.rows[1][1], Value::Int(1992), "joe is where he was");
+        assert_eq!(after.rows[2][1], Value::Null, "kay's year is gone");
+    }
+
+    /// A string property on an edge comes off too, and the blob side
+    /// says the absence with no bytes rather than with an empty string.
+    #[test]
+    fn removing_a_string_property_from_an_edge_reads_back_as_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_three_edges(&dir, "remove-edge-string.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'ada'})-[k:knows]->(b:person) REMOVE k.note",
+                &[],
+            )
+            .expect("remove");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS name, k.note AS note ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Null);
+        assert_eq!(after.rows[1][1], Value::Str("three".into()));
+        assert_eq!(after.rows[2][1], Value::Str("two".into()));
+    }
+
+    /// An edge whose property was taken off can take one again, which
+    /// is what says the mask is state and not a decision taken once.
+    #[test]
+    fn a_removed_edge_property_can_be_set_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_three_edges(&dir, "remove-edge-then-set.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'kay'})-[k:knows]->(b:person) REMOVE k.since",
+                &[],
+            )
+            .expect("remove");
+        session
+            .run(
+                "MATCH (a:person {name: 'kay'})-[k:knows]->(b:person) SET k.since = 2001",
+                &[],
+            )
+            .expect("set");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS name, k.since AS since ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[2][1], Value::Int(2001));
+    }
+
+    /// An edge that holds nothing in a column keeps holding nothing
+    /// through a fold that has other work to do, which is the case a
+    /// mask being rebuilt into a new edge order has to get right.
+    #[test]
+    fn an_edge_absence_survives_a_later_write_to_the_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_three_edges(&dir, "remove-edge-then-write.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'kay'})-[k:knows]->(b:person) REMOVE k.since",
+                &[],
+            )
+            .expect("remove");
+        session
+            .run(
+                "MATCH (a:person {name: 'ada'})-[k:knows]->(b:person) SET k.since = 1900",
+                &[],
+            )
+            .expect("set another edge");
+
+        let after = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS name, k.since AS since ORDER BY name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(after.rows[0][1], Value::Int(1900));
+        assert_eq!(after.rows[2][1], Value::Null, "kay's year is still gone");
     }
 
     /// EXPLAIN prints the statement, not the parts it is run as, so the

@@ -1,0 +1,64 @@
+schema: 2
+suite: wrong
+doc: Cases the engine does not answer the way they say, so that the two runners can be compared on what they say when a case fails. The corpus itself passes, which is the point of it and also why it can never show this. These are not corpus cases and are not packed with them; they live beside the C runner because they are a test of the C runner.
+
+cases:
+  - name: wrong-value
+    doc: A case asserting the wrong answer, which is the failure a report has to be most precise about, since it names the row, the column and both values.
+    query: RETURN 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 2
+
+  - name: wrong-column-name
+    doc: The projected name is part of the answer, and a report that said the value was wrong would send somebody looking in the wrong place.
+    query: RETURN 1 AS n
+    columns:
+      - m
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: too-many-rows
+    doc: Two rows where the case writes one. A runner that compared what it was given and stopped would call this a pass.
+    query: UNWIND [1, 2] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: too-few-rows
+    doc: The same thing the other way round, where the engine gives back less than the case asked for.
+    query: UNWIND [1] AS n RETURN n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+      - values:
+          - type: INT8
+            value: 2
+
+  - name: wrong-condition
+    doc: A statement that raises, against a case naming a condition it does not raise. The code is the contract, so the two have to be compared and not merely counted.
+    query: RETURN 1 / 0
+    raises: 22003
+
+  - name: no-condition-at-all
+    doc: A statement that returns rows, against a case saying it raises. Rows where a condition was expected is a failure and not an unexpected pass.
+    query: RETURN 1 AS n
+    raises: 22012
+
+  - name: ahead-of-the-engine
+    doc: A statement this engine does not implement, which is the third outcome and neither of the other two.
+    query: START TRANSACTION
+    columns:
+      - n
+    rows:

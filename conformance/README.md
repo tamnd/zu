@@ -24,6 +24,11 @@ cc -std=c99 -Wall -Wextra -Werror -o yaml_test conformance/c/yaml.c conformance/
 ./yaml_test conformance/cases/*.yaml          # the same files through the C reader
 ```
 
+```
+cc -std=c99 -Wall -Wextra -Werror -o value_test conformance/c/yaml.c conformance/c/value.c conformance/c/value_test.c
+./value_test conformance/cases/*.yaml         # and every value in them through the C decoder
+```
+
 The Rust runner in `crates/zu-corpus` is the first of nine and the reference for the rest. When a runner in another language disagrees with it about a case, the Rust one is right by definition: the cases and the engine version together are the contract, and this runner is the one compiled against the engine that defines it.
 
 Every case gets a database of its own. Cases are written as if nothing came before them, and the cheapest way to keep that true is to make it true. A case that leaked a table into the next one would be a failure that moves when the file is reordered, which is the worst kind to be handed. A suite with a `load:` gets it applied to each of those databases in turn, for the same reason.
@@ -147,6 +152,8 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 `DECIMAL`, `BYTES`, `NODE`, `EDGE`, and `PATH` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
 
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 783 values counting the ones inside lists, and both print them the same way.
+
 ## What the Rust runner does not check
 
 `QueryResult` carries the values a statement produced and no type metadata for the columns, so this runner compares the value a case declares and cannot verify the declared type. A case saying `INT8` and a case saying `INT64` are the same assertion here when the value matches.
@@ -163,4 +170,4 @@ The reason is the reason the TOML reader gives: a construct silently reinterpret
 
 Comments are found by the one rule that matters to a case writer: a `#` starts a comment only with whitespace before it, and a quote hides a `#` only if it opens after whitespace and closes on the same line. That last clause is what lets a `query:` hold `cast('  42  ' AS INT64)`, whose closing quote has a space before it and so looks like an opening one. A quote that opens nothing that closes was not a run.
 
-There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 555 files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.
+There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 14 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.

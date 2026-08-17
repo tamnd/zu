@@ -252,7 +252,13 @@ pub struct SetItem {
     /// The variable standing for the element, which an earlier clause
     /// bound.
     pub target: String,
-    pub key: String,
+    /// The property the assignment writes, or nothing when it writes
+    /// every property the element has: `SET p = {age: 37}` names no one
+    /// key, because what it assigns is the whole record and a property
+    /// the record leaves out is emptied rather than left alone. The
+    /// value of that form is the record, so it is one expression either
+    /// way.
+    pub key: Option<String>,
     pub value: Expr,
 }
 

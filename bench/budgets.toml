@@ -1450,6 +1450,17 @@ detach_stmt_kb = 8192.0
 set_edge_stmt_us = 250000.0
 set_edge_stmt_kb = 8192.0
 
+# A SET of the whole record of one element, measured 34 to 46 ms and 1556
+# kB at 10000 rows, which is the same bytes as a SET of one property of
+# the same element and about the same time. That is not a coincidence and
+# it is the thing to watch: the fold rewrites the columns of the table it
+# touched whether one of them changed or all of them did, so writing two
+# columns costs what writing one does. If a later fold learns to rewrite
+# only the column that changed then the one property number drops and
+# this one does not, and these two ceilings are where that shows.
+set_record_stmt_us = 250000.0
+set_record_stmt_kb = 4096.0
+
 # What a statement that changed nothing added to the store, per
 # statement. A SET that writes back the value it read leaves a table of
 # the same shape, so the fold's new blocks must come out of the free

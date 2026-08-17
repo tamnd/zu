@@ -365,6 +365,58 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
     }
 }
 
+/// A `SET` of the whole record of one element, `WRITES` times over.
+///
+/// This is the form that says what the element holds afterwards rather
+/// than what to change about it, so it writes every column of the table
+/// and not one of them. Two columns here, one of each kind, so the number
+/// beside the one property run is what the second column and the wider
+/// log record cost. Each write puts back the values it found, as the
+/// other runs do, so the growth column is again what changing nothing
+/// cost the store.
+fn run_set_record(dir: &Path, rows: u64) -> Cost {
+    let path = build(dir, rows);
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    conn.query("MATCH (p:person) WHERE p.age = 0 SET p = {age: 0, name: 'seed0'}")
+        .expect("warmup");
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        let age = i % rows;
+        conn.query(&format!(
+            "MATCH (p:person) WHERE p.age = {age} SET p = {{age: {age}, name: 'seed{age}'}}"
+        ))
+        .expect("set a record");
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    assert_eq!(
+        one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),
+        rows as i64,
+        "no row was added or lost"
+    );
+    assert_eq!(
+        one(
+            &mut conn,
+            "MATCH (p:person) WHERE p.name = 'seed7' RETURN count(p) AS n"
+        ),
+        1,
+        "and both values written back are the values that were there"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
 /// A `SET` of one property of one edge, `WRITES` times over, which is
 /// the same statement as the run above against the other half of the
 /// store.
@@ -596,6 +648,9 @@ fn main() {
     let set_edge = run_set_edge(&root.path().join("set-edge"), SMALL);
     set_edge.report(&format!("SET on an edge, {SMALL} rows"));
 
+    let set_record = run_set_record(&root.path().join("set-record"), SMALL);
+    set_record.report(&format!("SET a record, {SMALL} rows"));
+
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"));
 
@@ -619,6 +674,8 @@ fn main() {
         ("set_stmt_us", set_small.us),
         ("set_edge_stmt_us", set_edge.us),
         ("set_edge_stmt_kb", set_edge.written / 1024.0),
+        ("set_record_stmt_us", set_record.us),
+        ("set_record_stmt_kb", set_record.written / 1024.0),
         ("insert_stmt_us", insert.us),
         ("delete_stmt_us", delete.us),
         ("detach_stmt_us", detach.us),

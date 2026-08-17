@@ -884,11 +884,13 @@ fn edge_properties_survive_both_hops() {
     assert_eq!(got, want, "every edge keeps its own values on the way back");
 }
 
-/// An edge property column cannot say which of two edges with the same
-/// endpoints it belongs to, so a store holding a pair twice is refused
-/// at the conversion rather than answered wrongly later.
+/// Two edges over one pair keep two values across the hop. Neither
+/// side addresses an edge property by the endpoints: sqlite orders the
+/// scan by source, destination and then rowid, and zu1 numbers an edge
+/// by its slot in the forward list, so the copies line up in insertion
+/// order at both ends.
 #[test]
-fn a_duplicated_edge_with_properties_is_refused() {
+fn a_duplicated_edge_carries_both_values_across_the_hop() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = (dir.path().join("a.db"), dir.path().join("b.zu1"));
     let mut sq = SqliteStore::open(&a).unwrap();
@@ -909,11 +911,19 @@ fn a_duplicated_edge_with_properties_is_refused() {
     sq.commit().unwrap();
     drop(sq);
 
-    let err = sqlite_to_zu1(&a, &b).unwrap_err().to_string();
-    assert!(
-        err.contains("twice"),
-        "the error says what is wrong with the store: {err}"
-    );
+    sqlite_to_zu1(&a, &b).unwrap();
+    let mut db = zu::zu1::file::Zu1File::open(&b).unwrap();
+    let mut graph = zu::zu1::graph::GraphReader::load_table(&mut db, "knows").unwrap();
+    let (nbrs, base) = graph.out_neighbors_from(&mut db, 0).unwrap();
+    assert_eq!(nbrs, [1, 1], "both edges are stored");
+    let base = base as usize;
+    let root = graph.directory().props;
+    let mut props =
+        zu::zu1::props::PropsReader::new(zu::zu1::props::load_props_at(&mut db, root).unwrap());
+    let col = props.col("weight").unwrap();
+    let mut values = Vec::new();
+    props.read_int_column(&mut db, col, &mut values).unwrap();
+    assert_eq!(values[base..base + 2], [1, 2]);
 }
 
 /// A node's extra labels cross both hops, and a pattern naming one on

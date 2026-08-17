@@ -4054,7 +4054,10 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             }
             // A traversal source arrives as a user-facing id; resolve
             // it to the dense offset the kernel walks.
-            if matches!(func, TableFunc::Bfs | TableFunc::Sssp) {
+            if matches!(
+                func,
+                TableFunc::Bfs | TableFunc::Sssp | TableFunc::SsspWeighted
+            ) {
                 let name = func.name();
                 let Some(Value::Int(key)) = vals.first() else {
                     return Err(invalid(format!(
@@ -6078,6 +6081,28 @@ mod tests {
                         .map(|o| {
                             vec![if o == *source {
                                 Value::Int(0)
+                            } else {
+                                Value::Null
+                            }]
+                        })
+                        .collect())
+                }
+                // The stub answers the source's own distance and
+                // nothing else, which is enough to show the source and
+                // the column name arrived.
+                "sssp_weighted" => {
+                    let (Some(Value::Int(source)), Some(Value::Str(column))) =
+                        (args.first(), args.get(1))
+                    else {
+                        return Err(invalid(
+                            "mock sssp_weighted needs a source and a weight column".into(),
+                        ));
+                    };
+                    let width = column.len() as i64;
+                    Ok((0..n)
+                        .map(|o| {
+                            vec![if o == *source {
+                                Value::Int(width)
                             } else {
                                 Value::Null
                             }]

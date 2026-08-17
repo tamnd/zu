@@ -680,30 +680,20 @@ fn copy(
     // as some other edge's value.
     //
     // An edge list with no columns sorts its pairs directly, which is
-    // the ingest hot path and has no permutation to report. It keeps a
-    // repeated pair: a second copy is a second edge, and dropping it
-    // changes degree, which changes every answer that divides by degree.
-    // The GAP generators emit repeats on purpose and a pagerank over a
-    // file loaded without them is off by 4e-4, outside the tolerance the
-    // LDBC harness compares at. With columns the repeat is refused
-    // instead: the pair is the address of an edge property and one
-    // ordinal cannot answer with two values.
+    // the ingest hot path and has no permutation to report. Either way
+    // a repeated pair is kept: a second copy is a second edge, and
+    // dropping it changes degree, which changes every answer that
+    // divides by degree. The GAP generators emit repeats on purpose and
+    // a pagerank over a file loaded without them is off by 4e-4,
+    // outside the tolerance the LDBC harness compares at. With columns
+    // the sort is stable, so the copies stay in file order and each
+    // keeps the value that was written next to it.
     let mut sorted = edges;
     let columns: Vec<zu::zu1::props::OwnedColumn> = if columns.is_empty() {
         sorted.sort_unstable();
         Vec::new()
     } else {
         let order = zu::zu1::reorder::load_order(&mut sorted);
-        if let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]) {
-            return command_error(
-                "copy",
-                &zu::ZuError::InvalidArgument(format!(
-                    "edge ({}, {}) appears twice and the file carries edge property columns, \
-                     which are addressed by the pair",
-                    dup[0].0, dup[0].1
-                )),
-            );
-        }
         columns
             .into_iter()
             .map(|c| zu::zu1::props::OwnedColumn {
@@ -1824,13 +1814,14 @@ mod tests {
         assert_eq!(r.rows, want);
     }
 
-    /// The pair is the address of an edge property, so a file that
-    /// names the same pair twice has two values for one ordinal. A bare
-    /// edge list keeps both, because two lines are two edges and the
-    /// degree that comes out of them is what a kernel divides by.
+    /// A file that names the same pair twice loads both copies with
+    /// both values. The pair no longer addresses one edge, the slot in
+    /// the forward list does, and the sort that puts the copies next to
+    /// each other is stable, so the first line of the file is the first
+    /// of the two slots.
     #[cfg(feature = "arrow")]
     #[test]
-    fn a_duplicate_edge_with_properties_is_refused() {
+    fn a_duplicate_edge_keeps_both_copies_and_both_property_values() {
         use zu::zu1::props::{OwnedColumn, OwnedValues};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1845,7 +1836,7 @@ mod tests {
             }],
         )
         .expect("write parquet");
-        assert_ne!(
+        assert_eq!(
             copy(
                 &edges_path,
                 &db_path,
@@ -1854,6 +1845,24 @@ mod tests {
                 Format::Text
             ),
             ExitCode::SUCCESS
+        );
+        let mut db = zu::zu1::file::Zu1File::open(&db_path).expect("open");
+        let mut graph = zu::zu1::graph::GraphReader::load(&mut db).expect("reader");
+        let (nbrs, base) = graph.out_neighbors_from(&mut db, 1).expect("neighbors");
+        assert_eq!(nbrs, [2, 2], "both copies of the pair are stored");
+        let root = graph.directory().props;
+        let mut props = zu::zu1::props::PropsReader::new(
+            zu::zu1::props::load_props_at(&mut db, root).expect("props"),
+        );
+        let col = props.col("since").expect("since column");
+        let mut values = Vec::new();
+        props
+            .read_int_column(&mut db, col, &mut values)
+            .expect("read column");
+        assert_eq!(
+            values[base as usize..base as usize + 2],
+            [7, 8],
+            "the copies keep the values that were written next to them"
         );
 
         let plain = dir.path().join("plain.parquet");
@@ -1875,7 +1884,7 @@ mod tests {
             .neighbors_dir(&mut db, 1, zu::zu1::graph::Direction::Fwd)
             .expect("neighbors")
             .to_vec();
-        assert_eq!(out, [2, 2], "both copies of the pair are stored");
+        assert_eq!(out, [2, 2], "a bare edge list keeps both too");
     }
 
     /// A csv rel file written the way a bulk loader is handed one, with

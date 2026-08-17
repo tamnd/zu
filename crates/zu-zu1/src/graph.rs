@@ -1280,6 +1280,31 @@ impl GraphReader {
         self.neighbors_dir(db, node, Direction::Fwd)
     }
 
+    /// `node`'s forward list together with the ordinal of the first
+    /// edge in it, so the `i`th neighbor is edge `base + i` of the load
+    /// order and an edge property is a slice index rather than a
+    /// search.
+    ///
+    /// [`Self::edge_ordinal`] answers the same question for one pair
+    /// and costs a binary search to do it, which is the right trade for
+    /// an edge that arrived from somewhere else. A kernel walking the
+    /// forward lists already knows where it is, and on a graph where a
+    /// pair can repeat the count is the only thing that tells the
+    /// copies apart.
+    pub fn out_neighbors_from(&mut self, db: &mut Zu1File, node: u64) -> Result<(&[u64], u64)> {
+        let (g, row) = self.locate(node, Direction::Fwd)?;
+        let base = self.directory.groups[g].edge_base;
+        let idx = Direction::Fwd as usize;
+        if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
+            let (offsets, nbrs) = self.csr_group(db, g, Direction::Fwd)?;
+            self.cached_groups[idx] = Some((g, offsets, nbrs));
+        }
+        let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().expect("just cached");
+        let lo = offsets[row] as usize;
+        let hi = offsets[row + 1] as usize;
+        Ok((&nbrs[lo..hi], base + lo as u64))
+    }
+
     /// Chunks the neighbor array of `group` in `dir` is stored in,
     /// directory only, no decode. This is what says whether pinning a
     /// group is worth it: the pin decodes every one of these chunks,
@@ -1491,9 +1516,12 @@ impl GraphReader {
     /// pays a group decode for it, which is the same bet the neighbor
     /// list makes.
     ///
-    /// Edges are unique in a table that stores properties, which
-    /// [`crate::props::store_rel_props`] is what enforces, so the pair
-    /// names one edge and the ordinal is that edge's.
+    /// A pair that runs twice names two edges with two ordinals, and a
+    /// lookup given nothing but the pair cannot pick between them: this
+    /// answers with the first, the earliest of the run in load order.
+    /// The count is what tells the copies apart and only a walk of the
+    /// list has it, so a caller that needs each copy's own value takes
+    /// [`Self::out_neighbors_from`] and counts.
     pub fn edge_ordinal(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<u64>> {
         let (g, row) = self.locate(src, Direction::Fwd)?;
         let base = self.directory.groups[g].edge_base;
@@ -1505,10 +1533,12 @@ impl GraphReader {
         let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().expect("just cached");
         let lo = offsets[row] as usize;
         let hi = offsets[row + 1] as usize;
-        Ok(nbrs[lo..hi]
-            .binary_search(&dst)
-            .ok()
-            .map(|slot| base + (lo + slot) as u64))
+        // partition_point rather than binary_search: a run of equal
+        // destinations has the search landing anywhere inside it, and
+        // the first slot of the run is the one answer that does not
+        // depend on how the halving went.
+        let slot = nbrs[lo..hi].partition_point(|&n| n < dst);
+        Ok((lo + slot < hi && nbrs[lo + slot] == dst).then(|| base + (lo + slot) as u64))
     }
 
     /// Point access to the in-neighbor list.
@@ -2129,6 +2159,40 @@ mod tests {
         let adj = pools.adjacency.stats();
         assert_eq!(adj.misses + adj.hits, 0, "degrees touched adjacency");
         assert!(pools.csr_offsets.stats().misses > 0);
+    }
+
+    #[test]
+    fn a_forward_list_comes_with_the_ordinal_of_its_first_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.zu1");
+        // 0 -> 1 three times over, which is what makes counting the
+        // only way to tell the copies apart, plus a second source so
+        // the base is not always zero.
+        let edges = [(0u32, 1u32), (0, 1), (0, 1), (0, 2), (3, 0), (3, 1)];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, 4, &edges).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        let (nbrs, base) = reader.out_neighbors_from(&mut db, 0).unwrap();
+        assert_eq!(nbrs, [1, 1, 1, 2]);
+        assert_eq!(base, 0);
+        let (nbrs, base) = reader.out_neighbors_from(&mut db, 3).unwrap();
+        assert_eq!(nbrs, [0, 1]);
+        assert_eq!(base, 4);
+        // A node with no out-edges still has a base, the ordinal its
+        // first edge would take, so an empty list is an empty range
+        // rather than a special case.
+        let (nbrs, base) = reader.out_neighbors_from(&mut db, 1).unwrap();
+        assert!(nbrs.is_empty());
+        assert_eq!(base, 4);
+        // The pair alone names the first of the run, and nothing else:
+        // that is the answer that does not depend on how the search
+        // halved the list.
+        assert_eq!(reader.edge_ordinal(&mut db, 0, 1).unwrap(), Some(0));
+        assert_eq!(reader.edge_ordinal(&mut db, 0, 2).unwrap(), Some(3));
+        assert_eq!(reader.edge_ordinal(&mut db, 1, 0).unwrap(), None);
     }
 
     #[test]

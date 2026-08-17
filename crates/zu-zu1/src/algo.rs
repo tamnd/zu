@@ -220,12 +220,147 @@ pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
     Ok(roots.iter().map(|&root| smallest[root as usize]).collect())
 }
 
-/// Single-source hop distances over the undirected view. Rel tables
-/// carry no edge weights yet, so this is SSSP under unit weights; the
-/// weighted variant arrives with rel properties. Unreachable nodes get
-/// `u64::MAX`.
+/// Single-source hop distances over the undirected view, SSSP under
+/// unit weights. Unreachable nodes get `u64::MAX`. The weighted form is
+/// [`sssp_weighted`], which follows stored direction instead, that
+/// being what the GAP and Graph500 kernels measure.
 pub fn sssp(db: &mut Zu1File, reader: &mut GraphReader, source: u64) -> Result<Vec<u64>> {
     levels(db, reader, source, Walk::Both)
+}
+
+/// The widest edge weight a bucket queue is worth building for. Buckets
+/// cost a slot per distance value within a window of the settled
+/// distance, so the array is as wide as the widest edge plus one; past
+/// this the window is bigger than the frontier it holds and a heap is
+/// the cheaper structure. GAP's generators draw weights from 1..255,
+/// which is three orders inside it.
+const SSSP_BUCKET_LIMIT: u64 = 1 << 16;
+
+/// Weighted single-source shortest paths from `source` following stored
+/// edge direction, the GAP SSSP and Graph500 K3 kernel. `weights[i]` is
+/// the weight of edge `i` of the load order. Unreachable nodes get
+/// `u64::MAX`.
+///
+/// The load order is the order the forward lists lay out, group after
+/// group and list after list, so a walk that counts as it goes reads a
+/// weight at an index and never searches for one. That is also what
+/// keeps a parallel edge honest: two edges over the same pair are two
+/// slots of the list with two weights, and only the count says which is
+/// which.
+///
+/// Direction, not the undirected view, because the reference this is
+/// measured against relaxes out-edges only. The distances come out the
+/// same whichever order the frontier settles in, so there is nothing
+/// here for a tie to move.
+pub fn sssp_weighted(
+    db: &mut Zu1File,
+    reader: &mut GraphReader,
+    source: u64,
+    weights: &[u64],
+) -> Result<Vec<u64>> {
+    let n = reader.directory().one_domain()?;
+    let stored = reader.directory().edge_count;
+    if weights.len() as u64 != stored {
+        return Err(zu_common::ZuError::InvalidArgument(format!(
+            "{} weights over {stored} edges",
+            weights.len()
+        )));
+    }
+    let mut dist = vec![u64::MAX; n as usize];
+    if source >= n {
+        return Ok(dist);
+    }
+    dist[source as usize] = 0;
+    let widest = weights.iter().copied().max().unwrap_or(0);
+    if widest < SSSP_BUCKET_LIMIT {
+        dial(db, reader, source, weights, widest, &mut dist)?;
+    } else {
+        heap_dijkstra(db, reader, source, weights, &mut dist)?;
+    }
+    Ok(dist)
+}
+
+/// Dijkstra over a ring of buckets, one bucket a distance value.
+///
+/// Every edge out of a settled node lands within `widest` of the
+/// distance that settled it, so a ring of `widest + 1` buckets holds
+/// every tentative distance in flight and the ring index is the
+/// distance modulo its length. That turns the priority queue into an
+/// array index: no comparisons, no sift, and a node that improves is
+/// pushed again rather than moved, which the settled check at pop
+/// filters out. Against a binary heap this is what a small weight range
+/// buys, and the GAP generators draw 1..255.
+fn dial(
+    db: &mut Zu1File,
+    reader: &mut GraphReader,
+    source: u64,
+    weights: &[u64],
+    widest: u64,
+    dist: &mut [u64],
+) -> Result<()> {
+    let ring = (widest + 1) as usize;
+    let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); ring];
+    buckets[0].push(source);
+    let mut queued = 1usize;
+    let mut at = 0u64;
+    while queued > 0 {
+        let slot = (at % ring as u64) as usize;
+        // The bucket is emptied into a scratch first: relaxing out of
+        // it can push back into this same slot when an edge weighs
+        // zero, and a drain that walked the live vector would then read
+        // what it is writing.
+        let round = std::mem::take(&mut buckets[slot]);
+        queued -= round.len();
+        for &node in &round {
+            // A node reachable by several paths sits in as many
+            // buckets; the one that settled it is the only one that
+            // gets to expand it.
+            if dist[node as usize] != at {
+                continue;
+            }
+            let (nbrs, base) = reader.out_neighbors_from(db, node)?;
+            for (i, &dst) in nbrs.iter().enumerate() {
+                let reach = at + weights[(base + i as u64) as usize];
+                if reach < dist[dst as usize] {
+                    dist[dst as usize] = reach;
+                    buckets[(reach % ring as u64) as usize].push(dst);
+                    queued += 1;
+                }
+            }
+        }
+        at += 1;
+    }
+    Ok(())
+}
+
+/// Dijkstra over a binary heap, for the weight range a bucket ring
+/// would be wasteful over. Stale entries are left in the heap and
+/// dropped at pop, which is cheaper than finding and moving them.
+fn heap_dijkstra(
+    db: &mut Zu1File,
+    reader: &mut GraphReader,
+    source: u64,
+    weights: &[u64],
+    dist: &mut [u64],
+) -> Result<()> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut heap = BinaryHeap::new();
+    heap.push(Reverse((0u64, source)));
+    while let Some(Reverse((at, node))) = heap.pop() {
+        if at != dist[node as usize] {
+            continue;
+        }
+        let (nbrs, base) = reader.out_neighbors_from(db, node)?;
+        for (i, &dst) in nbrs.iter().enumerate() {
+            let reach = at + weights[(base + i as u64) as usize];
+            if reach < dist[dst as usize] {
+                dist[dst as usize] = reach;
+                heap.push(Reverse((reach, dst)));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Breadth-first levels from `source` following stored edge direction,
@@ -765,6 +900,66 @@ mod tests {
         let (_dir, mut db, mut reader) = open_with(&[(0, 1), (2, 1)], 4);
         let dist = sssp(&mut db, &mut reader, 0).expect("sssp");
         assert_eq!(dist, [0, 1, 2, u64::MAX]);
+    }
+
+    #[test]
+    fn sssp_weighted_takes_the_long_way_round_when_it_is_cheaper() {
+        // 0 -> 1 weighs 10, 0 -> 2 -> 1 weighs 2. Hop counting picks
+        // the direct edge and this has to pick the detour, so the two
+        // kernels disagree here on purpose. 3 is only reachable
+        // against the arrows, which a weighted run does not follow.
+        let edges = [(0u32, 1u32), (0, 2), (2, 1), (3, 0)];
+        let (_dir, mut db, mut reader) = open_with(&edges, 4);
+        // Sorted by pair, which is the load order the weights index:
+        // (0,1) (0,2) (2,1) (3,0).
+        let weights = [10, 1, 1, 1];
+        let dist = sssp_weighted(&mut db, &mut reader, 0, &weights).expect("sssp_weighted");
+        assert_eq!(dist, [0, 2, 1, u64::MAX]);
+        assert_eq!(sssp(&mut db, &mut reader, 0).expect("sssp"), [0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn sssp_weighted_tells_two_edges_over_one_pair_apart() {
+        // 0 -> 1 twice, the second copy weighing 3 against the first's
+        // 9, and 1 -> 2 weighing 1. A kernel that addressed the weight
+        // by the pair would find 9 for both copies and answer 10 at 2;
+        // reading by slot finds the cheap copy and answers 4.
+        let edges = [(0u32, 1u32), (0, 1), (1, 2)];
+        let (_dir, mut db, mut reader) = open_with(&edges, 3);
+        let dist = sssp_weighted(&mut db, &mut reader, 0, &[9, 3, 1]).expect("sssp_weighted");
+        assert_eq!(dist, [0, 3, 4]);
+    }
+
+    #[test]
+    fn the_bucket_ring_and_the_heap_answer_the_same_distances() {
+        // The same graph run under weights small enough for the ring
+        // and again with one edge widened past the limit, which is the
+        // only thing that decides between the two. The widened edge is
+        // one no shortest path uses, so the distances do not move and
+        // any difference is the structure rather than the graph.
+        let mut edges = Vec::new();
+        for node in 0..31u32 {
+            edges.push((node, node + 1));
+            edges.push((node, (node * 7 + 3) % 32));
+        }
+        let (_dir, mut db, mut reader) = open_with(&edges, 32);
+        let mut weights: Vec<u64> = (0..edges.len() as u64).map(|i| i % 200 + 1).collect();
+        let ring = sssp_weighted(&mut db, &mut reader, 0, &weights).expect("ring");
+        weights[0] = SSSP_BUCKET_LIMIT + 1;
+        let heap = sssp_weighted(&mut db, &mut reader, 0, &weights).expect("heap");
+        assert_ne!(ring[..], heap[..], "widening edge 0 has to move something");
+        weights[0] = 1;
+        assert_eq!(
+            ring,
+            sssp_weighted(&mut db, &mut reader, 0, &weights).expect("ring again")
+        );
+    }
+
+    #[test]
+    fn sssp_weighted_wants_one_weight_an_edge() {
+        let (_dir, mut db, mut reader) = open_with(&[(0u32, 1u32), (1, 2)], 3);
+        let err = sssp_weighted(&mut db, &mut reader, 0, &[1]).expect_err("short column");
+        assert!(err.to_string().contains("1 weights over 2 edges"), "{err}");
     }
 
     #[test]

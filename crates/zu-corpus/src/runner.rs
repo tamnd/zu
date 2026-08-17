@@ -112,9 +112,22 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
         detail,
     };
     let path = dir.join(format!("{}-{}.zu", suite.name, case.name));
-    if let Err(e) = zu::zu1::file::Zu1File::create(&path) {
-        return ran(Outcome::Failed, format!("creating {}: {e}", path.display()));
+    let mut file = match zu::zu1::file::Zu1File::create(&path) {
+        Ok(file) => file,
+        Err(e) => return ran(Outcome::Failed, format!("creating {}: {e}", path.display())),
+    };
+    // The load goes in before the session opens, because it is bulk
+    // load and bulk load is the path that owns the file rather than
+    // one that goes through a statement. Every case of the suite gets
+    // its own copy of it for the same reason every case gets its own
+    // database: a case that read what the case before it wrote would
+    // be a failure that moves when the file is reordered.
+    if let Some(load) = &suite.load
+        && let Err(e) = load.apply(&mut file)
+    {
+        return ran(Outcome::Failed, format!("the suite's load: {e}"));
     }
+    drop(file);
     let mut session = match Session::open(&path) {
         Ok(session) => session,
         Err(e) => return ran(Outcome::Failed, format!("opening {}: {e}", path.display())),
@@ -217,7 +230,7 @@ mod tests {
     use super::*;
     use crate::case::Suite;
 
-    const HEAD: &str = "schema: 1\nsuite: t\ndoc: a suite for the runner's own tests\n\ncases:\n";
+    const HEAD: &str = "schema: 2\nsuite: t\ndoc: a suite for the runner's own tests\n\ncases:\n";
 
     fn run_cases(cases: &str) -> Report {
         let suite = Suite::parse(&format!("{HEAD}{cases}")).expect("the fixture parses");

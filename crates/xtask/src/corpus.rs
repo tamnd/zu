@@ -178,8 +178,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
         for (suite, cases) in suites {
             let mut text = format!(
-                "schema: 1\nsuite: {suite}\ndoc: A suite the packing test wrote, which exists so \
-                 the packer has something to pack.\n\ncases:\n"
+                "schema: {}\nsuite: {suite}\ndoc: A suite the packing test wrote, which exists so \
+                 the packer has something to pack.\n\ncases:\n",
+                zu_corpus::case::SCHEMA
             );
             for n in 0..*cases {
                 text.push_str(&format!(
@@ -263,7 +264,7 @@ mod tests {
     #[test]
     fn a_case_that_does_not_parse_stops_the_pack() {
         let dir = corpus("broken", &[("alpha", 1)]);
-        std::fs::write(dir.join("beta.yaml"), "schema: 1\nsuite: beta\n").expect("writes");
+        std::fs::write(dir.join("beta.yaml"), "schema: 2\nsuite: beta\n").expect("writes");
         let err = pack(&dir, None, "0.1.0").expect_err("refused");
         assert!(err.contains("beta"), "{err}");
     }

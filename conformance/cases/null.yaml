@@ -1,4 +1,4 @@
-schema: 1
+schema: 2
 suite: null
 doc: Three-valued logic, which is the part of the standard a client is most likely to have replaced with its host language's two-valued one without noticing. Every case here has an answer that is neither true nor false, or an answer that is one of them where a two-valued reading gives the other.
 

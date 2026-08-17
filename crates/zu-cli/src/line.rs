@@ -36,6 +36,9 @@ pub(crate) enum Step {
     Quit,
     /// `Ctrl-L`: the screen is cleared and everything is drawn again.
     Clear,
+    /// Tab: the caller holds the names, so it is the caller that
+    /// completes. [`Editor::complete`] is the other half.
+    Complete,
 }
 
 /// The editor's whole state.
@@ -55,9 +58,21 @@ pub(crate) struct Editor {
     /// undo before it can draw.
     drawn_rows: usize,
     drawn_row: usize,
+    /// Whether a redraw paints the statement. Off by default, which is
+    /// what the tests want and what a terminal that has not said
+    /// otherwise gets.
+    colour: bool,
 }
 
 impl Editor {
+    /// An empty editor that paints what it draws, or does not.
+    pub(crate) fn new(colour: bool) -> Editor {
+        Editor {
+            colour,
+            ..Editor::default()
+        }
+    }
+
     /// Forgets the buffer without touching the history, which is what
     /// happens after a statement runs and after `Ctrl-C`.
     ///
@@ -213,11 +228,28 @@ impl Editor {
                     Step::Idle
                 }
             }
-            // Reserved for completion, which is a change of its own.
-            // Doing nothing is better than inserting a tab that the
-            // parser will refuse in a message about syntax.
-            Key::Tab => Step::Idle,
+            // A tab is never a character in a statement, so it is the
+            // one key whose whole meaning is the completion the caller
+            // does with the names it has.
+            Key::Tab => Step::Complete,
         }
+    }
+
+    /// Completes the word the cursor is in, and hands back what is
+    /// worth showing under the prompt.
+    ///
+    /// The insert happens here because the buffer is here; the list
+    /// goes back because printing is the caller's, and because a list
+    /// printed under the prompt is a thing the screen has to be told
+    /// about before the next redraw.
+    pub(crate) fn complete(&mut self, names: &crate::complete::Names) -> Vec<String> {
+        let done = crate::complete::complete(&self.text, self.cursor, names);
+        if !done.insert.is_empty() {
+            self.text.insert_str(self.cursor, &done.insert);
+            self.cursor += done.insert.len();
+            self.browsing = None;
+        }
+        done.list
     }
 
     /// Moves the cursor, and says whether that was a move.
@@ -324,10 +356,15 @@ impl Editor {
             out.push_str(&format!("\x1b[{}A", self.drawn_row));
         }
         out.push_str("\x1b[J");
-        let mut lines = self.text.split('\n').enumerate().peekable();
-        while let Some((i, line)) = lines.next() {
+        // The colour goes on the text that is written and never on the
+        // text the geometry is measured from, because an escape
+        // sequence occupies no column and a row count that included one
+        // would wrap the statement in the wrong place.
+        let painted = crate::highlight::lines(&self.text, self.colour);
+        let mut lines = self.text.split('\n').zip(painted).enumerate().peekable();
+        while let Some((i, (line, painted))) = lines.next() {
             out.push_str(if i == 0 { prompt } else { more });
-            out.push_str(line);
+            out.push_str(&painted);
             let cols = columns(if i == 0 { prompt } else { more }) + columns(line);
             if lines.peek().is_some() || (cols > 0 && cols.is_multiple_of(width)) {
                 out.push_str("\r\n");
@@ -780,6 +817,42 @@ mod tests {
         e.render(80, "zu> ", "..> ");
         // A row of statement below the cursor to step past first.
         assert_eq!(e.tail(), "\x1b[1B\r\n");
+    }
+
+    #[test]
+    fn a_painted_redraw_writes_colour_and_wraps_in_the_same_place() {
+        let mut plain = Editor::default();
+        let mut painted = Editor::new(true);
+        type_in(&mut plain, "MATCH (a)");
+        type_in(&mut painted, "MATCH (a)");
+        let drawn = painted.render(12, "zu> ", "..> ");
+        assert!(drawn.contains("\x1b[1;34mMATCH\x1b[0m"), "{drawn:?}");
+        // The escapes take no columns, so the two agree on the geometry
+        // of the same statement in the same window.
+        plain.render(12, "zu> ", "..> ");
+        assert_eq!(painted.place(12, 4), plain.place(12, 4));
+        assert_eq!(painted.drawn_rows, plain.drawn_rows);
+        assert_eq!(painted.drawn_row, plain.drawn_row);
+    }
+
+    #[test]
+    fn tab_completes_the_word_under_the_cursor() {
+        let mut names = crate::complete::Names {
+            labels: vec!["Person".to_string()],
+            ..crate::complete::Names::default()
+        };
+        names.tidy();
+        let mut e = Editor::default();
+        type_in(&mut e, "MATCH (a:Per");
+        assert_eq!(e.step(Key::Tab), Step::Complete);
+        assert!(e.complete(&names).is_empty());
+        assert_eq!(e.text, "MATCH (a:Person");
+        assert_eq!(e.cursor, e.text.len());
+        // A tab with nothing to say leaves the buffer alone, so a tab is
+        // never a character in a statement.
+        e.step(Key::Tab);
+        assert!(e.complete(&names).is_empty());
+        assert_eq!(e.text, "MATCH (a:Person");
     }
 
     #[test]

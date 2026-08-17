@@ -11,18 +11,20 @@ use zu::{
     ZU_SEVERITY_EXCEPTION, ZU_TEMPORAL_DATE, ZU_TEMPORAL_DURATION_DAY_TIME,
     ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME, ZU_TEMPORAL_LOCAL_TIME,
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
-    ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuResult,
-    ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
+    ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
+    ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
     zu_config_set_z, zu_conn_close, zu_connect, zu_database_close, zu_database_open_z,
     zu_database_path, zu_error_code, zu_error_free, zu_error_message, zu_error_severity,
-    zu_error_status, zu_execute, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
-    zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
-    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
-    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
-    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
-    zu_result_free, zu_result_rows, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64,
-    zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type,
-    zu_version,
+    zu_error_status, zu_execute, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64,
+    zu_loader_col_str, zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish,
+    zu_loader_free, zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare,
+    zu_prepare_z, zu_query, zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type,
+    zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
+    zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
+    zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
+    zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_rows, zu_stmt_close,
+    zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64, zu_value_len, zu_value_node,
+    zu_value_str, zu_value_temporal, zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -1396,6 +1398,464 @@ fn a_cell_carries_what_a_column_of_it_could_not() {
         );
         zu_result_free(result);
 
+        zu_conn_close(conn);
+    }
+}
+
+/// A path in a fresh directory, which the loader creates and the tests
+/// below then open as an ordinary database.
+fn fresh(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    dir.path().join(name)
+}
+
+unsafe fn loader(path: &std::path::Path) -> *mut ZuLoader {
+    let path = path.to_str().expect("utf-8 path");
+    let mut l: *mut ZuLoader = ptr::null_mut();
+    let status = unsafe {
+        zu_loader_create(
+            path.as_ptr().cast::<c_char>(),
+            path.len(),
+            &mut l,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, ZuStatus::Ok, "create {path}");
+    assert!(!l.is_null());
+    l
+}
+
+/// Names the table on the counted form, which is the one a binding
+/// uses.
+unsafe fn table(l: *mut ZuLoader, nodes: &str, edges: &str, rows: u64) -> ZuStatus {
+    unsafe {
+        zu_loader_table(
+            l,
+            nodes.as_ptr().cast::<c_char>(),
+            nodes.len(),
+            edges.as_ptr().cast::<c_char>(),
+            edges.len(),
+            rows,
+            ptr::null_mut(),
+        )
+    }
+}
+
+unsafe fn col_i64_in(l: *mut ZuLoader, name: &str, values: &[i64]) -> ZuStatus {
+    unsafe {
+        zu_loader_col_i64(
+            l,
+            name.as_ptr().cast::<c_char>(),
+            name.len(),
+            values.as_ptr(),
+            values.len() as u64,
+            ptr::null_mut(),
+        )
+    }
+}
+
+unsafe fn col_f64_in(l: *mut ZuLoader, name: &str, values: &[f64]) -> ZuStatus {
+    unsafe {
+        zu_loader_col_f64(
+            l,
+            name.as_ptr().cast::<c_char>(),
+            name.len(),
+            values.as_ptr(),
+            values.len() as u64,
+            ptr::null_mut(),
+        )
+    }
+}
+
+unsafe fn col_bool_in(l: *mut ZuLoader, name: &str, values: &[i32]) -> ZuStatus {
+    unsafe {
+        zu_loader_col_bool(
+            l,
+            name.as_ptr().cast::<c_char>(),
+            name.len(),
+            values.as_ptr(),
+            values.len() as u64,
+            ptr::null_mut(),
+        )
+    }
+}
+
+/// The counted form, so a value holding a NUL is a value like any
+/// other rather than a string that ends early.
+unsafe fn col_str_in(l: *mut ZuLoader, name: &str, values: &[&str]) -> ZuStatus {
+    let ptrs: Vec<*const c_char> = values.iter().map(|s| s.as_ptr().cast::<c_char>()).collect();
+    let lens: Vec<usize> = values.iter().map(|s| s.len()).collect();
+    unsafe {
+        zu_loader_col_str(
+            l,
+            name.as_ptr().cast::<c_char>(),
+            name.len(),
+            ptrs.as_ptr(),
+            lens.as_ptr(),
+            values.len() as u64,
+            ptr::null_mut(),
+        )
+    }
+}
+
+unsafe fn col_temporal_in(l: *mut ZuLoader, name: &str, kind: i32, values: &[i64]) -> ZuStatus {
+    unsafe {
+        zu_loader_col_temporal(
+            l,
+            name.as_ptr().cast::<c_char>(),
+            name.len(),
+            kind,
+            values.as_ptr(),
+            values.len() as u64,
+            ptr::null_mut(),
+        )
+    }
+}
+
+/// Everything a corpus fixture puts in a table goes in through this,
+/// and everything a query can return comes back out, which is the whole
+/// point of the loader: the value crosses the boundary twice and by two
+/// different mechanisms, so a bug in either one shows up as a mismatch.
+#[test]
+fn a_loader_builds_a_database_a_query_reads_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = fresh(&dir, "loaded.zu1");
+    unsafe {
+        let l = loader(&path);
+        assert_eq!(table(l, "person", "knows", 3), ZuStatus::Ok);
+
+        assert_eq!(col_i64_in(l, "age", &[30, 40, 50]), ZuStatus::Ok);
+
+        assert_eq!(col_f64_in(l, "score", &[1.5, 2.5, -0.5]), ZuStatus::Ok);
+
+        // Any nonzero is true, so 7 is as much a yes as 1 is.
+        assert_eq!(col_bool_in(l, "ok", &[1, 0, 7]), ZuStatus::Ok);
+
+        // The counted form carries a length that is not a strlen: the
+        // second name holds an embedded NUL, which is a string a `_z`
+        // call could not pass and a counted one has no trouble with.
+        assert_eq!(col_str_in(l, "name", &["ann", "b\0b", "cy"]), ZuStatus::Ok);
+
+        // 2024-02-29, 2024-03-01, 1969-12-31, in the days
+        // zu_value_temporal reads a date back out as.
+        assert_eq!(
+            col_temporal_in(l, "born", ZU_TEMPORAL_DATE, &[19782, 19783, -1]),
+            ZuStatus::Ok
+        );
+        assert_eq!(
+            col_temporal_in(
+                l,
+                "at",
+                ZU_TEMPORAL_LOCAL_TIME,
+                &[45_296_123_456_789, 0, 86_399_000_000_000]
+            ),
+            ZuStatus::Ok
+        );
+        assert_eq!(
+            col_temporal_in(l, "span", ZU_TEMPORAL_DURATION_YEAR_MONTH, &[14, 0, -3]),
+            ZuStatus::Ok
+        );
+
+        // Two calls, because a host streaming edges makes as many as it
+        // likes, and the duplicate is what the loader deduplicates.
+        let from = [0u32, 1];
+        let to = [1u32, 2];
+        assert_eq!(
+            zu_loader_edges(l, from.as_ptr(), to.as_ptr(), 2, ptr::null_mut()),
+            ZuStatus::Ok
+        );
+        let again = [0u32];
+        assert_eq!(
+            zu_loader_edges(l, again.as_ptr(), again[..].as_ptr(), 1, ptr::null_mut()),
+            ZuStatus::Ok
+        );
+        let dup_to = [1u32];
+        assert_eq!(
+            zu_loader_edges(l, again.as_ptr(), dup_to.as_ptr(), 1, ptr::null_mut()),
+            ZuStatus::Ok
+        );
+
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_loader_finish(l, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        zu_loader_free(l);
+
+        // From here on it is an ordinary database, opened the ordinary
+        // way.
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        let result = query(
+            conn,
+            "MATCH (p:person) RETURN p.age AS a ORDER BY a",
+            &mut err,
+        );
+        assert_eq!(col_i64(result, 0, 3), [30, 40, 50]);
+        zu_result_free(result);
+
+        let result = query(
+            conn,
+            "MATCH (p:person) RETURN p.score AS s ORDER BY s",
+            &mut err,
+        );
+        let mut scores = Vec::new();
+        for row in 0..3 {
+            let mut v = 0f64;
+            assert_eq!(zu_value_f64(cell(result, row, 0), &mut v), ZuStatus::Ok);
+            scores.push(v);
+        }
+        assert_eq!(scores, vec![-0.5, 1.5, 2.5]);
+        zu_result_free(result);
+
+        let result = query(
+            conn,
+            "MATCH (p:person) RETURN p.ok AS o, p.age AS a ORDER BY a",
+            &mut err,
+        );
+        let mut flags = Vec::new();
+        for row in 0..3 {
+            let mut v = -1i32;
+            assert_eq!(zu_value_bool(cell(result, row, 0), &mut v), ZuStatus::Ok);
+            flags.push(v);
+        }
+        assert_eq!(flags, vec![1, 0, 1], "any nonzero went in as one true");
+        zu_result_free(result);
+
+        let result = query(
+            conn,
+            "MATCH (p:person) RETURN p.name AS n, p.age AS a ORDER BY a",
+            &mut err,
+        );
+        let read: Vec<&str> = (0..3).map(|row| value_str(cell(result, row, 0))).collect();
+        assert_eq!(read, vec!["ann", "b\0b", "cy"], "the NUL survived the trip");
+        zu_result_free(result);
+
+        // Every temporal comes back as the kind and count it went in
+        // as, which is the property a corpus runner leans on.
+        for (column, kind, want) in [
+            ("born", ZU_TEMPORAL_DATE, [19782i64, 19783, -1]),
+            (
+                "at",
+                ZU_TEMPORAL_LOCAL_TIME,
+                [45_296_123_456_789, 0, 86_399_000_000_000],
+            ),
+            ("span", ZU_TEMPORAL_DURATION_YEAR_MONTH, [14, 0, -3]),
+        ] {
+            let text = format!("MATCH (p:person) RETURN p.{column} AS t, p.age AS a ORDER BY a");
+            let result = query(conn, &text, &mut err);
+            for (row, want) in want.iter().enumerate() {
+                let mut got_kind = -1i32;
+                let mut count = i64::MIN;
+                let mut offset = i32::MIN;
+                assert_eq!(
+                    zu_value_temporal(
+                        cell(result, row as u64, 0),
+                        &mut got_kind,
+                        &mut count,
+                        &mut offset
+                    ),
+                    ZuStatus::Ok,
+                    "{column} row {row}"
+                );
+                assert_eq!(got_kind, kind, "{column} row {row}");
+                assert_eq!(count, *want, "{column} row {row}");
+                assert_eq!(offset, 0);
+            }
+            zu_result_free(result);
+        }
+
+        // Three distinct edges went in across three calls, one of them
+        // a repeat of the first, and three minus the repeat came out.
+        let result = query(
+            conn,
+            "MATCH (:person)-[:knows]->(:person) RETURN 1 AS n",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), 3);
+        zu_result_free(result);
+
+        zu_conn_close(conn);
+    }
+}
+
+/// Every way to hand a loader something that cannot be a table, each
+/// answered at the call that did it rather than at finish, and none of
+/// them leaving the loader in a state where the next call would write
+/// half a database.
+#[test]
+fn a_loader_refuses_what_cannot_be_a_table() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    unsafe {
+        // A column before the table has nothing to be a column of.
+        let l = loader(&fresh(&dir, "a.zu1"));
+        assert_eq!(col_i64_in(l, "age", &[1, 2]), ZuStatus::Misuse);
+        assert_eq!(table(l, "person", "knows", 0), ZuStatus::Misuse);
+        assert_eq!(table(l, "", "knows", 2), ZuStatus::Misuse);
+        assert_eq!(table(l, "person", "knows", 2), ZuStatus::Ok);
+        // One table per loader.
+        assert_eq!(table(l, "other", "knows", 2), ZuStatus::Misuse);
+
+        // A column that is not as wide as the table was said to be.
+        assert_eq!(col_i64_in(l, "age", &[1, 2, 3]), ZuStatus::Misuse);
+        assert_eq!(col_i64_in(l, "age", &[1, 2]), ZuStatus::Ok);
+        // And the same name twice, which would be two answers to one
+        // question.
+        assert_eq!(col_i64_in(l, "age", &[3, 4]), ZuStatus::Misuse);
+        assert_eq!(col_i64_in(l, "", &[3, 4]), ZuStatus::Misuse);
+
+        // An edge that reaches past the table it is inside of.
+        let from = [0u32];
+        let past = [2u32];
+        assert_eq!(
+            zu_loader_edges(l, from.as_ptr(), past.as_ptr(), 1, ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+
+        // A zoned column is refused for a reason of its own: the store
+        // has nowhere to keep the offset, which is not the caller's
+        // mistake and does not read as one.
+        let mut err: *mut ZuError = ptr::null_mut();
+        let nanos = [0i64, 0];
+        assert_eq!(
+            zu_loader_col_temporal(
+                l,
+                "at".as_ptr().cast::<c_char>(),
+                2,
+                ZU_TEMPORAL_ZONED_DATETIME,
+                nanos.as_ptr(),
+                2,
+                &mut err
+            ),
+            ZuStatus::Unsupported
+        );
+        assert!(!err.is_null());
+        let mut len = 0usize;
+        let message = CStr::from_ptr(zu_error_message(err, &mut len))
+            .to_str()
+            .expect("utf-8");
+        assert!(message.contains("zoned"), "{message}");
+        zu_error_free(err);
+
+        // A tag that is not one of the seven.
+        assert_eq!(col_temporal_in(l, "at", 99, &nanos), ZuStatus::Misuse);
+        // A date that is not a number of days any date has.
+        assert_eq!(
+            col_temporal_in(l, "d", ZU_TEMPORAL_DATE, &[i64::MAX, 0]),
+            ZuStatus::Misuse
+        );
+
+        // A string that is not UTF-8 is refused now rather than read
+        // back later as something no query could return.
+        let bad: [u8; 2] = [0xff, 0xfe];
+        let ptrs = [bad.as_ptr().cast::<c_char>(), bad.as_ptr().cast::<c_char>()];
+        let lens = [2usize, 2];
+        assert_eq!(
+            zu_loader_col_str(
+                l,
+                "n".as_ptr().cast::<c_char>(),
+                1,
+                ptrs.as_ptr(),
+                lens.as_ptr(),
+                2,
+                ptr::null_mut()
+            ),
+            ZuStatus::Misuse
+        );
+
+        // Everything above was refused, so what is left is the one
+        // good column and no edges, and that is what finishes.
+        assert_eq!(zu_loader_finish(l, ptr::null_mut()), ZuStatus::Ok);
+        zu_loader_free(l);
+
+        // NULL is a misuse and not a crash, and free of NULL is a
+        // no-op, on the same terms as every other handle here.
+        assert_eq!(
+            zu_loader_table_z(
+                ptr::null_mut(),
+                c("a").as_ptr(),
+                c("b").as_ptr(),
+                1,
+                ptr::null_mut()
+            ),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_loader_finish(ptr::null_mut(), ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+        zu_loader_free(ptr::null_mut());
+
+        let mut out: *mut ZuLoader = ptr::null_mut();
+        let taken = fresh(&dir, "a.zu1");
+        let taken = taken.to_str().expect("utf-8");
+        assert_ne!(
+            zu_loader_create(
+                taken.as_ptr().cast::<c_char>(),
+                taken.len(),
+                &mut out,
+                ptr::null_mut()
+            ),
+            ZuStatus::Ok,
+            "a bulk load builds a database rather than clobbering one"
+        );
+        assert!(out.is_null());
+    }
+}
+
+/// A finished loader is spent, including one whose finish failed, so a
+/// host that keeps the handle around cannot write half a second table
+/// through it. The answer is the one a statement gives after its
+/// connection closed, and it means the same thing.
+#[test]
+fn a_finished_loader_is_spent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    unsafe {
+        let l = loader(&fresh(&dir, "spent.zu1"));
+        assert_eq!(table(l, "person", "knows", 2), ZuStatus::Ok);
+        assert_eq!(col_i64_in(l, "age", &[1, 2]), ZuStatus::Ok);
+        assert_eq!(zu_loader_finish(l, ptr::null_mut()), ZuStatus::Ok);
+
+        assert_eq!(zu_loader_finish(l, ptr::null_mut()), ZuStatus::MisuseClosed);
+        assert_eq!(col_i64_in(l, "height", &[1, 2]), ZuStatus::MisuseClosed);
+        assert_eq!(table(l, "thing", "link", 2), ZuStatus::MisuseClosed);
+        let ends = [0u32];
+        assert_eq!(
+            zu_loader_edges(l, ends.as_ptr(), ends.as_ptr(), 1, ptr::null_mut()),
+            ZuStatus::MisuseClosed
+        );
+        zu_loader_free(l);
+
+        // A finish with no table is a failure, and it spends the loader
+        // too: there is no half-built load to add to afterwards.
+        let l = loader(&fresh(&dir, "empty.zu1"));
+        assert_eq!(zu_loader_finish(l, ptr::null_mut()), ZuStatus::Misuse);
+        assert_eq!(table(l, "person", "knows", 2), ZuStatus::MisuseClosed);
+        zu_loader_free(l);
+
+        // A loader freed before it finished wrote nothing, and the file
+        // it created is still there and still empty.
+        let unfinished = fresh(&dir, "unfinished.zu1");
+        let l = loader(&unfinished);
+        assert_eq!(table(l, "person", "knows", 2), ZuStatus::Ok);
+        zu_loader_free(l);
+        assert!(unfinished.exists(), "the path is the caller's to remove");
+        let conn = open(&unfinished);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut result: *mut ZuResult = ptr::null_mut();
+        let text = "MATCH (p:person) RETURN p.age AS a";
+        assert_ne!(
+            zu_query(
+                conn,
+                text.as_ptr().cast::<c_char>(),
+                text.len(),
+                &mut result,
+                &mut err
+            ),
+            ZuStatus::Ok,
+            "nothing was written, so there is no person table"
+        );
+        if !err.is_null() {
+            zu_error_free(err);
+        }
         zu_conn_close(conn);
     }
 }

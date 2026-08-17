@@ -71,6 +71,14 @@
 //! fits an `int64_t *`. A cell pointer borrows from the result rather
 //! than allocating, so the reader costs a pointer per value and the
 //! columnar path stays the one a bulk read uses.
+//!
+//! Values get in through [`ZuLoader`], which is the other half and the
+//! only one in v0: `CREATE` and `INSERT` need a table and no statement
+//! makes one, so a host with data and an empty file has nowhere else to
+//! go. A loader is columnar for the same reason a result is, one call
+//! per column rather than one per cell, and it is the entry point the
+//! Rust appender and `zu copy` are both built on rather than a second
+//! way in beside them.
 
 // The pointer contract (what must be valid, who frees what, in which
 // order) is one contract for the whole surface; it lives in the module
@@ -88,6 +96,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use zu_common::{DurationKind, Temporal};
 use zudb::query::{QueryResult, Value};
+use zudb::zu1::file::Zu1File;
+use zudb::zu1::graph::bulk_load_keyed;
+use zudb::zu1::props::{PropValues, store_props};
 use zudb::{Config, Connection, Database, Severity, ZuError as EngineError};
 
 /// What a call answers, which is control flow and nothing else.
@@ -2105,6 +2116,568 @@ pub unsafe extern "C" fn zu_result_free(result: *mut ZuResult) {
     if !result.is_null() {
         drop(unsafe { Box::from_raw(result) });
     }
+}
+
+/* ---- bulk load ---- */
+
+/// A database being built. Opaque to C, freed with
+/// [`zu_loader_free`], and not thread-safe on the same terms as
+/// [`ZuConn`]: it holds the columns it was given, so two threads adding
+/// to one loader would be two threads writing one vector.
+///
+/// Nothing reaches the file until [`zu_loader_finish`], because the
+/// property store takes every column of a table in one call and a
+/// loader that wrote each one as it arrived would be writing a
+/// different table each time. What that costs is the columns held in
+/// memory; what it buys is that a load either happened or did not.
+pub struct ZuLoader {
+    db: Zu1File,
+    table: Option<Table>,
+    state: Arc<ConnState>,
+}
+
+/// What a loader has been told so far.
+struct Table {
+    nodes: String,
+    edges: String,
+    rows: u64,
+    pairs: Vec<(u32, u32)>,
+    columns: Vec<(String, LoadColumn)>,
+}
+
+/// A column reduced to the vector the property store keeps it in.
+///
+/// Owned rather than borrowed from the caller's arrays. A borrow would
+/// mean a rule no header can state safely, that every array a host
+/// passed stays alive and unmoved until a call it makes later, and a
+/// host that broke it would get a corrupt database rather than an
+/// error. The copy is a memcpy per column against a load that writes
+/// every one of those bytes to disk, and for an int column it is not
+/// even extra work: the store keeps ints as `u64` and the conversion
+/// has to walk them anyway.
+enum LoadColumn {
+    Int(Vec<u64>),
+    Float(Vec<f64>),
+    Bool(Vec<bool>),
+    Str(Vec<Vec<u8>>),
+    Date(Vec<i32>),
+    LocalTime(Vec<i64>),
+    LocalDatetime(Vec<i64>),
+    Duration(DurationKind, Vec<i64>),
+}
+
+/// A counted array from C, on the same terms as [`counted`]: a null
+/// pointer with a zero length is the empty array rather than a mistake.
+unsafe fn array<'a, T>(p: *const T, len: u64, what: &str) -> Result<&'a [T], EngineError> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if p.is_null() {
+        return Err(misuse(format!("{what} is NULL with a non-zero length")));
+    }
+    let len = usize::try_from(len)
+        .map_err(|_| misuse(format!("{what} is longer than this machine can address")))?;
+    Ok(unsafe { std::slice::from_raw_parts(p, len) })
+}
+
+/// Claims a loader for one call. A loader that has finished answers
+/// [`ZuStatus::MisuseClosed`], which is the same answer a statement
+/// gives after its connection closed and means the same thing: the
+/// handle is still safe to free and nothing else.
+unsafe fn claim_loader(l: *mut ZuLoader) -> Result<Claim, ZuStatus> {
+    if l.is_null() {
+        return Err(ZuStatus::Misuse);
+    }
+    claim(&Arc::clone(unsafe { &(*l).state }))
+}
+
+/// The load being built, under a [`Claim`], and projected off the raw
+/// pointer for the reason [`conn_state`] is.
+unsafe fn loader_table<'a>(l: *mut ZuLoader) -> &'a mut Option<Table> {
+    unsafe { &mut (*l).table }
+}
+
+/// The file being built, under a [`Claim`] as above.
+unsafe fn loader_db<'a>(l: *mut ZuLoader) -> &'a mut Zu1File {
+    unsafe { &mut (*l).db }
+}
+
+/// Takes one column, once the call that produced it has turned the
+/// caller's array into the vector the store wants.
+///
+/// The width check is here rather than at `finish` so that a column
+/// with a value missing is refused at the call that passed it, where
+/// the caller still knows which column it was building.
+fn add(
+    table: &mut Option<Table>,
+    name: &str,
+    len: usize,
+    column: LoadColumn,
+) -> Result<ZuStatus, EngineError> {
+    let Some(table) = table.as_mut() else {
+        return Err(misuse(
+            "the loader has no table yet, so a column has nothing to be in",
+        ));
+    };
+    if name.is_empty() {
+        return Err(misuse("a column has a name"));
+    }
+    if len as u64 != table.rows {
+        return Err(misuse(format!(
+            "column {name:?} has {len} values against a table of {} rows",
+            table.rows
+        )));
+    }
+    if table.columns.iter().any(|(had, _)| had == name) {
+        return Err(misuse(format!("column {name:?} was given twice")));
+    }
+    table.columns.push((name.to_string(), column));
+    Ok(ZuStatus::Ok)
+}
+
+/// Starts a load into a new database at `path`.
+///
+/// Fails if the path exists, which is what `zu copy` does and for the
+/// same reason: a bulk load builds a database rather than adding to
+/// one, so a path that is already a database is a caller who meant a
+/// different path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_create(
+    path: *const c_char,
+    path_len: usize,
+    out: *mut *mut ZuLoader,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let path = unsafe { counted(path, path_len, "path") }?;
+        let db = Zu1File::create(Path::new(path))?;
+        let loader = ZuLoader {
+            db,
+            table: None,
+            state: Arc::new(ConnState {
+                alive: AtomicBool::new(true),
+                busy: AtomicBool::new(false),
+            }),
+        };
+        unsafe { *out = Box::into_raw(Box::new(loader)) };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_create_z(
+    path: *const c_char,
+    out: *mut *mut ZuLoader,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_loader_create(path, zlen(path), out, err) }
+}
+
+/// Names the node table, the rel table, and how many rows the node
+/// table has. Everything after this is checked against `rows`.
+///
+/// The row count is given rather than counted from the first column,
+/// so a column with a value missing is an error and not a shorter
+/// table, and so a load of nodes with no columns at all is still a
+/// load. One table per loader in v0, which is what `bulk_load_keyed`
+/// builds.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_table(
+    l: *mut ZuLoader,
+    nodes: *const c_char,
+    nodes_len: usize,
+    edges: *const c_char,
+    edges_len: usize,
+    rows: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let nodes = unsafe { counted(nodes, nodes_len, "nodes") }?;
+        let edges = unsafe { counted(edges, edges_len, "edges") }?;
+        if nodes.is_empty() || edges.is_empty() {
+            return Err(misuse("a table has a node name and an edge name"));
+        }
+        if rows == 0 {
+            return Err(misuse(
+                "a load of no rows is a load nothing can be read back from",
+            ));
+        }
+        let table = unsafe { loader_table(l) };
+        if table.is_some() {
+            return Err(misuse("this loader already has a table"));
+        }
+        *table = Some(Table {
+            nodes: nodes.to_string(),
+            edges: edges.to_string(),
+            rows,
+            pairs: Vec::new(),
+            columns: Vec::new(),
+        });
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_table_z(
+    l: *mut ZuLoader,
+    nodes: *const c_char,
+    edges: *const c_char,
+    rows: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_loader_table(l, nodes, zlen(nodes), edges, zlen(edges), rows, err) }
+}
+
+/// Adds edges, as the row each one starts at and the row it ends at.
+///
+/// Two arrays rather than an array of pairs, because a host that has
+/// its edges in columns can pass them without building a third array,
+/// and a host that has them in pairs is writing a loop either way. The
+/// call appends, so a host streaming edges calls it as often as it
+/// likes; the loader sorts and deduplicates at [`zu_loader_finish`],
+/// which is what the graph builder wants and one fewer thing for a
+/// caller to get wrong.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_edges(
+    l: *mut ZuLoader,
+    from: *const u32,
+    to: *const u32,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let from = unsafe { array(from, count, "from") }?;
+        let to = unsafe { array(to, count, "to") }?;
+        let Some(table) = unsafe { loader_table(l) }.as_mut() else {
+            return Err(misuse(
+                "the loader has no table yet, so an edge has nothing to join",
+            ));
+        };
+        for (i, (&a, &b)) in from.iter().zip(to).enumerate() {
+            if u64::from(a) >= table.rows || u64::from(b) >= table.rows {
+                return Err(misuse(format!(
+                    "edge {i} joins rows {a} and {b} of a table with {} rows in it",
+                    table.rows
+                )));
+            }
+        }
+        table
+            .pairs
+            .extend(from.iter().copied().zip(to.iter().copied()));
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Adds a column of integers. `values` holds one per row of the table.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_col_i64(
+    l: *mut ZuLoader,
+    name: *const c_char,
+    name_len: usize,
+    values: *const i64,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let values = unsafe { array(values, count, "values") }?;
+        let held = values.iter().map(|v| *v as u64).collect();
+        add(
+            unsafe { loader_table(l) },
+            name,
+            values.len(),
+            LoadColumn::Int(held),
+        )
+    })
+}
+
+/// Adds a column of floats.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_col_f64(
+    l: *mut ZuLoader,
+    name: *const c_char,
+    name_len: usize,
+    values: *const f64,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let values = unsafe { array(values, count, "values") }?;
+        let held = values.to_vec();
+        add(
+            unsafe { loader_table(l) },
+            name,
+            values.len(),
+            LoadColumn::Float(held),
+        )
+    })
+}
+
+/// Adds a column of booleans, where any nonzero value is true.
+///
+/// `int32_t` rather than C99 `_Bool`, because the header is C89-safe
+/// and because every other truth value on this boundary is already an
+/// `int32_t`: [`zu_value_bool`] writes one out and this reads one in.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_col_bool(
+    l: *mut ZuLoader,
+    name: *const c_char,
+    name_len: usize,
+    values: *const i32,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let values = unsafe { array(values, count, "values") }?;
+        let held = values.iter().map(|v| *v != 0).collect();
+        add(
+            unsafe { loader_table(l) },
+            name,
+            values.len(),
+            LoadColumn::Bool(held),
+        )
+    })
+}
+
+/// Adds a column of strings, as an array of pointers and an array of
+/// byte lengths.
+///
+/// The lengths are separate so that a caller whose strings are not
+/// NUL-terminated, which is most of them once a binding is involved,
+/// passes what it has. Every string is checked for UTF-8 now rather
+/// than read back as something no query could return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_col_str(
+    l: *mut ZuLoader,
+    name: *const c_char,
+    name_len: usize,
+    values: *const *const c_char,
+    lens: *const usize,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let values = unsafe { array(values, count, "values") }?;
+        let lens = unsafe { array(lens, count, "lens") }?;
+        let mut held = Vec::with_capacity(values.len());
+        for (row, (&p, &len)) in values.iter().zip(lens).enumerate() {
+            let text = unsafe { counted(p, len, &format!("row {row}")) }?;
+            held.push(text.as_bytes().to_vec());
+        }
+        add(
+            unsafe { loader_table(l) },
+            name,
+            values.len(),
+            LoadColumn::Str(held),
+        )
+    })
+}
+
+/// [`zu_loader_col_str`] for a caller who has an array of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_col_str_z(
+    l: *mut ZuLoader,
+    name: *const c_char,
+    values: *const *const c_char,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, zlen(name), "name") }?;
+        let values = unsafe { array(values, count, "values") }?;
+        let mut held = Vec::with_capacity(values.len());
+        for (row, &p) in values.iter().enumerate() {
+            let text = unsafe { counted(p, zlen(p), &format!("row {row}")) }?;
+            held.push(text.as_bytes().to_vec());
+        }
+        add(
+            unsafe { loader_table(l) },
+            name,
+            values.len(),
+            LoadColumn::Str(held),
+        )
+    })
+}
+
+/// Adds a column of temporals, as one `ZU_TEMPORAL_*` kind and the
+/// count each row holds in the unit that kind implies.
+///
+/// This is [`zu_value_temporal`] read backwards, deliberately: a
+/// runner that read a date out as 19782 days writes it back in as
+/// 19782 days, and a host needs one mapping rather than two. One call
+/// for all of them rather than a call per kind, for the same reason
+/// the reader has one tag.
+///
+/// `ZU_TEMPORAL_ZONED_TIME` and `ZU_TEMPORAL_ZONED_DATETIME` answer
+/// [`ZuStatus::Unsupported`], because a stored column has nowhere to
+/// keep the offset that makes those two what they are. A zoned value
+/// still comes back out of a query, which is where they are read.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_col_temporal(
+    l: *mut ZuLoader,
+    name: *const c_char,
+    name_len: usize,
+    kind: i32,
+    values: *const i64,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let values = unsafe { array(values, count, "values") }?;
+        let held =
+            match kind {
+                ZU_TEMPORAL_DATE => {
+                    let mut days = Vec::with_capacity(values.len());
+                    for (row, v) in values.iter().enumerate() {
+                        days.push(i32::try_from(*v).map_err(|_| {
+                            misuse(format!("row {row} is {v} days, which is no date"))
+                        })?);
+                    }
+                    LoadColumn::Date(days)
+                }
+                ZU_TEMPORAL_LOCAL_TIME => LoadColumn::LocalTime(values.to_vec()),
+                ZU_TEMPORAL_LOCAL_DATETIME => LoadColumn::LocalDatetime(values.to_vec()),
+                ZU_TEMPORAL_DURATION_YEAR_MONTH => {
+                    LoadColumn::Duration(DurationKind::YearMonth, values.to_vec())
+                }
+                ZU_TEMPORAL_DURATION_DAY_TIME => {
+                    LoadColumn::Duration(DurationKind::DayTime, values.to_vec())
+                }
+                ZU_TEMPORAL_ZONED_TIME | ZU_TEMPORAL_ZONED_DATETIME => {
+                    return Err(EngineError::Unsupported {
+                        what: "a stored column of the zoned temporal kind",
+                        id: kind as u32,
+                    });
+                }
+                other => return Err(misuse(format!("{other} is no ZU_TEMPORAL_ kind"))),
+            };
+        add(unsafe { loader_table(l) }, name, values.len(), held)
+    })
+}
+
+/// Writes everything the loader was given and closes it.
+///
+/// The database is on disk when this returns `ZU_OK`, and
+/// [`zu_open`] on the same path reads it. The loader is spent either
+/// way: a call after this answers [`ZuStatus::MisuseClosed`], including
+/// after a failure, because a load that stopped halfway is not one to
+/// add more columns to. Freeing is all that is left.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_finish(l: *mut ZuLoader, err: *mut *mut ZuError) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_loader(l) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        // Spent before the first thing that can fail, so that every way
+        // out of here leaves a loader that can only be freed.
+        unsafe { &(*l).state }.alive.store(false, Ordering::Release);
+        let Some(table) = unsafe { loader_table(l) }.take() else {
+            return Err(misuse(
+                "the loader has no table, so there is nothing to write",
+            ));
+        };
+        let db = unsafe { loader_db(l) };
+        let mut pairs = table.pairs;
+        pairs.sort_unstable();
+        pairs.dedup();
+        bulk_load_keyed(db, &table.nodes, &table.edges, table.rows, &pairs, None)?;
+        if table.columns.is_empty() {
+            return Ok(ZuStatus::Ok);
+        }
+        // The store borrows a column at a time, and wants a slice of
+        // slices for a string column, which a `Vec<Vec<u8>>` is not. So
+        // the row borrows are built first and handed over after, which
+        // is the same two-step the corpus loader does.
+        let rows: Vec<Vec<&[u8]>> = table
+            .columns
+            .iter()
+            .map(|(_, held)| match held {
+                LoadColumn::Str(v) => v.iter().map(Vec::as_slice).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let props: Vec<(&str, PropValues<'_>)> = table
+            .columns
+            .iter()
+            .zip(&rows)
+            .map(|((name, held), rows)| {
+                let values = match held {
+                    LoadColumn::Str(_) => PropValues::Str(rows),
+                    LoadColumn::Int(v) => PropValues::Int(v),
+                    LoadColumn::Float(v) => PropValues::Float(v),
+                    LoadColumn::Bool(v) => PropValues::Bool(v),
+                    LoadColumn::Date(v) => PropValues::Date(v),
+                    LoadColumn::LocalTime(v) => PropValues::LocalTime(v),
+                    LoadColumn::LocalDatetime(v) => PropValues::LocalDatetime(v),
+                    LoadColumn::Duration(kind, v) => PropValues::Duration(*kind, v),
+                };
+                (name.as_str(), values)
+            })
+            .collect();
+        store_props(db, &table.nodes, &props)?;
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Frees a loader. A loader freed before [`zu_loader_finish`] wrote
+/// nothing, and the file it created is left where it is, empty, for the
+/// caller to remove: deleting a path this library was handed is not a
+/// thing a free should do.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_loader_free(l: *mut ZuLoader) {
+    if l.is_null() {
+        return;
+    }
+    let state = Arc::clone(unsafe { &(*l).state });
+    state.alive.store(false, Ordering::Release);
+    // Freeing under another thread's call would free memory that thread
+    // is inside of, so this leaks instead, on the same terms as
+    // [`zu_conn_close`].
+    if state.busy.load(Ordering::Acquire) {
+        return;
+    }
+    drop(unsafe { Box::from_raw(l) });
 }
 
 #[cfg(test)]

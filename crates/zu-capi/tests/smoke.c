@@ -263,6 +263,143 @@ int main(int argc, char **argv) {
     zu_result_free(values);
   }
 
+  /* The loader, which is how values get in and so the other half of
+   * what a binding does. It builds a database of its own beside the one
+   * this was given, then opens it and reads back what it wrote: a
+   * column that arrives wrong is a column that reads back wrong, and no
+   * amount of checking the write alone would say so. */
+  {
+    const char *suffix = ".load";
+    char *loaded = (char *)malloc(strlen(argv[1]) + strlen(suffix) + 1);
+    zu_loader *loader = NULL;
+    zu_conn *reader = NULL;
+    zu_result *back = NULL;
+    const int64_t ages[3] = {30, 40, 50};
+    const double scores[3] = {1.5, 2.5, -0.5};
+    const int32_t flags[3] = {1, 0, 7};
+    const char *names[3] = {"ann", "bo", "cy"};
+    /* 2024-02-29, 2024-03-01, and the day before the epoch. */
+    const int64_t days[3] = {19782, 19783, -1};
+    const uint32_t from[2] = {0, 1};
+    const uint32_t to[2] = {1, 2};
+    const int64_t *read = NULL;
+    if (loaded == NULL) {
+      zu_conn_close(first);
+      return fail("out of memory");
+    }
+    strcpy(loaded, argv[1]);
+    strcat(loaded, suffix);
+    /* The smoke test runs several times over one working directory, and
+     * a loader will not clobber a database, so the leftover from the
+     * last run goes first. */
+    remove(loaded);
+
+    status = zu_loader_create_z(loaded, &loader, &err);
+    if (status != ZU_OK) {
+      free(loaded);
+      zu_conn_close(first);
+      return report("loader create failed", status, err);
+    }
+    status = zu_loader_table_z(loader, "person", "knows", 3, &err);
+    if (status == ZU_OK) {
+      status = zu_loader_col_i64(loader, "age", 3, ages, 3, &err);
+    }
+    if (status == ZU_OK) {
+      status = zu_loader_col_f64(loader, "score", 5, scores, 3, &err);
+    }
+    if (status == ZU_OK) {
+      status = zu_loader_col_bool(loader, "ok", 2, flags, 3, &err);
+    }
+    if (status == ZU_OK) {
+      status = zu_loader_col_str_z(loader, "name", names, 3, &err);
+    }
+    if (status == ZU_OK) {
+      status = zu_loader_col_temporal(loader, "born", 4, ZU_TEMPORAL_DATE, days, 3, &err);
+    }
+    if (status == ZU_OK) {
+      status = zu_loader_edges(loader, from, to, 2, &err);
+    }
+    if (status == ZU_OK) {
+      status = zu_loader_finish(loader, &err);
+    }
+    if (status != ZU_OK) {
+      zu_loader_free(loader);
+      remove(loaded);
+      free(loaded);
+      zu_conn_close(first);
+      return report("load failed", status, err);
+    }
+    /* Spent, and saying so rather than writing a second table through a
+     * handle the host forgot to drop. */
+    if (zu_loader_finish(loader, NULL) != ZU_MISUSE_CLOSED) {
+      zu_loader_free(loader);
+      remove(loaded);
+      free(loaded);
+      zu_conn_close(first);
+      return fail("a finished loader took another call");
+    }
+    zu_loader_free(loader);
+
+    status = zu_open_z(loaded, &reader, &err);
+    if (status != ZU_OK) {
+      remove(loaded);
+      free(loaded);
+      zu_conn_close(first);
+      return report("the loaded database did not open", status, err);
+    }
+    status = zu_query_z(reader, "MATCH (p:person) RETURN p.age AS a ORDER BY a", &back, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(reader);
+      remove(loaded);
+      free(loaded);
+      zu_conn_close(first);
+      return report("the loaded database did not read", status, err);
+    }
+    if (zu_result_rows(back) != 3 || zu_result_col_i64(back, 0, &read) != ZU_OK || read == NULL ||
+        read[0] != 30 || read[1] != 40 || read[2] != 50) {
+      zu_result_free(back);
+      zu_conn_close(reader);
+      remove(loaded);
+      free(loaded);
+      zu_conn_close(first);
+      return fail("a column went in and came back as something else");
+    }
+    zu_result_free(back);
+
+    /* The date, read through the cell reader in the unit it was written
+     * in, which is the round trip a corpus runner is actually made of.
+     */
+    back = NULL;
+    status = zu_query_z(reader, "MATCH (p:person) WHERE p.name = 'ann' RETURN p.born AS b", &back,
+                        &err);
+    if (status != ZU_OK) {
+      zu_conn_close(reader);
+      remove(loaded);
+      free(loaded);
+      zu_conn_close(first);
+      return report("the loaded date did not read", status, err);
+    }
+    {
+      const zu_value *born = NULL;
+      int32_t kind = -1;
+      int64_t count = 0;
+      if (zu_result_rows(back) != 1 || zu_result_cell(back, 0, 0, &born) != ZU_OK ||
+          zu_value_temporal(born, &kind, &count, NULL) != ZU_OK || kind != ZU_TEMPORAL_DATE ||
+          count != 19782) {
+        zu_result_free(back);
+        zu_conn_close(reader);
+        remove(loaded);
+        free(loaded);
+        zu_conn_close(first);
+        return fail("a date went in as days and came back as something else");
+      }
+    }
+    zu_result_free(back);
+    zu_conn_close(reader);
+    remove(loaded);
+    free(loaded);
+  }
+
   /* A well formed query with nothing to return answers ZU_DONE rather
    * than an error, which is the whole reason a status crosses this
    * boundary alongside the pointer. */
@@ -344,7 +481,7 @@ int main(int argc, char **argv) {
 
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
-      "nested list, one refusal\n",
+      "nested list, one load, one refusal\n",
       version);
   return 0;
 }

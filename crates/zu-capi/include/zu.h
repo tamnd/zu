@@ -68,6 +68,8 @@ typedef struct zu_error zu_error;
 /* One cell of a result, borrowed from it. Not a handle: nothing to
  * free, and it lives exactly as long as the result does. */
 typedef struct zu_value zu_value;
+/* A database being built. See the bulk load section at the end. */
+typedef struct zu_loader zu_loader;
 
 /* The name a connection had before the database was split out of it.
  * Kept for one release, along with zu_close below, so that code written
@@ -374,6 +376,84 @@ zu_status zu_value_at(const zu_value *v, uint64_t i, const zu_value **out);
 zu_status zu_value_field(const zu_value *v, uint64_t i, const char **out, size_t *len);
 
 void zu_result_free(zu_result *result);
+
+/* ---- bulk load ----
+ *
+ * How values get in. It is the only way in v0: CREATE and INSERT need a
+ * table and no statement makes one, so a host holding data and an empty
+ * file has nowhere else to go. This is also the entry point the Rust
+ * appender and `zu copy` are built on, not a second mechanism beside
+ * them.
+ *
+ * A loader is columnar for the same reason a result is. One call per
+ * column, not one per cell.
+ *
+ * The order is fixed: create, then table, then columns and edges in any
+ * order and as many calls as you like, then finish. A column call
+ * before zu_loader_table is ZU_MISUSE, and so is a column whose count
+ * disagrees with the row count the table was given, checked at the call
+ * that passed it rather than at finish so the error names the column
+ * while you still know which one you were building.
+ *
+ * Nothing reaches the file until zu_loader_finish, so a load either
+ * happened or did not. The loader copies every array it is given, which
+ * means a caller may free or reuse its own buffers as soon as a call
+ * returns; the alternative is a lifetime rule this comment could not
+ * state safely.
+ *
+ * A loader is used from one thread, like a connection, and the same
+ * check applies: a second thread in a call answers ZU_MISUSE_CONCURRENT
+ * rather than corrupting the columns. After finish, and after a finish
+ * that failed, every call answers ZU_MISUSE_CLOSED and only
+ * zu_loader_free is left.
+ *
+ * zu_loader_create fails if the path exists, which is what `zu copy`
+ * does: a bulk load builds a database rather than adding to one. A
+ * loader freed before finish wrote nothing and leaves the empty file it
+ * created for the caller to remove. */
+zu_status zu_loader_create(const char *path, size_t path_len, zu_loader **out, zu_error **err);
+zu_status zu_loader_create_z(const char *path, zu_loader **out, zu_error **err);
+/* rows is given rather than counted from the first column, so a column
+ * with a value missing is an error and not a shorter table. One table
+ * per loader. */
+zu_status zu_loader_table(zu_loader *l, const char *nodes, size_t nodes_len, const char *edges,
+                          size_t edges_len, uint64_t rows, zu_error **err);
+zu_status zu_loader_table_z(zu_loader *l, const char *nodes, const char *edges, uint64_t rows,
+                            zu_error **err);
+/* Edges as the row each starts at and the row it ends at, two arrays so
+ * a host that has them in columns passes what it has. Appends, so call
+ * it as often as you like; the loader sorts and deduplicates at finish.
+ */
+zu_status zu_loader_edges(zu_loader *l, const uint32_t *from, const uint32_t *to, uint64_t count,
+                          zu_error **err);
+zu_status zu_loader_col_i64(zu_loader *l, const char *name, size_t name_len, const int64_t *values,
+                            uint64_t count, zu_error **err);
+zu_status zu_loader_col_f64(zu_loader *l, const char *name, size_t name_len, const double *values,
+                            uint64_t count, zu_error **err);
+/* Any nonzero value is true. int32_t rather than _Bool, because this
+ * header is C89-safe and because zu_value_bool writes one out. */
+zu_status zu_loader_col_bool(zu_loader *l, const char *name, size_t name_len, const int32_t *values,
+                             uint64_t count, zu_error **err);
+/* Lengths are a separate array so a caller whose strings are not
+ * NUL-terminated passes what it has. Every string is checked for UTF-8
+ * here rather than read back later as something no query could return.
+ */
+zu_status zu_loader_col_str(zu_loader *l, const char *name, size_t name_len,
+                            const char *const *values, const size_t *lens, uint64_t count,
+                            zu_error **err);
+zu_status zu_loader_col_str_z(zu_loader *l, const char *name, const char *const *values,
+                              uint64_t count, zu_error **err);
+/* zu_value_temporal read backwards: one ZU_TEMPORAL_ kind and the count
+ * each row holds in the unit that kind implies, so a value read out as
+ * 19782 days goes back in as 19782 days. ZU_TEMPORAL_ZONED_TIME and
+ * ZU_TEMPORAL_ZONED_DATETIME answer ZU_UNSUPPORTED: a stored column has
+ * nowhere to keep the offset that makes those two what they are. */
+zu_status zu_loader_col_temporal(zu_loader *l, const char *name, size_t name_len, int32_t kind,
+                                 const int64_t *values, uint64_t count, zu_error **err);
+/* Writes it all. The database is on disk when this returns ZU_OK, and
+ * zu_open on the same path reads it. */
+zu_status zu_loader_finish(zu_loader *l, zu_error **err);
+void zu_loader_free(zu_loader *l);
 
 #ifdef __cplusplus
 }

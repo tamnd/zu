@@ -19,10 +19,13 @@
 //! and the columns live in the file. So this is where a value meets its
 //! column, and where a value the column cannot hold is refused.
 
+use std::collections::BTreeMap;
+
 use zu_common::{FloatBits, LogicalType, Result, Temporal, ZuError};
-use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
+use zu_query::binder::{BoundExpr, BoundInsertNode};
 
 use crate::query::Value;
+use crate::split::Write;
 use crate::zu1::file::Zu1File;
 use crate::zu1::props::{PropColumn, load_props};
 use crate::zu1::txn::{Cell, WriteTxn};
@@ -50,34 +53,6 @@ impl NewNode {
     }
 }
 
-/// Works out what each insert writes, given the property values the
-/// evaluator already produced for it, in the order the patterns wrote
-/// them.
-///
-/// Nothing is staged here and nothing is written: a statement that
-/// cannot be written has to raise before the transaction opens, so that
-/// the failing case costs no log write and no fold.
-pub(crate) fn plan_rows(
-    db: &mut Zu1File,
-    nodes: &[BoundInsertNode],
-    values: &[Vec<Value>],
-) -> Result<Vec<NewNode>> {
-    let mut out: Vec<NewNode> = Vec::with_capacity(nodes.len());
-    for (node, values) in nodes.iter().zip(values) {
-        let columns = columns_of(db, node.table)?;
-        let cols = row(node, &columns, values)?;
-        // Two inserts into one table in one statement land one after
-        // the other, so the second one's offset is past the first.
-        let taken = out.iter().filter(|n| n.table == node.table).count() as u64;
-        out.push(NewNode {
-            table: node.table,
-            cols,
-            offset: rows_in(db, node.table)? + taken,
-        });
-    }
-    Ok(out)
-}
-
 /// One edge about to be created: which table, and the two rows it runs
 /// between.
 pub(crate) struct NewRel {
@@ -97,39 +72,132 @@ impl NewRel {
     }
 }
 
-/// Works out which rows each edge runs between, given the nodes the
-/// same statement is creating.
+/// The rows one write is making, filled a row at a time.
 ///
-/// The ends are slots and the binder has already refused every slot
-/// that is not one of these nodes, so a slot that is missing here is a
-/// binder that let something through rather than a statement anyone
-/// wrote.
-pub(crate) fn plan_edges(
-    nodes: &[BoundInsertNode],
-    new: &[NewNode],
-    rels: &[BoundInsertRel],
-) -> Result<Vec<NewRel>> {
-    let offset = |slot: usize| -> Result<u64> {
-        nodes
+/// A write runs once for every row the clauses before it answered, so
+/// this is opened once per statement and asked for every one of them.
+/// It holds what is the same across the rows, which is the columns of
+/// each table and where the next row of it lands, and it holds what
+/// has been worked out so far, which is what gets staged at the end.
+///
+/// Nothing is written here: a statement that cannot be written has to
+/// raise before the transaction opens, so that the failing case costs
+/// no log write and no fold.
+pub(crate) struct Batch<'a> {
+    write: &'a Write,
+    /// The property columns of each table being written to, read once.
+    columns: BTreeMap<u32, Vec<PropColumn>>,
+    /// Where the next row of each table lands, which is the count it
+    /// holds plus the rows this statement has added to it so far.
+    next: BTreeMap<u32, u64>,
+    nodes: Vec<NewNode>,
+    edges: Vec<NewRel>,
+}
+
+impl<'a> Batch<'a> {
+    pub(crate) fn open(db: &mut Zu1File, write: &'a Write) -> Result<Self> {
+        let mut columns = BTreeMap::new();
+        let mut next = BTreeMap::new();
+        for node in &write.nodes {
+            if columns.contains_key(&node.table) {
+                continue;
+            }
+            columns.insert(node.table, columns_of(db, node.table)?);
+            next.insert(node.table, rows_in(db, node.table)?);
+        }
+        Ok(Self {
+            write,
+            columns,
+            next,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        })
+    }
+
+    /// Works out what one row of the run writes: `carried` is the row
+    /// the clauses before the write answered, holding the slots in
+    /// [`Write::carry`] in that order, and `props` is the property
+    /// values behind them, one per property in written order.
+    ///
+    /// The created elements come back in the order
+    /// [`Write::created`] names them, which is the order they are
+    /// appended to the row the clauses after the write read.
+    pub(crate) fn row(&mut self, carried: &[Value], props: &[Value]) -> Result<Vec<Value>> {
+        let mut made: Vec<Value> = Vec::with_capacity(self.write.created.len());
+        let mut at = 0;
+        for node in &self.write.nodes {
+            let values = &props[at..at + node.props.len()];
+            at += node.props.len();
+            let cols = row(node, &self.columns[&node.table], values)?;
+            let offset = self.next.get_mut(&node.table).expect("read in open");
+            let new = NewNode {
+                table: node.table,
+                cols,
+                offset: *offset,
+            };
+            *offset += 1;
+            made.push(new.value());
+            self.nodes.push(new);
+        }
+        for rel in &self.write.rels {
+            let ends = [(rel.src, "leaves"), (rel.dst, "arrives at")];
+            let [src, dst] = ends.map(|(slot, side)| self.end(slot, side, carried, &made));
+            let new = NewRel {
+                table: rel.table,
+                src: src?,
+                dst: dst?,
+            };
+            made.push(new.value());
+            self.edges.push(new);
+        }
+        Ok(made)
+    }
+
+    /// The row one end of an edge runs to: an element this write made,
+    /// or one the clauses before it found.
+    ///
+    /// A found one is checked here rather than by the binder, because
+    /// what the binder knows about it is which tables the match left
+    /// open and what decides is the row.
+    fn end(&self, slot: usize, side: &str, carried: &[Value], made: &[Value]) -> Result<u64> {
+        let value = self
+            .write
+            .created
             .iter()
-            .position(|node| node.slot == slot)
-            .map(|i| new[i].offset)
+            .position(|s| *s == slot)
+            .map(|at| &made[at])
+            .or_else(|| {
+                self.write
+                    .carry
+                    .iter()
+                    .position(|s| *s == slot)
+                    .map(|at| &carried[at])
+            })
             .ok_or_else(|| {
                 ZuError::InvalidArgument(
-                    "an edge is being created between elements this statement is not creating"
+                    "an edge is being created between elements no clause of the statement binds"
                         .into(),
                 )
-            })
-    };
-    rels.iter()
-        .map(|rel| {
-            Ok(NewRel {
-                table: rel.table,
-                src: offset(rel.src)?,
-                dst: offset(rel.dst)?,
-            })
-        })
-        .collect()
+            })?;
+        match value {
+            Value::Node { offset, .. } => Ok(*offset),
+            other => Err(ZuError::gql(
+                zu_common::gqlstatus::codes::C22G03,
+                format!(
+                    "an edge {side} an element, and this one {}",
+                    match other {
+                        Value::Null => "found nothing".to_string(),
+                        other => format!("is {}", describe(other)),
+                    }
+                ),
+            )),
+        }
+    }
+
+    /// What the whole run writes, in the order it has to be staged in.
+    pub(crate) fn staged(self) -> (Vec<NewNode>, Vec<NewRel>) {
+        (self.nodes, self.edges)
+    }
 }
 
 /// Stages every row of one statement in the open transaction.
@@ -300,18 +368,6 @@ pub(crate) fn value_exprs(nodes: &[BoundInsertNode]) -> Vec<BoundExpr> {
         .iter()
         .flat_map(|node| node.props.iter().map(|(_, expr)| expr.clone()))
         .collect()
-}
-
-/// Splits one flat row of evaluated values back into one group per
-/// element, which is how [`plan_rows`] wants them.
-pub(crate) fn regroup(nodes: &[BoundInsertNode], mut row: Vec<Value>) -> Vec<Vec<Value>> {
-    let mut out = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let rest = row.split_off(node.props.len());
-        out.push(row);
-        row = rest;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -637,23 +693,158 @@ mod tests {
         assert_eq!(strings(&out, 0), ["ivy", "raj"]);
     }
 
-    /// An edge onto something a `MATCH` found is a write for every row
-    /// the match answers, which is the next piece rather than this one,
-    /// and it says so by name.
+    /// The statement this milestone line is about: a match says which
+    /// rows the write runs for, the write runs once for each of them,
+    /// and the clause after it reads what each one made.
     #[test]
-    fn an_edge_onto_a_matched_element_says_it_is_not_implemented_yet() {
+    fn an_insert_after_a_match_runs_once_for_every_row_it_answered() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = open(&dir, "matched.zu1");
 
-        let err = session
+        let out = session
             .run(
-                "MATCH (a:person {name: 'ada'}) INSERT (a)-[:knows]->(b:person {age: 1, name: 'new'})",
+                "MATCH (a:person) INSERT (a)-[:knows]->(b:person {age: 1, name: 'new'}) RETURN a.name AS was, b.name AS made ORDER BY was",
                 &[],
             )
-            .expect_err("the next piece");
+            .expect("insert");
+        assert_eq!(out.columns, ["was", "made"]);
+        assert_eq!(strings(&out, 0), ["ada", "kay"], "one row per person found");
+        assert_eq!(strings(&out, 1), ["new", "new"]);
+
+        // Two people were found and two were written, and each of the
+        // two edges runs from the one the row was about.
+        let after = session
+            .run(
+                "MATCH (a:person)-[:knows]->(b:person) WHERE b.name = 'new' RETURN a.name AS name ORDER BY name",
+                &[],
+            )
+            .expect("walk");
+        assert_eq!(strings(&after, 0), ["ada", "kay"]);
+        let count = session
+            .run("MATCH (p:person) RETURN count(*) AS n", &[])
+            .expect("count");
+        assert_eq!(count.rows[0][0], Value::Int(4));
+    }
+
+    /// A write runs for the rows the clauses before it answered and
+    /// for no others, so the rows the write itself makes are not rows
+    /// it then runs for.
+    #[test]
+    fn a_write_does_not_run_for_the_rows_it_is_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "halloween.zu1");
+
+        session
+            .run(
+                "MATCH (a:person) INSERT (b:person {age: a.age, name: 'copy'})",
+                &[],
+            )
+            .expect("insert");
+        let out = session
+            .run("MATCH (p:person) RETURN count(*) AS n", &[])
+            .expect("count");
+        assert_eq!(out.rows[0][0], Value::Int(4), "two found, two written");
+    }
+
+    /// A match that answers nothing is a write that runs no times,
+    /// which writes nothing and answers no rows.
+    #[test]
+    fn a_match_that_answers_nothing_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "nobody.zu1");
+
+        let out = session
+            .run(
+                "MATCH (a:person {name: 'nobody'}) INSERT (b:person {age: 1, name: 'x'}) RETURN b.name AS name",
+                &[],
+            )
+            .expect("insert");
+        assert!(out.rows.is_empty());
+        let count = session
+            .run("MATCH (p:person) RETURN count(*) AS n", &[])
+            .expect("count");
+        assert_eq!(count.rows[0][0], Value::Int(2));
+    }
+
+    /// An edge between two elements a match found runs between the two
+    /// rows of that row of the match.
+    #[test]
+    fn an_edge_between_two_matched_elements_is_written_per_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "pair.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'kay'}), (b:person {name: 'ada'}) INSERT (a)-[:knows]->(b)",
+                &[],
+            )
+            .expect("insert");
+        // The fixture has ada knows kay, and now kay knows ada too.
+        let out = session
+            .run(
+                "MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS from, b.name AS to ORDER BY from",
+                &[],
+            )
+            .expect("walk");
+        assert_eq!(strings(&out, 0), ["ada", "kay"]);
+        assert_eq!(strings(&out, 1), ["kay", "ada"]);
+    }
+
+    /// Two writes in one statement run in the order they are written,
+    /// and the second one sees what the first one made.
+    #[test]
+    fn a_statement_writes_twice_and_the_second_reads_the_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "twice.zu1");
+
+        let out = session
+            .run(
+                "INSERT (a:person {age: 1, name: 'one'}) INSERT (a)-[:knows]->(b:person {age: 2, name: 'two'}) RETURN a.name AS first, b.name AS second",
+                &[],
+            )
+            .expect("insert");
+        assert_eq!(strings(&out, 0), ["one"]);
+        assert_eq!(strings(&out, 1), ["two"]);
+        let after = session
+            .run(
+                "MATCH (a:person {name: 'one'})-[:knows]->(b:person) RETURN b.name AS name",
+                &[],
+            )
+            .expect("walk");
+        assert_eq!(strings(&after, 0), ["two"]);
+    }
+
+    /// EXPLAIN prints the statement, not the parts it is run as. The
+    /// parts are how the write is carried out and the plan is what the
+    /// reader asked about, so the listing still holds the write.
+    #[test]
+    fn explaining_a_write_prints_the_whole_statement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "explain.zu1");
+
+        let listing = session
+            .explain("MATCH (a:person) INSERT (a)-[:knows]->(b:person {age: 1, name: 'new'})")
+            .expect("explain");
+        assert!(listing.contains("Insert"), "the write is in it: {listing}");
+        assert!(listing.contains("Scan"), "so is the match: {listing}");
+    }
+
+    /// A profile is the counters of one run of one plan, and a
+    /// statement that writes is run as several, so profiling one is
+    /// refused by name rather than answered with the counters of
+    /// whichever part happened to be last.
+    #[test]
+    fn profiling_a_write_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "profile.zu1");
+
+        let err = session
+            .profile("INSERT (x:person {age: 1, name: 'new'})", &[])
+            .expect_err("a write has no one plan to profile");
         assert!(
-            err.to_string().contains("not implemented yet"),
-            "got: {err}"
+            err.to_string()
+                .contains("profiling a statement that writes"),
+            "says what it will not do: {err}"
         );
     }
 }

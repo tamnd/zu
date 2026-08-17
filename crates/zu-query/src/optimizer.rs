@@ -81,7 +81,7 @@ pub fn optimize_noted(
 /// group, so this is a reorder of two row filters and nothing else.
 fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Empty => LogicalPlan::Empty,
+        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. }) => leaf,
         LogicalPlan::ScanNodes {
             input,
             slot,
@@ -482,7 +482,11 @@ fn mark_asp_node(
     out: &mut Vec<Estimate>,
 ) -> (LogicalPlan, f64) {
     match plan {
-        LogicalPlan::Empty => (LogicalPlan::Empty, 1.0),
+        // A row set carried across a write is as wide as the write
+        // ran, which is a count from the run before this one rather
+        // than anything the statistics hold, so it counts as one row
+        // the way the empty seed does.
+        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. }) => (leaf, 1.0),
         LogicalPlan::ScanNodes {
             input,
             slot,
@@ -769,7 +773,7 @@ fn rewrite(
         return reorder_run(plan, query, schema, notes);
     }
     match plan {
-        LogicalPlan::Empty => Ok(LogicalPlan::Empty),
+        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. }) => Ok(leaf),
         LogicalPlan::Filter {
             input,
             expr,
@@ -1488,6 +1492,7 @@ fn place_filters(
 fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
     match plan {
         LogicalPlan::Empty => {}
+        LogicalPlan::Rows { slots, .. } => out.extend(slots.iter().copied()),
         LogicalPlan::ScanNodes { input, slot, .. } => {
             out.insert(*slot);
             bound_slots(input, out);
@@ -2339,7 +2344,7 @@ mod tests {
         let mut marks = Vec::new();
         loop {
             match plan {
-                LogicalPlan::Empty => break,
+                LogicalPlan::Empty | LogicalPlan::Rows { .. } => break,
                 LogicalPlan::Expand {
                     input, into, wcoj, ..
                 } => {

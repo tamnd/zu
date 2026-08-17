@@ -793,7 +793,7 @@ impl Compiler<'_> {
                 // unwind of a single value, which is exactly the kind
                 // of source the pipeline does not have, so the whole
                 // statement goes back to the old engine.
-                LogicalPlan::Insert { .. } => return Ok(None),
+                LogicalPlan::Insert { .. } | LogicalPlan::Rows { .. } => return Ok(None),
                 LogicalPlan::ScanNodes { input, .. }
                 | LogicalPlan::Expand { input, .. }
                 | LogicalPlan::Filter { input, .. }

@@ -661,6 +661,48 @@ fn covered_queries() -> &'static [&'static str] {
         "MATCH (p:person) WITH p WHERE p.age > 50 RETURN p.id AS id ORDER BY id LIMIT 10",
         "MATCH (p:person)-[:knows]->(f) WITH p, f WHERE f.age > 50 \
          RETURN f.id AS id ORDER BY id LIMIT 10",
+        // Two patterns sharing no variable and nothing tying them to
+        // each other either, each picked out by a predicate of its own.
+        // That is a cross product, and the held side is settled while
+        // the plan compiles: by the key index where the predicate is on
+        // the id, by one zone pushed scan where it is on an integer
+        // column. It is the shape a statement writes to name the two
+        // ends of an edge, so it is worth compiling even though neither
+        // side narrows the other.
+        //
+        // The pin is read off the id and off a column, on a row in the
+        // first scan chunk and on one past it, since a chunk the zones
+        // rule out answers with nothing and the walk has to tell that
+        // from the end of the table. Then a pin that matches nothing,
+        // one on a key no row has, one matching many rows, one with a
+        // second predicate over the held pattern that only becomes a
+        // filter once the pin has placed the level, and the product
+        // counted, ordered, cut short and read off both ends. Which of
+        // the two patterns drives is the optimizer's call, so the last
+        // pair names both by an equality and either way round is a pin.
+        "MATCH (a:person), (b:person) WHERE a.id = 7 AND b.id = 11 \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person), (b:person) WHERE a.id = 7 AND b.score = 900 \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person), (b:person) WHERE a.id = 7 AND b.score = 4500 \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person), (b:person) WHERE a.id = 7 AND b.score = 7 \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person), (b:person) WHERE a.id = 7 AND b.id = 999999 \
+         RETURN a.id AS a, b.id AS b",
+        "MATCH (a:person), (b:person) WHERE a.id = 7 AND b.age = 37 \
+         RETURN count(*) AS n",
+        "MATCH (a:person), (b:person) WHERE a.id = 7 AND b.age = 37 AND b.score > 4000 \
+         RETURN b.id AS b ORDER BY b LIMIT 5",
+        "MATCH (a:person), (b:person) WHERE a.age = 11 AND b.age = 37 \
+         RETURN a.id AS a, b.name AS name LIMIT 9",
+        "MATCH (a:person), (b:person) WHERE a.age = 11 AND b.age = 37 \
+         RETURN sum(b.score) AS s, count(*) AS n",
+        // The pinned level under a walk: the product is placed last, so
+        // the hop is off the driving pattern and the pinned rows pair
+        // with what it walked to.
+        "MATCH (a:person)-[:knows]->(c), (b:person) WHERE a.id = 7 AND b.id = 11 \
+         RETURN c.id AS c, b.id AS b ORDER BY c LIMIT 6",
         // Two patterns sharing no variable, tied by an equality on a
         // property. The held one is read into a table once and the
         // pipeline probes it a row at a time, which is the same answer

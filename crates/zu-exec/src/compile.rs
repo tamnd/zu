@@ -23,7 +23,9 @@ use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 use zu_query::exec::{Options, Sip, Value, Wcoj};
 use zu_query::plan::{Bracket, BracketKind, LogicalPlan};
-use zu_query::snapshot::{ColId, ColType, Dir, FuncCol, RelId, Snapshot, TableId, ZonePred};
+use zu_query::snapshot::{
+    ColId, ColType, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot, TableId, ZonePred,
+};
 use zu_vector::{BinOp, CmpOp, ExprOp, MorselArena, OwnedValue, PhysType, Program, Reg};
 
 use crate::join::JoinTable;
@@ -347,6 +349,18 @@ pub(crate) enum Op {
         key: ScalarRef,
         to: usize,
     },
+    /// A held pattern the query pinned to rows of its own rather than
+    /// to the pipeline: two patterns with no variable and no equality
+    /// between them, each picked out by a predicate of its own, which
+    /// is how a statement names the two ends of an edge it is about to
+    /// write. That is a cross product, and the rows on this side of it
+    /// are settled while the plan is compiled, by the key index where
+    /// the predicate is on the pattern's id and by one zone pushed scan
+    /// where it is on an integer column. Every row of the level below
+    /// pairs with all of them, which is the same rows in the same order
+    /// the old engine's nested loop produces, without its scan of the
+    /// whole table per outer row.
+    Product { rows: Arc<Vec<u64>>, to: usize },
     /// The sideways pass (perf/13 section 1): what a join's build side
     /// knows about its keys, applied to the level its probe reads, at
     /// the position that level is made. Everything between here and the
@@ -567,6 +581,9 @@ fn names_level(op: &Op, level: usize) -> bool {
         Op::Bracket { level: opt, .. } => *opt == level,
         Op::DegreeProduct { from, .. } => *from == level,
         Op::Join { key, to, .. } => key.level() == level || *to == level,
+        // The rows are settled, so the only level a product names is
+        // the one it builds out of them.
+        Op::Product { to, .. } => *to == level,
         Op::Sip { key, .. } => key.level() == level,
         Op::HasEdge { from, .. } => *from == level,
         Op::Filter { .. } | Op::BracketHit { .. } => false,
@@ -590,7 +607,9 @@ fn reads_newest(above: &[Op]) -> bool {
             Op::Filter { .. } | Op::Sip { .. } | Op::Semi { .. } | Op::Intersect { .. } => {
                 return true;
             }
-            Op::Expand { .. } | Op::Branch { .. } | Op::Join { .. } => return false,
+            Op::Expand { .. } | Op::Branch { .. } | Op::Join { .. } | Op::Product { .. } => {
+                return false;
+            }
             Op::Bracket { .. }
             | Op::BracketHit { .. }
             | Op::HasEdge { .. }
@@ -880,6 +899,12 @@ pub(crate) fn compile(
 /// ceiling, and a side larger than it falls back rather than building
 /// something that size before the query has answered anything.
 const BUILD_ROWS_MAX: u64 = 50_000_000;
+
+/// Rows a pinned held pattern may settle on. The list rides in the plan
+/// and pairs with every row under it, so a predicate that picks out
+/// more than a vector of rows is a cross product wide enough to belong
+/// on the old engine instead.
+const PIN_ROWS_MAX: usize = 2048;
 
 /// A level under construction: the registry assigns chunk vector
 /// positions as columns are demanded, so programs built mid-walk hold
@@ -1720,8 +1745,9 @@ impl Compiler<'_> {
             }
         }
 
-        // A held pattern nothing ever tied to the pipeline is a cross
-        // product, and one of those belongs on the old engine: it has a
+        // A held pattern nothing tied to the pipeline and nothing
+        // pinned to rows of its own is a cross product against a whole
+        // table, and one of those belongs on the old engine: it has a
         // nested loop for it and this pipeline would have to build a
         // table of the whole side to answer the same thing. A predicate
         // still waiting names one of those patterns, so it goes back
@@ -2118,6 +2144,10 @@ impl Compiler<'_> {
                     }
                     newest = *to;
                 }
+                // A product reads nothing off the pipeline, so there is
+                // nothing to check about where it sits; what it builds
+                // is the newest level from here on like any other.
+                Op::Product { to, .. } => newest = *to,
                 _ => {}
             }
         }
@@ -2261,6 +2291,7 @@ impl Compiler<'_> {
                     }
                     *to = map[*to];
                 }
+                Op::Product { to, .. } => *to = map[*to],
                 Op::Sip { key, .. } => match key {
                     ScalarRef::Node { level }
                     | ScalarRef::RowId { level }
@@ -3365,6 +3396,178 @@ impl Compiler<'_> {
         Ok(Some((table, probe)))
     }
 
+    /// Settles a held pattern no equality tied to the pipeline, where
+    /// the pattern's own predicate names rows of its table instead.
+    ///
+    /// What is left after every join that was going to happen has is a
+    /// cross product, and the reason to compile one at all is the
+    /// statement that writes an edge: `MATCH (a:Obj {id: 1}), (b:Obj
+    /// {id: 2})` names both ends and ties neither to the other, and
+    /// sending that back a row at a time costs a scan of the table per
+    /// end, which is the whole cost of the write at any size worth
+    /// measuring.
+    ///
+    /// The product goes in where the predicate that pinned it was
+    /// written, which is what lets a walk off the pinned pattern
+    /// compile as well, and true is that having happened. A pattern
+    /// nothing pins stays held and the caller falls back with it, so
+    /// the product this compiles always has a settled side.
+    fn pin_held(
+        &mut self,
+        ops: &mut Vec<Op>,
+        pending: &mut Vec<(usize, TableId)>,
+        waiting: &mut Vec<&BoundExpr>,
+    ) -> Result<bool> {
+        // Inside a bracket the newest level is the group's and may be
+        // null, and past a mark the runner has popped it. A product
+        // built on either would pair its rows with a level that is not
+        // there, so those go back whole.
+        if self.bracketed() || self.marked.is_some() {
+            return Ok(false);
+        }
+        for p in 0..pending.len() {
+            let (slot, build) = pending[p];
+            let mut pinned = None;
+            for (i, expr) in waiting.iter().enumerate() {
+                let Some(rows) = self.pin_rows(expr, slot, build)? else {
+                    continue;
+                };
+                pinned = Some((i, rows));
+                break;
+            }
+            let Some((at, rows)) = pinned else {
+                continue;
+            };
+            waiting.remove(at);
+            pending.remove(p);
+            let to = self.levels.len();
+            self.levels.push(LevelBuild {
+                table: build,
+                cols: Vec::new(),
+            });
+            self.slot_level.insert(slot, to);
+            ops.push(Op::Product {
+                rows: Arc::new(rows),
+                to,
+            });
+            self.sip_at.insert(to, ops.len());
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The rows of `build` a predicate over the held pattern at `slot`
+    /// picks out, `None` when it is not a predicate that names rows on
+    /// its own.
+    ///
+    /// Two shapes qualify. A point on the pattern's id is one key index
+    /// lookup and no scan at all, which is what the write statements
+    /// write. An equality on a stored integer column is one scan of the
+    /// table with the zone map pushed down, so a column the rows are
+    /// laid out by touches a chunk and the rest of the table is never
+    /// decoded.
+    fn pin_rows(
+        &mut self,
+        expr: &BoundExpr,
+        slot: usize,
+        build: TableId,
+    ) -> Result<Option<Vec<u64>>> {
+        // Whatever it says about the held pattern, it has to say it
+        // about that pattern alone: a predicate reading another
+        // variable is answered where both levels exist and not here.
+        let mut named = 0;
+        let mut mine = true;
+        self.walk_slots(expr, &mut |s| {
+            named += 1;
+            mine &= s == slot;
+        });
+        if named == 0 || !mine {
+            return Ok(None);
+        }
+        if let Some(key) = id_point(expr, slot) {
+            let Some(k) = self.const_int(key) else {
+                return Ok(None);
+            };
+            // A key that names no row is not a failure, it is a match
+            // of nothing, and an empty side is what says so.
+            return Ok(Some(
+                self.seek_arg(build, Some(k))?
+                    .into_iter()
+                    .map(|row| row as u64)
+                    .collect(),
+            ));
+        }
+        let BoundExpr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        let (col_expr, key) = match (self.const_int(rhs), self.const_int(lhs)) {
+            (Some(k), _) => (lhs.as_ref(), k),
+            (None, Some(k)) => (rhs.as_ref(), k),
+            (None, None) => return Ok(None),
+        };
+        let BoundExpr::Property { base, key: name } = col_expr else {
+            return Ok(None);
+        };
+        if !matches!(base.as_ref(), BoundExpr::Var(s) if *s == slot) {
+            return Ok(None);
+        }
+        let Some((col, ColType::Int)) = self.snap.resolve_col(build, name)? else {
+            return Ok(None);
+        };
+        let Ok(wanted) = u64::try_from(key) else {
+            // The zones compare unsigned and a negative bound has no
+            // place in them, so the scan below would answer the wrong
+            // rows rather than none.
+            return Ok(None);
+        };
+        let pred = ZonePred {
+            col,
+            lo: wanted,
+            hi: wanted,
+        };
+        let mut rows = Vec::new();
+        let mut arena = MorselArena::new();
+        // A chunk the zones ruled out answers with nothing, the same as
+        // a chunk past the end of the table, so the walk counts the
+        // chunks out rather than stopping at the first empty one: the
+        // pushdown is what makes this read cheap and the whole point is
+        // that most chunks come back empty.
+        let chunks = self.snap.table_rows(build)?.div_ceil(SCAN_ROWS as u64);
+        for chunk in 0..chunks {
+            let Some(sc) = self
+                .snap
+                .scan(build, chunk, &[col], Some(&pred), &mut arena)?
+            else {
+                continue;
+            };
+            let vec = &sc.columns[0];
+            let vals = vec.values::<i64>();
+            let mut take = |i: usize| {
+                if vec.is_valid(i) && vals[i] == key {
+                    rows.push(sc.row_base + i as u64);
+                }
+            };
+            match &sc.sel {
+                Some(sel) => sel.as_slice().iter().for_each(|&i| take(usize::from(i))),
+                None => (0..sc.rows as usize).for_each(take),
+            }
+            arena.reset();
+            // The rows sit in the plan and every one of them is paired
+            // with every row of the level below, so a predicate this
+            // loose is a cross product the old engine should own rather
+            // than one to hold a list this long for.
+            if rows.len() > PIN_ROWS_MAX {
+                return Ok(None);
+            }
+        }
+        Ok(Some(rows))
+    }
+
     /// Places every join the predicates seen so far allow, and compiles
     /// the ones that are not joins as filters once nothing they read is
     /// still held.
@@ -3431,6 +3634,14 @@ impl Compiler<'_> {
                 }
             }
             if !moved {
+                // Nothing an equality could move, so a held pattern
+                // whose own predicate names its rows is settled on
+                // those instead. That opens the join and filter passes
+                // again, since a predicate reading two held patterns
+                // has one of them now.
+                if self.pin_held(ops, pending, waiting)? {
+                    continue;
+                }
                 return Ok(Some(()));
             }
         }

@@ -16,8 +16,8 @@
 //! final truncate drops, so early stop never changes the answer.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use zu_common::{GROUP_ROWS, Interrupt, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Streaming, Value};
@@ -1341,6 +1341,10 @@ impl<'a> Worker<'a> {
                 to,
             } => self.branch(*rel, *dirs, *from, *to, rest, set),
             Op::Join { table, key, to } => self.join(table, *key, *to, rest, set, None),
+            Op::Product { rows, to } => {
+                let rows = Arc::clone(rows);
+                self.product(&rows, *to, rest, set)
+            }
             Op::Sip { filter, key, slot } => {
                 if !self.sip(filter, *key, *slot, set) {
                     return Ok(());
@@ -2330,6 +2334,39 @@ impl<'a> Worker<'a> {
                 if br.carries(self.bracket_hit)
                     && let Err(e) = self.bracket_row(br, set)
                 {
+                    result = Err(e);
+                    break 'srcs;
+                }
+            }
+            if self.stop.stopped() {
+                break;
+            }
+        }
+        set.chunks[src].cur = None;
+        self.idx_pool.push(idxs);
+        result
+    }
+
+    /// The cross product against a side the compiler already settled:
+    /// every active row of the newest level is pinned in turn and the
+    /// same rows descend under it, which is the order the old engine's
+    /// nested loop emits and none of its reads.
+    fn product(&mut self, rows: &[u64], to: usize, rest: &[Op], set: &mut ChunkSet) -> Result<()> {
+        let src = set.chunks.len() - 1;
+        let mut idxs = self.idx_pool.pop().unwrap_or_default();
+        idxs.clear();
+        {
+            let chunk = &set.chunks[src];
+            match &chunk.sel {
+                Some(s) => idxs.extend(s.as_slice().iter().map(|&i| u32::from(i))),
+                None => idxs.extend(0..chunk.count),
+            }
+        }
+        let mut result = Ok(());
+        'srcs: for &phys in &idxs {
+            set.chunks[src].cur = Some(phys);
+            for (_, part) in parts(rows, false) {
+                if let Err(e) = self.descend(to, part, &[], rest, set) {
                     result = Err(e);
                     break 'srcs;
                 }

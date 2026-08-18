@@ -602,9 +602,17 @@ impl Wal {
 
     /// Empties the log after a checkpoint has folded and published
     /// everything it held.
+    ///
+    /// The cut does not sync, and it is the one place in the write path
+    /// that does not have to. The header the checkpoint published names
+    /// the epoch it folded through, and replay skips every frame at or
+    /// below it, so a crash that finds the old bytes still on disk
+    /// replays nothing: what those frames say is already in the base
+    /// file. It costs one full sync per statement to make the file
+    /// shorter sooner, which is a quarter of what a one cell write pays
+    /// for durability it already has.
     pub fn truncate(&mut self) -> Result<()> {
         self.file.set_len(0)?;
-        self.file.sync_data()?;
         self.len = 0;
         Ok(())
     }

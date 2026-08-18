@@ -578,6 +578,60 @@ int main(int argc, char **argv) {
     return fail("a progress arrangement could not be taken back");
   }
 
+  /* Transactions, as far as a database this test was handed can take
+   * them: the four symbols are exported, the flag says what the
+   * boundaries did to it, and the two conditions a host meets by
+   * accident come back as conditions. What a transaction keeps and
+   * what a rollback unmakes is the Rust test beside this file, because
+   * this one is given somebody else's database and writing into it is
+   * not this test's business. */
+  int running = -1;
+  if (zu_conn_in_transaction(first, &running) != ZU_OK || running != 0) {
+    zu_conn_close(first);
+    return fail("a connection with nothing running said it was in a transaction");
+  }
+  err = NULL;
+  status = zu_begin(first, 1, &err);
+  if (status != ZU_OK) {
+    zu_conn_close(first);
+    return report("a read only transaction would not begin", status, err);
+  }
+  if (zu_conn_in_transaction(first, &running) != ZU_OK || running != 1) {
+    zu_conn_close(first);
+    return fail("a transaction began and the flag did not say so");
+  }
+  /* Beginning inside one is a condition rather than a nesting, and the
+   * transaction that is running is left alone by the refusal. */
+  err = NULL;
+  if (zu_begin(first, 0, &err) != ZU_ERROR || err == NULL) {
+    zu_conn_close(first);
+    return fail("a transaction nested");
+  }
+  zu_error_free(err);
+  err = NULL;
+  if (zu_commit(first, &err) != ZU_OK) {
+    zu_conn_close(first);
+    return report("a read only transaction would not commit", status, err);
+  }
+  /* Ending nothing is 2D000 rather than a call that quietly did
+   * nothing, on both words. */
+  err = NULL;
+  if (zu_commit(first, &err) != ZU_ERROR || err == NULL) {
+    zu_conn_close(first);
+    return fail("a commit with no transaction running was let through");
+  }
+  zu_error_free(err);
+  err = NULL;
+  if (zu_rollback(first, &err) != ZU_ERROR || err == NULL) {
+    zu_conn_close(first);
+    return fail("a rollback with no transaction running was let through");
+  }
+  zu_error_free(err);
+  if (zu_conn_in_transaction(first, &running) != ZU_OK || running != 0) {
+    zu_conn_close(first);
+    return fail("a committed transaction is still running");
+  }
+
   /* A statement that outlives its connection answers rather than
    * following the pointer it still holds, and is still safe to close. */
   zu_stmt *stmt = NULL;
@@ -597,7 +651,8 @@ int main(int argc, char **argv) {
 
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
-      "nested list, one load, one watched statement, one refusal with a place and one without\n",
+      "nested list, one load, one watched statement, one transaction, one refusal with a place "
+      "and one without\n",
       version);
   return 0;
 }

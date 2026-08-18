@@ -32,4 +32,4 @@ pub type Result<T> = std::result::Result<T, ZuError>;
 /// should have to depend on the other to say one number, and a CLI that
 /// linked the C ABI to read a string would export the whole of it.
 /// `cargo xtask package` holds `ZU_ABI_VERSION` in the header to this.
-pub const C_ABI_VERSION: &str = "0.7";
+pub const C_ABI_VERSION: &str = "0.8";

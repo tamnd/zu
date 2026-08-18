@@ -49,12 +49,12 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.7 and another
+ * system tests when it has to compile one way against 0.8 and another
  * against what comes next. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.7"
+#define ZU_ABI_VERSION "0.8"
 
 #ifdef __cplusplus
 extern "C" {
@@ -384,6 +384,45 @@ zu_status zu_bind_null(zu_stmt *stmt, const char *name, size_t name_len);
 zu_status zu_bind_null_z(zu_stmt *stmt, const char *name);
 zu_status zu_execute(zu_stmt *stmt, zu_result **out, zu_error **err);
 void zu_stmt_close(zu_stmt *stmt);
+
+/* Transactions.
+ *
+ * Every statement outside one is already a transaction of its own, so
+ * these do not turn transactions on. What they do is make several
+ * statements one: what they wrote is kept by zu_commit or unmade by
+ * zu_rollback, and nothing between the two is visible to another
+ * connection until the commit publishes it.
+ *
+ * They are the statements START TRANSACTION, COMMIT and ROLLBACK,
+ * called rather than written, which is deliberate on both counts. A
+ * host that sends the text gets the same behaviour, because these run
+ * that text; and a host that would rather call gets a signature instead
+ * of a string to build, which is what a binding wrapping this in a
+ * block or a decorator actually needs.
+ *
+ * zu_begin with a nonzero read_only starts a READ ONLY transaction,
+ * which is enforced rather than advisory: a write inside one is 25G03
+ * at the statement that wrote, not at the commit. Beginning inside a
+ * transaction is 25G01 rather than a nested one, and committing or
+ * rolling back with nothing running is 2D000 rather than a call that
+ * quietly did nothing, since a host that rolls back in an error path
+ * wants to hear that the transaction it meant to undo was not the one
+ * it thought.
+ *
+ * A commit that answers ZU_OK is durable: the log frame is on the disk
+ * before the call returns. Closing a connection with a transaction
+ * still running rolls it back, which is what a host that failed
+ * halfway and dropped everything wants and the only answer that does
+ * not depend on a destructor running.
+ *
+ * zu_conn_in_transaction is the one thing about a transaction that no
+ * statement answers, and every host offering a block, a `using` or a
+ * `defer` needs it: the cleanup path has to know whether the body
+ * already ended the transaction before it tries to. */
+zu_status zu_begin(zu_conn *conn, int32_t read_only, zu_error **err);
+zu_status zu_commit(zu_conn *conn, zu_error **err);
+zu_status zu_rollback(zu_conn *conn, zu_error **err);
+zu_status zu_conn_in_transaction(zu_conn *conn, int32_t *out);
 
 /* Result shape. The two counts are 0 for a NULL result, which is the
  * same answer as an empty one and needs no status. */

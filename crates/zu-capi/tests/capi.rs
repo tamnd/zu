@@ -13,22 +13,23 @@ use zu::{
     ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME, ZU_TEMPORAL_LOCAL_TIME,
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
     ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
-    ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_bool, zu_bind_bool_z, zu_bind_i64, zu_bind_i64_z,
-    zu_bind_str_z, zu_bind_temporal, zu_bind_temporal_z, zu_config_init, zu_config_set_z,
-    zu_conn_close, zu_conn_interrupt, zu_conn_rows_read, zu_conn_set_progress, zu_connect,
-    zu_create, zu_create_z, zu_database_close, zu_database_create_z, zu_database_open_z,
-    zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt, zu_error_free,
-    zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable, zu_error_severity,
-    zu_error_standard_text, zu_error_status, zu_execute, zu_loader_col_bool, zu_loader_col_f64,
-    zu_loader_col_i64, zu_loader_col_str, zu_loader_col_temporal, zu_loader_create,
-    zu_loader_edges, zu_loader_finish, zu_loader_free, zu_loader_table, zu_loader_table_z, zu_open,
-    zu_open_z, zu_prepare, zu_prepare_z, zu_query, zu_query_z, zu_result_cell, zu_result_cell_str,
-    zu_result_cell_type, zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
-    zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
-    zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
-    zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_rows, zu_stmt_close,
-    zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64, zu_value_len, zu_value_node,
-    zu_value_str, zu_value_temporal, zu_value_type, zu_version,
+    ZuResult, ZuStatus, ZuStmt, ZuValue, zu_begin, zu_bind_bool, zu_bind_bool_z, zu_bind_i64,
+    zu_bind_i64_z, zu_bind_str_z, zu_bind_temporal, zu_bind_temporal_z, zu_commit, zu_config_init,
+    zu_config_set_z, zu_conn_close, zu_conn_in_transaction, zu_conn_interrupt, zu_conn_rows_read,
+    zu_conn_set_progress, zu_connect, zu_create, zu_create_z, zu_database_close,
+    zu_database_create_z, zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url,
+    zu_error_excerpt, zu_error_free, zu_error_message, zu_error_offset, zu_error_position,
+    zu_error_retryable, zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute,
+    zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
+    zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
+    zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
+    zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
+    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
+    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
+    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
+    zu_result_free, zu_result_rows, zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool,
+    zu_value_f64, zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal,
+    zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -2434,5 +2435,305 @@ fn the_ways_of_asking_wrongly_are_all_answered() {
         assert_eq!(zu_conn_rows_read(conn, &mut rows), ZuStatus::Ok);
         assert_eq!(rows, 0);
         zu_conn_close(conn);
+    }
+}
+
+/* ---- transactions ---- */
+
+/// How many people there are, which is what every test below watches
+/// across a boundary.
+unsafe fn people(conn: *mut ZuConn) -> i64 {
+    let mut err: *mut ZuError = ptr::null_mut();
+    let result = unsafe { query(conn, "MATCH (p:person) RETURN count(p) AS n", &mut err) };
+    let n = unsafe { col_i64(result, 0, 1) }[0];
+    unsafe { zu_result_free(result) };
+    n
+}
+
+/// The condition a refused call carries, freed on the way out because
+/// the caller of this only wants the code.
+unsafe fn code_of(err: *mut ZuError) -> String {
+    assert!(!err.is_null(), "a refusal with no error handle");
+    let mut len = 0usize;
+    let code = unsafe { zu_error_code(err, &mut len) };
+    assert!(!code.is_null(), "a refusal with no condition");
+    let code = unsafe { CStr::from_ptr(code) }
+        .to_str()
+        .expect("utf-8")
+        .to_string();
+    unsafe { zu_error_free(err) };
+    code
+}
+
+unsafe fn in_transaction(conn: *mut ZuConn) -> bool {
+    let mut out = -1i32;
+    assert_eq!(
+        unsafe { zu_conn_in_transaction(conn, &mut out) },
+        ZuStatus::Ok
+    );
+    assert!(out == 0 || out == 1, "a flag answered {out}");
+    out == 1
+}
+
+/// A database with two people in it, made through the calls a C host
+/// has: create an empty one and write the table with statements.
+unsafe fn two_people(path: &std::path::Path) -> *mut ZuConn {
+    let path = path.to_str().expect("utf-8 path");
+    let mut conn: *mut ZuConn = ptr::null_mut();
+    let mut err: *mut ZuError = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            zu_create(
+                path.as_ptr().cast::<c_char>(),
+                path.len(),
+                &mut conn,
+                &mut err,
+            )
+        },
+        ZuStatus::Ok
+    );
+    for name in ["ada", "grace"] {
+        let text = format!("INSERT (p:person {{name: '{name}'}})");
+        let result = unsafe { query(conn, &text, &mut err) };
+        unsafe { zu_result_free(result) };
+    }
+    conn
+}
+
+/// What the three calls are for: several statements that are one
+/// transaction, kept together or unmade together.
+#[test]
+fn several_statements_commit_as_one_and_roll_back_as_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("txn.zu1");
+    unsafe {
+        let conn = two_people(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert!(!in_transaction(conn));
+
+        // Rolled back: two statements that both ran, neither of which
+        // is there afterwards.
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        assert!(in_transaction(conn));
+        for name in ["zoe", "raj"] {
+            let text = format!("INSERT (p:person {{name: '{name}'}})");
+            let result = query(conn, &text, &mut err);
+            zu_result_free(result);
+        }
+        assert_eq!(people(conn), 4, "a transaction sees its own writes");
+        assert_eq!(zu_rollback(conn, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        assert!(!in_transaction(conn));
+        assert_eq!(people(conn), 2, "the rollback took both statements");
+
+        // Committed: the same two statements, kept.
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Ok);
+        for name in ["zoe", "raj"] {
+            let text = format!("INSERT (p:person {{name: '{name}'}})");
+            let result = query(conn, &text, &mut err);
+            zu_result_free(result);
+        }
+        assert_eq!(zu_commit(conn, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        assert!(!in_transaction(conn));
+        assert_eq!(people(conn), 4);
+        zu_conn_close(conn);
+
+        // And the commit is what a reopen finds, which is the whole of
+        // what a commit promises.
+        let conn = open(&path);
+        assert_eq!(people(conn), 4);
+        zu_conn_close(conn);
+    }
+}
+
+/// The same three words, sent as statements, because these calls are
+/// those statements rather than a second mechanism beside them. A host
+/// that mixes the two, which is what a driver wrapping user text in a
+/// block does, has to be able to.
+#[test]
+fn the_calls_and_the_statements_they_stand_for_are_one_transaction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mixed.zu1");
+    unsafe {
+        let conn = two_people(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        // Begun by the call, ended by the text.
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Ok);
+        let result = query(conn, "INSERT (p:person {name: 'zoe'})", &mut err);
+        zu_result_free(result);
+        let result = query(conn, "ROLLBACK", &mut err);
+        zu_result_free(result);
+        assert!(!in_transaction(conn), "the text ended what the call began");
+        assert_eq!(people(conn), 2);
+
+        // Begun by the text, ended by the call, and the flag follows
+        // the text as readily as it follows the call.
+        let result = query(conn, "START TRANSACTION", &mut err);
+        zu_result_free(result);
+        assert!(in_transaction(conn));
+        let result = query(conn, "INSERT (p:person {name: 'zoe'})", &mut err);
+        zu_result_free(result);
+        assert_eq!(zu_commit(conn, &mut err), ZuStatus::Ok);
+        assert_eq!(people(conn), 3);
+        zu_conn_close(conn);
+    }
+}
+
+/// READ ONLY is enforced rather than advisory, and it is enforced at
+/// the statement that wrote rather than at the commit, so a host is
+/// told which statement was the one it should not have sent.
+#[test]
+fn a_read_only_transaction_turns_a_write_away_at_the_statement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("read-only-txn.zu1");
+    unsafe {
+        let conn = two_people(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        assert_eq!(zu_begin(conn, 1, &mut err), ZuStatus::Ok);
+        assert!(in_transaction(conn));
+        assert_eq!(people(conn), 2, "a read only transaction reads");
+
+        let write = "INSERT (p:person {name: 'zoe'})";
+        let mut result: *mut ZuResult = ptr::null_mut();
+        assert_eq!(
+            zu_query(
+                conn,
+                write.as_ptr().cast::<c_char>(),
+                write.len(),
+                &mut result,
+                &mut err
+            ),
+            ZuStatus::Error
+        );
+        assert!(result.is_null());
+        assert_eq!(code_of(err), "25G03");
+        err = ptr::null_mut();
+
+        // The transaction is still running and still ends normally: a
+        // statement it refused did not end it.
+        assert!(in_transaction(conn));
+        assert_eq!(zu_commit(conn, &mut err), ZuStatus::Ok);
+        assert_eq!(people(conn), 2);
+        zu_conn_close(conn);
+    }
+}
+
+/// The three ways of asking for a transaction that cannot be had, each
+/// of which is a condition rather than a call that quietly did nothing.
+#[test]
+fn a_transaction_does_not_nest_and_neither_word_ends_one_that_is_not_running() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("nesting.zu1");
+    unsafe {
+        let conn = two_people(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        // Ending nothing. A host that rolls back in an error path
+        // wants to hear that the transaction it meant to undo was not
+        // the one it thought.
+        assert_eq!(zu_commit(conn, &mut err), ZuStatus::Error);
+        assert_eq!(code_of(err), "2D000");
+        err = ptr::null_mut();
+        assert_eq!(zu_rollback(conn, &mut err), ZuStatus::Error);
+        assert_eq!(code_of(err), "2D000");
+        err = ptr::null_mut();
+        assert!(!in_transaction(conn));
+
+        // Beginning twice, which is a nesting this engine does not
+        // have and will not pretend to.
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Error);
+        assert_eq!(code_of(err), "25G01");
+        err = ptr::null_mut();
+        assert!(in_transaction(conn), "the refused begin left the first one");
+        assert_eq!(zu_rollback(conn, &mut err), ZuStatus::Ok);
+
+        // An error handle is optional here as everywhere: a host that
+        // only branches on the status passes NULL and leaks nothing.
+        assert_eq!(zu_commit(conn, ptr::null_mut()), ZuStatus::Error);
+        zu_conn_close(conn);
+    }
+}
+
+/// Closing inside a transaction rolls it back, which is the answer
+/// that does not depend on a destructor running: a host that failed
+/// halfway and dropped everything gets the database it had before.
+#[test]
+fn a_connection_closed_inside_a_transaction_keeps_nothing_it_wrote() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("closed-open.zu1");
+    unsafe {
+        let conn = two_people(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Ok);
+        let result = query(conn, "INSERT (p:person {name: 'zoe'})", &mut err);
+        zu_result_free(result);
+        zu_conn_close(conn);
+
+        let conn = open(&path);
+        assert_eq!(people(conn), 2, "the open transaction went with the close");
+        assert!(
+            !in_transaction(conn),
+            "and a fresh connection is not in one"
+        );
+        zu_conn_close(conn);
+    }
+}
+
+/// The same misuse the rest of the surface answers, on the four calls
+/// this section adds: nothing crashes, and the status says which
+/// mistake it was.
+#[test]
+fn the_transaction_calls_answer_a_null_handle_and_a_closed_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("txn-misuse.zu1");
+    unsafe {
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_begin(ptr::null_mut(), 0, &mut err), ZuStatus::Misuse);
+        assert_eq!(zu_commit(ptr::null_mut(), &mut err), ZuStatus::Misuse);
+        assert_eq!(zu_rollback(ptr::null_mut(), &mut err), ZuStatus::Misuse);
+        let mut flag = -1i32;
+        assert_eq!(
+            zu_conn_in_transaction(ptr::null_mut(), &mut flag),
+            ZuStatus::Misuse
+        );
+        assert_eq!(flag, 0, "the out-parameter is written on every path");
+
+        let conn = two_people(&path);
+        assert_eq!(
+            zu_conn_in_transaction(conn, ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+
+        // A statement prepared here and used after the close is the
+        // one that answers ZU_MISUSE_CLOSED, because a statement keeps
+        // the connection's state alive to be able to; the connection
+        // handle itself is gone once it is closed, like every other
+        // handle this header frees.
+        let text = "MATCH (p:person) RETURN count(p) AS n";
+        let mut stmt: *mut ZuStmt = ptr::null_mut();
+        assert_eq!(
+            zu_prepare(
+                conn,
+                text.as_ptr().cast::<c_char>(),
+                text.len(),
+                &mut stmt,
+                &mut err
+            ),
+            ZuStatus::Ok
+        );
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Ok);
+        zu_conn_close(conn);
+        let mut result: *mut ZuResult = ptr::null_mut();
+        assert_eq!(
+            zu_execute(stmt, &mut result, &mut err),
+            ZuStatus::MisuseClosed
+        );
+        assert!(result.is_null());
+        zu_stmt_close(stmt);
     }
 }

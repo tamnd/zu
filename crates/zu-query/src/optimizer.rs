@@ -2292,6 +2292,31 @@ mod tests {
         .expect("schema")
     }
 
+    /// A YIELD is the projection of the names it lets out and nothing
+    /// else: it does not group the rows, order them or cut them, so the
+    /// plan is the plan of the match with one projection of variables
+    /// standing on it.
+    #[test]
+    fn a_yield_plans_as_a_projection_of_names() {
+        let yielded = optimized("MATCH (p:Person)-[:KNOWS]->(q:Person) YIELD q RETURN q.id AS id");
+        assert_eq!(
+            lines(&yielded),
+            [
+                "Project q.id AS id",
+                "Project q",
+                "Expand (p)-[#1:KNOWS]->(q)",
+                "ScanNodes p: Person"
+            ],
+            "got:\n{yielded}"
+        );
+        let renamed =
+            optimized("MATCH (p:Person)-[:KNOWS]->(q:Person) YIELD q AS f RETURN f.id AS id");
+        assert!(
+            lines(&renamed).contains(&"Project q AS f"),
+            "the value is the one the match matched, under the name the yield gave it, got:\n{renamed}"
+        );
+    }
+
     fn optimized(source: &str) -> String {
         let schema = schema();
         let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");

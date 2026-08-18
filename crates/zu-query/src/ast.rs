@@ -411,6 +411,15 @@ pub enum Clause {
     /// The definitions read left to right, so a later one may use a
     /// name an earlier one in the same statement gave.
     Let { items: Vec<LetItem> },
+    /// `MATCH (a)-[:KNOWS]->(b) YIELD b, a AS friend`, the graph
+    /// pattern yield clause (ISO 16.14, GQ19). It says which of the
+    /// variables a match wrote leave it, so it takes names away where a
+    /// `LET` adds them, and it renames them where a `WITH` would have
+    /// to write the whole projection out to do the same.
+    ///
+    /// It does not group and it does not drop a row, so the rows a
+    /// match answered are the rows a yield answers, narrower.
+    Yield { items: Vec<YieldItem> },
     /// `CALL name(args) YIELD col [AS alias], ...`, a table function
     /// producing rows (docs/07 §4).
     Call {
@@ -572,6 +581,16 @@ pub struct ProjectionItem {
 pub struct LetItem {
     pub name: String,
     pub expr: Expr,
+}
+
+/// One variable a `YIELD` lets out of a match, and the name it wears
+/// after it. The name is a variable the match wrote rather than an
+/// expression, because a yield says what leaves the match and not what
+/// to compute out of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YieldItem {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 /// The counter a `FOR` numbers its rows with: the name it binds and

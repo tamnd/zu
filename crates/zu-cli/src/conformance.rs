@@ -197,6 +197,12 @@ const NOTES: &[&str] = &[
      from one and from zero; the number counts the elements of the list rather than the rows \
      the statement has answered, so a FOR under a match starts again at each row that reaches \
      it",
+    "a block of match statements stands wherever one does: an EXISTS takes one and asks \
+     whether it answered a row, and an OPTIONAL takes one and keeps what it answered. The \
+     statements of a block are all required and they share the names they write, so a block is \
+     one conjunction and the same thing the commas of a single statement are; under an OPTIONAL \
+     it is also one operand, so a block that matches half of itself matches none of it and \
+     every name it writes reads null",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",

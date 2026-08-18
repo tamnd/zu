@@ -1028,12 +1028,21 @@ impl Parser<'_> {
         loop {
             if self.at_kw("MATCH") || self.at_kw("OPTIONAL") {
                 let optional = self.eat_kw("OPTIONAL");
-                self.expect_kw("MATCH")?;
-                let mut patterns = vec![self.parse_path()?];
-                while self.eat(&TokenKind::Comma) {
-                    patterns.push(self.parse_path()?);
-                }
-                let filter = self.parse_where()?;
+                // GQ21. An OPTIONAL takes either one match statement or
+                // a braced block of them. The block is one operand, so
+                // it either matches whole or every name it writes is
+                // null, which is why the whole block becomes one
+                // bracketed group rather than a group per statement.
+                let (patterns, filter) = if optional && self.at(&TokenKind::LBrace) {
+                    self.parse_match_block()?
+                } else {
+                    self.expect_kw("MATCH")?;
+                    let mut patterns = vec![self.parse_path()?];
+                    while self.eat(&TokenKind::Comma) {
+                        patterns.push(self.parse_path()?);
+                    }
+                    (patterns, self.parse_where()?)
+                };
                 clauses.push(Clause::Match {
                     optional,
                     patterns,
@@ -2045,22 +2054,58 @@ impl Parser<'_> {
     /// `EXISTS { MATCH (a)-[:knows]->(b) WHERE b.id > 10 }`, the brace
     /// unconsumed and EXISTS already read.
     ///
-    /// The MATCH is optional because the block holds one and can hold
-    /// nothing else, so writing it is a courtesy to the reader rather
-    /// than something the parser needs. Everything a full MATCH may say
-    /// after the patterns is refused here: an ORDER BY or a LIMIT
-    /// inside a predicate would be sorting and cutting a set whose only
-    /// use is whether it is empty.
+    /// Everything a full MATCH may say after the patterns is refused
+    /// here: an ORDER BY or a LIMIT inside a predicate would be sorting
+    /// and cutting a set whose only use is whether it is empty.
     fn parse_exists(&mut self) -> Result<Expr> {
+        let (patterns, filter) = self.parse_match_block()?;
+        Ok(Expr::Exists {
+            patterns,
+            filter: filter.map(Box::new),
+        })
+    }
+
+    /// A match statement block, `{ MATCH ... MATCH ... }`, the brace
+    /// unconsumed. GQ21 and GQ22 both take one: an `EXISTS` asks
+    /// whether it answers a row and an `OPTIONAL` keeps what it
+    /// answered, but the block itself is the same thing in both.
+    ///
+    /// The first MATCH is optional because a block that holds one
+    /// statement can hold nothing else, so writing it is a courtesy to
+    /// the reader rather than something the parser needs.
+    ///
+    /// The statements are all required and they share the names they
+    /// write, so a block is one conjunction: the patterns gather into
+    /// one list and the conditions fold together with AND. That fold is
+    /// exact because nothing inside a block is optional, so no
+    /// statement can hand the next one a null that a condition would
+    /// have read differently had it run earlier.
+    fn parse_match_block(&mut self) -> Result<(Vec<PathPattern>, Option<Expr>)> {
         self.expect(&TokenKind::LBrace)?;
         self.eat_kw("MATCH");
-        let mut patterns = vec![self.parse_path()?];
-        while self.eat(&TokenKind::Comma) {
+        let mut patterns = Vec::new();
+        let mut filter: Option<Expr> = None;
+        loop {
             patterns.push(self.parse_path()?);
+            while self.eat(&TokenKind::Comma) {
+                patterns.push(self.parse_path()?);
+            }
+            if let Some(next) = self.parse_where()? {
+                filter = Some(match filter {
+                    Some(seen) => Expr::Binary {
+                        op: BinaryOp::And,
+                        lhs: Box::new(seen),
+                        rhs: Box::new(next),
+                    },
+                    None => next,
+                });
+            }
+            if !self.eat_kw("MATCH") {
+                break;
+            }
         }
-        let filter = self.parse_where()?.map(Box::new);
         self.expect(&TokenKind::RBrace)?;
-        Ok(Expr::Exists { patterns, filter })
+        Ok((patterns, filter))
     }
 
     /// `DATE '2024-01-15'` and the rest, the type name already read.
@@ -3425,6 +3470,60 @@ mod tests {
         assert_eq!(patterns.len(), 2);
         assert_eq!(patterns[1].start.var.as_deref(), Some("b"));
         assert!(filter.is_some(), "the block's own WHERE came with it");
+    }
+
+    /// GQ22. Several MATCH statements in one block are one conjunction,
+    /// so the patterns gather and the conditions fold together with AND.
+    #[test]
+    fn a_block_may_hold_several_match_statements() {
+        let q = parsed(
+            "MATCH (a:Person) \
+             WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.id > 1 \
+                            MATCH (b)-[:KNOWS]->(c) WHERE c.id > 3 } \
+             RETURN a.id AS id",
+        );
+        let Clause::Match { filter, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        let Some(Expr::Exists { patterns, filter }) = filter else {
+            panic!("the WHERE is the block itself, got {filter:?}");
+        };
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[1].start.var.as_deref(), Some("b"));
+        let Some(inner) = filter else {
+            panic!("both conditions came with it");
+        };
+        assert!(
+            matches!(
+                inner.as_ref(),
+                Expr::Binary {
+                    op: BinaryOp::And,
+                    ..
+                }
+            ),
+            "the two WHEREs fold into one condition, got {inner:?}"
+        );
+    }
+
+    /// GQ21. An OPTIONAL takes a block as well as a single statement,
+    /// and the block is one clause rather than one clause per statement.
+    #[test]
+    fn optional_takes_a_block_of_match_statements() {
+        let q = parsed(
+            "MATCH (a:Person) \
+             OPTIONAL { MATCH (a)-[:KNOWS]->(b) MATCH (b)-[:KNOWS]->(c) } \
+             RETURN a.id AS id",
+        );
+        assert_eq!(q.clauses().len(), 2, "one clause for the whole block");
+        let Clause::Match {
+            optional, patterns, ..
+        } = &q.clauses()[1]
+        else {
+            panic!("the block is a match");
+        };
+        assert!(optional, "the block came from an OPTIONAL");
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[1].start.var.as_deref(), Some("b"));
     }
 
     #[test]

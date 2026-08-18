@@ -975,6 +975,15 @@ impl Compiler<'_> {
         self.optional_level.is_some() || self.exists_level.is_some()
     }
 
+    /// Whether a level is one a bracket already compiled here walks.
+    /// The runner binds such a level to a single null row while it runs
+    /// what stands past the bracket, so an operator that reads the
+    /// level itself there is reading that null and not the row the
+    /// group matched.
+    fn walks_a_bracket_level(&self, level: usize) -> bool {
+        self.optional_level == Some(level) || self.exists_level == Some(level)
+    }
+
     /// The level the pipeline is standing on, which is where a
     /// predicate written after everything compiled so far reads its
     /// columns. That is the newest level everywhere except past a mark
@@ -1569,6 +1578,17 @@ impl Compiler<'_> {
                         mark = Some(at);
                     }
                     if kind != BracketKind::Optional && bare {
+                        // A degree read off a level some bracket walks
+                        // would read the null row the runner stands
+                        // there while it runs that bracket's
+                        // continuation, and answer the question about a
+                        // row that is not the one the block matched.
+                        // The pattern is a second statement of a block
+                        // or a predicate over what an OPTIONAL bound,
+                        // and either way it is the interpreter's.
+                        if self.walks_a_bracket_level(src) {
+                            return Ok(None);
+                        }
                         ops.push(Op::HasEdge {
                             rel: rel_id,
                             dirs,

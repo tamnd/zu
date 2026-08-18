@@ -58,6 +58,10 @@ const LARGE: u64 = 100_000;
 /// enough to keep the bench in seconds and large enough that one slow
 /// sync does not decide the number.
 const WRITES: u64 = 200;
+/// Timed passes over the `SET` loop, of which the fastest is the
+/// number. Three, because the two clocks it protects are divided by
+/// each other and the gate machines are shared vCPUs.
+const PASSES: u64 = 3;
 const MB: f64 = 1024.0 * 1024.0;
 
 fn budget(key: &str) -> Option<f64> {
@@ -349,17 +353,37 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
-    let start = Instant::now();
-    for i in 0..WRITES {
-        let age = i % rows;
-        conn.query(&format!(
-            "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
-        ))
-        .expect("set");
+    // The pass is timed [`PASSES`] times and the fastest one is the
+    // number, because `set_fold_x` is this clock at one table size over
+    // this clock at another and a single slow pass moves a ratio that
+    // is not about speed at all. On a hosted runner the large table's
+    // pass has come in anywhere from 7096 to 19735 us a statement,
+    // which put a ratio the laptop measures at 2.1 to 2.5 between 4.18
+    // and 6.18 on the same commit.
+    //
+    // The bytes and the disk growth are the first pass only. They are
+    // counts and not clocks, so nothing about them wants a best of, and
+    // a store that grows once on first touch would look like a store
+    // that grows a third as much if the same growth were spread over
+    // three passes.
+    let mut elapsed = std::time::Duration::MAX;
+    let mut once: Option<(Usage, u64)> = None;
+    for _ in 0..PASSES {
+        let start = Instant::now();
+        for i in 0..WRITES {
+            let age = i % rows;
+            conn.query(&format!(
+                "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
+            ))
+            .expect("set");
+        }
+        elapsed = elapsed.min(start.elapsed());
+        if once.is_none() {
+            once = Some((usage(), disk(dir)));
+        }
     }
-    let elapsed = start.elapsed();
-    let after = usage();
-    let growth = disk(dir).saturating_sub(disk_before);
+    let (after, disk_after) = once.expect("a pass ran");
+    let growth = disk_after.saturating_sub(disk_before);
 
     assert_eq!(
         one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),

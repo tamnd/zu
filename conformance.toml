@@ -36,7 +36,7 @@ gqlstatus = true  # every reply carries a code from the ISO conditions artifact
 parameters = true  # the shell takes a params object and prepare reports its names
 transactions = true  # START TRANSACTION, COMMIT and ROLLBACK run across statements on a session
 multiple-statements = true  # one shell process runs a case's setup list in order
-isolated = true  # reset drops the file, which is the most complete reset there is
+isolated = true  # a reset is a statement on the running session, so a case starts on a graph the case before it did not write to
 
 # Printed verbatim beside zu's numbers in the report.
 notes = [

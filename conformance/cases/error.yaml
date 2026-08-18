@@ -1,0 +1,617 @@
+schema: 3
+suite: error
+doc: The condition a statement raises, which is part of its answer rather than a message about it. Every case names one GQLSTATUS and nothing else, so two engines that both refuse a statement can be compared on why they refused it, and a client that turns a condition into an exception has something to test its mapping against. The cases are grouped by where the condition comes from and not by its class, because the same five characters raised by the parser, by the binder and by the executor are three different promises: a parser condition is about text, a binder condition is about names, and an executor condition is about a value that only existed once the statement ran.
+
+load:
+  nodes: person
+  edges: knows
+  count: 3
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+
+cases:
+  - name: nothing-to-parse
+    doc: An empty statement, which is what a client sends when it trims a comment or reads past the end of a file, and which has to be a condition rather than an empty result.
+    query: ""
+    raises: "42001"
+
+  - name: a-word-that-opens-no-clause
+    doc: SQL's first word, sent to a GQL engine, which is the single most likely mistake anyone makes here.
+    query: SELECT 1
+    raises: "42001"
+
+  - name: a-clause-that-is-reserved-and-not-here-yet
+    doc: MERGE is GQL and this engine does not run it, and a statement that names it is still a syntax condition rather than a feature flag, because the answer does not depend on the data.
+    query: MERGE (n:person)
+    raises: "42001"
+
+  - name: a-write-clause-that-is-reserved
+    doc: CREATE opens statements that are not in the v0 core, and the parser names it rather than saying it expected MATCH, which is the difference between a useful refusal and a puzzle.
+    query: CREATE (n:person)
+    raises: "42001"
+
+  - name: a-bracket-left-open
+    doc: A statement that ends in the middle of an expression, which is the shape of every truncated string a client ever sends.
+    query: RETURN (1
+    raises: "42001"
+
+  - name: a-string-left-open
+    doc: A quote with no closing quote, refused by the lexer rather than the parser, which is a different code path to the same condition.
+    query: RETURN 'a
+    raises: "42001"
+
+  - name: a-match-with-no-pattern
+    doc: A clause keyword with the clause missing, which is what a query built by concatenation looks like when one of the pieces is empty.
+    query: MATCH RETURN 1 AS a
+    raises: "42001"
+
+  - name: a-comma-with-nothing-after-it
+    doc: A trailing comma in a projection, which is legal in some languages and is not here.
+    query: RETURN 1 AS a,
+    raises: "42001"
+
+  - name: a-where-with-nothing-in-it
+    doc: WHERE followed by the next clause, so the parser reads the clause keyword where it wanted an expression.
+    query: MATCH (n:person) WHERE RETURN 1 AS a
+    raises: "42001"
+
+  - name: an-order-by-with-no-key
+    doc: A sort with nothing to sort on, which ends the statement rather than the clause and is the other end-of-input shape.
+    query: MATCH (n:person) RETURN n.age AS a ORDER BY
+    raises: "42001"
+
+  - name: a-number-that-stops-early
+    doc: An exponent with no digits after it, which is a number the lexer starts to read and cannot finish.
+    query: RETURN 1e AS a
+    raises: "42001"
+
+  - name: two-statements-in-one
+    doc: Two statements in one string, which a session runs one at a time, so the second one is text following a statement that has ended.
+    query: RETURN 1 AS a RETURN 2 AS a
+    raises: "42001"
+
+  - name: a-clause-after-the-projection
+    doc: RETURN ends a statement, so a clause written after one is refused where a reader of another language would expect it to continue.
+    query: MATCH (n:person) RETURN n.age AS a MATCH (m:person) RETURN m.age AS b
+    raises: "42001"
+
+  - name: an-arrow-with-no-end
+    doc: A pattern that stops after the arrow, which is a half written traversal and not an open ended one.
+    query: MATCH (a:person)-[:knows]-> RETURN 1 AS a
+    raises: "42001"
+
+  - name: a-colon-with-no-label
+    doc: The label separator with no label after it, which is what a template leaves behind when the label it interpolates is empty.
+    query: MATCH (n:) RETURN 1 AS a
+    raises: "42001"
+
+  - name: an-index-into-a-list
+    doc: Subscripting is not in this grammar, so a statement that indexes a list is refused as text and never reaches a value.
+    query: RETURN [1, 2][1] AS a
+    raises: "42001"
+
+  - name: a-property-handed-to-delete
+    doc: DELETE takes an element away and a property is not one, and the parser says so where it reads the dot, before anything is deleted.
+    query: MATCH (n:person) DELETE n.name
+    raises: "42001"
+
+  - name: an-unknown-function
+    doc: A function nobody declared, which is 42002 and not a syntax condition, because the call is written correctly and the name is what is missing.
+    query: RETURN nosuch(1) AS a
+    raises: "42002"
+
+  - name: an-unknown-variable
+    doc: A bare name in a projection with no clause binding it, which is the shape of every typo in a variable name.
+    query: RETURN n AS a
+    raises: "42002"
+
+  - name: an-unknown-variable-in-a-predicate
+    doc: The same condition raised from WHERE rather than RETURN, which is a different clause reaching the same table of names.
+    query: MATCH (n:person) WHERE m.age > 1 RETURN n.age AS a
+    raises: "42002"
+
+  - name: a-variable-a-with-dropped
+    doc: WITH is what a statement's scope is made of, so a name it does not carry forward is gone, and reading it afterwards is the same condition as never having bound it.
+    query: MATCH (n:person) WITH n.age AS a RETURN n.name AS b
+    raises: "42002"
+
+  - name: a-variable-an-aggregate-dropped
+    doc: A projection that aggregates keeps only what it projects, so an ORDER BY over the row the aggregate consumed has nothing to read.
+    query: MATCH (n:person) RETURN count(*) AS a ORDER BY n.name
+    raises: "42002"
+
+  - name: a-parameter-nobody-bound
+    doc: An unbound parameter is a name the statement needs and the client did not send, which is the same condition as an unknown variable and not a data one.
+    query: RETURN $n AS a
+    raises: "42002"
+
+  - name: an-unknown-function-over-a-property
+    doc: The function name is checked before the argument is read, so a call whose argument is perfectly good is still refused on the name.
+    query: MATCH (n:person) RETURN nosuch(n.name) AS a
+    raises: "42002"
+
+  - name: a-node-key-label-set-with-no-label
+    doc: A key label set that is written has to name a label, and an empty one asks for a type that selects nothing, which is 42012 on the node side.
+    query: "CREATE GRAPH TYPE t { (=> :B) }"
+    raises: "42012"
+
+  - name: a-node-key-label-set-that-is-too-long
+    doc: A label set is the bits of one word, so a key label set of 64 leaves no room for what the rest of the type adds, and the node side of that limit is 42013.
+    query: "CREATE GRAPH TYPE t { (:l0&l1&l2&l3&l4&l5&l6&l7&l8&l9&l10&l11&l12&l13&l14&l15&l16&l17&l18&l19&l20&l21&l22&l23&l24&l25&l26&l27&l28&l29&l30&l31&l32&l33&l34&l35&l36&l37&l38&l39&l40&l41&l42&l43&l44&l45&l46&l47&l48&l49&l50&l51&l52&l53&l54&l55&l56&l57&l58&l59&l60&l61&l62&l63 => :B) }"
+    raises: "42013"
+
+  - name: an-edge-key-label-set-with-no-label
+    doc: The same empty key label set inside an arc, which is a separate code so that a report says which half of the pattern was wrong.
+    query: "CREATE GRAPH TYPE t { (:A)-[=> :R]->(:A) }"
+    raises: "42014"
+
+  - name: an-edge-key-label-set-that-is-too-long
+    doc: The oversized key label set on the edge side, which is the fourth corner of the same limit.
+    query: "CREATE GRAPH TYPE t { (:A)-[:l0&l1&l2&l3&l4&l5&l6&l7&l8&l9&l10&l11&l12&l13&l14&l15&l16&l17&l18&l19&l20&l21&l22&l23&l24&l25&l26&l27&l28&l29&l30&l31&l32&l33&l34&l35&l36&l37&l38&l39&l40&l41&l42&l43&l44&l45&l46&l47&l48&l49&l50&l51&l52&l53&l54&l55&l56&l57&l58&l59&l60&l61&l62&l63 => :R]->(:A) }"
+    raises: "42015"
+
+  - name: a-string-added-to-a-number
+    doc: Addition is arithmetic here and not concatenation, so a string on either side of it is a value of the wrong type and not a coercion.
+    query: RETURN 'a' + 1 AS a
+    raises: "22G03"
+
+  - name: a-boolean-added-to-a-number
+    doc: A boolean is not a number that happens to be zero or one, which is the assumption this case exists to break.
+    query: RETURN true + 1 AS a
+    raises: "22G03"
+
+  - name: a-list-added-to-a-number
+    doc: A list and a number, which is the shape of an append somebody expected to work.
+    query: RETURN [1] + 1 AS a
+    raises: "22G03"
+
+  - name: a-string-negated
+    doc: Unary minus over a string, which is the one argument operator's version of the same condition.
+    query: RETURN -'a' AS a
+    raises: "22G03"
+
+  - name: a-number-under-not
+    doc: NOT wants a boolean and a number is not a truth value, however many languages say otherwise.
+    query: RETURN NOT 1 AS a
+    raises: "22G03"
+
+  - name: a-number-in-a-conjunction
+    doc: AND over a number and a boolean, which is where a client that leans on truthiness finds out this engine does not have it.
+    query: RETURN 1 AND true AS a
+    raises: "22G03"
+
+  - name: a-string-in-a-disjunction
+    doc: OR over a string, the other connective, so that both are pinned and not just the one a test happened to reach.
+    query: RETURN 'a' OR false AS a
+    raises: "22G03"
+
+  - name: a-date-added-to-a-date
+    doc: Two dates have no sum, because the distance between them is a duration and the operator for that is subtraction.
+    query: RETURN DATE '2024-01-01' + DATE '2024-01-01' AS a
+    raises: "22G03"
+
+  - name: the-size-of-a-number
+    doc: A function whose argument is of a type it does not take, which is the condition raised inside a call rather than by an operator.
+    query: RETURN size(1) AS a
+    raises: "22G03"
+
+  - name: a-number-cast-to-a-date
+    doc: A cast whose source and target have no conversion between them at all, which is the forbidden cell of the cast table and not a value that failed to convert.
+    query: RETURN cast(1 AS DATE) AS a
+    raises: "22G03"
+
+  - name: a-string-cast-to-bytes
+    doc: A second forbidden cell, chosen because a client that encodes bytes as text is exactly who tries it.
+    query: RETURN cast('1' AS BYTES) AS a
+    raises: "22G03"
+
+  - name: a-string-cast-to-a-record
+    doc: The record target, which no scalar reaches, so the condition is about the pair of types and never about the string.
+    query: RETURN cast(1 AS RECORD) AS a
+    raises: "22G03"
+
+  - name: a-limit-that-is-not-a-number
+    doc: A page size is read as an integer before any row is taken, so a string there is the wrong type rather than a bad number.
+    query: MATCH (n:person) RETURN n.age AS a LIMIT 'x'
+    raises: "22G03"
+
+  - name: a-skip-that-is-not-a-number
+    doc: The same reading on the other half of the page, which a client that sends both as strings hits first.
+    query: MATCH (n:person) RETURN n.age AS a SKIP 'x'
+    raises: "22G03"
+
+  - name: a-limit-below-zero
+    doc: An integer that is a number and still not a count, which the standard gives its own condition so a client can tell a bad type from a bad value.
+    query: MATCH (n:person) RETURN n.age AS a LIMIT -1
+    raises: "22G02"
+
+  - name: a-skip-below-zero
+    doc: A negative offset, which raises the same condition as a negative limit because the standard has one code for both.
+    query: MATCH (n:person) RETURN n.age AS a SKIP -1
+    raises: "22G02"
+
+  - name: a-string-that-is-no-number
+    doc: A cast from text that is the right type and the wrong content, which is the condition every client that reads numbers out of a form will meet.
+    query: RETURN cast('abc' AS INT64) AS a
+    raises: "22018"
+
+  - name: an-empty-string-as-a-number
+    doc: The empty string, which is what a missing field looks like after it has been through a form, and which is not zero.
+    query: RETURN cast('' AS INT64) AS a
+    raises: "22018"
+
+  - name: a-decimal-string-as-an-integer
+    doc: A number written with a point, cast to an integer, which does not truncate quietly.
+    query: RETURN cast('1.5' AS INT64) AS a
+    raises: "22018"
+
+  - name: a-word-that-is-no-boolean
+    doc: A string that means true to a person and nothing to a cast, which is the same condition as a bad number and not a different one.
+    query: RETURN cast('yes' AS BOOL) AS a
+    raises: "22018"
+
+  - name: a-word-that-is-no-float
+    doc: The float side of the same reading, since the two go through different parsers and both have to say the same thing.
+    query: RETURN cast('abc' AS FLOAT64) AS a
+    raises: "22018"
+
+  - name: a-number-too-big-for-its-target
+    doc: A value that is a number and does not fit, which is out of range and not a bad character, and the two are told apart by the code.
+    query: RETURN cast(300 AS INT8) AS a
+    raises: "22003"
+
+  - name: a-negative-number-in-an-unsigned-target
+    doc: The other edge of the same check, where the value fits the width and not the sign.
+    query: RETURN cast(-1 AS UINT8) AS a
+    raises: "22003"
+
+  - name: a-string-longer-than-its-target
+    doc: A string cast to a shorter string, which is a length condition of its own so that a client can tell it from a bad character.
+    query: RETURN cast('abcdef' AS STRING(3)) AS a
+    raises: "22001"
+
+  - name: a-stored-string-longer-than-its-target
+    doc: The same length condition over a value that came out of the store rather than out of the statement, because the check belongs to the cast and not to the literal.
+    query: MATCH (n:person) RETURN cast(n.name AS STRING(1)) AS a
+    raises: "22001"
+
+  - name: a-null-cast-to-a-target-that-refuses-one
+    doc: NOT NULL in a cast target is a promise about the value, and null is the one value that cannot keep it.
+    query: RETURN cast(null AS STRING NOT NULL) AS a
+    raises: "22004"
+
+  - name: a-null-cast-to-a-number-that-refuses-one
+    doc: The same refusal with a numeric target, so the condition is clearly about the null and not about the type it was going into.
+    query: RETURN cast(null AS INT64 NOT NULL) AS a
+    raises: "22004"
+
+  - name: a-date-that-is-not-one
+    doc: A date literal that no reader can make sense of, which is a data condition and not a syntax one, because the text is a well formed literal and its content is wrong.
+    query: RETURN DATE 'x' AS a
+    raises: "22007"
+
+  - name: a-month-that-does-not-exist
+    doc: The thirteenth month, which is what an off by one in a client's month numbering produces.
+    query: RETURN DATE '2024-13-01' AS a
+    raises: "22007"
+
+  - name: a-day-the-month-does-not-have
+    doc: The thirtieth of February, which is the check that says the calendar is read and not merely the field widths.
+    query: RETURN DATE '2024-02-30' AS a
+    raises: "22007"
+
+  - name: an-hour-the-day-does-not-have
+    doc: A time past the end of the day, so the same condition is pinned on a kind that is not a date.
+    query: RETURN LOCAL TIME '25:00:00' AS a
+    raises: "22007"
+
+  - name: a-duration-with-no-content
+    doc: An empty duration literal, which is read by the duration reader and reported the way a bad date is.
+    query: RETURN DURATION '' AS a
+    raises: "22007"
+
+  - name: a-duration-with-a-unit-nobody-has
+    doc: A quarter, which is a unit people write and ISO 8601 does not have.
+    query: RETURN DURATION 'P1Q' AS a
+    raises: "22007"
+
+  - name: a-string-cast-to-a-date-that-is-not-one
+    doc: The same bad content arriving through a cast rather than a literal, which is a separate path and worth its own case.
+    query: RETURN cast('bad' AS DATE) AS a
+    raises: "22007"
+
+  - name: a-string-cast-to-a-duration-that-is-not-one
+    doc: A cast to a duration has its own condition, so the code here is not the one a bad date gets, and a client that maps them together would be wrong.
+    query: RETURN cast('P1Q' AS DURATION) AS a
+    raises: "22G0H"
+
+  - name: an-empty-string-cast-to-a-duration
+    doc: The empty string through the cast, which is the second value that reaches the duration condition.
+    query: RETURN cast('' AS DURATION) AS a
+    raises: "22G0H"
+
+  - name: a-list-longer-than-its-target
+    doc: A list cast to a list of a fixed length, refused on the count before any element is looked at.
+    query: RETURN cast([1, 2, 3] AS LIST<INT8>(2)) AS a
+    raises: "22G0B"
+
+  - name: a-list-with-an-element-that-does-not-fit
+    doc: A list whose length is right and whose element is not, which is the element condition and carries the element's own condition inside its message.
+    query: RETURN cast([1, 300] AS LIST<INT8>) AS a
+    raises: "22G0C"
+
+  - name: a-list-with-an-element-of-the-wrong-type
+    doc: The element condition again with a type failure rather than a range failure underneath it, since the outer code is the same either way.
+    query: RETURN cast([1, 'a'] AS LIST<INT8>) AS a
+    raises: "22G0C"
+
+  - name: divided-by-zero
+    doc: The oldest arithmetic condition there is, which every client has a test for and every engine has to spell the same way.
+    query: RETURN 1 / 0 AS a
+    raises: "22012"
+
+  - name: a-float-divided-by-zero
+    doc: Float division by zero, which produces an infinity in the hardware and a condition here, because a value that no column can hold is not an answer.
+    query: RETURN 1.0 / 0.0 AS a
+    raises: "22012"
+
+  - name: a-modulus-by-zero
+    doc: The remainder operator's version of the same division, which is a separate site in an engine and the same condition in the standard.
+    query: RETURN 1 % 0 AS a
+    raises: "22012"
+
+  - name: a-duration-divided-by-zero
+    doc: Scaling a duration by zero, which reaches the division condition through the temporal path rather than the numeric one.
+    query: RETURN DURATION 'PT1S' / 0 AS a
+    raises: "22012"
+
+  - name: a-date-shifted-past-the-end-of-the-calendar
+    doc: The last date this engine holds, moved forward, which is an overflow of a field and not of a machine word.
+    query: RETURN DATE '9999-12-31' + DURATION 'P1Y' AS a
+    raises: "22008"
+
+  - name: a-date-shifted-before-the-start-of-the-calendar
+    doc: The same overflow at the other end, because a floor that is not checked is as wrong as a ceiling that is not.
+    query: RETURN DATE '0001-01-01' - DURATION 'P1Y' AS a
+    raises: "22008"
+
+  - name: a-duration-scaled-out-of-range
+    doc: A duration multiplied until it no longer fits, which is the interval condition and not the datetime one.
+    query: RETURN DURATION 'PT1S' * 9223372036854775807 AS a
+    raises: "22015"
+
+  - name: months-added-to-days
+    doc: A year and a day have no sum, because a month is not a fixed number of days and a duration that mixed them would have to pretend it is.
+    query: RETURN DURATION 'P1Y' + DURATION 'P1D' AS a
+    raises: "22G14"
+
+  - name: hours-taken-from-months
+    doc: The same refusal under subtraction, so a client cannot reach the sum by writing it backwards.
+    query: RETURN DURATION 'P1M' - DURATION 'PT1H' AS a
+    raises: "22G14"
+
+  - name: months-added-to-a-time
+    doc: A month added to a time of day, which is a duration whose unit the value has no field for.
+    query: RETURN LOCAL TIME '12:00:00' + DURATION 'P1M' AS a
+    raises: "22G14"
+
+  - name: one-property-assigned-twice
+    doc: A SET that writes the same property twice in one statement, which has no answer that is not an ordering, and an element holds one value per property.
+    query: MATCH (n:person) SET n.age = 1, n.age = 2
+    raises: "22G0M"
+
+  - name: a-record-and-a-property-assigned-together
+    doc: The whole record and one of its properties in the same SET, which is the same clash written the other way.
+    query: "MATCH (n:person) SET n = {age: 1}, n.age = 2"
+    raises: "22G0M"
+
+  - name: the-table-name-taken-off-a-node
+    doc: A node's table name is a label it carries by being in the table, so there is no taking it off and leaving the node where it is.
+    query: MATCH (n:person) REMOVE n:person
+    raises: "22G0N"
+
+  - name: the-table-name-put-on-a-node
+    doc: The same label written on rather than off, which is not a change and is refused rather than ignored, because a statement that says nothing is worth reporting.
+    query: MATCH (n:person) SET n:person
+    raises: "22G03"
+
+  - name: a-sixty-fifth-label
+    doc: A label set is the bits of one word, so a graph holds 64 labels and the statement that asks for one more is refused rather than silently dropping it.
+    query: MATCH (n:person) SET n:a0, n:a1, n:a2, n:a3, n:a4, n:a5, n:a6, n:a7, n:a8, n:a9, n:a10, n:a11, n:a12, n:a13, n:a14, n:a15, n:a16, n:a17, n:a18, n:a19, n:a20, n:a21, n:a22, n:a23, n:a24, n:a25, n:a26, n:a27, n:a28, n:a29, n:a30, n:a31, n:a32, n:a33, n:a34, n:a35, n:a36, n:a37, n:a38, n:a39, n:a40, n:a41, n:a42, n:a43, n:a44, n:a45, n:a46, n:a47, n:a48, n:a49, n:a50, n:a51, n:a52, n:a53, n:a54, n:a55, n:a56, n:a57, n:a58, n:a59, n:a60, n:a61, n:a62, n:a63
+    raises: "22G0P"
+
+  - name: a-label-put-on-an-edge
+    doc: An edge carries one label, the name of its rel table, so adding one asks for more labels than an edge has room for.
+    query: MATCH (a:person)-[e:knows]->(b:person) SET e:other
+    raises: "22G0R"
+
+  - name: a-label-taken-off-an-edge
+    doc: The same one label, taken away, which leaves an edge with fewer labels than an edge has, and is a different code from adding one.
+    query: MATCH (a:person)-[e:knows]->(b:person) REMOVE e:knows
+    raises: "22G0Q"
+
+  - name: an-element-deleted-while-an-edge-still-points-at-it
+    doc: DELETE without DETACH takes away a node and no edges, so a node that is still an end of one has to stay, and this is the condition that says so.
+    query: MATCH (n:person) WHERE n.name = 'ann' DELETE n
+    raises: "G1001"
+
+  - name: an-element-deleted-while-an-edge-arrives-at-it
+    doc: The same refusal counted on the other side, because a node with only incoming edges is as attached as one with outgoing edges.
+    query: MATCH (n:person) WHERE n.name = 'cy' DELETE n
+    raises: "G1001"
+
+  - name: an-edge-written-to-an-element-this-statement-deleted
+    doc: A statement that deletes a node and then writes an edge to it, which is a reference to a row that is gone by the time the edge is written.
+    query: MATCH (a:person), (b:person) WHERE a.name = 'ann' AND b.name = 'cy' DETACH DELETE b INSERT (a)-[:knows]->(b)
+    raises: "G1002"
+
+  - name: an-edge-written-from-an-element-this-statement-deleted
+    doc: The same reference at the other end of the arrow, since an edge has two ends and both are checked.
+    query: MATCH (a:person), (b:person) WHERE a.name = 'ann' AND b.name = 'cy' DETACH DELETE a INSERT (a)-[:knows]->(b)
+    raises: "G1002"
+
+  - name: a-property-read-off-an-element-this-statement-deleted
+    doc: A DELETE leaves the name bound, so a clause after one can read a row that is no longer there, and reading it is a condition rather than the value the row used to hold.
+    query: MATCH (n:person) WHERE n.name = 'cy' DETACH DELETE n RETURN n.name AS a
+    raises: "22G11"
+
+  - name: an-edge-used-as-the-end-of-an-edge
+    doc: An edge is not an element an edge can run between, and the statement says so with the name that stands for it rather than with the row.
+    query: MATCH (a:person)-[e:knows]->(b:person) INSERT (e)-[:knows]->(b)
+    raises: "22G03"
+
+  - name: a-path-handed-to-set
+    doc: SET changes one element and a path is a sequence of them, so the condition is about the type of the thing being written and not about what was written into it.
+    query: MATCH p = (a:person)-[:knows]->(b:person) SET p.n = 1
+    raises: "22G03"
+
+  - name: a-path-handed-to-delete
+    doc: The same type, handed to the other write clause, which is the case that says DELETE checks its target rather than walking whatever it is given.
+    query: MATCH p = (a:person)-[:knows]->(b:person) DELETE p
+    raises: "22G03"
+
+  - name: a-property-set-to-the-wrong-type
+    doc: A property has the type of the column it lives in, and a statement that writes a string into an integer column is refused before the row is touched.
+    query: MATCH (n:person) SET n.age = 'x'
+    raises: "22G03"
+
+  - name: a-property-set-to-a-list
+    doc: The same check against a value that is not a scalar at all, which is what a client sends when it means to write an array of one.
+    query: MATCH (n:person) SET n.name = [1, 2]
+    raises: "22G03"
+
+  - name: an-alias-that-was-never-written
+    doc: AS with nothing after it, which is what a client sends when it builds a projection from a column name that turned out to be empty.
+    query: RETURN 1 AS
+    raises: "42001"
+
+  - name: a-dot-with-no-property-after-it
+    doc: The same shape one level down, where the property name is the part that went missing rather than the alias.
+    query: MATCH (n:person) RETURN n. AS a
+    raises: "42001"
+
+  - name: an-operator-with-no-right-side
+    doc: An expression that stops after its operator, which is the usual result of concatenating a query out of pieces and losing one.
+    query: RETURN 1 + AS a
+    raises: "42001"
+
+  - name: a-list-left-open
+    doc: A list whose closing bracket never arrives, refused where the bracket was expected rather than at the end of the text.
+    query: RETURN [1, 2 AS a
+    raises: "42001"
+
+  - name: distinct-with-nothing-after-it
+    doc: DISTINCT is a modifier on a projection and not a projection, so a statement that ends on it has nothing to return.
+    query: MATCH (n:person) RETURN DISTINCT
+    raises: "42001"
+
+  - name: a-property-set-to-nothing
+    doc: An assignment with no right side, which is what a client sends when the value it meant to interpolate was empty text.
+    query: MATCH (n:person) SET n.age =
+    raises: "42001"
+
+  - name: an-insert-with-no-pattern
+    doc: A write clause with nothing to write, refused at the parenthesis that would have opened the pattern.
+    query: INSERT
+    raises: "42001"
+
+  - name: a-label-put-on-a-number
+    doc: A label goes on a bound element and nothing else, so a literal in that position is refused before anything is looked up.
+    query: MATCH (n:person) SET 1:other
+    raises: "42001"
+
+  - name: a-literal-handed-to-delete
+    doc: The same rule under DELETE, which takes the names of elements rather than values.
+    query: MATCH (n:person) DELETE 1
+    raises: "42001"
+
+  - name: a-cast-to-a-type-nobody-has
+    doc: A target type the grammar does not know, refused while the statement is read rather than when a value reaches the cast.
+    query: RETURN cast(1 AS NOPE) AS x
+    raises: "42001"
+
+  - name: a-total-over-strings
+    doc: A total needs numbers, and a client that points one at a text column gets this rather than a concatenation or a count.
+    query: MATCH (n:person) RETURN sum(n.name) AS a
+    raises: "22G03"
+
+  - name: an-average-over-strings
+    doc: The same for an average, which is the other set function whose argument has to be a number.
+    query: MATCH (n:person) RETURN avg(n.name) AS x
+    raises: "22G03"
+
+  - name: a-total-over-booleans
+    doc: Booleans are not numbers here, so a client that expected true to add one has to count a filtered set instead.
+    query: MATCH (n:person) RETURN sum(n.name = 'ann') AS x
+    raises: "22G03"
+
+  - name: a-string-under-a-modulus
+    doc: Modulus takes numbers on both sides, and the condition names the pair it was handed rather than only the operator.
+    query: RETURN 'a' % 'b' AS x
+    raises: "22G03"
+
+  - name: a-node-added-to-a-number
+    doc: An element is not a number, which is what a client meets when it forgets the property and writes the variable alone.
+    query: MATCH (n:person) RETURN n + 1 AS x
+    raises: "22G03"
+
+  - name: a-date-added-to-a-number
+    doc: Shifting a date takes a duration, not a count of anything, so a bare number on the right is refused rather than read as days.
+    query: RETURN DATE '2024-01-01' + 1 AS x
+    raises: "22G03"
+
+  - name: a-date-multiplied-by-a-date
+    doc: Two dates have a difference and no product, and the condition is the same one an unsupported pair of operands always raises.
+    query: RETURN DATE '2024-01-01' * DATE '2024-01-01' AS x
+    raises: "22G03"
+
+  - name: a-duration-added-to-a-number
+    doc: A duration scales by a number and adds to a duration, so a number on the other side of a plus is refused.
+    query: RETURN DURATION 'PT1S' + 1 AS x
+    raises: "22G03"
+
+  - name: a-time-added-to-a-date
+    doc: Two temporals of different kinds do not combine, which is the case a client hits when it builds a timestamp by adding the halves.
+    query: RETURN DATE '2024-01-01' + LOCAL TIME '01:00:00' AS x
+    raises: "22G03"
+
+  - name: a-stored-value-cast-too-small
+    doc: A cast over a column value is checked per row against the target range, so this one is raised while the rows are read rather than while the statement is planned.
+    query: MATCH (n:person) RETURN cast(n.age * 1000 AS INT8) AS a
+    raises: "22003"
+
+  - name: a-condition-raised-from-an-order-key
+    doc: An ordering key is an expression and is evaluated like one, so a division by zero there ends the statement the same way it would in a projection.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY 1 / 0
+    raises: "22012"
+
+  - name: a-condition-raised-from-inside-a-list
+    doc: The elements of a list literal are evaluated before the list exists, so a condition in one of them is raised rather than carried into the value.
+    query: RETURN [1 / 0] AS a
+    raises: "22012"
+
+  - name: a-condition-raised-from-a-predicate
+    doc: A filter is an expression too, and a condition raised while deciding a row ends the statement instead of dropping that row.
+    query: MATCH (n:person) WHERE 1 / 0 = 1 RETURN n.name AS a
+    raises: "22012"
+
+  - name: a-condition-raised-by-one-row-only
+    doc: One row of four divides by zero here, which is the case that separates an engine that evaluates lazily from one that answers with the rows it managed.
+    query: MATCH (n:person) RETURN 10 / (n.age - 40) AS a
+    raises: "22012"

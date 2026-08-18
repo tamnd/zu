@@ -498,14 +498,32 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The open sidecar log: an append position and the frame codec around
-/// it. Commit durability is one `fdatasync` per commit; the 1 ms
-/// group-commit window from docs/08 arrives with the writer queue.
+/// The open sidecar log: an append position, a staging buffer and the
+/// frame codec around them. Commit durability is one `fdatasync` per
+/// commit; the 1 ms group-commit window from docs/08 arrives with the
+/// writer queue.
+///
+/// A transaction's frames are built in memory and go to the file in one
+/// write at commit, because a small write is nearly all syscall: a one
+/// cell update is a begin frame, an update frame and a commit frame,
+/// three pwrites of about thirty bytes each, and on this laptop those
+/// three cost more processor time than everything the statement did
+/// before them. Nothing about durability changes, since the commit
+/// frame is still what reaches the disk last and the sync still follows
+/// it.
 pub struct Wal {
     file: Box<dyn VfsFile>,
     path: PathBuf,
     len: u64,
+    /// Frames appended but not yet pushed at the file, in log order.
+    buf: Vec<u8>,
 }
+
+/// How large the staging buffer is allowed to get before it goes to the
+/// file mid-transaction. A bulk insert stages one frame per batch and
+/// there is no reason to hold a whole load in memory to save syscalls
+/// that are already amortized over a large frame.
+const SPILL: usize = 256 * 1024;
 
 impl Wal {
     /// Opens the log at `path`, creating it when missing, and truncates
@@ -534,40 +552,65 @@ impl Wal {
             file,
             path: path.to_path_buf(),
             len: end,
+            buf: Vec::new(),
         })
     }
 
     /// Bytes of intact frames, the input to the checkpoint trigger.
+    /// Staged frames count: they are what the next commit is about to
+    /// make durable, and a trigger that ignored them would read a log
+    /// mid-transaction as shorter than it is about to be.
     pub fn len(&self) -> u64 {
-        self.len
+        self.len + self.buf.len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
-    /// Appends one frame without syncing. Durability comes from
-    /// [`Wal::commit`]; a crash before it tears the tail and replay
-    /// drops the whole uncommitted txn.
+    /// Stages one frame. Nothing reaches the file until the buffer
+    /// fills or the commit pushes it, and durability comes from
+    /// [`Wal::commit`] either way: a crash before it leaves the staged
+    /// frames unwritten, or leaves a spilled prefix with no commit
+    /// frame after it, and replay drops the whole uncommitted txn in
+    /// both cases.
     pub fn append(&mut self, epoch: Epoch, rec: &WalRecord) -> Result<()> {
-        let mut body = Vec::with_capacity(64);
-        body.extend_from_slice(&epoch.to_le_bytes());
-        body.push(rec.kind());
-        rec.encode_payload(&mut body);
-        let mut frame = Vec::with_capacity(PREFIX as usize + body.len());
-        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
-        frame.extend_from_slice(&body);
-        self.file.write_all_at(&frame, self.len)?;
-        self.len += frame.len() as u64;
+        let at = self.buf.len();
+        self.buf.extend_from_slice(&[0; PREFIX as usize]);
+        self.buf.extend_from_slice(&epoch.to_le_bytes());
+        self.buf.push(rec.kind());
+        rec.encode_payload(&mut self.buf);
+        let body = &self.buf[at + PREFIX as usize..];
+        let head = [
+            (body.len() as u32).to_le_bytes(),
+            crc32c::crc32c(body).to_le_bytes(),
+        ];
+        self.buf[at..at + PREFIX as usize].copy_from_slice(head.as_flattened());
+        if self.buf.len() >= SPILL {
+            self.flush()?;
+        }
         Ok(())
     }
 
-    /// Appends the txn's `TxnCommit` frame and syncs the file. The
-    /// record hitting disk is the commit point: replay delivers a txn
-    /// exactly when this frame verifies.
+    /// Pushes the staged frames at the file, without syncing.
+    fn flush(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all_at(&self.buf, self.len)?;
+        self.len += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Stages the txn's `TxnCommit` frame, writes everything the txn
+    /// staged in one go and syncs the file. The commit record hitting
+    /// disk is the commit point: replay delivers a txn exactly when
+    /// that frame verifies, and it is last in the buffer, so a write
+    /// the disk tears anywhere leaves a txn replay refuses.
     pub fn commit(&mut self, epoch: Epoch) -> Result<()> {
         self.append(epoch, &WalRecord::TxnCommit)?;
+        self.flush()?;
         self.file.sync_data()?;
         Ok(())
     }
@@ -582,6 +625,10 @@ impl Wal {
     /// before the transaction and stay, whether the base file has
     /// folded them already or replay is about to bring them back.
     pub fn rollback_above(&mut self, floor: Epoch) -> Result<()> {
+        // Staged frames belong to the transaction going away, and they
+        // never reached the file, so dropping them is the whole of the
+        // rollback for everything the buffer still holds.
+        self.buf.clear();
         let mut bytes = vec![0u8; self.len as usize];
         self.file.read_exact_at(&mut bytes, 0)?;
         let mut end = 0u64;
@@ -612,6 +659,7 @@ impl Wal {
     /// shorter sooner, which is a quarter of what a one cell write pays
     /// for durability it already has.
     pub fn truncate(&mut self) -> Result<()> {
+        self.buf.clear();
         self.file.set_len(0)?;
         self.len = 0;
         Ok(())

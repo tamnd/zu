@@ -23,9 +23,19 @@
 //! on is 3.9 ms whatever it is syncing, so the latency column of a
 //! single threaded run is mostly the storage and it will sit near that
 //! floor however cheap the write path gets. `cpu` is the part this
-//! repository can move, and it is what the P5 budget is written
-//! against. Latency comes down when commits stop syncing one at a time,
-//! which is group commit and a different change from this one. A one cell change that writes a megabyte is a real defect
+//! repository can move. Latency comes down when commits stop syncing
+//! one at a time, which is group commit and a different change from
+//! this one.
+//!
+//! `cpu-sync` is that column with the sync's own processor cost taken
+//! out, and it is the one the P5 budget is written against. A sync is
+//! not only a wait: on this laptop it is `fcntl` with `F_FULLFSYNC`,
+//! which burns 60 to 80 us before the disk is even asked, several times
+//! what the write path spends, and it lands in the same counter. So
+//! `cpu` on a durable one statement commit is mostly the storage too,
+//! and it moves with whatever else the machine is doing to its disk.
+//! What is taken out is measured on the machine the run is on, one sync
+//! a statement, which is what one statement commits. A one cell change that writes a megabyte is a real defect
 //! and the clock alone would call it fine; a write path that leaked a
 //! block per statement would pass every latency ceiling there is and
 //! show up only in `growth`.
@@ -222,6 +232,46 @@ fn usage() -> Usage {
     }
 }
 
+/// What one commit's durability costs the processor on this machine,
+/// in microseconds, measured rather than assumed.
+///
+/// An fsync is not only a wait. On this laptop the call is `fcntl`
+/// with `F_FULLFSYNC`, which burns 60 to 80 us of processor time before
+/// the disk is even asked, and that lands in the same `getrusage`
+/// counter the write path does, three times what the write path spends.
+/// So the `cpu` column of a durable single statement commit is mostly
+/// the sync and it moves with whatever else the machine is doing to its
+/// storage, which is no way to watch a write path.
+///
+/// The measurement is the difference between a loop that syncs and the
+/// same loop that does not, so what comes out is the sync and not the
+/// small write in front of it. It runs on the same directory the
+/// database is in, because a sync costs what the filesystem under it
+/// costs.
+fn sync_cpu(dir: &Path) -> f64 {
+    use std::io::Write;
+    const ROUNDS: u64 = 100;
+    let path = dir.join("sync-cost");
+    let pass = |sync: bool| -> u64 {
+        let mut file = std::fs::File::create(&path).expect("a writable scratch file");
+        let before = peak_rss_and_cpu().1;
+        for i in 0..ROUNDS {
+            file.write_all(&i.to_le_bytes()).expect("a write");
+            if sync {
+                file.sync_data().expect("a sync");
+            }
+        }
+        peak_rss_and_cpu().1 - before
+    };
+    // Warm: the first create and the first sync on a fresh file pay for
+    // metadata neither of the timed passes should carry.
+    pass(true);
+    let synced = pass(true).min(pass(true));
+    let plain = pass(false).min(pass(false));
+    let _ = std::fs::remove_file(&path);
+    synced.saturating_sub(plain) as f64 / ROUNDS as f64
+}
+
 /// Every byte the database occupies, which is the file and the log
 /// beside it.
 fn disk(dir: &Path) -> u64 {
@@ -260,18 +310,38 @@ struct Cost {
 }
 
 impl Cost {
+    /// The processor time of the statement with its commit's sync taken
+    /// out, given what a sync costs on this machine.
+    ///
+    /// One statement is one commit is one sync, so what comes off is one
+    /// `sync`. A statement that syncs twice keeps the second one, which
+    /// is the right way round: an extra sync is a regression and should
+    /// be visible rather than subtracted away.
+    fn cpu_less_sync(&self, sync: f64) -> f64 {
+        (self.cpu - sync).max(0.0)
+    }
+
     fn header() {
         println!(
-            "{:<26} {:>10} {:>9} {:>12} {:>13} {:>12} {:>10} {:>12}",
-            "statement", "latency", "cpu", "throughput", "written", "growth", "RSS", "peak growth"
+            "{:<26} {:>10} {:>9} {:>11} {:>12} {:>13} {:>12} {:>10} {:>12}",
+            "statement",
+            "latency",
+            "cpu",
+            "cpu-sync",
+            "throughput",
+            "written",
+            "growth",
+            "RSS",
+            "peak growth"
         );
     }
 
-    fn report(&self, what: &str) {
+    fn report(&self, what: &str, sync: f64) {
         println!(
-            "{what:<26} {:>7.0} us {:>6.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
+            "{what:<26} {:>7.0} us {:>6.0} us {:>8.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
             self.us,
             self.cpu,
+            self.cpu_less_sync(sync),
             1e6 / self.us.max(0.001),
             self.written / 1024.0,
             self.growth,
@@ -768,31 +838,33 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
 fn main() {
     let gate = std::env::var("ZU_GATE").is_ok_and(|v| v == "1");
     let root = tempfile::tempdir().expect("tempdir");
+    let sync = sync_cpu(root.path());
+    println!("one sync costs this machine {sync:.0} us of processor time");
 
     Cost::header();
     let set_small = run_set(&root.path().join("set-small"), SMALL);
-    set_small.report(&format!("SET, {SMALL} rows"));
+    set_small.report(&format!("SET, {SMALL} rows"), sync);
 
     let set_large = run_set(&root.path().join("set-large"), LARGE);
-    set_large.report(&format!("SET, {LARGE} rows"));
+    set_large.report(&format!("SET, {LARGE} rows"), sync);
 
     let set_edge = run_set_edge(&root.path().join("set-edge"), SMALL);
-    set_edge.report(&format!("SET on an edge, {SMALL} rows"));
+    set_edge.report(&format!("SET on an edge, {SMALL} rows"), sync);
 
     let set_record = run_set_record(&root.path().join("set-record"), SMALL);
-    set_record.report(&format!("SET a record, {SMALL} rows"));
+    set_record.report(&format!("SET a record, {SMALL} rows"), sync);
 
     let set_label = run_set_label(&root.path().join("set-label"), SMALL);
-    set_label.report(&format!("SET a label, {SMALL} rows"));
+    set_label.report(&format!("SET a label, {SMALL} rows"), sync);
 
     let insert = run_insert(&root.path().join("insert"), SMALL);
-    insert.report(&format!("INSERT, {SMALL} rows"));
+    insert.report(&format!("INSERT, {SMALL} rows"), sync);
 
     let delete = run_delete(&root.path().join("delete"), SMALL);
-    delete.report(&format!("DELETE, {SMALL} rows"));
+    delete.report(&format!("DELETE, {SMALL} rows"), sync);
 
     let detach = run_detach(&root.path().join("detach"), SMALL);
-    detach.report(&format!("DETACH DELETE, {SMALL} rows"));
+    detach.report(&format!("DETACH DELETE, {SMALL} rows"), sync);
 
     // How much of a one cell write is the table it sits in, in time and
     // in bytes. One means the write path does not read the table; ten
@@ -807,6 +879,7 @@ fn main() {
     let checks = [
         ("set_stmt_us", set_small.us),
         ("set_stmt_cpu_us", set_small.cpu),
+        ("set_stmt_cpu_nosync_us", set_small.cpu_less_sync(sync)),
         ("insert_stmt_cpu_us", insert.cpu),
         ("set_edge_stmt_us", set_edge.us),
         ("set_edge_stmt_kb", set_edge.written / 1024.0),

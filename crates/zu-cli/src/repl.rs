@@ -177,7 +177,9 @@ fn columns(session: &mut Session, name: &str) -> Vec<Column> {
     let catalog = session.catalog();
     let node = catalog.node_by_name(name).map(|t| t.id);
     let rel = catalog.rel_by_name(name).map(|t| t.id);
-    let db = session.file_mut();
+    let Ok(db) = session.file_mut() else {
+        return Vec::new();
+    };
     let directory = match (node, rel) {
         (Some(id), _) => zu::zu1::props::load_props(db, id),
         (_, Some(id)) => zu::zu1::props::load_rel_props(db, id),

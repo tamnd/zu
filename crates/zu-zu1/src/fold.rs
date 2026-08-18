@@ -142,12 +142,36 @@ fn seed_persisted_tombstones(db: &mut Zu1File, mvcc: &mut Mvcc) -> Result<()> {
 }
 
 /// Folds every overlay at the store's current epoch into new sealed
-/// segments and truncates the WAL. On return the overlay store is
-/// empty at the same epoch with persisted tombstones reseeded, and the
-/// file reads identically to the pre-fold snapshot at that epoch. On
-/// error nothing published: the header, the WAL, and the store are
-/// exactly as they were, and any blocks written are unreferenced.
+/// segments, publishes them, and truncates the WAL. On return the
+/// overlay store is empty at the same epoch with persisted tombstones
+/// reseeded, and the file reads identically to the pre-fold snapshot
+/// at that epoch. On error nothing published: the header, the WAL, and
+/// the store are exactly as they were, and any blocks written are
+/// unreferenced.
 pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Result<()> {
+    fold(db, mvcc, wal, true)
+}
+
+/// Folds the same way, and stops before the header flip.
+///
+/// This is the shape a write statement wants. The fold is what makes a
+/// committed change something the next `MATCH` reads, so it has to
+/// happen per commit; the flip is what makes it something the next
+/// process reads, and the log already says that. Two full syncs of the
+/// three a one cell write pays are the flip, and the frame the commit
+/// synced covers exactly the window skipping them opens: a crash finds
+/// the older header and replays the log back to where the fold had
+/// got to.
+///
+/// What it costs is file growth. Nothing freed can be handed out again
+/// until a checkpoint publishes, so every fold in between takes fresh
+/// blocks for what it rewrites, and the caller watches
+/// [`Zu1File::unpublished_blocks`] and publishes on a threshold.
+pub fn staged_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Result<()> {
+    fold(db, mvcc, wal, false)
+}
+
+fn fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal, publish: bool) -> Result<()> {
     let epoch = mvcc.epoch();
     let mut catalog = Catalog::load(db)?;
     let mut index = TableIndex::load(db)?;
@@ -221,7 +245,9 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
     if !changed && wal.is_empty() {
         return Ok(());
     }
-    // The publish: both roots and the WAL floor move in one flip.
+    // Both roots and the WAL floor move together, so whichever way
+    // this ends the header names segments that hold everything folded
+    // through the epoch it names and nothing above it.
     free_chain(db, db.db_header().catalog_root)?;
     free_chain(db, db.db_header().table_index_root)?;
     let catalog_root = meta::write_chain(db, &catalog.encode())?;
@@ -229,8 +255,13 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
     db.db_header_mut().catalog_root = catalog_root;
     db.db_header_mut().table_index_root = index_root;
     db.db_header_mut().wal_seq = epoch;
-    db.checkpoint()?;
-    wal.truncate()?;
+    match publish {
+        true => {
+            db.checkpoint()?;
+            wal.truncate()?;
+        }
+        false => db.stage_fold(),
+    }
     *mvcc = Mvcc::new(epoch);
     seed_persisted_tombstones(db, mvcc)
 }
@@ -1399,6 +1430,46 @@ mod tests {
         assert!(mvcc.is_deleted(f.person, 2, 0));
         assert_eq!(read_age(&mut db, f.person, 4), 50);
         assert_eq!(read_name(&mut db, f.person, 5), b"raj");
+    }
+
+    /// A fold that stops before the flip answers through the handle
+    /// that made it and leaves the file alone, and the log is what
+    /// covers the difference: a reopen replays it and lands on the same
+    /// answers a published fold would have left.
+    #[test]
+    fn a_staged_fold_reads_through_and_is_not_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = seeded(dir.path());
+        let published = f.db.db_header().epoch;
+        staged_fold(&mut f.db, &mut f.mvcc, &mut f.wal).unwrap();
+        assert_eq!(read_age(&mut f.db, f.person, 4), 50);
+        assert_eq!(read_name(&mut f.db, f.person, 5), b"raj");
+        assert!(f.db.db_header().epoch > published, "the readers above it");
+        assert!(!f.wal.is_empty(), "the staged fold cut the log");
+
+        let path = dir.path().join("fold.zu1");
+        {
+            let mut cold = Zu1File::open(&path).unwrap();
+            assert_eq!(cold.db_header().epoch, published);
+            let rows = Catalog::load(&mut cold)
+                .unwrap()
+                .node_by_id(f.person)
+                .unwrap()
+                .node_count;
+            assert_eq!(rows, 4, "the staged fold reached the file");
+        }
+
+        drop(f.db);
+        drop(f.wal);
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut wal = Wal::open(&dir.path().join("fold.wal")).unwrap();
+        let mut mvcc = recover(&mut db, &mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        assert_eq!(read_age(&mut db, f.person, 4), 50);
+        assert_eq!(read_name(&mut db, f.person, 5), b"raj");
+        assert!(mvcc.is_deleted(f.person, 2, 0));
+        drop(db);
+        crate::verify(&path).unwrap();
     }
 
     /// A crash at any point before the header flip is the pre-fold

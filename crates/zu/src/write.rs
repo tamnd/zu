@@ -13,17 +13,26 @@
 //! checkpoint, and turns a staged transaction into a committed epoch.
 //!
 //! Every commit that changed something folds, and that is worth being
-//! plain about, because it is not where this ends up. A fold rewrites
-//! every column of every table the transaction touched, so paying one
-//! per statement is the wrong shape for a write workload, and the
-//! overlay exists precisely so a reader can see a committed row
-//! without one. But [`Zu1Graph`] reads the sealed file and nothing
-//! else, so today a change that is not folded is a change the next
-//! `MATCH` cannot see, and a write nobody can read is not a write.
-//! Folding here keeps the visibility contract honest while the read
-//! path catches up; once it consults overlays this becomes a policy
-//! and a background checkpoint, and the only thing that changes here
-//! is when [`Writer::fold`] gets called.
+//! plain about, because it is not obviously the right cost. A fold
+//! rewrites the columns the transaction touched, and the overlay
+//! exists precisely so a reader could see a committed row without one.
+//! But [`Zu1Graph`] reads the sealed file and nothing else, so today a
+//! change that is not folded is a change the next `MATCH` cannot see,
+//! and a write nobody can read is not a write. Folding here keeps the
+//! visibility contract honest while the read path catches up.
+//!
+//! Not every fold publishes, and that is the part worth reading twice.
+//! A fold moves the roots this handle carries; a checkpoint puts them
+//! on disk, and on a platform where the only barrier is a full sync it
+//! costs two of them, against one for the log frame the commit already
+//! synced. So a commit folds and stops, and the file is checkpointed
+//! when the folds since the last one have taken
+//! [`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the
+//! frame is the durability point, the header on disk still names the
+//! epoch the last checkpoint folded through, and a crash replays the
+//! log from there back to where the folds had got to. What it costs is
+//! file growth, because a block freed by an unpublished fold cannot be
+//! handed out again, and that is what the threshold bounds.
 //!
 //! [`Zu1Graph`]: crate::query::Zu1Graph
 
@@ -33,9 +42,19 @@ use zu_common::{Epoch, Result, ZuError};
 
 use crate::append::sidecar;
 use crate::zu1::file::Zu1File;
-use crate::zu1::fold::{checkpoint_fold, recover};
+use crate::zu1::fold::{checkpoint_fold, recover, staged_fold};
 use crate::zu1::txn::{Mvcc, WriteTxn};
 use crate::zu1::wal::Wal;
+
+/// How much a run of folds may take before one of them checkpoints.
+///
+/// Every fold in a run takes fresh blocks for what it rewrites, so this
+/// is the file growth a writer that never stops is allowed to carry,
+/// 16 MiB at the 256 KiB block. A one cell write folds a handful of
+/// blocks, so a statement pays the two syncs of a checkpoint about
+/// once in a dozen and the log stays about that long, which is also
+/// about how much a recovery has to replay.
+const THRESHOLD_BLOCKS: u64 = 256;
 
 /// What one [`Writer::write`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,17 +159,28 @@ impl Writer {
         }
         let epoch = txn.commit(&mut self.wal)?;
         if staged {
-            self.fold(db)?;
+            match db.unpublished_blocks() >= THRESHOLD_BLOCKS {
+                true => self.fold(db)?,
+                false => staged_fold(db, &mut self.mvcc, &mut self.wal)?,
+            }
         }
         Ok(Written { value, epoch })
     }
 
-    /// Seals every committed overlay into the file and truncates the
-    /// log. On return the file alone answers what the overlays
-    /// answered, and the header epoch has moved, so anything caching
-    /// the catalog or a decoded layout has to reload.
+    /// Seals every committed overlay into the file, publishes it and
+    /// truncates the log. On return the file alone answers what the
+    /// overlays answered, and the header epoch has moved, so anything
+    /// caching the catalog or a decoded layout has to reload.
     pub fn fold(&mut self, db: &mut Zu1File) -> Result<()> {
         checkpoint_fold(db, &mut self.mvcc, &mut self.wal)
+    }
+
+    /// Cuts the log back to where it stood at `floor`, which is what a
+    /// rollback owes a log the folds it is undoing never truncated. A
+    /// writer is dropped straight after, because the store it holds
+    /// describes epochs that have stopped existing.
+    pub fn discard_above(&mut self, floor: Epoch) -> Result<()> {
+        self.wal.rollback_above(floor)
     }
 }
 
@@ -330,6 +360,130 @@ mod tests {
         assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay"]);
     }
 
+    /// How many people the file on disk says there are, read through a
+    /// handle of its own, so a session holding the same path with folds
+    /// it has not checkpointed does not answer for it.
+    fn published_people(path: &Path) -> u64 {
+        let mut db = Zu1File::open(path).expect("open");
+        Catalog::load(&mut db)
+            .expect("catalog")
+            .node_by_name("person")
+            .expect("person")
+            .node_count
+    }
+
+    /// The visibility contract holds without the header flip: a row
+    /// committed and folded is a row the next query reads, and the file
+    /// on disk is still the one from before it, because the fold
+    /// stopped short of publishing.
+    #[test]
+    fn a_fold_that_did_not_publish_is_read_and_is_not_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("staged.zu1");
+        seeded(&path);
+        assert_eq!(published_people(&path), 4);
+
+        let mut session = Session::open(&path).expect("open");
+        let (person, _) = person_and_knows(&session);
+        session
+            .write(|txn| {
+                txn.insert_nodes(
+                    person,
+                    vec![
+                        (0, vec![Cell::Int(50)]),
+                        (1, vec![Cell::Str(b"eva".to_vec())]),
+                    ],
+                )
+            })
+            .expect("write");
+        assert_eq!(names(&mut session), ["ada", "amy", "eva", "joe", "kay"]);
+        assert_eq!(
+            published_people(&path),
+            4,
+            "a statement checkpointed under the threshold"
+        );
+
+        // The log is what makes that safe, so a process that goes away
+        // here has lost nothing.
+        drop(session);
+        let mut session = Session::open(&path).expect("reopen");
+        assert_eq!(names(&mut session), ["ada", "amy", "eva", "joe", "kay"]);
+    }
+
+    /// Closing publishes. Nothing would be lost if it did not, because
+    /// the log holds every commit the folds staged, but a process that
+    /// only writes would leave a log as long as its life and hand the
+    /// next open a replay to match.
+    #[test]
+    fn a_session_that_closes_leaves_nothing_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("close.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let (person, _) = person_and_knows(&session);
+        for age in [50u64, 60, 70] {
+            session
+                .write(|txn| {
+                    txn.insert_nodes(
+                        person,
+                        vec![
+                            (0, vec![Cell::Int(age)]),
+                            (1, vec![Cell::Str(b"eva".to_vec())]),
+                        ],
+                    )
+                })
+                .expect("write");
+        }
+        drop(session);
+
+        assert_eq!(published_people(&path), 7);
+        let log = std::fs::metadata(sidecar(&path)).expect("the log is there");
+        assert_eq!(log.len(), 0, "the close left frames in the log");
+    }
+
+    /// A statement that writes twice and then raises is undone whole,
+    /// and it is undone whole after a crash too. Neither fold published,
+    /// so what has to be taken back is the log rather than the header,
+    /// and the marker the second commit wrote is what says how far.
+    #[test]
+    fn a_crash_inside_a_statement_that_wrote_twice_takes_both_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("half.zu1");
+        seeded(&path);
+
+        {
+            let mut db = Zu1File::open(&path).expect("open");
+            let person = Catalog::load(&mut db)
+                .expect("catalog")
+                .node_by_name("person")
+                .expect("person")
+                .id;
+            let mut writer = Writer::open(&mut db).expect("writer");
+            db.begin_savepoint(false, writer.epoch()).expect("hold");
+            for name in [b"eva", b"raj"] {
+                writer
+                    .write(&mut db, |txn| {
+                        txn.insert_nodes(
+                            person,
+                            vec![
+                                (0, vec![Cell::Int(50)]),
+                                (1, vec![Cell::Str(name.to_vec())]),
+                            ],
+                        )
+                    })
+                    .expect("write");
+            }
+            // The statement raises here and the process dies before it
+            // can say so.
+        }
+
+        let mut session = Session::open(&path).expect("reopen");
+        assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay"]);
+        drop(session);
+        crate::zu1::verify(&path).expect("verify");
+    }
+
     /// A log left beside the file by a process that committed and then
     /// died before checkpointing is sealed when the next session opens
     /// over it, so the reader sees the committed row rather than the
@@ -393,7 +547,8 @@ mod tests {
             .expect("write");
 
         let mut appender =
-            crate::append::Appender::open(session.file_mut(), "person").expect("open the appender");
+            crate::append::Appender::open(session.file_mut().expect("publish"), "person")
+                .expect("open the appender");
         appender.append_row((70i64, "raj")).expect("append");
         appender.close().expect("close");
 

@@ -138,6 +138,35 @@
       "doc": "Fold deltas and flip the root header."
     },
     {
+      "id": "zu::Column",
+      "kind": "struct",
+      "name": "Column",
+      "source": "zu_query::frame::Column",
+      "doc": "One column of a frame as the caller describes it."
+    },
+    {
+      "id": "zu::Column::layout",
+      "kind": "field",
+      "name": "layout",
+      "of": "zu::Column",
+      "signature": "Layout"
+    },
+    {
+      "id": "zu::Column::name",
+      "kind": "field",
+      "name": "name",
+      "of": "zu::Column",
+      "signature": "String"
+    },
+    {
+      "id": "zu::Column::ty",
+      "kind": "field",
+      "name": "ty",
+      "of": "zu::Column",
+      "signature": "zu_common::LogicalType",
+      "doc": "What a value read out of it is. The layout says how wide the\nbytes are and this says what they mean, which is the whole\ndifference between a count of days and a number."
+    },
+    {
       "id": "zu::Config",
       "kind": "struct",
       "name": "Config",
@@ -296,12 +325,36 @@
       "doc": "Runs one statement with parameters bound by name, without the\nleading `$`."
     },
     {
+      "id": "zu::Connection::register",
+      "kind": "method",
+      "name": "register",
+      "of": "zu::Connection",
+      "signature": "fn register(&mut self, frame: Frame) -> Result<()>",
+      "doc": "Registers a frame as a table of this connection, under the name\nit carries.\n\nThis is the replacement scan: a caller holding columns in memory\ngets to name them in a statement without loading them into the\ndatabase first. Nothing is copied, at registration or at read.\nThe frame is this connection's alone and goes when it does, and\na name a stored table already holds is refused."
+    },
+    {
+      "id": "zu::Connection::registered",
+      "kind": "method",
+      "name": "registered",
+      "of": "zu::Connection",
+      "signature": "fn registered(&self) -> Vec<String>",
+      "doc": "The names registered on this connection, sorted."
+    },
+    {
       "id": "zu::Connection::session_mut",
       "kind": "method",
       "name": "session_mut",
       "of": "zu::Connection",
       "signature": "fn session_mut(&mut self) -> &mut Session",
       "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
+    },
+    {
+      "id": "zu::Connection::unregister",
+      "kind": "method",
+      "name": "unregister",
+      "of": "zu::Connection",
+      "signature": "fn unregister(&mut self, name: &str) -> Result<bool>",
+      "doc": "Drops a registered frame, answering whether there was one under\nthat name."
     },
     {
       "id": "zu::Database",
@@ -471,6 +524,27 @@
       "signature": "Fwd"
     },
     {
+      "id": "zu::DurationKind",
+      "kind": "enum",
+      "name": "DurationKind",
+      "source": "zu_common::types::DurationKind",
+      "doc": "The two duration kinds, which do not mix.\n\nA year-month duration plus a day-time duration is a type error and\nnot a normalisation, because a month is not a number of days. An\nengine that stores months, days and nanoseconds in one value has to\ninvent an answer for \"one month after 31 January\" and the standard\ndoes not ask it to. zu stores two types and refuses the arithmetic\nthat would need the invention."
+    },
+    {
+      "id": "zu::DurationKind::DayTime",
+      "kind": "variant",
+      "name": "DayTime",
+      "of": "zu::DurationKind",
+      "signature": "DayTime"
+    },
+    {
+      "id": "zu::DurationKind::YearMonth",
+      "kind": "variant",
+      "name": "YearMonth",
+      "of": "zu::DurationKind",
+      "signature": "YearMonth"
+    },
+    {
       "id": "zu::Epoch",
       "kind": "type-alias",
       "name": "Epoch",
@@ -528,6 +602,64 @@
       "signature": "Temporal(zu_common::Temporal)"
     },
     {
+      "id": "zu::FloatBits",
+      "kind": "enum",
+      "name": "FloatBits",
+      "source": "zu_common::types::FloatBits",
+      "doc": "Width of a floating point type, in bits.\n\n16, 128 and 256 have no hardware anywhere zu runs. They are here\nbecause the standard has them; they compute in software and the\nbenchmark matrix never uses them, which gql/plan/09 section 6 says\nout loud so nobody reads a soft float number as an engine number."
+    },
+    {
+      "id": "zu::FloatBits::B128",
+      "kind": "variant",
+      "name": "B128",
+      "of": "zu::FloatBits",
+      "signature": "B128"
+    },
+    {
+      "id": "zu::FloatBits::B16",
+      "kind": "variant",
+      "name": "B16",
+      "of": "zu::FloatBits",
+      "signature": "B16"
+    },
+    {
+      "id": "zu::FloatBits::B256",
+      "kind": "variant",
+      "name": "B256",
+      "of": "zu::FloatBits",
+      "signature": "B256"
+    },
+    {
+      "id": "zu::FloatBits::B32",
+      "kind": "variant",
+      "name": "B32",
+      "of": "zu::FloatBits",
+      "signature": "B32"
+    },
+    {
+      "id": "zu::FloatBits::B64",
+      "kind": "variant",
+      "name": "B64",
+      "of": "zu::FloatBits",
+      "signature": "B64"
+    },
+    {
+      "id": "zu::FloatBits::bits",
+      "kind": "method",
+      "name": "bits",
+      "of": "zu::FloatBits",
+      "signature": "fn bits(self) -> u16",
+      "doc": "The width in bits."
+    },
+    {
+      "id": "zu::FloatBits::for_digits",
+      "kind": "method",
+      "name": "for_digits",
+      "of": "zu::FloatBits",
+      "signature": "fn for_digits(digits: u16) -> Option<FloatBits>",
+      "doc": "The narrowest binary width whose significand holds `digits`\ndecimal digits, which is what `FLOAT(p)` (GV22) asks for."
+    },
+    {
       "id": "zu::Flow",
       "kind": "enum",
       "name": "Flow",
@@ -549,6 +681,106 @@
       "of": "zu::Flow",
       "signature": "Stop",
       "doc": "Stop the statement here. The rows already handed over stand."
+    },
+    {
+      "id": "zu::Frame",
+      "kind": "struct",
+      "name": "Frame",
+      "source": "zu_query::frame::Frame",
+      "doc": "A registered frame: rows of columns the engine reads and never owns.\n\nCloning one costs the column names and two handle bumps. It does not\ncopy a value, because there is no value here to copy: both frames\npoint at the caller's bytes and both hold the owner that keeps them\nalive. That is what lets a label be re-derived when the epoch moves\nwithout a statement mid-flight losing the frame it was reading."
+    },
+    {
+      "id": "zu::Frame::column",
+      "kind": "method",
+      "name": "column",
+      "of": "zu::Frame",
+      "signature": "fn column(&self, name: &str) -> Option<ColId>",
+      "doc": "The position of a column by name."
+    },
+    {
+      "id": "zu::Frame::columns",
+      "kind": "method",
+      "name": "columns",
+      "of": "zu::Frame",
+      "signature": "fn columns(&self) -> impl Iterator",
+      "doc": "The column positions and names, in the order they were\nregistered, which is the order the caller's frame held them in."
+    },
+    {
+      "id": "zu::Frame::gather",
+      "kind": "method",
+      "name": "gather",
+      "of": "zu::Frame",
+      "signature": "fn gather(&self, col: ColId, rows: &[u64], arena: &mut MorselArena) -> ValueVector",
+      "doc": "One column of arbitrary rows as a vector, in the caller's row\norder. Rows that are not a run cannot be pointed at, so this one\nalways builds."
+    },
+    {
+      "id": "zu::Frame::id",
+      "kind": "method",
+      "name": "id",
+      "of": "zu::Frame",
+      "signature": "fn id(&self) -> TableId"
+    },
+    {
+      "id": "zu::Frame::labels",
+      "kind": "method",
+      "name": "labels",
+      "of": "zu::Frame",
+      "signature": "fn labels(&self) -> u64",
+      "doc": "The label bitset every row of a frame carries, the answer a\nstored table gives out of its catalog entry."
+    },
+    {
+      "id": "zu::Frame::lane",
+      "kind": "method",
+      "name": "lane",
+      "of": "zu::Frame",
+      "signature": "fn lane(&self, col: ColId) -> Option<ColType>",
+      "doc": "What the vector layer would carry this column as, `None` for a\ncolumn it has no lane for. The three lanes are integers, doubles\nand strings; a date or a boolean resolves to nothing here and\nthe statement reads it a row at a time, which is the same answer\na stored column of one gets."
+    },
+    {
+      "id": "zu::Frame::name",
+      "kind": "method",
+      "name": "name",
+      "of": "zu::Frame",
+      "signature": "fn name(&self) -> &str"
+    },
+    {
+      "id": "zu::Frame::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::Frame",
+      "signature": "unsafe fn new(name: impl Into<String>, rows: u64, columns: Vec<Column>, owner: Arc<dyn Any + Send + Sync>) -> Result<Frame>",
+      "doc": "Registers `columns` under `name` as `rows` rows.\n\nEvery check a read could have made is made here instead: that a\nword column is aligned for the words it will be read as, that\nan unsigned value fits the signed lane, that a scaled one does\nnot overflow, and that a string offset stays inside its buffer.\nA frame that comes back from this reads without failing.\n\n# Safety\n\nEvery pointer in `columns` must address at least the bytes the\nrow count implies, initialized, and neither written nor freed by\nanyone for as long as `owner` lives. `owner` must be what keeps\nthem alive, so that holding it here holds them."
+    },
+    {
+      "id": "zu::Frame::resolve",
+      "kind": "method",
+      "name": "resolve",
+      "of": "zu::Frame",
+      "signature": "fn resolve(&self, name: &str) -> Option<(ColId, ColType)>",
+      "doc": "Resolves a column by name as the vector layer would carry it."
+    },
+    {
+      "id": "zu::Frame::rows",
+      "kind": "method",
+      "name": "rows",
+      "of": "zu::Frame",
+      "signature": "fn rows(&self) -> u64"
+    },
+    {
+      "id": "zu::Frame::scan",
+      "kind": "method",
+      "name": "scan",
+      "of": "zu::Frame",
+      "signature": "fn scan(&self, chunk: u64, cols: &[ColId], pred: Option<&ZonePred>, arena: &mut MorselArena) -> Option<ScanChunk>",
+      "doc": "Reads chunk `chunk`, `None` past the last one.\n\nThe vectors of a chunk point at the caller's buffers wherever\nthe layouts agree, which is what makes this a scan of somebody\nelse's memory rather than a copy of it. Where they do not, the\nwidening lands in `arena` and dies with the morsel.\n\nA frame carries no zone maps, so `pred` cannot skip a chunk\nwithout looking at it. What it can still do is thin one: the\nbound is checked a row at a time against the same eight-byte\nword a stored column would have decoded to, and a chunk it\nempties never reaches an operator at all."
+    },
+    {
+      "id": "zu::Frame::value",
+      "kind": "method",
+      "name": "value",
+      "of": "zu::Frame",
+      "signature": "fn value(&self, col: ColId, row: u64) -> Value",
+      "doc": "One value of one row, the read the row-at-a-time executor makes.\nThe row is the caller's and has already been bounds checked by\nthe scan that produced it."
     },
     {
       "id": "zu::FromRow",
@@ -692,6 +924,71 @@
       "signature": "fn snapshot(&self) -> Arc<dyn Snapshot>"
     },
     {
+      "id": "zu::IntBits",
+      "kind": "enum",
+      "name": "IntBits",
+      "source": "zu_common::types::IntBits",
+      "doc": "Width of an integer type, in bits.\n\nThe tower stops at 256 because the standard does, and every width is\na fixed stride, so the FOR and delta cascades in `zu-encoding` need\nthe width registered and nothing else."
+    },
+    {
+      "id": "zu::IntBits::B128",
+      "kind": "variant",
+      "name": "B128",
+      "of": "zu::IntBits",
+      "signature": "B128"
+    },
+    {
+      "id": "zu::IntBits::B16",
+      "kind": "variant",
+      "name": "B16",
+      "of": "zu::IntBits",
+      "signature": "B16"
+    },
+    {
+      "id": "zu::IntBits::B256",
+      "kind": "variant",
+      "name": "B256",
+      "of": "zu::IntBits",
+      "signature": "B256"
+    },
+    {
+      "id": "zu::IntBits::B32",
+      "kind": "variant",
+      "name": "B32",
+      "of": "zu::IntBits",
+      "signature": "B32"
+    },
+    {
+      "id": "zu::IntBits::B64",
+      "kind": "variant",
+      "name": "B64",
+      "of": "zu::IntBits",
+      "signature": "B64"
+    },
+    {
+      "id": "zu::IntBits::B8",
+      "kind": "variant",
+      "name": "B8",
+      "of": "zu::IntBits",
+      "signature": "B8"
+    },
+    {
+      "id": "zu::IntBits::bits",
+      "kind": "method",
+      "name": "bits",
+      "of": "zu::IntBits",
+      "signature": "fn bits(self) -> u16",
+      "doc": "The width in bits."
+    },
+    {
+      "id": "zu::IntBits::for_digits",
+      "kind": "method",
+      "name": "for_digits",
+      "of": "zu::IntBits",
+      "signature": "fn for_digits(digits: u16) -> Option<IntBits>",
+      "doc": "The narrowest width that holds `digits` decimal digits, which is\nwhat `INT(p)` (GV09) asks for. `None` when no width in the tower\nis wide enough.\n\nThe bound is the count of decimal digits a width holds in full:\nan i64 reaches 9_223_372_036_854_775_807, so it holds every 18\ndigit number and only some 19 digit ones, and a type that\npromised 19 would be promising a range it does not have."
+    },
+    {
       "id": "zu::Interrupt",
       "kind": "struct",
       "name": "Interrupt",
@@ -753,6 +1050,337 @@
       "of": "zu::Interrupt",
       "signature": "fn stopped(&self) -> bool",
       "doc": "Whether somebody has asked."
+    },
+    {
+      "id": "zu::Layout",
+      "kind": "enum",
+      "name": "Layout",
+      "source": "zu_query::frame::Layout",
+      "doc": "Where one column's bytes are and how they are laid out.\n\nThis is the caller's description of memory it owns, in the terms\nArrow puts it in, and it is deliberately not an Arrow type: the\nengine never sees a schema, only widths and pointers, and mapping\none to the other is the client's business because the client is\nwhat knows which Arrow it is holding.\n\nIt clones, because a description is pointers and widths and copying\none copies no data. A client that registers the same columns on two\nconnections describes them once."
+    },
+    {
+      "id": "zu::Layout::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::Layout",
+      "signature": "Bool { ptr: std::ptr::NonNull<u8> }",
+      "doc": "One bit a row, packed low bit of the first byte first, which is\nArrow's bitmap and this engine's alike. The first row is the\npointer's low bit: a caller holding a sliced array with a bit\noffset of its own owes the shift before it gets here."
+    },
+    {
+      "id": "zu::Layout::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::Layout",
+      "signature": "Float { ptr: std::ptr::NonNull<u8>, bits: zu_common::FloatBits }",
+      "doc": "IEEE floats of one width."
+    },
+    {
+      "id": "zu::Layout::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::Layout",
+      "signature": "Int { ptr: std::ptr::NonNull<u8>, bits: zu_common::IntBits, signed: bool, scale: i64 }",
+      "doc": "Integers of one width, signed or not, and what one of them has\nto be multiplied by to reach the unit its logical type counts\nin. That is 1 for an integer and a date, and 1000 for the\nmicroseconds Arrow keeps a time or a timestamp in against the\nnanoseconds this engine keeps them in."
+    },
+    {
+      "id": "zu::Layout::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::Layout",
+      "signature": "Str { offsets: std::ptr::NonNull<u8>, wide: bool, data: std::ptr::NonNull<u8>, data_len: usize }",
+      "doc": "Characters end to end with offsets cutting them up, Arrow's\n`Utf8` when the offsets are 32 bits and `LargeUtf8` when they\nare 64. There are `rows + 1` of them."
+    },
+    {
+      "id": "zu::Layout::View",
+      "kind": "variant",
+      "name": "View",
+      "of": "zu::Layout",
+      "signature": "View { views: std::ptr::NonNull<u8>, data: Vec<(std::ptr::NonNull<u8>, usize)> }",
+      "doc": "Arrow's `Utf8View`: sixteen bytes a row over any number of data\nbuffers. A short string is already the engine's own view, byte\nfor byte; a long one names its buffer and offset in a different\norder and is rebuilt."
+    },
+    {
+      "id": "zu::LogicalType",
+      "kind": "enum",
+      "name": "LogicalType",
+      "source": "zu_common::types::LogicalType",
+      "doc": "What GQL talks about: the language facing type lattice.\n\nNever present in a vector. A vector holds a [`PhysicalType`] and a\nvalidity bitmap, and the logical type is what the binder knows about\nthe column, which is a different and larger thing: `INT(4) NOT NULL`\nand `BIGINT` are two logical types over one physical layout."
+    },
+    {
+      "id": "zu::LogicalType::Any",
+      "kind": "variant",
+      "name": "Any",
+      "of": "zu::LogicalType",
+      "signature": "Any",
+      "doc": "GV65 and GV66. The open dynamic union: any type at all."
+    },
+    {
+      "id": "zu::LogicalType::AnyProperty",
+      "kind": "variant",
+      "name": "AnyProperty",
+      "of": "zu::LogicalType",
+      "signature": "AnyProperty",
+      "doc": "GV68. Any type a property may hold, which is `Any` minus the\nreference and constructed types."
+    },
+    {
+      "id": "zu::LogicalType::BindingTable",
+      "kind": "variant",
+      "name": "BindingTable",
+      "of": "zu::LogicalType",
+      "signature": "BindingTable(Option<RecordType>)",
+      "doc": "GV61. A binding table handle, with the record type of its rows\nwhen that is known."
+    },
+    {
+      "id": "zu::LogicalType::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::LogicalType",
+      "signature": "Bool"
+    },
+    {
+      "id": "zu::LogicalType::Bytes",
+      "kind": "variant",
+      "name": "Bytes",
+      "of": "zu::LogicalType",
+      "signature": "Bytes { min: Option<u32>, max: Option<u32>, fixed: bool }",
+      "doc": "GV35 to GV38. Lengths are in octets."
+    },
+    {
+      "id": "zu::LogicalType::Date",
+      "kind": "variant",
+      "name": "Date",
+      "of": "zu::LogicalType",
+      "signature": "Date",
+      "doc": "GV39. Proleptic Gregorian, no zone."
+    },
+    {
+      "id": "zu::LogicalType::Decimal",
+      "kind": "variant",
+      "name": "Decimal",
+      "of": "zu::LogicalType",
+      "signature": "Decimal { precision: u16, scale: u16 }",
+      "doc": "GV17. Exact decimal, stored in the narrowest integer width that\nholds `precision` digits and scaled by `scale`."
+    },
+    {
+      "id": "zu::LogicalType::Duration",
+      "kind": "variant",
+      "name": "Duration",
+      "of": "zu::LogicalType",
+      "signature": "Duration(DurationKind)",
+      "doc": "GV41."
+    },
+    {
+      "id": "zu::LogicalType::Edge",
+      "kind": "variant",
+      "name": "Edge",
+      "of": "zu::LogicalType",
+      "signature": "Edge(Option<String>)",
+      "doc": "An edge reference, optionally of a named edge type."
+    },
+    {
+      "id": "zu::LogicalType::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::LogicalType",
+      "signature": "Float { bits: FloatBits, precision: Option<u16> }",
+      "doc": "GV20 to GV26."
+    },
+    {
+      "id": "zu::LogicalType::Graph",
+      "kind": "variant",
+      "name": "Graph",
+      "of": "zu::LogicalType",
+      "signature": "Graph(Option<String>)",
+      "doc": "GV60. A graph handle: a catalog id and a snapshot epoch, not\ndata. Making it a value is what turns `USE` from a statement\nprefix into something composable."
+    },
+    {
+      "id": "zu::LogicalType::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::LogicalType",
+      "signature": "Int { signed: bool, bits: IntBits, precision: Option<u16> }",
+      "doc": "GV01 to GV19. `signed` and the width are the tower; `precision`\nis the declared decimal digit count of `INT(p)`, kept because it\nis a check the engine owes the user and not a layout."
+    },
+    {
+      "id": "zu::LogicalType::List",
+      "kind": "variant",
+      "name": "List",
+      "of": "zu::LogicalType",
+      "signature": "List { elem: Box<LogicalType>, max: Option<u32> }",
+      "doc": "GV50."
+    },
+    {
+      "id": "zu::LogicalType::LocalDatetime",
+      "kind": "variant",
+      "name": "LocalDatetime",
+      "of": "zu::LogicalType",
+      "signature": "LocalDatetime",
+      "doc": "GV39. An instant with no zone."
+    },
+    {
+      "id": "zu::LogicalType::LocalTime",
+      "kind": "variant",
+      "name": "LocalTime",
+      "of": "zu::LogicalType",
+      "signature": "LocalTime",
+      "doc": "GV39. Time of day with no zone and therefore no DST."
+    },
+    {
+      "id": "zu::LogicalType::Node",
+      "kind": "variant",
+      "name": "Node",
+      "of": "zu::LogicalType",
+      "signature": "Node(Option<String>)",
+      "doc": "A node reference, optionally of a named node type."
+    },
+    {
+      "id": "zu::LogicalType::Nothing",
+      "kind": "variant",
+      "name": "Nothing",
+      "of": "zu::LogicalType",
+      "signature": "Nothing",
+      "doc": "GV72. The empty type: no value has it. A column can never be\ndeclared with it, an expression can have it, and the binder\nrefuses anything that would have to materialise one."
+    },
+    {
+      "id": "zu::LogicalType::Null",
+      "kind": "variant",
+      "name": "Null",
+      "of": "zu::LogicalType",
+      "signature": "Null",
+      "doc": "GV71. The type of the null literal, which every nullable type\naccepts and which carries no other value."
+    },
+    {
+      "id": "zu::LogicalType::Nullable",
+      "kind": "variant",
+      "name": "Nullable",
+      "of": "zu::LogicalType",
+      "signature": "Nullable(Box<LogicalType>)",
+      "doc": "GV90, orthogonal to everything above. Nullability is a wrapper\nand not a flag on each variant, so no variant can forget it."
+    },
+    {
+      "id": "zu::LogicalType::Path",
+      "kind": "variant",
+      "name": "Path",
+      "of": "zu::LogicalType",
+      "signature": "Path(Option<Box<PathType>>)",
+      "doc": "GV55. A path, whose type describes the alternating node and edge\ntypes it walks."
+    },
+    {
+      "id": "zu::LogicalType::Record",
+      "kind": "variant",
+      "name": "Record",
+      "of": "zu::LogicalType",
+      "signature": "Record(RecordType)",
+      "doc": "GV45 to GV48."
+    },
+    {
+      "id": "zu::LogicalType::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::LogicalType",
+      "signature": "Str { min: Option<u32>, max: Option<u32>, fixed: bool }",
+      "doc": "GV30 to GV32. Lengths are in characters, and a character is a\nUnicode scalar value. `fixed` is GV32, the one length constraint\nthat changes the layout rather than adding a check."
+    },
+    {
+      "id": "zu::LogicalType::Union",
+      "kind": "variant",
+      "name": "Union",
+      "of": "zu::LogicalType",
+      "signature": "Union(Vec<LogicalType>)",
+      "doc": "GV67. A closed dynamic union, `ANY<INT|STRING>`."
+    },
+    {
+      "id": "zu::LogicalType::ZonedDatetime",
+      "kind": "variant",
+      "name": "ZonedDatetime",
+      "of": "zu::LogicalType",
+      "signature": "ZonedDatetime",
+      "doc": "GV40. An instant with an offset from UTC in minutes."
+    },
+    {
+      "id": "zu::LogicalType::ZonedTime",
+      "kind": "variant",
+      "name": "ZonedTime",
+      "of": "zu::LogicalType",
+      "signature": "ZonedTime",
+      "doc": "GV40. Time of day with an offset from UTC in minutes."
+    },
+    {
+      "id": "zu::LogicalType::base",
+      "kind": "method",
+      "name": "base",
+      "of": "zu::LogicalType",
+      "signature": "fn base(&self) -> &LogicalType",
+      "doc": "This type with any nullability wrapper removed, which is the\nform every layout question is asked about."
+    },
+    {
+      "id": "zu::LogicalType::bytes",
+      "kind": "method",
+      "name": "bytes",
+      "of": "zu::LogicalType",
+      "signature": "fn bytes() -> LogicalType",
+      "doc": "A byte string with no length constraint."
+    },
+    {
+      "id": "zu::LogicalType::float",
+      "kind": "method",
+      "name": "float",
+      "of": "zu::LogicalType",
+      "signature": "fn float(bits: FloatBits) -> LogicalType"
+    },
+    {
+      "id": "zu::LogicalType::int",
+      "kind": "method",
+      "name": "int",
+      "of": "zu::LogicalType",
+      "signature": "fn int(bits: IntBits) -> LogicalType",
+      "doc": "The common integer spellings, so a caller does not write the\nstruct out to say `BIGINT`."
+    },
+    {
+      "id": "zu::LogicalType::is_material",
+      "kind": "method",
+      "name": "is_material",
+      "of": "zu::LogicalType",
+      "signature": "fn is_material(&self) -> bool",
+      "doc": "Whether this type may hold a value at all. The immaterial types\n(GV71, GV72) cannot: `NOTHING` has no values and `NULL` has one\nthat is never stored in a vector."
+    },
+    {
+      "id": "zu::LogicalType::is_nullable",
+      "kind": "method",
+      "name": "is_nullable",
+      "of": "zu::LogicalType",
+      "signature": "fn is_nullable(&self) -> bool",
+      "doc": "Whether a value of this type may be null. `NULL` itself is\nnullable and nothing else is unless it says so, which is the\nGV90 reading: a declared type is not null until wrapped."
+    },
+    {
+      "id": "zu::LogicalType::nullable",
+      "kind": "method",
+      "name": "nullable",
+      "of": "zu::LogicalType",
+      "signature": "fn nullable(self) -> LogicalType",
+      "doc": "A nullable version of this type, without stacking wrappers."
+    },
+    {
+      "id": "zu::LogicalType::physical",
+      "kind": "method",
+      "name": "physical",
+      "of": "zu::LogicalType",
+      "signature": "fn physical(&self) -> Option<PhysicalType>",
+      "doc": "The layout a vector of this type uses, or `None` when there is\nnothing to lay out.\n\nThe dynamic unions map to `Struct`, which holds a type code\nchild and one child per member. That is the one construct in the\nsystem that puts a tag back next to each value, and it is\nconfined to columns declared as unions, which in practice is the\nschemaless ingest path and nothing else."
+    },
+    {
+      "id": "zu::LogicalType::string",
+      "kind": "method",
+      "name": "string",
+      "of": "zu::LogicalType",
+      "signature": "fn string() -> LogicalType",
+      "doc": "A string with no length constraint."
+    },
+    {
+      "id": "zu::LogicalType::uint",
+      "kind": "method",
+      "name": "uint",
+      "of": "zu::LogicalType",
+      "signature": "fn uint(bits: IntBits) -> LogicalType"
     },
     {
       "id": "zu::NodeId",
@@ -1407,6 +2035,85 @@
       "doc": "Whether the rows were made and handed over in batches, rather\nthan buffered whole and cut into batches afterwards."
     },
     {
+      "id": "zu::Temporal",
+      "kind": "enum",
+      "name": "Temporal",
+      "source": "zu_common::temporal::Temporal",
+      "doc": "One temporal value.\n\nThe variants carry counts and not fields. A zoned value carries the\ninstant and the offset separately, so two zoned values compare by\ninstant while each still prints in the zone it was written in."
+    },
+    {
+      "id": "zu::Temporal::Date",
+      "kind": "variant",
+      "name": "Date",
+      "of": "zu::Temporal",
+      "signature": "Date(i32)",
+      "doc": "Days since 1970-01-01."
+    },
+    {
+      "id": "zu::Temporal::Duration",
+      "kind": "variant",
+      "name": "Duration",
+      "of": "zu::Temporal",
+      "signature": "Duration(zu_common::types::DurationKind, i64)",
+      "doc": "Months for a year-month duration, nanoseconds for a day-time\none. The kind is carried because the number means nothing on\nits own."
+    },
+    {
+      "id": "zu::Temporal::LocalDatetime",
+      "kind": "variant",
+      "name": "LocalDatetime",
+      "of": "zu::Temporal",
+      "signature": "LocalDatetime(i64)",
+      "doc": "Nanoseconds since 1970-01-01T00:00:00."
+    },
+    {
+      "id": "zu::Temporal::LocalTime",
+      "kind": "variant",
+      "name": "LocalTime",
+      "of": "zu::Temporal",
+      "signature": "LocalTime(i64)",
+      "doc": "Nanoseconds since midnight."
+    },
+    {
+      "id": "zu::Temporal::ZonedDatetime",
+      "kind": "variant",
+      "name": "ZonedDatetime",
+      "of": "zu::Temporal",
+      "signature": "ZonedDatetime { nanos: i64, offset: i16 }",
+      "doc": "Nanoseconds since the epoch in UTC, and the offset from UTC in\nminutes that the value was written with."
+    },
+    {
+      "id": "zu::Temporal::ZonedTime",
+      "kind": "variant",
+      "name": "ZonedTime",
+      "of": "zu::Temporal",
+      "signature": "ZonedTime { nanos: i64, offset: i16 }",
+      "doc": "Nanoseconds since midnight in the offset's own day, and the\noffset from UTC in minutes."
+    },
+    {
+      "id": "zu::Temporal::logical_type",
+      "kind": "method",
+      "name": "logical_type",
+      "of": "zu::Temporal",
+      "signature": "fn logical_type(&self) -> LogicalType",
+      "doc": "The lattice type of this value."
+    },
+    {
+      "id": "zu::Temporal::parse",
+      "kind": "method",
+      "name": "parse",
+      "of": "zu::Temporal",
+      "signature": "fn parse(ty: &LogicalType, text: &str) -> Option<Temporal>",
+      "doc": "The value `text` spells as a value of type `ty`, or `None` when\nit spells none.\n\nA datetime type accepts a date on its own, at midnight, because\nthe standard's datetime literal does. Nothing else is widened:\na date is not a datetime and reading one as the other silently\nwould answer a question nobody asked."
+    },
+    {
+      "id": "zu::Temporal::parse_any",
+      "kind": "method",
+      "name": "parse_any",
+      "of": "zu::Temporal",
+      "signature": "fn parse_any(text: &str) -> Option<Temporal>",
+      "doc": "The value `text` spells when the type is not written out, which\nis what a property in a fixture and a value read back from a\ncolumn both need.\n\nThe shape decides: a leading `P` is a duration, a `T` or a space\nin the middle is a datetime, a colon is a time, and a dash is a\ndate."
+    },
+    {
       "id": "zu::ZuError",
       "kind": "enum",
       "name": "ZuError",
@@ -2000,12 +2707,36 @@
       "doc": "Runs one statement with parameters bound by name, without the\nleading `$`."
     },
     {
+      "id": "zu::db::Connection::register",
+      "kind": "method",
+      "name": "register",
+      "of": "zu::db::Connection",
+      "signature": "fn register(&mut self, frame: Frame) -> Result<()>",
+      "doc": "Registers a frame as a table of this connection, under the name\nit carries.\n\nThis is the replacement scan: a caller holding columns in memory\ngets to name them in a statement without loading them into the\ndatabase first. Nothing is copied, at registration or at read.\nThe frame is this connection's alone and goes when it does, and\na name a stored table already holds is refused."
+    },
+    {
+      "id": "zu::db::Connection::registered",
+      "kind": "method",
+      "name": "registered",
+      "of": "zu::db::Connection",
+      "signature": "fn registered(&self) -> Vec<String>",
+      "doc": "The names registered on this connection, sorted."
+    },
+    {
       "id": "zu::db::Connection::session_mut",
       "kind": "method",
       "name": "session_mut",
       "of": "zu::db::Connection",
       "signature": "fn session_mut(&mut self) -> &mut Session",
       "doc": "The session under this connection, for the paths that have not\ngrown an API here yet: profiling, EXPLAIN ANALYZE, and the\nengine's own tooling."
+    },
+    {
+      "id": "zu::db::Connection::unregister",
+      "kind": "method",
+      "name": "unregister",
+      "of": "zu::db::Connection",
+      "signature": "fn unregister(&mut self, name: &str) -> Result<bool>",
+      "doc": "Drops a registered frame, answering whether there was one under\nthat name."
     },
     {
       "id": "zu::db::Database",
@@ -3491,6 +4222,14 @@
       "signature": "fn file_mut(&mut self) -> &mut Zu1File"
     },
     {
+      "id": "zu::query::Zu1Graph::frames",
+      "kind": "method",
+      "name": "frames",
+      "of": "zu::query::Zu1Graph",
+      "signature": "fn frames(&self) -> &Arc<FrameSet>",
+      "doc": "The frames a statement run through this graph reads as tables."
+    },
+    {
       "id": "zu::query::Zu1Graph::new",
       "kind": "method",
       "name": "new",
@@ -3512,6 +4251,14 @@
       "of": "zu::query::Zu1Graph",
       "signature": "fn set_catalog(&mut self, catalog: Catalog)",
       "doc": "Swaps in a fresh catalog and drops every cached reader; the\nsession calls this when the header epoch moves, because the\ncached directories and decoded groups describe the old epoch."
+    },
+    {
+      "id": "zu::query::Zu1Graph::set_frames",
+      "kind": "method",
+      "name": "set_frames",
+      "of": "zu::query::Zu1Graph",
+      "signature": "fn set_frames(&mut self, frames: Arc<FrameSet>)",
+      "doc": "Hands over the session's frames. Registering builds a new set\nrather than editing this one, so a statement already running\nkeeps reading the set it started with."
     },
     {
       "id": "zu::query::Zu1Graph::set_patches",
@@ -3541,6 +4288,13 @@
       "name": "explain_analyze",
       "signature": "fn explain_analyze(source: &str, db: &mut zu::zu1::file::Zu1File, params: &[(&str, Value)]) -> zu_common::Result<String>",
       "doc": "Executes one query with per-operator counters and returns the\nrendered EXPLAIN ANALYZE listing: pulls, rows, the estimate and its\nq-error, the average vector length, and self time per operator, per\nstage. The grammar has no EXPLAIN keyword yet, so this is the API\nentry point."
+    },
+    {
+      "id": "zu::query::merge_frames",
+      "kind": "function",
+      "name": "merge_frames",
+      "signature": "fn merge_frames(schema: &mut zu_query::binder::Schema, frames: &zu_query::frame::FrameSet) -> zu_common::Result<Vec<u16>>",
+      "doc": "Merges the registered frames into a schema as node tables of it,\nanswering the label each one's name took.\n\nA frame is a table to everything above the binder and nothing at all\nto the catalog, so this runs after the schema is built rather than\ninside the build: a schema loaded with statistics keeps them, and a\nregistration costs the merge and not a reload."
     },
     {
       "id": "zu::query::profile",
@@ -3715,6 +4469,22 @@
       "doc": "The same run, handing back the counters instead of the\nrendering, for callers that want the numbers. `zu bench\ncardinality` reads q-error off this."
     },
     {
+      "id": "zu::session::Session::register_frame",
+      "kind": "method",
+      "name": "register_frame",
+      "of": "zu::session::Session",
+      "signature": "fn register_frame(&mut self, frame: Frame) -> Result<()>",
+      "doc": "Registers a frame as a table of the working graph, under the\nname it carries.\n\nNothing is copied. The frame says where the caller's columns are\nand holds whatever keeps them alive, and a statement that reads\nit reads those bytes where they lie. Registering a name that is\nalready registered replaces what it stands for and keeps the\ntable id, so a prepared statement over it stays bound to the same\ntable. A name a stored table already holds is refused."
+    },
+    {
+      "id": "zu::session::Session::registered_frames",
+      "kind": "method",
+      "name": "registered_frames",
+      "of": "zu::session::Session",
+      "signature": "fn registered_frames(&self) -> Vec<String>",
+      "doc": "The registered names, sorted."
+    },
+    {
       "id": "zu::session::Session::run",
       "kind": "method",
       "name": "run",
@@ -3737,6 +4507,14 @@
       "of": "zu::session::Session",
       "signature": "fn set_options(&mut self, options: exec::Options)",
       "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement."
+    },
+    {
+      "id": "zu::session::Session::unregister_frame",
+      "kind": "method",
+      "name": "unregister_frame",
+      "of": "zu::session::Session",
+      "signature": "fn unregister_frame(&mut self, name: &str) -> Result<bool>",
+      "doc": "Drops a registered frame, answering whether there was one under\nthat name. The bytes go when the caller's handle on them does,\nwhich is not necessarily now: a statement still reading the frame\nholds it until it ends."
     },
     {
       "id": "zu::session::Session::warm",
@@ -4093,6 +4871,14 @@
       "kind": "struct",
       "name": "SnapshotCache",
       "doc": "What a snapshot learns while it reads, kept in a value of its own\nso a caller that opens a snapshot per query can carry it over.\n\nA snapshot is a view of one epoch and is built and dropped around a\nsingle execution, but the table readers behind it are not per query\nat all: loading one reads its directory out of the file, and on a\nsmall graph that load costs more than the query it was opened for.\nThe buffers are here for the same reason, so a scan does not start\nby growing a fresh vector every time.\n\nEverything in here is valid for as long as the epoch it was read at\nis, which is the caller's business: hand it back to\n[`Zu1Snapshot::with_cache`] while the epoch holds and drop it when\nthe epoch moves."
+    },
+    {
+      "id": "zu::snapshot::SnapshotCache::set_frames",
+      "kind": "method",
+      "name": "set_frames",
+      "of": "zu::snapshot::SnapshotCache",
+      "signature": "fn set_frames(&mut self, frames: Arc<FrameSet>)",
+      "doc": "Hands over the frames registered on the session, which the\nsnapshots built from this cache read as tables of the graph."
     },
     {
       "id": "zu::snapshot::SnapshotCache::set_patches",

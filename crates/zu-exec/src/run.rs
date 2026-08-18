@@ -51,7 +51,7 @@ pub(crate) fn run(
 ) -> Result<(QueryResult, Decisions)> {
     let sched = match &plan.source {
         Source::Seek(key) => seek_work(plan, snap, options, *key)?,
-        Source::Seeks(keys) => seeks_work(keys, options),
+        Source::Seeks(keys) => seeks_work(plan, snap, options, keys, true)?,
         Source::Scan(_) => scan_work(plan, snap, options)?,
     };
     let (partials, mut decisions) = drive(plan, snap, &sched, &options.interrupt)?;
@@ -116,7 +116,7 @@ pub(crate) fn run_streamed(
     };
     let mut sched = match &plan.source {
         Source::Seek(key) => seek_work(plan, snap, options, *key)?,
-        Source::Seeks(keys) => seeks_work(keys, options),
+        Source::Seeks(keys) => seeks_work(plan, snap, options, keys, false)?,
         Source::Scan(_) => scan_work(plan, snap, options)?,
     };
     // A morsel is the unit the scan advances by before the consumer
@@ -153,7 +153,7 @@ pub(crate) fn run_streamed(
         sched.morsels.len(),
         options.interrupt.clone(),
     );
-    let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched.work);
+    let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, &sched);
     for (idx, &range) in sched.morsels.iter().enumerate() {
         // Before the break below, because `stop.stopped()` is true for
         // a quota that is filled and for a caller who interrupted, and
@@ -198,12 +198,32 @@ enum Work {
     Seeks,
     /// One slice of a seeded plan's first frontier: the seed row is
     /// fixed and the morsel owns a range of its neighbor list.
-    Frontier {
-        seed: u64,
-        rel: RelId,
-        dir: Dir,
-        to: usize,
-    },
+    Frontier { seed: u64, to: usize },
+    /// A batch of seeks cut along both units at once: the schedule says
+    /// per morsel whether it is keys of the batch or a slice of one
+    /// key's frontier, and [`Part`] beside the morsel is which.
+    Hybrid { to: usize },
+}
+
+/// What one morsel of a hybrid batch is, beside the range it owns.
+///
+/// A batch of seeds holds two units of parallelism and neither one
+/// covers a request stream on real data. Handing whole keys out is the
+/// right unit while the keys weigh about the same, and it leaves one
+/// worker with all the work when one of the seeds is a celebrity. Cutting
+/// every seed's frontier is the right unit for that seed and pure
+/// overhead for the hundred ordinary ones beside it. So the schedule
+/// mixes them, per key, off what the key index and the degrees say the
+/// key is worth.
+#[derive(Clone, Copy)]
+enum Part {
+    /// Keys of the batch, run the way the whole batch runs when nothing
+    /// in it stands out.
+    Keys,
+    /// A slice of one seed's frontier: the row its key found, the key
+    /// itself, since level 0 may report it, and which of the schedule's
+    /// frontiers the slice is of.
+    Frontier { seed: u64, key: u64, at: usize },
 }
 
 /// The parts of an `Op::Expand` the walk itself reads, lifted out of
@@ -324,9 +344,51 @@ impl RowLists {
 struct Schedule {
     work: Work,
     morsels: Vec<(u64, u64)>,
+    /// What each morsel is, where the work is `Work::Hybrid` and the
+    /// morsels are not all the same thing. Empty otherwise.
+    parts: Vec<Part>,
+    /// The row behind every key of a batch, where the schedule already
+    /// looked them up to weigh them, `None` for a key that hit nothing.
+    /// Empty when nothing looked, and then the workers look themselves.
+    seeded: Vec<Option<u64>>,
+    /// The frontiers the morsels are slices of, one per seed being cut
+    /// that way. Empty for work that is not cut along a frontier.
+    fronts: Vec<Arc<FrontierList>>,
     threads: usize,
     /// The same three numbers, in the shape EXPLAIN ANALYZE prints.
     split: Split,
+}
+
+/// One seed's neighbor list, read once for the whole schedule.
+///
+/// A morsel cut along a frontier owns a range of the list, and reading
+/// the list is what finding that range would otherwise cost: on a
+/// celebrity that is a hundred thousand edges decoded per morsel, so
+/// thirty morsels read the list thirty times and the split gives back
+/// more than it wins. Read once here, shared by pointer, sliced there.
+struct FrontierList {
+    list: Vec<u64>,
+    /// The edges behind those neighbors, where a column above reads
+    /// one, cut the same way the list is. Empty otherwise.
+    ords: Vec<u64>,
+}
+
+/// One seed's frontier and, when the plan reads edge properties off it,
+/// the edges beside it.
+fn frontier_of(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    rel: RelId,
+    dir: Dir,
+    to: usize,
+    seed: u64,
+    list: Vec<u64>,
+) -> Result<Arc<FrontierList>> {
+    let mut ords = Vec::new();
+    if plan.levels[to].ords {
+        snap.list_ords_into(rel, seed, dir, &mut ords)?;
+    }
+    Ok(Arc::new(FrontierList { list, ords }))
 }
 
 /// The driving scan, split into morsels, with the worker count the
@@ -348,6 +410,9 @@ fn scan_work(plan: &ExecPlan, snap: &mut dyn Snapshot, options: &Options) -> Res
     let morsels = make_morsels(total_rows, threads.max(1));
     Ok(Schedule {
         work: Work::Scan,
+        parts: Vec::new(),
+        seeded: Vec::new(),
+        fronts: Vec::new(),
         split: Split {
             of: "scan",
             morsels: morsels.len(),
@@ -410,6 +475,9 @@ fn seek_work(
         Ok(Schedule {
             work,
             morsels: vec![(0, 0)],
+            parts: Vec::new(),
+            seeded: Vec::new(),
+            fronts: Vec::new(),
             threads: 1,
             split: Split {
                 of: "seed",
@@ -425,11 +493,17 @@ fn seek_work(
     if options.threads == 1 {
         return one(Work::Seek(Some(seed)));
     }
+    // The close has to be `None`, because the split unrolls this hop by
+    // hand and a semijoin fused into it is a filter the unrolled walk
+    // would not apply. A close probes a level below the one its expand
+    // walks, so a hop off level 0 cannot carry one and this asks rather
+    // than resting on it.
     let Some(&Op::Expand {
         rel,
         dirs: Dirs::One(dir),
         from: 0,
         to,
+        close: None,
         ..
     }) = plan.ops.first()
     else {
@@ -484,7 +558,10 @@ fn seek_work(
     }
     morsels.push((lo, list.len() as u64));
     Ok(Schedule {
-        work: Work::Frontier { seed, rel, dir, to },
+        work: Work::Frontier { seed, to },
+        parts: Vec::new(),
+        seeded: Vec::new(),
+        fronts: vec![frontier_of(plan, snap, rel, dir, to, seed, list)?],
         split: Split {
             of: "seed frontier",
             morsels: morsels.len(),
@@ -496,22 +573,66 @@ fn seek_work(
     })
 }
 
+/// Keys a core's worth of batch may hold before the schedule stops
+/// weighing them and cuts by position instead.
+///
+/// Weighing costs a key index lookup and an offsets read per key, on
+/// the thread that is about to hand the work out. A short batch is
+/// exactly where one celebrity seed decides how long the whole batch
+/// takes, so that is where the lookups buy something. Past it a batch
+/// is long enough that equal counts of keys are roughly equal work, by
+/// the same argument that makes any average work, and paying a lookup
+/// per key to learn that would be the whole point read cost over again.
+const WEIGH_KEYS_PER_CORE: usize = 4;
+
 /// A batch of seeks, split into morsels of the key list. The keys are
 /// the work here, not the rows behind them, so the split is by position
 /// in the list and a morsel keeps its keys in the order they were
 /// written: batches stitch back into the order one worker walking the
 /// list would have emitted.
-fn seeks_work(keys: &[u64], options: &Options) -> Schedule {
+///
+/// `weigh` asks for the hybrid policy over a short batch, which is what
+/// the parallel run wants and the streamed run does not: a streamed run
+/// is one thread by construction, so there is nothing to balance and the
+/// weighing would be a lookup per key spent on nothing.
+fn seeks_work(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    options: &Options,
+    keys: &[u64],
+    weigh: bool,
+) -> Result<Schedule> {
+    let cores = match options.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+        n => n,
+    };
+    let weighed =
+        match weigh && cores > 1 && !keys.is_empty() && keys.len() <= cores * WEIGH_KEYS_PER_CORE {
+            true => weigh_keys(plan, snap, keys)?,
+            false => None,
+        };
+    if let Some(weighed) = &weighed
+        && let Some(sched) = hybrid_work(plan, snap, weighed, keys, cores)?
+    {
+        return Ok(sched);
+    }
     let threads = match options.threads {
         // A page of ids is a handful of lookups, and forking snapshots
         // costs more than the lookups do.
         0 if keys.len() as u64 <= SPLIT_ROWS => 1,
-        0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+        0 => cores,
         n => n,
     };
     let morsels = make_morsels(keys.len() as u64, threads.max(1));
-    Schedule {
+    Ok(Schedule {
         work: Work::Seeks,
+        parts: Vec::new(),
+        // The weighing looked every key up. Whether or not it ended in a
+        // hybrid cut, the rows it found are the rows this run wants, so
+        // they go out with the schedule rather than being looked up a
+        // second time.
+        seeded: weighed.map(|w| w.seeded).unwrap_or_default(),
+        fronts: Vec::new(),
         split: Split {
             of: "seek keys",
             morsels: morsels.len(),
@@ -520,7 +641,198 @@ fn seeks_work(keys: &[u64], options: &Options) -> Schedule {
         },
         morsels,
         threads,
+    })
+}
+
+/// What a short batch of keys is worth, read once on the thread that is
+/// about to hand the work out.
+struct Weighed {
+    /// The hop the weights are of, which is the hop a frontier slice
+    /// unrolls.
+    rel: RelId,
+    dir: Dir,
+    to: usize,
+    /// The row behind every key, `None` for a key that hit nothing.
+    seeded: Vec<Option<u64>>,
+    /// What every key is worth: its own degree, floored at one.
+    weight: Vec<u64>,
+}
+
+/// Look up a short batch and read what is behind it.
+///
+/// `None` when there is nothing to weigh, or nothing weighing could pay
+/// for. Weighing is a key index lookup and an offsets read per key, and
+/// both of those are what a one hop read of that key costs in the first
+/// place: on the shape a plain multiget sends, learning the batch is
+/// even costs about as much as running it. So the schedule only weighs
+/// where a neighbor is worth more than the read that found it, which is
+/// where the plan walks on past the first hop, and that is also where a
+/// celebrity in the batch costs the most: one seed's second frontier is
+/// the whole request.
+fn weigh_keys(plan: &ExecPlan, snap: &mut dyn Snapshot, keys: &[u64]) -> Result<Option<Weighed>> {
+    // Same shape the celebrity seed asks for, and asked for the same
+    // reason: a frontier slice unrolls this hop, so a semijoin fused
+    // into it would go unapplied.
+    let Some(&Op::Expand {
+        rel,
+        dirs: Dirs::One(dir),
+        from: 0,
+        to,
+        close: None,
+        ..
+    }) = plan.ops.first()
+    else {
+        return Ok(None);
+    };
+    let walks_on = matches!(
+        plan.ops.get(1),
+        Some(Op::Expand { .. } | Op::Intersect { .. } | Op::Branch { .. })
+    );
+    if !walks_on {
+        return Ok(None);
     }
+    let mut rows = Vec::with_capacity(keys.len());
+    let mut at = Vec::with_capacity(keys.len());
+    for (i, &key) in keys.iter().enumerate() {
+        if let Some(row) = snap.seek_key(plan.table, key)? {
+            rows.push(row);
+            at.push(i);
+        }
+    }
+    let mut deg = vec![0u64; rows.len()];
+    snap.degrees(rel, &rows, dir, &mut deg)?;
+    // A key that found no row is still a lookup, and a seed with no
+    // edges is still a row for the ops above to run over, so the floor
+    // is one either way: it keeps a light key from vanishing out of the
+    // weighting and taking its place in the order with it.
+    let mut weight = vec![1u64; keys.len()];
+    let mut seeded = vec![None; keys.len()];
+    for (j, &i) in at.iter().enumerate() {
+        weight[i] = deg[j].max(1);
+        seeded[i] = Some(rows[j]);
+    }
+    Ok(Some(Weighed {
+        rel,
+        dir,
+        to,
+        seeded,
+        weight,
+    }))
+}
+
+/// The hybrid morsel policy over a short batch of seeds: pick the unit
+/// of parallelism per key rather than once for the batch (perf/06, the
+/// hybrid morsel paper).
+///
+/// What a key is worth is its own frontier, so the cut goes by the
+/// weights [`weigh_keys`] read. Keys that weigh about the same are
+/// handed out whole, several to a morsel, which is the cheap unit and
+/// the one a batch of point reads wants. A key worth more than a
+/// worker's share of the batch cannot be balanced that way however the
+/// keys are dealt, so that one is cut along its own frontier and the
+/// slices go out beside the other keys' morsels.
+///
+/// `None` asks the caller for the plain policy: the batch is not enough
+/// work to split at all, or the weights came out even enough that one
+/// morsel covers it.
+///
+/// Morsels stay in key order and a key's frontier slices stay in list
+/// order, so the batches still stitch back into the order one worker
+/// walking the key list would have emitted.
+fn hybrid_work(
+    plan: &ExecPlan,
+    snap: &mut dyn Snapshot,
+    weighed: &Weighed,
+    keys: &[u64],
+    cores: usize,
+) -> Result<Option<Schedule>> {
+    let Weighed {
+        rel,
+        dir,
+        to,
+        seeded,
+        weight,
+    } = weighed;
+    let (rel, dir, to) = (*rel, *dir, *to);
+    let total: u64 = weight.iter().sum();
+    if total < SPLIT_ROWS {
+        return Ok(None);
+    }
+    // What one worker would get if the batch divided evenly. A key over
+    // it is a key no dealing of whole keys can balance.
+    let share = (total / cores as u64).max(1);
+    // Four morsels a worker, the oversubscription the scan and the
+    // celebrity seed both use: the weights are estimates and a short
+    // tail morsel is what lets a worker that drew a heavy one be
+    // overtaken.
+    let target = (total / (cores as u64 * 4)).max(1);
+    let mut morsels = Vec::new();
+    let mut parts = Vec::new();
+    let mut fronts = Vec::new();
+    let (mut lo, mut acc) = (0usize, 0u64);
+    for i in 0..keys.len() {
+        let heavy = weight[i] >= share && weight[i] > 1;
+        if !heavy {
+            acc += weight[i];
+            if acc >= target {
+                morsels.push((lo as u64, i as u64 + 1));
+                parts.push(Part::Keys);
+                lo = i + 1;
+                acc = 0;
+            }
+            continue;
+        }
+        if i > lo {
+            morsels.push((lo as u64, i as u64));
+            parts.push(Part::Keys);
+        }
+        let seed = seeded[i].expect("a key with a frontier found its row");
+        // The list itself, not the degree that stood in for it while the
+        // keys were being compared: the slices are ranges of it, and it
+        // is read here so that no morsel has to read it again.
+        let mut list = Vec::new();
+        snap.list_into(rel, seed, dir, &mut list)?;
+        let len = list.len() as u64;
+        let at = fronts.len();
+        fronts.push(frontier_of(plan, snap, rel, dir, to, seed, list)?);
+        let mut slice = 0u64;
+        while slice < len {
+            let hi = (slice + target).min(len);
+            morsels.push((slice, hi));
+            parts.push(Part::Frontier {
+                seed,
+                key: keys[i],
+                at,
+            });
+            slice = hi;
+        }
+        lo = i + 1;
+        acc = 0;
+    }
+    if lo < keys.len() {
+        morsels.push((lo as u64, keys.len() as u64));
+        parts.push(Part::Keys);
+    }
+    // One morsel is the plain policy, so hand it back as the plain
+    // policy and let the caller keep the rows.
+    if morsels.len() < 2 {
+        return Ok(None);
+    }
+    let threads = cores.min(morsels.len());
+    Ok(Some(Schedule {
+        work: Work::Hybrid { to },
+        split: Split {
+            of: "batch keys and frontiers",
+            morsels: morsels.len(),
+            threads,
+            weighted: true,
+        },
+        morsels,
+        parts,
+        seeded: seeded.clone(),
+        fronts,
+        threads,
+    }))
 }
 
 /// Where one worker leaves what it finished with, empty until it does.
@@ -535,12 +847,9 @@ fn drive(
     asked: &Interrupt,
 ) -> Result<(Vec<SinkState>, Decisions)> {
     let Schedule {
-        work,
-        morsels,
-        threads,
-        split: _,
+        morsels, threads, ..
     } = sched;
-    let (work, threads) = (*work, *threads);
+    let threads = *threads;
     let quota = match &plan.sink {
         SinkSpec::Rows { post, .. } => quota_of(post),
         _ => None,
@@ -551,7 +860,7 @@ fn drive(
     // A single worker needs none of the handoff machinery, and a point
     // read is short enough that setting it up shows in the latency.
     if threads <= 1 || morsels.len() <= 1 {
-        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched);
         w.work(morsels, &claim)?;
         let mut all = Decisions::with_sips(w.decisions.sip.len());
         all.merge(&w.decisions);
@@ -584,14 +893,14 @@ fn drive(
             .map(|(f, slot)| {
                 let (stop, claim) = (&stop, &claim);
                 Box::new(move || {
-                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop, work);
+                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop, sched);
                     let res = w.work(morsels, claim).map(|()| (w.sink, w.decisions));
                     *slot.lock().unwrap() = Some(res);
                 }) as Box<dyn FnOnce() + Send + '_>
             })
             .collect();
         let pending = pool::submit(jobs);
-        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, work);
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched);
         let main = w.work(morsels, &claim).map(|()| (w.sink, w.decisions));
         pending.wait();
         main
@@ -802,6 +1111,16 @@ impl SnapHandle<'_> {
 
 struct Worker<'a> {
     plan: &'a ExecPlan,
+    /// What each morsel is, where the schedule cut a batch of seeds
+    /// along both units at once. Empty for every other kind of work.
+    parts: &'a [Part],
+    /// The row behind every key of a batch, where the schedule looked
+    /// them up already. Empty when it did not, and then a seeks morsel
+    /// looks its own keys up.
+    seeded: &'a [Option<u64>],
+    /// The frontiers this run's morsels are slices of, read once by the
+    /// schedule. Empty for work that is not cut along a frontier.
+    fronts: &'a [Arc<FrontierList>],
     snap: SnapHandle<'a>,
     arena: MorselArena,
     /// Pinned CSR groups, keyed (rel, backward, group). Pins are Arc
@@ -949,9 +1268,17 @@ fn parts(rows: &[u64], stop_early: bool) -> Parts<'_> {
 }
 
 impl<'a> Worker<'a> {
-    fn new(plan: &'a ExecPlan, snap: SnapHandle<'a>, stop: &'a StopState, work: Work) -> Self {
+    fn new(
+        plan: &'a ExecPlan,
+        snap: SnapHandle<'a>,
+        stop: &'a StopState,
+        sched: &'a Schedule,
+    ) -> Self {
         Worker {
             plan,
+            parts: &sched.parts,
+            seeded: &sched.seeded,
+            fronts: &sched.fronts,
             snap,
             arena: MorselArena::new(),
             pins: HashMap::new(),
@@ -993,7 +1320,7 @@ impl<'a> Worker<'a> {
                 ..SinkState::default()
             },
             stop,
-            work,
+            work: sched.work,
             local_rows: 0,
             morsel: 0,
             keybuf: Vec::new(),
@@ -1043,9 +1370,13 @@ impl<'a> Worker<'a> {
             Work::Scan => self.scan_morsel(idx, range)?,
             Work::Seek(seed) => self.seek_morsel(seed)?,
             Work::Seeks => self.seeks_morsel(idx, range)?,
-            Work::Frontier { seed, rel, dir, to } => {
-                self.frontier_morsel(seed, rel, dir, to, range)?
-            }
+            Work::Frontier { seed, to } => self.frontier_morsel(seed, None, 0, to, range)?,
+            Work::Hybrid { to } => match self.parts[idx] {
+                Part::Keys => self.seeks_morsel(idx, range)?,
+                Part::Frontier { seed, key, at } => {
+                    self.frontier_morsel(seed, Some(key), at, to, range)?
+                }
+            },
         }
         if rows_sink {
             let batch = std::mem::take(&mut self.sink.rows);
@@ -1073,6 +1404,10 @@ impl<'a> Worker<'a> {
     /// rather than once per key, which is what a batch of point reads
     /// used to cost. A key that finds nothing takes its place out of
     /// the vector and no row comes of it.
+    ///
+    /// A weighed batch has been looked up once already, on the thread
+    /// that cut the morsels, so there the rows come out of the schedule
+    /// and the lookup is not paid twice.
     fn seeks_morsel(&mut self, idx: usize, (lo, hi): (u64, u64)) -> Result<()> {
         let plan = self.plan;
         let Source::Seeks(keys) = &plan.source else {
@@ -1080,14 +1415,22 @@ impl<'a> Worker<'a> {
         };
         let rows_sink = matches!(plan.sink, SinkSpec::Rows { .. });
         let (mut found, mut hit) = (Vec::new(), Vec::new());
-        for part in keys[lo as usize..hi as usize].chunks(zu_vector::VECTOR_SIZE) {
+        for (at, part) in keys[lo as usize..hi as usize]
+            .chunks(zu_vector::VECTOR_SIZE)
+            .enumerate()
+        {
             if self.stop.stopped() {
                 break;
             }
             found.clear();
             hit.clear();
-            for &key in part {
-                if let Some(row) = self.snap.get().seek_key(plan.table, key)? {
+            let from = lo as usize + at * zu_vector::VECTOR_SIZE;
+            for (j, &key) in part.iter().enumerate() {
+                let row = match self.seeded.is_empty() {
+                    true => self.snap.get().seek_key(plan.table, key)?,
+                    false => self.seeded[from + j],
+                };
+                if let Some(row) = row {
                     found.push(row);
                     hit.push(key);
                 }
@@ -1112,46 +1455,40 @@ impl<'a> Worker<'a> {
     /// neighbor list instead of the whole of it. Slices are contiguous
     /// and claimed in order, so the batches stitch back into exactly
     /// the order one worker walking the list would have emitted.
+    ///
+    /// The list itself was read once, by the schedule that cut it, and
+    /// every morsel of it points at that one read: a celebrity's list is
+    /// the expensive thing here, and reading it per morsel would cost
+    /// more than splitting it saves.
     fn frontier_morsel(
         &mut self,
         seed: u64,
-        rel: RelId,
-        dir: Dir,
+        key: Option<u64>,
+        at: usize,
         to: usize,
         (lo, hi): (u64, u64),
     ) -> Result<()> {
         let plan = self.plan;
-        let mut level0 = self.make_level(0, &[seed], &[], &[], &[])?;
+        // A batch of seeds reports the key beside the row it found, so a
+        // slice of one of those seeds' frontiers carries the key down
+        // with it. A single seed has no key column to fill.
+        let keys = match &key {
+            Some(k) => std::slice::from_ref(k),
+            None => &[][..],
+        };
+        let mut level0 = self.make_level(0, &[seed], &[], &[], keys)?;
         level0.cur = Some(0);
         let mut set = ChunkSet::new(vec![level0]);
-        // One list, and every worker on this seed wants the same one, so
-        // pinning the group means each of them decoding a group's worth
-        // of neighbors for the slice of one list it owns.
-        let held = self.hold(rel, dir, seed, 1)?;
-        let mut owned = self.row_pool.pop().unwrap_or_default();
-        let list: &[u64] = match &held {
-            Some(pin) => pin.list((seed % u64::from(GROUP_ROWS)) as usize),
-            None => {
-                owned.clear();
-                self.snap.get().list_into(rel, seed, dir, &mut owned)?;
-                &owned
-            }
-        };
-        // The edges of the same list, when a column above reads one.
-        // The morsel owns a range of the list, so it owns the same
-        // range of the edges: one read of the seed's edges, cut the
-        // same way.
-        let mut ords = self.row_pool.pop().unwrap_or_default();
-        ords.clear();
-        if plan.levels[to].ords {
-            self.snap.get().list_ords_into(rel, seed, dir, &mut ords)?;
-        }
+        let front = &self.fronts[at];
+        let (list, ords) = (&front.list, &front.ords);
         let mut result = Ok(());
-        for (at, part) in list[lo as usize..hi as usize]
+        for (chunk_at, part) in list[lo as usize..hi as usize]
             .chunks(zu_vector::VECTOR_SIZE)
             .enumerate()
         {
-            let from = lo as usize + at * zu_vector::VECTOR_SIZE;
+            let from = lo as usize + chunk_at * zu_vector::VECTOR_SIZE;
+            // The morsel owns a range of the list, so it owns the same
+            // range of the edges beside it.
             let part_ords = match ords.is_empty() {
                 true => &[][..],
                 false => &ords[from..from + part.len()],
@@ -1174,8 +1511,6 @@ impl<'a> Worker<'a> {
                 break;
             }
         }
-        self.row_pool.push(owned);
-        self.row_pool.push(ords);
         result
     }
 
@@ -4032,6 +4367,39 @@ mod tests {
             self
         }
 
+        /// The chain with a celebrity on the front of it: row 0 knows
+        /// everybody, and every other row still knows the row after it.
+        /// It is the skew a request stream meets on a social graph, in
+        /// the shape that makes the arithmetic easy to check by hand:
+        /// one seed is worth the whole table and the rest are worth one
+        /// row each, at either hop.
+        fn hub(mut self) -> Mock {
+            let mut fo = vec![0u64];
+            let mut fnb: Vec<u64> = (1..self.rows).collect();
+            let mut bnb: Vec<u64> = Vec::new();
+            let mut bo = vec![0u64];
+            for i in 0..self.rows {
+                if i > 0 && i + 1 < self.rows {
+                    fnb.push(i + 1);
+                }
+                fo.push(fnb.len() as u64);
+            }
+            // Row 0 is on everybody's back list, and row i also carries
+            // row i - 1 from the chain, so both sides stay sorted.
+            for i in 0..self.rows {
+                if i > 0 {
+                    bnb.push(0);
+                    if i > 1 {
+                        bnb.push(i - 1);
+                    }
+                }
+                bo.push(bnb.len() as u64);
+            }
+            self.fwd = (Arc::new(fo), Arc::new(fnb));
+            self.bwd = (Arc::new(bo), Arc::new(bnb));
+            self
+        }
+
         fn lists(&self) -> usize {
             self.lists.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -4441,6 +4809,184 @@ mod tests {
         let r = run(&p, &mut snap, &seq()).unwrap().0;
         // Multiples of four above 999: 1000, 1004, ... 1996.
         assert_eq!(r.rows, vec![vec![Value::Int(250)]]);
+    }
+
+    /// A batch of seeks over two hops, which is the shape a multiget
+    /// read sends when it asks for friends of friends: `UNWIND $ids AS
+    /// x MATCH (p) WHERE p.id = x MATCH (p)-[:knows]->(f)-[:knows]->(g)`.
+    /// Two hops because that is where the schedule weighs a batch, one
+    /// hop being cheap enough per key that the weighing would cost more
+    /// than the balance it buys.
+    fn batch_plan(keys: Vec<u64>) -> ExecPlan {
+        let hop = |from: usize, to: usize| Op::Expand {
+            rel: 0,
+            dirs: Dirs::One(Dir::Fwd),
+            from,
+            to,
+            batch: false,
+            close: None,
+        };
+        ExecPlan {
+            source: Source::Seeks(keys),
+            ..plan(
+                vec![bare_level(), bare_level(), bare_level()],
+                vec![hop(0, 1), hop(1, 2)],
+                SinkSpec::Count,
+                &["n"],
+            )
+        }
+    }
+
+    /// The same batch over one hop, which the schedule does not weigh.
+    fn one_hop_batch_plan(keys: Vec<u64>) -> ExecPlan {
+        ExecPlan {
+            source: Source::Seeks(keys),
+            ..plan(
+                vec![bare_level(), bare_level()],
+                vec![Op::Expand {
+                    rel: 0,
+                    dirs: Dirs::One(Dir::Fwd),
+                    from: 0,
+                    to: 1,
+                    batch: false,
+                    close: None,
+                }],
+                SinkSpec::Count,
+                &["n"],
+            )
+        }
+    }
+
+    fn cores(n: usize) -> Options {
+        Options {
+            threads: n,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn a_batch_with_a_celebrity_in_it_is_cut_along_both_units() {
+        let rows = 8192;
+        let mut snap = Mock::new(rows, |i| i as i64, true).hub();
+        let keys = vec![5, 6, 0, 7];
+        let p = batch_plan(keys.clone());
+        let sched = seeks_work(&p, &mut snap, &cores(4), &keys, true).unwrap();
+        assert_eq!(sched.split.of, "batch keys and frontiers");
+        assert!(sched.split.weighted);
+        assert_eq!(sched.threads, 4);
+        assert_eq!(sched.parts.len(), sched.morsels.len());
+        // The two light keys ahead of the celebrity, then its frontier
+        // in slices, then the light key behind it. Every key of the
+        // batch is covered exactly once and in the order it was
+        // written, which is what lets the batches stitch back.
+        let keyed: Vec<(u64, u64)> = sched
+            .parts
+            .iter()
+            .zip(&sched.morsels)
+            .filter(|(part, _)| matches!(part, Part::Keys))
+            .map(|(_, &m)| m)
+            .collect();
+        assert_eq!(keyed, vec![(0, 2), (3, 4)]);
+        let slices: Vec<(u64, u64)> = sched
+            .parts
+            .iter()
+            .zip(&sched.morsels)
+            .filter(|(part, _)| matches!(part, Part::Frontier { .. }))
+            .map(|(_, &m)| m)
+            .collect();
+        assert!(slices.len() > 1, "the celebrity is worth splitting");
+        let mut want = 0;
+        for &(lo, hi) in &slices {
+            assert_eq!(lo, want, "the slices tile the frontier");
+            assert!(hi > lo);
+            want = hi;
+        }
+        assert_eq!(want, rows - 1, "row 0 knows everybody else");
+        assert!(
+            sched
+                .parts
+                .iter()
+                .all(|p| !matches!(p, Part::Frontier { seed, key, .. } if *seed != 0 || *key != 0)),
+            "only the celebrity is cut along its frontier"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_weighs_the_same_all_through_is_cut_along_its_keys() {
+        // The chain graph: every seed has one neighbor and one behind
+        // it, so nothing in the batch stands out and dealing whole keys
+        // out is the whole policy. Small enough that it is not worth
+        // splitting at all.
+        let mut snap = Mock::new(8192, |i| i as i64, true);
+        let keys: Vec<u64> = (0..16).collect();
+        let p = batch_plan(keys.clone());
+        let sched = seeks_work(&p, &mut snap, &cores(4), &keys, true).unwrap();
+        assert!(matches!(sched.work, Work::Seeks), "the plain policy");
+        assert_eq!(sched.split.of, "seek keys");
+        assert!(sched.parts.is_empty());
+        // The weighing looked the batch up to find that out, so the
+        // plain policy runs on the rows it found rather than looking
+        // them up again.
+        assert_eq!(sched.seeded.len(), keys.len());
+        assert!(sched.seeded.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn a_one_hop_batch_is_not_weighed() {
+        // The celebrity is in this batch too, and the schedule still
+        // does not look: over one hop a key is worth about what finding
+        // out what it is worth costs, so weighing the batch would show
+        // up in the middle of the request stream to save the far end of
+        // it.
+        let mut snap = Mock::new(8192, |i| i as i64, true).hub();
+        let keys = vec![5, 6, 0, 7];
+        let p = one_hop_batch_plan(keys.clone());
+        let sched = seeks_work(&p, &mut snap, &cores(4), &keys, true).unwrap();
+        assert!(matches!(sched.work, Work::Seeks));
+        assert!(sched.parts.is_empty());
+        assert!(sched.seeded.is_empty(), "nothing looked, so nothing found");
+    }
+
+    #[test]
+    fn a_long_batch_is_not_weighed() {
+        // Past the weighing window the schedule cuts by position, and
+        // the celebrity in the batch does not change that: paying a key
+        // index lookup per key to find it would cost more than the tail
+        // it saves.
+        let mut snap = Mock::new(8192, |i| i as i64, true).hub();
+        let keys: Vec<u64> = (0..64).collect();
+        let p = batch_plan(keys.clone());
+        let sched = seeks_work(&p, &mut snap, &cores(4), &keys, true).unwrap();
+        assert!(matches!(sched.work, Work::Seeks));
+        assert!(sched.parts.is_empty());
+        assert!(sched.seeded.is_empty(), "nothing looked, so nothing found");
+    }
+
+    #[test]
+    fn a_hybrid_batch_answers_what_one_worker_answers() {
+        // Every pair the batch reaches, counted on one thread and on
+        // four. The four thread run is the one that mixes the units,
+        // and an answer that depends on which unit a key was cut along
+        // is the one thing the policy is not allowed to do.
+        let rows = 8192;
+        let mut snap = Mock::new(rows, |i| i as i64, true).hub();
+        // The last one hits nothing, which the weighing has to carry
+        // through: a key with no row still holds its place in the batch
+        // and still produces no row of its own.
+        let keys = vec![5, 6, 0, 7, 9, rows + 3];
+        let p = batch_plan(keys.clone());
+        let one = run(&p, &mut snap, &seq()).unwrap().0;
+        let (many, d) = run(&p, &mut snap, &cores(4)).unwrap();
+        // The celebrity reaches everyone the chain carries on from,
+        // which is everybody but the last row, and each of the four
+        // light keys reaches one row two along from it.
+        assert_eq!(
+            one.rows,
+            vec![vec![Value::Int(rows as i64 - 2 + 4)]],
+            "the celebrity's second frontier and one row per light key"
+        );
+        assert_eq!(many.rows, one.rows);
+        assert_eq!(d.split.of, "batch keys and frontiers");
     }
 
     #[test]

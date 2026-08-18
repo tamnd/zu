@@ -211,6 +211,50 @@ fn returned_rows(r: &zu::query::QueryResult) -> u64 {
     r.rows.len() as u64
 }
 
+/// Ids per batched request. A multiget is what a service sends when it
+/// has a page of ids in hand rather than one, and a short batch is the
+/// case where a single celebrity in it decides how long the whole
+/// request takes: eight seeds, seven of them a row each and one of them
+/// a hundred thousand edges.
+const BATCH: usize = 8;
+
+/// The batched shape over one graph. Timed like the others, one request
+/// per batch of ids, and crosschecked against the degrees the edge list
+/// says those ids have.
+fn batched(session: &mut Session, seeds: &[i64], deg: &[u32]) -> Tail {
+    let source = "UNWIND $ids AS x MATCH (p:person {id: x})-[:knows]->(f) RETURN f.id AS f";
+    let batches: Vec<(Vec<Value>, u64)> = seeds
+        .chunks(BATCH)
+        .map(|part| {
+            let want = part.iter().map(|&s| u64::from(deg[s as usize])).sum();
+            (part.iter().map(|&s| Value::Int(s)).collect(), want)
+        })
+        .collect();
+    for (ids, want) in &batches {
+        let r = session
+            .run(source, &[("ids", Value::List(ids.clone()))])
+            .expect("warm run");
+        assert_eq!(r.rows.len() as u64, *want, "warm answer for a batch");
+    }
+    let mut us: Vec<f64> = batches
+        .iter()
+        .map(|(ids, want)| {
+            let param = [("ids", Value::List(ids.clone()))];
+            let t = Instant::now();
+            let r = session.run(source, &param).expect("timed run");
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            assert_eq!(r.rows.len() as u64, *want, "answer for a batch");
+            us
+        })
+        .collect();
+    us.sort_by(f64::total_cmp);
+    Tail {
+        p50: quantile(&us, 0.50),
+        p99: quantile(&us, 0.99),
+        max: us[us.len() - 1],
+    }
+}
+
 /// Both shapes over one graph, printed, with the friend list's ratio
 /// handed back because that is the one the ceiling sits on.
 fn measure(what: &str, path: &std::path::Path, deg: &[u32], seeds: &[i64]) -> f64 {
@@ -229,6 +273,7 @@ fn measure(what: &str, path: &std::path::Path, deg: &[u32], seeds: &[i64]) -> f6
         |s| u64::from(deg[s as usize]),
         count_rows,
     );
+    let batch = batched(&mut session, seeds, deg);
     let mut asked: Vec<u32> = seeds.iter().map(|&s| deg[s as usize]).collect();
     asked.sort_unstable();
     println!(
@@ -248,6 +293,14 @@ fn measure(what: &str, path: &std::path::Path, deg: &[u32], seeds: &[i64]) -> f6
         count.p99,
         count.ratio(),
         count.max,
+    );
+    println!(
+        "tail {what} batched friend list: p50 {:.1} us, p99 {:.1} us, {:.2}x, max {:.1} us over {} requests of {BATCH} ids, crosschecked",
+        batch.p50,
+        batch.p99,
+        batch.ratio(),
+        batch.max,
+        REQUESTS / BATCH,
     );
     list.ratio()
 }

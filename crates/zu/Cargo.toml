@@ -65,6 +65,10 @@ name = "compare"
 harness = false
 
 [[bench]]
+name = "dynamic"
+harness = false
+
+[[bench]]
 name = "project"
 harness = false
 

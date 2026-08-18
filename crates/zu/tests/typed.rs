@@ -151,6 +151,67 @@ fn a_predicate_in_a_filter_agrees_between_the_two_executors() {
     assert_eq!(with_exec2.rows[0][0], Value::Int(2));
 }
 
+/// Four people, and the fourth has no age. A stored column with a hole
+/// in it is what separates a predicate the column's type settles from
+/// one that has to look at a value, and a null is the row a wrong
+/// shortcut gets wrong first.
+fn ages(dir: &std::path::Path) -> Zu1File {
+    let mut zu = Zu1File::create(&dir.join("ages.zu1")).unwrap();
+    bulk_load_as(&mut zu, "person", "knows", 4, &[(0, 1)]).unwrap();
+    let values: [u64; 4] = [7, 30, 300, 0];
+    let held: [u64; 1] = [0b0111];
+    zu_zu1::props::store_props_nullable(
+        &mut zu,
+        "person",
+        &[zu_zu1::props::PropInput {
+            name: "age",
+            values: zu_zu1::props::PropValues::Int(&values),
+            validity: Some(&held),
+        }],
+    )
+    .unwrap();
+    zu
+}
+
+/// The compiler drops a cast to the type a column already has and
+/// answers a type test that column's type settles without reading a
+/// row. Both are only allowed to be faster, so the answers have to be
+/// the ones the row engine gives, on the null as much as on the rest.
+#[test]
+fn a_cast_and_a_type_test_over_a_stored_column_answer_the_same_either_way() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = ages(dir.path());
+    // A null is of every nullable type and of no type written NOT
+    // NULL, which is why the INT64 pair comes to four and three. INT8
+    // is the same question asked of each number instead, and 300 is
+    // the number that says so.
+    let counts = [
+        ("CAST(p.age AS INT64) > 30", 1),
+        ("p.age IS TYPED INT64", 4),
+        ("p.age IS NOT TYPED INT64", 0),
+        ("p.age IS TYPED INT64 NOT NULL", 3),
+        ("p.age IS TYPED INT8", 3),
+        ("p.age IS TYPED INT8 NOT NULL", 2),
+    ];
+    for (predicate, want) in counts {
+        let source = format!("MATCH (p:person) WHERE {predicate} RETURN count(p) AS n");
+        let vectorised = run(&source, &mut db, &[]).unwrap_or_else(|e| panic!("{predicate}: {e}"));
+        // SAFETY: single-threaded test, and the variable is read back
+        // by this process only.
+        unsafe { std::env::set_var("ZU_EXEC2", "0") };
+        let rows = run(&source, &mut db, &[]).unwrap_or_else(|e| panic!("{predicate}: {e}"));
+        unsafe { std::env::remove_var("ZU_EXEC2") };
+        assert_eq!(vectorised.rows, rows.rows, "{predicate}");
+        assert_eq!(vectorised.rows[0][0], Value::Int(want), "{predicate}");
+    }
+    // The narrowing cast keeps its check, which is the thing a shortcut
+    // would quietly take away: 300 does not fit in eight bits and the
+    // query has to say so rather than count a row.
+    let source = "MATCH (p:person) WHERE CAST(p.age AS INT8) > 30 RETURN count(p) AS n";
+    let err = run(source, &mut db, &[]).expect_err("300 does not fit in an INT8");
+    assert_eq!(err.gqlstatus().unwrap().code(), "22003");
+}
+
 #[test]
 fn an_unknown_type_name_in_a_predicate_is_a_syntax_error() {
     let dir = tempfile::tempdir().unwrap();

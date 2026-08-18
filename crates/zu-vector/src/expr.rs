@@ -63,6 +63,16 @@ pub enum ExprOp {
         negated: bool,
         dst: Reg,
     },
+    /// A predicate the rows cannot change: every row passes, or none
+    /// does. `IS TYPED` against the type a column already has is the
+    /// case that puts one here, since the answer is a fact about the
+    /// column and the compiler knows it before a row is read. Writing
+    /// it as an op rather than dropping the filter keeps the program
+    /// able to say `false`, which a dropped filter cannot.
+    All {
+        on: bool,
+        dst: Reg,
+    },
     And {
         l: Reg,
         r: Reg,
@@ -131,6 +141,11 @@ impl Program {
                         let v = resolve(&regs, *src, chunk)?;
                         validity_bits(v, *negated, &mut bits);
                     }
+                    regs[*dst as usize] = Slot::Bits(bits);
+                    last = *dst;
+                }
+                ExprOp::All { on, dst } => {
+                    let bits = Bitmap::new_in(arena, count, *on);
                     regs[*dst as usize] = Slot::Bits(bits);
                     last = *dst;
                 }

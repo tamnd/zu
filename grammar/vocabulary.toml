@@ -52,8 +52,8 @@ words = ["UNION", "EXCEPT", "INTERSECT", "OTHERWISE"]
 
 [[group]]
 kind = "keyword"
-doc = "Projection and ordering."
-words = ["DISTINCT", "AS", "ORDER", "BY", "ASC", "ASCENDING", "DESC", "DESCENDING", "NULLS", "FIRST", "LAST", "SKIP", "LIMIT"]
+doc = "Projection, grouping, ordering and the page. GROUP is also a value type word, being the GROUP of a group type, and one word is one entry here however many places the grammar reads it in. OFFSET is with the clauses, since it is the standard's word for the clause SKIP is the synonym of and the counter a FOR numbers its rows with."
+words = ["DISTINCT", "AS", "GROUP", "ORDER", "BY", "ASC", "ASCENDING", "DESC", "DESCENDING", "NULLS", "FIRST", "LAST", "SKIP", "LIMIT"]
 
 [[group]]
 kind = "keyword"
@@ -73,7 +73,7 @@ words = ["CREATE", "DROP", "SCHEMA", "GRAPH", "PROPERTY", "TYPE", "IF", "REPLACE
 [[group]]
 kind = "keyword"
 doc = "Value type words that are grammar rather than type names: the list types and the open types."
-words = ["LIST", "ARRAY", "GROUP", "RECORD", "VALUE"]
+words = ["LIST", "ARRAY", "RECORD", "VALUE"]
 
 [[group]]
 kind = "keyword"

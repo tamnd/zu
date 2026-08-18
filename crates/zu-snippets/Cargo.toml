@@ -1,0 +1,26 @@
+[package]
+name = "zu-snippets"
+description = "The snippets this repository publishes, compiled and run as printed"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Under the name it is published as, which is the name a reader types
+# after `cargo add zudb` and therefore the name the printed snippet has
+# to use. A crate cannot depend on itself under another name, which is
+# the whole reason the snippets are a package of their own.
+zudb = { package = "zu", path = "../zu" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

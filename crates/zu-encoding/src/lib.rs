@@ -9,6 +9,7 @@ pub mod alp;
 pub mod alp_rd;
 pub mod bitpack;
 pub mod bool_bitpack;
+mod counts;
 pub mod delta;
 pub mod delta_patch;
 pub mod dict;

@@ -16,14 +16,13 @@ use crate::for_bitpack;
 /// Encodes `values` into `out`, returning the encoded byte length.
 pub fn encode(values: &[u64], out: &mut Vec<u8>) -> usize {
     let start = out.len();
-    let mut counts = std::collections::HashMap::new();
-    for &v in values {
-        *counts.entry(v).or_insert(0usize) += 1;
-    }
-    let top = counts
-        .into_iter()
-        .max_by_key(|&(_, n)| n)
-        .map_or(0, |(v, _)| v);
+    // The dominant value, off the shared counting table rather than a
+    // hash map: the map hashed every value of every chunk with SipHash,
+    // and this encoder is on the write path of every fold.
+    let top = match values.is_empty() {
+        true => 0,
+        false => crate::counts::count(values, values.len()).top,
+    };
     let mut positions = Vec::new();
     let mut exceptions = Vec::new();
     for (i, &v) in values.iter().enumerate() {

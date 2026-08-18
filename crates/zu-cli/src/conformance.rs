@@ -149,7 +149,7 @@ const ENGINE: &[Declared] = &[
     Declared {
         key: "isolated",
         supported: true,
-        why: "reset drops the file, which is the most complete reset there is",
+        why: "a reset is a statement on the running session, so a case starts on a graph the case before it did not write to",
     },
 ];
 

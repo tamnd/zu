@@ -719,26 +719,13 @@ impl Session {
                 }
                 let mut args = args.clone();
                 args.extend(carried);
-                return exec::execute(
-                    &part.plan,
-                    &part.query,
-                    &cached.schema,
-                    &mut self.graph,
-                    &args,
-                    &options,
-                );
+                return self.read_part(&part.plan, &part.query, &cached.schema, &args, &options);
             };
             let mut args = args.clone();
             args.extend(carried.take());
-            let rows = exec::execute(
-                &part.plan,
-                &part.query,
-                &cached.schema,
-                &mut self.graph,
-                &args,
-                &options,
-            )?
-            .rows;
+            let rows = self
+                .read_part(&part.plan, &part.query, &cached.schema, &args, &options)?
+                .rows;
             // The row holds the slots the write carries across it and
             // then the values it wrote, which is the order the
             // projection at the end of this part wrote them in.
@@ -833,6 +820,44 @@ impl Session {
             carried = Some(Value::List(next));
         }
         unreachable!("the last part of a split statement writes nothing")
+    }
+
+    /// Runs the read half of one part of a write statement.
+    ///
+    /// A write is a read and then a write, and the read is an ordinary
+    /// `MATCH` that the pipeline executor covers here as well as it
+    /// covers the same clauses in a statement of their own. This used to
+    /// go straight to the old executor whatever the plan was, which
+    /// walks a row at a time and builds a [`Value`] per property, and on
+    /// a `SET` of one row out of a hundred thousand that scan was most
+    /// of what the statement cost: the write path itself is a log frame
+    /// and a fold of the chunks that moved. So the pipeline goes first
+    /// here, the same way it does in [`Self::run`], and the fallback is
+    /// the same fallback.
+    ///
+    /// The warm snapshot is the session's, and it stays right across a
+    /// write because [`Self::write`] refreshes when the epoch moves,
+    /// which drops the readers the fold made stale.
+    fn read_part(
+        &mut self,
+        plan: &LogicalPlan,
+        query: &BoundQuery,
+        schema: &zu_query::binder::Schema,
+        args: &[Value],
+        options: &exec::Options,
+    ) -> Result<QueryResult> {
+        if query::exec2_enabled() {
+            let catalog = self.graph.catalog().clone();
+            let warm = std::mem::take(&mut self.snap);
+            let mut snap =
+                crate::snapshot::Zu1Snapshot::with_cache(self.graph.file_mut(), catalog, warm);
+            let out = zu_exec::try_execute(plan, query, schema, &mut snap, args, options);
+            self.snap = snap.into_cache();
+            if let Some(rows) = out? {
+                return Ok(rows);
+            }
+        }
+        exec::execute(plan, query, schema, &mut self.graph, args, options)
     }
 
     /// Runs the query inside a `DELETE VALUE { ... }` and answers the

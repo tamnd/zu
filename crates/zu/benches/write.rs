@@ -12,11 +12,20 @@
 //! and the fold that makes the new value readable.
 //!
 //! One number would hide most of that. A write path can be quick and
-//! still be wrong to ship, so every run reports five: `us` is what a
-//! caller waits, `stmt/s` is what a stream of them sustains, `written`
-//! is what the statement pushed at the disk, `growth` is what it added
-//! to the store for good, and the two memory columns are what it cost
-//! to hold. A one cell change that writes a megabyte is a real defect
+//! still be wrong to ship, so every run reports six: `us` is what a
+//! caller waits, `cpu` is the processor time inside it, `stmt/s` is
+//! what a stream of them sustains, `written` is what the statement
+//! pushed at the disk, `growth` is what it added to the store for good,
+//! and the two memory columns are what it cost to hold.
+//!
+//! The clock and the processor time are worth reading as a pair. A
+//! commit ends in an fsync, and an fsync on the laptop this was written
+//! on is 3.9 ms whatever it is syncing, so the latency column of a
+//! single threaded run is mostly the storage and it will sit near that
+//! floor however cheap the write path gets. `cpu` is the part this
+//! repository can move, and it is what the P5 budget is written
+//! against. Latency comes down when commits stop syncing one at a time,
+//! which is group commit and a different change from this one. A one cell change that writes a megabyte is a real defect
 //! and the clock alone would call it fine; a write path that leaked a
 //! block per statement would pass every latency ceiling there is and
 //! show up only in `growth`.
@@ -90,6 +99,11 @@ struct Usage {
     peak_rss: u64,
     /// Bytes this process has pushed at the disk since it started.
     written: u64,
+    /// Microseconds of processor time, user and system together, that
+    /// this process has burned since it started. A commit waits on an
+    /// fsync and waiting is not burning, so this is the work the write
+    /// path does and not the storage it does it on.
+    cpu: u64,
 }
 
 /// The tail of `struct rusage` this bench does not read, sized so the
@@ -113,21 +127,25 @@ unsafe extern "C" {
     fn getrusage(who: i32, usage: *mut Rusage) -> i32;
 }
 
-/// The process peak resident size in bytes. `ru_maxrss` is bytes on
-/// macOS and kilobytes on Linux, which is a difference in the kernels
-/// rather than in the call.
-fn peak_rss() -> u64 {
+/// The process peak resident size in bytes and the processor time it
+/// has spent in microseconds. `ru_maxrss` is bytes on macOS and
+/// kilobytes on Linux, which is a difference in the kernels rather than
+/// in the call; the two timevals in front of it mean the same thing on
+/// both.
+fn peak_rss_and_cpu() -> (u64, u64) {
     let mut usage = Rusage::default();
     // RUSAGE_SELF is 0 on every platform that has the call.
     if unsafe { getrusage(0, &mut usage) } != 0 {
-        return 0;
+        return (0, 0);
     }
     let maxrss = usage.maxrss.max(0) as u64;
-    if cfg!(target_os = "macos") {
+    let peak = if cfg!(target_os = "macos") {
         maxrss
     } else {
         maxrss * 1024
-    }
+    };
+    let micros = |t: [i64; 2]| (t[0].max(0) as u64) * 1_000_000 + t[1].max(0) as u64;
+    (peak, micros(usage.utime) + micros(usage.stime))
 }
 
 #[cfg(target_os = "macos")]
@@ -195,10 +213,12 @@ mod platform {
 
 fn usage() -> Usage {
     let (rss, written) = platform::rss_and_written();
+    let (peak_rss, cpu) = peak_rss_and_cpu();
     Usage {
         rss,
-        peak_rss: peak_rss(),
+        peak_rss,
         written,
+        cpu,
     }
 }
 
@@ -222,6 +242,13 @@ fn disk(dir: &Path) -> u64 {
 struct Cost {
     /// Latency a caller waits, in microseconds.
     us: f64,
+    /// Processor time the statement burned, in microseconds. A commit
+    /// is a log append and an fsync, and on this laptop that fsync is
+    /// 3.9 ms on its own, so the latency column is mostly the storage
+    /// and this one is the write path. It is the column to watch when
+    /// the fold gets cheaper, because the clock beside it will not move
+    /// until commits stop syncing one at a time.
+    cpu: f64,
     /// Bytes pushed at the disk.
     written: f64,
     /// Bytes the store is bigger by afterwards.
@@ -235,15 +262,16 @@ struct Cost {
 impl Cost {
     fn header() {
         println!(
-            "{:<26} {:>10} {:>12} {:>13} {:>12} {:>10} {:>12}",
-            "statement", "latency", "throughput", "written", "growth", "RSS", "peak growth"
+            "{:<26} {:>10} {:>9} {:>12} {:>13} {:>12} {:>10} {:>12}",
+            "statement", "latency", "cpu", "throughput", "written", "growth", "RSS", "peak growth"
         );
     }
 
     fn report(&self, what: &str) {
         println!(
-            "{what:<26} {:>7.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
+            "{what:<26} {:>7.0} us {:>6.0} us {:>7.0} stmt/s {:>8.1} kB/st {:>7.0} B/st {:>7.1} MB {:>9.1} MB",
             self.us,
+            self.cpu,
             1e6 / self.us.max(0.001),
             self.written / 1024.0,
             self.growth,
@@ -361,11 +389,11 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
     // which put a ratio the laptop measures at 2.1 to 2.5 between 4.18
     // and 6.18 on the same commit.
     //
-    // The bytes and the disk growth are the first pass only. They are
-    // counts and not clocks, so nothing about them wants a best of, and
-    // a store that grows once on first touch would look like a store
-    // that grows a third as much if the same growth were spread over
-    // three passes.
+    // The bytes, the disk growth and the processor time are the first
+    // pass only. They are counts and not clocks, so nothing about them
+    // wants a best of, and a store that grows once on first touch would
+    // look like a store that grows a third as much if the same growth
+    // were spread over three passes.
     let mut elapsed = std::time::Duration::MAX;
     let mut once: Option<(Usage, u64)> = None;
     for _ in 0..PASSES {
@@ -400,6 +428,7 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
         rss: after.rss,
@@ -452,6 +481,7 @@ fn run_set_record(dir: &Path, rows: u64) -> Cost {
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
         rss: after.rss,
@@ -506,6 +536,7 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
         rss: after.rss,
@@ -568,6 +599,7 @@ fn run_set_edge(dir: &Path, rows: u64) -> Cost {
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
         rss: after.rss,
@@ -609,6 +641,7 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
         rss: after.rss,
@@ -657,6 +690,7 @@ fn run_delete(dir: &Path, rows: u64) -> Cost {
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
         rss: after.rss,
@@ -723,6 +757,7 @@ fn run_detach(dir: &Path, rows: u64) -> Cost {
     );
     Cost {
         us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
         written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
         growth: growth as f64 / WRITES as f64,
         rss: after.rss,
@@ -771,6 +806,8 @@ fn main() {
     let mut failed = false;
     let checks = [
         ("set_stmt_us", set_small.us),
+        ("set_stmt_cpu_us", set_small.cpu),
+        ("insert_stmt_cpu_us", insert.cpu),
         ("set_edge_stmt_us", set_edge.us),
         ("set_edge_stmt_kb", set_edge.written / 1024.0),
         ("set_record_stmt_us", set_record.us),

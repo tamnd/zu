@@ -2100,8 +2100,9 @@ fn a_statement_stopped_from_another_thread_leaves_the_connection_warm() {
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 assert!(rows > 0, "the statement never started reading");
+                let asked = std::time::Instant::now();
                 assert_eq!(zu_conn_interrupt(handed.0), ZuStatus::Ok);
-                rows
+                (rows, asked)
             });
             let mut result: *mut ZuResult = ptr::null_mut();
             let mut err: *mut ZuError = ptr::null_mut();
@@ -2112,11 +2113,21 @@ fn a_statement_stopped_from_another_thread_leaves_the_connection_warm() {
                 &mut result,
                 &mut err,
             );
-            let seen = asking.join().expect("the asking thread");
-            (status, result, err, seen)
+            let felt = std::time::Instant::now();
+            let (seen, asked) = asking.join().expect("the asking thread");
+            (status, result, err, seen, felt.duration_since(asked))
         });
-        let (status, result, err, seen) = stopped;
+        let (status, result, err, seen, took) = stopped;
         assert_eq!(status, ZuStatus::Interrupted, "the statement was stopped");
+        // dx/02 asks for fifty milliseconds from the ask to the return,
+        // and the executor reads the flag at the boundary of a chunk,
+        // which is a fraction of a millisecond of work. The margin is
+        // for a machine running the whole suite at once, not for the
+        // engine.
+        assert!(
+            took < std::time::Duration::from_millis(50),
+            "the ask took {took:?} to land"
+        );
         assert!(result.is_null(), "a stopped statement has no result");
         // Stopping is not failing, but it is still reported as an
         // error handle, and what it says is that it stopped.

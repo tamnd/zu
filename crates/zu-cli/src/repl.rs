@@ -240,11 +240,20 @@ fn timed(session: &mut Session, statement: &str, timing: bool) -> (String, bool)
 
 /// How often the watcher wakes: often enough that a `Ctrl-C` is
 /// answered while the finger is still on the key, rare enough that
-/// waiting on a statement costs nothing measurable. Fifty presses a
+/// waiting on a statement costs nothing measurable. Two hundred wakes a
 /// second against an executor that checks its flag every chunk puts the
 /// whole round trip well inside the tenth of a second a person reads as
-/// immediate.
-const TICK: std::time::Duration = std::time::Duration::from_millis(20);
+/// immediate, and a wake that finds nothing to do is a compare and a
+/// sleep.
+///
+/// A press pays this twice: once for the wake that reads the flag and
+/// once for the wake that finds the statement over, since the loop only
+/// looks between two sleeps. Ten milliseconds of budget for a press
+/// measured at forty when this was twenty, against a budget of fifty.
+/// The progress line is unaffected either way, because it is written
+/// only when the tenth of a second or the row count it prints has
+/// changed.
+const TICK: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// How long a statement runs before the shell says it is running.
 ///

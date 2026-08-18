@@ -73,6 +73,7 @@ use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
 use crate::plan::{Bracket, BracketKind, LogicalPlan, expr_text};
+use crate::refs::{BindingTable, GraphHandle};
 use crate::row::{Batch, Flow};
 
 /// Vector width of one chunk fill.
@@ -139,6 +140,15 @@ pub enum Value {
     /// variable-length path. [`settle`] turns it into the edge list
     /// before any value leaves the pipeline, so results never hold one.
     Chain(Arc<PathLink>),
+    /// GV60. A graph reference: which graph, not the graph. The engine
+    /// hands one out and a query carries it; there is no literal that
+    /// writes one, because a graph is in the catalog and not in the
+    /// text.
+    Graph(GraphHandle),
+    /// GV61. A binding table reference: the rows of some earlier
+    /// result, behind a handle so that passing the table costs a
+    /// pointer rather than a copy.
+    BindingTable(Arc<BindingTable>),
 }
 
 impl Value {
@@ -1031,6 +1041,12 @@ fn rank(v: &Value) -> u8 {
         // A path sorts after every record, and two paths sort by their
         // elements, which is the list order over the same sequence.
         Value::Path(_) => 9,
+        // GV60 and GV61 sort last, after everything the language can
+        // write down. They are handles rather than data, so where they
+        // go is a choice with nothing to recommend one place over
+        // another, and the end is the place that moves no other type.
+        Value::Graph(_) => 10,
+        Value::BindingTable(_) => 11,
     }
 }
 
@@ -1101,6 +1117,14 @@ pub fn value_order(a: &Value, b: &Value) -> Ordering {
             }
             a.len().cmp(&b.len())
         }
+        // Two graph references order by what identifies them, which is
+        // the catalog id and the epoch it was taken at; the names ride
+        // along and are the same whenever the id is.
+        (Value::Graph(a), Value::Graph(b)) => (a.id, a.epoch).cmp(&(b.id, b.epoch)),
+        // Two binding table references order by handle number, which
+        // is creation order. Ordering them by their rows would say two
+        // tables holding the same rows are one, and they are two.
+        (Value::BindingTable(a), Value::BindingTable(b)) => a.id().cmp(&b.id()),
         (a, b) => rank(a).cmp(&rank(b)),
     }
 }

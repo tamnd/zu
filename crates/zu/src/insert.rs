@@ -661,6 +661,8 @@ pub(crate) fn describe(value: &Value) -> &'static str {
         Value::Temporal(_) => "a temporal value",
         Value::Path(_) => "a path",
         Value::Chain(_) => "a path",
+        Value::Graph(_) => "a graph reference",
+        Value::BindingTable(_) => "a binding table reference",
     }
 }
 

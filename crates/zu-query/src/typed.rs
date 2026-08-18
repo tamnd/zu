@@ -100,7 +100,31 @@ fn material(v: &Value, ty: &LogicalType) -> bool {
 
         LogicalType::Node(_) => matches!(v, Value::Node { .. }),
         LogicalType::Edge(_) => matches!(v, Value::Rel { .. }),
-        LogicalType::Graph(_) | LogicalType::BindingTable(_) => false,
+        // GV60. Every graph reference is a value of `GRAPH` and of
+        // `ANY GRAPH`. The named form asks whether the graph is of a
+        // graph type, which is a catalog question rather than a
+        // question about the value, and the same one `NODE nodetype`
+        // is waiting on, so it answers the same way both do here: by
+        // the kind, until G2 gives the predicate a catalog to read.
+        LogicalType::Graph(_) => matches!(v, Value::Graph(_)),
+        // GV61. A bare `BINDING TABLE` admits every table. The typed
+        // form names the record type of a row, so it is answered where
+        // it can be: every column the type names is there, every row
+        // is a record of that type, and a closed type also refuses a
+        // column it did not name.
+        LogicalType::BindingTable(rt) => match (v, rt) {
+            (Value::BindingTable(_), None) => true,
+            (Value::BindingTable(t), Some(rt)) => {
+                let column = |name: &str| t.columns().iter().any(|c| c == name);
+                let named = |name: &String| rt.field(name).is_some();
+                (rt.open || t.columns().iter().all(named))
+                    && rt.fields.iter().all(|f| column(&f.name))
+                    && (0..t.rows().len())
+                        .filter_map(|ix| t.record(ix))
+                        .all(|row| is_of(&row, &LogicalType::Record(rt.clone())))
+            }
+            _ => false,
+        },
 
         LogicalType::Path(_) => matches!(v, Value::Path(_)),
         // A list belongs to a list type when every element belongs to
@@ -168,7 +192,9 @@ fn within(len: usize, min: Option<u32>, max: Option<u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zu_common::RecordType;
+    use zu_common::{Field, RecordType};
+
+    use crate::refs::{BindingTable, GraphHandle};
 
     fn nullable(ty: LogicalType) -> LogicalType {
         LogicalType::Nullable(Box::new(ty))
@@ -258,5 +284,61 @@ mod tests {
             &Value::Int(1),
             &nullable(LogicalType::Record(RecordType::open(Vec::new())))
         ));
+    }
+
+    /// GV60. A graph reference is a value of the graph type and of
+    /// nothing else, and a property union does not admit it, because a
+    /// handle is not a thing a property holds.
+    #[test]
+    fn a_graph_reference_is_a_value_of_the_graph_type() {
+        let g = Value::Graph(GraphHandle::new(1, "/", "social", 4));
+        assert!(is_of(&g, &LogicalType::Graph(None)));
+        assert!(is_of(&g, &LogicalType::Any));
+        assert!(!is_of(&g, &LogicalType::AnyProperty));
+        assert!(!is_of(&g, &LogicalType::BindingTable(None)));
+        assert!(!is_of(&Value::Int(1), &LogicalType::Graph(None)));
+    }
+
+    /// GV61. A bare binding table type admits every table, and the
+    /// typed form is answered against the columns and the rows.
+    #[test]
+    fn a_binding_table_belongs_to_the_row_type_its_rows_are_of() {
+        let t = Value::BindingTable(BindingTable::new(
+            vec!["n".into()],
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+            0,
+        ));
+        assert!(is_of(&t, &LogicalType::BindingTable(None)));
+        let of_int = |ty: LogicalType| {
+            LogicalType::BindingTable(Some(RecordType::closed(vec![Field {
+                name: "n".into(),
+                ty,
+            }])))
+        };
+        assert!(is_of(&t, &of_int(int())));
+        assert!(!is_of(&t, &of_int(LogicalType::Bool)));
+        // A column the closed type does not name is a column too many,
+        // and a field it names that no column matches is one missing.
+        let other = LogicalType::BindingTable(Some(RecordType::closed(vec![Field {
+            name: "m".into(),
+            ty: int(),
+        }])));
+        assert!(!is_of(&t, &other));
+    }
+
+    /// An empty table still has columns, so a closed row type it does
+    /// not describe is refused rather than waved through on the
+    /// strength of there being no row to check.
+    #[test]
+    fn an_empty_binding_table_is_checked_by_its_columns() {
+        let t = Value::BindingTable(BindingTable::new(vec!["n".into()], Vec::new(), 0));
+        let closed = |name: &str| {
+            LogicalType::BindingTable(Some(RecordType::closed(vec![Field {
+                name: name.into(),
+                ty: int(),
+            }])))
+        };
+        assert!(is_of(&t, &closed("n")));
+        assert!(!is_of(&t, &closed("m")));
     }
 }

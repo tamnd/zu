@@ -55,10 +55,15 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
         | LogicalType::Duration(_)) => to_temporal(v, target),
         // A reference is a handle the engine hands out and never a
         // value the language builds, so the only cast to one that can
-        // mean anything is the one that already holds it.
-        target @ (LogicalType::Node(_) | LogicalType::Edge(_) | LogicalType::Path(_)) => {
-            keep(v, target)
-        }
+        // mean anything is the one that already holds it. GV60 and
+        // GV61 are references too and the rule reaches them unchanged:
+        // a graph reference is already a graph, and nothing else
+        // becomes one.
+        target @ (LogicalType::Node(_)
+        | LogicalType::Edge(_)
+        | LogicalType::Path(_)
+        | LogicalType::Graph(_)
+        | LogicalType::BindingTable(_)) => keep(v, target),
         // GV65 and GV68. The open unions accept what they are open to,
         // which for a property union is everything a property may hold.
         LogicalType::Any => Ok(v),
@@ -91,11 +96,6 @@ pub fn cast(v: Value, ty: &LogicalType) -> Result<Value> {
         // a wrong answer rather than a missing one, so the whole column
         // refuses until the value exists.
         LogicalType::Bytes { .. } => Err(forbidden(&v, ty.base())),
-        // GV60 and GV61. A graph and a binding table are catalog handles
-        // the engine hands out, and nothing an expression builds is one,
-        // so the same rule as the references applies with none of them
-        // ever holding.
-        LogicalType::Graph(_) | LogicalType::BindingTable(_) => Err(forbidden(&v, ty.base())),
         // `base()` above has already removed the wrapper, and matching
         // on it here rather than on a catch-all is what makes a new
         // member of the lattice a compile error in this function.
@@ -117,6 +117,10 @@ fn property_value(v: &Value) -> bool {
     match v {
         Value::Node { .. } | Value::Rel { .. } | Value::Path(_) | Value::Chain(_) => false,
         Value::Record(_) => false,
+        // A handle least of all: a graph is not a thing to write into
+        // a column, and a stored one would name a graph the file may
+        // not have by the time something reads it back.
+        Value::Graph(_) | Value::BindingTable(_) => false,
         Value::List(items) => items.iter().all(property_value),
         _ => true,
     }
@@ -134,10 +138,18 @@ fn keep(v: Value, target: &LogicalType) -> Result<Value> {
     let held = match (&v, target) {
         (Value::Node { .. }, LogicalType::Node(None))
         | (Value::Rel { .. }, LogicalType::Edge(None))
-        | (Value::Path(_), LogicalType::Path(None)) => true,
+        | (Value::Path(_), LogicalType::Path(None))
+        | (Value::Graph(_), LogicalType::Graph(None))
+        | (Value::BindingTable(_), LogicalType::BindingTable(None)) => true,
+        // A binding table type names the record type of a row, and
+        // whether the rows are of it is [`crate::typed`]'s question
+        // rather than a conversion, so the named form waits with the
+        // other named references.
         (Value::Node { .. }, LogicalType::Node(Some(_)))
         | (Value::Rel { .. }, LogicalType::Edge(Some(_)))
-        | (Value::Path(_), LogicalType::Path(Some(_))) => {
+        | (Value::Path(_), LogicalType::Path(Some(_)))
+        | (Value::Graph(_), LogicalType::Graph(Some(_)))
+        | (Value::BindingTable(_), LogicalType::BindingTable(Some(_))) => {
             return Err(ZuError::gql(
                 codes::C22G0W,
                 format!("'{target}' names a type this cast cannot check yet"),
@@ -191,6 +203,8 @@ pub(crate) fn value_type(v: &Value) -> String {
         Value::Record(_) => "RECORD".into(),
         Value::Temporal(t) => t.logical_type().to_string(),
         Value::Path(_) | Value::Chain(_) => "PATH".into(),
+        Value::Graph(_) => "GRAPH".into(),
+        Value::BindingTable(_) => "BINDING TABLE".into(),
     }
 }
 
@@ -636,6 +650,7 @@ mod tests {
     use zu_common::{DurationKind, Field, RecordType};
 
     use super::*;
+    use crate::refs::{BindingTable, GraphHandle};
     use crate::value_type::spelled;
 
     fn ty(name: &str) -> LogicalType {
@@ -805,75 +820,83 @@ mod tests {
         ),
         (
             "bool",
-            "22G03 22G03 . . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . .",
+            "22G03 22G03 . . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . .",
         ),
         (
             "int",
-            "22G03 22G03 . . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . .",
+            "22G03 22G03 . . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . .",
         ),
         (
             "float",
-            "22G03 22G03 22G03 . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . .",
+            "22G03 22G03 22G03 . . . . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . .",
         ),
         (
             "'1'",
-            "22G03 22G03 22018 . . . . 22G03 22007 22007 22007 22007 22007 22G0H 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . .",
+            "22G03 22G03 22018 . . . . 22G03 22007 22007 22007 22007 22007 22G0H 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . .",
         ),
         (
             "'true'",
-            "22G03 22G03 . 22018 22018 22018 . 22G03 22007 22007 22007 22007 22007 22G0H 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22018",
+            "22G03 22G03 . 22018 22018 22018 . 22G03 22007 22007 22007 22007 22007 22G0H 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22018",
         ),
         (
             "'2024-01-15'",
-            "22G03 22G03 22018 22018 22018 22018 . 22G03 . 22007 22007 . . 22G0H 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22018",
+            "22G03 22G03 22018 22018 22018 22018 . 22G03 . 22007 22007 . . 22G0H 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22018",
         ),
         (
             "list",
-            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V . 22G03 . . 22G03 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V . 22G03 . . 22G03 22G03",
         ),
         (
             "record",
-            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 . . 22G03 22G03 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 . . 22G03 22G03 22G03",
         ),
         (
             "node",
-            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 . 22G0W 22G0V 22G03 22G03 22G0V 22G03 22G03 . 22G03 22G03 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 . 22G0W 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . 22G03 22G03 22G03",
         ),
         (
             "edge",
-            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V . 22G03 22G03 22G0V 22G03 22G03 . 22G03 22G03 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V . 22G0V 22G0V 22G0V 22G03 22G03 . 22G03 22G03 22G03",
         ),
         (
             "path",
-            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 . 22G03 22G03 . 22G03 22G03 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V . 22G03 22G03 . 22G03 22G03 22G03",
         ),
         (
             "date",
-            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 . 22G03 22G03 . . 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 . 22G03 22G03 . . 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22G03",
         ),
         (
             "time",
-            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 . . 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 . . 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22G03",
         ),
         (
             "ztime",
-            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 . . 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 . . 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22G03",
         ),
         (
             "datetime",
-            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 . . . . . 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 . . . . . 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22G03",
         ),
         (
             "zdatetime",
-            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 . . . . . 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 . . . . . 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22G03",
         ),
         (
             "duration",
-            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 22G03 22G03 22G03 22G03 . 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 22G03 22G03 22G03 22G03 . 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22G03",
         ),
         (
             "months",
-            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G03 22G03 22G0V 22G03 22G03 . . . 22G03",
+            "22G03 22G03 22G03 22G03 22G03 22G03 . 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V 22G0V 22G0V 22G03 22G03 . . . 22G03",
+        ),
+        (
+            "graph",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V . 22G0V 22G0V 22G03 22G03 . 22G03 22G03 22G03",
+        ),
+        (
+            "binding table",
+            "22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G03 22G0V 22G0V 22G0V 22G0V . 22G0V 22G03 22G03 . 22G03 22G03 22G03",
         ),
     ];
 
@@ -922,6 +945,12 @@ mod tests {
             }),
             Value::Temporal(Temporal::Duration(DurationKind::DayTime, NANOS_PER_DAY)),
             Value::Temporal(Temporal::Duration(DurationKind::YearMonth, 14)),
+            Value::Graph(GraphHandle::new(1, "/", "social", 0)),
+            Value::BindingTable(BindingTable::new(
+                vec!["a".into()],
+                vec![vec![Value::Int(1)]],
+                0,
+            )),
         ]
     }
 
@@ -1029,6 +1058,8 @@ mod tests {
             Value::Path(_) => "path",
             Value::Temporal(_) => "a temporal",
             Value::Chain(_) => "chain",
+            Value::Graph(_) => "graph",
+            Value::BindingTable(_) => "binding table",
         }
     }
 

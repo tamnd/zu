@@ -23,6 +23,7 @@ use zu_query::ast::TxnStmt;
 use zu_query::binder::BoundQuery;
 use zu_query::exec::{self, Streamed};
 use zu_query::plan::{LogicalPlan, QueryPlan};
+use zu_query::refs::{BindingTable, GraphHandle};
 use zu_query::row::{Batch, Flow};
 
 use crate::query::{self, NotAQuery, QueryResult, Value, Zu1Graph};
@@ -411,6 +412,108 @@ impl Session {
         self.refresh()
     }
 
+    /// A graph reference value naming one graph in the catalog (GV60),
+    /// or `42002` when the catalog has no such graph.
+    ///
+    /// This is where a graph reference comes from. GQL has no literal
+    /// that writes one and there is no expression yet that returns one
+    /// either, so the engine hands them out: a caller resolves a name
+    /// once, holds the handle, and passes it to as many statements as
+    /// it likes.
+    pub fn graph_ref(&mut self, schema: &str, name: &str) -> Result<Value> {
+        self.refresh()?;
+        let graph = self.graph.catalog().graph(schema, name).ok_or_else(|| {
+            ZuError::gql(codes::C42002, format!("no graph '{name}' in '{schema}'"))
+        })?;
+        Ok(Value::Graph(GraphHandle::new(
+            graph.id, schema, name, self.epoch,
+        )))
+    }
+
+    /// A graph reference on the graph this session is working in,
+    /// which is what `CURRENT_PROPERTY_GRAPH` will hand back once a
+    /// graph expression can be written (GE01, G6).
+    pub fn working_graph_ref(&mut self) -> Result<Value> {
+        self.refresh()?;
+        let graph = self
+            .graph
+            .catalog()
+            .graph_by_id(self.working)
+            .ok_or_else(|| {
+                ZuError::gql(
+                    codes::C42002,
+                    "the graph this session is working in is gone".to_string(),
+                )
+            })?;
+        let (schema, name) = (graph.schema.clone(), graph.name.clone());
+        Ok(Value::Graph(GraphHandle::new(
+            self.working,
+            schema,
+            name,
+            self.epoch,
+        )))
+    }
+
+    /// A binding table reference over the rows of a result (GV61).
+    ///
+    /// The rows are taken as they are: a binding table value is a
+    /// result that has already been read, held behind a handle so that
+    /// handing it to the next statement costs a pointer. The epoch it
+    /// was read at rides along, because that is what makes a table
+    /// holding element references answerable later.
+    pub fn binding_table(&self, result: QueryResult) -> Value {
+        Value::BindingTable(BindingTable::new(result.columns, result.rows, self.epoch))
+    }
+
+    /// Checks the reference values among a statement's parameters
+    /// against the epoch this session is at now.
+    ///
+    /// A handle can outlive what it names, and the two ways it can are
+    /// different. A graph reference is a catalog id, so it survives any
+    /// number of epochs and stops meaning something only when the graph
+    /// is dropped, which is a lookup. A binding table reference holds
+    /// rows that were read at one epoch, and the values in them are
+    /// still the values, except for the element references: a node is a
+    /// table and an offset in the snapshot it came from, and the row at
+    /// that offset in a later snapshot may belong to something else. So
+    /// a table of numbers and strings carries forward and a table
+    /// holding elements does not.
+    ///
+    /// Both refusals are `42002 invalid reference`, which is what they
+    /// are: the parameter is a reference to something the statement
+    /// cannot be run against.
+    fn check_refs(&self, params: &[(&str, Value)]) -> Result<()> {
+        for (name, value) in params {
+            match value {
+                Value::Graph(g) => {
+                    if self.graph.catalog().graph_by_id(g.id).is_none() {
+                        return Err(ZuError::gql(
+                            codes::C42002,
+                            format!(
+                                "${name} references {}, and that graph has been dropped",
+                                g.label()
+                            ),
+                        ));
+                    }
+                }
+                Value::BindingTable(t) if t.epoch() != self.epoch && t.holds_elements() => {
+                    return Err(ZuError::gql(
+                        codes::C42002,
+                        format!(
+                            "${name} references a binding table read at epoch {}, the session is \
+                             at epoch {}, and the table holds element references that name rows \
+                             of the older snapshot",
+                            t.epoch(),
+                            self.epoch
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The execution switches this session runs statements under.
     pub fn options(&self) -> &exec::Options {
         &self.options
@@ -466,6 +569,7 @@ impl Session {
         sink: &mut dyn FnMut(Batch<'_>) -> Result<Flow>,
     ) -> Result<Streamed> {
         self.refresh()?;
+        self.check_refs(params)?;
         if query::not_a_query(source)?.is_some() {
             let result = self.run(source, params)?;
             return exec::stream_result(result, batch_rows, sink);
@@ -519,6 +623,7 @@ impl Session {
     /// and reusing the cached plan afterwards.
     pub fn run(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.refresh()?;
+        self.check_refs(params)?;
         match query::not_a_query(source)? {
             Some(NotAQuery::Transaction(stmt)) => return self.transaction(stmt),
             // A catalog statement publishes a new epoch, and the plans

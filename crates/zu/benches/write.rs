@@ -52,6 +52,15 @@
 //! the read path learns to consult overlays and the fold stops running
 //! once per statement.
 //!
+//! An edge is the shape that has stopped folding, and it is measured
+//! twice: as the statement a client sends, and again staged straight
+//! onto a transaction. The two answer different questions. The
+//! statement carries a MATCH over two patterns to find its endpoints,
+//! and that search is linear in the rows of the table, so at 100 K it
+//! is most of what the statement costs and `insert_edge_x` mostly
+//! reports the read plane. The transaction rows are the write on its
+//! own, which is what `insert_edge_write_x` watches.
+//!
 //! Both statements are checked rather than only timed: the rows are
 //! counted and read back after the loop, so a write path that got
 //! faster by writing less fails instead of scoring.
@@ -62,9 +71,11 @@ use std::path::Path;
 use std::time::Instant;
 
 use zu::query::Value;
+use zu::session::Session;
 use zu::zu1::file::Zu1File;
 use zu::zu1::graph::bulk_load_as;
 use zu::zu1::props::{PropValues, store_labels, store_props, store_rel_props};
+use zu::zu1::txn::Cell;
 use zu::{Config, Database};
 
 /// The small table, where the fold is cheap enough that the statement
@@ -824,6 +835,79 @@ fn run_insert_edge(dir: &Path, rows: u64, strings: bool) -> Cost {
     }
 }
 
+/// The same edge inserts staged straight onto a transaction, with no
+/// statement in front of them.
+///
+/// This is the one that answers the size question. The statement above
+/// finds its two endpoints with a MATCH over two patterns, and that
+/// search is linear in the rows of the table, so at 100000 rows it is
+/// most of what the statement costs and the ratio it gives says more
+/// about the read plane than about the write. Staging the pair
+/// directly leaves the write on its own, which is what wants watching:
+/// a rel table holds its edges in the order the CSR lays them out, so
+/// an edge that folds pays for every edge already there, and one that
+/// commits without folding does not.
+fn run_insert_edge_txn(dir: &Path, rows: u64, strings: bool) -> Cost {
+    let path = if strings {
+        build_edge_payload(dir, rows)
+    } else {
+        build_edge_props(dir, rows)
+    };
+    let mut session = Session::open(&path).expect("open");
+    let rel = session
+        .catalog()
+        .rel_by_name("follows")
+        .expect("follows")
+        .id;
+    let cells = |i: u64| match strings {
+        true => vec![(0, Cell::Int(i)), (1, Cell::Str(payload(i)))],
+        false => vec![(0, Cell::Int(i))],
+    };
+    // The row a pair leaves is a fresh one every time and the row it
+    // arrives at is scattered, so no two writes share a pair and none
+    // of them is an edge the table already holds.
+    let write = |session: &mut Session, i: u64| {
+        let (src, dst) = (i % rows, (i * 7 + 3) % rows);
+        session
+            .write(|txn| {
+                txn.insert_rel_carrying(rel, src, dst, cells(i));
+                Ok(())
+            })
+            .expect("insert");
+    };
+    write(&mut session, 0);
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        write(&mut session, i + 1);
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    let read = session
+        .run(
+            "MATCH (p:person)-[f:follows]->(q:person) RETURN count(*) AS n",
+            &[],
+        )
+        .expect("read back");
+    assert_eq!(
+        read.rows.first().and_then(|row| row.first()),
+        Some(&Value::Int((rows + WRITES + 1) as i64)),
+        "every edge written is readable"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
 /// A `DELETE` of one element, `WRITES` times over, at the same shape as
 /// the other two.
 ///
@@ -977,6 +1061,18 @@ fn main() {
         sync,
     );
 
+    let txn_small = run_insert_edge_txn(&root.path().join("txn-edge-small"), SMALL, false);
+    txn_small.report(&format!("edge on a txn, {SMALL} edges"), sync);
+
+    let txn_large = run_insert_edge_txn(&root.path().join("txn-edge-large"), LARGE, false);
+    txn_large.report(&format!("edge on a txn, {LARGE} edges"), sync);
+
+    let txn_str = run_insert_edge_txn(&root.path().join("txn-edge-str"), SMALL, true);
+    txn_str.report(
+        &format!("edge on a txn with a payload, {SMALL} edges"),
+        sync,
+    );
+
     let delete = run_delete(&root.path().join("delete"), SMALL);
     delete.report(&format!("DELETE, {SMALL} rows"), sync);
 
@@ -1002,6 +1098,15 @@ fn main() {
     let edge_x = edge_large.cpu / edge_small.cpu.max(0.001);
     println!("insert_edge_x: {edge_x:.2}x in processor time from {SMALL} to {LARGE} edges");
 
+    // The same ratio of the write on its own. The statement one above
+    // carries the MATCH that found the two endpoints, and that search
+    // is linear in the rows of the table, so it is the bigger half of
+    // the number at 100000 and the write is nearly none of it.
+    let write_edge_x = txn_large.cpu / txn_small.cpu.max(0.001);
+    println!(
+        "insert_edge_write_x: {write_edge_x:.2}x in processor time from {SMALL} to {LARGE} edges"
+    );
+
     let mut failed = false;
     let checks = [
         ("set_stmt_us", set_small.us),
@@ -1021,6 +1126,10 @@ fn main() {
         ("insert_edge_str_stmt_us", edge_str.us),
         ("insert_edge_str_stmt_cpu_us", edge_str.cpu),
         ("insert_edge_x", edge_x),
+        ("insert_edge_write_us", txn_small.cpu),
+        ("insert_edge_write_kb", txn_small.written / 1024.0),
+        ("insert_edge_write_str_us", txn_str.cpu),
+        ("insert_edge_write_x", write_edge_x),
         ("delete_stmt_us", delete.us),
         ("detach_stmt_us", detach.us),
         ("set_stmt_kb", set_small.written / 1024.0),

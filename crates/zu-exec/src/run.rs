@@ -2679,7 +2679,11 @@ impl<'a> Worker<'a> {
         if self.pins.contains_key(&key) {
             return Ok(Some(self.pins[&key].clone()));
         }
-        if wanted < self.snap.get().list_threshold(rel, group, dir)? {
+        // No threshold at all is the snapshot refusing the pin rather
+        // than pricing it, which is not the same as a high bar: a scan
+        // wants every list of the group and clears any bar there is.
+        let threshold = self.snap.get().list_threshold(rel, group, dir)?;
+        if !threshold.is_some_and(|bar| wanted >= bar) {
             self.decisions.point_reads += 1;
             return Ok(None);
         }
@@ -3942,6 +3946,9 @@ mod tests {
         /// Answers the threshold with something no caller can reach, so
         /// every list goes the one at a time way a point read does.
         point: bool,
+        /// Refuses the pin outright, the way storage does over a group
+        /// holding an edge no fold has sealed.
+        unpinnable: bool,
         /// Lists served that way, shared with the forks.
         lists: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -3970,6 +3977,7 @@ mod tests {
                 bwd: (Arc::new(bo), Arc::new(bnb)),
                 forkable,
                 point: false,
+                unpinnable: false,
                 lists: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
@@ -3978,6 +3986,12 @@ mod tests {
         /// holds far more edges than the caller asked for.
         fn point(mut self) -> Mock {
             self.point = true;
+            self
+        }
+
+        /// The same graph over a group no pin may serve.
+        fn unpinnable(mut self) -> Mock {
+            self.unpinnable = true;
             self
         }
 
@@ -4052,8 +4066,18 @@ mod tests {
             Ok(CsrPin { offsets, neighbors })
         }
 
-        fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<usize> {
-            Ok(if self.point { usize::MAX } else { 0 })
+        /// No threshold where the group refuses the pin outright,
+        /// otherwise a bar no seed clears and every scan does.
+        fn list_threshold(
+            &mut self,
+            _rel: RelId,
+            _group: GroupId,
+            _dir: Dir,
+        ) -> Result<Option<usize>> {
+            if self.unpinnable {
+                return Ok(None);
+            }
+            Ok(Some(if self.point { usize::MAX - 1 } else { 0 }))
         }
 
         fn list_into(
@@ -4532,13 +4556,48 @@ mod tests {
         );
     }
 
+    /// A group the snapshot refuses is read a list at a time even under
+    /// a scan, which is the one thing the priced threshold above cannot
+    /// say: a scan wants every list of the group and clears any bar.
+    /// Storage refuses when a pin would be wrong rather than expensive,
+    /// which is what an edge no fold has sealed makes it.
+    #[test]
+    fn a_refused_group_is_read_a_list_at_a_time_under_a_scan() {
+        let p = plan(
+            vec![bare_level(), bare_level()],
+            vec![Op::Expand {
+                rel: 0,
+                dirs: Dirs::One(Dir::Fwd),
+                from: 0,
+                to: 1,
+                batch: false,
+                close: None,
+            }],
+            SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 1 }],
+                post: Vec::new(),
+            },
+            &["m"],
+        );
+        // Two mocks rather than one cloned, because a clone shares the
+        // read counter with what it was cloned from.
+        let mut pinned = Mock::new(64, |i| i as i64, false);
+        let mut refused = Mock::new(64, |i| i as i64, false).unpinnable();
+        let a = run(&p, &mut pinned, &seq()).unwrap().0;
+        let b = run(&p, &mut refused, &seq()).unwrap().0;
+        assert_eq!(a.rows.len(), 63, "one forward edge per row but the last");
+        assert_eq!(b.rows, a.rows, "the refused path walked a different graph");
+        assert_eq!(pinned.lists(), 0, "a pinned group serves its own lists");
+        assert_eq!(refused.lists(), 64, "one read per row, the empty included");
+    }
+
     /// A scan comes back around to the same group on every vector it
     /// draws and the pin is held for the whole query, so the vector in
     /// hand says nothing about how many of the group's lists the walk
     /// is going to want. The mock here says every list is better read
-    /// on its own, which is the strongest thing storage can say, and a
-    /// scan is still supposed to pin: the read counter staying at zero
-    /// is the assertion.
+    /// on its own, which is the strongest thing storage can say short
+    /// of refusing, and a scan is still supposed to pin: the read
+    /// counter staying at zero is the assertion.
     #[test]
     fn a_scan_pins_the_group_however_short_its_vectors_are() {
         let p = plan(

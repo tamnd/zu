@@ -269,7 +269,8 @@ impl<'a> Zu1Graph<'a> {
             .ok_or_else(|| ZuError::InvalidArgument(format!("unknown rel table {rel}")))?
             .name
             .clone();
-        let reader = GraphReader::load_table(&mut self.db, &name)?;
+        let mut reader = GraphReader::load_table(&mut self.db, &name)?;
+        reader.set_edges(self.patches.edges.get(&rel).cloned());
         self.readers.insert(rel, reader);
         Ok(())
     }
@@ -283,8 +284,12 @@ impl<'a> Zu1Graph<'a> {
     pub fn set_patches(&mut self, patches: Arc<Patches>) {
         for (table, reader) in &mut self.props {
             if let Some(reader) = reader {
-                reader.set_patch(patches.get(table).cloned());
+                reader.set_patch(patches.cells.get(table).cloned());
+                reader.set_added(patches.rows.get(table).cloned());
             }
+        }
+        for (rel, reader) in &mut self.readers {
+            reader.set_edges(patches.edges.get(rel).cloned());
         }
         self.patches = patches;
     }
@@ -295,7 +300,8 @@ impl<'a> Zu1Graph<'a> {
         }
         let reader = load_props(&mut self.db, table)?.map(|directory| {
             let mut reader = PropsReader::new(directory);
-            reader.set_patch(self.patches.get(&table).cloned());
+            reader.set_patch(self.patches.cells.get(&table).cloned());
+            reader.set_added(self.patches.rows.get(&table).cloned());
             reader
         });
         self.props.insert(table, reader);
@@ -366,7 +372,12 @@ impl<'a> Zu1Graph<'a> {
         let root = self.readers[&rel].directory().props;
         let reader = match root {
             NULL_BLOCK => None,
-            root => Some(PropsReader::new(load_props_at(&mut self.db, root)?)),
+            root => {
+                let mut reader = PropsReader::new(load_props_at(&mut self.db, root)?);
+                reader.set_patch(self.patches.cells.get(&rel).cloned());
+                reader.set_added(self.patches.rows.get(&rel).cloned());
+                Some(reader)
+            }
         };
         self.props.insert(rel, reader);
         Ok(())

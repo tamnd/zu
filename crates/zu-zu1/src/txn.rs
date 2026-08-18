@@ -112,23 +112,35 @@ pub struct Mvcc {
     /// Manifest roots of ingests not yet folded, with their commit
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
-    /// Whether every commit published here is an integer write onto a
-    /// column of a row the base file already holds. That is the one
-    /// shape a reader can be handed without a fold, so a writer asks
-    /// this to decide whether it has to fold at all. It starts true on
-    /// an empty store and one commit of any other shape turns it off
-    /// until the next fold empties the store again.
-    lane_only: bool,
-    /// Those writes, for the last commit only: table, row, column and
-    /// the word. A writer keeps the running set of them, so what it
-    /// wants after a commit is what that commit added, not another
-    /// walk of every chain in the store.
-    lanes: Vec<LaneWrite>,
+    /// Whether everything published here is a shape a reader can be
+    /// handed without a fold sealing it first. Two are: an integer
+    /// write onto a column of a row the base file already holds, and
+    /// an edge added to a rel table, which the adjacency reader merges
+    /// into the lists it holds. It starts true on an empty store and
+    /// one commit of any other shape turns it off until the next fold
+    /// empties the store again.
+    soft: bool,
+    /// Those writes, for the last commit only. A writer keeps the
+    /// running set of them, so what it wants after a commit is what
+    /// that commit added, not another walk of every chain in the
+    /// store.
+    deferred: Vec<Deferred>,
 }
 
 /// One integer write onto an existing row: table, row offset, column
 /// position in the props directory, and the word.
 pub type LaneWrite = (u32, u64, u32, u64);
+
+/// One change a reader can be shown before a fold has sealed it.
+#[derive(Debug, Clone)]
+pub enum Deferred {
+    /// A word written onto a column of a row that is already there.
+    Lane(LaneWrite),
+    /// An edge added to a rel table: the table, the rows it runs
+    /// between, and the cell it holds in each column the table stores,
+    /// by position in the props directory.
+    Edge(u32, u64, u64, Vec<(u32, Cell)>),
+}
 
 impl Default for Mvcc {
     fn default() -> Self {
@@ -137,8 +149,8 @@ impl Default for Mvcc {
             tables: HashMap::new(),
             rels: HashMap::new(),
             ingests: Vec::new(),
-            lane_only: true,
-            lanes: Vec::new(),
+            soft: true,
+            deferred: Vec::new(),
         }
     }
 }
@@ -259,18 +271,17 @@ impl Mvcc {
         self.epoch
     }
 
-    /// Whether everything this store holds is an integer write onto an
-    /// existing row, which is the shape a reader can be shown without a
-    /// fold sealing it first.
-    pub fn lane_only(&self) -> bool {
-        self.lane_only
+    /// Whether everything this store holds is a shape a reader can be
+    /// shown without a fold sealing it first.
+    pub fn soft(&self) -> bool {
+        self.soft
     }
 
-    /// The integer writes the last commit published, in statement
-    /// order. Empty when that commit was of any other shape, and empty
-    /// again once it has been read.
-    pub fn take_lanes(&mut self) -> Vec<LaneWrite> {
-        std::mem::take(&mut self.lanes)
+    /// The changes the last commit published, in statement order.
+    /// Empty when that commit held anything of another shape, and
+    /// empty again once it has been read.
+    pub fn take_deferred(&mut self) -> Vec<Deferred> {
+        std::mem::take(&mut self.deferred)
     }
 
     /// Opens the write transaction. The mutable borrow is the writer
@@ -785,8 +796,8 @@ impl Mvcc {
         }
         self.ingests.push((epoch, root));
         self.epoch = self.epoch.max(epoch);
-        self.lane_only = false;
-        self.lanes.clear();
+        self.soft = false;
+        self.deferred.clear();
     }
 
     /// Manifest roots of ingests committed at or below `epoch`, for
@@ -801,23 +812,35 @@ impl Mvcc {
 
     /// Publishes a committed txn's staged ops at `epoch`.
     fn apply(&mut self, epoch: Epoch, ops: Vec<Op>) {
-        self.lanes.clear();
+        self.deferred.clear();
         for op in ops {
             // What the op is about to put in the store, before the
-            // store has it. Everything but an integer write onto a row
-            // that is already there needs a fold to become readable,
-            // and a store that holds one of those needs a fold whatever
-            // else arrives after it.
+            // store has it. Two shapes can be handed to a reader as
+            // they are, a word onto a row that is already there and an
+            // edge added to a rel table; everything else needs a fold
+            // to become readable, and a store that holds one of those
+            // needs a fold whatever else arrives after it.
             match &op {
                 Op::Update {
                     table,
                     offset,
                     col,
                     value: Cell::Int(word),
-                } if self.lane_only => self.lanes.push((*table, *offset, *col, *word)),
+                } if self.soft => self
+                    .deferred
+                    .push(Deferred::Lane((*table, *offset, *col, *word))),
+                Op::InsertRel {
+                    rel,
+                    src,
+                    dst,
+                    cols,
+                } if self.soft => {
+                    self.deferred
+                        .push(Deferred::Edge(*rel, *src, *dst, cols.clone()))
+                }
                 _ => {
-                    self.lane_only = false;
-                    self.lanes.clear();
+                    self.soft = false;
+                    self.deferred.clear();
                 }
             }
             match op {

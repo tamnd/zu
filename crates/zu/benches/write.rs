@@ -31,7 +31,9 @@
 //! one does not, so those ceilings bound how badly it scales rather
 //! than promising that it does not. They are the numbers to watch when
 //! the read path learns to consult overlays and the fold stops running
-//! once per statement.
+//! once per statement. A ratio carries the noise of both the numbers it
+//! is made of, so the `SET` latency is the median of three passes and
+//! not one pass.
 //!
 //! Both statements are checked rather than only timed: the rows are
 //! counted and read back after the loop, so a write path that got
@@ -58,6 +60,10 @@ const LARGE: u64 = 100_000;
 /// enough to keep the bench in seconds and large enough that one slow
 /// sync does not decide the number.
 const WRITES: u64 = 200;
+/// Passes of the `SET` loop, of which the middle one is reported. Three
+/// because that is what it takes for one bad pass to be outvoted, and
+/// odd so the middle is a pass that happened rather than a mean of two.
+const PASSES: usize = 3;
 const MB: f64 = 1024.0 * 1024.0;
 
 fn budget(key: &str) -> Option<f64> {
@@ -349,17 +355,41 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
 
     let before = usage();
     let disk_before = disk(dir);
-    let start = Instant::now();
-    for i in 0..WRITES {
-        let age = i % rows;
-        conn.query(&format!(
-            "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
-        ))
-        .expect("set");
+    // The median of `PASSES` passes rather than one pass, because this
+    // is the only latency here that another number is made out of.
+    // `set_fold_x` divides the large table's by the small table's, so a
+    // pass that met a busy machine moves it twice as far as it moves a
+    // latency, and with one pass of 200 writes at each size to decide
+    // it, the gate flapped on and off across CI runs that had no write
+    // path change between them: 6.18 against a ceiling of 6, then 4.18,
+    // then 4.49, then 6.06. The passes share the table and the
+    // connection, so this costs the writes and nothing else.
+    let mut passes = Vec::with_capacity(PASSES);
+    // The byte columns are read after the first pass and not after the
+    // last, so that they stay what they were: what 200 writes cost a
+    // store that has just been built. The store expands once and the
+    // passes after that write into what the first one left, so counting
+    // all three would divide one expansion by three times the writes
+    // and read as a third of the growth on the same code.
+    let mut first = None;
+    for pass in 0..PASSES {
+        let start = Instant::now();
+        for i in 0..WRITES {
+            let age = (pass as u64 * WRITES + i) % rows;
+            conn.query(&format!(
+                "MATCH (p:person) WHERE p.age = {age} SET p.age = {age}"
+            ))
+            .expect("set");
+        }
+        passes.push(start.elapsed());
+        if first.is_none() {
+            first = Some((usage(), disk(dir)));
+        }
     }
-    let elapsed = start.elapsed();
-    let after = usage();
-    let growth = disk(dir).saturating_sub(disk_before);
+    passes.sort_unstable();
+    let elapsed = passes[PASSES / 2];
+    let (after, disk_after) = first.expect("a pass ran");
+    let growth = disk_after.saturating_sub(disk_before);
 
     assert_eq!(
         one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),

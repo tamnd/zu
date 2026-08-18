@@ -219,10 +219,16 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             expr,
             bracket,
         },
-        LogicalPlan::Unwind { input, expr, slot } => LogicalPlan::Unwind {
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            slot,
+            ordinal,
+        } => LogicalPlan::Unwind {
             input: Box::new(lift_close_filters(*input)),
             expr,
             slot,
+            ordinal,
         },
         LogicalPlan::Insert { input, nodes, rels } => LogicalPlan::Insert {
             input: Box::new(lift_close_filters(*input)),
@@ -756,7 +762,12 @@ fn mark_asp_node(
                 est,
             )
         }
-        LogicalPlan::Unwind { input, expr, slot } => {
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            slot,
+            ordinal,
+        } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // Nothing bounds how wide a list is.
             ceil.bnd = None;
@@ -765,6 +776,7 @@ fn mark_asp_node(
                     input: Box::new(input),
                     expr,
                     slot,
+                    ordinal,
                 },
                 est * 10.0,
             )
@@ -927,10 +939,16 @@ fn rewrite(
             wcoj,
             bracket,
         }),
-        LogicalPlan::Unwind { input, expr, slot } => Ok(LogicalPlan::Unwind {
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            slot,
+            ordinal,
+        } => Ok(LogicalPlan::Unwind {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
             slot,
+            ordinal,
         }),
         LogicalPlan::Insert { input, nodes, rels } => Ok(LogicalPlan::Insert {
             input: Box::new(rewrite(*input, query, schema, notes)?),
@@ -1634,8 +1652,16 @@ fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
             out.insert(*to);
             bound_slots(input, out);
         }
-        LogicalPlan::Unwind { input, slot, .. } => {
+        LogicalPlan::Unwind {
+            input,
+            slot,
+            ordinal,
+            ..
+        } => {
             out.insert(*slot);
+            if let Some(ordinal) = ordinal {
+                out.insert(ordinal.slot);
+            }
             bound_slots(input, out);
         }
         LogicalPlan::Insert { input, nodes, rels } => {
@@ -3114,6 +3140,33 @@ mod tests {
                 "ScanNodes a: Person",
             ],
             "got:\n{text}"
+        );
+    }
+
+    /// A FOR is one operator whether it counts or not, and the counter
+    /// is a column of the same operator rather than a stage after it,
+    /// which is what the plan says by naming it on the Unwind line.
+    #[test]
+    fn a_counter_is_part_of_the_for_and_not_a_stage_after_it() {
+        let plain = optimized("FOR x IN [1, 2] RETURN x AS v");
+        assert_eq!(
+            lines(&plain),
+            ["Project x AS v", "Unwind [1, 2] AS x"],
+            "got:\n{plain}"
+        );
+        let counted = optimized("FOR x IN [1, 2] WITH ORDINALITY i RETURN x AS v, i AS n");
+        assert_eq!(
+            lines(&counted),
+            [
+                "Project x AS v, i AS n",
+                "Unwind [1, 2] AS x WITH ORDINALITY i",
+            ],
+            "got:\n{counted}"
+        );
+        let offset = optimized("FOR x IN [1, 2] WITH OFFSET i RETURN x AS v, i AS n");
+        assert!(
+            offset.contains("WITH OFFSET i"),
+            "the two words are told apart in the plan, got:\n{offset}"
         );
     }
 }

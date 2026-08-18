@@ -15,7 +15,7 @@ use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 use crate::ast::{
     BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, ElementDefKind,
     ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr,
-    LetItem, Linear, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection,
+    LetItem, Linear, Literal, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, Projection,
     ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Selector,
     SetInto, SetItem, SetOp, Simple, SortKey, Statement, TxnStmt, UnaryOp,
 };
@@ -82,7 +82,7 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// told the parser expected MATCH has been sent looking for a typo
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
-const UNIMPLEMENTED: &[&str] = &["CREATE", "MERGE", "SESSION", "FINISH", "FOR"];
+const UNIMPLEMENTED: &[&str] = &["CREATE", "MERGE", "SESSION", "FINISH"];
 
 /// How a simple query statement ended, which is what the parser needs
 /// to say when something follows that may not.
@@ -884,6 +884,27 @@ impl Parser<'_> {
         })
     }
 
+    /// The counter a `FOR` may number its rows with, if the words for
+    /// one are there: `WITH ORDINALITY i` or `WITH OFFSET i`.
+    ///
+    /// The `WITH` is read two tokens at a time rather than one, because
+    /// `WITH` is also a clause and `FOR x IN xs WITH x AS y` is a
+    /// projection of the value the `FOR` just bound. Only the word
+    /// after it says which of the two was written, so nothing is
+    /// consumed until that word has been read.
+    fn parse_ordinal(&mut self) -> Result<Option<Ordinal>> {
+        let start = if self.at_kw("WITH") && self.kw_at(1, "ORDINALITY") {
+            1
+        } else if self.at_kw("WITH") && self.kw_at(1, "OFFSET") {
+            0
+        } else {
+            return Ok(None);
+        };
+        self.pos += 2;
+        let name = self.expect_name("a variable name for the counter")?;
+        Ok(Some(Ordinal { name, start }))
+    }
+
     /// One definition of a `LET`: a name, an equals sign and the value
     /// the name stands for.
     ///
@@ -1077,10 +1098,28 @@ impl Parser<'_> {
                 }
                 clauses.push(Clause::Call { name, args, yields });
             } else if self.eat_kw("UNWIND") {
+                // The Cypher spelling, which names the value after the
+                // list rather than before it and carries no counter,
+                // since WITH ORDINALITY is the standard's word and this
+                // form is the one the standard does not have.
                 let expr = self.parse_expr()?;
                 self.expect_kw("AS")?;
                 let alias = self.expect_name("an alias after AS")?;
-                clauses.push(Clause::Unwind { expr, alias });
+                clauses.push(Clause::Unwind {
+                    expr,
+                    alias,
+                    ordinal: None,
+                });
+            } else if self.eat_kw("FOR") {
+                let alias = self.expect_name("a variable name after FOR")?;
+                self.expect_kw("IN")?;
+                let expr = self.parse_expr()?;
+                let ordinal = self.parse_ordinal()?;
+                clauses.push(Clause::Unwind {
+                    expr,
+                    alias,
+                    ordinal,
+                });
             } else if self.eat_kw("FILTER") {
                 // The WHERE is the standard's own optional word and
                 // says nothing the FILTER has not already said.
@@ -2786,7 +2825,7 @@ mod tests {
         for (source, kw) in [
             ("SESSION SET VALUE $x = 1", "SESSION"),
             ("MATCH (p) FINISH", "FINISH"),
-            ("FOR x IN [1, 2] RETURN x", "FOR"),
+            ("MERGE (p:Person) RETURN p", "MERGE"),
         ] {
             let err = parse_err(source);
             assert!(
@@ -3172,7 +3211,7 @@ mod tests {
     #[test]
     fn unwind_and_lists() {
         let q = parsed("UNWIND [1, 2, 3] AS x RETURN x * -1");
-        let Clause::Unwind { expr, alias } = &q.clauses()[0] else {
+        let Clause::Unwind { expr, alias, .. } = &q.clauses()[0] else {
             panic!("UNWIND");
         };
         assert_eq!(alias, "x");
@@ -3527,6 +3566,52 @@ mod tests {
         assert!(
             err.contains("changing a property of an element is SET"),
             "{err}"
+        );
+    }
+
+    /// A FOR names the value in front of the list and may number the
+    /// rows it makes, from one with ORDINALITY and from zero with
+    /// OFFSET.
+    #[test]
+    fn for_names_its_value_and_may_count() {
+        let q = parsed("FOR x IN [1, 2] RETURN x");
+        let Clause::Unwind {
+            alias,
+            ordinal: None,
+            ..
+        } = &q.clauses()[0]
+        else {
+            panic!("a FOR with no counter");
+        };
+        assert_eq!(alias, "x");
+        for (source, start) in [("WITH ORDINALITY i", 1), ("WITH OFFSET i", 0)] {
+            let q = parsed(&format!("FOR x IN [1, 2] {source} RETURN x"));
+            let Clause::Unwind {
+                ordinal: Some(ordinal),
+                ..
+            } = &q.clauses()[0]
+            else {
+                panic!("a FOR with a counter: {source}");
+            };
+            assert_eq!(ordinal.name, "i");
+            assert_eq!(ordinal.start, start, "{source}");
+        }
+    }
+
+    /// WITH is a clause as well as the first word of a counter, and only
+    /// the word after it says which was written, so a projection after a
+    /// FOR is read as one.
+    #[test]
+    fn a_with_after_for_is_read_by_the_word_after_it() {
+        let q = parsed("FOR x IN [1, 2] WITH x AS y RETURN y");
+        let clauses = q.clauses();
+        assert!(
+            matches!(clauses[0], Clause::Unwind { ordinal: None, .. }),
+            "the FOR takes no counter"
+        );
+        assert!(
+            matches!(clauses[1], Clause::With { .. }),
+            "the WITH is the projection it looks like"
         );
     }
 

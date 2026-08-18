@@ -797,6 +797,17 @@ pub enum MatchKind {
     },
 }
 
+/// The counter a `FOR ... WITH ORDINALITY` or `WITH OFFSET` binds:
+/// the slot the number lands in and what the first element of a list
+/// is numbered, one for ordinality and zero for offset. The two words
+/// differ in nothing else, so they are one shape here and the start is
+/// the whole of the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ordinal {
+    pub slot: usize,
+    pub start: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundClause {
     Match {
@@ -854,6 +865,7 @@ pub enum BoundClause {
     Unwind {
         expr: BoundExpr,
         slot: usize,
+        ordinal: Option<Ordinal>,
     },
     /// A table function call, always the first clause: the kernel runs
     /// once over `rel` and yields one row per node of its domain.
@@ -1759,7 +1771,11 @@ impl Binder<'_> {
                     detach: *detach,
                 })
             }
-            Clause::Unwind { expr, alias } => {
+            Clause::Unwind {
+                expr,
+                alias,
+                ordinal,
+            } => {
                 let mut ctx = ExprCtx::new(false);
                 let (bound, ty) = self.bind_expr(expr, &mut ctx)?;
                 let element = match ty {
@@ -1773,7 +1789,23 @@ impl Binder<'_> {
                     }
                 };
                 let slot = self.declare(alias, element)?;
-                Ok(BoundClause::Unwind { expr: bound, slot })
+                // The counter is declared after the value, so a FOR
+                // that names the same thing twice is refused by the
+                // rule that refuses any redefinition rather than by a
+                // rule of its own, and it is an integer because it
+                // counts.
+                let ordinal = match ordinal {
+                    Some(ast::Ordinal { name, start }) => Some(Ordinal {
+                        slot: self.declare(name, Type::Int)?,
+                        start: *start,
+                    }),
+                    None => None,
+                };
+                Ok(BoundClause::Unwind {
+                    expr: bound,
+                    slot,
+                    ordinal,
+                })
             }
             Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
             // A FILTER is the WHERE of a MATCH with no pattern under

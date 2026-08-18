@@ -1341,6 +1341,19 @@ impl Parser<'_> {
         while self.eat(&TokenKind::Comma) {
             items.push(self.parse_projection_item()?);
         }
+        // GROUP BY stands after the items and in front of the order,
+        // which is where ISO 16.15 puts it: the items say what a row
+        // of the group is and this says what a group is.
+        let mut group_by = Vec::new();
+        if self.eat_kw("GROUP") {
+            self.expect_kw("BY")?;
+            loop {
+                group_by.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
         let mut order_by = Vec::new();
         if self.eat_kw("ORDER") {
             self.expect_kw("BY")?;
@@ -1405,6 +1418,7 @@ impl Parser<'_> {
             distinct,
             star,
             items,
+            group_by,
             order_by,
             skip,
             limit,

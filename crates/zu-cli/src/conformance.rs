@@ -184,6 +184,9 @@ const NOTES: &[&str] = &[
      WITH, and the definitions read left to right so a later one may use a name an earlier one \
      in the same statement gave; the name is a variable, so LET of a property is refused with \
      the statement that does change a property named",
+    "a page of a result is written OFFSET and LIMIT, and SKIP is the synonym the standard \
+     names for OFFSET, so the two words are one clause and writing both of them is refused \
+     rather than skipping twice",
     "a FOR makes a row of every element of a list, which is the same statement UNWIND is and \
      the spelling the standard gives it, and WITH ORDINALITY or WITH OFFSET numbers those rows, \
      from one and from zero; the number counts the elements of the list rather than the rows \

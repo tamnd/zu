@@ -155,7 +155,13 @@ where_clause    = "WHERE" , expression ;
 
 projection      = [ "DISTINCT" ] , ( "*" | projection_item ) ,
                   { "," , projection_item } ,
-                  [ order_by ] , [ "SKIP" , expression ] , [ "LIMIT" , expression ] ;
+                  [ order_by ] , [ page ] ;
+
+(* GQ12 and GQ13, ISO 14.9. OFFSET is the standard's word and SKIP is
+   the synonym it names for it, so the two are one clause and only one
+   of them may be written. *)
+page            = [ ( "OFFSET" | "SKIP" ) , expression ] ,
+                  [ "LIMIT" , expression ] ;
 projection_item = expression , [ "AS" , name ] ;
 order_by        = "ORDER" , "BY" , sort_item , { "," , sort_item } ;
 sort_item       = expression , [ "ASC" | "ASCENDING" | "DESC" | "DESCENDING" ] ,

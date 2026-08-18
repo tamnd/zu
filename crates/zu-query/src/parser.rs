@@ -1377,8 +1377,22 @@ impl Parser<'_> {
                 }
             }
         }
-        let skip = if self.eat_kw("SKIP") {
-            Some(self.parse_expr()?)
+        // OFFSET is the standard's word and SKIP is the synonym ISO
+        // 14.9 gives it, so the two are one clause and writing both is
+        // writing it twice.
+        let skip = if self.eat_kw("OFFSET") || self.eat_kw("SKIP") {
+            let expr = self.parse_expr()?;
+            if self.at_kw("OFFSET") || self.at_kw("SKIP") {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    self.peek().expect("peeked").start,
+                    format_args!(
+                        "OFFSET and SKIP are two spellings of one clause, so a result skips what one of them says and not what both do"
+                    ),
+                ));
+            }
+            Some(expr)
         } else {
             None
         };
@@ -3613,6 +3627,27 @@ mod tests {
             matches!(clauses[1], Clause::With { .. }),
             "the WITH is the projection it looks like"
         );
+    }
+
+    /// OFFSET is the standard's word for the clause Cypher spells SKIP,
+    /// so the two parse to one field and writing both is writing the
+    /// clause twice.
+    #[test]
+    fn offset_is_the_standard_spelling_of_skip() {
+        for word in ["OFFSET", "SKIP"] {
+            let q = parsed(&format!(
+                "MATCH (a) RETURN a.x AS x ORDER BY x {word} 2 LIMIT 3"
+            ));
+            let projection = q.result().expect("RETURN");
+            assert_eq!(
+                projection.skip,
+                Some(Expr::Literal(Literal::Int(2))),
+                "{word} is the page's first clause"
+            );
+            assert_eq!(projection.limit, Some(Expr::Literal(Literal::Int(3))));
+        }
+        let err = parse_err("MATCH (a) RETURN a.x AS x ORDER BY x OFFSET 1 SKIP 1");
+        assert!(err.contains("two spellings of one clause"), "{err}");
     }
 
     /// The conjunctions are all at one level and read left to right, so

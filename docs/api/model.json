@@ -6270,6 +6270,13 @@
       "doc": "Reads a segment back, verifying the payload crc, and appends every\nvalue to `bytes_out` and `ends_out` as [`decode_payload`] does."
     },
     {
+      "id": "zu::zu1::fullzip::rewrite_blob_reordered",
+      "kind": "function",
+      "name": "rewrite_blob_reordered",
+      "signature": "fn rewrite_blob_reordered(db: &mut zu_zu1::file::Zu1File, old: &zu_zu1::segment::SegmentMeta, values: &[&[u8]]) -> zu_common::Result<zu_zu1::segment::SegmentMeta>",
+      "doc": "The same, for a column that is already on disk in some other order:\nthe values are all of them again, but the table they were encoded\nwith is still good, so it comes off the old segment instead of being\ntrained a second time on the same strings.\n\nThis is the shape an edge write leaves. A rel table holds its edges\nsorted by the row they leave, so an edge added in the middle moves\nevery edge behind it, and the fold hands the whole column back in the\nnew order. Nothing about the strings changed, only where they sit, so\ntraining on them again is work with a known answer: reading the table\nback and encoding with it writes a column of the same size for the\ncost of the encode, and on the LinkBench shape that is 20 ms of an\nadd-link statement gone.\n\nA column that really is different from the one on disk is caught the\nway it always was, per chunk: a chunk that encodes well off the\ntable's own ratio buys a table of its own. If the old segment holds\nnothing to read a table out of, this trains one."
+    },
+    {
       "id": "zu::zu1::fullzip::rewrite_blob_segment",
       "kind": "function",
       "name": "rewrite_blob_segment",

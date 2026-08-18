@@ -4666,7 +4666,7 @@ mod tests {
     /// A composite meets two result tables. A statement that writes
     /// has no result table to offer, and letting one stand in an
     /// operand would make how many times it ran depend on which side
-    /// the planner chose to build over.
+    /// the optimizer chose to build over.
     #[test]
     fn a_write_may_not_stand_in_an_operand() {
         let e = bind_err(

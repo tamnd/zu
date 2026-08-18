@@ -86,6 +86,23 @@ const TRAIN_RUNS: usize = 16;
 /// table of its own would, so a chunk that lands well off the column's
 /// own ratio buys a table rather than shipping uncompressed.
 fn column_table(values: &[&[u8]]) -> (fsst::Table, u64, u64) {
+    let sample = column_sample(values);
+    let table = fsst::Table::train(&sample);
+    let (packed, raw) = fit(&table, &sample);
+    (table, packed, raw)
+}
+
+/// What a table is worth on a sample of the column: the code stream
+/// without the table, and the bytes it stands for. This is the yardstick
+/// [`ChunkEncoder::push`] measures a chunk against.
+fn fit(table: &fsst::Table, sample: &[u8]) -> (u64, u64) {
+    let mut probe = Vec::new();
+    let packed = table.encode(sample, &mut probe) - table.header_len();
+    (packed as u64, sample.len().max(1) as u64)
+}
+
+/// The sample a column's table is trained on and measured against.
+fn column_sample(values: &[&[u8]]) -> Vec<u8> {
     let total: usize = values.iter().map(|v| v.len() + 4).sum();
     let mut sample = Vec::with_capacity(total.min(TRAIN_SAMPLE + BLOCK_SIZE as usize));
     let mut push = |v: &[u8]| {
@@ -110,18 +127,28 @@ fn column_table(values: &[&[u8]]) -> (fsst::Table, u64, u64) {
             }
         }
     }
-    let table = fsst::Table::train(&sample);
-    let mut probe = Vec::new();
-    let packed = table.encode(&sample, &mut probe) - table.header_len();
-    (table, packed as u64, sample.len().max(1) as u64)
+    sample
 }
 
 /// Encodes `values` into the FullZip payload, appending to `out`, and
 /// returns the total value bytes. Public so the fuzz seeds can build a
 /// payload without a file around it.
 pub fn encode_payload(values: &[&[u8]], out: &mut Vec<u8>) -> Result<u64> {
+    encode_payload_with(values, None, out)
+}
+
+/// The same, with the option of a table the caller already has, which is
+/// what a rewrite of a column that is already on disk hands in.
+fn encode_payload_with(
+    values: &[&[u8]],
+    table: Option<(fsst::Table, u64, u64)>,
+    out: &mut Vec<u8>,
+) -> Result<u64> {
     let chunk_count = values.len().div_ceil(CHUNK_ROWS);
-    let mut enc = ChunkEncoder::train(values);
+    let mut enc = match table {
+        Some((table, packed, raw)) => ChunkEncoder::reusing(table, values, (packed, raw)),
+        None => ChunkEncoder::train(values),
+    };
     let mut body = Vec::new();
     let mut comp_ends = Vec::with_capacity(chunk_count);
     let mut raw_ends = Vec::with_capacity(chunk_count);
@@ -153,6 +180,34 @@ struct ChunkEncoder {
 impl ChunkEncoder {
     fn train(values: &[&[u8]]) -> Self {
         let (table, fit_packed, fit_raw) = column_table(values);
+        Self::new(table, fit_packed, fit_raw)
+    }
+
+    /// The same encoder around a table the caller brought, measured
+    /// against this column so the per chunk guard still works. Training
+    /// is 95% of what writing a string column costs, so a rewrite that
+    /// keeps the table the column already had writes for the price of
+    /// encoding.
+    ///
+    /// The table is kept only if it still earns what it used to: `was`
+    /// is what the column on disk encoded to over the bytes it stood
+    /// for, and a table that now costs a quarter more than that is a
+    /// table for a column this no longer is, so it trains. The per chunk
+    /// guard cannot make this call, because it measures a chunk against
+    /// the column and a stale table makes both look the same.
+    fn reusing(table: fsst::Table, values: &[&[u8]], was: (u64, u64)) -> Self {
+        let sample = column_sample(values);
+        let (fit_packed, fit_raw) = fit(&table, &sample);
+        let (old_packed, old_raw) = was;
+        if fit_packed * old_raw * 4 <= old_packed * fit_raw * 5 {
+            return Self::new(table, fit_packed, fit_raw);
+        }
+        let trained = fsst::Table::train(&sample);
+        let (fit_packed, fit_raw) = fit(&trained, &sample);
+        Self::new(trained, fit_packed, fit_raw)
+    }
+
+    fn new(table: fsst::Table, fit_packed: u64, fit_raw: u64) -> Self {
         Self {
             table,
             fit_packed,
@@ -260,6 +315,59 @@ pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentM
     let mut payload = Vec::new();
     let value_bytes = encode_payload(values, &mut payload)?;
     store(db, &payload, values.len() as u64, value_bytes)
+}
+
+/// The same, for a column that is already on disk in some other order:
+/// the values are all of them again, but the table they were encoded
+/// with is still good, so it comes off the old segment instead of being
+/// trained a second time on the same strings.
+///
+/// This is the shape an edge write leaves. A rel table holds its edges
+/// sorted by the row they leave, so an edge added in the middle moves
+/// every edge behind it, and the fold hands the whole column back in the
+/// new order. Nothing about the strings changed, only where they sit, so
+/// training on them again is work with a known answer: reading the table
+/// back and encoding with it writes a column of the same size for the
+/// cost of the encode, and on the LinkBench shape that is 20 ms of an
+/// add-link statement gone.
+///
+/// A column that really is different from the one on disk is caught the
+/// way it always was, per chunk: a chunk that encodes well off the
+/// table's own ratio buys a table of its own. If the old segment holds
+/// nothing to read a table out of, this trains one.
+pub fn rewrite_blob_reordered(
+    db: &mut Zu1File,
+    old: &SegmentMeta,
+    values: &[&[u8]],
+) -> Result<SegmentMeta> {
+    let table = table_of(db, old).map(|t| (t, old.payload_len, old.uncompressed_bytes.max(1)));
+    let mut payload = Vec::new();
+    let value_bytes = encode_payload_with(values, table, &mut payload)?;
+    store(db, &payload, values.len() as u64, value_bytes)
+}
+
+/// The symbol table of the old segment's first FSST chunk, or None when
+/// the segment holds no chunk encoded with one. A payload that will not
+/// parse is not an error here: the caller trains instead, and every
+/// reader of it still fails on it the way it did before.
+fn table_of(db: &mut Zu1File, old: &SegmentMeta) -> Option<fsst::Table> {
+    let payload = read_payload(db, old).ok()?;
+    let chunks = old.chunk_count();
+    let index = payload.get(4..4 + chunks * 16)?;
+    let body = payload.get(4 + chunks * 16..)?;
+    let mut start = 0usize;
+    for i in 0..chunks {
+        let end = u64::from_le_bytes(index[i * 8..i * 8 + 8].try_into().ok()?) as usize;
+        let chunk = body.get(start..end)?;
+        start = end;
+        match chunk.first() {
+            Some(&id) if id == EncodingId::Fsst as u8 => {
+                return fsst::Table::read(&chunk[1..]).ok();
+            }
+            _ => continue,
+        }
+    }
+    None
 }
 
 /// Writes the segment a fold leaves behind when it changed `updates`
@@ -926,6 +1034,56 @@ mod tests {
             assert_eq!(got.uncompressed_bytes, fresh.uncompressed_bytes, "{case}");
             assert_eq!(all(&mut db, &got), want, "{case}");
         }
+    }
+
+    /// A column handed back in a different order reads back in that
+    /// order, and reusing the table it already had costs it nothing on
+    /// disk: it is the same strings, so the table that fit them still
+    /// fits them.
+    #[test]
+    fn a_reordered_rewrite_keeps_the_values_and_the_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("fz.zu1")).unwrap();
+        let base = urls(4500);
+        let meta = write_blob_segment(&mut db, &refs(&base)).unwrap();
+        // An edge write moves everything behind where it landed, so the
+        // new order is the old one with a value pushed into the middle.
+        let mut want = base.clone();
+        want.insert(2000, b"https://example.com/user/added/1".to_vec());
+        let got = rewrite_blob_reordered(&mut db, &meta, &refs(&want)).unwrap();
+        assert_eq!(all(&mut db, &got), want);
+        let fresh = write_blob_segment(&mut db, &refs(&want)).unwrap();
+        assert_eq!(got.value_count, fresh.value_count);
+        assert_eq!(got.uncompressed_bytes, fresh.uncompressed_bytes);
+        assert!(
+            got.payload_len <= fresh.payload_len * 21 / 20,
+            "reused table wrote {} against {} trained",
+            got.payload_len,
+            fresh.payload_len
+        );
+    }
+
+    /// A column that turned into a different column is not one the old
+    /// table fits, and the per chunk guard is what catches that: every
+    /// chunk buys a table of its own and the result is still near what
+    /// training the column would have written.
+    #[test]
+    fn a_reordered_rewrite_of_other_strings_still_compresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("fz.zu1")).unwrap();
+        let meta = write_blob_segment(&mut db, &refs(&urls(4500))).unwrap();
+        let other: Vec<Vec<u8>> = (0..4500)
+            .map(|i| format!("PREFIX-{i:06}-SUFFIX-{}", i % 7).into_bytes())
+            .collect();
+        let got = rewrite_blob_reordered(&mut db, &meta, &refs(&other)).unwrap();
+        assert_eq!(all(&mut db, &got), other);
+        let fresh = write_blob_segment(&mut db, &refs(&other)).unwrap();
+        assert!(
+            got.payload_len <= fresh.payload_len * 6 / 5,
+            "reused table wrote {} against {} trained",
+            got.payload_len,
+            fresh.payload_len
+        );
     }
 
     /// The point of the rewrite: a chunk no write named keeps the bytes

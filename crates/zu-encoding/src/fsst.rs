@@ -128,6 +128,10 @@ impl Candidate {
         }
     }
 
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
     fn to_vec(self) -> Vec<u8> {
         self.bytes[..self.len as usize].to_vec()
     }
@@ -207,14 +211,26 @@ fn train(sample: &[u8]) -> Vec<Vec<u8>> {
             prev = Some((pos, len));
             pos += len;
         }
-        let mut candidates: Vec<(Vec<u8>, u64)> =
-            gain.into_iter().map(|(c, g)| (c.to_vec(), g)).collect();
-        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        table = candidates
-            .into_iter()
-            .take(MAX_SYMBOLS)
-            .map(|(s, _)| s)
-            .collect();
+        // The survivors, without a heap allocation per candidate and
+        // without ordering the ones that lose. A round on text that
+        // compresses badly proposes a candidate per position, tens of
+        // thousands of them, and all but 255 are about to be thrown
+        // away: sorting them cost more than parsing the sample did, and
+        // holding each as a `Vec` cost an allocation and a pointer chase
+        // per comparison. The key is already eight bytes and a length,
+        // so the order is the same and only the top of it is sorted.
+        let mut candidates: Vec<(Candidate, u64)> = gain.into_iter().collect();
+        let better = |a: &(Candidate, u64), b: &(Candidate, u64)| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.as_slice().cmp(b.0.as_slice()))
+        };
+        let keep = candidates.len().min(MAX_SYMBOLS);
+        if candidates.len() > keep {
+            candidates.select_nth_unstable_by(keep - 1, better);
+            candidates.truncate(keep);
+        }
+        candidates.sort_unstable_by(better);
+        table = candidates.into_iter().map(|(c, _)| c.to_vec()).collect();
     }
     table
 }
@@ -238,6 +254,48 @@ impl Table {
         Table {
             index: Index::new(train(&sample(bytes))),
         }
+    }
+
+    /// Reads back the table a buffer was encoded with.
+    ///
+    /// Training is the whole cost of writing a string column, and a
+    /// writer that rewrites a column it already wrote is training on
+    /// data it already trained on. The table is in the buffer already,
+    /// so a rewrite can encode with that one instead and pay nothing;
+    /// the codes it produces are as good as the codes on disk were,
+    /// which is what a rewrite of the same column wants. A column that
+    /// drifts away from its table is caught where it always was, by the
+    /// writer measuring a chunk against the table and buying it one of
+    /// its own.
+    pub fn read(bytes: &[u8]) -> Result<Table> {
+        let corrupt = |detail: &str| ZuError::Corrupt {
+            what: "fsst",
+            detail: detail.to_string(),
+        };
+        let header = bytes.get(..5).ok_or_else(|| corrupt("truncated header"))?;
+        let count = header[4] as usize;
+        let lens = bytes
+            .get(5..5 + count)
+            .ok_or_else(|| corrupt("truncated symbol lengths"))?;
+        if lens.iter().any(|&l| l == 0 || l as usize > MAX_SYMBOL_LEN) {
+            return Err(corrupt("symbol length outside 1..=8"));
+        }
+        let total: usize = lens.iter().map(|&l| l as usize).sum();
+        let syms = bytes
+            .get(5 + count..5 + count + total)
+            .ok_or_else(|| corrupt("truncated symbol bytes"))?;
+        let mut at = 0usize;
+        let table = lens
+            .iter()
+            .map(|&l| {
+                let sym = syms[at..at + l as usize].to_vec();
+                at += l as usize;
+                sym
+            })
+            .collect();
+        Ok(Table {
+            index: Index::new(table),
+        })
     }
 
     /// The symbols, in code order.
@@ -399,6 +457,38 @@ mod tests {
             );
         }
         text
+    }
+
+    #[test]
+    fn table_read_back_encodes_the_same_bytes() {
+        let text = text_corpus();
+        let mut first = Vec::new();
+        let len = Table::train(&text).encode(&text, &mut first);
+        assert_eq!(len, first.len());
+        // The table off the buffer has to be the table that wrote it,
+        // byte for byte, or a rewrite would change what a column costs.
+        let table = Table::read(&first).expect("table");
+        let mut again = Vec::new();
+        table.encode(&text, &mut again);
+        assert_eq!(first, again);
+        let mut out = Vec::new();
+        decode(&again, text.len(), &mut out).expect("decode");
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn table_read_rejects_rubbish() {
+        assert!(Table::read(&[1, 2, 3]).is_err());
+        // A count that claims more symbols than the buffer holds.
+        let mut buf = 4u32.to_le_bytes().to_vec();
+        buf.push(9);
+        buf.extend_from_slice(&[1, 1]);
+        assert!(Table::read(&buf).is_err());
+        // A zero length symbol is not one this encoder ever writes.
+        let mut buf = 4u32.to_le_bytes().to_vec();
+        buf.push(1);
+        buf.extend_from_slice(&[0, b'a']);
+        assert!(Table::read(&buf).is_err());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! table definitions become labels and relationship types.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
@@ -12,6 +13,7 @@ use zu_query::exec::{self, DeletedRows, Graph};
 use zu_query::{optimizer, parser, plan};
 
 use crate::deleted::Deleted;
+use crate::write::Patches;
 use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::{NULL_BLOCK, Zu1File};
@@ -194,6 +196,10 @@ pub struct Zu1Graph<'a> {
     /// asks and kept for the epoch. `None` is "not read yet", so a
     /// graph that is only ever written through never pays the read.
     gone: Option<Deleted>,
+    /// The cells committed since the last fold, by table. A props
+    /// reader reads through these, which is what lets a write be
+    /// visible without the column it wrote into being rewritten.
+    patches: Arc<Patches>,
 }
 
 impl<'a> Zu1Graph<'a> {
@@ -204,6 +210,7 @@ impl<'a> Zu1Graph<'a> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: None,
+            patches: Arc::new(Patches::new()),
         }
     }
 
@@ -219,6 +226,7 @@ impl<'a> Zu1Graph<'a> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: None,
+            patches: Arc::new(Patches::new()),
         }
     }
 
@@ -245,6 +253,10 @@ impl<'a> Zu1Graph<'a> {
         // the deleted set belongs to the epoch as much as the
         // directories do.
         self.gone = None;
+        // Only a fold moves the epoch, and a fold is what seals the
+        // cells the patch was carrying, so they are in the columns the
+        // next reader loads.
+        self.patches = Arc::new(Patches::new());
     }
 
     fn ensure_reader(&mut self, rel: u32) -> Result<()> {
@@ -262,11 +274,30 @@ impl<'a> Zu1Graph<'a> {
         Ok(())
     }
 
+    /// Hands the readers the cells a commit has left in the overlay,
+    /// which the session does after every write that did not fold.
+    ///
+    /// The readers stay: the columns they describe have not moved, and
+    /// that is the point of not folding. What changes is what they read
+    /// on top of them.
+    pub fn set_patches(&mut self, patches: Arc<Patches>) {
+        for (table, reader) in &mut self.props {
+            if let Some(reader) = reader {
+                reader.set_patch(patches.get(table).cloned());
+            }
+        }
+        self.patches = patches;
+    }
+
     fn ensure_props(&mut self, table: u32) -> Result<()> {
         if self.props.contains_key(&table) {
             return Ok(());
         }
-        let reader = load_props(&mut self.db, table)?.map(PropsReader::new);
+        let reader = load_props(&mut self.db, table)?.map(|directory| {
+            let mut reader = PropsReader::new(directory);
+            reader.set_patch(self.patches.get(&table).cloned());
+            reader
+        });
         self.props.insert(table, reader);
         Ok(())
     }
@@ -658,6 +689,7 @@ impl Graph for Zu1Graph<'_> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: self.gone.clone(),
+            patches: Arc::clone(&self.patches),
         }))
     }
 

@@ -12,14 +12,21 @@
 //! one open file, recovers whatever the log holds above the file's last
 //! checkpoint, and turns a staged transaction into a committed epoch.
 //!
-//! Every commit that changed something folds, and that is worth being
-//! plain about, because it is not obviously the right cost. A fold
-//! rewrites the columns the transaction touched, and the overlay
-//! exists precisely so a reader could see a committed row without one.
-//! But [`Zu1Graph`] reads the sealed file and nothing else, so today a
-//! change that is not folded is a change the next `MATCH` cannot see,
-//! and a write nobody can read is not a write. Folding here keeps the
-//! visibility contract honest while the read path catches up.
+//! Most commits fold, and the ones that do not are worth being plain
+//! about. A fold rewrites the columns the transaction touched, and the
+//! overlay exists precisely so a reader could see a committed row
+//! without one, but [`Zu1Graph`] reads the sealed file and nothing
+//! else, so a change that is not folded is a change the next `MATCH`
+//! cannot see, and a write nobody can read is not a write. So a commit
+//! folds unless the read side can be handed what it wrote instead,
+//! which is one shape and only one: a word written onto a column of a
+//! row that is already there. Those go into a [`LanePatch`] per table,
+//! the readers put them over the words their columns hold, and a fold
+//! seals them later, at a checkpoint or when the run of them has gone
+//! on long enough. It is worth what it costs to keep narrow, because
+//! the fold is not the only thing that goes: it is what moves the
+//! header epoch, and moving the epoch is what throws away the session's
+//! plan cache, its catalog and every decoded chunk it had warm.
 //!
 //! Not every fold publishes, and that is the part worth reading twice.
 //! A fold moves the roots this handle carries; a checkpoint puts them
@@ -36,14 +43,17 @@
 //!
 //! [`Zu1Graph`]: crate::query::Zu1Graph
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use zu_common::{Epoch, Result, ZuError};
 
 use crate::append::sidecar;
 use crate::zu1::file::Zu1File;
 use crate::zu1::fold::{checkpoint_fold, recover, staged_fold};
-use crate::zu1::txn::{Mvcc, WriteTxn};
+use crate::zu1::props::{LanePatch, PropsDirectory, load_props};
+use crate::zu1::txn::{LaneWrite, Mvcc, WriteTxn};
 use crate::zu1::wal::Wal;
 
 /// How much a run of folds may take before one of them checkpoints.
@@ -55,6 +65,28 @@ use crate::zu1::wal::Wal;
 /// once in a dozen and the log stays about that long, which is also
 /// about how much a recovery has to replay.
 const THRESHOLD_BLOCKS: u64 = 256;
+
+/// How many commits in a row may go without a fold.
+///
+/// A deferred commit is a frame in the log and a handful of cells in
+/// the overlay, and neither is freed until a fold takes them, so this
+/// is what a recovery has to replay and what the patch below has to
+/// carry. It is deliberately well short of what the log can hold: the
+/// point is to take the fold off the statement, and folding one
+/// statement in a few hundred does that whatever the number is.
+const DEFERRED_COMMITS: u32 = 256;
+
+/// How many cells the deferred commits may hold between them.
+///
+/// The patch is rebuilt when a commit adds to it, so this bounds the
+/// per-commit cost of deferring as well as the memory: a few hundred
+/// cells is a copy of a few kilobytes, against the column rewrite and
+/// the two segment writes a fold costs.
+const DEFERRED_CELLS: usize = 1024;
+
+/// The unsealed cells of every table that has any, which is what a
+/// reader is handed so that it reads a deferred commit.
+pub type Patches = HashMap<u32, Arc<LanePatch>>;
 
 /// What one [`Writer::write`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +116,22 @@ pub struct Writer {
     wal: Wal,
     mvcc: Mvcc,
     path: PathBuf,
+    /// The cells the commits since the last fold wrote, by table and
+    /// then by column, which is the running form the patch below is
+    /// built from.
+    pending: HashMap<u32, BTreeMap<usize, BTreeMap<u64, u64>>>,
+    /// The same cells as a reader takes them. Rebuilt whenever a
+    /// deferred commit adds to `pending`, and shared from there: a
+    /// reader holds the `Arc` and hands copies of it to the workers a
+    /// query forks.
+    patches: Arc<Patches>,
+    /// How many commits have gone without a fold.
+    deferred: u32,
+    /// Props directories of the tables a deferred commit has written
+    /// into, which is how a commit is checked against the columns it
+    /// names without reading the directory chain per statement. A fold
+    /// moves the roots these describe, so it empties this.
+    dirs: HashMap<u32, Option<PropsDirectory>>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -117,7 +165,15 @@ impl Writer {
         let path = sidecar(db.path());
         let mut wal = Wal::open(&path)?;
         let mvcc = recover(db, &mut wal)?;
-        let mut writer = Writer { wal, mvcc, path };
+        let mut writer = Writer {
+            wal,
+            mvcc,
+            path,
+            pending: HashMap::new(),
+            patches: Arc::new(Patches::new()),
+            deferred: 0,
+            dirs: HashMap::new(),
+        };
         writer.fold(db)?;
         Ok(writer)
     }
@@ -159,12 +215,123 @@ impl Writer {
         }
         let epoch = txn.commit(&mut self.wal)?;
         if staged {
-            match db.unpublished_blocks() >= THRESHOLD_BLOCKS {
-                true => self.fold(db)?,
-                false => staged_fold(db, &mut self.mvcc, &mut self.wal)?,
+            let lanes = self.mvcc.take_lanes();
+            if self.defers(db, &lanes)? {
+                self.stage_patch(lanes);
+            } else {
+                match db.unpublished_blocks() >= THRESHOLD_BLOCKS {
+                    true => self.fold(db)?,
+                    false => {
+                        staged_fold(db, &mut self.mvcc, &mut self.wal)?;
+                        self.sealed();
+                    }
+                }
             }
         }
         Ok(Written { value, epoch })
+    }
+
+    /// The cells the commits since the last fold wrote, which a reader
+    /// puts over the words its columns hold.
+    ///
+    /// This is the whole of what a deferred commit hands the read side,
+    /// so a reader that has it reads the same database a fold would
+    /// have left behind. The `Arc` is the version: it is replaced when
+    /// a commit adds to the patch and emptied when a fold seals it, and
+    /// a reader that holds the current one is up to date.
+    pub fn patches(&self) -> &Arc<Patches> {
+        &self.patches
+    }
+
+    /// Whether this commit can be left in the overlay for a later fold
+    /// to seal.
+    ///
+    /// A commit that only wrote words onto rows that are already there
+    /// can, because the patch carries exactly that and a reader reads
+    /// through it. Anything else, a new row, a deleted one, a string, a
+    /// null, a label, an edge, folds the way it always did. On top of
+    /// the shape there are three bounds: how many commits may go
+    /// unfolded, how many cells they may hold, and the block growth the
+    /// checkpoint threshold already bounds.
+    fn defers(&mut self, db: &mut Zu1File, lanes: &[LaneWrite]) -> Result<bool> {
+        if lanes.is_empty() || !self.mvcc.lane_only() {
+            return Ok(false);
+        }
+        if self.deferred >= DEFERRED_COMMITS
+            || self.patches.values().map(|p| p.cells()).sum::<usize>() + lanes.len()
+                > DEFERRED_CELLS
+            || db.unpublished_blocks() >= THRESHOLD_BLOCKS
+        {
+            return Ok(false);
+        }
+        for &(table, row, col, _) in lanes {
+            if !self.patchable(db, table, row, col as usize)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether a reader can be shown a word written onto this cell
+    /// without the column being rewritten.
+    ///
+    /// The column has to be one the patch can describe: fixed width, so
+    /// the new value is a word that goes straight over the old one, and
+    /// no validity segment, because a column that can hold nothing in a
+    /// row keeps that in a bitmap the patch does not carry. The row has
+    /// to be one the column already has a word for, which is what says
+    /// the write is an update rather than part of an append.
+    fn patchable(&mut self, db: &mut Zu1File, table: u32, row: u64, col: usize) -> Result<bool> {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(table) {
+            slot.insert(load_props(db, table)?);
+        }
+        let Some(directory) = self.dirs[&table].as_ref() else {
+            return Ok(false);
+        };
+        let Some(column) = directory.columns.get(col) else {
+            return Ok(false);
+        };
+        Ok(column.is_lane() && column.validity.is_none() && row < column.meta.value_count)
+    }
+
+    /// Adds a deferred commit's cells to the patch and republishes it.
+    ///
+    /// Only the tables this commit wrote into are rebuilt. The others
+    /// keep the `Arc` they already had, so a reader that has read one
+    /// of them is not made to look at it again.
+    fn stage_patch(&mut self, lanes: Vec<LaneWrite>) {
+        let mut patches = Patches::clone(&self.patches);
+        let mut touched: Vec<u32> = Vec::new();
+        for (table, row, col, word) in lanes {
+            self.pending
+                .entry(table)
+                .or_default()
+                .entry(col as usize)
+                .or_default()
+                .insert(row, word);
+            if !touched.contains(&table) {
+                touched.push(table);
+            }
+        }
+        for table in touched {
+            let cols = self.pending[&table]
+                .iter()
+                .map(|(&col, rows)| (col, rows.iter().map(|(&r, &w)| (r, w)).collect()))
+                .collect();
+            patches.insert(table, Arc::new(LanePatch::new(cols)));
+        }
+        self.patches = Arc::new(patches);
+        self.deferred += 1;
+    }
+
+    /// Drops the patch a fold has just sealed into the columns.
+    fn sealed(&mut self) {
+        self.deferred = 0;
+        self.dirs.clear();
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            self.patches = Arc::new(Patches::new());
+        }
     }
 
     /// Seals every committed overlay into the file, publishes it and
@@ -172,7 +339,9 @@ impl Writer {
     /// overlays answered, and the header epoch has moved, so anything
     /// caching the catalog or a decoded layout has to reload.
     pub fn fold(&mut self, db: &mut Zu1File) -> Result<()> {
-        checkpoint_fold(db, &mut self.mvcc, &mut self.wal)
+        checkpoint_fold(db, &mut self.mvcc, &mut self.wal)?;
+        self.sealed();
+        Ok(())
     }
 
     /// Cuts the log back to where it stood at `floor`, which is what a
@@ -567,5 +736,145 @@ mod tests {
             names(&mut session),
             ["ada", "amy", "eva", "joe", "kay", "raj", "sol"]
         );
+    }
+
+    /// Ages in order, the observable for the writes below: `age` is an
+    /// integer column with a value in every row, which is the one shape
+    /// a commit can leave for a later fold to seal.
+    fn ages(session: &mut Session) -> Vec<i64> {
+        let r = session
+            .run("MATCH (p:person) RETURN p.age AS age ORDER BY age", &[])
+            .expect("read");
+        r.rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Int(age) => *age,
+                other => panic!("expected an integer age, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A point write is read by the next statement without a fold
+    /// having sealed it. The epoch is what says so: a fold moves it,
+    /// and moving it is what throws away the plan cache, the catalog
+    /// and every decoded chunk the session was holding.
+    #[test]
+    fn a_point_write_is_read_before_it_is_folded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("defer.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        // The first write opens the writer, which recovers and folds,
+        // so the epoch to hold against is the one after it.
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        session
+            .run("MATCH (p:person) WHERE p.age = 20 SET p.age = 21", &[])
+            .expect("second write");
+        assert_eq!(session.epoch(), before, "a point write folded");
+        assert_eq!(ages(&mut session), [11, 21, 30, 40]);
+    }
+
+    /// A written value outside the column's stored bounds is still
+    /// found. The zone map is read off the sealed segment and a scan
+    /// skips a column it says cannot hold the value, so an unsealed
+    /// write has to widen it or the row goes missing.
+    #[test]
+    fn a_write_outside_the_zone_is_still_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zone.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 999", &[])
+            .expect("write");
+        let r = session
+            .run(
+                "MATCH (p:person) WHERE p.age = 999 RETURN p.name AS name",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(r.rows.len(), 1, "the write is outside the stored zone");
+        assert_eq!(ages(&mut session), [20, 30, 40, 999]);
+    }
+
+    /// A run of point writes longer than a writer will defer folds
+    /// somewhere in the middle, and what it sealed is what the writes
+    /// left. Reopening is the check: it reads the file and the log and
+    /// nothing this session was holding.
+    #[test]
+    fn a_long_run_of_point_writes_seals_what_it_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.zu1");
+        seeded(&path);
+
+        {
+            let mut session = Session::open(&path).expect("open");
+            let first = session.epoch();
+            for i in 0..DEFERRED_COMMITS + 8 {
+                let age = 100 + i64::from(i);
+                session
+                    .run(
+                        &format!("MATCH (p:person) WHERE p.name = 'ada' SET p.age = {age}"),
+                        &[],
+                    )
+                    .expect("write");
+            }
+            assert!(
+                session.epoch() > first,
+                "a run that long folded nothing at all"
+            );
+            let last = 100 + i64::from(DEFERRED_COMMITS + 7);
+            assert_eq!(ages(&mut session), [20, 30, 40, last]);
+        }
+
+        let mut session = Session::open(&path).expect("reopen");
+        let last = 100 + i64::from(DEFERRED_COMMITS + 7);
+        assert_eq!(ages(&mut session), [20, 30, 40, last]);
+    }
+
+    /// A point write is durable before it is sealed, the same as any
+    /// other: the frame is synced at commit, so a process that dies
+    /// with the fold still owed replays it on the next open.
+    #[test]
+    fn a_point_write_survives_a_crash_before_the_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crash-point.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 77", &[])
+            .expect("write");
+        // The process dies here: no fold, no checkpoint, and no drop
+        // either, because dropping the session is what publishes.
+        std::mem::forget(session);
+
+        let mut session = Session::open(&path).expect("reopen");
+        assert_eq!(ages(&mut session), [20, 30, 40, 77]);
+    }
+
+    /// A point write inside a transaction that rolls back goes away,
+    /// which is the one thing the readers holding the unsealed cells
+    /// must not keep.
+    #[test]
+    fn a_rolled_back_point_write_goes_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rollback-point.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 88", &[])
+            .expect("write");
+        assert_eq!(ages(&mut session), [20, 30, 40, 88]);
+        session.run("ROLLBACK", &[]).expect("roll back");
+        assert_eq!(ages(&mut session), [10, 20, 30, 40]);
     }
 }

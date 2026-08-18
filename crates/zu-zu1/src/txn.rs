@@ -104,7 +104,7 @@ pub enum IngestPayload {
 
 /// The committed overlay store and the epoch counter, owned by
 /// whichever handle owns the write side of the database.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Mvcc {
     epoch: Epoch,
     tables: HashMap<u32, TableOverlay>,
@@ -112,6 +112,35 @@ pub struct Mvcc {
     /// Manifest roots of ingests not yet folded, with their commit
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
+    /// Whether every commit published here is an integer write onto a
+    /// column of a row the base file already holds. That is the one
+    /// shape a reader can be handed without a fold, so a writer asks
+    /// this to decide whether it has to fold at all. It starts true on
+    /// an empty store and one commit of any other shape turns it off
+    /// until the next fold empties the store again.
+    lane_only: bool,
+    /// Those writes, for the last commit only: table, row, column and
+    /// the word. A writer keeps the running set of them, so what it
+    /// wants after a commit is what that commit added, not another
+    /// walk of every chain in the store.
+    lanes: Vec<LaneWrite>,
+}
+
+/// One integer write onto an existing row: table, row offset, column
+/// position in the props directory, and the word.
+pub type LaneWrite = (u32, u64, u32, u64);
+
+impl Default for Mvcc {
+    fn default() -> Self {
+        Mvcc {
+            epoch: 0,
+            tables: HashMap::new(),
+            rels: HashMap::new(),
+            ingests: Vec::new(),
+            lane_only: true,
+            lanes: Vec::new(),
+        }
+    }
 }
 
 /// One staged mutation, in statement order.
@@ -228,6 +257,20 @@ impl Mvcc {
     /// The newest committed epoch; a new reader pins this.
     pub fn epoch(&self) -> Epoch {
         self.epoch
+    }
+
+    /// Whether everything this store holds is an integer write onto an
+    /// existing row, which is the shape a reader can be shown without a
+    /// fold sealing it first.
+    pub fn lane_only(&self) -> bool {
+        self.lane_only
+    }
+
+    /// The integer writes the last commit published, in statement
+    /// order. Empty when that commit was of any other shape, and empty
+    /// again once it has been read.
+    pub fn take_lanes(&mut self) -> Vec<LaneWrite> {
+        std::mem::take(&mut self.lanes)
     }
 
     /// Opens the write transaction. The mutable borrow is the writer
@@ -742,6 +785,8 @@ impl Mvcc {
         }
         self.ingests.push((epoch, root));
         self.epoch = self.epoch.max(epoch);
+        self.lane_only = false;
+        self.lanes.clear();
     }
 
     /// Manifest roots of ingests committed at or below `epoch`, for
@@ -756,7 +801,25 @@ impl Mvcc {
 
     /// Publishes a committed txn's staged ops at `epoch`.
     fn apply(&mut self, epoch: Epoch, ops: Vec<Op>) {
+        self.lanes.clear();
         for op in ops {
+            // What the op is about to put in the store, before the
+            // store has it. Everything but an integer write onto a row
+            // that is already there needs a fold to become readable,
+            // and a store that holds one of those needs a fold whatever
+            // else arrives after it.
+            match &op {
+                Op::Update {
+                    table,
+                    offset,
+                    col,
+                    value: Cell::Int(word),
+                } if self.lane_only => self.lanes.push((*table, *offset, *col, *word)),
+                _ => {
+                    self.lane_only = false;
+                    self.lanes.clear();
+                }
+            }
             match op {
                 Op::InsertNodes { table, cols, rows } => {
                     self.tables

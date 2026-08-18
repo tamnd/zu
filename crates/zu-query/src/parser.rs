@@ -1686,6 +1686,21 @@ impl Parser<'_> {
             ));
         }
         let outbound = self.eat(&TokenKind::Gt);
+        let arrow = self.tokens[self.pos.saturating_sub(1)].start;
+        // The quantifier goes behind the whole arrow, whichever way it
+        // points, so it is read here rather than beside the types.
+        let range = match (range, self.parse_edge_quantifier()?) {
+            (Some(_), Some(_)) => {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    arrow,
+                    "a step repeats as many times as one quantity says: write the hops inside the brackets or the quantifier behind the arrow, not both",
+                ));
+            }
+            (Some(hops), None) => Some(hops),
+            (None, quantified) => quantified,
+        };
         let direction = match (inbound, left_tilde, outbound) {
             (true, true, true) => {
                 return Err(ZuError::gql_in(
@@ -1725,26 +1740,73 @@ impl Parser<'_> {
 
     /// The hop range after `*`: nothing, `2`, `1..3`, `..3`, or `2..`.
     fn parse_hop_range(&mut self) -> Result<(Option<u64>, Option<u64>)> {
-        let take_int = |parser: &mut Self| -> Option<u64> {
-            if let Some(Token {
-                kind: TokenKind::Int(v),
-                ..
-            }) = parser.peek()
-            {
-                let v = *v;
-                parser.pos += 1;
-                Some(v)
-            } else {
-                None
-            }
-        };
-        let min = take_int(self);
+        let min = self.take_int();
         if self.eat(&TokenKind::DotDot) {
-            Ok((min, take_int(self)))
+            Ok((min, self.take_int()))
         } else {
             // `*2` is exactly two hops; a bare `*` is unbounded.
             Ok((min, min))
         }
+    }
+
+    /// The next token if it is an integer, and nothing otherwise, which
+    /// is how both of the ways of writing a repetition read their
+    /// bounds: each of theirs is optional.
+    fn take_int(&mut self) -> Option<u64> {
+        if let Some(Token {
+            kind: TokenKind::Int(v),
+            ..
+        }) = self.peek()
+        {
+            let v = *v;
+            self.pos += 1;
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// The graph pattern quantifier a step may carry behind its arrow
+    /// (ISO 16.10, features G036 and G061): `{n}` for exactly n, `{n,m}`
+    /// for a range with either end left out, `+` for one or more, `*`
+    /// for zero or more.
+    ///
+    /// It says what `*n..m` inside the brackets says, so it lands in the
+    /// same range and nothing below the parser learns a second way of
+    /// writing a repetition. This is the form the standard's own
+    /// examples are written in and the form the conformance corpus uses.
+    fn parse_edge_quantifier(&mut self) -> Result<Option<(Option<u64>, Option<u64>)>> {
+        if self.eat(&TokenKind::Plus) {
+            return Ok(Some((Some(1), None)));
+        }
+        if self.eat(&TokenKind::Star) {
+            return Ok(Some((Some(0), None)));
+        }
+        if !self.at(&TokenKind::LBrace) {
+            return Ok(None);
+        }
+        let brace = self.tokens[self.pos].start;
+        self.expect(&TokenKind::LBrace)?;
+        let min = self.take_int();
+        let range = if self.eat(&TokenKind::Comma) {
+            (min, self.take_int())
+        } else {
+            // `{2}` is exactly two, and a quantifier with no number in
+            // it at all says nothing: `{}` is not `*`.
+            match min {
+                Some(n) => (Some(n), Some(n)),
+                None => {
+                    return Err(ZuError::gql_in(
+                        codes::C42001,
+                        self.source,
+                        brace,
+                        "a quantifier says how many: write {n}, {n,}, {n,m} or a bare + or *",
+                    ));
+                }
+            }
+        };
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Some(range))
     }
 
     fn parse_property_map(&mut self) -> Result<Vec<(String, Expr)>> {
@@ -3258,6 +3320,51 @@ mod tests {
             };
             assert_eq!(patterns[0].steps[0].0.range, Some(want), "range {text}");
         }
+    }
+
+    /// The other way of writing the same repetition, the standard's
+    /// own: a quantifier behind the arrow. Every form lands in the
+    /// range the brackets would have carried, so nothing past the
+    /// parser can tell which way a step was written.
+    #[test]
+    fn a_quantifier_behind_the_arrow_reads_as_a_range() {
+        for (text, want) in [
+            ("-[:KNOWS]->+", (Some(1), None)),
+            ("-[:KNOWS]->*", (Some(0), None)),
+            ("-[:KNOWS]->{3}", (Some(3), Some(3))),
+            ("-[:KNOWS]->{2,}", (Some(2), None)),
+            ("-[:KNOWS]->{,4}", (None, Some(4))),
+            ("-[:KNOWS]->{2,4}", (Some(2), Some(4))),
+            // The abbreviated edge pattern takes one too, and so does
+            // an edge pointing the other way.
+            ("-->+", (Some(1), None)),
+            ("<-[:KNOWS]-{2,4}", (Some(2), Some(4))),
+        ] {
+            let q = parsed(&format!("MATCH (a){text}(b) RETURN a"));
+            let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+                panic!("MATCH");
+            };
+            assert_eq!(
+                patterns[0].steps[0].0.range,
+                Some(want),
+                "quantifier {text}"
+            );
+        }
+    }
+
+    /// Two quantities on one step is a question rather than an
+    /// instruction, and a quantifier that names no number at all says
+    /// nothing.
+    #[test]
+    fn a_step_carries_one_quantity() {
+        assert!(
+            parse_err("MATCH (a)-[:KNOWS*2]->+(b) RETURN a").contains("not both"),
+            "both forms at once"
+        );
+        assert!(
+            parse_err("MATCH (a)-[:KNOWS]->{}(b) RETURN a").contains("says how many"),
+            "an empty quantifier"
+        );
     }
 
     /// A `WHERE` inside the brackets belongs to the step, and it reads

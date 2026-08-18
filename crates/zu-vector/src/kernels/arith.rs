@@ -62,6 +62,35 @@ pub fn binary(
         )));
     }
     let len = l.len as usize;
+    // Two constants make a constant, and it is worth spotting because
+    // it is not a corner case: a value pinned on a level below arrives
+    // here broadcast, so `outer.x * $k` is this shape on every vector
+    // the level above produces. One apply and one word beats a full
+    // pass, and everything downstream reads a constant the same way.
+    if let (VecEncoding::Constant, VecEncoding::Constant) = (l.encoding, r.encoding)
+        && matches!(
+            l.phys,
+            PhysType::Int64 | PhysType::Interval | PhysType::Float64
+        )
+    {
+        let mut out = match l.phys {
+            PhysType::Float64 => {
+                let v = apply_f64(op, l.constant_value::<f64>(), r.constant_value::<f64>());
+                ValueVector::constant(arena, l.phys, v, len)
+            }
+            _ => {
+                let v = apply_i64(op, l.constant_value::<i64>(), r.constant_value::<i64>());
+                ValueVector::constant(arena, l.phys, v, len)
+            }
+        };
+        out.validity = merged_validity(arena, l, r, len);
+        if matches!(l.phys, PhysType::Int64 | PhysType::Interval)
+            && matches!(op, BinOp::Div | BinOp::Mod)
+        {
+            clear_zero_divisor_rows(arena, &mut out, r, len);
+        }
+        return Ok(out);
+    }
     let mut out = ValueVector::flat_uninit(arena, l.phys, len);
     match l.phys {
         PhysType::Int64 | PhysType::Interval => {

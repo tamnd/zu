@@ -1419,7 +1419,11 @@ sha256_mibs = 80.0
 # Lower these ceilings, never raise them.
 set_stmt_us = 250000.0
 insert_stmt_us = 250000.0
-set_stmt_kb = 4096.0
+# Bytes written per SET, which is now the log frame and the header and
+# not a column rewrite: 9.4 kB, against 55.4 kB when every statement
+# folded. The ceiling is above the first and well below the second, so
+# a commit that goes back to sealing itself fails here.
+set_stmt_kb = 32.0
 
 # The processor time of the same two statements, user and system
 # together, per statement. The wall clock above is mostly the storage:
@@ -1428,16 +1432,16 @@ set_stmt_kb = 4096.0
 # columns move for different reasons and the latency one cannot see a
 # write path that got twice as expensive.
 #
-# Measured 0.5 to 1.1 ms per SET and 4.1 to 6.2 ms per INSERT at 10000
-# rows, the spread being what a laptop with other work on it does to a
-# run this short. The SET is the one that reads a table and changes one
+# Measured 134 us per SET and 4.1 to 6.2 ms per INSERT at 10000 rows,
+# the spread being what a laptop with other work on it does to a run
+# this short. The SET is the one that reads a table and changes one
 # cell of it, which is the shape the read half of a write statement is
 # measured by; the INSERT has no table to read and is nearly all write
 # path. What these ceilings are here to catch is the read half falling
-# back to the row at a time engine, which was 5x the processor time at
-# 100000 rows, so they sit an order of magnitude above the measurement
-# and still catch it. Lower these ceilings, never raise them.
-set_stmt_cpu_us = 10000.0
+# back to the row at a time engine, and the SET one also catches a
+# commit going back to folding per statement, which was 475 us at 10000
+# rows and 767 us at 100000. Lower these ceilings, never raise them.
+set_stmt_cpu_us = 400.0
 insert_stmt_cpu_us = 30000.0
 
 # A DELETE at the same shape, measured 15 ms and 1044 kB at 10000 rows.
@@ -1498,12 +1502,13 @@ set_label_stmt_kb = 4096.0
 
 # What a statement that changed nothing added to the store, per
 # statement. A SET that writes back the value it read leaves a table of
-# the same shape, so the fold's new blocks must come out of the free
+# the same shape, so the blocks a fold takes must come out of the free
 # list the old ones went onto and the file must not grow at all;
-# measured 0 everywhere. A block is 256 kB, so this ceiling fails on a
-# path that leaks even one block every four statements, which is the
-# defect it is here for. Lower this ceiling, never raise it.
-set_stmt_growth_b = 65536.0
+# measured 92 bytes a statement, against 6556 when every statement
+# folded. What is left is the fold that does run, once in a few hundred
+# statements, and this ceiling is what says the run between them is
+# free. Lower this ceiling, never raise it.
+set_stmt_growth_b = 2048.0
 
 # Peak resident growth across a 200 statement run, MB. A write of one
 # cell holds one cell, and the fold holds the columns it is rebuilding,

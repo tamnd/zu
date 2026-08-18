@@ -13,14 +13,23 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, Composite, DeleteTarget, ElementDefKind, ElementTypeDef,
-    Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Linear, Literal,
-    NodePattern, NullOrder, PathMode, PathPattern, Projection, ProjectionItem, PropertyDef, Query,
-    RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, Simple, SortKey,
-    Statement, TxnStmt, UnaryOp,
+    BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, ElementDefKind,
+    ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr,
+    Linear, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection, ProjectionItem,
+    PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem,
+    SetOp, Simple, SortKey, Statement, TxnStmt, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
+
+/// What to call a conjunction in a message, spelled the way the query
+/// would have written it.
+fn conjunction_name(how: Conjunction) -> &'static str {
+    match how {
+        Conjunction::Otherwise => "OTHERWISE",
+        Conjunction::Set { op, .. } => op.keyword(),
+    }
+}
 
 /// A name written where a value type belongs and spelling none.
 fn unknown_type(name: &str) -> ZuError {
@@ -784,10 +793,22 @@ impl Parser<'_> {
     /// whether the statement may end without a RETURN.
     /// Whether a statement could end here: the text ran out, or what is
     /// left belongs to somebody else, which is the semicolon after the
-    /// statement and the `NEXT` that hands its result to the statement
-    /// behind it.
+    /// statement, the `NEXT` that hands its result to the statement
+    /// behind it, and the conjunction that joins it to another operand.
     fn at_statement_end(&self) -> bool {
-        self.peek().is_none() || self.at(&TokenKind::Semicolon) || self.at_kw("NEXT")
+        self.peek().is_none()
+            || self.at(&TokenKind::Semicolon)
+            || self.at_kw("NEXT")
+            || self.at_conjunction()
+    }
+
+    /// Whether a conjunction stands here. Reading one is
+    /// [`Parser::parse_conjunction`]; this only looks.
+    fn at_conjunction(&self) -> bool {
+        self.at_kw("OTHERWISE")
+            || self.at_kw("UNION")
+            || self.at_kw("EXCEPT")
+            || self.at_kw("INTERSECT")
     }
 
     fn writes(clauses: &[Clause]) -> bool {
@@ -866,41 +887,95 @@ impl Parser<'_> {
     }
 
     /// A composite query statement: the `USE` in front of it, and the
-    /// linear query statement under it.
+    /// linear query statements it joins.
     ///
-    /// The set operators join two of these and are not parsed yet, so
-    /// the composite is one linear query and the loop below is over the
-    /// `NEXT` chain.
+    /// The conjunctions are left associative and share one level, so
+    /// this is a fold rather than a precedence climb: each operand read
+    /// joins onto everything read before it.
     fn parse_query(&mut self) -> Result<Query> {
         let use_graph = self.parse_use_graph()?;
+        let (linear, ending) = self.parse_linear()?;
+        let mut body = Composite::Linear(linear);
+        let mut ending = ending;
+        loop {
+            let at = self.peek().map(|t| t.start).unwrap_or(0);
+            let Some(how) = self.parse_conjunction()? else {
+                break;
+            };
+            if ending != Ending::Result {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    format_args!(
+                        "{} joins two result tables, so the statement in front of it has to end with RETURN",
+                        conjunction_name(how)
+                    ),
+                ));
+            }
+            let (right, next) = self.parse_linear()?;
+            ending = next;
+            body = Composite::Conjoined {
+                left: Box::new(body),
+                how,
+                right,
+            };
+        }
+        self.eat(&TokenKind::Semicolon);
+        if let Some(token) = self.peek() {
+            let what = match ending {
+                Ending::Result => "RETURN",
+                Ending::Write => "the end of a statement",
+            };
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                token.start,
+                format_args!("nothing may follow {what}, found {}", token.kind.describe()),
+            ));
+        }
+        Ok(Query { use_graph, body })
+    }
+
+    /// A linear query statement: simple statements chained by `NEXT`,
+    /// and how the last of them ended.
+    fn parse_linear(&mut self) -> Result<(Linear, Ending)> {
         let mut statements = Vec::new();
         loop {
             let (simple, ending) = self.parse_simple()?;
             statements.push(simple);
-            // What follows a statement is either the next one in the
-            // chain or nothing at all, and the two errors below say
-            // which of those the reader is short of.
-            if self.eat_kw("NEXT") {
-                continue;
+            if !self.eat_kw("NEXT") {
+                return Ok((Linear { statements }, ending));
             }
-            self.eat(&TokenKind::Semicolon);
-            if let Some(token) = self.peek() {
-                let what = match ending {
-                    Ending::Result => "RETURN",
-                    Ending::Write => "the end of a statement",
-                };
-                return Err(ZuError::gql_in(
-                    codes::C42001,
-                    self.source,
-                    token.start,
-                    format_args!("nothing may follow {what}, found {}", token.kind.describe()),
-                ));
-            }
-            return Ok(Query {
-                use_graph,
-                body: Composite::Linear(Linear { statements }),
-            });
         }
+    }
+
+    /// The operator joining this operand to the one before it, or
+    /// `None` where the composite ends.
+    ///
+    /// A set quantifier that is not written is `DISTINCT`, which is
+    /// what the standard says and is why a plain `UNION` removes
+    /// duplicates.
+    fn parse_conjunction(&mut self) -> Result<Option<Conjunction>> {
+        if self.eat_kw("OTHERWISE") {
+            return Ok(Some(Conjunction::Otherwise));
+        }
+        let op = if self.eat_kw("UNION") {
+            SetOp::Union
+        } else if self.eat_kw("EXCEPT") {
+            SetOp::Except
+        } else if self.eat_kw("INTERSECT") {
+            SetOp::Intersect
+        } else {
+            return Ok(None);
+        };
+        let all = if self.eat_kw("ALL") {
+            true
+        } else {
+            self.eat_kw("DISTINCT");
+            false
+        };
+        Ok(Some(Conjunction::Set { op, all }))
     }
 
     /// One simple query statement: the primitive statements it is
@@ -1021,6 +1096,21 @@ impl Parser<'_> {
                     self.peek().expect("peeked").start,
                     format_args!(
                         "NEXT reads what the statement in front of it returned, so that statement has to end with RETURN"
+                    ),
+                ));
+            } else if self.at_conjunction() {
+                // The same shortfall a word later: a conjunction joins
+                // two result tables and the left one is missing.
+                let word = ["OTHERWISE", "UNION", "EXCEPT", "INTERSECT"]
+                    .into_iter()
+                    .find(|kw| self.at_kw(kw))
+                    .expect("a conjunction stands here");
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    self.peek().expect("peeked").start,
+                    format_args!(
+                        "{word} joins two result tables, so the statement in front of it has to end with RETURN"
                     ),
                 ));
             } else if let Some(kw) = UNIMPLEMENTED.iter().find(|kw| self.at_kw(kw)) {
@@ -2239,6 +2329,16 @@ mod tests {
         parse(source).expect("parse")
     }
 
+    /// The one linear statement of a query that has no conjunction in
+    /// it, for the tests that are about what is inside an operand
+    /// rather than about how operands are joined.
+    fn linear_body(query: &Query) -> &Linear {
+        match &query.body {
+            Composite::Linear(linear) => linear,
+            Composite::Conjoined { .. } => panic!("this query is composite"),
+        }
+    }
+
     fn parse_err(source: &str) -> String {
         parse(source).expect_err("should fail").to_string()
     }
@@ -3276,7 +3376,7 @@ mod tests {
         let q = parsed(
             "MATCH (n:Person) RETURN n AS p NEXT MATCH (p)-[:KNOWS]->(f:Person) RETURN f AS friend",
         );
-        let Composite::Linear(linear) = &q.body;
+        let linear = linear_body(&q);
         assert_eq!(linear.statements.len(), 2);
         assert_eq!(linear.statements[0].clauses.len(), 1, "the MATCH");
         assert_eq!(
@@ -3309,7 +3409,7 @@ mod tests {
             "MATCH (a:Person) RETURN a AS a NEXT MATCH (a)-[:KNOWS]->(b:Person) RETURN b AS b \
              NEXT MATCH (b)-[:IS_LOCATED_IN]->(c:Place) RETURN c.name AS name",
         );
-        let Composite::Linear(linear) = &q.body;
+        let linear = linear_body(&q);
         assert_eq!(linear.statements.len(), 3);
     }
 
@@ -3318,7 +3418,7 @@ mod tests {
     #[test]
     fn a_write_may_stand_in_front_of_next_without_returning() {
         let q = parsed("INSERT (x:Person) NEXT MATCH (n:Person) RETURN n");
-        let Composite::Linear(linear) = &q.body;
+        let linear = linear_body(&q);
         assert_eq!(linear.statements.len(), 2);
         assert!(
             linear.statements[0].result.is_none(),
@@ -3347,6 +3447,98 @@ mod tests {
         let err = parse_err("INSERT (x:Person); INSERT (y:Person)");
         assert!(
             err.contains("nothing may follow the end of a statement"),
+            "{err}"
+        );
+    }
+
+    /// The conjunctions are all at one level and read left to right, so
+    /// three operands nest to the left however the words are mixed. A
+    /// parser that gave UNION and INTERSECT a precedence between them,
+    /// as SQL does, would nest the last two together instead.
+    #[test]
+    fn conjunctions_fold_to_the_left() {
+        let q = parsed(
+            "MATCH (a:Person) RETURN a AS x \
+             UNION ALL \
+             MATCH (b:Person) RETURN b AS x \
+             INTERSECT \
+             MATCH (c:Person) RETURN c AS x",
+        );
+        let Composite::Conjoined { left, how, right } = &q.body else {
+            panic!("two conjunctions, so a conjoined body");
+        };
+        assert_eq!(
+            *how,
+            Conjunction::Set {
+                op: SetOp::Intersect,
+                all: false
+            },
+            "the outermost conjunction is the one written last"
+        );
+        assert_eq!(right.statements.len(), 1);
+        let Composite::Conjoined { how, .. } = left.as_ref() else {
+            panic!("the first two operands are joined underneath");
+        };
+        assert_eq!(
+            *how,
+            Conjunction::Set {
+                op: SetOp::Union,
+                all: true
+            }
+        );
+        assert_eq!(q.clauses().len(), 3, "one MATCH from each operand");
+    }
+
+    /// The set quantifier is optional and DISTINCT is what leaving it
+    /// out means, which is the standard's default and the opposite of
+    /// what a reader coming from a bag oriented language expects.
+    #[test]
+    fn a_missing_set_quantifier_reads_as_distinct() {
+        for (source, want) in [
+            ("UNION", SetOp::Union),
+            ("EXCEPT", SetOp::Except),
+            ("INTERSECT", SetOp::Intersect),
+        ] {
+            let q = parsed(&format!(
+                "MATCH (a:Person) RETURN a AS x {source} MATCH (b:Person) RETURN b AS x"
+            ));
+            let Composite::Conjoined { how, .. } = &q.body else {
+                panic!("{source} joins two operands");
+            };
+            assert_eq!(
+                *how,
+                Conjunction::Set {
+                    op: want,
+                    all: false
+                }
+            );
+        }
+    }
+
+    /// OTHERWISE joins two result tables like the set operators do,
+    /// but it is not one of them and carries no quantifier.
+    #[test]
+    fn otherwise_is_a_conjunction_of_its_own() {
+        let q = parsed("MATCH (a:Person) RETURN a AS x OTHERWISE MATCH (b:Person) RETURN b AS x");
+        let Composite::Conjoined { how, .. } = &q.body else {
+            panic!("OTHERWISE joins two operands");
+        };
+        assert_eq!(*how, Conjunction::Otherwise);
+    }
+
+    /// A conjunction meets two result tables, so an operand that
+    /// returned none of one is told what is missing rather than being
+    /// told the word it ran into was unexpected.
+    #[test]
+    fn an_operand_of_a_conjunction_has_to_return() {
+        let err = parse_err("MATCH (n:Person) UNION MATCH (m:Person) RETURN m");
+        assert!(
+            err.contains("UNION joins two result tables, so the statement in front of it has to end with RETURN"),
+            "{err}"
+        );
+        let err = parse_err("INSERT (x:Person) OTHERWISE MATCH (m:Person) RETURN m");
+        assert!(
+            err.contains("OTHERWISE joins two result tables, so the statement in front of it has to end with RETURN"),
             "{err}"
         );
     }

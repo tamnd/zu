@@ -18,9 +18,9 @@ use zu_common::gqlstatus::codes;
 use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
-    self, BinaryOp, Clause, DeleteTarget, Expr, LabelExpr, Literal, NodePattern, PathMode,
-    Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, SortKey,
-    UnaryOp,
+    self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, LabelExpr, Literal, NodePattern,
+    PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto,
+    SetItem, SortKey, UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
@@ -731,6 +731,40 @@ pub struct BoundQuery {
     /// predicate can be printed with the names the query wrote rather
     /// than with the bits it compiled to.
     pub labels: Vec<String>,
+    /// The operands joined onto this one at the composite level, in
+    /// written order, empty for the ordinary query that is one linear
+    /// statement.
+    ///
+    /// Each carries a bound query of its own rather than more clauses,
+    /// because the operands of a set operator share nothing but their
+    /// columns: a variable one of them matched is not a variable the
+    /// other has, so each gets its own slot table and its own plan and
+    /// the operator meets them as two tables of rows.
+    pub conjoined: Vec<Conjoined>,
+}
+
+impl BoundQuery {
+    /// Whether this query is one linear statement, which is what every
+    /// caller that walks `clauses` alone is written for.
+    pub fn is_linear(&self) -> bool {
+        self.conjoined.is_empty()
+    }
+
+    /// Calls `f` on this query and on every operand joined to it.
+    pub fn walk(&self, f: &mut dyn FnMut(&BoundQuery)) {
+        f(self);
+        for joined in &self.conjoined {
+            joined.query.walk(f);
+        }
+    }
+}
+
+/// One operand of a composite query and the conjunction that joined it
+/// to what stands to its left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Conjoined {
+    pub how: Conjunction,
+    pub query: Box<BoundQuery>,
 }
 
 /// What a match does with the rows underneath it.
@@ -1344,19 +1378,122 @@ enum Projected {
 }
 
 /// Binds a parsed query against a schema.
+///
+/// A composite is bound operand by operand, left to right. Each gets a
+/// binder of its own, because the operands share no variables: what
+/// they do share is the parameter list, which is positional and belongs
+/// to the statement rather than to any one operand, so it is carried
+/// across and each operand's names are appended to it.
 pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
+    let mut operands = Vec::new();
+    let mut params = Vec::new();
+    collect_operands(&query.body, &mut operands);
+    let mut bound = bind_linear(operands[0].0, schema, &mut params)?;
+    for (linear, how) in &operands[1..] {
+        let how = how.expect("only the leftmost operand has no conjunction");
+        let right = bind_linear(linear, schema, &mut params)?;
+        // A statement that writes is taken apart at its write and run
+        // in parts, and a part is one pipeline. An operand of a
+        // composite is a second one, so the two cannot be the same
+        // statement yet, and saying so beats writing half of it.
+        for operand in [&bound, &right] {
+            if operand.clauses.iter().any(writes) {
+                return Err(invalid(
+                    "a statement that writes may not be an operand of a composite query, write it on its own".into(),
+                ));
+            }
+        }
+        agree_on_columns(&bound, &right, how)?;
+        bound.conjoined.push(Conjoined {
+            how,
+            query: Box::new(right),
+        });
+    }
+    // The parameter list is the statement's, so every operand's plan
+    // reads the same positions the caller filled in.
+    let all = params.clone();
+    bound.params = all.clone();
+    for joined in &mut bound.conjoined {
+        joined.query.params = all.clone();
+    }
+    Ok(bound)
+}
+
+/// Whether a bound clause changes the graph.
+fn writes(clause: &BoundClause) -> bool {
+    matches!(
+        clause,
+        BoundClause::Insert { .. } | BoundClause::Set { .. } | BoundClause::Delete { .. }
+    )
+}
+
+/// The operands of a composite in written order, each beside the
+/// conjunction that joined it to what stood to its left.
+fn collect_operands<'a>(
+    body: &'a ast::Composite,
+    out: &mut Vec<(&'a ast::Linear, Option<ast::Conjunction>)>,
+) {
+    match body {
+        ast::Composite::Linear(linear) => out.push((linear, None)),
+        ast::Composite::Conjoined { left, how, right } => {
+            collect_operands(left, out);
+            out.push((right, Some(*how)));
+        }
+    }
+}
+
+/// Refuses two operands whose result tables cannot meet.
+///
+/// A set operator reads two tables of rows column by column, so the
+/// operands have to have the same columns. The standard says the same
+/// of `OTHERWISE`, and for the same reason: whichever operand answers,
+/// the caller was promised one shape of answer.
+fn agree_on_columns(left: &BoundQuery, right: &BoundQuery, how: ast::Conjunction) -> Result<()> {
+    let word = match how {
+        ast::Conjunction::Otherwise => "OTHERWISE",
+        ast::Conjunction::Set { op, .. } => op.keyword(),
+    };
+    if left.columns.len() != right.columns.len() {
+        return Err(ZuError::gql(
+            codes::C42001,
+            format!(
+                "{word} joins two result tables, and these have {} and {} columns",
+                left.columns.len(),
+                right.columns.len()
+            ),
+        ));
+    }
+    for (a, b) in left.columns.iter().zip(&right.columns) {
+        if a != b {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "{word} joins two result tables column by column, and one calls a column '{a}' where the other calls it '{b}'"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Binds one linear query statement, appending whatever parameters it
+/// names to `params` so the positions stay the statement's.
+fn bind_linear(
+    linear: &ast::Linear,
+    schema: &Schema,
+    params: &mut Vec<String>,
+) -> Result<BoundQuery> {
     let mut binder = Binder {
         schema,
         variables: Vec::new(),
         scope: HashMap::new(),
-        params: Vec::new(),
+        params: std::mem::take(params),
         columns: Vec::new(),
         path_shapes: BTreeMap::new(),
         pending: Vec::new(),
         marks: None,
     };
     let mut clauses = Vec::new();
-    let ast::Composite::Linear(linear) = &query.body;
     // Where the clause stands in the whole query rather than in the
     // statement it was written in, because CALL runs over the graph and
     // a NEXT in front of it does not change that.
@@ -1392,6 +1529,7 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
             clauses.append(&mut binder.pending);
         }
     }
+    *params = binder.params.clone();
     Ok(BoundQuery {
         clauses,
         variables: binder.variables,
@@ -1399,6 +1537,7 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         columns: binder.columns,
         path_shapes: binder.path_shapes,
         labels: schema.labels.clone(),
+        conjoined: Vec::new(),
     })
 }
 
@@ -4245,5 +4384,94 @@ mod tests {
         let (rel, _) = &patterns[0].steps[0];
         assert_eq!(rel.mode, PathMode::Acyclic);
         assert_eq!(rel.selector, None);
+    }
+
+    /// Each operand binds on its own: its own variables, its own slots
+    /// and its own clauses, with the leftmost one holding the others
+    /// and naming the columns the caller gets.
+    #[test]
+    fn each_operand_of_a_composite_binds_on_its_own() {
+        let q = bound(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.id AS id \
+             UNION \
+             MATCH (c:Place) RETURN c.id AS id",
+        );
+        assert!(!q.is_linear());
+        assert_eq!(q.columns, ["id"]);
+        assert_eq!(q.conjoined.len(), 1);
+        let right = q.conjoined[0].query.as_ref();
+        assert_eq!(right.columns, ["id"], "the operands meet column by column");
+        assert!(right.is_linear());
+        assert_eq!(var(&q, "b").name, "b");
+        assert!(
+            right.variables.iter().all(|v| v.name != "b"),
+            "a variable the left bound is not a variable the right has"
+        );
+        assert!(
+            right.variables.iter().any(|v| v.name == "c"),
+            "the right bound what it wrote"
+        );
+        let mut operands = 0;
+        q.walk(&mut |_| operands += 1);
+        assert_eq!(operands, 2, "the query is both operands");
+    }
+
+    /// The parameters are positional and belong to the statement, not
+    /// to an operand of it, so the two operands see one list in the
+    /// order the reader wrote the names in.
+    #[test]
+    fn the_operands_share_one_parameter_list() {
+        let q = bound(
+            "MATCH (a:Person) WHERE a.id = $left RETURN a.id AS id \
+             UNION \
+             MATCH (b:Person) WHERE b.id = $right RETURN b.id AS id",
+        );
+        assert_eq!(q.params, ["left", "right"]);
+        assert_eq!(
+            q.conjoined[0].query.params, q.params,
+            "the same list, so a slot number means the same thing on either side"
+        );
+    }
+
+    /// A composite meets two result tables. A statement that writes
+    /// has no result table to offer, and letting one stand in an
+    /// operand would make how many times it ran depend on which side
+    /// the planner chose to build over.
+    #[test]
+    fn a_write_may_not_stand_in_an_operand() {
+        let e = bind_err(
+            "INSERT (x:Person) RETURN x.id AS id \
+             UNION \
+             MATCH (b:Person) RETURN b.id AS id",
+        );
+        assert!(e.contains("a statement that writes"), "got: {e}");
+        let e = bind_err(
+            "MATCH (b:Person) RETURN b.id AS id \
+             OTHERWISE \
+             INSERT (x:Person) RETURN x.id AS id",
+        );
+        assert!(e.contains("a statement that writes"), "got: {e}");
+    }
+
+    /// The operands are met column by column, so they have to have the
+    /// same columns, and the message says which pair did not match
+    /// rather than only that something did not.
+    #[test]
+    fn the_operands_have_to_agree_on_their_columns() {
+        let e = bind_err(
+            "MATCH (a:Person) RETURN a.id AS id \
+             UNION \
+             MATCH (b:Person) RETURN b.id AS id, b.id AS again",
+        );
+        assert!(e.contains("1 and 2 columns"), "got: {e}");
+        let e = bind_err(
+            "MATCH (a:Person) RETURN a.id AS id \
+             INTERSECT ALL \
+             MATCH (b:Person) RETURN b.id AS other",
+        );
+        assert!(
+            e.contains("'id' where the other calls it 'other'"),
+            "got: {e}"
+        );
     }
 }

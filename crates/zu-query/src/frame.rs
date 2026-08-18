@@ -58,6 +58,11 @@ fn refuse(reason: impl Into<String>) -> ZuError {
 /// engine never sees a schema, only widths and pointers, and mapping
 /// one to the other is the client's business because the client is
 /// what knows which Arrow it is holding.
+///
+/// It clones, because a description is pointers and widths and copying
+/// one copies no data. A client that registers the same columns on two
+/// connections describes them once.
+#[derive(Clone)]
 pub enum Layout {
     /// Integers of one width, signed or not, and what one of them has
     /// to be multiplied by to reach the unit its logical type counts
@@ -97,6 +102,7 @@ pub enum Layout {
 }
 
 /// One column of a frame as the caller describes it.
+#[derive(Clone)]
 pub struct Column {
     pub name: String,
     /// What a value read out of it is. The layout says how wide the

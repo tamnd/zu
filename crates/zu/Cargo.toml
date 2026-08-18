@@ -133,3 +133,7 @@ harness = false
 [[bench]]
 name = "convert"
 harness = false
+
+[[bench]]
+name = "density"
+harness = false

@@ -225,6 +225,12 @@ const NOTES: &[&str] = &[
      WALK repeats anything, ACYCLIC repeats no node, and SIMPLE repeats no node except that a \
      path may end where it began, so a cycle is a simple path and is not an acyclic one and \
      neither mode is a substitute for the other",
+    "a path variable binds the walk as a path value rather than as the list of the same \
+     elements, so PATH builds one, PATH_LENGTH counts its edges, ELEMENTS answers its nodes \
+     and edges as a list in the order they were walked, and two paths over the same elements \
+     compare equal; ELEMENTS is the one way to read what a path holds, since a path is a value \
+     of its own and nothing indexes into one, and it is refused on a list, which is already \
+     the list of its elements",
     "a YIELD after a match says which of the names it wrote leave it, and under what name, so \
      a name the yield does not carry is out of scope behind it and a name the match did not \
      write is refused; it narrows the columns and leaves the rows alone, so the rows a match \

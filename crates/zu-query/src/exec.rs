@@ -6058,6 +6058,20 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     ))),
                 }
             }
+            // ISO 20.9. The walk in the order it was taken, node then
+            // edge then node, which is the shape the path already
+            // holds, so the list is the same values under another
+            // type rather than a copy of anything.
+            Func::Elements => {
+                if *star || args.len() != 1 {
+                    return Err(invalid("elements() takes exactly one argument".into()));
+                }
+                match eval(ctx, &args[0])? {
+                    Value::Path(elements) => Ok(Value::List(elements)),
+                    Value::Null => Ok(Value::Null),
+                    other => Err(invalid(format!("elements() expects a path, got {other:?}"))),
+                }
+            }
             _ => Err(invalid(
                 "aggregate call outside a projection, this is a bug".into(),
             )),
@@ -6133,7 +6147,7 @@ impl AggState {
             Func::Min => Acc::Min(None),
             Func::Max => Acc::Max(None),
             Func::Collect => Acc::Collect(Vec::new()),
-            Func::Id | Func::Size | Func::Cardinality | Func::PathLength => {
+            Func::Id | Func::Size | Func::Cardinality | Func::PathLength | Func::Elements => {
                 unreachable!("scalar function as an aggregate")
             }
         };

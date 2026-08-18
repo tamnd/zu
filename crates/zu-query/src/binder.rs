@@ -1377,6 +1377,11 @@ pub enum Func {
     /// number of hops in the element list and not the element count:
     /// a two node path has three elements and a length of one.
     PathLength,
+    /// ISO 20.9. The elements of a path as a list, nodes and edges
+    /// alternating in the order the walk took them. It is the one way
+    /// to read what a path holds, since a path is a value rather than
+    /// a list and nothing else indexes into it.
+    Elements,
 }
 
 impl Func {
@@ -1393,6 +1398,7 @@ impl Func {
             "size" => Func::Size,
             "cardinality" => Func::Cardinality,
             "path_length" => Func::PathLength,
+            "elements" => Func::Elements,
             _ => return None,
         })
     }
@@ -3741,6 +3747,17 @@ impl Binder<'_> {
                     )));
                 }
                 Type::Int
+            }
+            // The elements of a path, and of nothing else: a list is
+            // already the list of its elements and answering it back
+            // would let a query that meant something else pass. The
+            // element type is ANY because the list holds nodes and
+            // edges together, which no narrower type covers.
+            Func::Elements => {
+                if !matches!(arg_ty, Type::Path | Type::Any) {
+                    return Err(bad_type(format!("elements() needs a path, got {arg_ty}")));
+                }
+                Type::List(Box::new(Type::Any))
             }
         };
         Ok((

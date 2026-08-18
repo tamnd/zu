@@ -25,6 +25,8 @@
 //! payload crc and every structural claim; the point path skips the crc
 //! by design and bounds every access instead.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use zu_common::{Result, ZuError};
 use zu_encoding::{EncodingId, fsst};
 
@@ -119,29 +121,67 @@ fn column_table(values: &[&[u8]]) -> (fsst::Table, u64, u64) {
 /// payload without a file around it.
 pub fn encode_payload(values: &[&[u8]], out: &mut Vec<u8>) -> Result<u64> {
     let chunk_count = values.len().div_ceil(CHUNK_ROWS);
-    let (table, fit_packed, fit_raw) = column_table(values);
+    let mut enc = ChunkEncoder::train(values);
     let mut body = Vec::new();
     let mut comp_ends = Vec::with_capacity(chunk_count);
     let mut raw_ends = Vec::with_capacity(chunk_count);
-    let mut zipped = Vec::new();
-    let mut packed = Vec::new();
-    let mut own = Vec::new();
     let mut raw_total = 0u64;
     let mut value_bytes = 0u64;
     for chunk in values.chunks(CHUNK_ROWS) {
-        zipped.clear();
+        let (raw, bytes) = enc.push(chunk, &mut body)?;
+        raw_total += raw;
+        value_bytes += bytes;
+        comp_ends.push(body.len() as u64);
+        raw_ends.push(raw_total);
+    }
+    lay_out(out, &comp_ends, &raw_ends, &body);
+    Ok(value_bytes)
+}
+
+/// One column's chunk encoder: the table the whole column is measured
+/// against, what it was worth on the sample it trained on, and the
+/// buffers every chunk reuses.
+struct ChunkEncoder {
+    table: fsst::Table,
+    fit_packed: u64,
+    fit_raw: u64,
+    zipped: Vec<u8>,
+    packed: Vec<u8>,
+    own: Vec<u8>,
+}
+
+impl ChunkEncoder {
+    fn train(values: &[&[u8]]) -> Self {
+        let (table, fit_packed, fit_raw) = column_table(values);
+        Self {
+            table,
+            fit_packed,
+            fit_raw,
+            zipped: Vec::new(),
+            packed: Vec::new(),
+            own: Vec::new(),
+        }
+    }
+
+    /// Zips one chunk, keeps whichever of plain and FSST is smaller and
+    /// appends it to `body`. Returns the chunk's zipped size and the
+    /// value bytes in it.
+    fn push(&mut self, chunk: &[&[u8]], body: &mut Vec<u8>) -> Result<(u64, u64)> {
+        self.zipped.clear();
+        let mut value_bytes = 0u64;
         for v in chunk {
-            if zipped.len() + 4 + v.len() > MAX_CHUNK_RAW {
+            if self.zipped.len() + 4 + v.len() > MAX_CHUNK_RAW {
                 return Err(ZuError::InvalidArgument(format!(
                     "fullzip chunk exceeds the {MAX_CHUNK_RAW} byte raw cap"
                 )));
             }
-            zipped.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            zipped.extend_from_slice(v);
+            self.zipped
+                .extend_from_slice(&(v.len() as u32).to_le_bytes());
+            self.zipped.extend_from_slice(v);
             value_bytes += v.len() as u64;
         }
-        packed.clear();
-        let mut packed_len = table.encode(&zipped, &mut packed);
+        self.packed.clear();
+        let mut packed_len = self.table.encode(&self.zipped, &mut self.packed);
         // Half again the bytes the column's own sample cost is the line
         // between a chunk of the column and a chunk of something else,
         // and only the second kind pays to be trained for. It is a loose
@@ -151,44 +191,47 @@ pub fn encode_payload(values: &[&[u8]], out: &mut Vec<u8>) -> Result<u64> {
         // is a seventh of a chunk this size and a fraction of a percent
         // of the sample, and comparing the two with it in would retrain
         // every chunk of every column.
-        let codes = (packed_len - table.header_len()) as u64;
-        if codes * 2 * fit_raw > fit_packed * 3 * zipped.len() as u64 {
-            own.clear();
-            let own_len = fsst::Table::train(&zipped).encode(&zipped, &mut own);
+        let codes = (packed_len - self.table.header_len()) as u64;
+        if codes * 2 * self.fit_raw > self.fit_packed * 3 * self.zipped.len() as u64 {
+            self.own.clear();
+            let own_len = fsst::Table::train(&self.zipped).encode(&self.zipped, &mut self.own);
             if own_len < packed_len {
-                std::mem::swap(&mut packed, &mut own);
+                std::mem::swap(&mut self.packed, &mut self.own);
                 packed_len = own_len;
             }
         }
-        if packed_len < zipped.len() {
+        if packed_len < self.zipped.len() {
             body.push(EncodingId::Fsst as u8);
-            body.extend_from_slice(&packed);
+            body.extend_from_slice(&self.packed);
         } else {
             body.push(EncodingId::Plain as u8);
-            body.extend_from_slice(&zipped);
+            body.extend_from_slice(&self.zipped);
         }
-        raw_total += zipped.len() as u64;
-        comp_ends.push(body.len() as u64);
-        raw_ends.push(raw_total);
+        Ok((self.zipped.len() as u64, value_bytes))
     }
-    out.reserve(4 + chunk_count * 16 + body.len());
-    out.extend_from_slice(&(chunk_count as u32).to_le_bytes());
-    for e in &comp_ends {
-        out.extend_from_slice(&e.to_le_bytes());
-    }
-    for e in &raw_ends {
-        out.extend_from_slice(&e.to_le_bytes());
-    }
-    out.extend_from_slice(&body);
-    Ok(value_bytes)
 }
 
-/// Encodes `values` chunk by chunk and writes the FullZip payload across
-/// freshly allocated blocks.
-pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentMeta> {
-    let mut payload = Vec::new();
-    let value_bytes = encode_payload(values, &mut payload)?;
-    let crc = crc32c::crc32c(&payload);
+/// Lays the chunk index and the body out as a payload.
+fn lay_out(out: &mut Vec<u8>, comp_ends: &[u64], raw_ends: &[u64], body: &[u8]) {
+    out.reserve(4 + comp_ends.len() * 16 + body.len());
+    out.extend_from_slice(&(comp_ends.len() as u32).to_le_bytes());
+    for e in comp_ends {
+        out.extend_from_slice(&e.to_le_bytes());
+    }
+    for e in raw_ends {
+        out.extend_from_slice(&e.to_le_bytes());
+    }
+    out.extend_from_slice(body);
+}
+
+/// Checksums a payload and writes it across freshly allocated blocks.
+fn store(
+    db: &mut Zu1File,
+    payload: &[u8],
+    value_count: u64,
+    value_bytes: u64,
+) -> Result<SegmentMeta> {
+    let crc = crc32c::crc32c(payload);
     let mut blocks = Vec::new();
     let mut block = vec![0u8; BLOCK_SIZE as usize];
     for part in payload.chunks(BLOCK_SIZE as usize) {
@@ -199,7 +242,7 @@ pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentM
         blocks.push(ptr);
     }
     Ok(SegmentMeta {
-        value_count: values.len() as u64,
+        value_count,
         payload_len: payload.len() as u64,
         uncompressed_bytes: value_bytes,
         min: 0,
@@ -209,6 +252,157 @@ pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentM
         sorted: false,
         blocks,
     })
+}
+
+/// Encodes `values` chunk by chunk and writes the FullZip payload across
+/// freshly allocated blocks.
+pub fn write_blob_segment(db: &mut Zu1File, values: &[&[u8]]) -> Result<SegmentMeta> {
+    let mut payload = Vec::new();
+    let value_bytes = encode_payload(values, &mut payload)?;
+    store(db, &payload, values.len() as u64, value_bytes)
+}
+
+/// Writes the segment a fold leaves behind when it changed `updates`
+/// and appended `appended` to `old`: the chunks holding a changed row
+/// are read and encoded again, and every other chunk keeps the bytes it
+/// already encodes to, index entries and all.
+///
+/// This is [`crate::segment::rewrite_segment`] for the byte side, and it
+/// saves more than that one does, because a blob chunk costs a symbol
+/// table to encode and a walk of its inline lengths to read. A one cell
+/// write into a 100k row string column used to decode the column into a
+/// vector per row and encode all 98 chunks of it back; now it touches
+/// the one chunk the row is in. The table is trained on the rows that
+/// are about to be written rather than on the column, which is exactly
+/// what the rewrite exists to avoid reading, and a chunk carries its own
+/// table when it needs one, so a chunk encoded now still decodes beside
+/// chunks encoded against an older table.
+pub fn rewrite_blob_segment(
+    db: &mut Zu1File,
+    old: &SegmentMeta,
+    updates: &BTreeMap<u64, Vec<u8>>,
+    appended: &[Vec<u8>],
+) -> Result<SegmentMeta> {
+    let base = old.value_count;
+    if let Some((&row, _)) = updates.iter().next_back()
+        && row >= base
+    {
+        return Err(ZuError::InvalidArgument(format!(
+            "update at row {row} past the {base} rows the segment holds"
+        )));
+    }
+    let new_count = base + appended.len() as u64;
+    let old_chunks = old.chunk_count();
+    let payload = read_payload(db, old)?;
+    let head = payload.get(..4).ok_or_else(|| corrupt("truncated index"))?;
+    if u32::from_le_bytes(head.try_into().unwrap()) as usize != old_chunks {
+        return Err(corrupt("chunk count disagrees with meta"));
+    }
+    let index = payload
+        .get(4..4 + old_chunks * 16)
+        .ok_or_else(|| corrupt("truncated index"))?;
+    let body = &payload[4 + old_chunks * 16..];
+    let at = |i: usize| u64::from_le_bytes(index[i * 8..i * 8 + 8].try_into().unwrap());
+    // A chunk is kept when nothing wrote into it and it holds the rows
+    // it used to. The last chunk of a column that grew is neither, and
+    // short of the row count nothing about a chunk is the same.
+    let dirty: BTreeSet<usize> = updates
+        .keys()
+        .map(|&row| row as usize / CHUNK_ROWS)
+        .collect();
+    let chunk_count = (new_count as usize).div_ceil(CHUNK_ROWS);
+    let rows_in = |i: usize| ((i + 1) * CHUNK_ROWS).min(new_count as usize) - i * CHUNK_ROWS;
+    let kept = |i: usize| i < old_chunks && !dirty.contains(&i) && old.chunk_rows(i) == rows_in(i);
+
+    // The rows of the chunks that have to be encoded again, gathered
+    // first so the table trains on them. The copy per row is what the
+    // old path paid for the whole column and this one pays for the
+    // chunks a statement wrote into.
+    let mut rebuilt: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
+    for i in (0..chunk_count).filter(|&i| !kept(i)) {
+        let lo = i * CHUNK_ROWS;
+        let hi = lo + rows_in(i);
+        let mut rows: Vec<Vec<u8>> = Vec::with_capacity(hi - lo);
+        let held = hi.min(base as usize);
+        if lo < held {
+            let (mut bytes, mut ends) = (Vec::new(), Vec::new());
+            read_blob_range(db, old, lo as u64, held as u64, &mut bytes, &mut ends)?;
+            let mut start = 0usize;
+            for &end in &ends {
+                rows.push(bytes[start..end as usize].to_vec());
+                start = end as usize;
+            }
+        }
+        for row in lo.max(held)..hi {
+            rows.push(appended[row - base as usize].clone());
+        }
+        for (&row, value) in updates.range(lo as u64..hi as u64) {
+            rows[row as usize - lo] = value.clone();
+        }
+        rebuilt.push((i, rows));
+    }
+
+    let sample: Vec<&[u8]> = rebuilt
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|v| v.as_slice()))
+        .collect();
+    let mut enc = ChunkEncoder::train(&sample);
+    let mut out = Vec::with_capacity(body.len());
+    let mut comp_ends = Vec::with_capacity(chunk_count);
+    let mut raw_ends = Vec::with_capacity(chunk_count);
+    let mut raw_total = 0u64;
+    let mut value_bytes = 0u64;
+    let mut prev_comp = 0usize;
+    let mut prev_raw = 0u64;
+    let mut fresh = rebuilt.iter();
+    for i in 0..chunk_count {
+        let span = match i < old_chunks {
+            true => {
+                let comp_end = at(i) as usize;
+                let raw_end = at(old_chunks + i);
+                if comp_end < prev_comp || comp_end > body.len() {
+                    return Err(corrupt("chunk index not monotone"));
+                }
+                let raw_size = raw_end
+                    .checked_sub(prev_raw)
+                    .ok_or_else(|| corrupt("chunk index not monotone"))?;
+                let span = (prev_comp..comp_end, raw_size);
+                prev_comp = comp_end;
+                prev_raw = raw_end;
+                Some(span)
+            }
+            false => None,
+        };
+        match kept(i) {
+            true => {
+                let (span, raw_size) =
+                    span.ok_or_else(|| corrupt("kept chunk past the old end"))?;
+                if raw_size > MAX_CHUNK_RAW as u64 {
+                    return Err(corrupt("chunk above the raw cap"));
+                }
+                // The zipped form is a `len: u32` before each row's
+                // bytes, so what the meta counts is the chunk without
+                // its lengths.
+                value_bytes += raw_size
+                    .checked_sub(4 * rows_in(i) as u64)
+                    .ok_or_else(|| corrupt("chunk shorter than its row lengths"))?;
+                out.extend_from_slice(&body[span]);
+                raw_total += raw_size;
+            }
+            false => {
+                let (_, rows) = fresh.next().expect("one per chunk not kept");
+                let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+                let (raw, bytes) = enc.push(&refs, &mut out)?;
+                raw_total += raw;
+                value_bytes += bytes;
+            }
+        }
+        comp_ends.push(out.len() as u64);
+        raw_ends.push(raw_total);
+    }
+    let mut payload_out = Vec::new();
+    lay_out(&mut payload_out, &comp_ends, &raw_ends, &out);
+    store(db, &payload_out, new_count, value_bytes)
 }
 
 /// One chunk's zipped bytes: borrowed straight from a plain chunk,
@@ -354,6 +548,19 @@ pub fn read_blob_segment(
     bytes_out: &mut Vec<u8>,
     ends_out: &mut Vec<u64>,
 ) -> Result<()> {
+    let payload = read_payload(db, meta)?;
+    decode_payload(
+        &payload,
+        meta.value_count,
+        meta.uncompressed_bytes,
+        bytes_out,
+        ends_out,
+    )
+}
+
+/// The whole payload of a segment, block by block, verified against the
+/// length and the checksum the meta claims.
+fn read_payload(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Vec<u8>> {
     if meta.structural != Structural::FullZip {
         return Err(corrupt("FullZip reader given a MiniBlock segment"));
     }
@@ -371,13 +578,7 @@ pub fn read_blob_segment(
     if crc32c::crc32c(&payload) != meta.crc {
         return Err(corrupt("payload crc mismatch"));
     }
-    decode_payload(
-        &payload,
-        meta.value_count,
-        meta.uncompressed_bytes,
-        bytes_out,
-        ends_out,
-    )
+    Ok(payload)
 }
 
 /// Point access: appends values `[start, end)` to `bytes_out` and their
@@ -654,6 +855,125 @@ mod tests {
         let (mut bytes, mut ends) = (Vec::new(), Vec::new());
         read_blob_segment(&mut db, &meta, &mut bytes, &mut ends).unwrap();
         assert!(bytes.is_empty() && ends.is_empty());
+    }
+
+    /// Every value of a segment, as the readers hand them back.
+    fn all(db: &mut Zu1File, meta: &SegmentMeta) -> Vec<Vec<u8>> {
+        let (mut bytes, mut ends) = (Vec::new(), Vec::new());
+        read_blob_segment(db, meta, &mut bytes, &mut ends).unwrap();
+        (0..ends.len())
+            .map(|i| value(&bytes, &ends, i).to_vec())
+            .collect()
+    }
+
+    /// The compressed size of each chunk of a segment, which is what a
+    /// copied chunk keeps and a re-encoded one is free to change.
+    fn spans(db: &mut Zu1File, meta: &SegmentMeta) -> Vec<u64> {
+        let payload = read_payload(db, meta).unwrap();
+        let chunks = meta.chunk_count();
+        let at = |i: usize| u64::from_le_bytes(payload[4 + i * 8..12 + i * 8].try_into().unwrap());
+        (0..chunks)
+            .map(|i| at(i) - if i == 0 { 0 } else { at(i - 1) })
+            .collect()
+    }
+
+    /// A rewritten segment holds what a full write of the same rows
+    /// would, whatever the write did: change a row, empty one, grow the
+    /// last chunk, add chunks past it, or all of that at once.
+    #[test]
+    fn a_rewrite_holds_what_a_full_write_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("fz.zu1")).unwrap();
+        // 4500 rows, so the last chunk is a short one and appends have
+        // to extend it before they open a new one.
+        let base = urls(4500);
+        let meta = write_blob_segment(&mut db, &refs(&base)).unwrap();
+        let cases: Vec<(Vec<u64>, usize)> = vec![
+            (vec![], 0),
+            (vec![0], 0),
+            (vec![4499], 0),
+            (vec![0, 1023, 1024, 2047, 4499], 0),
+            (vec![], 7),
+            (vec![17], 700),
+            (vec![1, 4400], 1500),
+        ];
+        for (rows, grow) in cases {
+            let updates: BTreeMap<u64, Vec<u8>> = rows
+                .iter()
+                .enumerate()
+                .map(|(k, &row)| {
+                    let v = match k % 3 {
+                        0 => format!("rewritten row {row}").into_bytes(),
+                        1 => Vec::new(),
+                        _ => vec![b'x'; 3000],
+                    };
+                    (row, v)
+                })
+                .collect();
+            let appended: Vec<Vec<u8>> = (0..grow)
+                .map(|i| format!("https://example.com/added/{i}").into_bytes())
+                .collect();
+            let mut want = base.clone();
+            for (&row, v) in &updates {
+                want[row as usize] = v.clone();
+            }
+            want.extend(appended.iter().cloned());
+
+            let got = rewrite_blob_segment(&mut db, &meta, &updates, &appended).unwrap();
+            let fresh = write_blob_segment(&mut db, &refs(&want)).unwrap();
+            let case = format!("{rows:?} +{grow}");
+            assert_eq!(got.value_count, want.len() as u64, "{case}");
+            assert_eq!(got.uncompressed_bytes, fresh.uncompressed_bytes, "{case}");
+            assert_eq!(all(&mut db, &got), want, "{case}");
+        }
+    }
+
+    /// The point of the rewrite: a chunk no write named keeps the bytes
+    /// it already encodes to, so a one cell change into a 4500 row
+    /// column re-encodes one chunk of the five and copies the rest.
+    #[test]
+    fn a_rewrite_copies_the_chunks_no_write_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("fz.zu1")).unwrap();
+        let base = urls(4500);
+        let meta = write_blob_segment(&mut db, &refs(&base)).unwrap();
+        let before = spans(&mut db, &meta);
+        let updates =
+            BTreeMap::from([(2000u64, b"https://example.com/user/1/posts?page=1".to_vec())]);
+        let got = rewrite_blob_segment(&mut db, &meta, &updates, &[]).unwrap();
+        let after = spans(&mut db, &got);
+        assert_eq!(after.len(), before.len());
+        for i in 0..before.len() {
+            match i == 1 {
+                true => continue,
+                false => assert_eq!(after[i], before[i], "chunk {i} was re-encoded"),
+            }
+        }
+    }
+
+    /// Growing an empty column is the first fold of every new column,
+    /// and it has no old chunk to copy from.
+    #[test]
+    fn a_rewrite_grows_an_empty_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("fz.zu1")).unwrap();
+        let meta = write_blob_segment(&mut db, &[]).unwrap();
+        let appended = urls(2500);
+        let got = rewrite_blob_segment(&mut db, &meta, &BTreeMap::new(), &appended).unwrap();
+        assert_eq!(all(&mut db, &got), appended);
+    }
+
+    #[test]
+    fn a_rewrite_refuses_an_update_past_the_rows_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("fz.zu1")).unwrap();
+        let base = urls(100);
+        let meta = write_blob_segment(&mut db, &refs(&base)).unwrap();
+        let updates = BTreeMap::from([(100u64, b"past the end".to_vec())]);
+        assert!(rewrite_blob_segment(&mut db, &meta, &updates, &[]).is_err());
+        let mut fake = meta.clone();
+        fake.structural = Structural::MiniBlock;
+        assert!(rewrite_blob_segment(&mut db, &fake, &BTreeMap::new(), &[]).is_err());
     }
 
     #[test]

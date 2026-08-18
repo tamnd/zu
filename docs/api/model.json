@@ -6239,6 +6239,13 @@
       "doc": "Reads a segment back, verifying the payload crc, and appends every\nvalue to `bytes_out` and `ends_out` as [`decode_payload`] does."
     },
     {
+      "id": "zu::zu1::fullzip::rewrite_blob_segment",
+      "kind": "function",
+      "name": "rewrite_blob_segment",
+      "signature": "fn rewrite_blob_segment(db: &mut zu_zu1::file::Zu1File, old: &zu_zu1::segment::SegmentMeta, updates: &std::collections::BTreeMap<u64, Vec<u8>>, appended: &[Vec<u8>]) -> zu_common::Result<zu_zu1::segment::SegmentMeta>",
+      "doc": "Writes the segment a fold leaves behind when it changed `updates`\nand appended `appended` to `old`: the chunks holding a changed row\nare read and encoded again, and every other chunk keeps the bytes it\nalready encodes to, index entries and all.\n\nThis is [`crate::segment::rewrite_segment`] for the byte side, and it\nsaves more than that one does, because a blob chunk costs a symbol\ntable to encode and a walk of its inline lengths to read. A one cell\nwrite into a 100k row string column used to decode the column into a\nvector per row and encode all 98 chunks of it back; now it touches\nthe one chunk the row is in. The table is trained on the rows that\nare about to be written rather than on the column, which is exactly\nwhat the rewrite exists to avoid reading, and a chunk carries its own\ntable when it needs one, so a chunk encoded now still decodes beside\nchunks encoded against an older table."
+    },
+    {
       "id": "zu::zu1::fullzip::write_blob_segment",
       "kind": "function",
       "name": "write_blob_segment",

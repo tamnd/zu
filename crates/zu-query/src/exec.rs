@@ -885,6 +885,7 @@ fn op_label(
             target,
             edge_filter,
             reach,
+            counts,
             chunk,
             ..
         } => {
@@ -907,8 +908,13 @@ fn op_label(
             });
             // The walk that keeps endpoints rather than paths reads
             // as `reach`, because the row count it produces is the
-            // reachable set and not the path count.
-            let kind = if *reach { " reach" } else { "" };
+            // reachable set and not the path count. The one that counts
+            // the paths without building them reads as `count`.
+            let kind = match (*reach, *counts) {
+                (true, _) => " reach",
+                (_, true) => " count",
+                _ => "",
+            };
             (
                 "VarExpand",
                 format!(
@@ -1312,6 +1318,16 @@ enum OpDesc {
         /// set. The walk then visits each node once instead of once
         /// per path. See [`rewrite_reach_varlen`].
         reach: bool,
+        /// Count mode, the PMR half of the count-to-degree rewrite
+        /// (docs/07 §5): nothing reads this chunk but one bare count,
+        /// so the walk counts the paths off the shortest-path DAG
+        /// instead of building them. A node's paths are its
+        /// predecessors' paths added up, which is one pass over the
+        /// levelled graph where enumerating is one walk per path, and
+        /// there can be exponentially many of those between the same
+        /// two nodes. Set only under a shortest selector, where the
+        /// levels make the graph acyclic and the sum is exact.
+        counts: bool,
         chunk: usize,
     },
     /// Both endpoints bound: an edge probe instead of a list read.
@@ -1866,6 +1882,7 @@ fn compile_match_op(
                     edge_filter: v.edge_filter.clone(),
                     edge_slot: v.edge_slot,
                     reach: false,
+                    counts: false,
                     chunk,
                 });
                 b.produced(chunk);
@@ -2084,6 +2101,16 @@ fn post_refs(post: &[PostOp], out: &mut BTreeSet<usize>) {
 /// inside the degree sum. Runs after the sink's own flattens, so a key
 /// or filter that reads either chunk has already shown up in the
 /// reference walk and blocks the rewrite.
+///
+/// A variable-length walk under a shortest selector takes the same
+/// rewrite and answers it off the PMR (docs/07 §5): the levels make
+/// the searched graph acyclic, so a node's shortest paths are its
+/// predecessors' shortest paths added up and the whole count is one
+/// breadth-first pass. Enumerating instead is one walk per path, and
+/// two nodes can have exponentially many shortest paths between them,
+/// so this is the difference between a number and a search that does
+/// not finish. `ANY SHORTEST` keeps one path per endpoint by
+/// definition and counts its endpoints.
 fn rewrite_count_expand(
     b: &mut StageBuilder,
     items: &[BoundItem],
@@ -2217,8 +2244,30 @@ fn rewrite_count_expand(
     else {
         return;
     };
-    let OpDesc::Expand { from, chunk: c, .. } = b.descs[target] else {
-        return;
+    // The counting expand, and the walk that counts paths the same
+    // way. A shortest walk is the one kind of walk whose paths can be
+    // counted without being built: the levels make the graph acyclic,
+    // so a node's paths are its predecessors' paths added up. A walk
+    // that already answers one path per endpoint is pinned to a single
+    // far node, or keeps endpoints rather than paths, has nothing to
+    // count this way and is left alone.
+    let (c, walk) = match &b.descs[target] {
+        OpDesc::Expand { chunk, .. } => (*chunk, false),
+        OpDesc::VarExpand {
+            chunk,
+            selector,
+            min,
+            target: None,
+            reach: false,
+            ..
+        } if matches!(
+            selector,
+            Some(Selector::AnyShortest | Selector::AllShortest)
+        ) && *min <= 1 =>
+        {
+            (*chunk, true)
+        }
+        _ => return,
     };
     // Flat mode, or something read the chunk flat: no factorized count
     // to serve.
@@ -2270,6 +2319,15 @@ fn rewrite_count_expand(
         }
         _ => return,
     }
+    if walk {
+        if let OpDesc::VarExpand { counts, .. } = &mut b.descs[target] {
+            *counts = true;
+        }
+        return;
+    }
+    let OpDesc::Expand { from, .. } = b.descs[target] else {
+        unreachable!("the fixed-length arm above matched an expand")
+    };
     let mut absorb = None;
     if target > 0
         && let OpDesc::Flatten { chunk: f } = b.descs[target - 1]
@@ -3088,7 +3146,12 @@ struct VarSpec<'a> {
     min: u64,
     max: Option<u64>,
     mode: PathMode,
-    levels: Option<&'a BTreeMap<(u32, u64), u64>>,
+    /// The levelled graph a shortest walk runs down, `None` for a walk
+    /// that reads the graph itself. Every hop of it is a hop of some
+    /// shortest path, so the walk follows it without asking storage
+    /// anything and without checking the mode's repeat rule: a
+    /// shortest path repeats no node, so every mode allows it.
+    steps: Option<&'a Steps>,
     gate: EdgeGate<'a>,
 }
 
@@ -3379,17 +3442,24 @@ fn enumerate_paths(
         // there is nothing legal left to walk.
         return Ok(());
     }
-    for (rel_val, next_table, next_offset) in
-        hop_edges(ctx, spec.rels, spec.direction, spec.gate, table, offset)?
-    {
-        if let Some(levels) = spec.levels {
-            if levels.get(&(next_table, next_offset)) != Some(&(depth + 1)) {
-                continue;
-            }
-        } else {
+    // The levelled walk reads its hops out of the DAG the prepass
+    // built, which is the point of building one: a node is reached by
+    // one path prefix per path through it, and asking storage again
+    // for each of those is the read the DAG spends memory to remove.
+    let read;
+    let hops: &[(Value, u32, u64)] = match spec.steps {
+        Some(steps) => steps.get(&(table, offset)).map_or(&[][..], Vec::as_slice),
+        None => {
+            read = hop_edges(ctx, spec.rels, spec.direction, spec.gate, table, offset)?;
+            &read
+        }
+    };
+    for (rel_val, next_table, next_offset) in hops {
+        let (next_table, next_offset) = (*next_table, *next_offset);
+        if spec.steps.is_none() {
             let repeats = match spec.mode {
                 PathMode::Walk => false,
-                PathMode::Trail => chain_has_rel(link, &rel_val),
+                PathMode::Trail => chain_has_rel(link, rel_val),
                 PathMode::Acyclic => chain_has_node(link, next_table, next_offset),
                 // The step back to the start is the one repeat SIMPLE
                 // allows, and the guard above stops the path there.
@@ -3404,7 +3474,7 @@ fn enumerate_paths(
         }
         let child = Arc::new(PathLink {
             prev: Some(link.clone()),
-            rel: Some(rel_val),
+            rel: Some(rel_val.clone()),
             node: Value::Node {
                 table: next_table,
                 offset: next_offset,
@@ -3558,42 +3628,83 @@ fn chain_root(table: u32, offset: u64) -> Arc<PathLink> {
     })
 }
 
+/// The shortest-path DAG as a walk that is going to run over it reads
+/// it: the hops leaving one node that land a level further out, in the
+/// order storage handed them back.
+type Steps = BTreeMap<(u32, u64), Vec<(Value, u32, u64)>>;
+
 /// The breadth-first prepass behind the SHORTEST selectors: minimum
 /// hop counts from the start node within the hop window, the first
 /// discovered parent hop per node, and nodes in discovery order.
 /// Frontiers expand in discovery order and neighbors in storage order,
 /// so levels, parents, and order are all deterministic. ANY SHORTEST
 /// walks the parent chain for one canonical path per endpoint; ALL
-/// SHORTEST hands the level map to [`enumerate_paths`].
+/// SHORTEST reads the DAG below.
 struct HopLevels {
     levels: BTreeMap<(u32, u64), u64>,
     parents: BTreeMap<(u32, u64), (Value, u32, u64)>,
     order: Vec<(u32, u64)>,
+    /// The levelled graph itself, kept when the caller asks for it:
+    /// every hop of it is a hop of some shortest path, and every
+    /// shortest path is a walk down it. This is the PMR of docs/07 §5,
+    /// the multiset of paths held as the graph that spells them rather
+    /// than as the paths. Empty when the caller did not ask.
+    steps: Steps,
+    /// How many shortest paths reach each node, which is its
+    /// predecessors' counts added up. Empty when the caller did not
+    /// ask for the DAG, since this is read off it.
+    paths: BTreeMap<(u32, u64), u64>,
 }
 
+/// `dag` asks for the levelled graph and the path counts over it. A
+/// walk that is about to enumerate wants them: the alternative is
+/// reading each node's neighbors again for every path prefix that
+/// reaches it, and there is one prefix per path. A walk that only
+/// wants one canonical path per endpoint does not, and pays neither.
 fn hop_levels(
     ctx: &mut StageCtx,
     rels: &[RelStep],
     direction: RelDirection,
     gate: EdgeGate<'_>,
     max: Option<u64>,
-    table: u32,
-    offset: u64,
+    from: NodeAt,
+    dag: bool,
 ) -> Result<HopLevels> {
     let mut bfs = HopLevels {
         levels: BTreeMap::new(),
         parents: BTreeMap::new(),
-        order: vec![(table, offset)],
+        order: vec![from],
+        steps: BTreeMap::new(),
+        paths: BTreeMap::new(),
     };
-    bfs.levels.insert((table, offset), 0);
-    let mut frontier = vec![(table, offset)];
+    bfs.levels.insert(from, 0);
+    if dag {
+        // The start is reached by the one path of no hops.
+        bfs.paths.insert(from, 1);
+    }
+    let mut frontier = vec![from];
     let mut depth = 0u64;
     while !frontier.is_empty() && max.is_none_or(|m| depth < m) {
         depth += 1;
         let mut next = Vec::new();
         for (t, o) in frontier {
             for (rel_val, nt, no) in hop_edges(ctx, rels, direction, gate, t, o)? {
-                if bfs.levels.contains_key(&(nt, no)) {
+                let seen = bfs.levels.get(&(nt, no)).copied();
+                if dag && seen.unwrap_or(depth) == depth {
+                    // A hop of the levelled graph, whether or not it is
+                    // the one that discovered the far node: every way
+                    // in from the level behind is another path, and
+                    // parallel edges between the same two nodes are
+                    // different paths for the same reason.
+                    let reaching = bfs.paths.get(&(t, o)).copied().unwrap_or(0);
+                    let at = bfs.paths.entry((nt, no)).or_insert(0);
+                    *at = at.saturating_add(reaching);
+                    bfs.steps
+                        .entry((t, o))
+                        .or_default()
+                        .push((rel_val.clone(), nt, no));
+                }
+                if seen.is_some() {
                     continue;
                 }
                 bfs.levels.insert((nt, no), depth);
@@ -4394,6 +4505,69 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             c.cur = None;
             return Ok(true);
         },
+        // Count mode: nothing reads this chunk's values but one bare
+        // count, so the walk counts the shortest paths off the levelled
+        // graph and materializes none of them. A node's count is its
+        // predecessors' counts added up, which the prepass does as it
+        // levels, so this is one breadth-first pass where enumerating
+        // is one walk per path and there can be exponentially many
+        // paths between two nodes.
+        OpDesc::VarExpand {
+            from,
+            direction,
+            rels,
+            min,
+            max,
+            selector,
+            to_tables,
+            edge_filter,
+            edge_slot,
+            counts: true,
+            chunk,
+            ..
+        } => loop {
+            if !next(descs, ctx, i - 1)? {
+                return Ok(false);
+            }
+            let v = value_of(ctx, *from)?;
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let (table, offset) = node_value(v, "var expand")?;
+            let gate = match (edge_filter.as_ref(), *edge_slot) {
+                (Some(expr), Some(slot)) => EdgeGate {
+                    expr: Some(expr),
+                    slot: Some(slot),
+                },
+                _ => EdgeGate::OPEN,
+            };
+            // ANY SHORTEST keeps one path per endpoint however many
+            // there are, so its count is the endpoints and the DAG is
+            // not worth building.
+            let all = *selector == Some(Selector::AllShortest);
+            let bfs = hop_levels(ctx, rels, *direction, gate, *max, (table, offset), all)?;
+            let mut total = 0u64;
+            for (at, level) in &bfs.levels {
+                if *level < *min || !to_tables.contains(&at.0) {
+                    continue;
+                }
+                let paths = match all {
+                    true => bfs.paths.get(at).copied().unwrap_or(0),
+                    false => 1,
+                };
+                total = total.saturating_add(paths);
+            }
+            if total == 0 {
+                continue;
+            }
+            let c = &mut ctx.chunks[*chunk];
+            c.size = usize::try_from(total).unwrap_or(usize::MAX);
+            for col in &mut c.cols {
+                col.clear();
+            }
+            c.cur = None;
+            return Ok(true);
+        },
         OpDesc::VarExpand {
             from,
             direction,
@@ -4407,6 +4581,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             edge_filter,
             edge_slot,
             reach,
+            counts: false,
             chunk,
         } => loop {
             if !next(descs, ctx, i - 1)? {
@@ -4475,7 +4650,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 // Chains build in discovery order, so a node's parent
                 // chain always exists before its own and every
                 // endpoint's path is one `Arc` clone.
-                let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
+                let bfs = hop_levels(ctx, rels, *direction, gate, *max, (table, offset), false)?;
                 let mut chains: BTreeMap<(u32, u64), Arc<PathLink>> = BTreeMap::new();
                 chains.insert((table, offset), chain_root(table, offset));
                 for &(t, o) in &bfs.order {
@@ -4508,7 +4683,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 // ALL SHORTEST. The level map cuts the walk down to the
                 // shortest-path DAG, so every path it finds is one of
                 // the shortest and the walk keeps the lot.
-                let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
+                let bfs = hop_levels(ctx, rels, *direction, gate, *max, (table, offset), true)?;
                 let spec = VarSpec {
                     rels,
                     direction: *direction,
@@ -4516,7 +4691,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     min: *min,
                     max: *max,
                     mode: *mode,
-                    levels: Some(&bfs.levels),
+                    steps: Some(&bfs.steps),
                     gate,
                 };
                 let root = chain_root(table, offset);
@@ -4531,7 +4706,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                     min: *min,
                     max: *max,
                     mode: *mode,
-                    levels: None,
+                    steps: None,
                     gate,
                 };
                 if *reach {
@@ -9377,6 +9552,76 @@ mod tests {
     }
 
     #[test]
+    fn shortest_paths_are_counted_without_being_built() {
+        // The walk above, counted rather than built. Six shortest
+        // paths reach the five endpoints, node 2 holding two of them,
+        // and ANY SHORTEST keeps one per endpoint however many there
+        // are, so the two selectors count differently over the same
+        // graph.
+        for (selector, want) in [("ALL", 6), ("ANY", 5)] {
+            let text = format!(
+                "MATCH {selector} SHORTEST (a:Person {{id: 3}})-[r:KNOWS*]-(b) RETURN count(*) AS n"
+            );
+            assert_eq!(int_rows(&run(&text, &[])), [[want]], "{selector} SHORTEST");
+            let (_, p) = profiled(&text, &[]);
+            let counted = p
+                .stages
+                .iter()
+                .flat_map(|s| &s.ops)
+                .any(|o| o.kind == "VarExpand" && o.detail.contains(" count "));
+            assert!(counted, "{selector} SHORTEST did not count off the DAG");
+        }
+        // A bare count of the endpoint is the same count, and it is the
+        // rewrite that has to say so: the walk it counts materializes
+        // no endpoint to count.
+        let r = run(
+            "MATCH ALL SHORTEST (a:Person {id: 3})-[r:KNOWS*]-(b) RETURN count(b) AS n",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[6]]);
+    }
+
+    #[test]
+    fn counting_paths_agrees_with_building_them() {
+        // Flat mode enumerates every path and counts the rows, which is
+        // the oracle the DAG sum is checked against: every seed, both
+        // selectors, both directions, and the hop windows the levels
+        // are allowed to answer.
+        for id in 0..6 {
+            for selector in ["ALL", "ANY"] {
+                for arrow in ["-[r:KNOWS*]->", "-[r:KNOWS*]-", "-[r:KNOWS*1..2]->"] {
+                    let text = format!(
+                        "MATCH {selector} SHORTEST (a:Person {{id: {id}}}){arrow}(b)                          RETURN count(*) AS n"
+                    );
+                    let counted = run(&text, &[]);
+                    let built = run_opts(
+                        &text,
+                        &[],
+                        Options {
+                            flat: true,
+                            ..Options::default()
+                        },
+                    );
+                    assert_eq!(int_rows(&counted), int_rows(&built), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_counted_walk_that_reads_its_paths_still_builds_them() {
+        // Anything read off the walk besides the one count blocks the
+        // rewrite, because a count off the DAG is a number and not a
+        // set of paths.
+        let r = run(
+            "MATCH ALL SHORTEST (a:Person {id: 3})-[r:KNOWS*]-(b) \
+             RETURN b.id AS b, count(*) AS n ORDER BY b",
+            &[],
+        );
+        assert_eq!(int_rows(&r), [[0, 1], [1, 1], [2, 2], [4, 1], [5, 1]]);
+    }
+
+    #[test]
     fn shortest_selectors_agree_with_trail_minimums() {
         // On the directed graph every endpoint's shortest path is
         // unique, so ANY, ALL, and a minimum over plain trails agree.
@@ -9733,7 +9978,7 @@ mod tests {
             min: 1,
             max: Some(6),
             mode: PathMode::Trail,
-            levels: None,
+            steps: None,
             gate: EdgeGate::OPEN,
         };
         let root = chain_root(0, 0);

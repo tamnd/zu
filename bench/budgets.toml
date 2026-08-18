@@ -1746,3 +1746,24 @@ convert_nodes_s = 350000.0
 # size lands on. Lower these ceilings, never raise them.
 density_closed_prop_bits = 96.0
 density_schemaless_prop_bits = 128.0
+
+# Counting shortest paths against building them (perf/06, zu#77),
+# benches/paths.rs. A layered graph, six nodes per layer and seven
+# layers, so 335922 paths of least length leave the source and the
+# whole count is a sum the bench checks by hand.
+#
+# The count is answered off the levelled graph the breadth-first
+# prepass builds: a node's shortest paths are its predecessors' added
+# up, so it is one pass over 43 nodes whatever the paths multiply out
+# to. The local M series reads 29.8 us against 53381.2 us before this
+# was a sum rather than a walk, and the enumeration of the same paths
+# on the same run reads 68549.5 us.
+#
+# The ratio is the gate that matters and the one that holds still
+# across hosts: it says the count is not quietly walking the paths.
+# Measured 0.00043, held to a hundredth, which is a factor of twenty
+# three of headroom and still fails the moment counting turns back into
+# enumerating. The microsecond ceiling is the backstop, set well above
+# the reading so a slower box passes.
+paths_count_us = 2000.0
+paths_count_over_enumerate_x = 0.01

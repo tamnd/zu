@@ -172,6 +172,78 @@ fn peel_exists<'a>(expr: &'a Expr, out: &mut Vec<ExistsBlock<'a>>) -> Option<Exp
     }
 }
 
+/// One edge pattern of a list, as edge distinctness reads it: what it
+/// was written as, what it bound, and the two ends it joins.
+struct Step<'a> {
+    pat: &'a ast::RelPattern,
+    rel: &'a BoundRel,
+    ends: (usize, usize),
+}
+
+/// Whether two steps join the same pair of ends, which is what makes
+/// one edge able to answer both.
+///
+/// A step written `-[]->` takes its ends in the order they stand and
+/// one written `<-[]-` takes them the other way round, so those two
+/// have to agree on which end an edge leaves and which it reaches. The
+/// five spellings that read an edge either way round have no such
+/// order, and one of those beside anything else agrees when the pair is
+/// the same pair, `(a)~[e]~(b)` and `(b)~[f]~(a)` alike.
+fn same_ends(left: &Step<'_>, right: &Step<'_>) -> bool {
+    let one_way = |dir: RelDirection| matches!(dir, RelDirection::Out | RelDirection::In);
+    let ordered = |step: &Step<'_>| match step.rel.direction {
+        RelDirection::In => (step.ends.1, step.ends.0),
+        _ => step.ends,
+    };
+    match one_way(left.rel.direction) && one_way(right.rel.direction) {
+        true => ordered(left) == ordered(right),
+        false => {
+            let (a, b) = left.ends;
+            let (c, d) = right.ends;
+            (a, b) == (c, d) || (a, b) == (d, c)
+        }
+    }
+}
+
+/// Whether two edge patterns name types that have nothing in common,
+/// which is the one thing a pattern says that can put an edge out of
+/// reach of it whatever the graph holds.
+///
+/// A step naming no type reaches every edge, so it overlaps with
+/// anything.
+fn disjoint_types(lhs: &ast::RelPattern, rhs: &ast::RelPattern) -> bool {
+    if lhs.types.is_empty() || rhs.types.is_empty() {
+        return false;
+    }
+    !lhs.types.iter().any(|name| rhs.types.contains(name))
+}
+
+/// `NOT (edge IN walked)`: the edge one step bound is none of the edges
+/// another step walked.
+fn not_among(edge: usize, walked: usize) -> BoundExpr {
+    BoundExpr::Unary {
+        op: UnaryOp::Not,
+        expr: Box::new(BoundExpr::Binary {
+            op: BinaryOp::In,
+            lhs: Box::new(BoundExpr::Var(edge)),
+            rhs: Box::new(BoundExpr::Var(walked)),
+        }),
+    }
+}
+
+/// Folds tests into a predicate that already stands there, which is how
+/// a rule the language states as a rule joins one the query wrote.
+fn and_all(filter: Option<BoundExpr>, tests: Vec<BoundExpr>) -> Option<BoundExpr> {
+    tests.into_iter().fold(filter, |left, right| match left {
+        Some(left) => Some(BoundExpr::Binary {
+            op: BinaryOp::And,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+        }),
+        None => Some(right),
+    })
+}
+
 /// One node table: a label naming the row domain `0..node_count`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDef {
@@ -1853,6 +1925,7 @@ impl Binder<'_> {
                 // would have to run inside that bracket and refuses
                 // instead.
                 let filter = self.bind_where(filter, !optional)?;
+                let filter = and_all(filter, self.edge_distinctness(patterns, &bound));
                 Ok(BoundClause::Match {
                     kind: match optional {
                         true => MatchKind::Optional,
@@ -2106,6 +2179,7 @@ impl Binder<'_> {
             Some(expr) => Some(self.bind_bool(expr, "WHERE")?),
             None => None,
         };
+        let filter = and_all(filter, self.edge_distinctness(block.patterns, &bound));
         self.marks = held;
         self.scope = outer;
         Ok(BoundClause::Match {
@@ -2628,7 +2702,11 @@ impl Binder<'_> {
         let start = self.bind_node(&path.start)?;
         let mut steps = Vec::new();
         for (rel, node) in &path.steps {
-            let rel = self.bind_rel(rel, path.mode.unwrap_or_default(), path.selector)?;
+            // A pattern that named no path mode walks under the one its
+            // match mode settles, which is TRAIL under DIFFERENT EDGES
+            // and WALK under REPEATABLE ELEMENTS.
+            let mode = path.mode.unwrap_or(path.list.mode.path_mode());
+            let rel = self.bind_rel(rel, mode, path.selector)?;
             let node = self.bind_node(node)?;
             steps.push((rel, node));
         }
@@ -2657,6 +2735,82 @@ impl Binder<'_> {
             self.path_shapes.insert(slot, parts);
         }
         Ok(BoundPath { slot, start, steps })
+    }
+
+    /// The predicate `DIFFERENT EDGES` stands for (ISO 16.9): no edge
+    /// of the graph answers two of the edge patterns of one pattern
+    /// list at once.
+    ///
+    /// What a path mode forbids inside one path this forbids across the
+    /// patterns of a list, and it is the mode a list that named none
+    /// runs under, so `MATCH (a)-[e]->(b), (a)-[f]->(b)` answers the
+    /// pairs of distinct edges between a pair of nodes rather than
+    /// every edge paired with itself. The patterns are grouped by the
+    /// list they were written in, because a match statement block
+    /// gathers several lists and each of them keeps its own edges
+    /// apart.
+    ///
+    /// A pair is tested when the two steps describe the same pair of
+    /// ends and their types overlap, which is when any graph at all can
+    /// answer both with one edge. Two steps that end somewhere else are
+    /// left alone, and that is where this stops short of what the
+    /// standard asks: `(a)-[e]->(b)-[f]->(c)` can answer both with one
+    /// edge too, when the graph holds a loop at a node and `a`, `b` and
+    /// `c` all land on it. Testing that pair costs a comparison on
+    /// every two hop walk of every query, to rule out a shape that no
+    /// graph without a loop holds, so the test belongs behind a fact
+    /// about the graph rather than in front of it. docs/07 says what is
+    /// checked and what is not.
+    fn edge_distinctness(
+        &self,
+        patterns: &[ast::PathPattern],
+        bound: &[BoundPath],
+    ) -> Vec<BoundExpr> {
+        let mut lists: Vec<(u32, Vec<Step<'_>>)> = Vec::new();
+        for (path, bound) in patterns.iter().zip(bound) {
+            if path.list.mode != ast::MatchMode::DifferentEdges {
+                continue;
+            }
+            let mut near = bound.start.slot;
+            let mut steps = Vec::with_capacity(path.steps.len());
+            for ((pat, _), (rel, node)) in path.steps.iter().zip(&bound.steps) {
+                steps.push(Step {
+                    pat,
+                    rel,
+                    ends: (near, node.slot),
+                });
+                near = node.slot;
+            }
+            match lists.iter_mut().find(|(at, _)| *at == path.list.at) {
+                Some((_, edges)) => edges.append(&mut steps),
+                None => lists.push((path.list.at, steps)),
+            }
+        }
+        let mut tests = Vec::new();
+        for (_, edges) in &lists {
+            for (at, left) in edges.iter().enumerate() {
+                for right in &edges[at + 1..] {
+                    if !same_ends(left, right) || disjoint_types(left.pat, right.pat) {
+                        continue;
+                    }
+                    let (left, right) = (left.rel, right.rel);
+                    tests.extend(match (left.range.is_some(), right.range.is_some()) {
+                        (false, false) => Some(BoundExpr::Binary {
+                            op: BinaryOp::Ne,
+                            lhs: Box::new(BoundExpr::Var(left.slot)),
+                            rhs: Box::new(BoundExpr::Var(right.slot)),
+                        }),
+                        (false, true) => Some(not_among(left.slot, right.slot)),
+                        (true, false) => Some(not_among(right.slot, left.slot)),
+                        // Two walks, where the test would be between two
+                        // lists of edges rather than between two edges,
+                        // and there is no such test to write yet.
+                        (true, true) => None,
+                    });
+                }
+            }
+        }
+        tests
     }
 
     /// Binds one end of a path written under `INSERT`, and says which

@@ -742,14 +742,26 @@ fn fuse_closes(ops: &mut Vec<Op>) {
             i += 1;
             continue;
         };
-        let Op::Expand { to, close, .. } = &mut ops[i] else {
+        let Op::Expand {
+            from, to, close, ..
+        } = &mut ops[i]
+        else {
             unreachable!("matched an expand just above");
         };
         // A semi probing the level the expand is building would have to
         // read rows that do not exist yet. Validation rejects that
         // shape, and this pass leaves it alone rather than relying on
         // the order the two run in.
-        if probe_level == *to {
+        //
+        // One probing the level the expand walks off is the same
+        // question a step further down: that level is the vector the
+        // walk is reading, so it has no one row pinned while the walk
+        // runs and the probe has nothing to read either. It stays an
+        // operator of its own, where it runs per row after the walk has
+        // built one. This is the shape a pattern list writes when two
+        // of its patterns join both of their ends, `(a)-[e]->(b),
+        // (a)-[f]->(b)`.
+        if probe_level == *to || probe_level == *from {
             i += 1;
             continue;
         }

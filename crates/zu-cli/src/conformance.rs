@@ -225,6 +225,16 @@ const NOTES: &[&str] = &[
      WALK repeats anything, ACYCLIC repeats no node, and SIMPLE repeats no node except that a \
      path may end where it began, so a cycle is a simple path and is not an acyclic one and \
      neither mode is a substitute for the other",
+    "a match mode says what a whole list of patterns may bind twice where a path mode says what \
+     one path of it may, and DIFFERENT EDGES is what a list naming none means: a pattern that \
+     named no path mode walks a TRAIL under it, and no one edge answers two of the edge patterns \
+     of the list, while REPEATABLE ELEMENTS lifts both; either mode is written with the singular \
+     noun and with BINDINGS behind it and all four spellings say one thing, and the mode belongs \
+     to the pattern list rather than to the match statement block, so two patterns of one \
+     statement may not take the same edge where two patterns of two statements of a block may. \
+     The edges kept apart are those whose steps describe the same pair of ends, which is where \
+     any graph at all can answer both patterns with one edge; two steps that end somewhere else \
+     coincide only on a graph holding a loop, and that pair is not checked yet",
     "a path variable binds the walk as a path value rather than as the list of the same \
      elements, so PATH builds one, PATH_LENGTH counts its edges, ELEMENTS answers its nodes \
      and edges as a list in the order they were walked, and two paths over the same elements \

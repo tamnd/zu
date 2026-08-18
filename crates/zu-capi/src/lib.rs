@@ -1549,6 +1549,105 @@ pub unsafe extern "C" fn zu_stmt_close(stmt: *mut ZuStmt) {
     }
 }
 
+/* ---- transactions ---- */
+
+/// Runs one of the three words that bound a transaction.
+///
+/// The text is what a host would have written, and running it is what
+/// keeps these three calls and the statements they stand for one
+/// implementation: the same parser, the same session state and the
+/// same conditions, so a host that begins with [`zu_begin`] and a host
+/// that sends `START TRANSACTION` are told the same thing when they
+/// begin twice.
+///
+/// Not watched, unlike a query. A boundary reads no rows, so a
+/// progress hook counting rows read has nothing to say about one, and
+/// a thread per commit would cost more than the commit on a small
+/// transaction. The interrupt word is still checked by the work a
+/// commit does, so a commit of a large transaction stops like anything
+/// else.
+unsafe fn boundary(conn: *mut ZuConn, word: &str, err: *mut *mut ZuError) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        unsafe { conn_of(conn) }.execute(word)?;
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Begins a transaction, read-write unless `read_only` is nonzero.
+///
+/// Every statement outside one is already a transaction of its own, so
+/// this does not turn transactions on. What it does is make several
+/// statements one: what they wrote is kept by [`zu_commit`] or unmade
+/// by [`zu_rollback`], and nothing between the two is visible to
+/// another connection.
+///
+/// Beginning inside a transaction is `25G01` on the error handle
+/// rather than a nested transaction, because a nesting this engine
+/// does not have would otherwise be a commit that silently committed
+/// its parent.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_begin(
+    conn: *mut ZuConn,
+    read_only: i32,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    let word = if read_only != 0 {
+        "START TRANSACTION READ ONLY"
+    } else {
+        "START TRANSACTION"
+    };
+    unsafe { boundary(conn, word, err) }
+}
+
+/// Keeps everything the transaction wrote, and ends it.
+///
+/// A commit that returns [`ZuStatus::Ok`] is durable: the log frame is
+/// on the disk before this call returns, so a process that dies
+/// afterwards reopens the file with the work in it. A commit with no
+/// transaction running is `2D000`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_commit(conn: *mut ZuConn, err: *mut *mut ZuError) -> ZuStatus {
+    unsafe { boundary(conn, "COMMIT", err) }
+}
+
+/// Unmakes everything the transaction wrote, and ends it.
+///
+/// A rollback with no transaction running is `2D000`, the same as a
+/// commit, rather than a call that quietly did nothing: a host that
+/// rolls back in an error path wants to know that the transaction it
+/// meant to undo was not the one it thought.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_rollback(conn: *mut ZuConn, err: *mut *mut ZuError) -> ZuStatus {
+    unsafe { boundary(conn, "ROLLBACK", err) }
+}
+
+/// Whether a transaction is running on this connection.
+///
+/// This is the one thing about a transaction that no statement
+/// answers, and every host that offers a `with` block, a `using`
+/// block or a `defer` needs it: the cleanup path has to know whether
+/// the body already ended the transaction before it tries to.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_in_transaction(conn: *mut ZuConn, out: *mut i32) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0 };
+    guard_status(|| {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return status,
+        };
+        let running = unsafe { conn_of(conn) }.session_mut().in_transaction();
+        unsafe { *out = i32::from(running) };
+        ZuStatus::Ok
+    })
+}
+
 /* ---- binding ---- */
 
 unsafe fn bind(stmt: *mut ZuStmt, name: *const c_char, name_len: usize, value: Value) -> ZuStatus {

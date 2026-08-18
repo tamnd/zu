@@ -32,6 +32,7 @@
   "SHORTEST"
   "PATHS"
   "GROUPS"
+  "KEEP"
   "WALK"
   "TRAIL"
   "ACYCLIC"

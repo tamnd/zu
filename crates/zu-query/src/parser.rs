@@ -1069,10 +1069,7 @@ impl Parser<'_> {
                     self.parse_match_block()?
                 } else {
                     self.expect_kw("MATCH")?;
-                    let mut patterns = vec![self.parse_path()?];
-                    while self.eat(&TokenKind::Comma) {
-                        patterns.push(self.parse_path()?);
-                    }
+                    let patterns = self.parse_graph_pattern()?;
                     (patterns, self.parse_where()?)
                 };
                 clauses.push(Clause::Match {
@@ -1534,6 +1531,54 @@ impl Parser<'_> {
         })
     }
 
+    /// A list of path patterns and the `KEEP` that may follow it (ISO
+    /// 16.9, features G006 and G007), which is a prefix said once for
+    /// the whole list rather than once per pattern of it.
+    ///
+    /// What a KEEP carries is the prefix a pattern carries itself, and
+    /// what it does is fill in what the patterns left out: a pattern
+    /// that named no selector takes the KEEP's selector, one that named
+    /// no mode takes its mode, and one that named a selector and no mode
+    /// keeps the selector and takes the mode. Naming the same kind twice
+    /// is refused rather than settled by a rule of precedence, because
+    /// either way round would drop something the query asked for.
+    fn parse_graph_pattern(&mut self) -> Result<Vec<PathPattern>> {
+        let mut patterns = vec![self.parse_path()?];
+        while self.eat(&TokenKind::Comma) {
+            patterns.push(self.parse_path()?);
+        }
+        if self.eat_kw("KEEP") {
+            let at = self.pos;
+            let (selector, mode) = self.parse_path_prefix()?;
+            if self.pos == at {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "KEEP says which of the paths a pattern matches to keep, \
+                     so it needs a path selector or a path mode after it",
+                ));
+            }
+            for path in &mut patterns {
+                if selector.is_some() && path.selector.is_some() {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        "a pattern carries a path selector and the KEEP names another, \
+                         so write one of the two",
+                    ));
+                }
+                if mode.is_some() && path.mode.is_some() {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        "a pattern carries a path mode and the KEEP names another, \
+                         so write one of the two",
+                    ));
+                }
+                path.selector = path.selector.or(selector);
+                path.mode = path.mode.or(mode);
+            }
+        }
+        Ok(patterns)
+    }
+
     /// What a pattern carries in front of its first node (ISO 16.6): a
     /// path selector, a path mode, or both, and in that order.
     ///
@@ -1549,7 +1594,10 @@ impl Parser<'_> {
     /// said, so they are eaten and dropped. `GROUP` is no such word: it
     /// is the whole of the difference between keeping k paths and
     /// keeping every path of the k shortest lengths.
-    fn parse_path_prefix(&mut self) -> Result<(Option<Selector>, PathMode)> {
+    /// A mode of `None` is a pattern that named none, which walks under
+    /// the default; the two are told apart because a `KEEP` fills in
+    /// what the patterns left out.
+    fn parse_path_prefix(&mut self) -> Result<(Option<Selector>, Option<PathMode>)> {
         // The head words, which are all that tells the seven apart bar
         // the `GROUP` at the very end. A bare `SHORTEST` head is held
         // aside as `grouped`, count and all, because whether it counts
@@ -1574,15 +1622,15 @@ impl Parser<'_> {
             grouped = Some(self.take_path_count("SHORTEST")?);
         }
         let mode = if self.eat_kw("WALK") {
-            PathMode::Walk
+            Some(PathMode::Walk)
         } else if self.eat_kw("TRAIL") {
-            PathMode::Trail
+            Some(PathMode::Trail)
         } else if self.eat_kw("ACYCLIC") {
-            PathMode::Acyclic
+            Some(PathMode::Acyclic)
         } else if self.eat_kw("SIMPLE") {
-            PathMode::Simple
+            Some(PathMode::Simple)
         } else {
-            PathMode::default()
+            None
         };
         self.eat_paths();
         if let Some(count) = grouped {
@@ -2291,10 +2339,7 @@ impl Parser<'_> {
         let mut patterns = Vec::new();
         let mut filter: Option<Expr> = None;
         loop {
-            patterns.push(self.parse_path()?);
-            while self.eat(&TokenKind::Comma) {
-                patterns.push(self.parse_path()?);
-            }
+            patterns.append(&mut self.parse_graph_pattern()?);
             if let Some(next) = self.parse_where()? {
                 filter = Some(match filter {
                     Some(seen) => Expr::Binary {
@@ -3348,12 +3393,15 @@ mod tests {
         };
         assert_eq!(patterns[0].var.as_deref(), Some("p"));
         assert_eq!(patterns[0].selector, Some(Selector::AnyShortest));
-        assert_eq!(patterns[0].mode, PathMode::Trail);
+        assert_eq!(patterns[0].mode, Some(PathMode::Trail));
         assert_eq!(patterns[1].selector, Some(Selector::AllShortest));
-        assert_eq!(patterns[1].mode, PathMode::Trail);
+        // The second names no mode, and walks under TRAIL because that
+        // is the default rather than because it said so.
+        assert_eq!(patterns[1].mode, None);
+        assert_eq!(patterns[1].mode.unwrap_or_default(), PathMode::Trail);
         assert_eq!(patterns[2].selector, None);
-        assert_eq!(patterns[2].mode, PathMode::Walk);
-        assert_eq!(patterns[3].mode, PathMode::Acyclic);
+        assert_eq!(patterns[2].mode, Some(PathMode::Walk));
+        assert_eq!(patterns[3].mode, Some(PathMode::Acyclic));
     }
 
     /// `SHORTEST` on its own says shortest of how many, and there is no
@@ -3403,43 +3451,39 @@ mod tests {
     #[test]
     fn the_mode_sits_inside_the_selector_and_group_comes_last() {
         for (source, selector, mode) in [
-            ("ALL TRAIL PATHS", None, PathMode::Trail),
-            ("ALL WALK", None, PathMode::Walk),
-            ("TRAIL PATHS", None, PathMode::Trail),
+            ("ALL TRAIL PATHS", None, Some(PathMode::Trail)),
+            ("ALL WALK", None, Some(PathMode::Walk)),
+            ("TRAIL PATHS", None, Some(PathMode::Trail)),
             (
                 "ANY 2 ACYCLIC PATHS",
                 Some(Selector::Any(2)),
-                PathMode::Acyclic,
+                Some(PathMode::Acyclic),
             ),
             (
                 "ANY SHORTEST SIMPLE PATH",
                 Some(Selector::AnyShortest),
-                PathMode::Simple,
+                Some(PathMode::Simple),
             ),
             (
                 "ALL SHORTEST ACYCLIC PATHS",
                 Some(Selector::AllShortest),
-                PathMode::Acyclic,
+                Some(PathMode::Acyclic),
             ),
             (
                 "SHORTEST 2 SIMPLE PATHS",
                 Some(Selector::Shortest(2)),
-                PathMode::Simple,
+                Some(PathMode::Simple),
             ),
             (
                 "SHORTEST 2 ACYCLIC PATHS GROUPS",
                 Some(Selector::ShortestGroup(2)),
-                PathMode::Acyclic,
+                Some(PathMode::Acyclic),
             ),
-            (
-                "SHORTEST GROUPS",
-                Some(Selector::ShortestGroup(1)),
-                PathMode::Trail,
-            ),
+            ("SHORTEST GROUPS", Some(Selector::ShortestGroup(1)), None),
             (
                 "SHORTEST TRAIL GROUP",
                 Some(Selector::ShortestGroup(1)),
-                PathMode::Trail,
+                Some(PathMode::Trail),
             ),
         ] {
             let q = parsed(&format!("MATCH {source} (a)-[:KNOWS*1..3]->(b) RETURN *"));
@@ -3448,6 +3492,66 @@ mod tests {
             };
             assert_eq!(patterns[0].selector, selector, "{source}");
             assert_eq!(patterns[0].mode, mode, "{source}");
+        }
+    }
+
+    /// A KEEP says a prefix once for a whole list of patterns, so what
+    /// each pattern of the list ends up carrying is what it wrote itself
+    /// and, where it wrote nothing, what the KEEP wrote.
+    #[test]
+    fn a_keep_says_the_prefix_for_every_pattern_of_the_list() {
+        let q = parsed(
+            "MATCH (a)-[:KNOWS*1..3]->(b), WALK (b)-[:KNOWS*1..2]->(c) \
+             KEEP ALL SHORTEST RETURN *",
+        );
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        // The first wrote nothing, so the selector is all it carries.
+        assert_eq!(patterns[0].selector, Some(Selector::AllShortest));
+        assert_eq!(patterns[0].mode, None);
+        // The second wrote a mode, which it keeps, and takes the
+        // selector beside it.
+        assert_eq!(patterns[1].selector, Some(Selector::AllShortest));
+        assert_eq!(patterns[1].mode, Some(PathMode::Walk));
+
+        // And the other way round: a KEEP naming a mode leaves a
+        // selector a pattern wrote alone.
+        let q = parsed(
+            "MATCH (a)-[:KNOWS*1..3]->(b), ANY (b)-[:KNOWS*1..2]->(c) \
+             KEEP ACYCLIC PATHS RETURN *",
+        );
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        assert_eq!(patterns[0].selector, None);
+        assert_eq!(patterns[0].mode, Some(PathMode::Acyclic));
+        assert_eq!(patterns[1].selector, Some(Selector::Any(1)));
+        assert_eq!(patterns[1].mode, Some(PathMode::Acyclic));
+    }
+
+    /// A KEEP naming what a pattern has already named is refused. Either
+    /// answer, the pattern's or the KEEP's, throws away something the
+    /// query asked for, and a query asking for two contradictory things
+    /// is a query somebody wrote by mistake.
+    #[test]
+    fn a_keep_that_names_what_a_pattern_named_is_refused() {
+        for (source, want) in [
+            (
+                "MATCH ANY SHORTEST (a)-[:KNOWS*]->(b) KEEP ALL SHORTEST RETURN *",
+                "carries a path selector",
+            ),
+            (
+                "MATCH WALK (a)-[:KNOWS*1..2]->(b) KEEP ACYCLIC RETURN *",
+                "carries a path mode",
+            ),
+            (
+                "MATCH (a)-[:KNOWS*1..2]->(b) KEEP RETURN *",
+                "needs a path selector or a path mode",
+            ),
+        ] {
+            let e = parse_err(source);
+            assert!(e.contains(want), "{source}: {e}");
         }
     }
 
@@ -3470,7 +3574,7 @@ mod tests {
         let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
-        assert_eq!(patterns[0].mode, PathMode::Simple);
+        assert_eq!(patterns[0].mode, Some(PathMode::Simple));
     }
 
     #[test]

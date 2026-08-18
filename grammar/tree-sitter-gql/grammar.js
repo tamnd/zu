@@ -107,7 +107,19 @@ module.exports = grammar({
       ),
 
     match_clause: ($) =>
-      seq(optional(kw("OPTIONAL")), kw("MATCH"), $.pattern, optional($.where_clause)),
+      seq(
+        optional(kw("OPTIONAL")),
+        kw("MATCH"),
+        $.pattern,
+        optional($.keep_clause),
+        optional($.where_clause),
+      ),
+
+    // ISO 16.9. A KEEP says a prefix once for a whole list of patterns
+    // rather than once in front of each of them, and it belongs to a
+    // graph pattern, which is why it is here and not in `pattern`: an
+    // INSERT writes paths rather than choosing between them.
+    keep_clause: ($) => seq(kw("KEEP"), $.path_prefix),
 
     insert_clause: ($) => seq(kw("INSERT"), $.pattern),
 
@@ -386,6 +398,7 @@ module.exports = grammar({
           "{",
           optional(kw("MATCH")),
           $.pattern,
+          optional($.keep_clause),
           optional($.where_clause),
           "}",
         ),

@@ -159,6 +159,46 @@ fn a_shortest_selector_reads_a_lower_bound() {
     assert_eq!(hops, [2, 2]);
 }
 
+/// `KEEP` says the prefix once, behind the patterns, instead of once in
+/// front of each of them (ISO 16.9, features G006 and G007). It says the
+/// same thing, so it answers the same rows, and it says it to every
+/// pattern of the list rather than to the last one written.
+#[test]
+fn a_keep_says_the_prefix_for_the_whole_pattern_list() {
+    let mut fx = Fixture::open("selector-keep.zu1");
+    let mut kept = |source: &str| -> Vec<i64> {
+        let rows = fx.conn.query(source).expect("query");
+        rows.iter()
+            .map(|row| (row.get_by_name::<i64>("n").expect("n") - 1) / 2)
+            .collect()
+    };
+    // The same query written both ways answers the same lengths.
+    assert_eq!(
+        kept(
+            "MATCH p = (a:person {id: 0})-[:knows]->+(b:person) KEEP SHORTEST 2 \
+             WHERE b.id = 6 RETURN size(p) AS n ORDER BY n"
+        ),
+        [1, 2]
+    );
+    // And it reaches every pattern of the list rather than the one it
+    // stands behind. Both patterns here run from 0 to 6, which is four
+    // paths each and sixteen rows between them, and a KEEP that reached
+    // only the second would leave four.
+    let mut rows = |source: &str, want: i64| {
+        let rows = fx.conn.query(source).expect("query");
+        let got: Vec<i64> = rows
+            .iter()
+            .map(|row| row.get_by_name::<i64>("n").expect("n"))
+            .collect();
+        assert_eq!(got, [want], "{source}");
+    };
+    let both = "MATCH (a:person {id: 0})-[:knows]->+(b:person), \
+                (a)-[:knows]->+(c:person) WHERE b.id = 6 AND c.id = 6 \
+                RETURN COUNT(*) AS n";
+    rows(both, 16);
+    rows(&both.replace("WHERE", "KEEP ANY SHORTEST WHERE"), 1);
+}
+
 /// The plan says which selector is running, because two of them differ
 /// only in how many paths come out and a reader of the listing has no
 /// other way to tell which search was chosen.

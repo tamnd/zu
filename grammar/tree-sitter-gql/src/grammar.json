@@ -343,12 +343,49 @@
           "members": [
             {
               "type": "SYMBOL",
+              "name": "keep_clause"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
               "name": "where_clause"
             },
             {
               "type": "BLANK"
             }
           ]
+        }
+      ]
+    },
+    "keep_clause": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "TOKEN",
+            "content": {
+              "type": "PREC",
+              "value": 1,
+              "content": {
+                "type": "PATTERN",
+                "value": "[kK][eE][eE][pP]"
+              }
+            }
+          },
+          "named": false,
+          "value": "KEEP"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "path_prefix"
         }
       ]
     },
@@ -3221,6 +3258,18 @@
           {
             "type": "SYMBOL",
             "name": "pattern"
+          },
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "keep_clause"
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
           },
           {
             "type": "CHOICE",

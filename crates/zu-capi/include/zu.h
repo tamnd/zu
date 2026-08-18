@@ -49,12 +49,12 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.8 and another
+ * system tests when it has to compile one way against 0.9 and another
  * against what comes next. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.8"
+#define ZU_ABI_VERSION "0.9"
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,6 +70,9 @@ typedef struct zu_error zu_error;
 typedef struct zu_value zu_value;
 /* A database being built. See the bulk load section at the end. */
 typedef struct zu_loader zu_loader;
+/* Rows on their way into a table that already exists. See the appending
+ * section at the end. */
+typedef struct zu_appender zu_appender;
 
 /* The name a connection had before the database was split out of it.
  * Kept for one release, along with zu_close below, so that code written
@@ -552,11 +555,12 @@ void zu_result_free(zu_result *result);
 
 /* ---- bulk load ----
  *
- * How values get in. It is the only way in v0: CREATE and INSERT need a
- * table and no statement makes one, so a host holding data and an empty
- * file has nowhere else to go. This is also the entry point the Rust
- * appender and `zu copy` are built on, not a second mechanism beside
- * them.
+ * How values get into a database that does not exist yet. CREATE and
+ * INSERT need a table and no statement makes one, so a host holding
+ * data and an empty file has nowhere else to go. A database that does
+ * exist is what the appending section below is for. This is also the
+ * entry point the Rust appender and `zu copy` are built on, not a
+ * second mechanism beside them.
  *
  * A loader is columnar for the same reason a result is. One call per
  * column, not one per cell.
@@ -627,6 +631,96 @@ zu_status zu_loader_col_temporal(zu_loader *l, const char *name, size_t name_len
  * zu_open on the same path reads it. */
 zu_status zu_loader_finish(zu_loader *l, zu_error **err);
 void zu_loader_free(zu_loader *l);
+
+/* ---- appending ----
+ *
+ * How values get into a table that already exists. A statement is the
+ * wrong shape for it: every row is parsed, bound, planned and
+ * committed, and the commit is the expensive part, so a million rows is
+ * a million commits and the load is dominated by durability work nobody
+ * asked for. An appender buffers rows and pays one commit per flush.
+ *
+ * A row is written a value at a time, in the order the table declares
+ * its columns, and ended by zu_append_end_row. A column is a position
+ * rather than a name, because naming one per value would cost a lookup
+ * on the one path where per-value cost is the whole story and a loader
+ * knows its own column order. The columns are there to be read back:
+ * zu_appender_cols is how many values a row carries and
+ * zu_appender_col_name is what each one is called.
+ *
+ * A refused value ends the row it was in, whether the column would not
+ * take it or it was no value at all. The values that row had already
+ * written come back off, the error names the column and says what it
+ * holds, and the next value starts a new row. A row of the wrong width
+ * is refused the same way at zu_append_end_row. Nothing of a refused row
+ * is kept, so an appender is still usable once the loop is fixed. A row
+ * that was never ended is not a row: a flush takes it back off rather
+ * than writing a short one.
+ *
+ * A rel table has no property columns. A row of one is the two ends of
+ * an edge, as offsets into the tables it runs between, so those are its
+ * two columns and they are named for what they are. A negative offset
+ * is refused where it was appended, since it is no row of anything. An
+ * edge to a row that is not there is refused at the flush, before
+ * anything is written, and the file is left as it was.
+ *
+ * A flush is one commit. When it returns the rows are durable and every
+ * later statement sees them, and before it returns nothing sees
+ * anything. A flush with nothing buffered touches no file, so a host
+ * can flush on a timer without writing empty commits, and a flush that
+ * failed keeps its rows so what did not go in is still there to look
+ * at. Opening the appender is where a table nothing declares, a table
+ * that stores no properties, a column that holds a null and a read-only
+ * connection are refused, rather than at the first flush a million rows
+ * later.
+ *
+ * An appender is used from one thread, like the connection it writes
+ * through, and it takes that connection's claim for every call: a
+ * second thread in a call, or a statement running on the same
+ * connection, answers ZU_MISUSE_CONCURRENT rather than tearing a
+ * buffer. After close, every call but close answers ZU_MISUSE_CLOSED
+ * and only zu_appender_free is left. Closing twice writes nothing the
+ * second time, so a cleanup path may close what the load already did.
+ *
+ * zu_appender_free writes what is still buffered, because rows that
+ * were appended are rows the host meant to write; what it cannot do is
+ * say that the write failed, which is what close is for. A host that
+ * wants the rows gone calls zu_appender_discard and gets exactly
+ * that. */
+zu_status zu_appender_open(zu_conn *conn, const char *table, size_t table_len, zu_appender **out,
+                           zu_error **err);
+zu_status zu_appender_open_z(zu_conn *conn, const char *table, zu_appender **out, zu_error **err);
+/* Any nonzero value is true, as everywhere else in this header. */
+zu_status zu_append_bool(zu_appender *app, int32_t v, zu_error **err);
+zu_status zu_append_i64(zu_appender *app, int64_t v, zu_error **err);
+zu_status zu_append_f64(zu_appender *app, double v, zu_error **err);
+zu_status zu_append_str(zu_appender *app, const char *v, size_t v_len, zu_error **err);
+zu_status zu_append_str_z(zu_appender *app, const char *v, zu_error **err);
+zu_status zu_append_bytes(zu_appender *app, const uint8_t *v, size_t v_len, zu_error **err);
+/* One ZU_TEMPORAL_ kind and the count in the unit that kind implies,
+ * which is zu_value_temporal read backwards. ZU_TEMPORAL_ZONED_TIME and
+ * ZU_TEMPORAL_ZONED_DATETIME answer ZU_UNSUPPORTED for the reason
+ * zu_loader_col_temporal gives. */
+zu_status zu_append_temporal(zu_appender *app, int32_t kind, int64_t count, zu_error **err);
+/* Ends the row being written, which is what makes it a row. */
+zu_status zu_append_end_row(zu_appender *app, zu_error **err);
+zu_status zu_appender_flush(zu_appender *app, zu_error **err);
+/* Rows ended and not yet written, and rows committed across every
+ * flush. Both write nought before anything can fail. */
+zu_status zu_appender_buffered(zu_appender *app, uint64_t *out);
+zu_status zu_appender_committed(zu_appender *app, uint64_t *out);
+zu_status zu_appender_cols(zu_appender *app, uint32_t *out);
+/* The column's name, borrowed from the appender and valid until it is
+ * freed, or NULL out of range. len may be NULL. */
+const char *zu_appender_col_name(zu_appender *app, uint32_t col, size_t *len);
+/* Throws away what is buffered and says how many rows that was. Rows an
+ * earlier flush committed are committed and this does not reach them.
+ * out may be NULL. */
+zu_status zu_appender_discard(zu_appender *app, uint64_t *out);
+/* Flushes what is left and spends the appender, writing the rows it
+ * committed in all through out, which may be NULL. */
+zu_status zu_appender_close(zu_appender *app, uint64_t *out, zu_error **err);
+void zu_appender_free(zu_appender *app);
 
 #ifdef __cplusplus
 }

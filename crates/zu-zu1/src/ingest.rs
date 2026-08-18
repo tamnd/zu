@@ -330,9 +330,36 @@ pub fn ingest_edges(
             dst.len()
         )));
     }
-    if Catalog::load(db)?.rel_by_id(rel).is_none() {
+    let catalog = Catalog::load(db)?;
+    let table = catalog
+        .rel_by_id(rel)
+        .ok_or_else(|| ZuError::InvalidArgument(format!("ingest names unknown rel table {rel}")))?;
+    // Every edge joins two rows that are there, checked here and not
+    // left to the fold. The fold checks it too and has to, since it is
+    // what builds the CSR, but by the time it runs the frame naming
+    // these edges is committed: the fold's refusal leaves a log the
+    // next writer replays, refuses again, and cannot get past, so one
+    // edge to a row that is not there would cost the database every
+    // writer it has. Refused here, nothing is written and the file is
+    // as it was.
+    //
+    // The domain is what the fold will see and not what the catalog
+    // says: rows appended in this session and not folded yet are rows,
+    // and an edge to one of them is a good edge.
+    let epoch = mvcc.epoch();
+    let rows = |end: u32| {
+        catalog.node_by_id(end).map_or(0, |node| node.node_count) + mvcc.appended_rows(end, epoch)
+    };
+    let (from_rows, to_rows) = (rows(table.from), rows(table.to));
+    if let Some((at, (&from, &to))) = src
+        .iter()
+        .zip(dst)
+        .enumerate()
+        .find(|&(_, (&from, &to))| from >= from_rows || to >= to_rows)
+    {
         return Err(ZuError::InvalidArgument(format!(
-            "ingest names unknown rel table {rel}"
+            "edge {at} of this ingest joins ({from}, {to}), and the tables it runs between \
+             hold {from_rows} and {to_rows} rows"
         )));
     }
     let (root, ()) = seal(

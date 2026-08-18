@@ -827,6 +827,30 @@ mod tests {
     }
 
     #[test]
+    fn an_edge_to_a_row_that_is_not_there_leaves_the_database_writable() {
+        // The check this leans on is at the ingest and not at the fold.
+        // A fold that refuses has already committed the frame it is
+        // refusing, so the refusal comes back again from every writer
+        // that opens the file afterwards and the database has no
+        // writers left. Refused at the ingest, nothing is written.
+        let (_dir, path) = scratch("outside.zu1");
+        let db = Database::open(&path).expect("open");
+        let mut conn = db.connect().expect("connect");
+        let mut app = conn.appender("follows").expect("appender");
+        app.append_row((0i64, 99i64)).expect("buffered");
+        let err = app.close().expect_err("no row 99");
+        assert!(err.to_string().contains("hold 8 and 8 rows"), "{err}");
+        drop(conn);
+        drop(db);
+
+        let db = Database::open(&path).expect("the database still opens for writing");
+        let mut conn = db.connect().expect("connect");
+        let mut app = conn.appender("follows").expect("appender");
+        app.append_row((7i64, 2i64)).expect("buffered");
+        assert_eq!(app.close().expect("the good edge goes in"), 1);
+    }
+
+    #[test]
     fn a_row_of_the_wrong_width_leaves_nothing_of_itself_behind() {
         let (_dir, path) = scratch("width.zu1");
         let db = Database::open(&path).expect("open");

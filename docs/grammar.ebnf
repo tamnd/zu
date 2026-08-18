@@ -218,8 +218,26 @@ keep_clause     = "KEEP" , path_prefix ;
    selector takes the KEEP's, one that named no mode takes its mode, and
    one that named the same kind the KEEP names is refused rather than
    settled by a rule of precedence. *)
-path            = [ name , "=" ] , [ path_prefix ] ,
-                  node , { relationship , node } ;
+path            = [ name , "=" ] , [ path_prefix ] , path_body ;
+path_body       = factor , { ( relationship , factor ) | factor } ;
+factor          = node | subpath ;
+subpath         = "(" , [ name , "=" ] , [ path_mode ] , path_body ,
+                  [ where_clause ] , ")" ;
+(* ISO 16.11, feature G038. Brackets around part of a pattern match
+   nothing of their own: what they do is let three things be said about a
+   stretch of a walk rather than about the whole of it, a name for the
+   stretch, a path mode for it, and a condition that has to hold of it.
+   The condition may read a variable bound outside the brackets, which is
+   the non local predicate.
+
+   A factor written straight against another with no edge pattern between
+   them is juxtaposition, and the node the left one ends at is the node
+   the right one starts at rather than a second node beside it, so the
+   two node patterns there describe one node. Two different names written
+   there is one node under two names and is refused, since a slot carries
+   one name. A path selector is not on the list of what the brackets may
+   carry: how many paths to keep is a question about the whole pattern,
+   so the standard writes it in front of one. *)
 path_prefix     = "ALL" , [ "SHORTEST" ] , path_tail
                 | "ANY" , ( "SHORTEST" | [ integer ] ) , path_tail
                 | "SHORTEST" , ( integer , path_tail , [ group_or_groups ]

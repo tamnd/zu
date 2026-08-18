@@ -80,13 +80,51 @@ pub(crate) enum At {
 /// Nothing is written here: a statement that cannot be written has to
 /// raise before the transaction opens, so that the failing case costs
 /// no log write and no fold.
+/// The property columns of the tables writes have touched, held by the
+/// session rather than by the statement.
+///
+/// Which tables those are is not known until the rows arrive, because a
+/// slot the write names is bound by a match and a match can leave
+/// several tables open, so this fills in as the rows come. Reading a
+/// directory back is a block chain walk and a copy of every block in
+/// it, and a point write that did that per statement spent a quarter of
+/// its processor time on blocks it had copied before.
+///
+/// What a directory says changes only when the layout of the file does,
+/// and that moves the header epoch, so the session drops this along
+/// with the plans and the readers an epoch move invalidates.
+#[derive(Default)]
+pub(crate) struct Dirs(BTreeMap<u32, Vec<PropColumn>>);
+
+impl Dirs {
+    /// The columns of `table`, read from the file the first time and
+    /// held after that.
+    ///
+    /// A rel table keeps its columns inside its group directory rather
+    /// than in the table index, because they are in edge order and the
+    /// directory is what holds that order, so which of the two is read
+    /// comes from what the element is.
+    fn columns(&mut self, db: &mut Zu1File, table: u32, at: &At) -> Result<&[PropColumn]> {
+        if let Entry::Vacant(empty) = self.0.entry(table) {
+            let dir = match at {
+                At::Row(_) => load_props(db, table)?,
+                At::Edge(..) => load_rel_props(db, table)?,
+            };
+            empty.insert(dir.map_or_else(Vec::new, |dir| dir.columns));
+        }
+        let columns = &self.0[&table];
+        if columns.is_empty() {
+            return Err(ZuError::Unsupported {
+                what: "setting a property on an element of a table that stores none",
+                id: table,
+            });
+        }
+        Ok(columns)
+    }
+}
+
 pub(crate) struct Changes<'a> {
     write: &'a Set,
-    /// The property columns of each table an element has turned up in,
-    /// read once per table. Which tables those are is not known until
-    /// the rows arrive, because a slot the write names is bound by a
-    /// match and a match can leave several tables open.
-    columns: BTreeMap<u32, Vec<PropColumn>>,
     /// The catalog as the statement started, which is what says which
     /// bit a label is and which labels a table has declared. A `SET` of
     /// a label a table has not declared declares it here, so this is
@@ -102,7 +140,6 @@ impl<'a> Changes<'a> {
     pub(crate) fn open(write: &'a Set, catalog: Catalog) -> Self {
         Self {
             write,
-            columns: BTreeMap::new(),
             catalog,
             widened: false,
             updates: Vec::new(),
@@ -116,6 +153,7 @@ impl<'a> Changes<'a> {
     pub(crate) fn row(
         &mut self,
         db: &mut Zu1File,
+        dirs: &mut Dirs,
         carried: &[Value],
         values: &[Value],
     ) -> Result<()> {
@@ -141,10 +179,7 @@ impl<'a> Changes<'a> {
                 });
                 continue;
             }
-            let columns = match self.columns.entry(table) {
-                Entry::Occupied(held) => held.into_mut(),
-                Entry::Vacant(empty) => empty.insert(columns_of(db, table, &element)?),
-            };
+            let columns = dirs.columns(db, table, &element)?;
             match &item.into {
                 BoundSetInto::Labels { .. } => unreachable!("settled above"),
                 BoundSetInto::Property(key) => {
@@ -419,27 +454,6 @@ fn written(col: &PropColumn, value: &Value, key: &str) -> Result<Cell> {
         Value::Null => Ok(Cell::Null),
         other => cell(&col.ty, other, key),
     }
-}
-
-/// The property columns of a table an element being changed sits in.
-///
-/// A rel table keeps its columns inside its group directory rather than
-/// in the table index, because they are in edge order and the directory
-/// is what holds that order, so which of the two is read comes from what
-/// the element is.
-fn columns_of(db: &mut Zu1File, table: u32, at: &At) -> Result<Vec<PropColumn>> {
-    let dir = match at {
-        At::Row(_) => load_props(db, table)?,
-        At::Edge(..) => load_rel_props(db, table)?,
-    };
-    let columns = dir.map_or_else(Vec::new, |dir| dir.columns);
-    if columns.is_empty() {
-        return Err(ZuError::Unsupported {
-            what: "setting a property on an element of a table that stores none",
-            id: table,
-        });
-    }
-    Ok(columns)
 }
 
 #[cfg(test)]

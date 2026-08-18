@@ -1444,6 +1444,22 @@ set_stmt_kb = 32.0
 set_stmt_cpu_us = 400.0
 insert_stmt_cpu_us = 30000.0
 
+# The same SET with the sync's own processor cost taken off, one sync a
+# statement, which is what one statement commits. A sync is not only a
+# wait: on a Mac it is fcntl with F_FULLFSYNC and it burns 73 to 83 us
+# of processor time before the disk is asked, measured by the bench on
+# the machine it runs on, which is most of the ceiling above and none of
+# the write path. Taking it out is what makes the column comparable
+# across a laptop and a runner, and it is the column P5 is written
+# against: a point write under 30 us.
+#
+# Measured 165 to 205 us over four runs at 10000 rows, against a raw cpu
+# of 242 to 280 us for the same statements. That spread is the number to
+# beat and 30 is where it has to land, so this ceiling is set to catch a
+# regression today rather than to declare the gate met. Lower it as the
+# write path gets cheaper, never raise it.
+set_stmt_cpu_nosync_us = 300.0
+
 # A DELETE at the same shape, measured 15 ms and 1044 kB at 10000 rows.
 # It is the cheapest of the three because a delete does not compact: the
 # row keeps its offset, so the fold merges one offset into the table's

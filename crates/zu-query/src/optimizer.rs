@@ -2317,6 +2317,32 @@ mod tests {
         );
     }
 
+    /// A value query expression is not an operator in the plan that
+    /// reads it. It is a plan of its own that runs once, printed under
+    /// the one that reads it, and what stands where it was written is
+    /// the value it answered. That is the decorrelation, and it is
+    /// read off the plan rather than off the clock: there is no
+    /// operator under the filter for the subquery to run per row.
+    #[test]
+    fn a_value_query_plans_as_a_query_of_its_own() {
+        let plan = optimized(
+            "MATCH (p:Person) WHERE p.id < VALUE { MATCH (q:Person) RETURN COUNT(*) } RETURN p.id AS id",
+        );
+        assert_eq!(
+            lines(&plan),
+            [
+                "Project p.id AS id",
+                "Filter p.id < VALUE {0}",
+                "ScanNodes p: Person",
+                "",
+                "VALUE {0}:",
+                "Aggregate count(*) AS COUNT(*)",
+                "ScanNodes q: Person",
+            ],
+            "got:\n{plan}"
+        );
+    }
+
     fn optimized(source: &str) -> String {
         let schema = schema();
         let query = binder::bind(&parse(source).expect("parse"), &schema).expect("bind");

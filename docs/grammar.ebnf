@@ -253,7 +253,7 @@ unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
                 | function_call | cast | path_constructor | exists_block
-                | "(" , expression , ")" | list | record ;
+                | value_query | "(" , expression , ")" | list | record ;
 
 cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
 (* An existence block is a match written where a predicate goes, so it
@@ -262,6 +262,13 @@ cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
    is wanted. The brace is what tells it apart from a variable called
    exists. *)
 exists_block    = "EXISTS" , match_block ;
+(* GQ18, ISO 20.6. A whole query written where one value belongs. It is
+   a query and not a block: it may chain with NEXT, join with a set
+   operator and end with an ORDER BY and a LIMIT, and it has to end with
+   a RETURN of one column, because one value is what stands here. The
+   brace tells it apart from a variable called value, the same way it
+   does for EXISTS. *)
+value_query     = "VALUE" , "{" , composite_query , "}" ;
 (* A value type is a name, its arguments, and whether it admits null.
    The names are the ISO spellings and live in one table; see
    crates/zu-query/src/value_type.rs. *)

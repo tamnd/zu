@@ -284,6 +284,10 @@ fn compile(
         // its write, and a statement that writes is one operand: the
         // binder refuses a write in a composite.
         conjoined: Vec::new(),
+        // Every part carries the statement's value query expressions,
+        // because a part is a slice of the same statement and
+        // [`BoundExpr::Scalar`] indexes them by position.
+        scalars: query.scalars.clone(),
     };
     let leaf = match base {
         // The rows the part before this one carried arrive as one

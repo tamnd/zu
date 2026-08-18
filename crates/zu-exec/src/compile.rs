@@ -844,6 +844,13 @@ pub(crate) fn compile(
     params: &[Value],
     options: &Options,
 ) -> Result<Option<ExecPlan>> {
+    // A value query expression is answered by running a query of its
+    // own before this plan starts, which is a thing the old engine
+    // does and this one has no place for yet, so the whole statement
+    // goes back there (GQ18).
+    if !query.scalars.is_empty() {
+        return Ok(None);
+    }
     let mut c = Compiler {
         query,
         schema,

@@ -714,7 +714,23 @@ pub fn tree(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<P
 /// This is [`tree`] printed, so the listing and the structure a caller
 /// reads cannot say different things about the same statement.
 pub fn explain(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> String {
-    tree(plan, query, schema).map_or(String::new(), |root| root.render())
+    let mut out = tree(plan, query, schema).map_or(String::new(), |root| root.render());
+    // A value query expression is a plan of its own that runs once
+    // before this one, so it is printed once, under it, rather than
+    // wherever the expression reading it stands (GQ18).
+    for (ix, scalar) in query.scalars.iter().enumerate() {
+        let Ok(built) = build(scalar) else { continue };
+        let Ok(opt) = crate::optimizer::optimize(built, scalar, schema) else {
+            continue;
+        };
+        out.push_str(&format!("\nVALUE {{{ix}}}:\n"));
+        for line in explain(&opt, scalar, schema).lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn slot_name(query: &BoundQuery, slot: usize) -> &str {
@@ -1104,6 +1120,11 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::Literal(Literal::Str(s)) => format!("'{s}'"),
         BoundExpr::Literal(Literal::Temporal(t)) => t.to_string(),
         BoundExpr::Param(ix) => format!("${}", query.params[*ix]),
+        // The query itself is not written out here: this text titles an
+        // operator, and a whole query inside one reads worse than the
+        // reference does. [`explain`] prints the plan for it under the
+        // plan that reads it.
+        BoundExpr::Scalar(ix) => format!("VALUE {{{ix}}}"),
         BoundExpr::Var(slot) => slot_name(query, *slot).to_string(),
         BoundExpr::HasLabels { slot, test } => {
             format!("{}:{}", slot_name(query, *slot), test.text(&query.labels))

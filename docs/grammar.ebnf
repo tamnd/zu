@@ -7,8 +7,18 @@
    spec change to docs/07 first. *)
 
 statement       = query | catalog_statement ;
-query           = [ use_clause ] , { reading_clause } , return_clause ,
-                  [ ";" ] ;
+query           = [ use_clause ] , linear_query , [ ";" ] ;
+
+(* GQ20, ISO 12.2. A query is one statement or several chained by NEXT,
+   and what a statement hands the one behind it is the result it
+   returned and nothing else it had in hand. The rows the caller gets
+   are the last statement's. A statement in front of a NEXT ends with
+   RETURN unless it writes; a write ends without projecting anything,
+   the way it does at the end of a query, and hands on the rows it was
+   given. *)
+linear_query    = simple_query , { "NEXT" , simple_query } ;
+simple_query    = { reading_clause } , return_clause
+                | { reading_clause } ;
 
 (* GQ01, ISO 16.2. The graph the clauses after it are against. ISO
    writes it as a graph expression; a name and CURRENT_PROPERTY_GRAPH
@@ -258,7 +268,7 @@ string          = [ "@" ] , "'" , { character } , "'"
    the parser. *)
 
 (* Reserved but not yet parsed; the parser rejects them by name:
-   CREATE, SET, DELETE, DETACH, MERGE, CALL, FILTER, LET, NEXT.
+   CREATE, SET, DELETE, DETACH, MERGE, CALL, FILTER, LET.
    CREATE is a statement only where GRAPH follows it, with OR REPLACE
    and PROPERTY allowed in between; anywhere else it is still the write
    nobody has implemented. *)

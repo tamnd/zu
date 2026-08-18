@@ -1126,6 +1126,43 @@ mod tests {
         explain(&plan, &query, &schema())
     }
 
+    /// A chain of three statements plans as one pipeline: the result
+    /// each statement ends with hands its rows straight to the expand
+    /// the next one starts with, and nothing in between collects a
+    /// table first. Writing the same question with WITH plans exactly
+    /// the same operators, which is the whole of the claim that NEXT
+    /// composes statements without costing anything to compose them.
+    #[test]
+    fn a_next_chain_fuses_rather_than_materialising() {
+        let chain = explained(
+            "MATCH (a:Person) RETURN a AS a \
+             NEXT MATCH (a)-[:KNOWS]->(b:Person) RETURN b AS b \
+             NEXT MATCH (b)-[:IS_LOCATED_IN]->(c:Place) RETURN c.name AS name",
+        );
+        let lines: Vec<&str> = chain.lines().map(str::trim_start).collect();
+        assert_eq!(
+            lines,
+            [
+                "Project c.name AS name",
+                "Expand (b)-[#3:IS_LOCATED_IN]->(c)",
+                "Project b",
+                "Expand (a)-[#1:KNOWS]->(b)",
+                "Project a",
+                "ScanNodes a: Person",
+            ],
+            "got:\n{chain}"
+        );
+        let withs = explained(
+            "MATCH (a:Person) WITH a AS a \
+             MATCH (a)-[:KNOWS]->(b:Person) WITH b AS b \
+             MATCH (b)-[:IS_LOCATED_IN]->(c:Place) RETURN c.name AS name",
+        );
+        assert_eq!(
+            chain, withs,
+            "NEXT plans what the same question written with WITH plans"
+        );
+    }
+
     #[test]
     fn point_lookup_plans_scan_filter_expand() {
         let text = explained(

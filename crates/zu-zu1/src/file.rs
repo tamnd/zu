@@ -316,6 +316,11 @@ struct Savepoint {
     across_statements: bool,
     /// Whether anything has been published under this savepoint.
     published: bool,
+    /// The epoch that was published when the transaction began, which
+    /// is the newest epoch that reads the blocks held out of allocation
+    /// while it runs, and so the epoch the reader leases are compared
+    /// against when it lets go of them.
+    began_at: u64,
 }
 
 /// An open zu1 file: block I/O, the free list, and the header flip.
@@ -375,6 +380,26 @@ pub struct Zu1File {
     /// already free when it began, because a block the transaction
     /// frees is a block the state being kept still reads.
     savepoint: Option<Savepoint>,
+    /// Blocks a checkpoint has listed as free that an older epoch still
+    /// reads, held out of allocation until nothing is reading that
+    /// epoch any more. Each entry is the epoch the checkpoint
+    /// superseded and the blocks that epoch's roots reach.
+    ///
+    /// docs/08 §3 calls this epoch refcounts: with one connection there
+    /// is never a reader behind the writer and the list empties as fast
+    /// as it fills, and with several there is, because a statement on
+    /// another connection reads the roots the writer has just replaced.
+    /// The blocks are on the free list on disk either way, so a crash
+    /// reclaims them: what waits is only this handle allocating into
+    /// them, and only while somebody is reading them.
+    retained: Vec<(u64, Vec<BlockPtr>)>,
+    /// Whether something above this handle counts the readers and hands
+    /// the retained blocks back itself, which is what a file behind
+    /// `zu::shared::FileHandle` has. A handle used bare has nobody
+    /// reading behind it, because reading it means holding it, so it
+    /// releases what it retains as soon as it has retained it and
+    /// allocates exactly as it did before any of this existed.
+    defer_reclaim: bool,
     /// Blocks this handle has allocated since its last checkpoint,
     /// which is what a caller deferring one has to watch. Nothing
     /// allocated since then can be given back until a checkpoint
@@ -422,6 +447,8 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            retained: Vec::new(),
+            defer_reclaim: false,
             unpublished: 0,
             interrupted: None,
             pin_memo: None,
@@ -546,6 +573,8 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            retained: Vec::new(),
+            defer_reclaim: false,
             unpublished: 0,
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -601,6 +630,8 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            retained: Vec::new(),
+            defer_reclaim: false,
             unpublished: 0,
             interrupted: None,
             pin_memo: None,
@@ -639,6 +670,32 @@ impl Zu1File {
     /// other openers until [`Self::checkpoint`] publishes them.
     pub fn db_header_mut(&mut self) -> &mut DatabaseHeader {
         &mut self.db
+    }
+
+    /// Which header slot this handle is reading, which a caller passing
+    /// the header to another handle on the same file passes with it.
+    pub fn active_slot(&self) -> usize {
+        self.active_slot
+    }
+
+    /// Takes the roots another handle on this file has reached.
+    ///
+    /// [`Self::reopen`] hands a new handle the roots the writer holds,
+    /// and this is the same move made again later: a reader forked
+    /// before a commit reads the blocks that commit wrote, because data
+    /// blocks reach the file as they are staged and only the flip waits
+    /// for a checkpoint, but it has no way to know where they went. The
+    /// header is that way, so a reader given the writer's header reads
+    /// the writer's database.
+    ///
+    /// Only the header moves. The free lists, the savepoint and the
+    /// unpublished count belong to the handle that allocates, and a
+    /// handle that follows another one does not: it reads. The pin memo
+    /// goes because it names a block of the state being left behind.
+    pub fn follow(&mut self, header: &DatabaseHeader, slot: usize) {
+        self.db = header.clone();
+        self.active_slot = slot;
+        self.pin_memo = None;
     }
 
     /// Returns a block to write into: a committed-free block when one
@@ -742,6 +799,7 @@ impl Zu1File {
             marked: false,
             across_statements,
             published: false,
+            began_at: self.db.epoch,
         });
         // Blocks freed before the transaction and not published yet are
         // referenced by the header it keeps, so they go straight into
@@ -770,7 +828,21 @@ impl Zu1File {
         // What it freed is free for good now, so it goes back into the
         // list allocation draws from. The next checkpoint publishes it
         // as free either way; this is about reuse, not about the list.
-        self.free.append(&mut self.frozen);
+        //
+        // It goes by way of the retained list rather than straight in,
+        // because a block the transaction freed is a block the epoch it
+        // freed it under still reads, and a statement on another
+        // connection may be on that epoch. With nobody behind, which is
+        // one connection writing, the reclaim after this hands the
+        // whole lot back and nothing is delayed.
+        if !self.frozen.is_empty() {
+            let freed = std::mem::take(&mut self.frozen);
+            let epoch = held.as_ref().map_or(self.db.epoch, |held| held.began_at);
+            self.retained.push((epoch, freed));
+            if !self.defer_reclaim {
+                self.release_retained(u64::MAX);
+            }
+        }
         match held.is_some_and(|held| held.marked) {
             true => self.forget_kept(),
             false => Ok(()),
@@ -883,6 +955,12 @@ impl Zu1File {
         // What the transaction freed is live again in the header going
         // back in, so it is dropped rather than published.
         self.frozen.clear();
+        // Same for the blocks a checkpoint inside the transaction was
+        // holding for a reader: the header going back in reaches them
+        // again. What older checkpoints are holding is untouched, being
+        // blocks that header does not reach either.
+        let floor = self.db.epoch;
+        self.retained.retain(|(epoch, _)| *epoch < floor);
         self.pin_memo = None;
         // A transaction that staged blocks and published nothing is
         // undone by forgetting them, and a header flip would only cost
@@ -926,6 +1004,55 @@ impl Zu1File {
     /// durable before the WAL frame referencing them is.
     pub fn sync_data(&mut self) -> Result<()> {
         self.file.sync_data()
+    }
+
+    /// Gives back for allocation the blocks a checkpoint listed as free
+    /// that no reader is on any more, and answers how many.
+    ///
+    /// `floor` is the oldest epoch anything is reading, so an entry the
+    /// checkpoint tagged with an epoch below it is reachable from
+    /// nothing: every reader has moved past it. A caller with no
+    /// readers passes `u64::MAX` and gets the whole list back, which is
+    /// the single-connection case and is why one connection allocates
+    /// exactly as it did before this existed.
+    pub fn release_retained(&mut self, floor: u64) -> usize {
+        let mut ready = Vec::new();
+        self.retained.retain(|(epoch, blocks)| {
+            if *epoch < floor {
+                ready.extend_from_slice(blocks);
+                return false;
+            }
+            true
+        });
+        let count = ready.len();
+        // The same split a checkpoint makes: inside a transaction, a
+        // block it froze stays out of allocation until the transaction
+        // ends, whatever the readers are doing.
+        match &mut self.savepoint {
+            Some(saved) => {
+                let (free, frozen): (Vec<BlockPtr>, Vec<BlockPtr>) =
+                    ready.into_iter().partition(|p| saved.reusable.contains(p));
+                self.free.extend(free);
+                self.frozen.extend(frozen);
+            }
+            None => self.free.extend(ready),
+        }
+        count
+    }
+
+    /// Says that a caller above this handle counts the readers, so a
+    /// checkpoint holds what it frees until that caller says which
+    /// epoch is the oldest anything is reading. Set on the one handle
+    /// of a file that writes; every other handle only reads.
+    pub fn defer_reclaim(&mut self, on: bool) {
+        self.defer_reclaim = on;
+    }
+
+    /// How many blocks are waiting on a reader. Nonzero here is a
+    /// connection reading an epoch the writer has moved past, and the
+    /// file growing rather than reusing while it does.
+    pub fn retained_blocks(&self) -> usize {
+        self.retained.iter().map(|(_, blocks)| blocks.len()).sum()
     }
 
     /// Marks `ptr` free. The committed epoch still references it, so it
@@ -1072,6 +1199,18 @@ impl Zu1File {
         let committed = std::mem::take(&mut self.free);
         let safe = committed.len();
         let mut all = committed;
+        // The two the comment above names as unsafe to overwrite before
+        // the flip are the two a reader left on this epoch is unsafe to
+        // overwrite after it, for the same reason: they are the blocks
+        // the epoch being superseded reads. They are listed as free
+        // like the rest and held back from allocation below.
+        let superseded = self.db.epoch;
+        let reached: HashSet<BlockPtr> = self
+            .pending_free
+            .iter()
+            .chain(self.free_chain.iter())
+            .copied()
+            .collect();
         // Inside a transaction the free blocks it may not write into
         // are held aside rather than listed, so they come back here to
         // be listed: the epoch being published has let go of them, and
@@ -1112,6 +1251,13 @@ impl Zu1File {
         if root != NULL_BLOCK {
             self.free_chain = crate::meta::chain_blocks(self, root)?;
         }
+        // The blocks the superseded epoch reaches wait for whoever is
+        // reading it; the caller releases them when nobody is.
+        let (held, all): (Vec<BlockPtr>, Vec<BlockPtr>) =
+            all.into_iter().partition(|p| reached.contains(p));
+        if !held.is_empty() {
+            self.retained.push((superseded, held));
+        }
         // Outside a transaction every free block is allocatable again.
         // Inside one the list splits: what was free before it began is
         // allocatable, and what it freed on the way is not, because the
@@ -1124,6 +1270,11 @@ impl Zu1File {
                 self.frozen = frozen;
             }
             None => self.free = all,
+        }
+        // Nobody behind, nobody to wait for: what was just retained is
+        // allocatable again before this call returns.
+        if !self.defer_reclaim {
+            self.release_retained(u64::MAX);
         }
         self.unpublished = 0;
         Ok(())
@@ -1368,6 +1519,28 @@ mod tests {
         assert_eq!(db.allocate_block(), a);
         assert!(db.free_block(NULL_BLOCK).is_err());
         assert!(db.free_block(99).is_err());
+    }
+
+    /// With somebody reading behind the writer, a checkpoint lists a
+    /// freed block as free and still does not allocate into it, because
+    /// the epoch being read is the epoch that reaches it.
+    #[test]
+    fn a_retained_block_waits_for_the_reader_of_the_epoch_that_reaches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&temp_path(&dir)).unwrap();
+        db.defer_reclaim(true);
+        let a = db.allocate_block();
+        db.write_block(a, &vec![1; BLOCK_SIZE as usize]).unwrap();
+        db.checkpoint().unwrap();
+        let reading = db.db_header().epoch;
+        db.free_block(a).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.retained_blocks(), 1, "held for the reader");
+        assert_eq!(db.release_retained(reading), 0, "the reader is on it");
+        assert_ne!(db.allocate_block(), a, "so the file grows instead");
+        assert_eq!(db.release_retained(reading + 1), 1, "the reader left");
+        assert_eq!(db.retained_blocks(), 0);
+        assert_eq!(db.allocate_block(), a, "and the block is reused");
     }
 
     #[test]

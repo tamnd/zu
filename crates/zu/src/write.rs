@@ -1225,6 +1225,7 @@ mod tests {
         // The process dies here: no fold, no checkpoint, and no drop
         // either, because dropping the session is what publishes.
         std::mem::forget(session);
+        crate::shared::forget(&path);
 
         let mut session = Session::open(&path).expect("reopen");
         assert_eq!(ages(&mut session), [20, 30, 40, 77]);
@@ -1248,6 +1249,7 @@ mod tests {
             )
             .expect("write an edge");
         std::mem::forget(session);
+        crate::shared::forget(&path);
 
         let mut session = Session::open(&path).expect("reopen");
         let out = session

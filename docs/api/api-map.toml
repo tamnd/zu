@@ -37,6 +37,11 @@ tier = 2
 reason = "how much work a checkpoint does, which only a binding that exposes checkpointing needs"
 
 [[group]]
+prefix = "zu::Column"
+tier = 2
+reason = "one column of a registered frame: the name, the logical type and the layout the caller's own memory holds it in. A binding that can hand the engine a pointer to a column builds these; one that can only copy rows in through the appender never names it"
+
+[[group]]
 prefix = "zu::Config"
 tier = 1
 reason = "how a database is opened: the memory budget, the thread count, and read-only, which every binding takes as an option map"
@@ -62,14 +67,29 @@ tier = 2
 reason = "traversal direction, which a query says in its text rather than through an argument"
 
 [[group]]
+prefix = "zu::DurationKind"
+tier = 2
+reason = "which of the two durations a value is, year-month or day-time, which a binding needs only where it hands a duration back as something other than a string"
+
+[[group]]
 prefix = "zu::Field"
 tier = 1
 reason = "one value on its way into a column, which is the appender's half of the conversion code every binding writes"
 
 [[group]]
+prefix = "zu::FloatBits"
+tier = 2
+reason = "the width of an approximate number, which goes with the logical type and is read by a binding that describes a column rather than one that only reads its values"
+
+[[group]]
 prefix = "zu::Flow"
 tier = 2
 reason = "what a streaming sink answers to carry on or to stop, which is only a name in a binding that exposes streaming at all"
+
+[[group]]
+prefix = "zu::Frame"
+tier = 2
+reason = "a table of the caller's own memory registered with a session and scanned in place, which is the zero copy read path: a binding that can pin a buffer for the length of a query exposes it, and one whose runtime moves memory under it cannot"
 
 [[group]]
 prefix = "zu::FromRow"
@@ -92,9 +112,24 @@ tier = 3
 reason = "the trait the storage engines implement, chosen by the path a session opens rather than by a caller"
 
 [[group]]
+prefix = "zu::IntBits"
+tier = 2
+reason = "the width of an exact number, the integer half of what FloatBits says for the approximate one"
+
+[[group]]
 prefix = "zu::Interrupt"
 tier = 2
 reason = "the flag a running statement checks, set from another thread; the C ABI exposes the act of cancelling rather than the flag, so a binding that hands its user a cancellation token names this and one with a cancel call does not"
+
+[[group]]
+prefix = "zu::Layout"
+tier = 2
+reason = "how a registered column is laid out in the caller's memory, which is the one part of the frame API that is raw pointers and the reason the whole of it is tier 2"
+
+[[group]]
+prefix = "zu::LogicalType"
+tier = 2
+reason = "the type the language talks about, which is larger than the physical layout under it: a binding describing a column with more than a kind byte reads this, and one that hands values back already converted does not"
 
 [[group]]
 prefix = "zu::NodeId"
@@ -160,6 +195,11 @@ reason = "one pipeline stage of a profile, which is where the time went rather t
 prefix = "zu::Streamed"
 tier = 2
 reason = "what a streaming call answers once the rows are gone: the column names, how many went over, whether the caller stopped it and whether the engine made them as it handed them over"
+
+[[group]]
+prefix = "zu::Temporal"
+tier = 2
+reason = "a date, a time, a datetime or a duration as the engine holds one, which a binding converting into its own language's temporal types reads and one handing them back as text does not"
 
 [[group]]
 prefix = "zu::ZuError"

@@ -361,7 +361,7 @@ cases:
   - name: a-duration-holds-one-kind-or-the-other
     doc: A month and two days cannot be written as one duration, because the number of days a month comes to is not known until it starts, and the type refuses to pretend otherwise.
     query: RETURN DURATION 'P1M2D' AS n
-    raises: "22007"
+    raises: "22G0H"
 
   - name: a-day-and-twenty-four-hours-are-equal
     doc: On the day time side a day is exactly twenty four hours, so these compare equal, and a client keeping the fields apart has to compare the total.

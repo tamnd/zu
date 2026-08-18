@@ -36,9 +36,11 @@ use crate::graph::{
     Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain,
     free_directory_keeping_props, group_bases, group_rows, pad_direction,
 };
-use crate::keys::write_key_index;
+use crate::keys::write_key_index_live;
 use crate::meta;
-use crate::props::{PropsDirectory, free_props_keeping_labels, free_props_reusing, load_props_at};
+use crate::props::{
+    PropsDirectory, PropsReader, free_props_keeping_labels, free_props_reusing, load_props_at,
+};
 use crate::segment::{read_segment, write_segment};
 use crate::txn::{Cell, Mvcc};
 use crate::wal::Wal;
@@ -152,6 +154,9 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
     let mut changed = false;
     // Node tables first, so rel rebuilds see the grown row domains.
     let mut grown: HashSet<u32> = HashSet::new();
+    // And which of them lost a row, which a keyed rel table over the
+    // table has to hear about even when no edge of it moved.
+    let mut retired: HashSet<u32> = HashSet::new();
     for table in mvcc.tables_touched() {
         let node = catalog.node_by_id(table).ok_or_else(|| {
             ZuError::InvalidArgument(format!("overlay names unknown node table {table}"))
@@ -178,7 +183,10 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
             grown.insert(table);
             changed = true;
         }
-        changed |= fold_tombstones(db, mvcc, &mut index, table, epoch)?;
+        if fold_tombstones(db, mvcc, &mut index, table, epoch)? {
+            retired.insert(table);
+            changed = true;
+        }
     }
     let rels: Vec<RelTable> = catalog.rel_tables().to_vec();
     let dirty: HashSet<u32> = mvcc.rels_touched().into_iter().collect();
@@ -190,7 +198,13 @@ pub fn checkpoint_fold(db: &mut Zu1File, mvcc: &mut Mvcc, wal: &mut Wal) -> Resu
         }
     }
     for rel in rels {
-        if !dirty.contains(&rel.id) && !grown.contains(&rel.from) && !grown.contains(&rel.to) {
+        let moved = dirty.contains(&rel.id) || grown.contains(&rel.from) || grown.contains(&rel.to);
+        // A row that went away takes its key with it, and the key index
+        // is the one thing a rel table holds about the rows rather than
+        // about the edges. So a table that keys the node table the
+        // delete hit is rebuilt too, and one that keys nothing is left
+        // where it is: the edges of both are exactly as they were.
+        if !moved && !(retired.contains(&rel.from) && is_keyed(db, &index, rel.id)?) {
             continue;
         }
         let edge_count = fold_rel(db, mvcc, &catalog, &mut index, &rel, epoch)?;
@@ -717,37 +731,26 @@ fn fold_rel(
         }
         edges.push((src as u32, dst as u32, Came::Overlay(at)));
     }
-    edges.sort_unstable_by_key(|&(src, dst, _)| (src, dst));
-    // A bulk load can hold a pair twice, because the sort that puts the
-    // copies next to each other is stable and the copies keep file
-    // order. This sort is not: the base edge and the overlay edge over
-    // one pair would land in whichever order the sort left them, and
-    // the column permutation would then be reading a coin toss. Until
-    // the fold sorts by something that separates them, a second edge
-    // over a pair the table already holds is refused.
-    if old.props != NULL_BLOCK
-        && edges
-            .windows(2)
-            .any(|w| (w[0].0, w[0].1) == (w[1].0, w[1].1))
-    {
-        return Err(ZuError::Unsupported {
-            what: "a second edge over a pair a table that stores edge properties already holds",
-            id: rel.id,
-        });
-    }
+    // A pair can run more than once: a bulk load holds every copy the
+    // file gave it, and the reader answers a pair with the whole run.
+    // What the copies need is an order, since the property column is
+    // dense over the edges and the permutation below is what says which
+    // value belongs to which. This sort is stable and the edges went in
+    // base first, in the order the base holds them, so a copy keeps its
+    // place among the copies and an overlay edge lands behind the ones
+    // that were already there, which is where a newly written edge
+    // belongs.
+    edges.sort_by_key(|&(src, dst, _)| (src, dst));
     let order: Vec<Came> = edges.iter().map(|&(_, _, came)| came).collect();
     let edges: Vec<(u32, u32)> = edges.into_iter().map(|(src, dst, _)| (src, dst)).collect();
-    // A keyed table's index survives only while the row domain holds
-    // still; growing it takes the key allocation the constraint slice
-    // brings, so appending to a keyed table is refused for now.
+    // A keyed table's index is rebuilt row for row, which is what lets
+    // the row domain grow underneath it: the rows the base had keep the
+    // keys the index already holds, and the rows the appends added take
+    // theirs from the `id` column of the node table the index is over.
+    // Node tables fold ahead of rel tables, so that column already
+    // holds the appended values by the time this reads it.
     let key_by_row = match &old.keys {
         None => None,
-        Some(_) if new_from != old.from_count => {
-            return Err(ZuError::Unsupported {
-                what: "folding appended rows into a keyed table",
-                id: rel.id,
-            });
-        }
         Some(keys) => {
             let mut key_list = Vec::with_capacity(keys.keys.value_count as usize);
             read_segment(db, &keys.keys, &mut key_list)?;
@@ -755,11 +758,25 @@ fn fold_rel(
             read_segment(db, &keys.rows, &mut rows)?;
             let mut by_row = vec![0u64; new_from as usize];
             for (i, &row) in rows.iter().enumerate() {
-                by_row[row as usize] = key_list[i];
+                // A row the index names that the table no longer has is
+                // a file that disagrees with itself, and reading past
+                // the end of the vector would panic rather than say so.
+                let slot = by_row.get_mut(row as usize).ok_or_else(|| {
+                    corrupt(format!(
+                        "the key index of '{}' names row {row} of a table holding {new_from}",
+                        rel.name
+                    ))
+                })?;
+                *slot = key_list[i];
             }
+            read_appended_keys(db, index, rel, old.from_count, &mut by_row)?;
             Some(by_row)
         }
     };
+    // Which of those rows a DELETE took away, which the rebuilt index
+    // leaves out. Node tables fold first, so the fold's own table index
+    // already holds the merged set rather than the published one.
+    let dead_rows = tombstones_of(db, index, rel.from)?;
     free_directory_keeping_props(db, root)?;
     let mut fwd = build_direction(db, "source", new_from, &edges)?;
     let mut rev: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
@@ -793,13 +810,75 @@ fn fold_rel(
         to_count: new_to,
         edge_count: edges.len() as u64,
         keys: key_by_row
-            .map(|keys| write_key_index(db, &keys))
+            .map(|keys| write_key_index_live(db, &keys, &dead_rows))
             .transpose()?,
         props,
         groups,
     };
     index.set(rel.id, meta::write_chain(db, &directory.encode())?);
     Ok(directory.edge_count)
+}
+
+/// Whether a rel table carries a key index over the rows it leaves,
+/// read from its directory rather than from a rebuild of it.
+fn is_keyed(db: &mut Zu1File, index: &TableIndex, rel: u32) -> Result<bool> {
+    let Some(root) = index.get(rel) else {
+        return Ok(false);
+    };
+    Ok(Directory::decode(&meta::read_chain(db, root)?)?.keys.is_some())
+}
+
+/// The rows of a node table that a DELETE took away, sorted, as the
+/// fold's own table index holds them.
+fn tombstones_of(db: &mut Zu1File, index: &TableIndex, table: u32) -> Result<Vec<u64>> {
+    match index.get(table | TOMBSTONE_KEY) {
+        Some(root) => decode_tombstones(&meta::read_chain(db, root)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Fills in the keys of the rows a fold appended to the node table a
+/// rel table's key index is built over.
+///
+/// `by_row` is the whole index laid out row by row, already holding the
+/// keys of the rows `base` covered, and the rows from `base` on are the
+/// ones this answers. Their keys are the values of the node table's
+/// `id` column, which is where the loader put them and where a reader
+/// asking for `n.id` looks: a table whose ids are its row offsets is
+/// dense and carries no key index at all, so a table that has one has
+/// the column too.
+///
+/// Doing nothing when the domain did not grow is what makes this free
+/// on the fold that only rewrote a property.
+///
+/// The directory is reached through the fold's own table index rather
+/// than the file's, because the file's is a checkpoint behind: the node
+/// props this reads were rebuilt earlier in this same fold and nothing
+/// is published until it ends.
+fn read_appended_keys(
+    db: &mut Zu1File,
+    index: &TableIndex,
+    rel: &RelTable,
+    base: u64,
+    by_row: &mut [u64],
+) -> Result<()> {
+    if by_row.len() as u64 <= base {
+        return Ok(());
+    }
+    let root = index.get(rel.from).ok_or_else(|| ZuError::Unsupported {
+        what: "growing a keyed table whose node table stores no properties",
+        id: rel.id,
+    })?;
+    let dir = load_props_at(db, root)?;
+    let mut reader = PropsReader::new(dir);
+    let col = reader.col("id").ok_or_else(|| ZuError::Unsupported {
+        what: "growing a keyed table whose node table has no 'id' column to take a key from",
+        id: rel.id,
+    })?;
+    for row in base..by_row.len() as u64 {
+        by_row[row as usize] = reader.read_int(db, col, row)?;
+    }
+    Ok(())
 }
 
 /// Where one edge of a rebuilt rel table came from, which is what says
@@ -1383,10 +1462,11 @@ mod tests {
     }
 
     /// A keyed table folds updates in place and keeps its key index
-    /// while the row domain holds still; growing it is refused whole,
-    /// with nothing published.
+    /// while the row domain holds still, and grows it when the domain
+    /// does: the rows the appends added take their keys from the `id`
+    /// column, and the index answers for them afterwards.
     #[test]
-    fn keyed_tables_keep_their_index_and_refuse_growth() {
+    fn keyed_tables_keep_their_index_and_grow_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("keyed.zu1")).unwrap();
         bulk_load_keyed(
@@ -1401,7 +1481,10 @@ mod tests {
         store_props(
             &mut db,
             "person",
-            &[("age", PropValues::Int(&[1, 2, 3, 4]))],
+            &[
+                ("age", PropValues::Int(&[1, 2, 3, 4])),
+                ("id", PropValues::Int(&[100, 200, 300, 400])),
+            ],
         )
         .unwrap();
         let person = Catalog::load(&mut db)
@@ -1426,7 +1509,124 @@ mod tests {
         assert_eq!(g.lookup_key(&mut db, 400).unwrap(), Some(3));
         assert_eq!(g.neighbors_dir(&mut db, 1, Direction::Fwd).unwrap(), &[3]);
         assert_eq!(read_age(&mut db, person, 3), 44);
-        // Growth: refused before anything publishes.
+        // Growth: the appended row brings its own key in the `id`
+        // column, and the index it lands in answers for it and for
+        // every key that was already there.
+        let mut txn = mvcc.begin();
+        txn.insert_nodes(
+            person,
+            vec![(0, vec![Cell::Int(5)]), (1, vec![Cell::Int(500)])],
+        )
+        .unwrap();
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        assert_eq!(
+            Catalog::load(&mut db)
+                .unwrap()
+                .node_by_id(person)
+                .unwrap()
+                .node_count,
+            5
+        );
+        let mut g = GraphReader::load_table(&mut db, "knows").unwrap();
+        assert_eq!(g.lookup_key(&mut db, 500).unwrap(), Some(4));
+        assert_eq!(g.lookup_key(&mut db, 100).unwrap(), Some(0));
+        assert_eq!(g.lookup_key(&mut db, 400).unwrap(), Some(3));
+        assert_eq!(g.lookup_key(&mut db, 250).unwrap(), None);
+        assert_eq!(read_age(&mut db, person, 4), 5);
+        assert!(wal.is_empty(), "the fold published and truncated");
+    }
+
+    /// A DELETE takes a row's key out of the index with the row, so the
+    /// next INSERT may have that key back. Without this a store that
+    /// creates and removes the same entity in a loop, which is what a
+    /// benchmark's stationary write does, refuses the second round and
+    /// keeps refusing it, because the record it cannot fold stays in
+    /// the log.
+    #[test]
+    fn a_deleted_row_gives_its_key_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("reuse.zu1")).unwrap();
+        bulk_load_keyed(
+            &mut db,
+            "person",
+            "knows",
+            4,
+            &[(0, 1), (2, 3)],
+            Some(&[100, 200, 300, 400]),
+        )
+        .unwrap();
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[1, 2, 3, 4])),
+                ("id", PropValues::Int(&[100, 200, 300, 400])),
+            ],
+        )
+        .unwrap();
+        let person = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("reuse.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.delete(person, 1);
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        let mut g = GraphReader::load_table(&mut db, "knows").unwrap();
+        assert_eq!(g.lookup_key(&mut db, 200).unwrap(), None);
+        assert_eq!(g.lookup_key(&mut db, 300).unwrap(), Some(2));
+        // The same key again, on a new row, which is the whole point.
+        let mut txn = mvcc.begin();
+        txn.insert_nodes(
+            person,
+            vec![(0, vec![Cell::Int(9)]), (1, vec![Cell::Int(200)])],
+        )
+        .unwrap();
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        let mut g = GraphReader::load_table(&mut db, "knows").unwrap();
+        assert_eq!(g.lookup_key(&mut db, 200).unwrap(), Some(4));
+        assert_eq!(read_age(&mut db, person, 4), 9);
+        assert!(wal.is_empty(), "the fold published and truncated");
+        let path = dir.path().join("reuse.zu1");
+        drop(g);
+        drop(db);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A keyed table whose node table has no `id` column has nowhere to
+    /// take an appended row's key from, so growing it is refused whole,
+    /// with nothing published and the txn still in the log.
+    #[test]
+    fn a_keyed_table_with_no_id_column_refuses_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("nokey.zu1")).unwrap();
+        bulk_load_keyed(
+            &mut db,
+            "person",
+            "knows",
+            4,
+            &[(0, 1), (2, 3)],
+            Some(&[100, 200, 300, 400]),
+        )
+        .unwrap();
+        store_props(
+            &mut db,
+            "person",
+            &[("age", PropValues::Int(&[1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let person = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut wal = Wal::open(&dir.path().join("nokey.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
         let mut txn = mvcc.begin();
         txn.insert_nodes(person, vec![(0, vec![Cell::Int(5)])])
             .unwrap();
@@ -1856,15 +2056,21 @@ mod tests {
         assert_eq!(reader.read_int(&mut db, col, 1).unwrap(), 2);
     }
 
-    /// A bulk load keeps both copies of a pair; folding a second one in
-    /// over a table that stores properties does not, because the fold's
-    /// sort would not say which copy came first.
+    /// A bulk load keeps both copies of a pair, and the fold keeps them
+    /// in the order the load left them, with a copy the fold adds
+    /// behind both. Every copy keeps the value it was written with,
+    /// which is the whole of what the ordering is for.
+    ///
+    /// A table nothing new is written to has to fold as well, since a
+    /// row appended to either end rebuilds it: a load with a pair that
+    /// runs twice, which is most of what a real dataset is, would
+    /// otherwise take no write at all.
     #[test]
-    fn a_second_edge_over_a_pair_is_refused_on_a_table_with_columns() {
+    fn a_pair_that_runs_twice_folds_in_load_order() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("reldup.zu1")).unwrap();
-        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2)]).unwrap();
-        crate::props::store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1, 2]))])
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (0, 1), (1, 2)]).unwrap();
+        crate::props::store_rel_props(&mut db, "knows", &[("since", PropValues::Int(&[1, 2, 3]))])
             .unwrap();
         let knows = Catalog::load(&mut db)
             .unwrap()
@@ -1876,8 +2082,28 @@ mod tests {
         let mut txn = mvcc.begin();
         txn.insert_rel_carrying(knows, 0, 1, vec![(0, Cell::Int(9))]);
         txn.commit(&mut wal).unwrap();
-        let err = checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap_err();
-        assert!(matches!(err, ZuError::Unsupported { .. }), "{err}");
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+
+        let mut graph = GraphReader::load_table(&mut db, "knows").unwrap();
+        assert_eq!(graph.edge_run(&mut db, 0, 1).unwrap(), Some((0, 3)));
+        assert_eq!(graph.edge_run(&mut db, 1, 2).unwrap(), Some((3, 1)));
+        let mut reader = PropsReader::new(
+            crate::props::load_rel_props(&mut db, knows)
+                .unwrap()
+                .unwrap(),
+        );
+        let since = reader.col("since").unwrap();
+        let read = |reader: &mut PropsReader, db: &mut Zu1File, row| {
+            reader.read_int(db, since, row).unwrap()
+        };
+        assert_eq!(read(&mut reader, &mut db, 0), 1);
+        assert_eq!(read(&mut reader, &mut db, 1), 2);
+        assert_eq!(read(&mut reader, &mut db, 2), 9);
+        assert_eq!(read(&mut reader, &mut db, 3), 3);
+        let path = dir.path().join("reldup.zu1");
+        drop(graph);
+        drop(db);
+        crate::verify(&path).unwrap();
     }
 
     /// A table that stores nothing on its edges has nowhere to put a

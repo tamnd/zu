@@ -1377,7 +1377,7 @@ pub enum Func {
     /// number of hops in the element list and not the element count:
     /// a two node path has three elements and a length of one.
     PathLength,
-    /// ISO 20.9. The elements of a path as a list, nodes and edges
+    /// ISO 20.16. The elements of a path as a list, nodes and edges
     /// alternating in the order the walk took them. It is the one way
     /// to read what a path holds, since a path is a value rather than
     /// a list and nothing else indexes into it.

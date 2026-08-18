@@ -6058,7 +6058,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     ))),
                 }
             }
-            // ISO 20.9. The walk in the order it was taken, node then
+            // ISO 20.16. The walk in the order it was taken, node then
             // edge then node, which is the shape the path already
             // holds, so the list is the same values under another
             // type rather than a copy of anything.

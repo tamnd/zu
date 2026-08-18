@@ -12,3 +12,6 @@ Cargo.lock
 *.zu1.wal
 .DS_Store
 .claude/
+# The node modules of the grammar checks, which npm puts here and
+# nothing else reads.
+/grammar/node_modules

@@ -1,0 +1,31 @@
+{
+  "grammars": [
+    {
+      "name": "gql",
+      "camelcase": "Gql",
+      "scope": "source.gql",
+      "path": ".",
+      "file-types": ["gql", "zuql"],
+      "injection-regex": "^(gql|zuql)$",
+      "highlights": ["queries/highlights.scm"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "Apache-2.0",
+    "description": "zuQL, the GQL dialect the zu engine speaks",
+    "authors": [{ "name": "the zu authors" }],
+    "links": {
+      "repository": "https://github.com/tamnd/zu"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": false,
+    "node": false,
+    "python": false,
+    "rust": false,
+    "swift": false,
+    "zig": false
+  }
+}

@@ -1,0 +1,216 @@
+================================================================================
+A match, a filter, a projection, an order and a limit
+================================================================================
+
+MATCH (p:Person {name: $n})-[:KNOWS]->(q)
+WHERE p.age > 30
+RETURN q.name AS who ORDER BY who DESC LIMIT 5
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)
+            (label_expr
+              (label
+                (identifier)))
+            (property_map
+              (identifier)
+              (parameter)))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier))))
+      (where_clause
+        (binary_expression
+          (property_access
+            (variable
+              (identifier))
+            (identifier))
+          (literal
+            (integer)))))
+    (return_clause
+      (projection
+        (projection_item
+          (property_access
+            (variable
+              (identifier))
+            (identifier))
+          (identifier))
+        (order_by
+          (sort_item
+            (variable
+              (identifier))))
+        (literal
+          (integer))))))
+
+================================================================================
+An optional match keeps the row it did not match
+================================================================================
+
+MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(q) RETURN p, q
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)))))
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A list unwound into rows, and a with between two clauses
+================================================================================
+
+UNWIND [1, 2, 3] AS n WITH n WHERE n > 1 RETURN count(n) AS c
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (unwind_clause
+      (list
+        (literal
+          (integer))
+        (literal
+          (integer))
+        (literal
+          (integer)))
+      (identifier))
+    (with_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier))))
+      (where_clause
+        (binary_expression
+          (variable
+            (identifier))
+          (literal
+            (integer)))))
+    (return_clause
+      (projection
+        (projection_item
+          (function_call
+            (identifier)
+            (variable
+              (identifier)))
+          (identifier))))))
+
+================================================================================
+A graph named before the query that reads it
+================================================================================
+
+USE PROPERTY GRAPH /social/main MATCH (p) RETURN p
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (use_clause
+      (graph_ref
+        (graph_name
+          (identifier)
+          (identifier))))
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+Distinct, skip, and the ordering of nulls
+================================================================================
+
+MATCH (p) RETURN DISTINCT p.city AS c ORDER BY c ASC NULLS LAST SKIP 10 LIMIT 10
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (property_access
+            (variable
+              (identifier))
+            (identifier))
+          (identifier))
+        (order_by
+          (sort_item
+            (variable
+              (identifier))
+            (null_ordering)))
+        (literal
+          (integer))
+        (literal
+          (integer))))))
+
+================================================================================
+Two statements in one file
+================================================================================
+
+MATCH (p) RETURN p; MATCH (q) RETURN q
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier))))))
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))

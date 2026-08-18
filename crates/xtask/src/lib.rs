@@ -6,6 +6,7 @@ pub mod apimap;
 pub mod artifacts;
 pub mod corpus;
 pub mod fixture;
+pub mod grammar;
 pub mod matrix;
 pub mod model;
 pub mod package;

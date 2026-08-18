@@ -1,0 +1,298 @@
+================================================================================
+Precedence, from the loosest binding to the tightest
+================================================================================
+
+RETURN NOT a OR b AND c = 1 + 2 * -3 AS x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (binary_expression
+            (unary_expression
+              (variable
+                (identifier)))
+            (binary_expression
+              (variable
+                (identifier))
+              (binary_expression
+                (variable
+                  (identifier))
+                (binary_expression
+                  (literal
+                    (integer))
+                  (binary_expression
+                    (literal
+                      (integer))
+                    (unary_expression
+                      (literal
+                        (integer))))))))
+          (identifier))))))
+
+================================================================================
+A null test and a type test
+================================================================================
+
+MATCH (n) WHERE n.age IS NOT NULL AND n.name IS TYPED STRING RETURN n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))))
+      (where_clause
+        (binary_expression
+          (is_expression
+            (property_access
+              (variable
+                (identifier))
+              (identifier)))
+          (is_expression
+            (property_access
+              (variable
+                (identifier))
+              (identifier))
+            (value_type
+              (type_name
+                (identifier)))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A temporal literal is a type name and a string
+================================================================================
+
+RETURN DATE '2024-01-01' AS d, LOCAL TIME '12:34:00' AS t,
+       ZONED DATETIME '2024-01-01T07:00:00+07:00' AS z
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (temporal_literal
+            (type_name
+              (identifier))
+            (string))
+          (identifier))
+        (projection_item
+          (temporal_literal
+            (type_name
+              (identifier)
+              (identifier))
+            (string))
+          (identifier))
+        (projection_item
+          (temporal_literal
+            (type_name
+              (identifier)
+              (identifier))
+            (string))
+          (identifier))))))
+
+================================================================================
+A cast names a type, and a name before a string does too
+================================================================================
+
+RETURN CAST(1 AS INT64) AS n, CAST('x' AS LIST<STRING>) AS l
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (cast
+            (literal
+              (integer))
+            (value_type
+              (type_name
+                (identifier))))
+          (identifier))
+        (projection_item
+          (cast
+            (literal
+              (string))
+            (value_type
+              (list_type
+                (list_name)
+                (value_type
+                  (type_name
+                    (identifier))))))
+          (identifier))))))
+
+================================================================================
+The comparisons spelled as words
+================================================================================
+
+MATCH (n)
+WHERE n.name STARTS WITH 'a' AND n.name ENDS WITH 'z'
+  AND n.name CONTAINS 'm' AND n.city IN ['a', 'b']
+RETURN n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))))
+      (where_clause
+        (binary_expression
+          (binary_expression
+            (binary_expression
+              (binary_expression
+                (property_access
+                  (variable
+                    (identifier))
+                  (identifier))
+                (literal
+                  (string)))
+              (binary_expression
+                (property_access
+                  (variable
+                    (identifier))
+                  (identifier))
+                (literal
+                  (string))))
+            (binary_expression
+              (property_access
+                (variable
+                  (identifier))
+                (identifier))
+              (literal
+                (string))))
+          (binary_expression
+            (property_access
+              (variable
+                (identifier))
+              (identifier))
+            (list
+              (literal
+                (string))
+              (literal
+                (string)))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A match written where a predicate goes
+================================================================================
+
+MATCH (a) WHERE exists { MATCH (a)-[:KNOWS]->(b) WHERE b.age > 30 } RETURN a
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))))
+      (where_clause
+        (exists_block
+          (identifier)
+          (pattern
+            (path
+              (node
+                (identifier))
+              (relationship
+                (rel_detail
+                  (label
+                    (identifier))))
+              (node
+                (identifier))))
+          (where_clause
+            (binary_expression
+              (property_access
+                (variable
+                  (identifier))
+                (identifier))
+              (literal
+                (integer)))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A list, a record, and a path constructor
+================================================================================
+
+RETURN [1, 2] AS l, {a: 1, b: 'two'} AS r, path[a, b] AS p
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (list
+            (literal
+              (integer))
+            (literal
+              (integer)))
+          (identifier))
+        (projection_item
+          (record
+            (property_map
+              (identifier)
+              (literal
+                (integer))
+              (identifier)
+              (literal
+                (string))))
+          (identifier))
+        (projection_item
+          (path_constructor
+            (identifier)
+            (variable
+              (identifier))
+            (variable
+              (identifier)))
+          (identifier))))))
+
+================================================================================
+A keyword is a name where a name is what stands
+================================================================================
+
+MATCH (match) RETURN match.value AS `order by`
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (property_access
+            (variable
+              (identifier))
+            (identifier))
+          (quoted_identifier))))))

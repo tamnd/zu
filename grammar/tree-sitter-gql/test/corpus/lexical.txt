@@ -1,0 +1,118 @@
+================================================================================
+The number forms
+================================================================================
+
+RETURN 1 AS a, 0xff AS b, 0o17 AS c, 0b1010 AS d, 1.5 AS e, 1e3 AS f, 1.5f AS g
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (literal
+            (integer))
+          (identifier))
+        (projection_item
+          (literal
+            (integer))
+          (identifier))
+        (projection_item
+          (literal
+            (integer))
+          (identifier))
+        (projection_item
+          (literal
+            (integer))
+          (identifier))
+        (projection_item
+          (literal
+            (float))
+          (identifier))
+        (projection_item
+          (literal
+            (float))
+          (identifier))
+        (projection_item
+          (literal
+            (float))
+          (identifier))))))
+
+================================================================================
+A quote inside a string, escaped and doubled
+================================================================================
+
+RETURN 'it\'s' AS a, "she said \"no\"" AS b, @'a\b' AS c, @'it''s' AS d
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (literal
+            (string))
+          (identifier))
+        (projection_item
+          (literal
+            (string))
+          (identifier))
+        (projection_item
+          (literal
+            (string))
+          (identifier))
+        (projection_item
+          (literal
+            (string))
+          (identifier))))))
+
+================================================================================
+Both comment forms are whitespace
+================================================================================
+
+// what this query is for
+MATCH (p) /* and a note in the middle */ RETURN p
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (comment)
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)))))
+    (comment)
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A name with a space in it, in backticks
+================================================================================
+
+MATCH (`odd name`:`Odd Label`) RETURN `odd name` AS `the answer`
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (quoted_identifier)
+            (label_expr
+              (label
+                (quoted_identifier)))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (quoted_identifier))
+          (quoted_identifier))))))

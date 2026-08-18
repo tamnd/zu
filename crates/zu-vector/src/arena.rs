@@ -105,6 +105,8 @@ impl MorselArena {
                 len: bytes,
                 #[cfg(debug_assertions)]
                 tag: None,
+                #[cfg(debug_assertions)]
+                borrowed: false,
             });
         }
         let off = self.off.next_multiple_of(align);
@@ -126,6 +128,8 @@ impl MorselArena {
             len: bytes,
             #[cfg(debug_assertions)]
             tag: None,
+            #[cfg(debug_assertions)]
+            borrowed: false,
         })
     }
 
@@ -172,6 +176,12 @@ pub struct RawBuf {
     len: usize,
     #[cfg(debug_assertions)]
     tag: Option<(Arc<AtomicU64>, u64)>,
+    /// Whether the bytes belong to somebody else, which is the one
+    /// thing that decides whether they may be written. Debug only,
+    /// like the generation tag: it is a rule the type cannot state and
+    /// a mistake worth catching where it is made.
+    #[cfg(debug_assertions)]
+    borrowed: bool,
 }
 
 // The buffer is plain bytes; the arena outliving it is the executor
@@ -187,6 +197,38 @@ impl RawBuf {
             len: 0,
             #[cfg(debug_assertions)]
             tag: None,
+            #[cfg(debug_assertions)]
+            borrowed: false,
+        }
+    }
+
+    /// A buffer over memory the arena did not hand out and does not
+    /// own: a column of a registered frame, which is somebody else's
+    /// allocation for as long as it stays registered.
+    ///
+    /// This is what makes a scan of borrowed data a scan rather than a
+    /// copy. A vector built over one of these reads exactly as a vector
+    /// over arena memory reads, because a buffer was never more than a
+    /// pointer and a length; what differs is who frees it, and the
+    /// answer is nobody here. It carries no generation tag, so the
+    /// use-after-reset assert that guards arena buffers does not fire
+    /// on it and cannot: the memory has nothing to do with the morsel.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at `len` initialized bytes, aligned for every
+    /// type the buffer is read as, unwritten and unfreed by anyone for
+    /// as long as this buffer and every vector built over it live. The
+    /// caller keeps them alive; in the engine that is the frame
+    /// registration holding the handle its columns arrived on.
+    pub unsafe fn borrowed(ptr: NonNull<u8>, len: usize) -> Self {
+        Self {
+            ptr,
+            len,
+            #[cfg(debug_assertions)]
+            tag: None,
+            #[cfg(debug_assertions)]
+            borrowed: true,
         }
     }
 
@@ -223,6 +265,8 @@ impl RawBuf {
     #[inline]
     pub fn as_mut_slice<T: Pod>(&mut self) -> &mut [T] {
         self.check();
+        #[cfg(debug_assertions)]
+        assert!(!self.borrowed, "a borrowed buffer was written to");
         debug_assert_eq!(self.ptr.as_ptr() as usize % align_of::<T>(), 0);
         unsafe {
             std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast(), self.len / size_of::<T>())
@@ -280,6 +324,39 @@ mod tests {
         let _odd = arena.alloc(3, 1);
         let aligned = arena.alloc_of::<u64>(1);
         assert_eq!(aligned.as_slice::<u64>().len(), 1);
+    }
+
+    #[test]
+    fn borrowed_reads_the_memory_it_was_given() {
+        // A column of a registered frame: the values are read where
+        // they lie, and the arena never sees them.
+        let outside = [7u64, 8, 9];
+        let buf = unsafe {
+            RawBuf::borrowed(
+                NonNull::new(outside.as_ptr() as *mut u8).expect("a real pointer"),
+                size_of_val(&outside[..]),
+            )
+        };
+        assert_eq!(buf.as_slice::<u64>(), &outside[..]);
+        let mut arena = MorselArena::new();
+        arena.reset();
+        // Nothing about the morsel reaches it: it survives the reset
+        // that kills every buffer the arena handed out.
+        assert_eq!(buf.as_slice::<u64>()[2], 9);
+    }
+
+    #[test]
+    #[should_panic(expected = "borrowed buffer was written")]
+    #[cfg(debug_assertions)]
+    fn writing_a_borrowed_buffer_asserts() {
+        let outside = [7u64];
+        let mut buf = unsafe {
+            RawBuf::borrowed(
+                NonNull::new(outside.as_ptr() as *mut u8).expect("a real pointer"),
+                8,
+            )
+        };
+        buf.as_mut_slice::<u64>()[0] = 1;
     }
 
     #[test]

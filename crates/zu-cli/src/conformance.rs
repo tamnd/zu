@@ -202,6 +202,16 @@ const NOTES: &[&str] = &[
      graph the caller passed in as a parameter; the last is a graph reference and not a name, \
      so a string spelling a graph's name is refused, and a reference to a graph that has been \
      dropped since it was taken is refused rather than read as whatever holds that place now",
+    "a step repeats as many times as one quantity says, written as a range inside the brackets \
+     or as the standard's quantifier behind the arrow, `+` for one or more, `{n}` for exactly n \
+     and `{n,m}` for a range with either end left out, and a step carrying both forms is refused \
+     rather than one of them being read and the other dropped; a repetition that may take no hop \
+     at all, a bare `*` or a range starting at zero, is refused with that as the reason rather \
+     than answered as though it had been written `+`",
+    "a repeated step walks under a path mode, and the default is TRAIL, which repeats no edge: \
+     WALK repeats anything, ACYCLIC repeats no node, and SIMPLE repeats no node except that a \
+     path may end where it began, so a cycle is a simple path and is not an acyclic one and \
+     neither mode is a substitute for the other",
     "a YIELD after a match says which of the names it wrote leave it, and under what name, so \
      a name the yield does not carry is out of scope behind it and a name the match did not \
      write is refused; it narrows the columns and leaves the rows alone, so the rows a match \

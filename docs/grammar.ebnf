@@ -201,7 +201,12 @@ pattern         = path , { "," , path } ;
 path            = [ name , "=" ] , [ selector ] , [ path_mode ] ,
                   node , { relationship , node } ;
 selector        = ( "ANY" | "ALL" ) , "SHORTEST" ;
-path_mode       = "WALK" | "TRAIL" | "ACYCLIC" ;
+path_mode       = "WALK" | "TRAIL" | "SIMPLE" | "ACYCLIC" ;
+(* The four differ only in the repeat they forbid: none, a repeated
+   edge, a repeated node except the one the path started at, and a
+   repeated node anywhere. SIMPLE and ACYCLIC are not substitutes for
+   one another, because a cycle is a simple path and not an acyclic
+   one. *)
 node            = "(" , [ name ] , { ":" , label_expr } ,
                   [ property_map ] , ")" ;
 label_expr      = label_term , { "|" , label_term } ;
@@ -212,8 +217,8 @@ label_atom      = name | "%" | "(" , label_expr , ")" ;
    the same pattern, and `%` holds of every element because an element
    always carries the label of the table it lives in. *)
 
-relationship    = [ "<" ] , bar , [ rel_detail ] , bar , [ ">" ]
-                | [ "<" ] , bar , [ ">" ] ;
+relationship    = ( [ "<" ] , bar , [ rel_detail ] , bar , [ ">" ]
+                  | [ "<" ] , bar , [ ">" ] ) , [ quantifier ] ;
 bar             = "-" | "~" ;
 (* The seven edge patterns of ISO 18.9, written as one production with
    two rules the parser applies: both bars are the same character, and
@@ -230,6 +235,13 @@ rel_detail      = "[" , [ name ] , [ ":" , name , { "|" , name } ] ,
 hop_range       = integer , [ ".." , [ integer ] ]
                 | ".." , integer ;
 (* `*n` alone means exactly n hops; a bare `*` is unbounded. *)
+quantifier      = "+" | "*" | "{" , [ integer ] , [ "," , [ integer ] ] , "}" ;
+(* The standard's way of writing the same repetition, behind the arrow
+   rather than inside the brackets: `+` is one or more, `*` is zero or
+   more, `{n}` is exactly n, and `{n,m}` is a range with either end
+   allowed to be left out. A step carries one of the two forms and not
+   both. A step of no hops is not walked yet, so `*` and a lower bound
+   of 0 are refused rather than read as `+`. *)
 
 property_map    = "{" , [ name , ":" , expression ,
                   { "," , name , ":" , expression } ] , "}" ;

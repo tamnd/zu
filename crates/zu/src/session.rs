@@ -159,6 +159,10 @@ pub struct Session {
     writer: Option<Writer>,
     /// The explicit transaction running here, if a statement opened one.
     txn: Option<Explicit>,
+    /// The props directories of the tables writes have touched, held
+    /// across statements because reading one back is a block chain walk
+    /// and what it says only changes when the epoch does.
+    dirs: crate::set::Dirs,
     /// The cells the writer's committed but unfolded statements wrote,
     /// as the readers were last given them. Held so that handing them
     /// over again costs a pointer comparison on a session that only
@@ -194,6 +198,7 @@ impl Session {
             },
             writer: None,
             txn: None,
+            dirs: crate::set::Dirs::default(),
             patches: Arc::new(Patches::new()),
         })
     }
@@ -813,7 +818,7 @@ impl Session {
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
                         let (carried, values) = row.split_at(carry);
-                        changes.row(self.graph.file_mut(), carried, values)?;
+                        changes.row(self.graph.file_mut(), &mut self.dirs, carried, values)?;
                         next.push(Value::List(carried.to_vec()));
                     }
                     let (updates, widened) = changes.staged();
@@ -1216,6 +1221,9 @@ impl Session {
         // so the next hand-over starts from nothing rather than being
         // skipped as already done.
         self.patches = Arc::new(Patches::new());
+        // A moved epoch is a moved layout, and the directories say
+        // where the columns of a table are.
+        self.dirs = crate::set::Dirs::default();
         self.epoch = epoch;
         Ok(())
     }

@@ -6270,6 +6270,13 @@
       "doc": "Reads a segment back, verifying the payload crc, and appends every\nvalue to `bytes_out` and `ends_out` as [`decode_payload`] does."
     },
     {
+      "id": "zu::zu1::fullzip::rewrite_blob_reordered",
+      "kind": "function",
+      "name": "rewrite_blob_reordered",
+      "signature": "fn rewrite_blob_reordered(db: &mut zu_zu1::file::Zu1File, old: &zu_zu1::segment::SegmentMeta, values: &[&[u8]]) -> zu_common::Result<zu_zu1::segment::SegmentMeta>",
+      "doc": "The same, for a column that is already on disk in some other order:\nthe values are all of them again, but the table they were encoded\nwith is still good, so it comes off the old segment instead of being\ntrained a second time on the same strings.\n\nThis is the shape an edge write leaves. A rel table holds its edges\nsorted by the row they leave, so an edge added in the middle moves\nevery edge behind it, and the fold hands the whole column back in the\nnew order. Nothing about the strings changed, only where they sit, so\ntraining on them again is work with a known answer: reading the table\nback and encoding with it writes a column of the same size for the\ncost of the encode, and on the LinkBench shape that is 20 ms of an\nadd-link statement gone.\n\nA column that really is different from the one on disk is caught the\nway it always was, per chunk: a chunk that encodes well off the\ntable's own ratio buys a table of its own. If the old segment holds\nnothing to read a table out of, this trains one."
+    },
+    {
       "id": "zu::zu1::fullzip::rewrite_blob_segment",
       "kind": "function",
       "name": "rewrite_blob_segment",
@@ -8649,7 +8656,7 @@
       "id": "zu::zu1::wal::Wal",
       "kind": "struct",
       "name": "Wal",
-      "doc": "The open sidecar log: an append position, a staging buffer and the\nframe codec around them. Commit durability is one `fdatasync` per\ncommit; the 1 ms group-commit window from docs/08 arrives with the\nwriter queue.\n\nA transaction's frames are built in memory and go to the file in one\nwrite at commit, because a small write is nearly all syscall: a one\ncell update is a begin frame, an update frame and a commit frame,\nthree pwrites of about thirty bytes each, and on this laptop those\nthree cost more processor time than everything the statement did\nbefore them. Nothing about durability changes, since the commit\nframe is still what reaches the disk last and the sync still follows\nit."
+      "doc": "The open sidecar log: an append position, a staging buffer and the\nframe codec around them. Commit durability is one `fdatasync` per\ncommit; the 1 ms group-commit window from docs/08 arrives with the\nwriter queue.\n\nA transaction's frames are built in memory and go to the file in one\nwrite at commit, because a small write is nearly all syscall: a one\ncell update is a begin frame, an update frame and a commit frame,\nthree pwrites of about thirty bytes each, and on this laptop those\nthree cost more processor time than everything the statement did\nbefore them. Nothing about durability changes, since the commit\nframe is still what reaches the disk last and the sync still follows\nit.\n\nThe room those frames go into is asked for ahead of them. A write\nthat makes a file longer is a write plus an allocation plus a size\nthe sync has to carry, and a commit that does that every time pays\nfor it every time: measured on this laptop, a hundred byte frame\nand its sync cost 34 us of processor time and 3.75 ms of wall\nappending, against 25 us and 3.17 ms into space the file already\nhad. So the log takes its space in chunks and writes zeros over it,\nand a commit writes inside what it already has.\n\nZeros are not padding, they are the end of the log. A frame is a\nlength and a crc, and a length of zero is shorter than the smallest\nrecord, so the scan that replay and open both use stops at the\nfirst byte of unused reservation. That is the same stop a torn tail\ngets and it is why nothing else is needed to say where the log\nends. It is also why every path that takes frames away, the cut\nafter a checkpoint and the rollback of a transaction the process\ndied inside, writes zeros over what it took rather than leaving\nbytes that once parsed."
     },
     {
       "id": "zu::zu1::wal::Wal::append",

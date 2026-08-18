@@ -667,11 +667,11 @@ mod tests {
         sorted.sort();
         assert_eq!(abi.declared, sorted);
         assert!(abi.declared.iter().all(|n| n.starts_with("zu_")));
-        // dx/02 §8 is the v0.5 restructure, and the error model and the
-        // cancellation calls added to it are both additive, so this is
-        // 0.7: the number the milestone is about and the one nine
-        // bindings will test for.
-        assert_eq!(abi.revision, ("0.7".to_string(), "0.7".to_string()));
+        // dx/02 §8 is the v0.5 restructure, and the error model, the
+        // cancellation calls and the transaction boundaries added to it
+        // are all additive, so this is 0.8: the number a binding tests
+        // for when it wants to know whether zu_begin is there.
+        assert_eq!(abi.revision, ("0.8".to_string(), "0.8".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

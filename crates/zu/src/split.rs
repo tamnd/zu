@@ -288,6 +288,9 @@ fn compile(
         // because a part is a slice of the same statement and
         // [`BoundExpr::Scalar`] indexes them by position.
         scalars: query.scalars.clone(),
+        // A part is a slice of a statement and not a query written
+        // inside one, so it reads nothing from a query around it.
+        captures: Vec::new(),
     };
     let leaf = match base {
         // The rows the part before this one carried arrive as one

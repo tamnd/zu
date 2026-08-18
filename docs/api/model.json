@@ -1091,7 +1091,7 @@
       "name": "render",
       "of": "zu::QueryPlan",
       "signature": "fn render(&self) -> String",
-      "doc": "The listing EXPLAIN prints, notes first and the tree under them."
+      "doc": "The listing EXPLAIN prints, notes first, the tree under them,\nand the plan of each value query expression under that."
     },
     {
       "id": "zu::QueryPlan::root",
@@ -1100,6 +1100,14 @@
       "of": "zu::QueryPlan",
       "signature": "Option<PlanNode>",
       "doc": "The top operator, `None` for the plan with no operators at all,\nwhich is the one row a statement with no clauses runs over."
+    },
+    {
+      "id": "zu::QueryPlan::scalars",
+      "kind": "field",
+      "name": "scalars",
+      "of": "zu::QueryPlan",
+      "signature": "Vec<ScalarPlan>",
+      "doc": "The value query expressions this statement holds, in the order\n`VALUE {n}` in the tree names them (GQ18).\n\nEach is a plan of its own rather than an operator of this one,\nbecause that is what it is: a query written where a value\nbelongs is run on its own and what stands in the tree is the\nvalue it answered."
     },
     {
       "id": "zu::Result",
@@ -1202,6 +1210,28 @@
       "name": "RowIter",
       "source": "zu_query::row::RowIter",
       "doc": "The rows of a result, borrowed one at a time."
+    },
+    {
+      "id": "zu::ScalarPlan",
+      "kind": "struct",
+      "name": "ScalarPlan",
+      "source": "zu_query::plan::ScalarPlan",
+      "doc": "One value query expression as a plan, and how often it runs."
+    },
+    {
+      "id": "zu::ScalarPlan::plan",
+      "kind": "field",
+      "name": "plan",
+      "of": "zu::ScalarPlan",
+      "signature": "QueryPlan"
+    },
+    {
+      "id": "zu::ScalarPlan::reads",
+      "kind": "field",
+      "name": "reads",
+      "of": "zu::ScalarPlan",
+      "signature": "Vec<String>",
+      "doc": "The names it reads from the query around it, empty for one that\nreads none. Empty is the whole test for whether it decorrelates:\na query reading nothing answers the same value for every row and\nis run once, and a query reading a name is run per row."
     },
     {
       "id": "zu::Severity",

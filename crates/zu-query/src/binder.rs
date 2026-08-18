@@ -550,6 +550,45 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Adds a node table the file does not hold, under a label of its
+    /// own name.
+    ///
+    /// This is what a registered frame is to the binder: a table of the
+    /// graph for as long as the session keeps it, named the same way
+    /// every other table is named and matched by the same patterns. It
+    /// is added here rather than built into the schema so that the
+    /// statistics a schema was loaded with survive a registration,
+    /// which is the difference between rebuilding one per `register`
+    /// call and not.
+    pub fn add_node_table(&mut self, mut def: NodeDef) -> Result<u16> {
+        if self.nodes.iter().any(|n| n.name == def.name)
+            || self.rels.iter().any(|r| r.name == def.name)
+        {
+            return Err(invalid(format!(
+                "'{}' is already a table of this graph",
+                def.name
+            )));
+        }
+        // A name the graph already has a label under costs nothing; it
+        // is only a new one that has to fit.
+        let label = match self.label_id(&def.name) {
+            Some(id) => id,
+            None => {
+                if self.labels.len() >= MAX_LABELS {
+                    return Err(invalid(format!(
+                        "a graph holds at most {MAX_LABELS} labels and this one already holds {}",
+                        self.labels.len()
+                    )));
+                }
+                self.labels.push(def.name.clone());
+                (self.labels.len() - 1) as u16
+            }
+        };
+        def.labels = vec![label];
+        self.nodes.push(def);
+        Ok(label)
+    }
+
     pub fn nodes(&self) -> &[NodeDef] {
         &self.nodes
     }

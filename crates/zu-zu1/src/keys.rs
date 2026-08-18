@@ -33,9 +33,27 @@ pub struct KeyIndex {
 /// Builds the sealed index from `key_by_row`, where `key_by_row[row]` is
 /// the key of row `row`. Keys must be unique.
 pub fn write_key_index(db: &mut Zu1File, key_by_row: &[u64]) -> Result<KeyIndex> {
+    write_key_index_live(db, key_by_row, &[])
+}
+
+/// The same over the rows `dead` does not name, which are sorted row
+/// offsets a DELETE took away.
+///
+/// A row nothing holds any more has no original id, and keeping its key
+/// would be worse than pointless: the key is the one thing a later
+/// INSERT can reasonably ask for back, and an index that still lists it
+/// refuses the reuse as a duplicate of a row that is not there. So the
+/// index covers the live rows, and a lookup of a key a DELETE took away
+/// misses the way a lookup of a key nobody ever held does.
+pub fn write_key_index_live(
+    db: &mut Zu1File,
+    key_by_row: &[u64],
+    dead: &[u64],
+) -> Result<KeyIndex> {
     let mut pairs: Vec<(u64, u64)> = key_by_row
         .iter()
         .enumerate()
+        .filter(|(row, _)| dead.binary_search(&(*row as u64)).is_err())
         .map(|(row, &key)| (key, row as u64))
         .collect();
     pairs.sort_unstable();
@@ -105,12 +123,18 @@ impl KeyReader {
 }
 
 /// Reads the index back in the shape [`write_key_index`] took it,
-/// `key_by_row[row]` being the key of that row.
+/// `key_by_row[row]` being the key of that row over the whole row
+/// domain, and `None` where the index holds no key for the row.
 ///
 /// A kernel whose answer is stated in original ids rather than in rows
 /// needs every key, and asking for them one at a time costs a fence
 /// search each to learn what two sequential segment scans already say.
-pub fn key_by_row(db: &mut Zu1File, index: &KeyIndex) -> Result<Vec<u64>> {
+///
+/// The gaps are the rows a DELETE took away, which the index stops
+/// covering the moment the fold rebuilds it. They are `None` rather
+/// than any particular number because every number is a key some row
+/// could legitimately hold.
+pub fn key_by_row(db: &mut Zu1File, index: &KeyIndex, node_count: u64) -> Result<Vec<Option<u64>>> {
     let corrupt = |detail: String| ZuError::Corrupt {
         what: "key index",
         detail,
@@ -126,20 +150,26 @@ pub fn key_by_row(db: &mut Zu1File, index: &KeyIndex) -> Result<Vec<u64>> {
             rows.len()
         )));
     }
-    let mut by_row = vec![0u64; rows.len()];
+    let mut by_row = vec![None; node_count as usize];
     for (&key, &row) in keys.iter().zip(&rows) {
         let slot = by_row
             .get_mut(row as usize)
-            .ok_or_else(|| corrupt(format!("row {row} out of 0..{}", rows.len())))?;
-        *slot = key;
+            .ok_or_else(|| corrupt(format!("row {row} out of 0..{node_count}")))?;
+        *slot = Some(key);
     }
     Ok(by_row)
 }
 
 /// Full check for `zu verify`: both segments decode clean (crc and zone
-/// included via the scan path), the counts match the node domain, the
-/// keys ascend strictly, and the rows are a permutation of it.
-pub fn verify_key_index(db: &mut Zu1File, index: &KeyIndex, node_count: u64) -> Result<()> {
+/// included via the scan path), the keys ascend strictly, and the rows
+/// are exactly the live ones, which are the row domain less the sorted
+/// offsets `dead` names.
+pub fn verify_key_index(
+    db: &mut Zu1File,
+    index: &KeyIndex,
+    node_count: u64,
+    dead: &[u64],
+) -> Result<()> {
     let corrupt = |detail: String| ZuError::Corrupt {
         what: "key index",
         detail,
@@ -148,9 +178,10 @@ pub fn verify_key_index(db: &mut Zu1File, index: &KeyIndex, node_count: u64) -> 
     read_segment(db, &index.keys, &mut keys)?;
     let mut rows = Vec::with_capacity(index.rows.value_count as usize);
     read_segment(db, &index.rows, &mut rows)?;
-    if keys.len() as u64 != node_count || rows.len() as u64 != node_count {
+    let live = node_count - dead.len() as u64;
+    if keys.len() as u64 != live || rows.len() as u64 != live {
         return Err(corrupt(format!(
-            "index holds {} keys and {} rows over {node_count} nodes",
+            "index holds {} keys and {} rows over {live} live of {node_count} nodes",
             keys.len(),
             rows.len()
         )));
@@ -158,13 +189,16 @@ pub fn verify_key_index(db: &mut Zu1File, index: &KeyIndex, node_count: u64) -> 
     if let Some(w) = keys.windows(2).find(|w| w[0] >= w[1]) {
         return Err(corrupt(format!("keys not strictly ascending at {}", w[1])));
     }
-    let mut seen = vec![false; rows.len()];
+    let mut seen = vec![false; node_count as usize];
     for &row in &rows {
         let slot = seen
             .get_mut(row as usize)
             .ok_or_else(|| corrupt(format!("row {row} out of 0..{node_count}")))?;
         if *slot {
             return Err(corrupt(format!("row {row} listed twice")));
+        }
+        if dead.binary_search(&row).is_ok() {
+            return Err(corrupt(format!("row {row} is deleted and still keyed")));
         }
         *slot = true;
     }
@@ -186,7 +220,7 @@ mod tests {
         let key_of = |row: u64| (row.wrapping_mul(0x9E37_79B9) % (1 << 20)) | (1 << 40);
         let key_by_row: Vec<u64> = (0..n).map(key_of).collect();
         let index = write_key_index(&mut db, &key_by_row).unwrap();
-        verify_key_index(&mut db, &index, n).unwrap();
+        verify_key_index(&mut db, &index, n, &[]).unwrap();
         let mut reader = KeyReader::load(&mut db, index).unwrap();
         for row in (0..n).step_by(97) {
             assert_eq!(
@@ -216,13 +250,45 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_row_keeps_neither_its_key_nor_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("k.zu1")).unwrap();
+        // Row 1 is gone, so its key is free for another row to take:
+        // the index over the four rows holds three keys and answers 30
+        // with a miss.
+        let index = write_key_index_live(&mut db, &[10, 30, 20, 30], &[1]).unwrap();
+        verify_key_index(&mut db, &index, 4, &[1]).unwrap();
+        assert_eq!(
+            key_by_row(&mut db, &index, 4).unwrap(),
+            vec![Some(10), None, Some(20), Some(30)]
+        );
+        let mut reader = KeyReader::load(&mut db, index).unwrap();
+        assert_eq!(reader.lookup(&mut db, 30).unwrap(), Some(3));
+        assert_eq!(reader.lookup(&mut db, 10).unwrap(), Some(0));
+        // An index that still holds a deleted row's key is a file that
+        // will refuse the reuse, so verify says so rather than waiting
+        // for the INSERT to fail.
+        let stale = write_key_index(&mut db, &[10, 30, 20]).unwrap();
+        let err = verify_key_index(&mut db, &stale, 3, &[1]).unwrap_err();
+        assert!(format!("{err}").contains("3 keys and 3 rows over 2 live"));
+        // The right number of keys, over the wrong rows: one of them is
+        // the deleted one and the live row 3 has none.
+        let stale = KeyIndex {
+            keys: write_segment(&mut db, &[10, 20, 30]).unwrap(),
+            rows: write_segment(&mut db, &[0, 1, 2]).unwrap(),
+        };
+        let err = verify_key_index(&mut db, &stale, 4, &[1]).unwrap_err();
+        assert!(format!("{err}").contains("row 1 is deleted and still keyed"));
+    }
+
+    #[test]
     fn verify_catches_a_short_or_shuffled_index() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Zu1File::create(&dir.path().join("k.zu1")).unwrap();
         let index = write_key_index(&mut db, &[10, 30, 20]).unwrap();
-        verify_key_index(&mut db, &index, 3).unwrap();
+        verify_key_index(&mut db, &index, 3, &[]).unwrap();
         // Count mismatch against a larger claimed domain.
-        let err = verify_key_index(&mut db, &index, 4).unwrap_err();
+        let err = verify_key_index(&mut db, &index, 4, &[]).unwrap_err();
         assert!(format!("{err}").contains("3 keys"));
         // A rows segment that repeats a row: build a broken index by hand
         // from two valid segments.
@@ -230,13 +296,13 @@ mod tests {
             keys: write_segment(&mut db, &[1, 2, 3]).unwrap(),
             rows: write_segment(&mut db, &[0, 1, 1]).unwrap(),
         };
-        let err = verify_key_index(&mut db, &broken, 3).unwrap_err();
+        let err = verify_key_index(&mut db, &broken, 3, &[]).unwrap_err();
         assert!(format!("{err}").contains("listed twice"));
         let broken = KeyIndex {
             keys: write_segment(&mut db, &[1, 2, 3]).unwrap(),
             rows: write_segment(&mut db, &[0, 1, 7]).unwrap(),
         };
-        let err = verify_key_index(&mut db, &broken, 3).unwrap_err();
+        let err = verify_key_index(&mut db, &broken, 3, &[]).unwrap_err();
         assert!(format!("{err}").contains("out of"));
     }
 }

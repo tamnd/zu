@@ -272,7 +272,13 @@ pub fn verify(path: &Path) -> Result<u64> {
             }
         }
         if let Some(keys) = &directory.keys {
-            keys::verify_key_index(&mut db, keys, directory.from_count)?;
+            // The index covers the live rows, so what it may leave out
+            // is exactly what the node table's tombstone chain names.
+            let dead = match index.get(rel.from | fold::TOMBSTONE_KEY) {
+                Some(root) => fold::decode_tombstones(&meta::read_chain(&mut db, root)?)?,
+                None => Vec::new(),
+            };
+            keys::verify_key_index(&mut db, keys, directory.from_count, &dead)?;
             for seg in [&keys.keys, &keys.rows] {
                 bytes += seg.payload_len;
                 live.extend(seg.blocks.iter().copied());

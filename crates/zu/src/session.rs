@@ -628,7 +628,17 @@ impl Session {
                         let made = batch.row(carried, props)?;
                         next.push(Value::List(carried.iter().cloned().chain(made).collect()));
                     }
+                    let propful = batch.propful();
+                    let created = batch.created_rows();
                     let (new, edges) = batch.staged();
+                    let catalog = self.graph.catalog().clone();
+                    crate::insert::refuse_duplicate_pairs(
+                        &mut self.graph,
+                        &catalog,
+                        &edges,
+                        &propful,
+                        &created,
+                    )?;
                     self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
                     // The edges have rows of their own now, which they
                     // had not when the row that carries them was built.

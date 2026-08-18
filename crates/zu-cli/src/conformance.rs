@@ -159,7 +159,7 @@ const ENGINE: &[Declared] = &[
 const NOTES: &[&str] = &[
     "driven through `zu shell --format jsonl`, one long-lived process per session",
     "loaded through `zu convert`, which reads a SQLite database in zu's schema",
-    "the evaluator is MATCH WHERE CALL UNWIND WITH RETURN, plus INSERT of node patterns and \
+    "the evaluator is MATCH WHERE FILTER LET FOR CALL UNWIND WITH RETURN, plus INSERT of node patterns and \
      of edges between the elements a statement has in scope, SET and REMOVE of properties and \
      of labels, and DELETE and DETACH DELETE of elements, so a case that writes anything else \
      is answered with an error rather than a skip",
@@ -177,6 +177,21 @@ const NOTES: &[&str] = &[
     "the operands of a conjunction have to have the same columns, in the same order and under \
      the same names, and neither of them may write, because how many times a write ran would \
      otherwise depend on which operand the planner chose to hold",
+    "a FILTER keeps the rows its condition holds for and has no pattern under it, so it reads \
+     what the statement already has, including what a NEXT handed it, and the WHERE the \
+     standard allows after the word is optional and says nothing more",
+    "a LET names values and takes no name away, which is what makes it a LET rather than a \
+     WITH, and the definitions read left to right so a later one may use a name an earlier one \
+     in the same statement gave; the name is a variable, so LET of a property is refused with \
+     the statement that does change a property named",
+    "a page of a result is written OFFSET and LIMIT, and SKIP is the synonym the standard \
+     names for OFFSET, so the two words are one clause and writing both of them is refused \
+     rather than skipping twice",
+    "a FOR makes a row of every element of a list, which is the same statement UNWIND is and \
+     the spelling the standard gives it, and WITH ORDINALITY or WITH OFFSET numbers those rows, \
+     from one and from zero; the number counts the elements of the list rather than the rows \
+     the statement has answered, so a FOR under a match starts again at each row that reaches \
+     it",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",

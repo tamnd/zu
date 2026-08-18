@@ -951,7 +951,7 @@ fn op_label(
             )
         }
         OpDesc::Filter { expr, .. } => ("Filter", expr_text(expr, query)),
-        OpDesc::Unwind { expr, chunk } => (
+        OpDesc::Unwind { expr, chunk, .. } => (
             "Unwind",
             format!(
                 "{} AS {}",
@@ -1342,6 +1342,12 @@ enum OpDesc {
     Unwind {
         expr: BoundExpr,
         chunk: usize,
+        /// Where in the chunk the counter of a `WITH ORDINALITY` or a
+        /// `WITH OFFSET` goes, and what its first element is numbered.
+        /// The chunk holds the value and the number side by side, so
+        /// the operator writes two columns of the same length rather
+        /// than the counter being an operator of its own.
+        ordinal: Option<i64>,
     },
     /// A table function source: one engine kernel call fills the chunk
     /// with every row at once, node column first. The kernel sweeps
@@ -1524,7 +1530,7 @@ impl StageBuilder {
     /// The unflat chunks an expression reads, in creation order.
     fn unflat_of(&self, expr: &BoundExpr) -> Result<Vec<usize>> {
         let mut slots = BTreeSet::new();
-        expr_slots(expr, &mut slots);
+        crate::binder::expr_slots(expr, &mut slots);
         self.expand_shapes(&mut slots);
         let mut chunks = BTreeSet::new();
         for slot in slots {
@@ -1541,44 +1547,6 @@ impl StageBuilder {
             }
         }
         Ok(chunks.into_iter().collect())
-    }
-}
-
-fn expr_slots(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
-    match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
-        BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => {
-            out.insert(*slot);
-        }
-        BoundExpr::Property { base, .. } => expr_slots(base, out),
-        BoundExpr::Unary { expr, .. } => expr_slots(expr, out),
-        BoundExpr::Binary { lhs, rhs, .. } => {
-            expr_slots(lhs, out);
-            expr_slots(rhs, out);
-        }
-        BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
-        BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
-        BoundExpr::Call { args, .. } => {
-            for arg in args {
-                expr_slots(arg, out);
-            }
-        }
-        BoundExpr::List(items) => {
-            for item in items {
-                expr_slots(item, out);
-            }
-        }
-        BoundExpr::Map(pairs) => {
-            for (_, v) in pairs {
-                expr_slots(v, out);
-            }
-        }
-        BoundExpr::Path(elements) => {
-            for element in elements {
-                expr_slots(element, out);
-            }
-        }
-        BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
     }
 }
 
@@ -1635,7 +1603,7 @@ fn index_key(expr: &BoundExpr, slot: usize) -> Option<BoundExpr> {
         };
         if hits {
             let mut slots = BTreeSet::new();
-            expr_slots(other, &mut slots);
+            crate::binder::expr_slots(other, &mut slots);
             if slots.is_empty() {
                 return Some(other.as_ref().clone());
             }
@@ -1961,7 +1929,7 @@ fn compile_bracket(
                     read.insert(*to);
                 }
             }
-            LogicalPlan::Filter { expr, .. } => expr_slots(expr, &mut read),
+            LogicalPlan::Filter { expr, .. } => crate::binder::expr_slots(expr, &mut read),
             _ => {}
         }
     }
@@ -2019,7 +1987,7 @@ fn compile_bracket(
 /// Slots one operator reads.
 fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
     match desc {
-        OpDesc::IndexLookup { key, .. } => expr_slots(key, out),
+        OpDesc::IndexLookup { key, .. } => crate::binder::expr_slots(key, out),
         OpDesc::Expand { from, .. } | OpDesc::VarExpand { from, .. } => {
             out.insert(*from);
         }
@@ -2031,8 +1999,12 @@ fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
             out.insert(*seed);
             out.insert(*probe);
         }
-        OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => expr_slots(expr, out),
-        OpDesc::TableFunction { args, .. } => args.iter().for_each(|e| expr_slots(e, out)),
+        OpDesc::Filter { expr, .. } | OpDesc::Unwind { expr, .. } => {
+            crate::binder::expr_slots(expr, out)
+        }
+        OpDesc::TableFunction { args, .. } => {
+            args.iter().for_each(|e| crate::binder::expr_slots(e, out))
+        }
         OpDesc::Source
         | OpDesc::RowSource { .. }
         | OpDesc::ArgSource { .. }
@@ -2047,8 +2019,12 @@ fn desc_refs(desc: &OpDesc, out: &mut BTreeSet<usize>) {
 fn post_refs(post: &[PostOp], out: &mut BTreeSet<usize>) {
     for op in post {
         match op {
-            PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => expr_slots(e, out),
-            PostOp::Sort(keys) => keys.iter().for_each(|k| expr_slots(&k.expr, out)),
+            PostOp::Filter(e) | PostOp::Skip(e) | PostOp::Limit(e) => {
+                crate::binder::expr_slots(e, out)
+            }
+            PostOp::Sort(keys) => keys
+                .iter()
+                .for_each(|k| crate::binder::expr_slots(&k.expr, out)),
             PostOp::Distinct => {}
         }
     }
@@ -2096,7 +2072,7 @@ fn rewrite_count_expand(
         desc_refs(desc, &mut full_refs);
     }
     for item in items {
-        expr_slots(&item.expr, &mut full_refs);
+        crate::binder::expr_slots(&item.expr, &mut full_refs);
     }
     post_refs(post, &mut full_refs);
     full_refs.extend(extra.iter().copied());
@@ -2175,7 +2151,7 @@ fn rewrite_count_expand(
                 }
             }
             for item in items {
-                expr_slots(&item.expr, &mut others);
+                crate::binder::expr_slots(&item.expr, &mut others);
             }
             post_refs(post, &mut others);
             others.extend(extra.iter().copied());
@@ -2221,7 +2197,7 @@ fn rewrite_count_expand(
         }
     }
     for item in items.iter().filter(|it| !it.aggregate) {
-        expr_slots(&item.expr, &mut refs);
+        crate::binder::expr_slots(&item.expr, &mut refs);
     }
     post_refs(post, &mut refs);
     refs.extend(extra.iter().copied());
@@ -2233,7 +2209,7 @@ fn rewrite_count_expand(
     for (ix, spec) in aggs.iter().enumerate() {
         let Some(arg) = &spec.arg else { continue };
         let mut arg_refs = BTreeSet::new();
-        expr_slots(arg, &mut arg_refs);
+        crate::binder::expr_slots(arg, &mut arg_refs);
         b.expand_shapes(&mut arg_refs);
         if arg_refs.iter().any(|s| b.chunk_slots[c].contains(s)) {
             counting.push(ix);
@@ -2335,11 +2311,11 @@ fn rewrite_reach_varlen(
         desc_refs(desc, &mut refs);
     }
     for item in items {
-        expr_slots(&item.expr, &mut refs);
+        crate::binder::expr_slots(&item.expr, &mut refs);
     }
     for spec in aggs {
         if let Some(arg) = &spec.arg {
-            expr_slots(arg, &mut refs);
+            crate::binder::expr_slots(arg, &mut refs);
         }
     }
     post_refs(post, &mut refs);
@@ -2481,14 +2457,22 @@ fn build_stages(
                     i += 1;
                 }
             }
-            LogicalPlan::Unwind { expr, slot, .. } => {
+            LogicalPlan::Unwind {
+                expr,
+                slot,
+                ordinal,
+                ..
+            } => {
                 for c in b.unflat_of(expr)? {
                     b.ensure_flat(c);
                 }
-                let chunk = b.new_chunk(vec![*slot], false);
+                let mut slots = vec![*slot];
+                slots.extend(ordinal.map(|ordinal| ordinal.slot));
+                let chunk = b.new_chunk(slots, false);
                 b.push(OpDesc::Unwind {
                     expr: expr.clone(),
                     chunk,
+                    ordinal: ordinal.map(|ordinal| ordinal.start),
                 });
                 b.produced(chunk);
             }
@@ -2591,7 +2575,7 @@ fn build_stages(
                     match op {
                         LogicalPlan::Distinct { .. } => post.push(PostOp::Distinct),
                         LogicalPlan::Filter { expr, .. } => {
-                            expr_slots(expr, &mut extra);
+                            crate::binder::expr_slots(expr, &mut extra);
                             post.push(PostOp::Filter(expr.clone()));
                         }
                         LogicalPlan::Sort { keys, .. } => post.push(PostOp::Sort(keys.clone())),
@@ -4725,7 +4709,11 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 }
             },
         },
-        OpDesc::Unwind { expr, chunk } => loop {
+        OpDesc::Unwind {
+            expr,
+            chunk,
+            ordinal,
+        } => loop {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
             }
@@ -4741,6 +4729,14 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             }
             let c = &mut ctx.chunks[*chunk];
             c.size = items.len();
+            if let Some(start) = ordinal {
+                // The counter is the position in this list, so it runs
+                // from the start over the elements this row's list has
+                // and begins again at the next row's.
+                c.cols[1] = (0..items.len())
+                    .map(|i| Value::Int(start + i as i64))
+                    .collect();
+            }
             c.cols[0] = items;
             c.cur = None;
             return Ok(true);
@@ -5540,7 +5536,7 @@ fn vector_filter(ctx: &mut StageCtx, expr: &BoundExpr, chunk: usize) -> Result<O
     // The other side is evaluated once for the vector, so it must not
     // read anything the vector holds.
     let mut slots = BTreeSet::new();
-    expr_slots(other, &mut slots);
+    crate::binder::expr_slots(other, &mut slots);
     if slots
         .iter()
         .any(|s| ctx.slot_loc.get(s).is_some_and(|&(cc, _)| cc == chunk))

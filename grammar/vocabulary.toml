@@ -42,8 +42,8 @@ audited = "2026-08-18"
 
 [[group]]
 kind = "keyword"
-doc = "The clauses a query is made of, in the order they may appear, and NEXT, which is not a clause but the word one statement hands its result to the next with."
-words = ["USE", "OPTIONAL", "MATCH", "UNWIND", "WITH", "WHERE", "RETURN", "YIELD", "NEXT"]
+doc = "The clauses a query is made of, in the order they may appear, and NEXT, which is not a clause but the word one statement hands its result to the next with. FILTER and LET are the two GQL writes where Cypher writes a WHERE and a WITH: one keeps rows without a pattern under it, the other adds a name without dropping the others. FOR is where GQL makes a row of every element of a list, which Cypher spells UNWIND, and ORDINALITY and OFFSET are the counter it may number them with; IN belongs to the predicates group, being the same word the membership test is written with."
+words = ["USE", "OPTIONAL", "MATCH", "FOR", "ORDINALITY", "OFFSET", "UNWIND", "FILTER", "LET", "WITH", "WHERE", "RETURN", "YIELD", "NEXT"]
 
 [[group]]
 kind = "keyword"
@@ -88,7 +88,7 @@ words = ["START", "COMMIT", "ROLLBACK"]
 [[group]]
 kind = "keyword"
 doc = "Words the parser knows and refuses by name, because a statement that writes one is a statement somebody expected to work. CREATE is refused the same way and is in the catalog group, being the one word that opens a statement here and a different one in Cypher. They are coloured for the reason they are refused by name: a word that comes out plain reads as a variable, and the error is easier to believe when the word looked like a word."
-words = ["MERGE", "FILTER", "LET", "FOR", "SESSION", "FINISH"]
+words = ["MERGE", "SESSION", "FINISH"]
 
 [[group]]
 kind = "literal"

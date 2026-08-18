@@ -176,7 +176,7 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
                 } = below
                 {
                     let mut slots = HashSet::new();
-                    expr_slots(&expr, &mut slots);
+                    crate::binder::expr_slots(&expr, &mut slots);
                     if filter_bracket != bracket || slots.contains(&rel) {
                         below = LogicalPlan::Filter {
                             input: inner,
@@ -219,10 +219,16 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
             expr,
             bracket,
         },
-        LogicalPlan::Unwind { input, expr, slot } => LogicalPlan::Unwind {
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            slot,
+            ordinal,
+        } => LogicalPlan::Unwind {
             input: Box::new(lift_close_filters(*input)),
             expr,
             slot,
+            ordinal,
         },
         LogicalPlan::Insert { input, nodes, rels } => LogicalPlan::Insert {
             input: Box::new(lift_close_filters(*input)),
@@ -756,7 +762,12 @@ fn mark_asp_node(
                 est,
             )
         }
-        LogicalPlan::Unwind { input, expr, slot } => {
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            slot,
+            ordinal,
+        } => {
             let (input, est) = mark_asp_walk(*input, query, schema, dists, ceil, seeds, out);
             // Nothing bounds how wide a list is.
             ceil.bnd = None;
@@ -765,6 +776,7 @@ fn mark_asp_node(
                     input: Box::new(input),
                     expr,
                     slot,
+                    ordinal,
                 },
                 est * 10.0,
             )
@@ -927,10 +939,16 @@ fn rewrite(
             wcoj,
             bracket,
         }),
-        LogicalPlan::Unwind { input, expr, slot } => Ok(LogicalPlan::Unwind {
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            slot,
+            ordinal,
+        } => Ok(LogicalPlan::Unwind {
             input: Box::new(rewrite(*input, query, schema, notes)?),
             expr,
             slot,
+            ordinal,
         }),
         LogicalPlan::Insert { input, nodes, rels } => Ok(LogicalPlan::Insert {
             input: Box::new(rewrite(*input, query, schema, notes)?),
@@ -1331,7 +1349,7 @@ fn order_component(
         .iter()
         .map(|f| {
             let mut s = HashSet::new();
-            expr_slots(f, &mut s);
+            crate::binder::expr_slots(f, &mut s);
             s
         })
         .collect();
@@ -1599,7 +1617,7 @@ fn place_filters(
             continue;
         }
         let mut slots = HashSet::new();
-        expr_slots(filter, &mut slots);
+        crate::binder::expr_slots(filter, &mut slots);
         if slots.is_subset(bound) {
             placed[ix] = true;
             plan = LogicalPlan::Filter {
@@ -1634,8 +1652,16 @@ fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
             out.insert(*to);
             bound_slots(input, out);
         }
-        LogicalPlan::Unwind { input, slot, .. } => {
+        LogicalPlan::Unwind {
+            input,
+            slot,
+            ordinal,
+            ..
+        } => {
             out.insert(*slot);
+            if let Some(ordinal) = ordinal {
+                out.insert(ordinal.slot);
+            }
             bound_slots(input, out);
         }
         LogicalPlan::Insert { input, nodes, rels } => {
@@ -1683,44 +1709,6 @@ fn split_and(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
         split_and(*rhs, out);
     } else {
         out.push(expr);
-    }
-}
-
-fn expr_slots(expr: &BoundExpr, out: &mut HashSet<usize>) {
-    match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
-        BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => {
-            out.insert(*slot);
-        }
-        BoundExpr::Property { base, key: _ } => expr_slots(base, out),
-        BoundExpr::Unary { expr, .. } => expr_slots(expr, out),
-        BoundExpr::Binary { lhs, rhs, .. } => {
-            expr_slots(lhs, out);
-            expr_slots(rhs, out);
-        }
-        BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
-        BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
-        BoundExpr::Call { args, .. } => {
-            for arg in args {
-                expr_slots(arg, out);
-            }
-        }
-        BoundExpr::List(items) => {
-            for item in items {
-                expr_slots(item, out);
-            }
-        }
-        BoundExpr::Map(entries) => {
-            for (_, value) in entries {
-                expr_slots(value, out);
-            }
-        }
-        BoundExpr::Path(elements) => {
-            for element in elements {
-                expr_slots(element, out);
-            }
-        }
-        BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
     }
 }
 
@@ -3129,6 +3117,56 @@ mod tests {
                 "ScanNodes c: Person",
             ],
             "got:\n{text}"
+        );
+    }
+    /// A FILTER is a filter and a LET is a projection, so what EXPLAIN
+    /// prints for them is what the reader wrote, in the place they
+    /// wrote it.
+    #[test]
+    fn filter_and_let_read_as_what_they_are() {
+        let text = optimized(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             LET gap = b.id - a.id \
+             FILTER gap > 0 \
+             RETURN a.id AS id",
+        );
+        assert_eq!(
+            lines(&text),
+            [
+                "Project a.id AS id",
+                "Filter gap > 0",
+                "Project a, b, b.id - a.id AS gap",
+                "Expand (a)-[#1:KNOWS]->(b)",
+                "ScanNodes a: Person",
+            ],
+            "got:\n{text}"
+        );
+    }
+
+    /// A FOR is one operator whether it counts or not, and the counter
+    /// is a column of the same operator rather than a stage after it,
+    /// which is what the plan says by naming it on the Unwind line.
+    #[test]
+    fn a_counter_is_part_of_the_for_and_not_a_stage_after_it() {
+        let plain = optimized("FOR x IN [1, 2] RETURN x AS v");
+        assert_eq!(
+            lines(&plain),
+            ["Project x AS v", "Unwind [1, 2] AS x"],
+            "got:\n{plain}"
+        );
+        let counted = optimized("FOR x IN [1, 2] WITH ORDINALITY i RETURN x AS v, i AS n");
+        assert_eq!(
+            lines(&counted),
+            [
+                "Project x AS v, i AS n",
+                "Unwind [1, 2] AS x WITH ORDINALITY i",
+            ],
+            "got:\n{counted}"
+        );
+        let offset = optimized("FOR x IN [1, 2] WITH OFFSET i RETURN x AS v, i AS n");
+        assert!(
+            offset.contains("WITH OFFSET i"),
+            "the two words are told apart in the plan, got:\n{offset}"
         );
     }
 }

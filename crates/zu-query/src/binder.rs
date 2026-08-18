@@ -11,7 +11,7 @@
 //! types as `Any` once the base is a node, rel, or map; the typed
 //! column catalog tightens this later without changing the shape here.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use zu_common::gqlstatus::codes;
@@ -797,6 +797,17 @@ pub enum MatchKind {
     },
 }
 
+/// The counter a `FOR ... WITH ORDINALITY` or `WITH OFFSET` binds:
+/// the slot the number lands in and what the first element of a list
+/// is numbered, one for ordinality and zero for offset. The two words
+/// differ in nothing else, so they are one shape here and the start is
+/// the whole of the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ordinal {
+    pub slot: usize,
+    pub start: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundClause {
     Match {
@@ -854,6 +865,7 @@ pub enum BoundClause {
     Unwind {
         expr: BoundExpr,
         slot: usize,
+        ordinal: Option<Ordinal>,
     },
     /// A table function call, always the first clause: the kernel runs
     /// once over `rel` and yields one row per node of its domain.
@@ -1476,6 +1488,49 @@ fn agree_on_columns(left: &BoundQuery, right: &BoundQuery, how: ast::Conjunction
     Ok(())
 }
 
+/// Every slot a bound expression reads.
+///
+/// The set is whatever the caller keeps them in, since the executor
+/// wants them in slot order and the optimizer only asks whether one is
+/// in there. It lives here because it is a fact about `BoundExpr` and
+/// three places need it; two of them used to hold a copy each, which is
+/// two places to forget when a variant is added.
+pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
+    match expr {
+        BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
+        BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => out.extend([*slot]),
+        BoundExpr::Property { base, .. } => expr_slots(base, out),
+        BoundExpr::Unary { expr, .. } => expr_slots(expr, out),
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            expr_slots(lhs, out);
+            expr_slots(rhs, out);
+        }
+        BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
+        BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
+        BoundExpr::Call { args, .. } => {
+            for arg in args {
+                expr_slots(arg, out);
+            }
+        }
+        BoundExpr::List(items) => {
+            for item in items {
+                expr_slots(item, out);
+            }
+        }
+        BoundExpr::Map(pairs) => {
+            for (_, value) in pairs {
+                expr_slots(value, out);
+            }
+        }
+        BoundExpr::Path(elements) => {
+            for element in elements {
+                expr_slots(element, out);
+            }
+        }
+        BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
+    }
+}
+
 /// Binds one linear query statement, appending whatever parameters it
 /// names to `params` so the positions stay the statement's.
 fn bind_linear(
@@ -1716,7 +1771,11 @@ impl Binder<'_> {
                     detach: *detach,
                 })
             }
-            Clause::Unwind { expr, alias } => {
+            Clause::Unwind {
+                expr,
+                alias,
+                ordinal,
+            } => {
                 let mut ctx = ExprCtx::new(false);
                 let (bound, ty) = self.bind_expr(expr, &mut ctx)?;
                 let element = match ty {
@@ -1730,9 +1789,41 @@ impl Binder<'_> {
                     }
                 };
                 let slot = self.declare(alias, element)?;
-                Ok(BoundClause::Unwind { expr: bound, slot })
+                // The counter is declared after the value, so a FOR
+                // that names the same thing twice is refused by the
+                // rule that refuses any redefinition rather than by a
+                // rule of its own, and it is an integer because it
+                // counts.
+                let ordinal = match ordinal {
+                    Some(ast::Ordinal { name, start }) => Some(Ordinal {
+                        slot: self.declare(name, Type::Int)?,
+                        start: *start,
+                    }),
+                    None => None,
+                };
+                Ok(BoundClause::Unwind {
+                    expr: bound,
+                    slot,
+                    ordinal,
+                })
             }
             Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
+            // A FILTER is the WHERE of a MATCH with no pattern under
+            // it, which is a shape the binder already has: a mark's
+            // predicate is queued as exactly this. Binding it to that
+            // rather than to a clause of its own is not a shortcut, it
+            // is what the statement is, and it means every executor
+            // and the optimizer's filter handling take it as they
+            // stand.
+            Clause::Filter { expr } => {
+                let filter = self.bind_where(&Some(expr.clone()), true)?;
+                Ok(BoundClause::Match {
+                    kind: MatchKind::Required,
+                    patterns: Vec::new(),
+                    filter,
+                })
+            }
+            Clause::Let { items } => self.bind_let(items),
             Clause::With { projection, filter } => {
                 self.bind_projection(projection, Projected::Onward, filter)
             }
@@ -2145,6 +2236,101 @@ impl Binder<'_> {
             limit,
             filter,
         })
+    }
+
+    /// Binds a `LET`: the names it gives, added to everything already
+    /// in hand.
+    ///
+    /// The clause binds to the same projection every `WITH` binds to,
+    /// carrying the variables in scope through unchanged and putting
+    /// the new ones after them. That is what the statement means and it
+    /// costs nothing to say it that way, since projecting a plain
+    /// variable keeps the slot it was already in, so the carried names
+    /// are not copied anywhere.
+    ///
+    /// The definitions are bound left to right and each one is in scope
+    /// for the ones after it, which is how a reader writes a pair where
+    /// the second is about the first. A projection evaluates all of its
+    /// items against the row that came into it, so a definition that
+    /// reads one the same statement made cannot be an item beside it:
+    /// it starts a projection of its own, running behind the one that
+    /// made what it reads. Definitions that read nothing new stay
+    /// together, so the ordinary `LET a = ..., b = ...` is one operator
+    /// and not one per name.
+    fn bind_let(&mut self, items: &[ast::LetItem]) -> Result<BoundClause> {
+        let mut stages: Vec<Vec<BoundItem>> = vec![Vec::new()];
+        // The slots this statement has made so far. A definition that
+        // reads one of them is the boundary between two stages.
+        let mut fresh: HashSet<usize> = HashSet::new();
+        for item in items {
+            let mut ctx = ExprCtx::new(true);
+            let (expr, ty) = self.bind_expr(&item.expr, &mut ctx)?;
+            if ctx.saw_aggregate {
+                // A set function reads a group of rows and a LET reads
+                // one, so there is no group here for it to be over.
+                return Err(invalid(format!(
+                    "LET names what one row holds, so '{}' cannot be an aggregate: write it in a RETURN or a WITH, which is where the rows are grouped",
+                    item.name
+                )));
+            }
+            let mut read = HashSet::new();
+            expr_slots(&expr, &mut read);
+            if !read.is_disjoint(&fresh) {
+                stages.push(Vec::new());
+                fresh.clear();
+            }
+            let slot = self.declare(&item.name, ty.clone())?;
+            fresh.insert(slot);
+            stages.last_mut().expect("a stage is open").push(BoundItem {
+                expr,
+                ty,
+                name: item.name.clone(),
+                slot: Some(slot),
+                aggregate: false,
+            });
+        }
+        // Every stage carries the whole scope as it stood when the
+        // stage was written, which is what makes this a LET and not a
+        // WITH: the names already in hand go through it. Reading them
+        // off the scope at the end and cutting each stage's list at the
+        // slots that existed then works because a slot number only ever
+        // goes up.
+        let mut named: Vec<(usize, String)> = self
+            .scope
+            .iter()
+            .map(|(name, &slot)| (slot, name.clone()))
+            .collect();
+        named.sort_unstable();
+        let mut built = Vec::new();
+        for stage in stages {
+            let first_new = stage
+                .first()
+                .and_then(|item| item.slot)
+                .expect("a stage holds at least one definition");
+            let carried = named
+                .iter()
+                .filter(|(slot, _)| *slot < first_new)
+                .map(|(slot, name)| BoundItem {
+                    expr: BoundExpr::Var(*slot),
+                    ty: self.variables[*slot].ty.clone(),
+                    name: name.clone(),
+                    slot: Some(*slot),
+                    aggregate: false,
+                });
+            built.push(BoundClause::Project {
+                distinct: false,
+                items: carried.chain(stage).collect(),
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+                filter: None,
+            });
+        }
+        // The clause the caller gets is the first stage; the rest run
+        // straight behind it, which is where `pending` puts them.
+        let first = built.remove(0);
+        self.pending.extend(built);
+        Ok(first)
     }
 
     fn bind_count_limit(&mut self, expr: &Option<Expr>, what: &str) -> Result<Option<BoundExpr>> {
@@ -4473,5 +4659,97 @@ mod tests {
             e.contains("'id' where the other calls it 'other'"),
             "got: {e}"
         );
+    }
+    /// A FILTER binds to the shape a standalone condition already had
+    /// here: a required match with no pattern under it and the
+    /// condition on it.
+    #[test]
+    fn a_filter_binds_as_a_match_with_no_pattern() {
+        let q = bound("MATCH (a:Person) FILTER a.id = $x RETURN a.id AS id");
+        let BoundClause::Match {
+            kind,
+            patterns,
+            filter,
+        } = &q.clauses[1]
+        else {
+            panic!("the FILTER is the second clause");
+        };
+        assert_eq!(*kind, MatchKind::Required);
+        assert!(patterns.is_empty(), "no pattern was written");
+        assert!(filter.is_some(), "the condition is on it");
+    }
+
+    /// A LET carries the scope through and adds to it, which is a
+    /// projection of everything in hand plus the new names. The names
+    /// already in hand keep the slots they were in, so carrying them is
+    /// not a copy.
+    #[test]
+    fn a_let_projects_the_scope_and_the_new_names() {
+        let q = bound("MATCH (a:Person) LET twice = a.id * 2 RETURN twice AS v");
+        let BoundClause::Project { items, .. } = &q.clauses[1] else {
+            panic!("the LET is the second clause");
+        };
+        assert_eq!(
+            items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["a", "twice"],
+            "the matched variable is carried and the new name follows it"
+        );
+        let a = q
+            .variables
+            .iter()
+            .position(|v| v.name == "a")
+            .expect("the matched variable");
+        assert_eq!(items[0].slot, Some(a), "carrying a variable keeps its slot");
+    }
+
+    /// Definitions that read nothing the same statement made are one
+    /// projection, because a projection evaluates its items against one
+    /// row and these all read that row.
+    #[test]
+    fn independent_definitions_are_one_projection() {
+        let q = bound("MATCH (a:Person) LET x = a.id, y = a.id + 1 RETURN x AS v");
+        assert_eq!(q.clauses.len(), 3, "the MATCH, the LET, the RETURN");
+        let BoundClause::Project { items, .. } = &q.clauses[1] else {
+            panic!("the LET is one projection");
+        };
+        assert_eq!(
+            items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["a", "x", "y"]
+        );
+    }
+
+    /// One that reads a name the same statement made cannot stand
+    /// beside it, so it starts a projection of its own behind the one
+    /// that made what it reads.
+    #[test]
+    fn a_definition_reading_an_earlier_one_starts_a_stage() {
+        let q = bound("MATCH (a:Person) LET x = a.id, y = x + 1 RETURN y AS v");
+        assert_eq!(q.clauses.len(), 4, "the MATCH, two stages, the RETURN");
+        let BoundClause::Project { items, .. } = &q.clauses[1] else {
+            panic!("the first stage");
+        };
+        assert_eq!(
+            items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["a", "x"]
+        );
+        let BoundClause::Project { items, .. } = &q.clauses[2] else {
+            panic!("the second stage");
+        };
+        assert_eq!(
+            items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["a", "x", "y"],
+            "the second stage carries what the first one left"
+        );
+    }
+
+    /// A LET names a variable, so a name already in scope is refused
+    /// rather than quietly meaning the new one from there on, and an
+    /// aggregate is refused with the clauses that do group rows named.
+    #[test]
+    fn a_let_refuses_a_taken_name_and_an_aggregate() {
+        let e = bind_err("MATCH (a:Person) LET a = 1 RETURN a AS v");
+        assert!(e.contains("'a' is already defined"), "got: {e}");
+        let e = bind_err("MATCH (a:Person) LET n = count(*) RETURN n AS v");
+        assert!(e.contains("cannot be an aggregate"), "got: {e}");
     }
 }

@@ -13,10 +13,11 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, ElementDefKind, ElementTypeDef, Endpoint, Expr, GraphName,
-    GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder, PathMode,
-    PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
-    RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, Statement, TxnStmt, UnaryOp,
+    BinaryOp, CatalogStmt, Clause, DeleteTarget, ElementDefKind, ElementTypeDef, Endpoint, Expr,
+    GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder,
+    PathMode, PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection,
+    RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, Statement, TxnStmt,
+    UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -982,12 +983,82 @@ impl Parser<'_> {
         }
     }
 
-    /// One element a `DELETE` takes away, which is a variable and not
-    /// an expression. GQL deletes what an earlier clause bound, so a
-    /// property reference here is a syntax error, and it says so rather
-    /// than the clause ending at the name and the dot being what
-    /// nobody expected.
-    fn parse_delete_target(&mut self) -> Result<String> {
+    /// One element a `DELETE` takes away: a variable an earlier clause
+    /// bound, or `VALUE { ... }`, the value query expression ISO makes
+    /// a delete item out of. Nothing else is one. GQL deletes an
+    /// element rather than a value computed from one, so a property
+    /// reference here is a syntax error, and it says so rather than the
+    /// clause ending at the name and the dot being what nobody
+    /// expected.
+    fn parse_delete_target(&mut self) -> Result<DeleteTarget> {
+        // VALUE is not a reserved word here, so the brace after it is
+        // what says this is a value query expression rather than a
+        // variable somebody called `value`.
+        if self.at_kw("VALUE")
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|token| token.kind == TokenKind::LBrace)
+        {
+            return self.parse_delete_value();
+        }
+        Ok(DeleteTarget::Variable(self.parse_delete_variable()?))
+    }
+
+    /// `VALUE { <query> }` as a delete item (GD03). The braces are
+    /// matched over the tokens rather than by parsing through them, so
+    /// the text between them is handed to a fresh parse and comes back
+    /// as a query of its own. That is what it is: a nested query
+    /// specification runs on its own and answers a value, and running
+    /// it is the session's job rather than this clause's.
+    fn parse_delete_value(&mut self) -> Result<DeleteTarget> {
+        self.expect_kw("VALUE")?;
+        let Some(open) = self.peek().filter(|t| t.kind == TokenKind::LBrace).cloned() else {
+            return Err(self.error("'{' after VALUE, which opens the query the item deletes"));
+        };
+        let mut depth = 0usize;
+        let mut at = self.pos;
+        let close = loop {
+            let Some(token) = self.tokens.get(at) else {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    open.start,
+                    format_args!("the '{{' after VALUE is never closed"),
+                ));
+            };
+            match token.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break token.clone();
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        };
+        let inner = self.source[open.end..close.start].trim();
+        if inner.is_empty() {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                open.start,
+                format_args!("VALUE takes a query and the braces after it hold nothing"),
+            ));
+        }
+        // Parsed here rather than at the first run, so that a statement
+        // with a broken subquery in it is refused when it is compiled
+        // the way every other syntax error is. The error carries the
+        // subquery as its text, which is the part it is about.
+        let nested = parse(inner)?;
+        self.pos = at + 1;
+        Ok(DeleteTarget::Value(Box::new(nested)))
+    }
+
+    /// The variable form of a delete item.
+    fn parse_delete_variable(&mut self) -> Result<String> {
         let name = self.expect_name("a variable after DELETE")?;
         if self.at(&TokenKind::Dot) {
             return Err(ZuError::gql_in(
@@ -3234,13 +3305,25 @@ mod tests {
         assert_eq!(q.clauses.len(), 2);
     }
 
+    /// The names of the delete items that are variables, which is what
+    /// most of these cases are about.
+    fn vars(targets: &[DeleteTarget]) -> Vec<&str> {
+        targets
+            .iter()
+            .map(|target| match target {
+                DeleteTarget::Variable(name) => name.as_str(),
+                DeleteTarget::Value(_) => panic!("a query, not a variable"),
+            })
+            .collect()
+    }
+
     #[test]
     fn a_delete_carries_the_variables_it_was_written_with() {
         let q = parsed("MATCH (p:person), (q:person) DELETE p, q");
         let Clause::Delete { targets, detach } = &q.clauses[1] else {
             panic!("DELETE");
         };
-        assert_eq!(targets, &["p".to_string(), "q".to_string()]);
+        assert_eq!(vars(targets), ["p", "q"]);
         assert!(!detach, "no DETACH was written");
         // A DELETE is a write, so the statement ends without a RETURN
         // the way a SET does.
@@ -3255,7 +3338,7 @@ mod tests {
         let Clause::Delete { targets, detach } = &q.clauses[1] else {
             panic!("DELETE");
         };
-        assert_eq!(targets, &["p".to_string()]);
+        assert_eq!(vars(targets), ["p"]);
         assert!(detach, "DETACH was written");
     }
 
@@ -3267,7 +3350,7 @@ mod tests {
         let Clause::Delete { targets, detach } = &q.clauses[1] else {
             panic!("DELETE");
         };
-        assert_eq!(targets, &["p".to_string()]);
+        assert_eq!(vars(targets), ["p"]);
         assert!(!detach, "NODETACH is the default spelled out");
     }
 
@@ -3279,6 +3362,57 @@ mod tests {
             parse_err("MATCH (p:person) DELETE p.age").contains("an element and not a property")
         );
         assert!(parse_err("MATCH (p:person) DELETE").contains("a variable after DELETE"));
+    }
+
+    /// GD03: a delete item can be a query, and the query comes back
+    /// parsed rather than as the text between the braces.
+    #[test]
+    fn a_delete_item_can_be_a_value_query_expression() {
+        let q = parsed("DELETE VALUE { MATCH (p:person) WHERE p.age > 30 RETURN p }");
+        let Clause::Delete { targets, detach } = &q.clauses[0] else {
+            panic!("DELETE");
+        };
+        assert!(!detach, "no DETACH was written");
+        let [DeleteTarget::Value(nested)] = &targets[..] else {
+            panic!("one item, a query");
+        };
+        assert_eq!(nested.clauses.len(), 2, "MATCH and RETURN");
+    }
+
+    /// The braces are matched over the tokens, so a query with braces
+    /// of its own inside it ends where its own closing brace is and not
+    /// at the first one.
+    #[test]
+    fn a_nested_query_ends_at_its_own_closing_brace() {
+        let q = parsed(
+            "MATCH (p:person) DELETE p, VALUE { MATCH (q:person {name: 'ada'}) RETURN q }, p",
+        );
+        let Clause::Delete { targets, .. } = &q.clauses[1] else {
+            panic!("DELETE");
+        };
+        assert_eq!(targets.len(), 3, "two variables around one query");
+        assert!(matches!(targets[1], DeleteTarget::Value(_)));
+    }
+
+    /// A subquery is parsed where the statement holding it is, so a
+    /// syntax error inside one is a syntax error and not something the
+    /// first run finds.
+    #[test]
+    fn a_broken_query_inside_a_delete_item_is_a_syntax_error() {
+        assert!(parse_err("DELETE VALUE { MATCH (p:person) RETRUN p }").contains("42001"));
+        assert!(parse_err("DELETE VALUE { }").contains("the braces after it hold nothing"));
+        assert!(parse_err("DELETE VALUE { MATCH (p:person) RETURN p").contains("never closed"));
+    }
+
+    /// VALUE is not reserved, so a variable somebody called that is
+    /// still a variable: what makes the item a query is the brace.
+    #[test]
+    fn a_variable_called_value_is_read_as_a_variable() {
+        let q = parsed("MATCH (value:person) DELETE value");
+        let Clause::Delete { targets, .. } = &q.clauses[1] else {
+            panic!("DELETE");
+        };
+        assert_eq!(vars(targets), ["value"]);
     }
 
     /// A label is the other thing GQL lets REMOVE take, in either of

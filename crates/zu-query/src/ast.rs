@@ -229,16 +229,15 @@ pub enum Clause {
         items: Vec<RemoveItem>,
     },
     /// `DELETE n`, the statement that takes an element out of the graph
-    /// (ISO 13.5). The elements are named by variables an earlier clause
-    /// bound, one variable each, because what a delete takes away is an
-    /// element and not a value computed from one.
+    /// (ISO 13.5). Each item names one element, either as a variable an
+    /// earlier clause bound or as a query that answers one.
     ///
     /// `DETACH` says the edges on the element go with it. Without it, an
     /// element that still has edges is an error rather than a way to
     /// leave one hanging, so either way what this clause deletes never
     /// leaves an edge behind.
     Delete {
-        targets: Vec<String>,
+        targets: Vec<DeleteTarget>,
         detach: bool,
     },
     Unwind {
@@ -261,6 +260,21 @@ pub enum Clause {
     Return {
         projection: Projection,
     },
+}
+
+/// One item of a `DELETE`, which ISO writes as a value expression and
+/// splits into two optional features: a simple expression naming an
+/// element (GD04) and a subquery answering one (GD03).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteTarget {
+    /// `DELETE n`: a variable an earlier clause bound.
+    Variable(String),
+    /// `DELETE VALUE { MATCH (p:Person) WHERE p.name = 'Ada' RETURN p }`,
+    /// the value query expression of ISO 20.9. The query inside runs on
+    /// its own and has to answer one row of one column, because the
+    /// item is one element and a query answering two of them has not
+    /// said which.
+    Value(Box<Query>),
 }
 
 /// What one item of a `SET` writes, which is the one thing that differs

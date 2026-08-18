@@ -181,6 +181,41 @@ fn path_length_counts_the_edges_and_not_the_elements() {
     assert_eq!(one(&mut db, source), Value::Int(3));
 }
 
+/// ISO 20.9. `ELEMENTS` is how a query reads what a path holds, since
+/// a path is a value of its own and nothing indexes into one. The list
+/// it answers is the walk in the order it was taken, a node at each end
+/// and an edge between each pair of them.
+#[test]
+fn elements_answers_the_walk_as_a_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let source = "MATCH p = (a:person)-[:knows]->(b:person)-[:knows]->(c:person) \
+                  WHERE a.id = 0 RETURN ELEMENTS(p) AS v";
+    let Value::List(items) = one(&mut db, source) else {
+        panic!("{source} answered something that is not a list");
+    };
+    assert_eq!(items.len(), 5);
+    for (at, item) in items.iter().enumerate() {
+        let node = matches!(item, Value::Node { .. });
+        assert_eq!(node, at % 2 == 0, "element {at} is {item:?}");
+    }
+
+    // The elements are the ones the path holds and in the same places,
+    // so the list the path answers is the list the query can write out.
+    let source = "MATCH p = (a:person)-[e:knows]->(b:person) WHERE a.id = 0 \
+                  RETURN (ELEMENTS(p) = [a, e, b]) AS v";
+    assert!(yes(&mut db, source));
+
+    // A one node path is one element, and a null is a null.
+    let source = "MATCH (a:person) WHERE a.id = 0 RETURN SIZE(ELEMENTS(PATH [a])) AS v";
+    assert_eq!(one(&mut db, source), Value::Int(1));
+    assert_eq!(one(&mut db, "RETURN ELEMENTS(null) AS v"), Value::Null);
+
+    // A list is already the list of its elements, so asking a list for
+    // them is a query that has lost the path it meant to ask about.
+    assert_eq!(code(&mut db, "RETURN ELEMENTS([1, 2, 3]) AS v"), "22G03");
+}
+
 /// A path is a value like any other, so DISTINCT and ORDER BY owe it an
 /// answer. ISO orders two paths no more than it orders two records, and
 /// the answer still has to be the same on two runs or a query returns

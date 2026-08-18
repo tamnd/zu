@@ -1220,6 +1220,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 Func::Size => "size",
                 Func::Cardinality => "cardinality",
                 Func::PathLength => "path_length",
+                Func::Elements => "elements",
             };
             let inner = if *star {
                 "*".to_string()

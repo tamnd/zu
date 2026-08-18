@@ -28,7 +28,7 @@ boolean-values = true  # boolean columns ride the lane, declared BOOLEAN across 
 undirected-edges = true  # a rel table says whether its edges have a direction, and both stored lists answer for one that has none
 self-loops = true  # the converter reads endpoints through, so an edge to itself survives
 parallel-edges = true  # a second edge over the same ordered pair survives
-parallel-edge-properties = false  # an edge property is addressed by searching the forward list for the destination, and two edges over one pair answer that search the same way
+parallel-edge-properties = true  # an edge property is addressed by the ordinal the match bound, not by searching the forward list for the destination, so two edges over one pair carry their own values
 
 # What the session and the wire protocol can do.
 [capabilities]

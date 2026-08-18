@@ -52,6 +52,61 @@
       "doc": "Writes every buffered row and makes it readable.\n\nOne commit, whatever the buffer holds: the values are sealed\ninto the data file as segments, one frame naming them is\nappended and synced to the log, which is the commit point, and\nthe fold that follows seals them into the base every query\nreads. On return the buffer is empty and the rows are there.\n\nA flush with nothing buffered touches no file and returns, so a\nloader can flush on a timer without writing empty commits."
     },
     {
+      "id": "zu::Batch",
+      "kind": "struct",
+      "name": "Batch",
+      "source": "zu_query::row::Batch",
+      "doc": "A batch of rows handed to a streaming caller\n([`crate::exec::execute_streaming`]).\n\nIt is the same view a whole result gives, over a piece of one: the\ncolumn names and some rows, borrowed for the length of the call. A\ncaller that wants to keep rows past the call copies what it wants\nout of them, which is the trade streaming makes and the reason the\nbatch cannot outlive the sink."
+    },
+    {
+      "id": "zu::Batch::columns",
+      "kind": "method",
+      "name": "columns",
+      "of": "zu::Batch",
+      "signature": "fn columns(&self) -> &[String]",
+      "doc": "The column names, which are the statement's and so are the same\nfor every batch of one run."
+    },
+    {
+      "id": "zu::Batch::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::Batch",
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether the batch is empty, which the sink is never handed."
+    },
+    {
+      "id": "zu::Batch::iter",
+      "kind": "method",
+      "name": "iter",
+      "of": "zu::Batch",
+      "signature": "fn iter(&self) -> RowIter",
+      "doc": "The rows, typed, exactly as a whole result reads them."
+    },
+    {
+      "id": "zu::Batch::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::Batch",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many rows this batch holds. It is never zero: a filter that\nrejected everything it read hands over nothing rather than an\nempty batch."
+    },
+    {
+      "id": "zu::Batch::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::Batch",
+      "signature": "fn new(columns: &[String], rows: &[Vec<Value>]) -> Batch",
+      "doc": "A batch over names and rows that belong together."
+    },
+    {
+      "id": "zu::Batch::rows",
+      "kind": "method",
+      "name": "rows",
+      "of": "zu::Batch",
+      "signature": "fn rows(&self) -> &[Vec<Value>]",
+      "doc": "The rows, untyped."
+    },
+    {
       "id": "zu::C_ABI_VERSION",
       "kind": "constant",
       "name": "C_ABI_VERSION",
@@ -169,6 +224,22 @@
       "doc": "The plan this connection would run for `source`, rendered,\nwithout running it."
     },
     {
+      "id": "zu::Connection::explain_plan",
+      "kind": "method",
+      "name": "explain_plan",
+      "of": "zu::Connection",
+      "signature": "fn explain_plan(&mut self, source: &str) -> Result<QueryPlan>",
+      "doc": "The same plan as operators rather than as text: the tree, the\ncolumns the statement answers with, the parameters it wants, and\nthe notes compiling it raised.\n\nA caller that reads a plan is asking a question about it, and\nevery one of those questions is easier to ask of a tree than of\na listing: whether the scan reaches an index, how deep the\nexpands go, which tables are touched. [`QueryPlan::render`] is\nwhat [`Self::explain`] returns, so the two are one thing printed\ntwo ways rather than two renderings that can drift.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet plan = conn.explain_plan(\"MATCH (p:person) RETURN p.id AS id\")?;\nlet root = plan.root.as_ref().expect(\"a statement with operators\");\nassert_eq!(root.op, \"Project\");\nassert_eq!(plan.columns, [\"id\"]);\n# Ok::<(), zu::ZuError>(())\n```"
+    },
+    {
+      "id": "zu::Connection::interrupt",
+      "kind": "method",
+      "name": "interrupt",
+      "of": "zu::Connection",
+      "signature": "fn interrupt(&self) -> Interrupt",
+      "doc": "The handle a statement on this connection can be stopped\nthrough, and the count of rows it has read.\n\nA statement runs on the thread that asked for it, so the handle\nis taken before the call and raised from another thread: it is\nhow a shell answers `Ctrl-C` and how a server answers a client\nthat hung up. The statement returns\n[`zu_common::ZuError::Interrupted`] and the connection is\nunchanged, which is what makes this different from closing it."
+    },
+    {
       "id": "zu::Connection::is_read_only",
       "kind": "method",
       "name": "is_read_only",
@@ -185,12 +256,36 @@
       "doc": "Compiles a statement and pins it under an id, so a loop binds\nand executes without recompiling. The names it wants come back\nwith it, in the order the binder assigned them."
     },
     {
+      "id": "zu::Connection::profile",
+      "kind": "method",
+      "name": "profile",
+      "of": "zu::Connection",
+      "signature": "fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<Profile>",
+      "doc": "Runs `source` with the counters on and hands back what it\nobserved, one entry per operator per stage.\n\nThis costs the execution, so it is the tool a caller reaches for\nwhen a statement is slower than the plan says it should be: the\nrows an operator really produced sit next to what the optimizer\nexpected, and the self time says which one of them the wall\nclock went into. [`Profile::render`] prints it the way\n`EXPLAIN ANALYZE` does in the shell.\n\nA statement that writes is refused, because it runs as the parts\nit was split at its write into rather than as the one plan a\nprofile describes, and profiling it would apply the write."
+    },
+    {
       "id": "zu::Connection::query",
       "kind": "method",
       "name": "query",
       "of": "zu::Connection",
       "signature": "fn query(&mut self, source: &str) -> Result<QueryResult>",
       "doc": "Runs one statement and returns its rows."
+    },
+    {
+      "id": "zu::Connection::query_stream",
+      "kind": "method",
+      "name": "query_stream",
+      "of": "zu::Connection",
+      "signature": "fn query_stream(&mut self, source: &str, params: &[(&str, Value)], sink: impl FnMut) -> Result<Streamed>",
+      "doc": "Runs one statement and hands its rows to `sink` in batches as\nthey are made, instead of returning them all.\n\nThis is the shape for a result that is too big to want in\nmemory, and for a caller that will not read all of it: the sink\nanswers [`Flow::Stop`] and the scan under it stops at the next\nboundary, the same boundary an interrupt is answered at. A batch\nborrows the rows for the length of the call, so a caller keeping\nanything past it copies what it wants out.\n\n```no_run\nuse zu::{Database, Flow};\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut total = 0i64;\nconn.query_stream(\"MATCH (p:person) RETURN p.id AS id\", &[], |batch| {\n    for row in batch.iter() {\n        total += row.get_at::<i64>(0)?;\n    }\n    Ok(Flow::More)\n})?;\n# Ok::<(), zu::ZuError>(())\n```"
+    },
+    {
+      "id": "zu::Connection::query_stream_batched",
+      "kind": "method",
+      "name": "query_stream_batched",
+      "of": "zu::Connection",
+      "signature": "fn query_stream_batched(&mut self, source: &str, params: &[(&str, Value)], batch_rows: usize, sink: impl FnMut) -> Result<Streamed>",
+      "doc": "The same, with the batch size named. One vector of rows is the\ndefault because it is the unit the executor already works in;\na caller writing batches somewhere with a size of its own, an\nArrow record batch or an HTTP chunk, says so here."
     },
     {
       "id": "zu::Connection::query_with",
@@ -276,7 +371,7 @@
       "kind": "struct",
       "name": "DiagnosticRecord",
       "source": "zu_common::gqlstatus::DiagnosticRecord",
-      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers."
+      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers.\n\n`excerpt` is the line that position falls on, kept because the\ncaller furthest from the statement is the one most likely to be\nshowing this to a person: a driver, a notebook cell, a log line. The\nengine has the text in hand when it raises the condition and the\ncaller may not have it at all by the time it prints one."
     },
     {
       "id": "zu::DiagnosticRecord::at",
@@ -294,6 +389,30 @@
       "signature": "String"
     },
     {
+      "id": "zu::DiagnosticRecord::doc_url",
+      "kind": "method",
+      "name": "doc_url",
+      "of": "zu::DiagnosticRecord",
+      "signature": "fn doc_url(&self) -> String",
+      "doc": "The page that documents the condition this record carries."
+    },
+    {
+      "id": "zu::DiagnosticRecord::excerpt",
+      "kind": "field",
+      "name": "excerpt",
+      "of": "zu::DiagnosticRecord",
+      "signature": "Option<String>",
+      "doc": "The whole line `position` is on, without its newline, so that\n`column` indexes into it. `None` when there is no position, when\nthe line is empty, and when it is longer than a person is going\nto read, which are the three cases where quoting it back helps\nnobody."
+    },
+    {
+      "id": "zu::DiagnosticRecord::in_source",
+      "kind": "method",
+      "name": "in_source",
+      "of": "zu::DiagnosticRecord",
+      "signature": "fn in_source(status: GqlStatus, source: &str, offset: usize, detail: impl fmt::Display) -> Self",
+      "doc": "The same again, raised at a byte offset into the statement text.\n\nThis is the form to reach for wherever the text is in hand,\nwhich is every place inside the front end, because it is the\nonly form that can fill the excerpt: the line comes from the\nsource and nothing downstream of here still has it."
+    },
+    {
       "id": "zu::DiagnosticRecord::new",
       "kind": "method",
       "name": "new",
@@ -307,6 +426,14 @@
       "of": "zu::DiagnosticRecord",
       "signature": "Option<Position>",
       "doc": "Where in the statement, for the conditions that happen somewhere.\nA division by zero happens at runtime and has no token to point\nat, so this is `None` rather than a guess at one."
+    },
+    {
+      "id": "zu::DiagnosticRecord::retryable",
+      "kind": "method",
+      "name": "retryable",
+      "of": "zu::DiagnosticRecord",
+      "signature": "fn retryable(&self) -> bool",
+      "doc": "Whether running the statement again could succeed."
     },
     {
       "id": "zu::DiagnosticRecord::severity",
@@ -401,11 +528,72 @@
       "signature": "Temporal(zu_common::Temporal)"
     },
     {
+      "id": "zu::Flow",
+      "kind": "enum",
+      "name": "Flow",
+      "source": "zu_query::row::Flow",
+      "doc": "What a streaming caller wants after a batch: the next one, or no\nmore. Stopping is not a failure and leaves nothing to clean up, so\nit is a value rather than an error."
+    },
+    {
+      "id": "zu::Flow::More",
+      "kind": "variant",
+      "name": "More",
+      "of": "zu::Flow",
+      "signature": "More",
+      "doc": "Keep going."
+    },
+    {
+      "id": "zu::Flow::Stop",
+      "kind": "variant",
+      "name": "Stop",
+      "of": "zu::Flow",
+      "signature": "Stop",
+      "doc": "Stop the statement here. The rows already handed over stand."
+    },
+    {
+      "id": "zu::FromRow",
+      "kind": "trait",
+      "name": "FromRow",
+      "source": "zu_query::row::FromRow",
+      "doc": "A Rust type one whole row can be read as, which is a tuple in every\ncase this crate provides. It is a trait rather than an inherent\nmethod so that a caller can implement it for its own struct without\nwaiting for a derive."
+    },
+    {
+      "id": "zu::FromRow::from_row",
+      "kind": "method",
+      "name": "from_row",
+      "of": "zu::FromRow",
+      "signature": "fn from_row(row: Row) -> Result<Self>",
+      "doc": "Reads the row, or raises what the first column that disagreed\nwith the type raised."
+    },
+    {
+      "id": "zu::FromValue",
+      "kind": "trait",
+      "name": "FromValue",
+      "source": "zu_query::row::FromValue",
+      "doc": "A Rust type one column can be read as.\n\nThe lifetime is the result's, which is what lets `&'r str` be an\nimplementation here and is the whole reason this is not a plain\n`TryFrom<&Value>`: a borrowed string has to name the result it\nborrows from."
+    },
+    {
+      "id": "zu::FromValue::from_value",
+      "kind": "method",
+      "name": "from_value",
+      "of": "zu::FromValue",
+      "signature": "fn from_value(value: &Value) -> Result<Self>",
+      "doc": "Reads `value`, or raises `22G03` naming both types."
+    },
+    {
       "id": "zu::GqlStatus",
       "kind": "struct",
       "name": "GqlStatus",
       "source": "zu_common::gqlstatus::GqlStatus",
       "doc": "A GQLSTATUS value. Constructible only from the generated table, so\nevery value of this type is a code the standard defines."
+    },
+    {
+      "id": "zu::GqlStatus::class",
+      "kind": "method",
+      "name": "class",
+      "of": "zu::GqlStatus",
+      "signature": "fn class(self) -> &str",
+      "doc": "The two characters that open the code, which is the condition\nclass: `22` for the data exceptions, `42` for the syntax\nerrors, `40` for the rollbacks. A binding raises one exception\ntype per class, so this is the field it switches on, and taking\nthe first two characters of a five-character code is the sort of\nthing every binding would otherwise write for itself."
     },
     {
       "id": "zu::GqlStatus::code",
@@ -423,12 +611,28 @@
       "doc": "The row this status names."
     },
     {
+      "id": "zu::GqlStatus::doc_url",
+      "kind": "method",
+      "name": "doc_url",
+      "of": "zu::GqlStatus",
+      "signature": "fn doc_url(self) -> String",
+      "doc": "The page that documents this condition. Derived from the code\nrather than stored, because a table of eighty urls is eighty\nchances for one of them to be the url of a different condition."
+    },
+    {
       "id": "zu::GqlStatus::from_code",
       "kind": "method",
       "name": "from_code",
       "of": "zu::GqlStatus",
       "signature": "fn from_code(code: &str) -> Option<Self>",
       "doc": "Looks a code up by its five characters. Returns `None` for\nanything the standard does not define, which is how a code\narriving from outside zu gets checked rather than trusted."
+    },
+    {
+      "id": "zu::GqlStatus::retryable",
+      "kind": "method",
+      "name": "retryable",
+      "of": "zu::GqlStatus",
+      "signature": "fn retryable(self) -> bool",
+      "doc": "Whether running the same statement again could succeed.\n\nTrue for `40000 transaction rollback`, which is the engine\nsaying it undid the work and nothing of it is in the file. False\nfor `40003 statement completion unknown`, which is the same\nclass and the opposite advice: a statement that may or may not\nhave committed is one a retry could apply twice, and a caller\nthat wants to retry it has to establish which happened first.\nFalse for everything else, since a statement that failed to\nparse parses no better the second time."
     },
     {
       "id": "zu::GqlStatus::severity",
@@ -488,6 +692,69 @@
       "signature": "fn snapshot(&self) -> Arc<dyn Snapshot>"
     },
     {
+      "id": "zu::Interrupt",
+      "kind": "struct",
+      "name": "Interrupt",
+      "source": "zu_common::interrupt::Interrupt",
+      "doc": "A handle on a running statement.\n\nCloning is cloning the handle, not the state: every clone reads and\nwrites the same word, which is what lets one thread hand a copy to\nthe executor and keep one to raise. [`Interrupt::default`] is the\nhandle nobody is holding, and it is the one that costs nothing."
+    },
+    {
+      "id": "zu::Interrupt::armed",
+      "kind": "method",
+      "name": "armed",
+      "of": "zu::Interrupt",
+      "signature": "fn armed() -> Interrupt",
+      "doc": "A handle a caller can raise, with the word allocated for it.\n\nSpelled apart from [`Default`] because the two are different\nthings: this one can stop a statement and the default one\ncannot, and a constructor that quietly returned the second when\nasked for the first would be a cancellation that never arrives."
+    },
+    {
+      "id": "zu::Interrupt::check",
+      "kind": "method",
+      "name": "check",
+      "of": "zu::Interrupt",
+      "signature": "fn check(&self) -> Result<()>",
+      "doc": "The check an executor makes at a boundary: `Ok` while nobody has\nasked, and the condition that ends the statement once somebody\nhas."
+    },
+    {
+      "id": "zu::Interrupt::clear",
+      "kind": "method",
+      "name": "clear",
+      "of": "zu::Interrupt",
+      "signature": "fn clear(&self)",
+      "doc": "Puts the flag down and the count back to zero, which is what\nmakes one handle serve a session rather than one statement.\n\nCalled before a statement rather than after it, so that a stop\nwhich arrived while nothing was running cannot end the next\nthing the user types."
+    },
+    {
+      "id": "zu::Interrupt::read",
+      "kind": "method",
+      "name": "read",
+      "of": "zu::Interrupt",
+      "signature": "fn read(&self, rows: u64)",
+      "doc": "The executor reporting rows it has read out of storage.\n\nRows read rather than rows answered, because the number is there\nto show a person that something is happening, and a statement\nthat reads a hundred million rows to answer one row is exactly\nthe statement they are waiting on."
+    },
+    {
+      "id": "zu::Interrupt::rows",
+      "kind": "method",
+      "name": "rows",
+      "of": "zu::Interrupt",
+      "signature": "fn rows(&self) -> u64",
+      "doc": "How many rows it has read so far."
+    },
+    {
+      "id": "zu::Interrupt::stop",
+      "kind": "method",
+      "name": "stop",
+      "of": "zu::Interrupt",
+      "signature": "fn stop(&self)",
+      "doc": "Asks the statement to stop. Does nothing on a handle nobody\narmed, which is the honest answer: there is no statement on the\nother end of it."
+    },
+    {
+      "id": "zu::Interrupt::stopped",
+      "kind": "method",
+      "name": "stopped",
+      "of": "zu::Interrupt",
+      "signature": "fn stopped(&self) -> bool",
+      "doc": "Whether somebody has asked."
+    },
+    {
       "id": "zu::NodeId",
       "kind": "struct",
       "name": "NodeId",
@@ -539,11 +806,197 @@
       "doc": "Row index within the table, `group * GROUP_ROWS + row`."
     },
     {
+      "id": "zu::OpProfile",
+      "kind": "struct",
+      "name": "OpProfile",
+      "source": "zu_query::exec::OpProfile",
+      "doc": "One operator line of an EXPLAIN ANALYZE profile."
+    },
+    {
+      "id": "zu::OpProfile::bnd",
+      "kind": "field",
+      "name": "bnd",
+      "of": "zu::OpProfile",
+      "signature": "Option<f64>",
+      "doc": "The most rows the optimizer's ceiling allowed this operator,\nwhen the statistics were there to set one. `flat` above this is\na bound violation and perf/12 §6 makes that a hard fail."
+    },
+    {
+      "id": "zu::OpProfile::bound_violation",
+      "kind": "method",
+      "name": "bound_violation",
+      "of": "zu::OpProfile",
+      "signature": "fn bound_violation(&self) -> bool",
+      "doc": "The q-error of this operator's estimate, `max(est/act, act/est)`\n(perf/12 §4). Both sides are floored at one row: a zero actual\nagainst an estimate of 3 is an error of 3, not of infinity, and\nan operator nobody pulled has no error at all.\nWhether this operator produced more rows than the optimizer's\nceiling promised it could. Compared on the flattened count,\nwhich is what the estimate stands for.\n\nThe slack is there because the ceiling comes out of roots and\nfractional powers: a table whose every node holds one edge has\nan exact bound of `sqrt(n) * l2`, and in f64 that lands a\ncouple of ULPs under the edge count it is supposed to equal. A\nreal violation is a factor out, never a rounding."
+    },
+    {
+      "id": "zu::OpProfile::detail",
+      "kind": "field",
+      "name": "detail",
+      "of": "zu::OpProfile",
+      "signature": "String",
+      "doc": "What the operator is working on, rendered the way the statement\nwrote it: the tables a scan reads, the pattern an expand walks,\nthe predicate a filter asks. Empty where the operator has no\narguments to name."
+    },
+    {
+      "id": "zu::OpProfile::est",
+      "kind": "field",
+      "name": "est",
+      "of": "zu::OpProfile",
+      "signature": "Option<f64>",
+      "doc": "What the optimizer expected this operator to produce, when the\noperator is one that produces rows at all. `None` for the\nsource, the flattens, and the brackets themselves, which pass\ntheir input through and have no cardinality of their own."
+    },
+    {
+      "id": "zu::OpProfile::flat",
+      "kind": "field",
+      "name": "flat",
+      "of": "zu::OpProfile",
+      "signature": "u64",
+      "doc": "The rows those values stand for with the factorization\nmultiplied out: on a chain it equals `rows`, on a star it is\nthe product over every vector still unflat beside this one."
+    },
+    {
+      "id": "zu::OpProfile::kind",
+      "kind": "field",
+      "name": "kind",
+      "of": "zu::OpProfile",
+      "signature": "&str",
+      "doc": "The operator itself, the word a reader groups by."
+    },
+    {
+      "id": "zu::OpProfile::name",
+      "kind": "method",
+      "name": "name",
+      "of": "zu::OpProfile",
+      "signature": "fn name(&self) -> String",
+      "doc": "What the listing calls this operator, the kind and its detail\njoined the way EXPLAIN ANALYZE prints them."
+    },
+    {
+      "id": "zu::OpProfile::nanos",
+      "kind": "field",
+      "name": "nanos",
+      "of": "zu::OpProfile",
+      "signature": "u64",
+      "doc": "Self time in nanoseconds, child time excluded."
+    },
+    {
+      "id": "zu::OpProfile::pulls",
+      "kind": "field",
+      "name": "pulls",
+      "of": "zu::OpProfile",
+      "signature": "u64",
+      "doc": "Successful pulls: how many chunks this operator produced."
+    },
+    {
+      "id": "zu::OpProfile::qerror",
+      "kind": "method",
+      "name": "qerror",
+      "of": "zu::OpProfile",
+      "signature": "fn qerror(&self) -> Option<f64>"
+    },
+    {
+      "id": "zu::OpProfile::rows",
+      "kind": "field",
+      "name": "rows",
+      "of": "zu::OpProfile",
+      "signature": "u64",
+      "doc": "Values produced across all pulls. Rows over pulls is the\naverage vector length, the factorization stat."
+    },
+    {
+      "id": "zu::PlanNode",
+      "kind": "struct",
+      "name": "PlanNode",
+      "source": "zu_query::plan::PlanNode",
+      "doc": "One operator of a plan, with the operators feeding it underneath.\n\nThis is the tree EXPLAIN prints, before it is printed. `op` is what\nthe operator is and `detail` is what the listing writes after it,\nwhich is the operator's arguments rendered the way the statement\nwrote them. They are separate fields because a caller grouping\noperators by kind, or drawing them, should not have to cut a printed\nline back apart to find out what it is holding, and a listing is a\nrendering of this rather than the other way around."
+    },
+    {
+      "id": "zu::PlanNode::binds",
+      "kind": "field",
+      "name": "binds",
+      "of": "zu::PlanNode",
+      "signature": "Vec<String>",
+      "doc": "The variables this operator introduces, in the order it binds\nthem, and empty for the operators that only pass rows through."
+    },
+    {
+      "id": "zu::PlanNode::bracket",
+      "kind": "field",
+      "name": "bracket",
+      "of": "zu::PlanNode",
+      "signature": "Option<Bracket>",
+      "doc": "The bracket group this operator belongs to, `None` for a plain\nmatch. It prints in front of the operator, so an OPTIONAL MATCH\nexpand is [`PlanNode::name`] `OptionalExpand` and `op` `Expand`."
+    },
+    {
+      "id": "zu::PlanNode::children",
+      "kind": "field",
+      "name": "children",
+      "of": "zu::PlanNode",
+      "signature": "Vec<PlanNode>"
+    },
+    {
+      "id": "zu::PlanNode::count",
+      "kind": "method",
+      "name": "count",
+      "of": "zu::PlanNode",
+      "signature": "fn count(&self) -> usize",
+      "doc": "How many operators the subtree holds, this one counted."
+    },
+    {
+      "id": "zu::PlanNode::detail",
+      "kind": "field",
+      "name": "detail",
+      "of": "zu::PlanNode",
+      "signature": "String"
+    },
+    {
+      "id": "zu::PlanNode::line",
+      "kind": "method",
+      "name": "line",
+      "of": "zu::PlanNode",
+      "signature": "fn line(&self) -> String",
+      "doc": "The one line this operator prints, without its children and\nwithout the indent its depth would give it."
+    },
+    {
+      "id": "zu::PlanNode::name",
+      "kind": "method",
+      "name": "name",
+      "of": "zu::PlanNode",
+      "signature": "fn name(&self) -> String",
+      "doc": "What the listing calls this operator, the bracket prefix\nincluded."
+    },
+    {
+      "id": "zu::PlanNode::op",
+      "kind": "field",
+      "name": "op",
+      "of": "zu::PlanNode",
+      "signature": "&str"
+    },
+    {
+      "id": "zu::PlanNode::render",
+      "kind": "method",
+      "name": "render",
+      "of": "zu::PlanNode",
+      "signature": "fn render(&self) -> String",
+      "doc": "The subtree as EXPLAIN prints it, this operator first and one\nchild per line under it, indented by depth."
+    },
+    {
+      "id": "zu::PlanNode::tables",
+      "kind": "field",
+      "name": "tables",
+      "of": "zu::PlanNode",
+      "signature": "Vec<String>",
+      "doc": "The tables this operator touches: node tables for a scan, rel\ntables for an expand, both for an insert. Empty elsewhere."
+    },
+    {
+      "id": "zu::PlanNode::walk",
+      "kind": "method",
+      "name": "walk",
+      "of": "zu::PlanNode",
+      "signature": "fn walk(&self, visit: &mut impl FnMut)",
+      "doc": "Every operator of the subtree with its depth, this one first,\nwhich is the order the listing prints them in."
+    },
+    {
       "id": "zu::Position",
       "kind": "struct",
       "name": "Position",
       "source": "zu_common::gqlstatus::Position",
-      "doc": "Where in the statement text a condition was raised. Both are 1-based\nand columns count characters rather than bytes, so a line of\nmulti-byte text does not read as wider than it looks.\n\nThis is a pair rather than a byte offset because a byte offset is\nonly useful to something holding the source, and the caller that\nmost wants a position is an editor or a shell that has already\nprinted the line and wants to point under it."
+      "doc": "Where in the statement text a condition was raised, said three ways.\n\n`line` and `column` are 1-based and the column counts characters\nrather than bytes, so a line of multi-byte text does not read as\nwider than it looks. That pair is what an editor or a shell wants:\nit has printed the line already and needs somewhere to put the\ncaret.\n\n`offset` is the same place as a byte index into the statement, and\nit is here for the caller the pair does not serve: a tool that holds\nthe text and wants to slice it, an editor mapping into a buffer it\nindexes by byte, a highlighter marking a range. Recovering it from\nthe pair means counting lines and characters again, over text the\nengine had in hand when it raised the condition. It is always on a\ncharacter boundary of that text, so slicing at it cannot panic."
     },
     {
       "id": "zu::Position::column",
@@ -565,7 +1018,88 @@
       "name": "of",
       "of": "zu::Position",
       "signature": "fn of(source: &str, offset: usize) -> Self",
-      "doc": "The pair `offset` bytes into `source`. An offset past the end\nlands at the end, which is where an error about a query that\nstopped too early belongs."
+      "doc": "The place `offset` bytes into `source`. An offset past the end\nlands at the end, which is where an error about a query that\nstopped too early belongs, and an offset inside a character\nlands on the start of that character."
+    },
+    {
+      "id": "zu::Position::offset",
+      "kind": "field",
+      "name": "offset",
+      "of": "zu::Position",
+      "signature": "u32",
+      "doc": "Bytes into the statement, 0-based."
+    },
+    {
+      "id": "zu::Profile",
+      "kind": "struct",
+      "name": "Profile",
+      "source": "zu_query::exec::Profile"
+    },
+    {
+      "id": "zu::Profile::qerrors",
+      "kind": "method",
+      "name": "qerrors",
+      "of": "zu::Profile",
+      "signature": "fn qerrors(&self) -> Vec<f64>",
+      "doc": "Every operator's q-error across every stage, unordered. This is\nwhat `zu bench cardinality` accumulates into percentiles."
+    },
+    {
+      "id": "zu::Profile::render",
+      "kind": "method",
+      "name": "render",
+      "of": "zu::Profile",
+      "signature": "fn render(&self) -> String",
+      "doc": "Renders one block per stage: the sink with its row count and\nwall time, then each operator top-down with pulls, rows, the\nestimate and its q-error where there is one, the average vector\nlength per pull, and self time."
+    },
+    {
+      "id": "zu::Profile::stages",
+      "kind": "field",
+      "name": "stages",
+      "of": "zu::Profile",
+      "signature": "Vec<StageProfile>"
+    },
+    {
+      "id": "zu::QueryPlan",
+      "kind": "struct",
+      "name": "QueryPlan",
+      "source": "zu_query::plan::QueryPlan",
+      "doc": "A compiled statement described without being run: its operators,\nthe columns it answers with, and the parameters it wants bound.\n\n`notes` is what the optimizer wants said about the plan that the\ntree does not carry, and the caller filling it in is the session,\nwhich is where compiling raised them."
+    },
+    {
+      "id": "zu::QueryPlan::columns",
+      "kind": "field",
+      "name": "columns",
+      "of": "zu::QueryPlan",
+      "signature": "Vec<String>"
+    },
+    {
+      "id": "zu::QueryPlan::notes",
+      "kind": "field",
+      "name": "notes",
+      "of": "zu::QueryPlan",
+      "signature": "Vec<String>"
+    },
+    {
+      "id": "zu::QueryPlan::params",
+      "kind": "field",
+      "name": "params",
+      "of": "zu::QueryPlan",
+      "signature": "Vec<String>"
+    },
+    {
+      "id": "zu::QueryPlan::render",
+      "kind": "method",
+      "name": "render",
+      "of": "zu::QueryPlan",
+      "signature": "fn render(&self) -> String",
+      "doc": "The listing EXPLAIN prints, notes first and the tree under them."
+    },
+    {
+      "id": "zu::QueryPlan::root",
+      "kind": "field",
+      "name": "root",
+      "of": "zu::QueryPlan",
+      "signature": "Option<PlanNode>",
+      "doc": "The top operator, `None` for the plan with no operators at all,\nwhich is the one row a statement with no clauses runs over."
     },
     {
       "id": "zu::Result",
@@ -574,6 +1108,100 @@
       "signature": "std::result::Result<T, ZuError>",
       "source": "zu_common::Result",
       "doc": "Result alias used across the workspace."
+    },
+    {
+      "id": "zu::Row",
+      "kind": "struct",
+      "name": "Row",
+      "source": "zu_query::row::Row",
+      "doc": "One row of a result, borrowed from it.\n\nThe column names ride along with the values so that a row read out\nof an iterator can still be asked for a column by name, which is\nwhat a caller with a wide result wants and what a bare `&[Value]`\ncannot answer."
+    },
+    {
+      "id": "zu::Row::columns",
+      "kind": "method",
+      "name": "columns",
+      "of": "zu::Row",
+      "signature": "fn columns(&self) -> &[String]",
+      "doc": "The column names, in the order the statement projected them."
+    },
+    {
+      "id": "zu::Row::get",
+      "kind": "method",
+      "name": "get",
+      "of": "zu::Row",
+      "signature": "fn get<T>(&self) -> Result<T>",
+      "doc": "The whole row as one type: a tuple for the usual case, or\nanything implementing [`FromRow`].\n\nThe arity is checked before the columns are read, so a tuple\nthat does not match the projection is one error naming both\ncounts rather than a type error about whichever column happened\nto be first."
+    },
+    {
+      "id": "zu::Row::get_at",
+      "kind": "method",
+      "name": "get_at",
+      "of": "zu::Row",
+      "signature": "fn get_at<T>(&self, ix: usize) -> Result<T>",
+      "doc": "One column by position, typed."
+    },
+    {
+      "id": "zu::Row::get_by_name",
+      "kind": "method",
+      "name": "get_by_name",
+      "of": "zu::Row",
+      "signature": "fn get_by_name<T>(&self, name: &str) -> Result<T>",
+      "doc": "One column by name, typed. The name is the one the statement\nprojected, so `RETURN p.name AS name` is `name` and a projection\nwith no alias is spelled the way the plan spells it."
+    },
+    {
+      "id": "zu::Row::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::Row",
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether the row has no columns, which is what a statement with\nno projection returns."
+    },
+    {
+      "id": "zu::Row::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::Row",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many columns this row has."
+    },
+    {
+      "id": "zu::Row::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::Row",
+      "signature": "fn new(columns: &[String], values: &[Value]) -> Row",
+      "doc": "A row over names and values that belong together. The two are\nthe same length in every result the executor builds; a caller\nthat pairs mismatched slices gets a row whose extra values have\nno name, which reads as a missing column rather than a panic."
+    },
+    {
+      "id": "zu::Row::value",
+      "kind": "method",
+      "name": "value",
+      "of": "zu::Row",
+      "signature": "fn value(&self, ix: usize) -> Result<&Value>",
+      "doc": "One column by position, untyped."
+    },
+    {
+      "id": "zu::Row::value_by_name",
+      "kind": "method",
+      "name": "value_by_name",
+      "of": "zu::Row",
+      "signature": "fn value_by_name(&self, name: &str) -> Result<&Value>",
+      "doc": "One column by name, untyped."
+    },
+    {
+      "id": "zu::Row::values",
+      "kind": "method",
+      "name": "values",
+      "of": "zu::Row",
+      "signature": "fn values(&self) -> &[Value]",
+      "doc": "The values, untyped, for a caller doing its own matching."
+    },
+    {
+      "id": "zu::RowIter",
+      "kind": "struct",
+      "name": "RowIter",
+      "source": "zu_query::row::RowIter",
+      "doc": "The rows of a result, borrowed one at a time."
     },
     {
       "id": "zu::Severity",
@@ -666,6 +1294,89 @@
       "signature": "fn scan_column(&self, t: TableId, g: NodeGroupId, c: u32) -> Result<SegmentRef>"
     },
     {
+      "id": "zu::StageProfile",
+      "kind": "struct",
+      "name": "StageProfile",
+      "source": "zu_query::exec::StageProfile",
+      "doc": "One stage of a profiled run: the operator pipeline bottom-up plus\nthe sink that materialized the rows."
+    },
+    {
+      "id": "zu::StageProfile::nanos",
+      "kind": "field",
+      "name": "nanos",
+      "of": "zu::StageProfile",
+      "signature": "u64",
+      "doc": "Wall time of the whole stage in nanoseconds, sink included."
+    },
+    {
+      "id": "zu::StageProfile::ops",
+      "kind": "field",
+      "name": "ops",
+      "of": "zu::StageProfile",
+      "signature": "Vec<OpProfile>"
+    },
+    {
+      "id": "zu::StageProfile::out_rows",
+      "kind": "field",
+      "name": "out_rows",
+      "of": "zu::StageProfile",
+      "signature": "u64"
+    },
+    {
+      "id": "zu::StageProfile::sink",
+      "kind": "field",
+      "name": "sink",
+      "of": "zu::StageProfile",
+      "signature": "String"
+    },
+    {
+      "id": "zu::Streamed",
+      "kind": "struct",
+      "name": "Streamed",
+      "source": "zu_query::exec::Streamed",
+      "doc": "What a streamed statement did, once its rows have all been handed\nover. The rows themselves are gone by now, which is the point."
+    },
+    {
+      "id": "zu::Streamed::columns",
+      "kind": "field",
+      "name": "columns",
+      "of": "zu::Streamed",
+      "signature": "Vec<String>",
+      "doc": "The column names, the one part of a result a streaming caller\nstill wants after the fact."
+    },
+    {
+      "id": "zu::Streamed::notices",
+      "kind": "field",
+      "name": "notices",
+      "of": "zu::Streamed",
+      "signature": "Vec<zu_common::gqlstatus::DiagnosticRecord>",
+      "doc": "Conditions raised without stopping the statement, as on any\nother result."
+    },
+    {
+      "id": "zu::Streamed::rows",
+      "kind": "field",
+      "name": "rows",
+      "of": "zu::Streamed",
+      "signature": "u64",
+      "doc": "How many rows were handed over, which is fewer than the\nstatement would have returned when the caller stopped early."
+    },
+    {
+      "id": "zu::Streamed::stopped",
+      "kind": "field",
+      "name": "stopped",
+      "of": "zu::Streamed",
+      "signature": "bool",
+      "doc": "Whether the caller stopped it."
+    },
+    {
+      "id": "zu::Streamed::streamed",
+      "kind": "field",
+      "name": "streamed",
+      "of": "zu::Streamed",
+      "signature": "bool",
+      "doc": "Whether the rows were made and handed over in batches, rather\nthan buffered whole and cut into batches afterwards."
+    },
+    {
       "id": "zu::ZuError",
       "kind": "enum",
       "name": "ZuError",
@@ -694,6 +1405,14 @@
       "of": "zu::ZuError",
       "signature": "Gql(Box<zu_common::gqlstatus::DiagnosticRecord>)",
       "doc": "A GQL condition, with the standard's code and our own detail."
+    },
+    {
+      "id": "zu::ZuError::Interrupted",
+      "kind": "variant",
+      "name": "Interrupted",
+      "of": "zu::ZuError",
+      "signature": "Interrupted",
+      "doc": "The caller asked the statement to stop and it did, at the next\nboundary the executor checks ([`crate::Interrupt`]). No condition\ncode, because the standard has none for this and the statement\ndid not fail: it was stopped, which is a fact about the caller\nrather than about the query."
     },
     {
       "id": "zu::ZuError::InvalidArgument",
@@ -725,6 +1444,14 @@
       "doc": "The diagnostic record for this error, if it has one."
     },
     {
+      "id": "zu::ZuError::excerpt",
+      "kind": "method",
+      "name": "excerpt",
+      "of": "zu::ZuError",
+      "signature": "fn excerpt(&self) -> Option<&str>",
+      "doc": "The line of the statement this was raised on, when the statement\ntext was in hand where it was raised."
+    },
+    {
       "id": "zu::ZuError::gql",
       "kind": "method",
       "name": "gql",
@@ -741,6 +1468,14 @@
       "doc": "The same, raised at a place in the statement text. The message\nreads as it did before, with the line and column ahead of the\ndetail, and the pair is also kept as a pair so that a caller can\npoint at the token instead of parsing the sentence."
     },
     {
+      "id": "zu::ZuError::gql_in",
+      "kind": "method",
+      "name": "gql_in",
+      "of": "zu::ZuError",
+      "signature": "fn gql_in(status: GqlStatus, source: &str, offset: usize, detail: impl std::fmt::Display) -> Self",
+      "doc": "The same, raised at a byte offset into the statement text.\n\nThe front end raises through this one rather than through\n[`Self::gql_at`], because the source is what turns an offset\ninto a line and a column and it is also the only way to quote\nthe line back. A caller three layers up has the message and the\nnumbers and no longer has the text."
+    },
+    {
       "id": "zu::ZuError::gqlstatus",
       "kind": "method",
       "name": "gqlstatus",
@@ -755,6 +1490,14 @@
       "of": "zu::ZuError",
       "signature": "fn position(&self) -> Option<Position>",
       "doc": "Where in the statement this was raised, when it was raised\nsomewhere. An engine-internal failure and a runtime condition\nboth answer `None`."
+    },
+    {
+      "id": "zu::ZuError::retryable",
+      "kind": "method",
+      "name": "retryable",
+      "of": "zu::ZuError",
+      "signature": "fn retryable(&self) -> bool",
+      "doc": "Whether running the same thing again could succeed, which is the\none question a caller writing a retry loop is asking.\n\nA lost compare-and-swap is the case: a concurrent writer got\nthere first, so the work was not applied and the same call on a\nfresh read may well win. A condition answers for itself, which\nis `40000 transaction rollback` and nothing else. Everything\nremaining is false, including an interruption, which is not the\nengine failing but the caller having asked it to stop."
     },
     {
       "id": "zu::append",
@@ -1155,6 +1898,22 @@
       "doc": "The plan this connection would run for `source`, rendered,\nwithout running it."
     },
     {
+      "id": "zu::db::Connection::explain_plan",
+      "kind": "method",
+      "name": "explain_plan",
+      "of": "zu::db::Connection",
+      "signature": "fn explain_plan(&mut self, source: &str) -> Result<QueryPlan>",
+      "doc": "The same plan as operators rather than as text: the tree, the\ncolumns the statement answers with, the parameters it wants, and\nthe notes compiling it raised.\n\nA caller that reads a plan is asking a question about it, and\nevery one of those questions is easier to ask of a tree than of\na listing: whether the scan reaches an index, how deep the\nexpands go, which tables are touched. [`QueryPlan::render`] is\nwhat [`Self::explain`] returns, so the two are one thing printed\ntwo ways rather than two renderings that can drift.\n\n```no_run\nuse zu::Database;\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet plan = conn.explain_plan(\"MATCH (p:person) RETURN p.id AS id\")?;\nlet root = plan.root.as_ref().expect(\"a statement with operators\");\nassert_eq!(root.op, \"Project\");\nassert_eq!(plan.columns, [\"id\"]);\n# Ok::<(), zu::ZuError>(())\n```"
+    },
+    {
+      "id": "zu::db::Connection::interrupt",
+      "kind": "method",
+      "name": "interrupt",
+      "of": "zu::db::Connection",
+      "signature": "fn interrupt(&self) -> Interrupt",
+      "doc": "The handle a statement on this connection can be stopped\nthrough, and the count of rows it has read.\n\nA statement runs on the thread that asked for it, so the handle\nis taken before the call and raised from another thread: it is\nhow a shell answers `Ctrl-C` and how a server answers a client\nthat hung up. The statement returns\n[`zu_common::ZuError::Interrupted`] and the connection is\nunchanged, which is what makes this different from closing it."
+    },
+    {
       "id": "zu::db::Connection::is_read_only",
       "kind": "method",
       "name": "is_read_only",
@@ -1171,12 +1930,36 @@
       "doc": "Compiles a statement and pins it under an id, so a loop binds\nand executes without recompiling. The names it wants come back\nwith it, in the order the binder assigned them."
     },
     {
+      "id": "zu::db::Connection::profile",
+      "kind": "method",
+      "name": "profile",
+      "of": "zu::db::Connection",
+      "signature": "fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<Profile>",
+      "doc": "Runs `source` with the counters on and hands back what it\nobserved, one entry per operator per stage.\n\nThis costs the execution, so it is the tool a caller reaches for\nwhen a statement is slower than the plan says it should be: the\nrows an operator really produced sit next to what the optimizer\nexpected, and the self time says which one of them the wall\nclock went into. [`Profile::render`] prints it the way\n`EXPLAIN ANALYZE` does in the shell.\n\nA statement that writes is refused, because it runs as the parts\nit was split at its write into rather than as the one plan a\nprofile describes, and profiling it would apply the write."
+    },
+    {
       "id": "zu::db::Connection::query",
       "kind": "method",
       "name": "query",
       "of": "zu::db::Connection",
       "signature": "fn query(&mut self, source: &str) -> Result<QueryResult>",
       "doc": "Runs one statement and returns its rows."
+    },
+    {
+      "id": "zu::db::Connection::query_stream",
+      "kind": "method",
+      "name": "query_stream",
+      "of": "zu::db::Connection",
+      "signature": "fn query_stream(&mut self, source: &str, params: &[(&str, Value)], sink: impl FnMut) -> Result<Streamed>",
+      "doc": "Runs one statement and hands its rows to `sink` in batches as\nthey are made, instead of returning them all.\n\nThis is the shape for a result that is too big to want in\nmemory, and for a caller that will not read all of it: the sink\nanswers [`Flow::Stop`] and the scan under it stops at the next\nboundary, the same boundary an interrupt is answered at. A batch\nborrows the rows for the length of the call, so a caller keeping\nanything past it copies what it wants out.\n\n```no_run\nuse zu::{Database, Flow};\n\nlet db = Database::open(\"social.zu1\")?;\nlet mut conn = db.connect()?;\nlet mut total = 0i64;\nconn.query_stream(\"MATCH (p:person) RETURN p.id AS id\", &[], |batch| {\n    for row in batch.iter() {\n        total += row.get_at::<i64>(0)?;\n    }\n    Ok(Flow::More)\n})?;\n# Ok::<(), zu::ZuError>(())\n```"
+    },
+    {
+      "id": "zu::db::Connection::query_stream_batched",
+      "kind": "method",
+      "name": "query_stream_batched",
+      "of": "zu::db::Connection",
+      "signature": "fn query_stream_batched(&mut self, source: &str, params: &[(&str, Value)], batch_rows: usize, sink: impl FnMut) -> Result<Streamed>",
+      "doc": "The same, with the batch size named. One vector of rows is the\ndefault because it is the unit the executor already works in;\na caller writing batches somewhere with a size of its own, an\nArrow record batch or an HTTP chunk, says so here."
     },
     {
       "id": "zu::db::Connection::query_with",
@@ -1301,10 +2084,17 @@
       "doc": "The subclass name, for example `division by zero`. `None` on the\ntwelve class rows, whose code ends in `000`."
     },
     {
+      "id": "zu::gqlstatus::DOC_BASE",
+      "kind": "constant",
+      "name": "DOC_BASE",
+      "signature": "&str",
+      "doc": "Where a condition is written up. The code goes on the end, so an\nerror hands the reader a url rather than a code to go and search\nfor, which is the difference between a message a user can act on\nand a message a user has to research."
+    },
+    {
       "id": "zu::gqlstatus::DiagnosticRecord",
       "kind": "struct",
       "name": "DiagnosticRecord",
-      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers."
+      "doc": "What zu hands back when a condition is raised: the standard's code and\nzu's own account of what happened.\n\nThe two are kept apart on purpose. `status` is comparable across\nengines and is what a conformance run grades. `detail` is ours and can\nsay whatever is most useful, including the line and column, without\nputting that in the field a harness matches on.\n\n`position` is that line and column again, as a pair. The detail keeps\nsaying it because a message a user reads should be complete on its\nown, and the pair exists because a caller that wants to underline the\noffending token should not have to parse English back into numbers.\n\n`excerpt` is the line that position falls on, kept because the\ncaller furthest from the statement is the one most likely to be\nshowing this to a person: a driver, a notebook cell, a log line. The\nengine has the text in hand when it raises the condition and the\ncaller may not have it at all by the time it prints one."
     },
     {
       "id": "zu::gqlstatus::DiagnosticRecord::at",
@@ -1322,6 +2112,30 @@
       "signature": "String"
     },
     {
+      "id": "zu::gqlstatus::DiagnosticRecord::doc_url",
+      "kind": "method",
+      "name": "doc_url",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "fn doc_url(&self) -> String",
+      "doc": "The page that documents the condition this record carries."
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::excerpt",
+      "kind": "field",
+      "name": "excerpt",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "Option<String>",
+      "doc": "The whole line `position` is on, without its newline, so that\n`column` indexes into it. `None` when there is no position, when\nthe line is empty, and when it is longer than a person is going\nto read, which are the three cases where quoting it back helps\nnobody."
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::in_source",
+      "kind": "method",
+      "name": "in_source",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "fn in_source(status: GqlStatus, source: &str, offset: usize, detail: impl fmt::Display) -> Self",
+      "doc": "The same again, raised at a byte offset into the statement text.\n\nThis is the form to reach for wherever the text is in hand,\nwhich is every place inside the front end, because it is the\nonly form that can fill the excerpt: the line comes from the\nsource and nothing downstream of here still has it."
+    },
+    {
       "id": "zu::gqlstatus::DiagnosticRecord::new",
       "kind": "method",
       "name": "new",
@@ -1335,6 +2149,14 @@
       "of": "zu::gqlstatus::DiagnosticRecord",
       "signature": "Option<Position>",
       "doc": "Where in the statement, for the conditions that happen somewhere.\nA division by zero happens at runtime and has no token to point\nat, so this is `None` rather than a guess at one."
+    },
+    {
+      "id": "zu::gqlstatus::DiagnosticRecord::retryable",
+      "kind": "method",
+      "name": "retryable",
+      "of": "zu::gqlstatus::DiagnosticRecord",
+      "signature": "fn retryable(&self) -> bool",
+      "doc": "Whether running the statement again could succeed."
     },
     {
       "id": "zu::gqlstatus::DiagnosticRecord::severity",
@@ -1357,6 +2179,14 @@
       "doc": "A GQLSTATUS value. Constructible only from the generated table, so\nevery value of this type is a code the standard defines."
     },
     {
+      "id": "zu::gqlstatus::GqlStatus::class",
+      "kind": "method",
+      "name": "class",
+      "of": "zu::gqlstatus::GqlStatus",
+      "signature": "fn class(self) -> &str",
+      "doc": "The two characters that open the code, which is the condition\nclass: `22` for the data exceptions, `42` for the syntax\nerrors, `40` for the rollbacks. A binding raises one exception\ntype per class, so this is the field it switches on, and taking\nthe first two characters of a five-character code is the sort of\nthing every binding would otherwise write for itself."
+    },
+    {
       "id": "zu::gqlstatus::GqlStatus::code",
       "kind": "method",
       "name": "code",
@@ -1372,12 +2202,28 @@
       "doc": "The row this status names."
     },
     {
+      "id": "zu::gqlstatus::GqlStatus::doc_url",
+      "kind": "method",
+      "name": "doc_url",
+      "of": "zu::gqlstatus::GqlStatus",
+      "signature": "fn doc_url(self) -> String",
+      "doc": "The page that documents this condition. Derived from the code\nrather than stored, because a table of eighty urls is eighty\nchances for one of them to be the url of a different condition."
+    },
+    {
       "id": "zu::gqlstatus::GqlStatus::from_code",
       "kind": "method",
       "name": "from_code",
       "of": "zu::gqlstatus::GqlStatus",
       "signature": "fn from_code(code: &str) -> Option<Self>",
       "doc": "Looks a code up by its five characters. Returns `None` for\nanything the standard does not define, which is how a code\narriving from outside zu gets checked rather than trusted."
+    },
+    {
+      "id": "zu::gqlstatus::GqlStatus::retryable",
+      "kind": "method",
+      "name": "retryable",
+      "of": "zu::gqlstatus::GqlStatus",
+      "signature": "fn retryable(self) -> bool",
+      "doc": "Whether running the same statement again could succeed.\n\nTrue for `40000 transaction rollback`, which is the engine\nsaying it undid the work and nothing of it is in the file. False\nfor `40003 statement completion unknown`, which is the same\nclass and the opposite advice: a statement that may or may not\nhave committed is one a retry could apply twice, and a caller\nthat wants to retry it has to establish which happened first.\nFalse for everything else, since a statement that failed to\nparse parses no better the second time."
     },
     {
       "id": "zu::gqlstatus::GqlStatus::severity",
@@ -1398,7 +2244,7 @@
       "id": "zu::gqlstatus::Position",
       "kind": "struct",
       "name": "Position",
-      "doc": "Where in the statement text a condition was raised. Both are 1-based\nand columns count characters rather than bytes, so a line of\nmulti-byte text does not read as wider than it looks.\n\nThis is a pair rather than a byte offset because a byte offset is\nonly useful to something holding the source, and the caller that\nmost wants a position is an editor or a shell that has already\nprinted the line and wants to point under it."
+      "doc": "Where in the statement text a condition was raised, said three ways.\n\n`line` and `column` are 1-based and the column counts characters\nrather than bytes, so a line of multi-byte text does not read as\nwider than it looks. That pair is what an editor or a shell wants:\nit has printed the line already and needs somewhere to put the\ncaret.\n\n`offset` is the same place as a byte index into the statement, and\nit is here for the caller the pair does not serve: a tool that holds\nthe text and wants to slice it, an editor mapping into a buffer it\nindexes by byte, a highlighter marking a range. Recovering it from\nthe pair means counting lines and characters again, over text the\nengine had in hand when it raised the condition. It is always on a\ncharacter boundary of that text, so slicing at it cannot panic."
     },
     {
       "id": "zu::gqlstatus::Position::column",
@@ -1420,7 +2266,15 @@
       "name": "of",
       "of": "zu::gqlstatus::Position",
       "signature": "fn of(source: &str, offset: usize) -> Self",
-      "doc": "The pair `offset` bytes into `source`. An offset past the end\nlands at the end, which is where an error about a query that\nstopped too early belongs."
+      "doc": "The place `offset` bytes into `source`. An offset past the end\nlands at the end, which is where an error about a query that\nstopped too early belongs, and an offset inside a character\nlands on the start of that character."
+    },
+    {
+      "id": "zu::gqlstatus::Position::offset",
+      "kind": "field",
+      "name": "offset",
+      "of": "zu::gqlstatus::Position",
+      "signature": "u32",
+      "doc": "Bytes into the statement, 0-based."
     },
     {
       "id": "zu::gqlstatus::Severity",
@@ -2146,10 +3000,125 @@
       "doc": "Writes elements back as a JSON array, the inverse of [`parse`]."
     },
     {
+      "id": "zu::params",
+      "kind": "macro",
+      "name": "params",
+      "source": "zu_query::params",
+      "doc": "The bindings for a statement, written the way the statement names\nthem.\n\n```ignore\nlet rows = conn.query_with(\n    \"MATCH (p:person {id: $id}) WHERE p.name STARTS WITH $prefix RETURN p.name AS name\",\n    &params! { \"id\" => 42, \"prefix\" => \"A\" },\n)?;\n```\n\nIt expands to an array literal and not a `Vec`, so the bindings live\non the caller's stack and `&params!{...}` is the slice the query\nmethods take with no allocation at all. The names carry no `$`,\nwhich is the same spelling the C ABI and the JSONL protocol use, so\none statement's parameter list reads the same in all three."
+    },
+    {
       "id": "zu::query",
       "kind": "module",
       "name": "query",
       "doc": "zuQL against an engine catalog: the facade that turns the storage\ncatalog into the binder's `Schema` and runs text through the\nfrontend. The binder itself is engine-agnostic; this is where zu1\ntable definitions become labels and relationship types."
+    },
+    {
+      "id": "zu::query::Batch",
+      "kind": "struct",
+      "name": "Batch",
+      "source": "zu_query::row::Batch",
+      "doc": "A batch of rows handed to a streaming caller\n([`crate::exec::execute_streaming`]).\n\nIt is the same view a whole result gives, over a piece of one: the\ncolumn names and some rows, borrowed for the length of the call. A\ncaller that wants to keep rows past the call copies what it wants\nout of them, which is the trade streaming makes and the reason the\nbatch cannot outlive the sink."
+    },
+    {
+      "id": "zu::query::Batch::columns",
+      "kind": "method",
+      "name": "columns",
+      "of": "zu::query::Batch",
+      "signature": "fn columns(&self) -> &[String]",
+      "doc": "The column names, which are the statement's and so are the same\nfor every batch of one run."
+    },
+    {
+      "id": "zu::query::Batch::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::query::Batch",
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether the batch is empty, which the sink is never handed."
+    },
+    {
+      "id": "zu::query::Batch::iter",
+      "kind": "method",
+      "name": "iter",
+      "of": "zu::query::Batch",
+      "signature": "fn iter(&self) -> RowIter",
+      "doc": "The rows, typed, exactly as a whole result reads them."
+    },
+    {
+      "id": "zu::query::Batch::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::query::Batch",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many rows this batch holds. It is never zero: a filter that\nrejected everything it read hands over nothing rather than an\nempty batch."
+    },
+    {
+      "id": "zu::query::Batch::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::query::Batch",
+      "signature": "fn new(columns: &[String], rows: &[Vec<Value>]) -> Batch",
+      "doc": "A batch over names and rows that belong together."
+    },
+    {
+      "id": "zu::query::Batch::rows",
+      "kind": "method",
+      "name": "rows",
+      "of": "zu::query::Batch",
+      "signature": "fn rows(&self) -> &[Vec<Value>]",
+      "doc": "The rows, untyped."
+    },
+    {
+      "id": "zu::query::Flow",
+      "kind": "enum",
+      "name": "Flow",
+      "source": "zu_query::row::Flow",
+      "doc": "What a streaming caller wants after a batch: the next one, or no\nmore. Stopping is not a failure and leaves nothing to clean up, so\nit is a value rather than an error."
+    },
+    {
+      "id": "zu::query::Flow::More",
+      "kind": "variant",
+      "name": "More",
+      "of": "zu::query::Flow",
+      "signature": "More",
+      "doc": "Keep going."
+    },
+    {
+      "id": "zu::query::Flow::Stop",
+      "kind": "variant",
+      "name": "Stop",
+      "of": "zu::query::Flow",
+      "signature": "Stop",
+      "doc": "Stop the statement here. The rows already handed over stand."
+    },
+    {
+      "id": "zu::query::FromRow",
+      "kind": "trait",
+      "name": "FromRow",
+      "source": "zu_query::row::FromRow",
+      "doc": "A Rust type one whole row can be read as, which is a tuple in every\ncase this crate provides. It is a trait rather than an inherent\nmethod so that a caller can implement it for its own struct without\nwaiting for a derive."
+    },
+    {
+      "id": "zu::query::FromRow::from_row",
+      "kind": "method",
+      "name": "from_row",
+      "of": "zu::query::FromRow",
+      "signature": "fn from_row(row: Row) -> Result<Self>",
+      "doc": "Reads the row, or raises what the first column that disagreed\nwith the type raised."
+    },
+    {
+      "id": "zu::query::FromValue",
+      "kind": "trait",
+      "name": "FromValue",
+      "source": "zu_query::row::FromValue",
+      "doc": "A Rust type one column can be read as.\n\nThe lifetime is the result's, which is what lets `&'r str` be an\nimplementation here and is the whole reason this is not a plain\n`TryFrom<&Value>`: a borrowed string has to name the result it\nborrows from."
+    },
+    {
+      "id": "zu::query::FromValue::from_value",
+      "kind": "method",
+      "name": "from_value",
+      "of": "zu::query::FromValue",
+      "signature": "fn from_value(value: &Value) -> Result<Self>",
+      "doc": "Reads `value`, or raises `22G03` naming both types."
     },
     {
       "id": "zu::query::QueryResult",
@@ -2159,11 +3128,27 @@
       "doc": "The rows a query returns, one column name per RETURN item, plus any\nconditions raised along the way that did not stop it.\n\nThis and [`QueryResult::status`] are the other half of the GQLSTATUS\nenvelope (Spec/2064g/gql/plan/07). An exception replaces the result\nand comes back as `Err`; a warning rides with the answer and lands in\n`notices`, because a statement that dropped a null out of an\naggregate still has rows to give you and the standard still wants you\ntold. Almost every query leaves `notices` empty, so it costs one empty\n`Vec` and no allocation on the path that raises nothing."
     },
     {
+      "id": "zu::query::QueryResult::column_index",
+      "kind": "method",
+      "name": "column_index",
+      "of": "zu::query::QueryResult",
+      "signature": "fn column_index(&self, name: &str) -> Option<usize>",
+      "doc": "Where a column is, by name, or `None` when the result has no\nsuch column. This is the cheap question a caller asks once\nbefore a loop, so that the loop reads by index and never\ncompares a string per row."
+    },
+    {
       "id": "zu::query::QueryResult::columns",
       "kind": "field",
       "name": "columns",
       "of": "zu::query::QueryResult",
       "signature": "Vec<String>"
+    },
+    {
+      "id": "zu::query::QueryResult::iter",
+      "kind": "method",
+      "name": "iter",
+      "of": "zu::query::QueryResult",
+      "signature": "fn iter(&self) -> RowIter",
+      "doc": "The rows, as typed views over this result."
     },
     {
       "id": "zu::query::QueryResult::new",
@@ -2189,6 +3174,14 @@
       "signature": "Vec<zu_common::gqlstatus::DiagnosticRecord>"
     },
     {
+      "id": "zu::query::QueryResult::row",
+      "kind": "method",
+      "name": "row",
+      "of": "zu::query::QueryResult",
+      "signature": "fn row(&self, ix: usize) -> Result<Row>",
+      "doc": "One row by position, for the query that returns exactly one and\nwhose caller should not have to write a loop to say so."
+    },
+    {
       "id": "zu::query::QueryResult::rows",
       "kind": "field",
       "name": "rows",
@@ -2202,6 +3195,100 @@
       "of": "zu::query::QueryResult",
       "signature": "fn status(&self) -> GqlStatus",
       "doc": "The completion condition for the statement, which is the single\nGQLSTATUS value a caller gets back when nothing went wrong.\n\n`00000 successful completion` unless the statement had no\nprojection to give back, in which case the standard has a\ncondition for exactly that: `00001 successful completion, omitted\nresult`. It is derived here rather than stored at each call site\nso no executor can forget it, and because \"did this statement\nproduce columns\" is the whole test.\n\nThis is deliberately not a notice. A statement reports one\noutcome and any number of warnings alongside it, and folding the\noutcome into the warning list makes the two indistinguishable to\nanything reading the envelope."
+    },
+    {
+      "id": "zu::query::Row",
+      "kind": "struct",
+      "name": "Row",
+      "source": "zu_query::row::Row",
+      "doc": "One row of a result, borrowed from it.\n\nThe column names ride along with the values so that a row read out\nof an iterator can still be asked for a column by name, which is\nwhat a caller with a wide result wants and what a bare `&[Value]`\ncannot answer."
+    },
+    {
+      "id": "zu::query::Row::columns",
+      "kind": "method",
+      "name": "columns",
+      "of": "zu::query::Row",
+      "signature": "fn columns(&self) -> &[String]",
+      "doc": "The column names, in the order the statement projected them."
+    },
+    {
+      "id": "zu::query::Row::get",
+      "kind": "method",
+      "name": "get",
+      "of": "zu::query::Row",
+      "signature": "fn get<T>(&self) -> Result<T>",
+      "doc": "The whole row as one type: a tuple for the usual case, or\nanything implementing [`FromRow`].\n\nThe arity is checked before the columns are read, so a tuple\nthat does not match the projection is one error naming both\ncounts rather than a type error about whichever column happened\nto be first."
+    },
+    {
+      "id": "zu::query::Row::get_at",
+      "kind": "method",
+      "name": "get_at",
+      "of": "zu::query::Row",
+      "signature": "fn get_at<T>(&self, ix: usize) -> Result<T>",
+      "doc": "One column by position, typed."
+    },
+    {
+      "id": "zu::query::Row::get_by_name",
+      "kind": "method",
+      "name": "get_by_name",
+      "of": "zu::query::Row",
+      "signature": "fn get_by_name<T>(&self, name: &str) -> Result<T>",
+      "doc": "One column by name, typed. The name is the one the statement\nprojected, so `RETURN p.name AS name` is `name` and a projection\nwith no alias is spelled the way the plan spells it."
+    },
+    {
+      "id": "zu::query::Row::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::query::Row",
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether the row has no columns, which is what a statement with\nno projection returns."
+    },
+    {
+      "id": "zu::query::Row::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::query::Row",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many columns this row has."
+    },
+    {
+      "id": "zu::query::Row::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::query::Row",
+      "signature": "fn new(columns: &[String], values: &[Value]) -> Row",
+      "doc": "A row over names and values that belong together. The two are\nthe same length in every result the executor builds; a caller\nthat pairs mismatched slices gets a row whose extra values have\nno name, which reads as a missing column rather than a panic."
+    },
+    {
+      "id": "zu::query::Row::value",
+      "kind": "method",
+      "name": "value",
+      "of": "zu::query::Row",
+      "signature": "fn value(&self, ix: usize) -> Result<&Value>",
+      "doc": "One column by position, untyped."
+    },
+    {
+      "id": "zu::query::Row::value_by_name",
+      "kind": "method",
+      "name": "value_by_name",
+      "of": "zu::query::Row",
+      "signature": "fn value_by_name(&self, name: &str) -> Result<&Value>",
+      "doc": "One column by name, untyped."
+    },
+    {
+      "id": "zu::query::Row::values",
+      "kind": "method",
+      "name": "values",
+      "of": "zu::query::Row",
+      "signature": "fn values(&self) -> &[Value]",
+      "doc": "The values, untyped, for a caller doing its own matching."
+    },
+    {
+      "id": "zu::query::RowIter",
+      "kind": "struct",
+      "name": "RowIter",
+      "source": "zu_query::row::RowIter",
+      "doc": "The rows of a result, borrowed one at a time."
     },
     {
       "id": "zu::query::Value",
@@ -2487,12 +3574,36 @@
       "doc": "EXPLAIN ANALYZE through the session: same cache, same options,\nprofiled execution."
     },
     {
+      "id": "zu::session::Session::explain_plan",
+      "kind": "method",
+      "name": "explain_plan",
+      "of": "zu::session::Session",
+      "signature": "fn explain_plan(&mut self, source: &str) -> Result<QueryPlan>",
+      "doc": "The same plan as the operators it is made of, for a caller that\nwants to read it rather than print it.\n\nA plan viewer, a test asserting that a statement reaches an\nindex, a tool colouring the expands red: each of those wants the\ntree, and each of them parsing the listing back into one would\nbe a parser of a format nothing promised to keep. The listing is\n[`zu_query::plan::QueryPlan::render`] of this, so what a caller\nreads and what a caller prints cannot disagree."
+    },
+    {
       "id": "zu::session::Session::file_mut",
       "kind": "method",
       "name": "file_mut",
       "of": "zu::session::Session",
       "signature": "fn file_mut(&mut self) -> &mut Zu1File",
       "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs."
+    },
+    {
+      "id": "zu::session::Session::in_transaction",
+      "kind": "method",
+      "name": "in_transaction",
+      "of": "zu::session::Session",
+      "signature": "fn in_transaction(&self) -> bool",
+      "doc": "Whether an explicit transaction is running on this session."
+    },
+    {
+      "id": "zu::session::Session::interrupt",
+      "kind": "method",
+      "name": "interrupt",
+      "of": "zu::session::Session",
+      "signature": "fn interrupt(&self) -> Interrupt",
+      "doc": "The handle a statement on this session can be stopped through.\n\nOne handle for the life of the session, so a caller can take it\nonce and keep it. It is raised from another thread while a\nstatement runs, which is the only time it means anything: the\nstatement stops at the next boundary the executor checks and\nanswers [`ZuError::Interrupted`], and this session is exactly as\nit was, plans and readers included. Clear it before a statement\nrather than after, so a stop that arrived while nothing was\nrunning cannot end the next one."
     },
     {
       "id": "zu::session::Session::on",
@@ -2542,12 +3653,20 @@
       "doc": "Runs one query, compiling it on the first sighting of this text\nand reusing the cached plan afterwards."
     },
     {
+      "id": "zu::session::Session::run_streaming",
+      "kind": "method",
+      "name": "run_streaming",
+      "of": "zu::session::Session",
+      "signature": "fn run_streaming(&mut self, source: &str, params: &[(&str, Value)], batch_rows: usize, sink: &mut dyn FnMut) -> Result<Streamed>",
+      "doc": "Runs one query and hands its rows to `sink` in batches as they\nare made, instead of returning them.\n\nA statement that has to see every row before it can give one,\nwhich is ORDER BY, DISTINCT and the aggregates, runs whole and is\nhanded over in batches afterwards, and so does a statement that\nwrites, because a write runs as the parts it was split into and\nthe rows come out of the last of them. Which happened is in\n[`Streamed::streamed`], and the caller's loop is the same either\nway."
+    },
+    {
       "id": "zu::session::Session::set_options",
       "kind": "method",
       "name": "set_options",
       "of": "zu::session::Session",
       "signature": "fn set_options(&mut self, options: exec::Options)",
-      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them."
+      "doc": "Replaces them. [`crate::db::Config`] is the supported way to do\nthis; the setter is here because the switches belong to the\nsession and a caller holding one directly should not have to\nreach through the environment to change them.\n\nThe interrupt handle survives, whatever the new switches carry.\nIt belongs to whoever opened the session rather than to the\nswitches it rides in, and a caller changing the thread count\nwould otherwise silently take away the only way to stop a\nstatement."
     },
     {
       "id": "zu::session::Session::warm",
@@ -2584,7 +3703,15 @@
       "kind": "enum",
       "name": "ColType",
       "source": "zu_query::snapshot::ColType",
-      "doc": "The storage type of a property column, the two the props directory\nholds today; the full typed catalog is M3."
+      "doc": "The storage type of a property column, the three the props\ndirectory hands the vector layer today; the full typed catalog is\nM3."
+    },
+    {
+      "id": "zu::snapshot::ColType::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::snapshot::ColType",
+      "signature": "Float",
+      "doc": "IEEE double. It rides the same fixed width lane an integer does\nand is stored as its bit pattern, so the read is the integer\nread and only the type on the vector differs."
     },
     {
       "id": "zu::snapshot::ColType::Int",
@@ -2804,12 +3931,28 @@
       "doc": "Gathers a property column for arbitrary `rows` into one vector\nin argument order, decoding each touched chunk once."
     },
     {
+      "id": "zu::snapshot::Snapshot::gather_rel",
+      "kind": "method",
+      "name": "gather_rel",
+      "of": "zu::snapshot::Snapshot",
+      "signature": "fn gather_rel(&mut self, rel: RelId, col: ColId, ords: &[u64], arena: &mut MorselArena) -> Result<ValueVector>",
+      "doc": "Gathers an edge column for arbitrary `ords` into one vector in\nargument order, the edge-side [`Snapshot::gather`]."
+    },
+    {
       "id": "zu::snapshot::Snapshot::list_into",
       "kind": "method",
       "name": "list_into",
       "of": "zu::snapshot::Snapshot",
       "signature": "fn list_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()>",
       "doc": "Appends one node's sorted neighbor list in `dir` to `out`,\nreading the range that list occupies rather than the group\naround it. Worth it below [`Snapshot::list_threshold`] lists per\ngroup and a loss above it, since a range read pays its own way\nin per list where a pin pays once for all of them."
+    },
+    {
+      "id": "zu::snapshot::Snapshot::list_ords_into",
+      "kind": "method",
+      "name": "list_ords_into",
+      "of": "zu::snapshot::Snapshot",
+      "signature": "fn list_ords_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()>",
+      "doc": "Appends the load-order ordinal of every edge of `node`'s list\nin `dir` to `out`, position for position with\n[`Snapshot::list_into`].\n\nAn edge's ordinal is the row its properties sit in, and it is\nwhat a pair with several edges between it needs: the pair alone\nnames the first of the run for all of them, and counting the\nlist out instead gives every copy its own value."
     },
     {
       "id": "zu::snapshot::Snapshot::list_threshold",
@@ -2826,6 +3969,14 @@
       "of": "zu::snapshot::Snapshot",
       "signature": "fn resolve_col(&mut self, table: TableId, name: &str) -> Result<Option<(ColId, ColType)>>",
       "doc": "Resolves a property column by name, `None` when the table has\nno column under it."
+    },
+    {
+      "id": "zu::snapshot::Snapshot::resolve_rel_col",
+      "kind": "method",
+      "name": "resolve_rel_col",
+      "of": "zu::snapshot::Snapshot",
+      "signature": "fn resolve_rel_col(&mut self, rel: RelId, name: &str) -> Result<Option<(ColId, ColType)>>",
+      "doc": "The same for a rel table's edge columns, `None` when the rel\nstores nothing under that name and `None` from a backend with\nno edge columns at all.\n\nAnswering `None` is what keeps the other two edge methods\nhonest: nothing compiles a plan that reads an edge column\nunless this resolved one, so a backend that does not implement\nthem is never asked."
     },
     {
       "id": "zu::snapshot::Snapshot::scan",
@@ -3485,12 +4636,28 @@
       "doc": "Everything `add_graph` refuses a graph for other than a name its\nschema already holds.\n\n`CREATE OR REPLACE GRAPH` frees the blocks the old graph held\nbefore the new one is added, and a refusal after that point would\nleave a file holding neither, so the caller asks first and frees\nnothing when the answer is no."
     },
     {
+      "id": "zu::zu1::catalog::Catalog::closed_type_of",
+      "kind": "method",
+      "name": "closed_type_of",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn closed_type_of(&self, graph: u32) -> Option<&GraphType>",
+      "doc": "The closed graph type one graph is of, which is what a write has\nto keep (GG02).\n\n`None` for a graph created with no type and for one whose type\nis open, because both of those describe rather than promise: an\nopen type admits elements it says nothing about, so there is\nnothing a write can break. A named type the file no longer holds\nis `None` too, since a promise nothing states is not one a write\ncan be measured against, and the statement that dropped it is\nwhere that would be caught."
+    },
+    {
       "id": "zu::zu1::catalog::Catalog::copy_graph_tables",
       "kind": "method",
       "name": "copy_graph_tables",
       "of": "zu::zu1::catalog::Catalog",
       "signature": "fn copy_graph_tables(&mut self, source: u32, target: u32) -> Result<Vec<(u32, u32, ElementKind)>>",
       "doc": "Copies the table definitions of one graph into another, which is\nthe catalog half of `CREATE GRAPH ... AS COPY OF` (GC04).\n\nEach copy keeps the name it had, which is what makes the copy a\ncopy: a query written against the source runs against the copy\nonce `USE` names it. A name belongs to a graph rather than to\nthe file, so both graphs holding a `person` is two tables and\nnot a clash. What the copies do not keep is their ids, because\nan id is what the table index addresses storage by and the copy\ngets storage of its own.\n\nAnswers the source id, the copy's id and the kind of each table,\nwhich is what [`crate::graph::copy_graph_storage`] needs to copy\nthe blocks those ids stand for."
+    },
+    {
+      "id": "zu::zu1::catalog::Catalog::create_node_in",
+      "kind": "method",
+      "name": "create_node_in",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn create_node_in(&mut self, graph: u32, name: &str) -> Result<u32>",
+      "doc": "Creates an empty node table in one graph and returns its id.\n\nThis is `upsert_node` for a caller that says which graph rather\nthan meaning the home one, and it creates rather than updating:\na name the graph already holds is a table the caller meant to\nfind, not one to make twice. What it is for is the table an\n`INSERT` names by a label nothing declared, which lands in the\ngraph the statement runs against."
     },
     {
       "id": "zu::zu1::catalog::Catalog::declare_label",
@@ -3582,6 +4749,14 @@
       "of": "zu::zu1::catalog::Catalog",
       "signature": "fn graphs(&self) -> &[GraphDef]",
       "doc": "The graphs this file holds."
+    },
+    {
+      "id": "zu::zu1::catalog::Catalog::grow_node",
+      "kind": "method",
+      "name": "grow_node",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn grow_node(&mut self, id: u32, node_count: u64) -> Result<()>",
+      "doc": "Grows the row domain of the table with this id.\n\nA fold knows which table it appended to, and the name is not\nenough to say which one that is: two graphs in one file each\nhold their own `person`, so growing by name would grow the home\ngraph's table however far from home the rows landed."
     },
     {
       "id": "zu::zu1::catalog::Catalog::has_schema",
@@ -3709,6 +4884,14 @@
       "of": "zu::zu1::catalog::Catalog",
       "signature": "fn schemas(&self) -> &[String]",
       "doc": "The schemas this file holds, the root schema always among them\nunless it was dropped."
+    },
+    {
+      "id": "zu::zu1::catalog::Catalog::set_edge_count",
+      "kind": "method",
+      "name": "set_edge_count",
+      "of": "zu::zu1::catalog::Catalog",
+      "signature": "fn set_edge_count(&mut self, id: u32, edge_count: u64) -> Result<()>",
+      "doc": "Records how many edges the table with this id holds, which a\nfold knows because it just rebuilt it. By id for the same reason\nas [`Self::grow_node`]."
     },
     {
       "id": "zu::zu1::catalog::Catalog::store",
@@ -3969,6 +5152,14 @@
       "signature": "Vec<ElementType>"
     },
     {
+      "id": "zu::zu1::catalog::GraphType::holder",
+      "kind": "method",
+      "name": "holder",
+      "of": "zu::zu1::catalog::GraphType",
+      "signature": "fn holder(&self, kind: ElementKind, labels: u64) -> Option<&ElementType>",
+      "doc": "The element type an element carrying `labels` belongs to, if one\nof them describes it. This is what a closed graph type promises\nof every element it holds (GG02).\n\nBelonging is two things at once: the type's key label set picks\nthe element out, and every label the element carries is one the\ntype declares. Selection alone would let an element grow a label\nno type mentions and still count as described, which is the\npromise a closed type is there to make.\n\nMore than one type may describe it, and the first is answered,\nbecause what the caller asks is whether any does."
+    },
+    {
       "id": "zu::zu1::catalog::GraphType::name",
       "kind": "field",
       "name": "name",
@@ -4086,6 +5277,13 @@
       "name": "MAX_LABELS",
       "signature": "usize",
       "doc": "The label dictionary is bounded by the width of the bitset a node\ncarries. One word per node is the fast path the whole design is\nsized for (LDBC SNB declares 13 labels, LinkBench and Graph500 one),\nand a wider set waits for the spill representation."
+    },
+    {
+      "id": "zu::zu1::catalog::MAX_PROPERTIES",
+      "kind": "constant",
+      "name": "MAX_PROPERTIES",
+      "signature": "usize",
+      "doc": "The most properties one element holds. Generous and finite rather\nthan unlimited, for the reason the label dictionary is bounded: a\ndeclared limit is one the encoding can be built on, and an engine\nthat declares none pays for the possibility on every element of\nevery graph. The standard has a condition for hitting a declared\nlimit, and an engine with no limit can never raise it, so declaring\none is also the honest answer to the question the code asks."
     },
     {
       "id": "zu::zu1::catalog::MAX_TABLE_ID",
@@ -4592,6 +5790,28 @@
       "signature": "[u8; 16]"
     },
     {
+      "id": "zu::zu1::file::Interrupted",
+      "kind": "struct",
+      "name": "Interrupted",
+      "doc": "What a transaction the process died inside left on a file.\n\nBoth halves are needed to take it back. The file has to be published\npast what the crash left, or the header the transaction wrote wins\nthe next open by being the newer of the two slots, and the log has\nto be cut back to where it stood when the transaction began, or\nreplay puts what the transaction committed back as overlays over the\nheader that went back in."
+    },
+    {
+      "id": "zu::zu1::file::Interrupted::log_floor",
+      "kind": "field",
+      "name": "log_floor",
+      "of": "zu::zu1::file::Interrupted",
+      "signature": "zu_common::Epoch",
+      "doc": "The newest epoch the log held before the transaction started."
+    },
+    {
+      "id": "zu::zu1::file::Interrupted::published",
+      "kind": "field",
+      "name": "published",
+      "of": "zu::zu1::file::Interrupted",
+      "signature": "zu_common::Epoch",
+      "doc": "The epoch the crash left published."
+    },
+    {
       "id": "zu::zu1::file::NULL_BLOCK",
       "kind": "constant",
       "name": "NULL_BLOCK",
@@ -4610,7 +5830,15 @@
       "name": "allocate_block",
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn allocate_block(&mut self) -> BlockPtr",
-      "doc": "Returns a block to write into: a committed-free block when one\nexists, otherwise one past the high-water mark. Either way the\nblock becomes durable state only via the next checkpoint."
+      "doc": "Returns a block to write into: a committed-free block when one\nexists, otherwise one past the high-water mark. Either way the\nblock becomes durable state only via the next checkpoint.\n\nA transaction narrows what counts as free. A checkpoint inside\none publishes the blocks that transaction has freed, and the\nstate the savepoint keeps still reads them, so those are held in\n[`Self::frozen`] until the transaction ends and this list holds\nonly what was free before it began."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::begin_savepoint",
+      "kind": "method",
+      "name": "begin_savepoint",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn begin_savepoint(&mut self, across_statements: bool, log_floor: Epoch) -> Result<()>",
+      "doc": "Keeps what the file is now, so that [`Self::rollback_savepoint`]\ncan put it back after any number of statements have committed on\ntop of it.\n\nThis is what makes an explicit transaction more than a word. A\nstatement commits by folding its overlays into new segments and\nflipping the header, and there is no undoing that in memory\nafterwards, so the undo is at the file: keep the roots, refuse to\nreuse anything freed while the transaction runs, and publish the\nkept roots again if the transaction ends in a rollback.\n\nOne savepoint at a time. Nested transactions are not a thing GQL\nhas, and a second one here would quietly become the first.\n\n`across_statements` says whether what is being kept has to\nsurvive the process going away, which is what an explicit\ntransaction needs and a single statement does not: a statement\nthat publishes once publishes in one header flip, and a crash\neither leaves that flip whole or leaves the state before it. See\n[`Self::keep_savepoint`] for what a savepoint that has to\nsurvive costs.\n\nA transaction starts from a folded file, because what is kept\nhere is the file's roots and a rollback publishes them again:\nwhatever the log has not folded into them is not in them, and\nwould go back along with the transaction. Callers fold first,\nwhich is what opening a writer does.\n\n`log_floor` is where the log stands as this is called, which is\nthe newest epoch anything committed before the transaction. A\nrollback cuts the log back to it, so a caller handing over a\nfloor older than what the log holds is asking for those frames\nto be dropped along with the transaction."
     },
     {
       "id": "zu::zu1::file::Zu1File::cache_stats",
@@ -4669,6 +5897,14 @@
       "doc": "Write-once file identity."
     },
     {
+      "id": "zu::zu1::file::Zu1File::finish_rollback",
+      "kind": "method",
+      "name": "finish_rollback",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn finish_rollback(&mut self) -> Result<()>",
+      "doc": "Publishes the state a transaction the process died inside was\nholding, and says the transaction is over.\n\nNothing is put back in memory, because opening a file with a\ntransaction open on it reads the kept state to begin with. What\nis left is the file: the kept header goes in with an epoch past\nthe one the crash left, so the next open reads it rather than\nthe middle of the transaction, and only then is the kept state\ncleared. A crash anywhere in here leaves the marker down and the\nnext open does the same thing again."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::free_block",
       "kind": "method",
       "name": "free_block",
@@ -4677,12 +5913,36 @@
       "doc": "Marks `ptr` free. The committed epoch still references it, so it\nbecomes allocatable only after the next checkpoint; until then its\ncontents must survive a crash. Frees staged on a handle that closes\nwithout a checkpoint are dropped, which leaks the blocks until\nVACUUM rewrites the file, never corrupts it."
     },
     {
+      "id": "zu::zu1::file::Zu1File::in_savepoint",
+      "kind": "method",
+      "name": "in_savepoint",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn in_savepoint(&self) -> bool",
+      "doc": "Whether a transaction is holding this file to a state it can be\nput back to."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::interrupted",
+      "kind": "method",
+      "name": "interrupted",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn interrupted(&self) -> Option<Interrupted>",
+      "doc": "What a transaction the process died inside left behind, if this\nhandle opened a file with one open on it.\n\nThe header this handle is reading is already the one that\ntransaction was holding, so a reader needs nothing else. A\nwriter owes the file a publish, which is what\n[`Self::finish_rollback`] is, and owes the log a cut back to the\nfloor, which is the one thing it cannot do itself."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::is_writable",
       "kind": "method",
       "name": "is_writable",
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn is_writable(&self) -> bool",
       "doc": "Whether this handle may write, which is false for one opened by\n[`Self::open_read_only`]."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::keep_savepoint",
+      "kind": "method",
+      "name": "keep_savepoint",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn keep_savepoint(&mut self) -> Result<()>",
+      "doc": "Puts the state a savepoint is keeping on the file, so that a\nprocess that goes away before the transaction ends leaves\nsomething that says where to go back to.\n\nThis runs before the write it protects reaches the log, which is\nwhere a change becomes something a recovery would bring back,\nrather than before the publish behind it: a commit is durable at\nits log sync and the fold that publishes it comes after, so a\nmarker written at the fold leaves that window uncovered. Every\npath that commits calls this first, and the checkpoint calls it\ntoo, for the publishes that reach the file without a frame.\n\nThe two syncs are what it costs: one here and one at the word\nthat ends the transaction. A statement pays neither until it\ncommits a second time, because one commit and the fold behind it\nare one header flip, which a crash either leaves whole or does\nnot leave at all."
     },
     {
       "id": "zu::zu1::file::Zu1File::open",
@@ -4757,12 +6017,28 @@
       "doc": "Retires a fork into its shared pool for the next\n[`Self::reopen`] to reuse. The handle drops its own reference\nto the pool on the way in, so the pool holding it does not keep\nitself alive. Dropping a fork without recycling is fine, the\nnext reopen just pays the OS open again."
     },
     {
+      "id": "zu::zu1::file::Zu1File::release_savepoint",
+      "kind": "method",
+      "name": "release_savepoint",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn release_savepoint(&mut self) -> Result<()>",
+      "doc": "Ends the transaction by keeping what it did. Everything it wrote\nis already published, so this only drops what was being held and\nlets allocation reuse free blocks again.\n\nA transaction whose kept state reached the file has one more\nthing to do, which is to say it is over. The state is published\nbefore the saying, so a crash in between takes the transaction\nback, which is the right way round: the word that ends it had\nnot returned yet."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::reopen",
       "kind": "method",
       "name": "reopen",
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn reopen(&self) -> Result<Self>",
       "doc": "A second read handle on the same file carrying this handle's\ncurrent in-memory state. Data blocks are written to the file as\nthey are staged and only the header flip waits for the\ncheckpoint, so adopting this handle's header lets the new\nhandle read exactly what this one reads, staged roots included.\nThe free lists stay empty because a reopened handle exists to\nread; the morsel workers are the caller. The block cache is\nshared, so a fork starts warm and warms its siblings.\n\nHandles retired through [`Self::recycle`] come back first, with\nthis handle's header and a cleared pin memo, so steady-state\nforking costs a mutex pop instead of an OS open."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::rollback_savepoint",
+      "kind": "method",
+      "name": "rollback_savepoint",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn rollback_savepoint(&mut self) -> Result<()>",
+      "doc": "Ends the transaction by putting the file back where it started\nand publishing that, so a reader after this reads what a reader\nbefore the transaction read.\n\nThe epoch is the one thing not put back: the kept header is\nrepublished with the next epoch after the newest, because a\nheader written with a lower epoch than the other slot would be\nthe older of the two and the transaction's last state would win\nthe next open. Blocks the transaction wrote past the kept\nhigh-water mark are outside the file the header describes, so the\nnext writer hands them out again; blocks it freed are still\nreferenced by the header going back in, so what it freed is\ndropped rather than published."
     },
     {
       "id": "zu::zu1::file::Zu1File::set_memory_limit",
@@ -4833,8 +6109,8 @@
       "id": "zu::zu1::fold::recover",
       "kind": "function",
       "name": "recover",
-      "signature": "fn recover(db: &mut zu_zu1::file::Zu1File, wal: &zu_zu1::wal::Wal) -> zu_common::Result<zu_zu1::txn::Mvcc>",
-      "doc": "Rebuilds the overlay store after a crash or reopen: committed txns\nabove the header's `wal_seq` replay from the log, an `IngestRef`\nresolves back into its payload by reading the sealed segments it\nnames, then every persisted tombstone chain seeds back in at epoch\n0."
+      "signature": "fn recover(db: &mut zu_zu1::file::Zu1File, wal: &mut zu_zu1::wal::Wal) -> zu_common::Result<zu_zu1::txn::Mvcc>",
+      "doc": "Rebuilds the overlay store after a crash or reopen: committed txns\nabove the header's `wal_seq` replay from the log, an `IngestRef`\nresolves back into its payload by reading the sealed segments it\nnames, then every persisted tombstone chain seeds back in at epoch\n0.\n\nA file with a transaction still open on it is put back first. The\nlog is cut to what the state going back in had folded, because a\nframe above that is a statement of the transaction being taken back\nand replaying it would put the transaction back on as an overlay,\nand then the kept state is published. Nothing here is a special case\nafterwards: the file reads as one whose last statement was the one\nbefore the transaction started."
     },
     {
       "id": "zu::zu1::fullzip",
@@ -5319,6 +6595,13 @@
       "name": "copy_graph_storage",
       "signature": "fn copy_graph_storage(db: &mut zu_zu1::file::Zu1File, tables: &[(u32, u32, zu_zu1::catalog::ElementKind)]) -> zu_common::Result<()>",
       "doc": "Copies everything the tables of one graph hold into blocks of their\nown, which is the storage half of `CREATE GRAPH ... AS COPY OF`\n(GC04).\n\n`tables` pairs each source table id with the id the catalog gave its\ncopy, which the caller has already put in the new graph. The copy is\nblock for block: every segment block of the source is read whole and\nwritten into a freshly allocated one, and the directories are\nre-encoded only because a directory names the blocks its segments\nlive in and those are now different blocks. The bytes of a column,\na CSR array and a key index are the source's byte for byte, so the\ncopy costs a read and a write per block and no decode, and it does\nnot matter to it what the columns hold.\n\nNothing is shared with the source. A copy that pointed at the same\nsegments would be a second name for one graph, and the first write\nto either would show up in both; `COPY OF` is a graph that starts\nout equal and goes its own way.\n\nNothing is published here either, as in [`free_graph_storage`]: the\ntable index and the statistics are staged and the checkpoint that\nstores the catalog makes all three visible at once."
+    },
+    {
+      "id": "zu::zu1::graph::create_empty_rel",
+      "kind": "function",
+      "name": "create_empty_rel",
+      "signature": "fn create_empty_rel(db: &mut zu_zu1::file::Zu1File, catalog: &mut zu_zu1::catalog::Catalog, name: &str, from: u32, to: u32, undirected: bool) -> zu_common::Result<u32>",
+      "doc": "Creates a rel table that holds no edges yet, between two node\ntables the caller has already got the ids of, and returns its id.\n\nThis is what an `INSERT` needs when it writes an edge of a type no\ntable is named by. A bulk load makes a rel table out of an edge list\nand would make the node tables with it, which is the wrong shape\nhere twice over: the ends are already there, and there are no edges\nyet because the statement that wants the table is the one about to\nwrite the first one.\n\nThe directory is the one a table of no edges has: both row domains\nas the catalog says they are, and a group per group of the longer\nend holding an empty CSR each way. The catalog is the caller's to\nstore, which is what keeps the table and the rows of the statement\nthat wanted it in one checkpoint."
     },
     {
       "id": "zu::zu1::graph::densify_keyed",
@@ -6034,6 +7317,13 @@
       "doc": "Stores the property columns of `node_table`, replacing any earlier\nset whole; every column must hold exactly one value per row of the\ntable's domain. The table must already exist, so a load always\nprecedes its properties."
     },
     {
+      "id": "zu::zu1::props::store_props_for",
+      "kind": "function",
+      "name": "store_props_for",
+      "signature": "fn store_props_for(db: &mut zu_zu1::file::Zu1File, table_id: u32, node_count: u64, columns: &[PropInput]) -> zu_common::Result<PropsDirectory>",
+      "doc": "The same store over a table named by its id, which is what a caller\nwho has already resolved the name means, and the only way to reach a\ntable outside the home graph: a name is a name in a graph, and the\nstore above resolves one in the graph a load writes into.\n\n`node_count` is the row domain the columns have to cover, which is\nthe table's own count and is nought for a table nothing has written\nto yet."
+    },
+    {
       "id": "zu::zu1::props::store_props_nullable",
       "kind": "function",
       "name": "store_props_nullable",
@@ -6053,6 +7343,13 @@
       "name": "store_rel_props",
       "signature": "fn store_rel_props(db: &mut zu_zu1::file::Zu1File, rel_table: &str, columns: &[(&str, PropValues)]) -> zu_common::Result<PropsDirectory>",
       "doc": "Stores the property columns of the rel table `rel_table`, replacing\nany earlier set whole. Every column holds one value per edge, in the\norder the edges were loaded in, which is sorted by source and then by\ndestination: value `i` belongs to edge `i` of that order, and that is\nthe only thing tying a column to an edge, so a caller that hands over\na column in another order has silently mislabeled its graph.\n\nA pair may run twice. Two edges over the same endpoints are two\nslots of the forward list and two values of the column, and a walk\nthat counts as it goes has each one's own\n([`crate::graph::GraphReader::out_neighbors_from`]). What such a\ntable cannot do is answer a lookup given nothing but the pair with\nboth values, and `edge_ordinal` says which of the two it picks."
+    },
+    {
+      "id": "zu::zu1::props::store_rel_props_for",
+      "kind": "function",
+      "name": "store_rel_props_for",
+      "signature": "fn store_rel_props_for(db: &mut zu_zu1::file::Zu1File, rel_id: u32, edge_count: u64, columns: &[PropInput]) -> zu_common::Result<PropsDirectory>",
+      "doc": "The same store over a rel table named by its id, which is what a\ncaller who has already resolved the name means, and the only way to\nreach a table outside the home graph. This is [`store_props_for`] on\nthe edge side, and the difference is where the columns hang: a node\ntable's props are the table index entry, a rel table's are a field\nof the directory that entry holds."
     },
     {
       "id": "zu::zu1::props::store_rel_props_nullable",
@@ -6878,6 +8175,14 @@
       "doc": "Tombstoned offsets of `table` visible at `epoch`, ascending."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::touched_cols",
+      "kind": "method",
+      "name": "touched_cols",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn touched_cols(&self, table: u32, epoch: Epoch) -> BTreeSet<u32>",
+      "doc": "Which columns of `table` hold an update chain entry visible at\n`epoch`, the columns a fold has to rewrite. The ones outside it\ncome through untouched, and answering the whole set in one pass\nis what keeps that check off the column count."
+    },
+    {
       "id": "zu::zu1::txn::WriteTxn",
       "kind": "struct",
       "name": "WriteTxn",
@@ -7197,12 +8502,20 @@
       "doc": "Replays committed transactions in log order through `sink`,\nwhich sees every frame of a txn including its `TxnBegin` and\n`TxnCommit`. Records with epoch at or below `floor` are already\nfolded into the base file and skip. A `CheckpointNote` raises\nthe floor the same way and is not delivered; the notes are\ngathered in a first pass so a note folds the txns before it in\nthe log, which is where the txns it folded sit. Reads go\nthrough a second descriptor so an open writer keeps its append\nposition."
     },
     {
+      "id": "zu::zu1::wal::Wal::rollback_above",
+      "kind": "method",
+      "name": "rollback_above",
+      "of": "zu::zu1::wal::Wal",
+      "signature": "fn rollback_above(&mut self, floor: Epoch) -> Result<()>",
+      "doc": "Drops the frames of a transaction the process died inside, which\nare the ones committed after it began: the marker it left says\nwhere the log stood then, so everything above that floor is the\ntransaction's own and goes with it.\n\nEpochs only go up along the log, so this is a prefix cut rather\nthan a rewrite. Frames at or below the floor were committed\nbefore the transaction and stay, whether the base file has\nfolded them already or replay is about to bring them back."
+    },
+    {
       "id": "zu::zu1::wal::Wal::truncate",
       "kind": "method",
       "name": "truncate",
       "of": "zu::zu1::wal::Wal",
       "signature": "fn truncate(&mut self) -> Result<()>",
-      "doc": "Empties the log after a checkpoint has folded and published\neverything it held."
+      "doc": "Empties the log after a checkpoint has folded and published\neverything it held.\n\nThe cut does not sync, and it is the one place in the write path\nthat does not have to. The header the checkpoint published names\nthe epoch it folded through, and replay skips every frame at or\nbelow it, so a crash that finds the old bytes still on disk\nreplays nothing: what those frames say is already in the base\nfile. It costs one full sync per statement to make the file\nshorter sooner, which is a quarter of what a one cell write pays\nfor durability it already has."
     },
     {
       "id": "zu::zu1::wal::WalColumn",

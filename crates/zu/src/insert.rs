@@ -283,6 +283,41 @@ impl<'a> Batch<'a> {
     }
 }
 
+/// Fills in the stored row of every edge the statement has just
+/// written, now that staging has folded them into their tables.
+///
+/// An edge is handed to the clauses after the write before it is
+/// staged, because what settles the rows it runs between is the write
+/// itself, so at that moment it has no row of its own and a property
+/// read off it would answer null. By the time this runs the fold has
+/// landed, so the row is there to be found and `RETURN k.since` reads
+/// back what the same statement wrote on `k`.
+///
+/// A pair of rows that runs more than once names as many edges as it
+/// has copies, and the lookup answers with the first of them, which is
+/// all a caller holding nothing but the pair can be told.
+pub(crate) fn settle(graph: &mut impl zu_query::exec::Graph, rows: &mut [Value]) -> Result<()> {
+    for row in rows {
+        let Value::List(values) = row else {
+            continue;
+        };
+        for value in values {
+            if let Value::Rel {
+                table,
+                src,
+                dst,
+                ord,
+            } = value
+                && *ord == Value::NO_REL_ROW
+                && let Some(found) = graph.edge_ordinal(*table, *src, *dst)?
+            {
+                *ord = found;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Stages every row of one statement in the open transaction.
 ///
 /// The nodes go first. An edge names two rows by their offsets and the
@@ -741,23 +776,23 @@ mod tests {
         );
     }
 
-    /// An edge type that names no rel table is a reference error, not a
-    /// parse error: the statement is well formed and mentions something
-    /// that is not there. A node label that names no table is not this,
-    /// because a table gets made for it (`crate::declare`), and an edge
-    /// table cannot be made the same way: it is between two tables and
-    /// the pattern says which two only for the edge it is writing.
+    /// An edge type that names no rel table is a table to be made, the
+    /// way a node label that names none is (`crate::declare`), as long
+    /// as the pattern says which two node tables the edge runs between.
+    /// When it does not, there is nothing to make and the statement is
+    /// a reference error rather than a parse error: it is well formed
+    /// and mentions something that is not there.
     #[test]
-    fn an_edge_type_that_names_no_table_is_refused() {
+    fn an_edge_type_that_names_no_table_and_no_ends_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = open(&dir, "label.zu1");
 
         let err = session
             .run(
-                "MATCH (a:person {name: 'ada'}), (b:person {name: 'kay'}) INSERT (a)-[e:employs]->(b)",
+                "MATCH (a), (b:person {name: 'kay'}) INSERT (a)-[e:employs]->(b)",
                 &[],
             )
-            .expect_err("no such table");
+            .expect_err("nothing says which table the edge leaves");
         assert_eq!(
             err.gqlstatus().map(|s| s.code()),
             Some("42002"),
@@ -859,8 +894,10 @@ mod tests {
                     .id,
                 src: 3,
                 dst: 2,
-                // Staged, so no stored row yet.
-                ord: Value::NO_REL_ROW,
+                // The write has folded by the time the row is handed
+                // on, so the edge has a row of its own: the second of
+                // the table, behind the one the fixture loaded.
+                ord: 1,
             }
         );
     }

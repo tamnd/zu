@@ -1130,6 +1130,90 @@ pub fn bulk_load_keyed(
     )
 }
 
+/// Creates a rel table that holds no edges yet, between two node
+/// tables the caller has already got the ids of, and returns its id.
+///
+/// This is what an `INSERT` needs when it writes an edge of a type no
+/// table is named by. A bulk load makes a rel table out of an edge list
+/// and would make the node tables with it, which is the wrong shape
+/// here twice over: the ends are already there, and there are no edges
+/// yet because the statement that wants the table is the one about to
+/// write the first one.
+///
+/// The directory is the one a table of no edges has: both row domains
+/// as the catalog says they are, and a group per group of the longer
+/// end holding an empty CSR each way. The catalog is the caller's to
+/// store, which is what keeps the table and the rows of the statement
+/// that wanted it in one checkpoint.
+pub fn create_empty_rel(
+    db: &mut Zu1File,
+    catalog: &mut Catalog,
+    name: &str,
+    from: u32,
+    to: u32,
+    undirected: bool,
+) -> Result<u32> {
+    let count_of = |id: u32| -> Result<u64> {
+        catalog
+            .node_by_id(id)
+            .map(|t| t.node_count)
+            .ok_or_else(|| ZuError::InvalidArgument(format!("no node table with id {id}")))
+    };
+    let (from_count, to_count) = (count_of(from)?, count_of(to)?);
+    let none: [(u32, u32); 0] = [];
+    let mut fwd = build_direction(db, "source", from_count, &none)?;
+    let mut bwd = build_direction(db, "destination", to_count, &none)?;
+    let group_count = fwd.len().max(bwd.len());
+    pad_direction(db, &mut fwd, group_count)?;
+    pad_direction(db, &mut bwd, group_count)?;
+    let groups = fwd
+        .into_iter()
+        .zip(bwd)
+        .enumerate()
+        .map(|(g, (fwd, bwd))| GroupMeta {
+            row_count: group_rows(from_count, g as u64),
+            edge_base: 0,
+            fwd,
+            bwd,
+        })
+        .collect();
+    let directory = Directory {
+        from_count,
+        to_count,
+        edge_count: 0,
+        keys: None,
+        props: NULL_BLOCK,
+        groups,
+    };
+    let root = meta::write_chain(db, &directory.encode())?;
+    let id = catalog.upsert_rel_as(name, from, to, 0, undirected)?;
+    let mut index = TableIndex::load(db)?;
+    index.set(id, root);
+    free_chain(db, db.db_header().table_index_root)?;
+    let index_root = meta::write_chain(db, &index.encode())?;
+    db.db_header_mut().table_index_root = index_root;
+    // A table of no edges has the degree statistics of no edges, which
+    // is not the same as having none: a planner that finds no entry has
+    // to guess, and there is nothing to guess about here.
+    let mut stats = crate::stats::Stats::load(db)?;
+    stats.rels.insert(
+        id,
+        crate::stats::RelStats {
+            out_hist: crate::stats::degree_histogram(&none),
+            in_hist: crate::stats::degree_histogram(&none),
+            norms: crate::stats::DegreeStats {
+                out: crate::stats::degree_norms(&none),
+                inn: crate::stats::degree_norms(&none),
+                cross: crate::stats::degree_cross(&none, &none),
+            },
+            colors: None,
+        },
+    );
+    free_chain(db, db.db_header().stats_root)?;
+    stats.store(db)?;
+    Ok(id)
+}
+
 fn bulk_load_inner(
     db: &mut Zu1File,
     ends: Ends<'_>,

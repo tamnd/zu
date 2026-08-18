@@ -15,9 +15,10 @@ use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 use crate::ast::{
     BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, ElementDefKind,
     ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr,
-    LetItem, Linear, Literal, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, Projection,
-    ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Selector,
-    SetInto, SetItem, SetOp, Simple, SortKey, Statement, TxnStmt, UnaryOp, YieldItem,
+    LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern,
+    PatternList, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
+    RemoveItem, Removed, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, TxnStmt,
+    UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -118,6 +119,7 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         tokens,
         pos: 0,
         depth: 0,
+        lists: 0,
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
@@ -135,6 +137,11 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     depth: usize,
+    /// How many pattern lists have been read, which numbers the next
+    /// one. A statement block gathers several lists into one clause and
+    /// the edges a match mode keeps apart are the ones of a single
+    /// list, so each list carries a number of its own.
+    lists: u32,
 }
 
 impl Parser<'_> {
@@ -1526,14 +1533,27 @@ impl Parser<'_> {
             var,
             selector,
             mode,
+            // The list is said in front of the whole list, so the
+            // pattern is read first and stamped after.
+            list: PatternList::default(),
             start,
             steps,
         })
     }
 
-    /// A list of path patterns and the `KEEP` that may follow it (ISO
-    /// 16.9, features G006 and G007), which is a prefix said once for
-    /// the whole list rather than once per pattern of it.
+    /// A graph pattern (ISO 16.9): the match mode in front of a list of
+    /// path patterns, and the `KEEP` that may follow it (features G002,
+    /// G003, G006 and G007). All three are said once for the whole list
+    /// rather than once per pattern of it.
+    ///
+    /// The match mode says what the list as a whole may bind twice, and
+    /// a path mode says what one path of it may, so a list under
+    /// `DIFFERENT EDGES` walks trails and no two of its patterns take
+    /// the same edge, while one under `REPEATABLE ELEMENTS` walks and
+    /// shares whatever it likes. Which list a pattern was written in is
+    /// stamped on it here, because a match statement block gathers the
+    /// lists of several statements and the edges have to stay apart per
+    /// list rather than across the block.
     ///
     /// What a KEEP carries is the prefix a pattern carries itself, and
     /// what it does is fill in what the patterns left out: a pattern
@@ -1543,6 +1563,11 @@ impl Parser<'_> {
     /// is refused rather than settled by a rule of precedence, because
     /// either way round would drop something the query asked for.
     fn parse_graph_pattern(&mut self) -> Result<Vec<PathPattern>> {
+        let list = PatternList {
+            mode: self.parse_match_mode(),
+            at: self.lists,
+        };
+        self.lists += 1;
         let mut patterns = vec![self.parse_path()?];
         while self.eat(&TokenKind::Comma) {
             patterns.push(self.parse_path()?);
@@ -1576,7 +1601,40 @@ impl Parser<'_> {
                 path.mode = path.mode.or(mode);
             }
         }
+        for path in &mut patterns {
+            path.list = list;
+        }
         Ok(patterns)
+    }
+
+    /// The match mode in front of a pattern list, `DIFFERENT EDGES`
+    /// when none is written (ISO 16.9).
+    ///
+    /// Both are written four ways and all four say the same thing:
+    /// `EDGE` and `EDGES` are the same word twice over, and `BINDINGS`
+    /// after it is the standard spelling out that what may not repeat is
+    /// what the patterns bound rather than what the graph holds. The
+    /// singular and the plural of `ELEMENT` go the same way.
+    fn parse_match_mode(&mut self) -> MatchMode {
+        let at = self.pos;
+        if self.eat_kw("REPEATABLE") {
+            if self.eat_kw("ELEMENTS") || self.eat_kw("ELEMENT") {
+                let _ = self.eat_kw("BINDINGS") || self.eat_kw("BINDING");
+                return MatchMode::RepeatableElements;
+            }
+            // `REPEATABLE` is not a keyword of anything else, but a
+            // pattern may name a variable after it, so a word that does
+            // not carry on into a match mode is handed back rather than
+            // refused here.
+            self.pos = at;
+        } else if self.eat_kw("DIFFERENT") {
+            if self.eat_kw("EDGES") || self.eat_kw("EDGE") {
+                let _ = self.eat_kw("BINDINGS") || self.eat_kw("BINDING");
+                return MatchMode::DifferentEdges;
+            }
+            self.pos = at;
+        }
+        MatchMode::DifferentEdges
     }
 
     /// What a pattern carries in front of its first node (ISO 16.6): a

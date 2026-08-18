@@ -335,6 +335,18 @@
           "value": "MATCH"
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "match_mode"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "SYMBOL",
           "name": "pattern"
         },
@@ -361,6 +373,188 @@
               "type": "BLANK"
             }
           ]
+        }
+      ]
+    },
+    "match_mode": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "ALIAS",
+              "content": {
+                "type": "TOKEN",
+                "content": {
+                  "type": "PREC",
+                  "value": 1,
+                  "content": {
+                    "type": "PATTERN",
+                    "value": "[rR][eE][pP][eE][aA][tT][aA][bB][lL][eE]"
+                  }
+                }
+              },
+              "named": false,
+              "value": "REPEATABLE"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "TOKEN",
+                    "content": {
+                      "type": "PREC",
+                      "value": 1,
+                      "content": {
+                        "type": "PATTERN",
+                        "value": "[eE][lL][eE][mM][eE][nN][tT]"
+                      }
+                    }
+                  },
+                  "named": false,
+                  "value": "ELEMENT"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "TOKEN",
+                    "content": {
+                      "type": "PREC",
+                      "value": 1,
+                      "content": {
+                        "type": "PATTERN",
+                        "value": "[eE][lL][eE][mM][eE][nN][tT][sS]"
+                      }
+                    }
+                  },
+                  "named": false,
+                  "value": "ELEMENTS"
+                }
+              ]
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "_binding_s"
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "ALIAS",
+              "content": {
+                "type": "TOKEN",
+                "content": {
+                  "type": "PREC",
+                  "value": 1,
+                  "content": {
+                    "type": "PATTERN",
+                    "value": "[dD][iI][fF][fF][eE][rR][eE][nN][tT]"
+                  }
+                }
+              },
+              "named": false,
+              "value": "DIFFERENT"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "TOKEN",
+                    "content": {
+                      "type": "PREC",
+                      "value": 1,
+                      "content": {
+                        "type": "PATTERN",
+                        "value": "[eE][dD][gG][eE]"
+                      }
+                    }
+                  },
+                  "named": false,
+                  "value": "EDGE"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "TOKEN",
+                    "content": {
+                      "type": "PREC",
+                      "value": 1,
+                      "content": {
+                        "type": "PATTERN",
+                        "value": "[eE][dD][gG][eE][sS]"
+                      }
+                    }
+                  },
+                  "named": false,
+                  "value": "EDGES"
+                }
+              ]
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "_binding_s"
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "_binding_s": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "TOKEN",
+            "content": {
+              "type": "PREC",
+              "value": 1,
+              "content": {
+                "type": "PATTERN",
+                "value": "[bB][iI][nN][dD][iI][nN][gG]"
+              }
+            }
+          },
+          "named": false,
+          "value": "BINDING"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "TOKEN",
+            "content": {
+              "type": "PREC",
+              "value": 1,
+              "content": {
+                "type": "PATTERN",
+                "value": "[bB][iI][nN][dD][iI][nN][gG][sS]"
+              }
+            }
+          },
+          "named": false,
+          "value": "BINDINGS"
         }
       ]
     },
@@ -3249,6 +3443,18 @@
                 },
                 "named": false,
                 "value": "MATCH"
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
+          },
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "match_mode"
               },
               {
                 "type": "BLANK"

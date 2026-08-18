@@ -197,7 +197,20 @@ null_ordering   = "NULLS" , ( "FIRST" | "LAST" ) ;
 
 (* Patterns. *)
 
-pattern         = path , { "," , path } , [ keep_clause ] ;
+pattern         = [ match_mode ] , path , { "," , path } , [ keep_clause ] ;
+match_mode      = "REPEATABLE" , ( "ELEMENT" | "ELEMENTS" ) , [ binding_s ]
+                | "DIFFERENT" , ( "EDGE" | "EDGES" ) , [ binding_s ] ;
+binding_s       = "BINDING" | "BINDINGS" ;
+(* ISO 16.9, features G002 and G003. A match mode speaks about the whole
+   list where a path mode speaks about one path of it. DIFFERENT EDGES is
+   what a list that names none means, and it says two things at once: a
+   pattern that named no path mode walks a TRAIL, and no one edge answers
+   two of the edge patterns of the list. REPEATABLE ELEMENTS lifts both.
+   The singular noun and the BINDINGS behind it are spellings of the same
+   mode and say nothing more. The mode belongs to the list rather than to
+   the match statement block, so two patterns of one statement may not
+   take the same edge where two patterns of two statements of a block
+   may. *)
 keep_clause     = "KEEP" , path_prefix ;
 (* ISO 16.9, features G006 and G007. A KEEP says a prefix once for the
    whole list rather than once in front of each pattern of it, and what

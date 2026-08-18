@@ -1,6 +1,6 @@
 schema = 1
 doc = "The words of zuQL, grouped by what they are, for the three things that colour them."
-audited = "2026-08-18"
+audited = "2026-08-19"
 
 # One list of words, three consumers. The shell scans a statement as it
 # is typed and colours the words it recognises, the tree-sitter grammar
@@ -57,8 +57,8 @@ words = ["DISTINCT", "AS", "GROUP", "ORDER", "BY", "ASC", "ASCENDING", "DESC", "
 
 [[group]]
 kind = "keyword"
-doc = "Patterns: the selectors, the modes, the KEEP that says one of them for a whole list of patterns, and the words a path may carry. PATHS and GROUPS are the plurals a selector may be written with, PATH being a word already as the type and the constructor, and GROUP being one as the grouping clause."
-words = ["ALL", "ANY", "SHORTEST", "PATHS", "GROUPS", "KEEP", "WALK", "TRAIL", "ACYCLIC", "SIMPLE"]
+doc = "Patterns: the selectors, the path modes, the match modes, the KEEP that says one selector for a whole list of patterns, and the words a path may carry. PATHS and GROUPS are the plurals a selector may be written with, PATH being a word already as the type and the constructor, and GROUP being one as the grouping clause. A match mode is written REPEATABLE ELEMENTS or DIFFERENT EDGES, either of them with the singular noun and either of them with BINDINGS behind it, and EDGE, ELEMENTS and BINDING are words already elsewhere."
+words = ["ALL", "ANY", "SHORTEST", "PATHS", "GROUPS", "KEEP", "WALK", "TRAIL", "ACYCLIC", "SIMPLE", "REPEATABLE", "ELEMENT", "DIFFERENT", "EDGES", "BINDINGS"]
 
 [[group]]
 kind = "keyword"

@@ -37,6 +37,11 @@
   "TRAIL"
   "ACYCLIC"
   "SIMPLE"
+  "REPEATABLE"
+  "ELEMENT"
+  "DIFFERENT"
+  "EDGES"
+  "BINDINGS"
   "AND"
   "OR"
   "XOR"
@@ -86,6 +91,11 @@
   "TRUE"
   "FALSE"
 ] @constant.builtin
+
+; functions
+[
+  "ELEMENTS"
+] @function.builtin
 
 ; The rest is the shape of the tree rather than a list of words. A name is a
 ; type where a type stands and a variable where a value does, which is the

@@ -1377,6 +1377,81 @@ struct StrChunk {
     ends: Vec<u64>,
 }
 
+/// The cell writes a commit made that no fold has sealed into the
+/// columns yet, for the lane columns of one table.
+///
+/// A commit used to fold because a reader read the sealed file and
+/// nothing else, so a change that was not folded was a change the next
+/// `MATCH` could not see. Rewriting a column to change one cell of it
+/// is most of what a point write cost. A reader holding one of these
+/// reads the column as it stands and puts the newer words over the
+/// rows the patch names, which is what lets the fold wait for the
+/// checkpoint.
+///
+/// Lane columns and no nulls, which is the write whose new value is a
+/// word that goes straight over the word the column holds. A commit
+/// that writes a string or takes a value away folds the way it always
+/// did, and that is what keeps the blob side, the validity masks and
+/// the label bitset out of here.
+#[derive(Debug, Default, Clone)]
+pub struct LanePatch {
+    /// Row and new word, ascending by row, for each column the commit
+    /// wrote into. Ascending because a reader asks about a chunk at a
+    /// time and a run of rows sharing one is then a subslice.
+    cols: BTreeMap<usize, Vec<(u64, u64)>>,
+}
+
+impl LanePatch {
+    pub fn new(cols: BTreeMap<usize, Vec<(u64, u64)>>) -> Self {
+        Self { cols }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cols.values().all(|rows| rows.is_empty())
+    }
+
+    /// How many cells this holds, which is what a writer bounds when it
+    /// decides whether to keep deferring the fold.
+    pub fn cells(&self) -> usize {
+        self.cols.values().map(Vec::len).sum()
+    }
+
+    fn of(&self, col: usize) -> &[(u64, u64)] {
+        self.cols.get(&col).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// The entries for rows `lo..hi`, which is a subslice because the
+    /// rows are in order.
+    fn span(&self, col: usize, lo: u64, hi: u64) -> &[(u64, u64)] {
+        let rows = self.of(col);
+        let from = rows.partition_point(|&(row, _)| row < lo);
+        let to = rows.partition_point(|&(row, _)| row < hi);
+        &rows[from..to]
+    }
+
+    fn get(&self, col: usize, row: u64) -> Option<u64> {
+        let rows = self.of(col);
+        let at = rows.partition_point(|&(r, _)| r < row);
+        rows.get(at).filter(|&&(r, _)| r == row).map(|&(_, v)| v)
+    }
+
+    /// `bounds` widened over whatever this holds for rows `lo..hi`.
+    ///
+    /// A zone is there to be skipped past, so it has to hold every
+    /// value the reader can see. The word a patched row used to carry
+    /// is still inside the stored bounds and the reader never returns
+    /// it, so widening is all this owes: a bound that is too wide costs
+    /// a chunk read and a bound that is too narrow loses a row.
+    fn widen(&self, col: usize, lo: u64, hi: u64, bounds: (u64, u64)) -> (u64, u64) {
+        let (mut min, mut max) = bounds;
+        for &(_, value) in self.span(col, lo, hi) {
+            min = min.min(value);
+            max = max.max(value);
+        }
+        (min, max)
+    }
+}
+
 /// Point reads over one table's property columns, keeping decoded
 /// chunks between reads the way the key reader does: integer columns
 /// through the segment chunk cache, string columns as the last decoded
@@ -1397,6 +1472,9 @@ pub struct PropsReader {
     label_state: Option<(Arc<ChunkDirectory>, ChunkCache)>,
     /// Row order scratch for the gathers, reused across calls.
     order_scratch: Vec<u32>,
+    /// Committed words the columns below do not hold yet. Shared,
+    /// because a query hands the same patch to every worker it forks.
+    patch: Option<Arc<LanePatch>>,
 }
 
 impl PropsReader {
@@ -1408,7 +1486,14 @@ impl PropsReader {
             valid_state: BTreeMap::new(),
             label_state: None,
             order_scratch: Vec::new(),
+            patch: None,
         }
+    }
+
+    /// Hands this reader the committed words its columns do not hold
+    /// yet, or takes them away when a fold has sealed them.
+    pub fn set_patch(&mut self, patch: Option<Arc<LanePatch>>) {
+        self.patch = patch.filter(|p| !p.is_empty());
     }
 
     /// Whether row `row` of `col` holds a value.
@@ -1489,7 +1574,33 @@ impl PropsReader {
     ) -> Result<Option<(u64, u64)>> {
         let dir = self.int_dir(db, col)?;
         let meta = &self.directory.columns[col].meta;
-        Ok(chunk_zone(meta, &dir, chunk))
+        let Some(bounds) = chunk_zone(meta, &dir, chunk) else {
+            return Ok(None);
+        };
+        let Some(patch) = &self.patch else {
+            return Ok(Some(bounds));
+        };
+        let lo = (chunk * CHUNK_ROWS) as u64;
+        Ok(Some(patch.widen(col, lo, lo + CHUNK_ROWS as u64, bounds)))
+    }
+
+    /// The value bounds of the whole of `col`, which is what says
+    /// whether a scan has to look at the column at all. `None` for an
+    /// empty column, which bounds nothing.
+    ///
+    /// This is [`Self::meta`] with the unsealed words folded in, and
+    /// the reason to ask it rather than read the bounds off the meta is
+    /// that a write the columns do not hold yet can sit outside them.
+    pub fn zone(&self, col: usize) -> Option<(u64, u64)> {
+        let meta = &self.directory.columns[col].meta;
+        if meta.value_count == 0 {
+            return None;
+        }
+        let bounds = (meta.min, meta.max);
+        Some(match &self.patch {
+            Some(patch) => patch.widen(col, 0, u64::MAX, bounds),
+            None => bounds,
+        })
     }
 
     /// The chunk directory of an integer column, loaded through the
@@ -1521,7 +1632,14 @@ impl PropsReader {
         }
         let dir = self.int_dir(db, col)?;
         let meta = &self.directory.columns[col].meta;
-        decode_chunk(db, meta, &dir, chunk, out)
+        decode_chunk(db, meta, &dir, chunk, out)?;
+        if let Some(patch) = &self.patch {
+            let base = (chunk * CHUNK_ROWS) as u64;
+            for &(row, value) in patch.span(col, base, base + out.len() as u64) {
+                out[(row - base) as usize] = value;
+            }
+        }
+        Ok(())
     }
 
     /// Decodes the whole of an integer column into `out`, chunk after
@@ -1585,7 +1703,11 @@ impl PropsReader {
             slot.insert((dir, ChunkCache::default()));
         }
         let (dir, cache) = self.int_state.get_mut(&col).expect("just inserted");
-        read_one_cached(db, meta, dir, cache, row)
+        let value = read_one_cached(db, meta, dir, cache, row)?;
+        Ok(match &self.patch {
+            Some(patch) => patch.get(col, row).unwrap_or(value),
+            None => value,
+        })
     }
 
     /// Gathers `col` for arbitrary `rows`, writing `out[i]` for
@@ -1644,6 +1766,19 @@ impl PropsReader {
                 }
                 out[order[i] as usize] = values[(r % CHUNK_ROWS as u64) as usize];
                 i += 1;
+            }
+        }
+        // The unsealed words go over the gathered ones at the end
+        // rather than inside the walk above, because the walk is sorted
+        // by chunk and this is a lookup per row: doing it here keeps
+        // the whole of it off a column no commit has written into.
+        if let Some(patch) = &self.patch
+            && !patch.of(col).is_empty()
+        {
+            for (at, &row) in rows.iter().enumerate() {
+                if let Some(value) = patch.get(col, row) {
+                    out[at] = value;
+                }
             }
         }
         Ok(())

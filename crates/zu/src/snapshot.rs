@@ -12,6 +12,7 @@
 //! [`Zu1Graph`]: crate::query::Zu1Graph
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zu_common::{FloatBits, IntBits, LogicalType, Result, ZuError};
 use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
@@ -22,6 +23,7 @@ pub use zu_query::snapshot::{
 };
 
 use crate::deleted::Deleted;
+use crate::write::Patches;
 use crate::zu1::algo;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
@@ -102,6 +104,10 @@ pub struct Zu1Snapshot<'a> {
     /// costs a table index decode, so a snapshot that never scans a
     /// node table never pays it.
     gone: Option<Deleted>,
+    /// The cells committed since the last fold, by table, which the
+    /// props readers read through. A fork carries them, so every worker
+    /// of a parallel query reads the same database.
+    patches: Arc<Patches>,
 }
 
 /// What a snapshot learns while it reads, kept in a value of its own
@@ -126,6 +132,25 @@ pub struct SnapshotCache {
     str_bytes: Vec<u8>,
     str_ends: Vec<u64>,
     gone: Option<Deleted>,
+    patches: Arc<Patches>,
+}
+
+impl SnapshotCache {
+    /// Hands the cached readers the cells a commit has left in the
+    /// overlay, and keeps them for the readers a later snapshot loads.
+    ///
+    /// The readers are kept rather than dropped, which is the point: a
+    /// commit that does not fold does not move the columns they
+    /// describe, so the only thing that has changed about them is what
+    /// they read on top.
+    pub fn set_patches(&mut self, patches: Arc<Patches>) {
+        for (table, reader) in &mut self.props {
+            if let Some(reader) = reader {
+                reader.set_patch(patches.get(table).cloned());
+            }
+        }
+        self.patches = patches;
+    }
 }
 
 impl<'a> Zu1Snapshot<'a> {
@@ -144,6 +169,7 @@ impl<'a> Zu1Snapshot<'a> {
             str_bytes: cache.str_bytes,
             str_ends: cache.str_ends,
             gone: cache.gone,
+            patches: cache.patches,
         }
     }
 
@@ -156,6 +182,7 @@ impl<'a> Zu1Snapshot<'a> {
             str_bytes: self.str_bytes,
             str_ends: self.str_ends,
             gone: self.gone,
+            patches: self.patches,
         }
     }
 
@@ -184,7 +211,12 @@ impl<'a> Zu1Snapshot<'a> {
         if self.props.contains_key(&table) {
             return Ok(());
         }
-        let reader = load_props(&mut self.db, table)?.map(PropsReader::new);
+        let patch = self.patches.get(&table).cloned();
+        let reader = load_props(&mut self.db, table)?.map(|directory| {
+            let mut reader = PropsReader::new(directory);
+            reader.set_patch(patch);
+            reader
+        });
         self.props.insert(table, reader);
         Ok(())
     }
@@ -443,8 +475,12 @@ impl Snapshot for Zu1Snapshot<'_> {
         let mut sel = None;
         if let Some(p) = pred {
             let col = check_col(reader, p.col)?;
-            let m = reader.meta(col);
-            if m.value_count > 0 && p.skips(m.min, m.max) {
+            // The zone rather than the stored bounds, because a write
+            // the column does not hold yet can sit outside them and a
+            // skip here is the whole scan.
+            if let Some((min, max)) = reader.zone(col)
+                && p.skips(min, max)
+            {
                 return Ok(None);
             }
             if let Some((lo, hi)) = reader.chunk_bounds(db, col, chunk_ix)?
@@ -754,6 +790,7 @@ impl Snapshot for Zu1Snapshot<'_> {
             // way, so a worker starts with it rather than reading the
             // table index again.
             gone: self.gone.clone(),
+            patches: Arc::clone(&self.patches),
         }))
     }
 }

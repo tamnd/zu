@@ -27,7 +27,7 @@ use zu_query::refs::{BindingTable, GraphHandle};
 use zu_query::row::{Batch, Flow};
 
 use crate::query::{self, NotAQuery, QueryResult, Value, Zu1Graph};
-use crate::write::Writer;
+use crate::write::{Patches, Writer};
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 
@@ -159,6 +159,11 @@ pub struct Session {
     writer: Option<Writer>,
     /// The explicit transaction running here, if a statement opened one.
     txn: Option<Explicit>,
+    /// The cells the writer's committed but unfolded statements wrote,
+    /// as the readers were last given them. Held so that handing them
+    /// over again costs a pointer comparison on a session that only
+    /// reads.
+    patches: Arc<Patches>,
 }
 
 impl Session {
@@ -189,6 +194,7 @@ impl Session {
             },
             writer: None,
             txn: None,
+            patches: Arc::new(Patches::new()),
         })
     }
 
@@ -217,6 +223,7 @@ impl Session {
         if let Some(mut writer) = self.writer.take() {
             writer.fold(self.graph.file_mut())?;
         }
+        self.sync_patches();
         Ok(self.graph.file_mut())
     }
 
@@ -253,6 +260,7 @@ impl Session {
         self.writer = Some(writer);
         let written = written?;
         self.refresh()?;
+        self.sync_patches();
         Ok(written.value)
     }
 
@@ -265,6 +273,7 @@ impl Session {
         if self.writer.is_none() {
             self.writer = Some(Writer::open(self.graph.file_mut())?);
             self.refresh()?;
+            self.sync_patches();
         }
         Ok(())
     }
@@ -409,7 +418,12 @@ impl Session {
         }
         self.writer = None;
         self.graph.file_mut().rollback_savepoint()?;
-        self.refresh()
+        self.refresh()?;
+        // The writer went with the epochs it was holding, and the cells
+        // its unfolded commits wrote went with it, so what the readers
+        // were shown has to go too.
+        self.sync_patches();
+        Ok(())
     }
 
     /// A graph reference value naming one graph in the catalog (GV60),
@@ -1162,6 +1176,28 @@ impl Session {
         Ok(schema)
     }
 
+    /// Passes the writer's unfolded cells to the two read paths, or
+    /// takes back what they were given when a fold has sealed them.
+    ///
+    /// This is what makes a write visible without a fold. The readers
+    /// keep everything they had loaded, which is the saving: the
+    /// columns have not moved, so the plan cache, the catalog and the
+    /// decoded chunks all stay, and the statement pays the log sync and
+    /// nothing else.
+    fn sync_patches(&mut self) {
+        let patches = match &self.writer {
+            Some(writer) => Arc::clone(writer.patches()),
+            None if self.patches.is_empty() => return,
+            None => Arc::new(Patches::new()),
+        };
+        if Arc::ptr_eq(&patches, &self.patches) {
+            return;
+        }
+        self.graph.set_patches(Arc::clone(&patches));
+        self.snap.set_patches(Arc::clone(&patches));
+        self.patches = patches;
+    }
+
     fn refresh(&mut self) -> Result<()> {
         let epoch = self.graph.file().db_header().epoch;
         if epoch == self.epoch {
@@ -1176,6 +1212,10 @@ impl Session {
         // The readers the last epoch's snapshots loaded describe a
         // layout that has moved, so they go with the plans.
         self.snap = crate::snapshot::SnapshotCache::default();
+        // The readers that had the unfolded cells are gone with them,
+        // so the next hand-over starts from nothing rather than being
+        // skipped as already done.
+        self.patches = Arc::new(Patches::new());
         self.epoch = epoch;
         Ok(())
     }

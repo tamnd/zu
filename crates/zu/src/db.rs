@@ -381,7 +381,7 @@ impl Connection {
                 "an appender writes and the connection is read-only".to_string(),
             ));
         }
-        Appender::open(self.session.file_mut(), table)
+        Appender::open(self.session.file_mut()?, table)
     }
 
     /// Whether this connection refuses writes.

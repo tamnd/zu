@@ -3484,6 +3484,14 @@
       "doc": "Swaps in a fresh catalog and drops every cached reader; the\nsession calls this when the header epoch moves, because the\ncached directories and decoded groups describe the old epoch."
     },
     {
+      "id": "zu::query::Zu1Graph::set_patches",
+      "kind": "method",
+      "name": "set_patches",
+      "of": "zu::query::Zu1Graph",
+      "signature": "fn set_patches(&mut self, patches: Arc<Patches>)",
+      "doc": "Hands the readers the cells a commit has left in the overlay,\nwhich the session does after every write that did not fold.\n\nThe readers stay: the columns they describe have not moved, and\nthat is the point of not folding. What changes is what they read\non top of them."
+    },
+    {
       "id": "zu::query::bind",
       "kind": "function",
       "name": "bind",
@@ -4057,6 +4065,14 @@
       "doc": "What a snapshot learns while it reads, kept in a value of its own\nso a caller that opens a snapshot per query can carry it over.\n\nA snapshot is a view of one epoch and is built and dropped around a\nsingle execution, but the table readers behind it are not per query\nat all: loading one reads its directory out of the file, and on a\nsmall graph that load costs more than the query it was opened for.\nThe buffers are here for the same reason, so a scan does not start\nby growing a fresh vector every time.\n\nEverything in here is valid for as long as the epoch it was read at\nis, which is the caller's business: hand it back to\n[`Zu1Snapshot::with_cache`] while the epoch holds and drop it when\nthe epoch moves."
     },
     {
+      "id": "zu::snapshot::SnapshotCache::set_patches",
+      "kind": "method",
+      "name": "set_patches",
+      "of": "zu::snapshot::SnapshotCache",
+      "signature": "fn set_patches(&mut self, patches: Arc<Patches>)",
+      "doc": "Hands the cached readers the cells a commit has left in the\noverlay, and keeps them for the readers a later snapshot loads.\n\nThe readers are kept rather than dropped, which is the point: a\ncommit that does not fold does not move the columns they\ndescribe, so the only thing that has changed about them is what\nthey read on top."
+    },
+    {
       "id": "zu::snapshot::TableId",
       "kind": "type-alias",
       "name": "TableId",
@@ -4174,7 +4190,14 @@
       "id": "zu::write",
       "kind": "module",
       "name": "write",
-      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nEvery commit that changed something folds, and that is worth being\nplain about, because it is not obviously the right cost. A fold\nrewrites the columns the transaction touched, and the overlay\nexists precisely so a reader could see a committed row without one.\nBut [`Zu1Graph`] reads the sealed file and nothing else, so today a\nchange that is not folded is a change the next `MATCH` cannot see,\nand a write nobody can read is not a write. Folding here keeps the\nvisibility contract honest while the read path catches up.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
+      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nMost commits fold, and the ones that do not are worth being plain\nabout. A fold rewrites the columns the transaction touched, and the\noverlay exists precisely so a reader could see a committed row\nwithout one, but [`Zu1Graph`] reads the sealed file and nothing\nelse, so a change that is not folded is a change the next `MATCH`\ncannot see, and a write nobody can read is not a write. So a commit\nfolds unless the read side can be handed what it wrote instead,\nwhich is one shape and only one: a word written onto a column of a\nrow that is already there. Those go into a [`LanePatch`] per table,\nthe readers put them over the words their columns hold, and a fold\nseals them later, at a checkpoint or when the run of them has gone\non long enough. It is worth what it costs to keep narrow, because\nthe fold is not the only thing that goes: it is what moves the\nheader epoch, and moving the epoch is what throws away the session's\nplan cache, its catalog and every decoded chunk it had warm.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
+    },
+    {
+      "id": "zu::write::Patches",
+      "kind": "type-alias",
+      "name": "Patches",
+      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::LanePatch>>",
+      "doc": "The unsealed cells of every table that has any, which is what a\nreader is handed so that it reads a deferred commit."
     },
     {
       "id": "zu::write::Writer",
@@ -4213,6 +4236,14 @@
       "of": "zu::write::Writer",
       "signature": "fn open(db: &mut Zu1File) -> Result<Writer>",
       "doc": "Opens the write side of `db`, replaying whatever the log holds\nabove the file's last checkpoint and sealing it.\n\nThe sealing is what makes a reopen after a crash the same as\nnever having crashed: a crash between a commit and a checkpoint\nleaves committed transactions in the log and not in the file,\nrecovery brings them back as overlays, and an overlay is what no\nreader reads. A session replays the sidecar when it opens, so on\nthat path this usually finds an empty log and folds nothing;\ndoing it here too is what keeps a [`Writer`] correct for a\ncaller that did not come through a session.\n\nA read-only handle is refused here rather than at the first\ncommit, because opening the write side already creates the log,\nand a log beside a database nobody may write to is a file that\nonly ever confuses the next reader."
+    },
+    {
+      "id": "zu::write::Writer::patches",
+      "kind": "method",
+      "name": "patches",
+      "of": "zu::write::Writer",
+      "signature": "fn patches(&self) -> &Arc<Patches>",
+      "doc": "The cells the commits since the last fold wrote, which a reader\nputs over the words its columns hold.\n\nThis is the whole of what a deferred commit hands the read side,\nso a reader that has it reads the same database a fold would\nhave left behind. The `Arc` is the version: it is replaced when\na commit adds to the patch and emptied when a fold seals it, and\na reader that holds the current one is up to date."
     },
     {
       "id": "zu::write::Writer::path",
@@ -6908,6 +6939,34 @@
       "doc": "The same pair for a rel file that names its endpoints by the ids a\nnode file gave its rows rather than by row offsets, which is what a\ndataset of many node tables is written with. Which row of which table\neach id is takes every node file to answer, so the translation is the\nloader's and not the reader's."
     },
     {
+      "id": "zu::zu1::props::LanePatch",
+      "kind": "struct",
+      "name": "LanePatch",
+      "doc": "The cell writes a commit made that no fold has sealed into the\ncolumns yet, for the lane columns of one table.\n\nA commit used to fold because a reader read the sealed file and\nnothing else, so a change that was not folded was a change the next\n`MATCH` could not see. Rewriting a column to change one cell of it\nis most of what a point write cost. A reader holding one of these\nreads the column as it stands and puts the newer words over the\nrows the patch names, which is what lets the fold wait for the\ncheckpoint.\n\nLane columns and no nulls, which is the write whose new value is a\nword that goes straight over the word the column holds. A commit\nthat writes a string or takes a value away folds the way it always\ndid, and that is what keeps the blob side, the validity masks and\nthe label bitset out of here."
+    },
+    {
+      "id": "zu::zu1::props::LanePatch::cells",
+      "kind": "method",
+      "name": "cells",
+      "of": "zu::zu1::props::LanePatch",
+      "signature": "fn cells(&self) -> usize",
+      "doc": "How many cells this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+    },
+    {
+      "id": "zu::zu1::props::LanePatch::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::zu1::props::LanePatch",
+      "signature": "fn is_empty(&self) -> bool"
+    },
+    {
+      "id": "zu::zu1::props::LanePatch::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::zu1::props::LanePatch",
+      "signature": "fn new(cols: BTreeMap<usize, Vec<(u64, u64)>>) -> Self"
+    },
+    {
       "id": "zu::zu1::props::ListElement",
       "kind": "enum",
       "name": "ListElement",
@@ -7365,6 +7424,22 @@
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn scan_str_range(&mut self, db: &mut Zu1File, col: usize, start: u64, end: u64, bytes: &mut Vec<u8>, ends: &mut Vec<u64>) -> Result<()>",
       "doc": "Reads the string values of rows `start..end` of `col`, the scan\nunit for string columns: values concatenated in `bytes`, row\n`i - start` ending at `ends[i - start]`."
+    },
+    {
+      "id": "zu::zu1::props::PropsReader::set_patch",
+      "kind": "method",
+      "name": "set_patch",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn set_patch(&mut self, patch: Option<Arc<LanePatch>>)",
+      "doc": "Hands this reader the committed words its columns do not hold\nyet, or takes them away when a fold has sealed them."
+    },
+    {
+      "id": "zu::zu1::props::PropsReader::zone",
+      "kind": "method",
+      "name": "zone",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn zone(&self, col: usize) -> Option<(u64, u64)>",
+      "doc": "The value bounds of the whole of `col`, which is what says\nwhether a scan has to look at the column at all. `None` for an\nempty column, which bounds nothing.\n\nThis is [`Self::meta`] with the unsealed words folded in, and\nthe reason to ask it rather than read the bounds off the meta is\nthat a write the columns do not hold yet can sit outside them."
     },
     {
       "id": "zu::zu1::props::list_elements",
@@ -8076,6 +8151,13 @@
       "signature": "Nodes { cols: Vec<zu_zu1::wal::WalColumn>, rows: u64 }"
     },
     {
+      "id": "zu::zu1::txn::LaneWrite",
+      "kind": "type-alias",
+      "name": "LaneWrite",
+      "signature": "(u32, u64, u32, u64)",
+      "doc": "One integer write onto an existing row: table, row offset, column\nposition in the props directory, and the word."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc",
       "kind": "struct",
       "name": "Mvcc",
@@ -8218,6 +8300,14 @@
       "doc": "What `table` has had put on its rows' labels and taken off them\nby `epoch`, keyed by offset: one pair of masks per row, the bits\nto set and the bits to clear.\n\nA row's chain is composed rather than read at its end, because\ntwo statements can change two labels of one row and both have to\nland. Composing keeps the two masks disjoint, so the fold can\nwrite `(word | add) & !remove` and get the same answer whichever\norder it applies them in."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::lane_only",
+      "kind": "method",
+      "name": "lane_only",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn lane_only(&self) -> bool",
+      "doc": "Whether everything this store holds is an integer write onto an\nexisting row, which is the shape a reader can be shown without a\nfold sealing it first."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc::neighbors",
       "kind": "method",
       "name": "neighbors",
@@ -8272,6 +8362,14 @@
       "of": "zu::zu1::txn::Mvcc",
       "signature": "fn tables_touched(&self) -> Vec<u32>",
       "doc": "Node tables holding any overlay state, sorted so a fold walks\nthem deterministically."
+    },
+    {
+      "id": "zu::zu1::txn::Mvcc::take_lanes",
+      "kind": "method",
+      "name": "take_lanes",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn take_lanes(&mut self) -> Vec<LaneWrite>",
+      "doc": "The integer writes the last commit published, in statement\norder. Empty when that commit was of any other shape, and empty\nagain once it has been read."
     },
     {
       "id": "zu::zu1::txn::Mvcc::tombstones",

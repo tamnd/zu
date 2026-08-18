@@ -150,6 +150,9 @@ A statement naming a parameter nobody bound raises `42002`, which is a case like
 | `stored` | Values put in through a client's own loader and read back out through a query, so the value crosses the boundary twice and by two different mechanisms. |
 | `graph` | The shape a load puts into the store, read back by walking it: direction, a row nothing points at, and a row that points at itself. |
 | `param` | Values handed to a statement rather than written in it, which is the client's own encoder rather than its decoder: every type through a binding, the positions a statement takes one in, and the rules about names. |
+| `pattern` | What a pattern selects: labels and inline properties, direction, an undirected walk, a quantified one, a subquery that only asks whether something exists, and the rows an optional match keeps. |
+| `result` | The shape of an answer rather than the values in it: what a column is named, how many rows come back, what paging and DISTINCT do to them, and where a grouping puts its boundary. |
+| `error` | The condition a statement raises, which is part of its answer rather than a message about it, so two engines that both refuse a statement can be compared on why they refused it. |
 
 A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. The suites that store a value first do it through `load:` rather than through a statement, because the v0 core does not implement `CREATE` yet. The few cases that write through a statement instead are the ones asking what a bound value looks like after a round trip through the store, and they declare their table the only way a statement can, which is a bare `INSERT` in `setup:` with the properties the case is about.
 
@@ -183,7 +186,7 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 `DECIMAL`, `BYTES`, `NODE`, `EDGE`, and `PATH` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
 
-The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 989 values counting the ones inside lists, and both print them the same way.
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1367 values counting the ones inside lists, and both print them the same way.
 
 ## What the Rust runner does not check
 
@@ -201,4 +204,4 @@ The reason is the reason the TOML reader gives: a construct silently reinterpret
 
 Comments are found by the one rule that matters to a case writer: a `#` starts a comment only with whitespace before it, and a quote hides a `#` only if it opens after whitespace and closes on the same line. That last clause is what lets a `query:` hold `cast('  42  ' AS INT64)`, whose closing quote has a space before it and so looks like an opening one. A quote that opens nothing that closes was not a run.
 
-There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 15 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.
+There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 18 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.

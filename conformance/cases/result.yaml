@@ -1,0 +1,1494 @@
+schema: 3
+suite: result
+doc: The shape of an answer rather than the values in it: which columns come back, what they are called, in what order they stand, and how many rows there are. A client that decodes values perfectly can still hand back the wrong result if it sorts the columns, drops a repeated name, or counts a paged result before the page was taken, and none of that shows up in a suite that checks one value at a time. Every multi-row case here is ordered by something, because a result whose order the statement does not fix is not a thing a case can assert.
+
+load:
+  nodes: person
+  edges: knows
+  count: 4
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+        - di
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+        - "40"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+
+cases:
+  - name: an-alias-names-the-column
+    doc: The plainest fact about a result, which everything else here is written against.
+    query: RETURN 1 AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: no-alias-leaves-the-source-text
+    doc: A projection with no AS is named by the text that produced it, spaces and all, so a client cannot invent a name of its own and cannot leave the column unnamed.
+    query: RETURN 1 + 1
+    columns:
+      - 1 + 1
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-property-with-no-alias-keeps-the-dot
+    doc: The same rule over a property, which is the shape most clients meet first and the one whose name contains a character a host language would not allow in an identifier.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n.name
+    columns:
+      - n.name
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+
+  - name: columns-keep-the-order-they-were-written-in
+    doc: The order is the statement's and not the alphabet's, which is the one thing a client that hands back a map instead of a sequence gets wrong.
+    query: RETURN 1 AS b, 2 AS a
+    columns:
+      - b
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "2"
+
+  - name: the-same-name-twice
+    doc: Two columns may share a name, so a result is a sequence of columns and not a map from names to values, and a client that builds a dictionary loses one of these.
+    query: RETURN 1 AS a, 2 AS a
+    columns:
+      - a
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "2"
+
+  - name: a-name-keeps-its-case
+    doc: Column names are compared exactly, so a client that lowercases them to be helpful has changed the answer.
+    query: RETURN 1 AS Ab
+    columns:
+      - Ab
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-name-in-backticks
+    doc: A quoted name may hold a space, which is a name no host language has an identifier for and which still has to arrive unchanged.
+    query: RETURN 1 AS `a b`
+    columns:
+      - a b
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-name-with-digits-and-an-underscore
+    doc: The ordinary shape of a generated name, pinned so that a client's name validator does not refuse one the engine allows.
+    query: RETURN 1 AS a_1
+    columns:
+      - a_1
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: three-columns
+    doc: More than two, because a client that pairs the columns with the values by zipping two sequences of different lengths fails here and not above.
+    query: RETURN 1 AS a, 2 AS b, 3 AS c
+    columns:
+      - a
+      - b
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "3"
+
+  - name: an-alias-may-shadow-the-variable-it-reads
+    doc: The name a projection gives is not the name it read, so one that reuses the other's spelling is still a projection and not a loop.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n.age AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+
+  - name: a-name-from-with-reaches-the-projection
+    doc: WITH names a value for the clauses after it, and the name it gives is the one the result carries unless the projection renames it again.
+    query: MATCH (n:person) WHERE n.name = 'ann' WITH n.age AS years RETURN years
+    columns:
+      - years
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+
+  - name: an-aggregate-with-no-alias
+    doc: A call is source text like any other expression, so the column it makes is named after the call as written, brackets included.
+    query: MATCH (n:person) RETURN count(*)
+    columns:
+      - count(*)
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-column-that-is-a-literal-null
+    doc: A column whose every value is null is still a column, and a client that drops empty columns hands back a result of the wrong width.
+    query: RETURN null AS a, 1 AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: NULL
+          - type: INT64
+            value: "1"
+
+  - name: one-row-with-no-match
+    doc: A projection with nothing to read from still produces a row, which is where the count of rows and the count of matches part company.
+    query: RETURN 1 AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-row-for-every-node
+    doc: The load put four rows in and a match over the label finds four, which is the count every case below is measured against.
+    query: MATCH (n:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: no-rows-from-a-label-nothing-carries
+    doc: A pattern that matches nothing gives no rows and not a null row, and the columns are still there, which is what a client needs to render an empty table.
+    query: MATCH (n:nothing) RETURN n.name AS a
+    columns:
+      - a
+    rows:
+
+  - name: no-rows-from-a-predicate-that-holds-for-nothing
+    doc: The same empty result reached through WHERE rather than through the pattern, since the two are different stages and a client may page them differently.
+    query: MATCH (n:person) WHERE false RETURN n.name AS a
+    columns:
+      - a
+    rows:
+
+  - name: an-aggregate-over-nothing-still-answers
+    doc: Counting nothing is zero and zero is a row, which is the case a client that returns an empty result for an empty match gets wrong.
+    query: MATCH (n:nothing) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: an-aggregate-with-a-key-over-nothing-answers-nothing
+    doc: A grouped aggregate has one row per group and nothing has no groups, which is the other half of the rule above and points the opposite way.
+    query: MATCH (n:nothing) RETURN n.age AS a, count(*) AS b
+    columns:
+      - a
+      - b
+    rows:
+
+  - name: a-group-for-every-distinct-key
+    doc: Two of the four rows share an age, so grouping by age gives three rows and not four, and the counts inside them add up to the ungrouped count.
+    query: MATCH (n:person) RETURN n.age AS a, count(*) AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "40"
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "50"
+          - type: INT64
+            value: "1"
+
+  - name: unwinding-nothing-gives-no-rows
+    doc: An empty list produces no rows rather than one row holding a null, which is the difference between a list a client sent empty and a list it did not send.
+    query: UNWIND [] AS n RETURN n AS a
+    columns:
+      - a
+    rows:
+
+  - name: unwinding-a-null-gives-a-row
+    doc: A list of one null is a list of one, so the row exists and the value in it is null, which is the case the rule above is most often confused with.
+    query: UNWIND [null] AS n RETURN n AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: NULL
+
+  - name: unwinding-keeps-the-order-of-the-list
+    doc: A list is ordered and the rows it unwinds into are in that order, which is what lets every other suite here write UNWIND without an ORDER BY after it.
+    query: UNWIND [3, 1, 2] AS n RETURN n AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: two-unwinds-multiply
+    doc: Two lists of two give four rows, which is the cardinality rule for stacked clauses and the reason a client cannot stream one of them lazily and forget the other.
+    query: UNWIND [1, 2] AS n UNWIND [10, 20] AS m RETURN n AS a, m AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "10"
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "20"
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "10"
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "20"
+
+  - name: two-patterns-multiply
+    doc: Two patterns with nothing joining them are a cross product, so four nodes against four nodes are sixteen rows, and a client that expected a join has to see the number.
+    query: MATCH (a:person), (b:person) RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "16"
+
+  - name: a-row-for-every-edge
+    doc: The load put two pairs in, so the pattern that walks one edge gives two rows, and the ends are the ones the pairs named.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS x, b.name AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+
+  - name: a-row-for-every-two-hop-walk
+    doc: One walk of two edges exists in this graph, which is the cardinality of a joined pattern rather than of a product.
+    query: MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) RETURN a.name AS x, c.name AS y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+
+  - name: an-edge-read-backwards
+    doc: The arrow pointing the other way finds the same two edges from the other end, and a client that stores only one direction gives no rows here.
+    query: MATCH (a:person)<-[:knows]-(b:person) RETURN a.name AS x, b.name AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: cy
+          - type: STRING
+            value: bo
+
+  - name: an-edge-read-either-way
+    doc: A pattern with no arrowhead walks an edge in both directions, so each of the two edges answers twice and the count is four.
+    query: MATCH (a:person)-[:knows]-(b:person) RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: an-optional-match-keeps-the-row
+    doc: A node nothing points at keeps its row and the columns the optional half would have filled are null, which is the whole point of the clause and the case a client implementing it as a filter fails.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN n.name AS a, m.name AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: cy
+          - type: NULL
+      - values:
+          - type: STRING
+            value: di
+          - type: NULL
+
+  - name: a-predicate-over-a-property
+    doc: The ordinary filter, which halves the rows and is here so that the paging cases below have something whose count is not the whole table.
+    query: MATCH (n:person) WHERE n.age > 35 RETURN n.name AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-predicate-that-holds-for-everything
+    doc: A predicate that is true keeps every row, which is the boundary the empty one above is measured against.
+    query: MATCH (n:person) WHERE true RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-predicate-that-is-null-keeps-nothing
+    doc: An unknown is not a truth, so a row a predicate answers null for is dropped exactly like one it answers false for, and the two are told apart nowhere in a result.
+    query: MATCH (n:person) WHERE null RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-limit-takes-the-first-rows
+    doc: Paging is applied after the order, so the row a limit keeps is the first in the order the statement wrote and not the first the engine happened to produce.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a LIMIT 1
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+
+  - name: a-limit-of-zero-takes-nothing
+    doc: Zero is a page size and not a missing one, so the result is empty and the columns are still there.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a LIMIT 0
+    columns:
+      - a
+    rows:
+
+  - name: a-limit-past-the-end-takes-everything
+    doc: A page larger than the result is not an error and not a shorter page, which is what a client asking for a thousand rows relies on.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a LIMIT 100
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-skip-of-zero-takes-everything
+    doc: The other end of the same page, where zero means no rows are skipped rather than none are kept.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a SKIP 0 LIMIT 1
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+
+  - name: a-skip-drops-the-first-rows
+    doc: A skip past the first row is what the second page of any client's paged read looks like.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a SKIP 2
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-skip-past-the-end-leaves-nothing
+    doc: Skipping more rows than there are is an empty result rather than a condition, which is how a client knows it has reached the last page.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a SKIP 100
+    columns:
+      - a
+    rows:
+
+  - name: a-skip-and-a-limit-together
+    doc: The skip is taken first and the limit counts from what is left, which is the arithmetic every pager depends on and the one an engine can get backwards.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a SKIP 1 LIMIT 2
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-page-of-the-last-row
+    doc: A page that ends exactly at the end, which is the off by one a pager makes when it compares the count it took with the count it asked for.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a SKIP 3 LIMIT 1
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-page-that-runs-off-the-end
+    doc: A page asking for more than is left gives what is left, and the count is smaller than the limit without that being a condition.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a SKIP 3 LIMIT 10
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: di
+
+  - name: paging-a-descending-order
+    doc: The order is applied before the page in either direction, so the first row of a descending page is the largest and not the smallest.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY a DESC LIMIT 2
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: di
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: paging-an-aggregate
+    doc: A limit over grouped rows counts groups and not the rows they came from, which is the number a client showing a summary page needs.
+    query: MATCH (n:person) RETURN n.age AS a, count(*) AS b ORDER BY a LIMIT 2
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "40"
+          - type: INT64
+            value: "2"
+
+  - name: paging-an-unwound-list
+    doc: A page over rows that never touched the store, so a client cannot answer this one by pushing the page into an index.
+    query: UNWIND [1, 2, 3, 4] AS n RETURN n AS a SKIP 1 LIMIT 2
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: distinct-collapses-repeats
+    doc: The plain deduplication, over a list rather than the store so that the input order is written in the statement.
+    query: UNWIND [1, 1, 2] AS n RETURN DISTINCT n AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: distinct-compares-whole-rows
+    doc: Two columns and one of them repeating, which is the case a client that deduplicates the first column only gets wrong.
+    query: UNWIND [1, 1, 2] AS n RETURN DISTINCT n AS a, 0 AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "0"
+      - values:
+          - type: INT64
+            value: "2"
+          - type: INT64
+            value: "0"
+
+  - name: distinct-keeps-one-null
+    doc: Two nulls are the same row for deduplication even though a null is not equal to a null, which is the one place the two rules disagree and a client has to follow the row rule.
+    query: UNWIND [null, null, 1] AS n RETURN DISTINCT n AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: NULL
+
+  - name: distinct-over-values-of-two-types
+    doc: An integer and a float of the same value are one row, because deduplication follows the ordering and the ordering does not separate them.
+    query: UNWIND [1, 1.0] AS n RETURN DISTINCT n AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: distinct-over-lists
+    doc: A list is a value like any other, so two equal lists deduplicate and a client comparing them by identity keeps both.
+    query: UNWIND [[1, 2], [1, 2], [1]] AS n RETURN DISTINCT n AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+
+  - name: distinct-over-the-store
+    doc: Two people of the same age, deduplicated to one row, which is the same rule reaching values that came out of a column.
+    query: MATCH (n:person) RETURN DISTINCT n.age AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+      - values:
+          - type: INT64
+            value: "40"
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: distinct-then-counted
+    doc: The count of the deduplicated rows, which is the number a client reports as the size of a facet and is not the count of the rows underneath.
+    query: MATCH (n:person) WITH DISTINCT n.age AS a RETURN count(*) AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: distinct-with-a-page
+    doc: The page is taken after the deduplication, so a client that pages first and deduplicates afterwards returns fewer rows than it was asked for.
+    query: UNWIND [1, 1, 2, 3] AS n RETURN DISTINCT n AS a ORDER BY a LIMIT 2
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: with-renames-a-value
+    doc: WITH is the pipe between one part of a statement and the next, and the name it gives is the only one the next part can use.
+    query: MATCH (n:person) WHERE n.name = 'ann' WITH n.age AS a RETURN a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+
+  - name: with-filters-what-it-passes-on
+    doc: A WHERE after a WITH reads the names the WITH made, which is how a filter over an expression that is not a property is written.
+    query: MATCH (n:person) WITH n.age AS a WHERE a > 35 RETURN a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "40"
+      - values:
+          - type: INT64
+            value: "40"
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: with-filters-an-aggregate
+    doc: A predicate over a value the aggregate produced, which is the clause a client would write as HAVING elsewhere and which is a plain WHERE here.
+    query: MATCH (n:person) WITH n.age AS a, count(*) AS b WHERE b > 1 RETURN a, b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "40"
+          - type: INT64
+            value: "2"
+
+  - name: two-withs-in-a-row
+    doc: Three stages in one statement, so a client that keeps one scope for the whole statement rather than one per stage answers the wrong name here.
+    query: MATCH (n:person) WITH n.age AS a WITH a + 1 AS b WHERE b > 41 RETURN b ORDER BY b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "51"
+
+  - name: with-orders-and-pages-before-the-projection
+    doc: A page inside a WITH is taken where it is written, so the rows the projection sees are already the page and the order after it is free to differ.
+    query: MATCH (n:person) WITH n.name AS a ORDER BY a LIMIT 2 RETURN a ORDER BY a DESC
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: ann
+
+  - name: with-after-an-unwind
+    doc: The pipe over rows a list made rather than rows the store made, which is the same stage boundary reached from the other side.
+    query: UNWIND [1, 2, 3] AS n WITH n AS a WHERE a > 1 RETURN a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: an-unwind-after-a-match
+    doc: A list expanded once per matched row, which multiplies the two counts and is how a client fans a row out over its own list.
+    query: MATCH (n:person) WHERE n.age = 40 UNWIND [1, 2] AS m RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: an-aggregate-over-a-with
+    doc: An aggregate reading a name a WITH made, which is the ordinary shape of a two stage summary.
+    query: MATCH (n:person) WITH n.age AS a RETURN sum(a) AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "160"
+
+  - name: a-projection-of-an-expression
+    doc: A column that is not a property and not a literal, which is the third kind and the one whose name is the source text when it has no alias.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n.age * 2 AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "60"
+
+  - name: a-projection-of-a-list
+    doc: A list built in the projection, which is a value of the row like any other and arrives as one column and not as several.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN [n.name, 'x'] AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: STRING
+                value: ann
+              - type: STRING
+                value: x
+
+  - name: a-column-of-nulls-from-a-property-that-is-not-set
+    doc: A property no row carries a value for reads as null for every row, which a client has to tell apart from a missing column.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN n.name AS a, null AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: NULL
+
+  - name: order-by-a-column-the-projection-does-not-return
+    doc: A sort key that is not projected, which is what a client that sorts the rows it received cannot do and the engine can.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY n.age, n.name
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: order-by-two-keys
+    doc: A second key that decides the ties the first one leaves, which is the case that says the sort is stable in the way the statement asked for rather than in the way the engine happened to read.
+    query: MATCH (n:person) RETURN n.name AS a, n.age AS b ORDER BY b DESC, a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+          - type: INT64
+            value: "50"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "40"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "40"
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "30"
+
+  - name: order-by-an-alias
+    doc: A sort key written as the name the projection gave, which is the spelling a client reads most often and reaches the same rows as sorting by the expression.
+    query: MATCH (n:person) RETURN n.age AS years ORDER BY years DESC LIMIT 1
+    columns:
+      - years
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: order-by-an-expression
+    doc: A key that is computed and projected nowhere, which is the shape of a sort by a derived score.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY n.age * -1, n.name LIMIT 1
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: order-by-a-boolean
+    doc: A sort whose key is a predicate, which puts the rows that fail it first because false sorts before true.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY n.age > 35, n.name
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: order-by-a-column-that-holds-a-null
+    doc: A column an optional match padded, sorted, where the nulls go last and a client sorting it in a host language puts them first.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN m.name AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: NULL
+      - values:
+          - type: NULL
+
+  - name: order-by-a-column-that-holds-a-null-descending
+    doc: The same column the other way round, where the nulls stay last because they are placed by a rule rather than by being the largest value, so the first row is the largest name.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN m.name AS a ORDER BY a DESC LIMIT 1
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-page-that-lands-on-a-null
+    doc: A page whose last row is the padded one, which is where a client that drops nulls while paging returns a short page.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN m.name AS a ORDER BY a SKIP 3
+    columns:
+      - a
+    rows:
+      - values:
+          - type: NULL
+
+  - name: a-total-over-the-store
+    doc: A sum of a column, which is one row from four and is the shape of every summary a client shows above a table.
+    query: MATCH (n:person) RETURN sum(n.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "160"
+
+  - name: an-average-over-the-store
+    doc: An average of whole numbers that comes out whole, which is a float all the same, because the type of a column cannot depend on the values in it.
+    query: MATCH (n:person) RETURN avg(n.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "40.0"
+
+  - name: the-smallest-and-the-largest
+    doc: Two set functions in one row, which is one pass over the rows and two columns out of it.
+    query: MATCH (n:person) RETURN min(n.age) AS a, max(n.age) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "50"
+
+  - name: the-smallest-and-the-largest-string
+    doc: The same pair over text, which orders by the string ordering and not by length or by any host locale.
+    query: MATCH (n:person) RETURN min(n.name) AS a, max(n.name) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: di
+
+  - name: a-count-of-distinct-values
+    doc: The number of values a column holds rather than the number of rows, which differs here because two people share an age.
+    query: MATCH (n:person) RETURN count(DISTINCT n.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-sum-of-an-expression
+    doc: A set function over something computed per row, which says the expression runs before the aggregate and not after it.
+    query: MATCH (n:person) RETURN sum(n.age * 2) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "320"
+
+  - name: a-total-over-nothing-is-zero
+    doc: A sum of no rows is zero, which is the choice the case below differs from, so a client that has one empty answer for every set function gets one of the two wrong.
+    query: MATCH (n:nothing) RETURN sum(n.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-smallest-over-nothing-is-null
+    doc: The same empty answer from a function that has no natural zero at all.
+    query: MATCH (n:nothing) RETURN min(n.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: NULL
+
+  - name: a-collection-over-nothing-is-empty
+    doc: Collecting no rows gives a list of nothing and not a null, which is the one set function whose empty answer is a value.
+    query: MATCH (n:nothing) RETURN collect(n.name) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+
+  - name: a-collection-in-a-known-order
+    doc: A list of every name, ordered by the stage before the projection, which is how a client asks for a collection whose order it can rely on.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN collect(n.name) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: STRING
+                value: ann
+              - type: STRING
+                value: bo
+              - type: STRING
+                value: cy
+              - type: STRING
+                value: di
+
+  - name: a-collection-unwound-again
+    doc: A list collected and then expanded, which is a round trip through a value and gives back the row count it started with.
+    query: MATCH (n:person) WITH collect(n.name) AS c UNWIND c AS x RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-collection-per-group
+    doc: One list per group, which is the shape behind every grouped list a client renders and is where the order inside the list comes from the stage before.
+    query: MATCH (n:person) WITH n ORDER BY n.name RETURN n.age AS a, collect(n.name) AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: LIST
+            value:
+              - type: STRING
+                value: ann
+      - values:
+          - type: INT64
+            value: "40"
+          - type: LIST
+            value:
+              - type: STRING
+                value: bo
+              - type: STRING
+                value: di
+      - values:
+          - type: INT64
+            value: "50"
+          - type: LIST
+            value:
+              - type: STRING
+                value: cy
+
+  - name: an-average-per-group
+    doc: A float per group, which says the type of an aggregate does not change when it is grouped.
+    query: MATCH (n:person) RETURN n.age AS a, avg(n.age) AS b ORDER BY a LIMIT 1
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: FLOAT64
+            value: "30.0"
+
+  - name: a-group-key-that-is-an-expression
+    doc: Grouping by something computed rather than by a column, which is what a client does when it buckets rows, and which gives two groups here.
+    query: MATCH (n:person) RETURN n.age > 35 AS a, count(*) AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+          - type: INT64
+            value: "1"
+      - values:
+          - type: BOOL
+            value: true
+          - type: INT64
+            value: "3"
+
+  - name: two-group-keys
+    doc: Two keys, which group by the pair and not by either one, so the number of groups is the number of distinct pairs.
+    query: MATCH (n:person) RETURN n.age AS a, n.name AS b, count(*) AS c ORDER BY a, b LIMIT 2
+    columns:
+      - a
+      - b
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "40"
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "1"
+
+  - name: a-count-of-distinct-values-per-group
+    doc: A deduplicating aggregate inside a group, which counts the values of the group and not of the whole result.
+    query: MATCH (n:person) RETURN n.age > 35 AS a, count(DISTINCT n.age) AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+          - type: INT64
+            value: "1"
+      - values:
+          - type: BOOL
+            value: true
+          - type: INT64
+            value: "2"
+
+  - name: an-order-by-over-an-aggregate
+    doc: The groups sorted by what the aggregate produced, which is the ranking every summary page is, and needs a second key because two counts are equal.
+    query: MATCH (n:person) RETURN n.age AS a, count(*) AS b ORDER BY b DESC, a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "40"
+          - type: INT64
+            value: "2"
+      - values:
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "50"
+          - type: INT64
+            value: "1"
+
+  - name: an-aggregate-over-a-page
+    doc: A sum of the rows a page kept, which is smaller than the sum of everything and says the page is taken where it is written and not at the end.
+    query: MATCH (n:person) WITH n.age AS a ORDER BY a LIMIT 2 RETURN sum(a) AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "70"
+
+  - name: an-aggregate-over-a-filtered-set
+    doc: A summary of the rows a predicate kept, which is the ordinary shape of a filtered report.
+    query: MATCH (n:person) WHERE n.age > 35 RETURN count(*) AS a, sum(n.age) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+          - type: INT64
+            value: "130"
+
+  - name: an-aggregate-over-a-cross-product
+    doc: A count over rows the product made, which is the number the product case pins read through a set function rather than a projection.
+    query: MATCH (a:person), (b:person) WHERE a.age = b.age RETURN count(*) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "6"
+
+  - name: an-aggregate-that-skips-a-null
+    doc: A count of a column an optional match padded, which counts the values and not the rows, and is the difference a client has to keep.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN count(*) AS a, count(m.name) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+          - type: INT64
+            value: "2"
+
+  - name: an-aggregate-with-no-alias-beside-a-key
+    doc: Two columns named by their source text, one a property and one a call, which is the naming rule applied to a grouped projection.
+    query: MATCH (n:person) WHERE n.age = 30 RETURN n.age, count(*)
+    columns:
+      - n.age
+      - count(*)
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "1"
+
+  - name: a-name-in-backticks-with-a-dot-in-it
+    doc: A quoted name that looks like a property, which is a name and not a path, and a client that splits column names on the dot loses it.
+    query: RETURN 1 AS `a.b`
+    columns:
+      - a.b
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-pipeline-of-three-stages
+    doc: A filter, a summary and a page in one statement, which is the shape of an ordinary report and is here so that the stages are exercised together and not only one at a time.
+    query: MATCH (n:person) WHERE n.age > 25 WITH n.age AS a, count(*) AS b WHERE b > 0 RETURN a, b ORDER BY a DESC LIMIT 2
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+          - type: INT64
+            value: "1"
+      - values:
+          - type: INT64
+            value: "40"
+          - type: INT64
+            value: "2"
+
+  - name: a-collection-of-distinct-values
+    doc: DISTINCT inside a set function narrows what that one function sees and nothing else, so a collection built this way holds each value once in the order the first of each arrived.
+    query: MATCH (n:person) RETURN collect(DISTINCT n.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "30"
+              - type: INT64
+                value: "40"
+              - type: INT64
+                value: "50"
+
+  - name: a-total-of-distinct-values
+    doc: The same narrowing under a total, which is where it changes the answer rather than only the order, since forty is counted once instead of twice.
+    query: MATCH (n:person) RETURN sum(DISTINCT n.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "120"
+
+  - name: a-total-over-counts-from-an-earlier-stage
+    doc: A WITH that groups hands its counts on as ordinary values, so a later aggregate adds them up and lands back on the number of rows the first stage grouped.
+    query: MATCH (n:person) WITH n.age AS g, count(*) AS c RETURN sum(c) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: order-by-a-column-position
+    doc: An integer key orders by the column in that position rather than by the constant, which is the reading a client that builds ORDER BY from a column index depends on.
+    query: MATCH (n:person) RETURN n.name AS a ORDER BY 1
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-count-of-a-variable
+    doc: Counting a bound element counts the rows it appears in, the same number the star gives here because no row lacks a node.
+    query: MATCH (n:person) RETURN count(n) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: four-aggregates-in-one-projection
+    doc: Every set function in a projection sees the same group, so a client can ask for a whole summary row in one statement instead of four.
+    query: MATCH (n:person) RETURN count(*) AS a, sum(n.age) AS b, min(n.age) AS c, max(n.age) AS d
+    columns:
+      - a
+      - b
+      - c
+      - d
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+          - type: INT64
+            value: "160"
+          - type: INT64
+            value: "30"
+          - type: INT64
+            value: "50"
+
+  - name: with-distinct-narrows-what-follows
+    doc: DISTINCT on a WITH collapses the rows before the next stage runs, so the count afterwards is a count of distinct ages rather than of people.
+    query: MATCH (n:person) WITH DISTINCT n.age AS a RETURN count(*) AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: unwinding-a-list-of-lists-keeps-the-inner-lists
+    doc: UNWIND takes one layer off and no more, so each row carries a list rather than the numbers inside it.
+    query: UNWIND [[1, 2], [3]] AS a RETURN a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "3"
+
+  - name: a-collection-unwound-in-the-same-statement
+    doc: Collecting and then unwinding is how a client folds a set and reopens it, and the values come back in the order they were collected, duplicates and all.
+    query: MATCH (n:person) WITH collect(n.age) AS l UNWIND l AS a RETURN a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+      - values:
+          - type: INT64
+            value: "40"
+      - values:
+          - type: INT64
+            value: "50"
+      - values:
+          - type: INT64
+            value: "40"
+
+  - name: distinct-then-ordered
+    doc: DISTINCT runs before the ordering, so the order is over the collapsed rows and every value appears once in it.
+    query: MATCH (n:person) RETURN DISTINCT n.age AS a ORDER BY a DESC
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+      - values:
+          - type: INT64
+            value: "40"
+      - values:
+          - type: INT64
+            value: "30"
+
+  - name: two-counts-over-an-optional-match
+    doc: The star counts the padded rows and a named element counts only the rows where the optional half matched, which is the pair a client needs to tell a miss from a hit.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN count(*) AS a, count(m) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+          - type: INT64
+            value: "2"
+
+  - name: a-page-of-groups
+    doc: Paging applies after the grouping and the ordering, so the window is over group rows and lands on the second largest age here.
+    query: MATCH (n:person) RETURN n.age AS a, count(*) AS b ORDER BY a DESC SKIP 1 LIMIT 1
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "40"
+          - type: INT64
+            value: "2"
+
+  - name: an-empty-list-projected
+    doc: A list with nothing in it is a value like any other and comes back as a list rather than as a null, which is the distinction a host binding has to keep.
+    query: RETURN [] AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+
+  - name: a-boolean-column-from-a-comparison
+    doc: A comparison in a projection gives a boolean column, so a client can carry a predicate out as data instead of using it to filter.
+    query: MATCH (n:person) RETURN n.name AS a, n.age >= 40 AS b ORDER BY a
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: BOOL
+            value: false
+      - values:
+          - type: STRING
+            value: bo
+          - type: BOOL
+            value: true
+      - values:
+          - type: STRING
+            value: cy
+          - type: BOOL
+            value: true
+      - values:
+          - type: STRING
+            value: di
+          - type: BOOL
+            value: true

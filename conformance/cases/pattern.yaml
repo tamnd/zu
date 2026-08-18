@@ -1,0 +1,792 @@
+schema: 3
+suite: pattern
+doc: What a pattern selects, which is the half of a statement that reads the graph rather than the values in it. The fixture is four people and three edges, one of which runs from a node to itself, and every case here is a question about which of those a pattern reaches: whether a label selects, whether an arrow has a direction, whether a name written twice means one element or two, and how many rows a walk of two edges is. The counts are small enough to check by reading the pairs at the top of this file, which is the point of them.
+
+load:
+  nodes: person
+  edges: knows
+  count: 4
+  columns:
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+        - di
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+        - "40"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+    - from: 3
+      to: 3
+
+cases:
+  - name: a-label-selects-its-table
+    doc: The plainest pattern there is, which every case below is counted against.
+    query: MATCH (n:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-label-nothing-carries-selects-nothing
+    doc: A label no element has is an empty result rather than a condition, because a graph is allowed not to hold something.
+    query: MATCH (n:nothing) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-node-pattern-with-no-label
+    doc: A pattern that names no label reaches every node, which is the shape a client writes when it is counting the whole graph.
+    query: MATCH (n) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-node-pattern-with-no-variable
+    doc: A node nothing refers to still selects, so a pattern's cardinality does not depend on whether the client asked for the element.
+    query: MATCH (:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-label-conjunction
+    doc: Two labels joined, which selects the elements carrying both, and here nothing carries the second one.
+    query: MATCH (n:person&other) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: a-label-disjunction
+    doc: The same two labels the other way, which selects everything carrying either and so selects the whole table.
+    query: MATCH (n:person|other) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-label-negation
+    doc: A label expression that says which label an element does not carry, which reaches every node here because nothing carries it.
+    query: MATCH (n:!other) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-negation-of-the-label-everything-carries
+    doc: The other end of the same expression, where the negated label is the one every node has, so nothing is selected.
+    query: MATCH (n:!person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: an-inline-property
+    doc: A property written into the pattern, which is the lookup by key that every client's first read is.
+    query: MATCH (n:person {name: 'ann'}) RETURN n.age AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+
+  - name: two-inline-properties
+    doc: Two properties in one pattern, which are joined by and, so a row has to answer both.
+    query: MATCH (n:person {name: 'ann', age: 30}) RETURN n.age AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "30"
+
+  - name: two-inline-properties-that-no-row-answers-together
+    doc: Each of the two matches a row on its own and no row matches both, which is the case a client that treats the map as a disjunction gets wrong.
+    query: MATCH (n:person {name: 'ann', age: 40}) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: an-inline-property-nothing-matches
+    doc: A key that is not in the table's values, which selects nothing and is not a condition.
+    query: MATCH (n:person {name: 'zz'}) RETURN n.age AS a
+    columns:
+      - a
+    rows:
+
+  - name: an-inline-property-that-matches-more-than-one
+    doc: Two people of the same age, so an inline property is a filter and not a key lookup that stops at the first row.
+    query: MATCH (n:person {age: 40}) RETURN n.name AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+
+  - name: an-inline-property-and-a-predicate
+    doc: The same filtering written half in the pattern and half in WHERE, which has to reach the same rows as writing all of it either way.
+    query: MATCH (n:person {age: 40}) WHERE n.name = 'bo' RETURN n.name AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-predicate-over-a-property
+    doc: The plain WHERE, which is the same selection as an inline property and is the spelling that takes an operator other than equals.
+    query: MATCH (n:person) WHERE n.age >= 40 RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-predicate-over-two-properties
+    doc: A predicate joining two properties of one element, which no index answers and every engine has to evaluate.
+    query: MATCH (n:person) WHERE n.age > 35 AND n.name < 'd' RETURN n.name AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: an-edge-walked-forwards
+    doc: The three pairs the load wrote, read in the direction they were written, which is the count every direction case below is measured against.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: the-ends-of-every-edge
+    doc: The same three edges with their ends named, so a client cannot pass the count without holding the pairs.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS x, b.name AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: an-edge-walked-backwards
+    doc: The arrow pointing the other way finds the same three edges from the other end, and a client storing one direction only answers nothing here.
+    query: MATCH (a:person)<-[:knows]-(b:person) RETURN a.name AS x, b.name AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: cy
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: an-anonymous-edge
+    doc: An arrow with no bracket, which selects every edge between the two nodes whatever its table is called.
+    query: MATCH (a:person)-->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: an-edge-with-a-variable-and-no-label
+    doc: A bracket that names the edge and not its table, which is how a client asks for whatever runs between two nodes.
+    query: MATCH (a:person)-[e]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: an-edge-of-a-table-nothing-is-in
+    doc: A rel table nobody declared, which selects nothing rather than refusing, the same way an unknown node label does.
+    query: MATCH (a:person)-[:nothing]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: an-edge-from-a-node-to-itself
+    doc: The pair the load wrote from a row to itself, which is an edge like any other and is the one a walk can take twice.
+    query: MATCH (a:person)-[:knows]->(a) RETURN a.name AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-name-written-twice-is-one-element
+    doc: The same variable at both ends selects only the edges whose ends are the same element, which is what makes the case above a self edge test and not a spelling.
+    query: MATCH (a:person)-[:knows]->(a) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-walk-of-two-edges
+    doc: One walk of two edges runs between distinct people here, which is a join of the pattern with itself and not a product.
+    query: MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) WHERE a.name <> b.name RETURN a.name AS x, c.name AS y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+
+  - name: a-walk-of-two-edges-over-the-self-edge
+    doc: A self edge can be the second hop of a walk that started on it, so the two hop pattern reaches the same node twice and that is a row.
+    query: MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-walk-of-three-edges
+    doc: Three hops, which only the self edge can supply here, so the count says whether a walk is allowed to reuse an edge.
+    query: MATCH (a:person)-[:knows]->()-[:knows]->()-[:knows]->(d:person) RETURN d.name AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: di
+
+  - name: two-edges-arriving-at-one-node
+    doc: A pattern shaped like a V, which pairs every two edges that share a target, including each edge with itself.
+    query: MATCH (a:person)-[:knows]->(b:person)<-[:knows]-(c:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: two-edges-leaving-one-node
+    doc: The same shape turned around, which is the other way a client asks for a node's neighbourhood.
+    query: MATCH (a:person)<-[:knows]-(b:person)-[:knows]->(c:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-walk-of-one-or-two-edges
+    doc: A quantified edge, which is the three single hops plus the one walk of two, and is where a client that expands a walk itself has to agree with one that pushes it down.
+    query: MATCH (a:person)-[:knows*1..2]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-quantifier-of-exactly-one
+    doc: A quantified edge that allows one hop only, which has to give what the unquantified pattern gives.
+    query: MATCH (a:person)-[:knows*1..1]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-quantifier-of-exactly-two
+    doc: Two hops and no fewer, which is the half of the range case that the single hops would otherwise hide, and which the self edge does not answer because a quantified walk does not take one edge twice.
+    query: MATCH (a:person)-[:knows*2..2]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: the-ends-of-a-two-hop-quantifier
+    doc: The row behind that count, named, so a client that reaches the right number by a different walk is still caught.
+    query: MATCH (a:person)-[:knows*2..2]->(b:person) RETURN a.name AS x, b.name AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+
+  - name: a-pattern-that-exists
+    doc: A predicate asking whether a walk leaves this node, which is the shape of every neighbour check and does not multiply the rows.
+    query: MATCH (a:person) WHERE EXISTS { (a)-[:knows]->(:person) } RETURN a.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-pattern-that-does-not-exist
+    doc: The negation of the same predicate, which is the node nothing leaves and is the case a client answering with a join returns wrongly.
+    query: MATCH (a:person) WHERE NOT EXISTS { (a)-[:knows]->(:person) } RETURN a.name AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-pattern-that-exists-in-the-other-direction
+    doc: The same predicate over an arriving edge, so a client cannot answer it by looking at one adjacency list.
+    query: MATCH (a:person) WHERE EXISTS { (a)<-[:knows]-(:person) } RETURN a.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: two-patterns-with-nothing-joining-them
+    doc: A cross product of the table with itself, which is sixteen rows and is the count a client that quietly joins on the variable name would not produce.
+    query: MATCH (a:person), (b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "16"
+
+  - name: two-patterns-joined-by-a-predicate
+    doc: The product with a WHERE over both halves, which is how a client asks a question no edge answers.
+    query: MATCH (a:person), (b:person) WHERE a.age < b.age RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+
+  - name: two-patterns-sharing-a-variable
+    doc: A name written in both halves, which joins them, so the product collapses to the table's own size.
+    query: MATCH (a:person), (a) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-pattern-in-a-second-match-clause
+    doc: Two MATCH clauses in a row, which join on the name they share the way two patterns in one clause do.
+    query: MATCH (a:person) MATCH (a)-[:knows]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: an-optional-match-that-finds-nothing
+    doc: An optional half nothing answers, which keeps the row and fills the column with null rather than dropping it.
+    query: MATCH (n:person) WHERE n.name = 'cy' OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN n.name AS x, m.name AS y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+          - type: NULL
+
+  - name: an-optional-match-that-finds-something
+    doc: The same clause where the walk exists, so the column holds the value and the row is not duplicated.
+    query: MATCH (n:person) WHERE n.name = 'ann' OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN n.name AS x, m.name AS y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: bo
+
+  - name: an-optional-match-over-every-row
+    doc: The clause applied to the whole table, which is three walks and one null and is the join a client writes as a left outer one.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: an-optional-match-whose-null-is-counted
+    doc: Counting the optional column rather than the rows, which is three because a count of a value skips the nulls and a count of rows does not.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN count(m.name) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-predicate-after-an-optional-match
+    doc: A WHERE written after the optional half belongs to it, so a row the predicate rejects is padded with nulls rather than dropped, and the count is the whole table rather than the rows that matched.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) WHERE m.name = 'bo' RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: what-a-predicate-after-an-optional-match-keeps
+    doc: The same clause counted over the optional column rather than over the rows, which is the one walk the predicate let through and is the number a client expects the case above to give.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) WHERE m.name = 'bo' RETURN count(m.name) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-pattern-after-a-with
+    doc: A match reading a name an earlier stage bound, which is the pipeline shape and not a new scan.
+    query: MATCH (a:person) WHERE a.name = 'ann' WITH a MATCH (a)-[:knows]->(b:person) RETURN b.name AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-pattern-over-a-node-the-store-holds-alone
+    doc: The node no edge leaves, reached by the plain pattern, which is the row a client that builds its graph from the edge list loses.
+    query: MATCH (n:person) WHERE n.name = 'cy' RETURN n.age AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: the-neighbours-of-one-node
+    doc: The read a client does most, which is one node by key and one hop out of it.
+    query: MATCH (a:person {name: 'ann'})-[:knows]->(b:person) RETURN b.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: the-neighbours-of-a-node-that-has-none
+    doc: The same read over a node nothing leaves, which is an empty result and not a null row, because the pattern is not optional.
+    query: MATCH (a:person {name: 'cy'})-[:knows]->(b:person) RETURN b.name AS x
+    columns:
+      - x
+    rows:
+
+  - name: the-degree-of-every-node
+    doc: A count per node over an optional walk, which is the summary a client draws a histogram from and is where the padded null has to count as zero.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person) RETURN n.name AS x, count(m.name) AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: cy
+          - type: INT64
+            value: "0"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "1"
+
+  - name: a-property-of-the-far-end
+    doc: A value read through a walk, which is the join every client writes and the reason an edge is worth storing.
+    query: MATCH (a:person {name: 'bo'})-[:knows]->(b:person) RETURN b.age AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: a-predicate-over-the-far-end
+    doc: A filter on the other side of the arrow, which is what makes a walk a query rather than a traversal.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE b.age > 45 RETURN a.name AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-predicate-comparing-the-two-ends
+    doc: A predicate over both ends at once, which no index answers and which is the shape of every question about a difference along an edge.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE a.age < b.age RETURN a.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: an-aggregate-over-a-walk
+    doc: A summary of the far ends, grouped by the near one, which is the read behind every neighbour list a client renders.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS x, count(*) AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: bo
+          - type: INT64
+            value: "1"
+      - values:
+          - type: STRING
+            value: di
+          - type: INT64
+            value: "1"
+
+  - name: an-aggregate-over-the-far-ends-values
+    doc: The same walk with a value taken off the far end, so the aggregate reads a column through the edge rather than beside it.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN sum(b.age) AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "130"
+
+  - name: the-nodes-a-walk-reaches
+    doc: The distinct far ends, which is the set a client renders as a neighbourhood and is smaller than the count of walks whenever two walks land together.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN DISTINCT b.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: cy
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-walk-out-and-back
+    doc: Out along an edge and back along another, which pairs a node with the nodes that share a target with it, itself included.
+    query: MATCH (a:person)-[:knows]->()<-[:knows]-(b:person) RETURN a.name AS x, b.name AS y ORDER BY x
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+          - type: STRING
+            value: di
+
+  - name: a-walk-out-and-back-to-somebody-else
+    doc: The same shape with the trivial pairing filtered out, which is how the useful half of that query is written and is empty in this graph.
+    query: MATCH (a:person)-[:knows]->()<-[:knows]-(b:person) WHERE a.name <> b.name RETURN count(*) AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "0"
+
+  - name: an-edge-either-way
+    doc: A pattern with no arrowhead walks every edge in both directions, so each of the three answers twice, the self edge included.
+    query: MATCH (a:person)-[:knows]-(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "6"
+
+  - name: an-edge-either-way-from-one-node
+    doc: The neighbours of a node in either direction, which is the read a client does when it draws a node and everything touching it.
+    query: MATCH (a:person {name: 'bo'})-[:knows]-(b:person) RETURN b.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-self-edge-either-way
+    doc: A self edge under an undirected pattern answers twice, once for each direction it can be walked in, which is the count that says the direction and not the pair of ends is what the pattern is asking about.
+    query: MATCH (a:person {name: 'di'})-[:knows]-(b:person) RETURN count(*) AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-node-selected-by-a-property-of-a-neighbour
+    doc: A pattern whose filter is one hop away from the node it returns, which is the read a recommendation is built out of.
+    query: MATCH (a:person)-[:knows]->(b:person {name: 'cy'}) RETURN a.name AS x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-pattern-whose-ends-carry-the-same-value
+    doc: A join on a property rather than on an edge, which is the query a client writes when the graph does not have the edge it wants.
+    query: MATCH (a:person), (b:person) WHERE a.age = b.age AND a.name < b.name RETURN a.name AS x, b.name AS y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+          - type: STRING
+            value: di
+
+  - name: a-pattern-and-a-page
+    doc: A walk with a limit over it, which is the read behind a paged neighbour list and takes its page after the order.
+    query: MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS x ORDER BY x LIMIT 2
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo

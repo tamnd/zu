@@ -357,14 +357,14 @@ jobs:
       - run: cargo bench -p xtask --bench corpus
       # The second reader of the same files, in the language the C
       # runner is written in. It runs over every case rather than over
-      # a handful of literals, because 15 files of hand written YAML are
+      # a handful of literals, because 18 files of hand written YAML are
       # a better adversary than anything a test would think to write,
       # and it runs under both sanitizers, because a reader in C over
       # files nobody validated first is exactly where a bad index lives.
       # `-fno-sanitize-recover` because UBSan prints and carries on by
       # default, and a report nothing acts on is a report nobody reads.
       # The decoder above it gets the same treatment over the same
-      # files, which is 989 values through the temporal parser and the
+      # files, which is 1367 values through the temporal parser and the
       # float printer on every pull request.
       - name: The C reader and decoder over every case
         run: |
@@ -457,7 +457,7 @@ jobs:
       # roughly doubles the cost, so the two readers get it, where it
       # turns "uninitialised" into the line that left it that way, and
       # the runner does not, because the runner also runs the engine
-      # over all 652 cases and that is where the minutes are.
+      # over all 945 cases and that is where the minutes are.
       - name: The C programs under Valgrind
         run: |
           sudo apt-get update

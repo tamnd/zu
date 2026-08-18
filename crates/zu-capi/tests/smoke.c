@@ -458,6 +458,19 @@ int main(int argc, char **argv) {
       zu_conn_close(first);
       return report("a table could not be declared to append to", status, err);
     }
+    /* A write has nothing to project, and the completion condition for
+     * that is not the one a query gets: 00001 is successful completion
+     * with the result omitted, which is neither a failure nor an empty
+     * answer. */
+    if (zu_result_cols(back) != 0 || zu_result_gqlstatus(back, NULL) == NULL ||
+        strcmp(zu_result_gqlstatus(back, NULL), "00001") != 0 || zu_result_notices(back) != 0) {
+      zu_result_free(back);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return fail("a statement with nothing to project said otherwise");
+    }
     zu_result_free(back);
     back = NULL;
 
@@ -697,6 +710,58 @@ int main(int argc, char **argv) {
   }
   zu_error_free(err);
 
+  /* The other half of the GQLSTATUS envelope, which is the half a host
+   * reading rows and errors could not see: what a statement that worked
+   * completed with, and what it raised on the way and carried on
+   * through. The warning is the one an optional group that misses
+   * raises, because avg() then has a null argument on those rows and
+   * ignores it, and the point of checking it here is that the answer
+   * survived: three is three whether or not anything was said about
+   * it. */
+  err = NULL;
+  result = NULL;
+  status = zu_query_z(first,
+                      "MATCH (a) OPTIONAL MATCH (a)-->(b) WHERE b.id > 2 RETURN avg(b.id) AS x",
+                      &result, &err);
+  if (status != ZU_OK) {
+    zu_conn_close(first);
+    return report("an aggregate over an optional group failed", status, err);
+  }
+  {
+    size_t code_len = 0;
+    const char *completion = zu_result_gqlstatus(result, &code_len);
+    zu_error *notice = NULL;
+    if (completion == NULL || strcmp(completion, "00000") != 0 || code_len != 5) {
+      zu_result_free(result);
+      zu_conn_close(first);
+      return fail("a statement that answered with columns said otherwise");
+    }
+    if (zu_result_rows(result) != 1 || zu_result_notices(result) != 1) {
+      zu_result_free(result);
+      zu_conn_close(first);
+      return fail("a warning is not an exception and the rows are still rows");
+    }
+    if (zu_result_notice(result, 0, &notice) != ZU_OK || notice == NULL ||
+        zu_error_code(notice, NULL) == NULL ||
+        strcmp(zu_error_code(notice, NULL), "01G11") != 0 ||
+        zu_error_severity(notice) != ZU_SEVERITY_WARNING ||
+        zu_error_status(notice) != ZU_OK) {
+      zu_error_free(notice);
+      zu_result_free(result);
+      zu_conn_close(first);
+      return fail("a notice that is not the condition that was raised");
+    }
+    /* A copy rather than a borrow, so it is freed here on the same
+     * terms as a failure and the result still has its own. */
+    zu_error_free(notice);
+    notice = (zu_error *)1;
+    if (zu_result_notice(result, 1, &notice) != ZU_DONE || notice != NULL) {
+      zu_result_free(result);
+      zu_conn_close(first);
+      return fail("a notice past the end was handed out");
+    }
+    zu_result_free(result);
+  }
   /* Cancellation and progress, as far as one thread and four nodes can
    * take them: the symbols are exported, the header's function-pointer
    * type is the one the library was built with, a period of nothing is
@@ -815,8 +880,8 @@ int main(int argc, char **argv) {
 
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
-      "nested list, one load, one append, one watched statement, one transaction, one refusal "
-      "with a place and one without\n",
+      "nested list, one load, one append, one warning carried alongside its rows, one watched "
+      "statement, one transaction, one refusal with a place and one without\n",
       version);
   return 0;
 }

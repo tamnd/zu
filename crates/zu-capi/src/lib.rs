@@ -106,7 +106,8 @@ use zudb::zu1::file::Zu1File;
 use zudb::zu1::graph::bulk_load_keyed;
 use zudb::zu1::props::{PropValues, load_props, store_props};
 use zudb::{
-    Config, Connection, Database, Field, Interrupt, Position, Severity, ZuError as EngineError,
+    Config, Connection, Database, DiagnosticRecord, Field, Interrupt, Position, Severity,
+    ZuError as EngineError,
 };
 
 /// What a call answers, which is control flow and nothing else.
@@ -296,6 +297,33 @@ impl ZuError {
             retryable: i32::from(e.retryable()),
             position: e.position(),
             excerpt: e.excerpt().map(c_message),
+        }
+    }
+
+    /// A condition a statement raised and survived, on the same handle
+    /// a failure comes back on.
+    ///
+    /// One shape rather than two, because a diagnostic record is a
+    /// diagnostic record and the standard says what is on one: the
+    /// code, its standard text, the severity, the place, the line that
+    /// place is on and the page it is written up on are the same
+    /// accessors either way, and a binding that already turns one of
+    /// these into an exception gets its warning class for the cost of
+    /// reading the severity. That is what tells them apart, and it is
+    /// what the field is for. `status` is [`ZuStatus::Ok`] because that
+    /// is what the call this came from returned, which is the whole
+    /// difference between a notice and a failure.
+    fn from_notice(record: &DiagnosticRecord) -> ZuError {
+        ZuError {
+            status: ZuStatus::Ok,
+            message: c_message(&record.to_string()),
+            code: Some(c_message(record.status.code())),
+            standard_text: Some(c_message(&record.status.standard_text())),
+            doc_url: Some(c_message(&record.doc_url())),
+            severity: severity_of(record.severity()),
+            retryable: i32::from(record.retryable()),
+            position: record.position,
+            excerpt: record.excerpt.as_deref().map(c_message),
         }
     }
 
@@ -714,6 +742,11 @@ pub struct ZuResult {
     chunk_node: Vec<Chunk<u64>>,
     chunk_valid: Vec<Chunk<u8>>,
     strs: HashMap<(u64, u32), CString>,
+    /// The statement's completion condition, kept NUL-terminated
+    /// because [`zu_result_gqlstatus`] hands it out. Taken from the
+    /// result rather than worked out here, so it cannot come to
+    /// disagree with what the engine would say.
+    gqlstatus: CString,
 }
 
 /// Rows in a chunk, which is the width the executor works in.
@@ -764,6 +797,7 @@ impl ZuResult {
             .map(|c| c_message(c.as_str()))
             .collect();
         let cols = result.columns.len();
+        let gqlstatus = c_message(result.status().code());
         ZuResult {
             result,
             col_names,
@@ -776,6 +810,7 @@ impl ZuResult {
             chunk_node: chunk_slots(cols),
             chunk_valid: chunk_slots(cols),
             strs: HashMap::new(),
+            gqlstatus,
         }
     }
 }
@@ -2793,6 +2828,92 @@ pub unsafe extern "C" fn zu_result_free(result: *mut ZuResult) {
     if !result.is_null() {
         drop(unsafe { Box::from_raw(result) });
     }
+}
+
+/* ---- diagnostics ---- */
+
+/// The completion condition of the statement that produced this
+/// result.
+///
+/// `00000` for a statement that answered with columns, and `00001`,
+/// successful completion with the result omitted, for one that had
+/// none to give back. The status a call returns says whether it
+/// worked; this says which way it worked, in the standard's own terms,
+/// which is what a conformance harness grades and what the JSON Lines
+/// protocol already puts in every record it writes. It is the one half
+/// of the GQLSTATUS envelope a host had no way to read here.
+///
+/// Never NULL for a non-NULL result, so a host can compare it without
+/// testing for one first, and owned by the result rather than by the
+/// caller, so it is good until [`zu_result_free`] and is not freed on
+/// its own.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_gqlstatus(
+    result: *const ZuResult,
+    len: *mut usize,
+) -> *const c_char {
+    if result.is_null() {
+        if !len.is_null() {
+            unsafe { *len = 0 };
+        }
+        return std::ptr::null();
+    }
+    let code = &unsafe { &*result }.gqlstatus;
+    if !len.is_null() {
+        unsafe { *len = code.as_bytes().len() };
+    }
+    code.as_ptr()
+}
+
+/// How many conditions the statement raised and carried on through.
+///
+/// The other half of the envelope. An exception replaces a result and
+/// arrives as an error; a warning rides along with one, because a
+/// statement that dropped a null out of an aggregate still has rows to
+/// give you and the standard still wants you told. Almost every
+/// statement raises none, so a host that reads this and finds nought
+/// has paid for one call and no allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_notices(result: *const ZuResult) -> u32 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }.result.notices.len() as u32
+}
+
+/// One of those conditions, as the handle a failure comes back on and
+/// freed the same way with [`zu_error_free`].
+///
+/// A copy rather than a borrow, so that the rule for every
+/// `zu_error *` a host is ever handed stays the one rule: free it. The
+/// result keeps its own and can be asked again. What tells a notice
+/// from a failure is [`zu_error_severity`], which is a warning here and
+/// an exception there, and [`zu_error_status`], which is
+/// [`ZuStatus::Ok`] because that is what the call that produced it
+/// returned.
+///
+/// `ZU_DONE` for an index past the end, which is the answer a host
+/// walking them gets at the end of the walk rather than a failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_result_notice(
+    result: *const ZuResult,
+    ix: u32,
+    out: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    if result.is_null() {
+        return ZuStatus::Misuse;
+    }
+    guard_status(|| {
+        let Some(record) = unsafe { &*result }.result.notices.get(ix as usize) else {
+            return ZuStatus::Done;
+        };
+        unsafe { *out = Box::into_raw(Box::new(ZuError::from_notice(record))) };
+        ZuStatus::Ok
+    })
 }
 
 /* ---- bulk load ---- */

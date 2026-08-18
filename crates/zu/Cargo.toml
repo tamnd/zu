@@ -45,6 +45,10 @@ name = "graphalytics"
 harness = false
 
 [[bench]]
+name = "paths"
+harness = false
+
+[[bench]]
 name = "scale"
 harness = false
 

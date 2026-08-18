@@ -238,6 +238,20 @@ jobs:
       # one machine, so a shared runner cannot move it.
       - run: ZU_GATE=1 cargo bench -p zu --bench tail
 
+  paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      # The perf/06 path count gate: counting the shortest paths of a
+      # layered graph against enumerating the same paths on the same
+      # run. Forty three nodes and a third of a million paths between
+      # them, so it builds in no time and still fails loudly if the
+      # count goes back to being a walk. A ratio between two numbers
+      # timed together, so a shared runner cannot move it.
+      - run: ZU_GATE=1 cargo bench -p zu --bench paths
+
   relprops:
     runs-on: ubuntu-latest
     steps:

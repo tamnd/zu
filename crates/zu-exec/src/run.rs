@@ -3604,6 +3604,9 @@ fn scalar(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<V
         ScalarRef::RowId { .. } => Value::Int(row_at(chunk, idx) as i64),
         ScalarRef::Col { vec, ty, .. } => match ty {
             zu_query::snapshot::ColType::Int => Value::Int(chunk.vecs[vec].values::<i64>()[idx]),
+            zu_query::snapshot::ColType::Float => {
+                Value::Float(chunk.vecs[vec].values::<f64>()[idx])
+            }
             zu_query::snapshot::ColType::Str => Value::Str(str_at(&chunk.vecs[vec], idx)?),
         },
     })
@@ -3653,6 +3656,11 @@ fn part_kind(r: ScalarRef) -> PartKind {
         ScalarRef::Col { ty, .. } => match ty {
             zu_query::snapshot::ColType::Int => PartKind::Int,
             zu_query::snapshot::ColType::Str => PartKind::Str,
+            // The compiler declines a float key, so one never reaches
+            // a packer. See `keyable`.
+            zu_query::snapshot::ColType::Float => {
+                unreachable!("a float is not a key the compiler hands over")
+            }
         },
     }
 }
@@ -3694,6 +3702,11 @@ fn fill_key_col(
             }
         }
         ScalarRef::Col { vec, ty, .. } => match ty {
+            // The compiler declines a float key, so one never reaches
+            // a packer. See `keyable`.
+            zu_query::snapshot::ColType::Float => {
+                unreachable!("a float is not a key the compiler hands over")
+            }
             zu_query::snapshot::ColType::Int => {
                 if live {
                     fill_col(

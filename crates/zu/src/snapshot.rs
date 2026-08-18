@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use zu_common::{IntBits, LogicalType, Result, ZuError};
+use zu_common::{FloatBits, IntBits, LogicalType, Result, ZuError};
 use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
 
 pub use zu_query::snapshot::{
@@ -285,31 +285,54 @@ fn props_of(props: &mut HashMap<u32, Option<PropsReader>>, table: u32) -> Result
 /// The column `name` names, as the vector layer would carry it, or
 /// `None` when the reader holds nothing readable under that name.
 ///
-/// The vector layer types a column as one of two things, so a column
-/// that is neither is not resolvable and the compiler declines the
-/// plan rather than reading a float or a date as though it were a
-/// count. The row at a time executor reads those, and widening this is
-/// the vector layer's own change (G1, the `PhysType` move).
+/// The vector layer types a column as one of three things, so a column
+/// that is none of them is not resolvable and the compiler declines the
+/// plan rather than reading a date as though it were a count. The row
+/// at a time executor reads those, and widening this is the vector
+/// layer's own change (G1, the `PhysType` move).
 ///
 /// A vector carries a validity mask of its own, but a scan does not
 /// fill one from storage yet, so a column that holds a null is not
-/// resolvable here either.
+/// resolvable here either. The compiler leans on that: a value read
+/// through one of these is a value and never a null.
 fn vector_col(reader: &PropsReader, name: &str) -> Option<(ColId, ColType)> {
     reader.col(name).and_then(|ix| {
         if reader.columns()[ix].validity.is_some() {
             return None;
         }
-        let ty = match &reader.columns()[ix].ty {
-            LogicalType::Int {
-                signed: true,
-                bits: IntBits::B64,
-                ..
-            } => ColType::Int,
-            LogicalType::Str { .. } => ColType::Str,
-            _ => return None,
-        };
-        Some((ix as ColId, ty))
+        Some((ix as ColId, lane_type(&reader.columns()[ix].ty)?))
     })
+}
+
+/// How the vector layer types one stored column, `None` for a type it
+/// has no lane for. A 32 bit float is not one of them: it is stored in
+/// its own width and the layer has one float type, so widening it is a
+/// conversion rather than a read.
+fn lane_type(ty: &LogicalType) -> Option<ColType> {
+    match ty {
+        LogicalType::Int {
+            signed: true,
+            bits: IntBits::B64,
+            ..
+        } => Some(ColType::Int),
+        LogicalType::Float {
+            bits: FloatBits::B64,
+            ..
+        } => Some(ColType::Float),
+        LogicalType::Str { .. } => Some(ColType::Str),
+        _ => None,
+    }
+}
+
+/// The physical type a lane column's stored words carry. A float is
+/// written as `f64::to_bits`, so the eight bytes the decoder hands back
+/// are already the value and the vector only has to be told what they
+/// are. Nothing converts.
+fn lane_phys(ty: &LogicalType) -> PhysType {
+    match lane_type(ty) {
+        Some(ColType::Float) => PhysType::Float64,
+        _ => PhysType::Int64,
+    }
 }
 
 fn check_col(reader: &PropsReader, col: ColId) -> Result<usize> {
@@ -484,7 +507,7 @@ impl Snapshot for Zu1Snapshot<'_> {
                 }
                 columns.push(ValueVector::flat_from(
                     arena,
-                    PhysType::Int64,
+                    lane_phys(&reader.columns()[col].ty),
                     &scratch[..rows],
                 ));
             } else {
@@ -585,7 +608,8 @@ impl Snapshot for Zu1Snapshot<'_> {
         let ix = check_col(reader, col)?;
         if reader.columns()[ix].is_lane() {
             reader.gather_int(db, ix, rows, scratch)?;
-            Ok(ValueVector::flat_from(arena, PhysType::Int64, scratch))
+            let phys = lane_phys(&reader.columns()[ix].ty);
+            Ok(ValueVector::flat_from(arena, phys, scratch))
         } else {
             reader.gather_str(db, ix, rows, str_bytes, str_ends)?;
             Ok(str_views(arena, str_bytes, str_ends))
@@ -615,7 +639,8 @@ impl Snapshot for Zu1Snapshot<'_> {
         let ix = check_col(reader, col)?;
         if reader.columns()[ix].is_lane() {
             reader.gather_int(db, ix, ords, scratch)?;
-            Ok(ValueVector::flat_from(arena, PhysType::Int64, scratch))
+            let phys = lane_phys(&reader.columns()[ix].ty);
+            Ok(ValueVector::flat_from(arena, phys, scratch))
         } else {
             reader.gather_str(db, ix, ords, str_bytes, str_ends)?;
             Ok(str_views(arena, str_bytes, str_ends))

@@ -777,6 +777,24 @@ fn is_window(node: &LogicalPlan) -> bool {
     )
 }
 
+/// Whether a ref can stand as a group key.
+///
+/// A float cannot. A key here is packed as the bytes the value is
+/// stored as, and the row at a time engine compares floats by their
+/// order, which puts `0.0` and `-0.0` in one group and every NaN in
+/// one group. Neither is a group anybody writes on purpose, and a
+/// stored column can hold both, so the grouping goes back to the
+/// engine that already agrees with itself about them.
+fn keyable(r: ScalarRef) -> bool {
+    !matches!(
+        r,
+        ScalarRef::Col {
+            ty: ColType::Float,
+            ..
+        }
+    )
+}
+
 /// Whether anything above the sink reads column `at` of the row the
 /// sink writes. Only the stages are asked: a window step indexes the
 /// row the stage below it emitted, which is a different row and a
@@ -1681,6 +1699,9 @@ impl Compiler<'_> {
                     let Some(r) = self.item_ref(&item.expr)? else {
                         return Ok(None);
                     };
+                    if !keyable(r) {
+                        return Ok(None);
+                    }
                     key_refs.push(r);
                 }
                 // A clause of its own above the aggregate reads the
@@ -2934,6 +2955,21 @@ impl Compiler<'_> {
         Ok(self.snap.seek_key(table, key)?.map(|row| row as i64))
     }
 
+    /// Whether vector `vec` of `level` is read straight out of storage,
+    /// which is where a value cannot be null: a stored column holding a
+    /// null does not resolve into a plan at all, so one that did resolve
+    /// has a value in every row. Vector 0 is the level's row ids, which
+    /// are not null either.
+    fn stored_col(&self, level: usize, vec: usize) -> bool {
+        if vec == 0 {
+            return true;
+        }
+        matches!(
+            self.levels[level].cols.get(vec - 1).map(|(_, c)| c),
+            Some(ColSpec::Stored(..) | ColSpec::RelStored(..))
+        )
+    }
+
     /// Registers a lower level's pinned value as a constant column on
     /// `level`, returning its chunk vector position. Two predicates
     /// reading the same end share the column, the way two readers of a
@@ -3426,6 +3462,9 @@ impl Compiler<'_> {
             let Some(r) = self.item_ref(part)? else {
                 return Ok(None);
             };
+            if !keyable(r) {
+                return Ok(None);
+            }
             // A node key carries its table beside its row, and a level
             // has one table, so the table word is the same for every
             // row the query will ever hash. Counting rows counts the
@@ -3734,6 +3773,7 @@ impl Compiler<'_> {
                         vec,
                         match ty {
                             ColType::Int => PhysType::Int64,
+                            ColType::Float => PhysType::Float64,
                             ColType::Str => PhysType::Str,
                         },
                     ),
@@ -3743,7 +3783,18 @@ impl Compiler<'_> {
                     // A level above this one is not built yet, and a
                     // string end would have to carry its buffers into
                     // the broadcast, so both go back to the old engine.
-                    if !outer || from > level || ty != PhysType::Int64 {
+                    //
+                    // Under a comparison the broadcast may be null: the
+                    // kernel clears the whole column's validity and that
+                    // is the answer the old engine gives. Inside
+                    // arithmetic it may not, because the arith kernels
+                    // do not propagate validity and a null end would
+                    // come back a number. A stored column is the case
+                    // where that cannot arise, since a column holding a
+                    // null does not resolve at all.
+                    let numeric = matches!(ty, PhysType::Int64 | PhysType::Float64);
+                    let never_null = self.stored_col(from, col);
+                    if from > level || !numeric || !(outer || never_null) {
                         return Ok(None);
                     }
                     col = self.register_outer(level, from, col);

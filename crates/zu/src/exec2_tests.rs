@@ -574,6 +574,11 @@ fn covered_queries() -> &'static [&'static str] {
         // a degree read over the whole vector.
         "MATCH (a:person)-[:knows]->(b) WHERE a.age = 13 \
          AND (b.id < 100 OR EXISTS { MATCH (b)-[:knows]->(c) }) RETURN count(*) AS n",
+        // A correlated end inside arithmetic. The arith kernels do not
+        // carry validity, so a null end would come back a number, but a
+        // stored column that holds a null does not resolve into a plan
+        // at all and this one is read straight out of storage.
+        "MATCH (a:person)-[:knows]->(b) WHERE b.age > a.age + 1 RETURN count(*) AS n",
         // A block over a pattern with no variable in common with the
         // outer row, tied to it by an equality: the walk a hop would do
         // is a probe into a table built off the other side, and the
@@ -842,11 +847,6 @@ fn fallback_queries() -> &'static [&'static str] {
         // the shape stays where the error is, divisor constant or not.
         "MATCH (p:person) RETURN p.score / 3 AS b",
         "MATCH (p:person) RETURN p.age % 10 AS b, p.id AS id",
-        // A correlated end inside arithmetic. The compare kernel ands
-        // the broadcast column's validity into its answer, so a null
-        // end compares false there, but the arith kernels do not carry
-        // validity yet and would turn a null into a number.
-        "MATCH (a:person)-[:knows]->(b) WHERE b.age > a.age + 1 RETURN count(*) AS n",
         // A correlated string end would have to carry its buffers into
         // the broadcast.
         "MATCH (a:person)-[:knows]->(b) WHERE a.name < b.name RETURN count(*) AS n",
@@ -1228,6 +1228,119 @@ fn an_edge_property_runs_on_the_pipeline() {
     )
     .unwrap();
     assert_eq!(r.rows, [[Value::Int(late)]]);
+}
+
+/// A float column reads on the pipeline, on a node and on an edge.
+///
+/// The stored words are the IEEE bits, so the read is the integer read
+/// and only the type on the vector differs. What that buys is the
+/// finbench decay filter, an edge amount against the amount of the
+/// edge before it in the chain, which is a value pinned on a level
+/// below arriving broadcast into arithmetic.
+///
+/// The fixture puts values on both sides of a bound that a chain can
+/// straddle: the graph is dense enough that a three hop chain exists
+/// out of most rows, and the amounts rise and fall along it, so the
+/// decay predicate keeps some chains and drops others rather than
+/// answering nothing or everything and agreeing by accident.
+#[test]
+fn a_float_column_runs_on_the_pipeline() {
+    use crate::zu1::props::store_rel_props;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("floats.zu1");
+    let mut db = Zu1File::create(&path).unwrap();
+    let n = N as u32;
+    let mut edges: Vec<(u32, u32)> = (0..n).map(|i| (i, (i * 7 + 3) % n)).collect();
+    edges.extend((0..n).map(|i| ((i * 13 + 5) % n, i)));
+    edges.extend((0..n).map(|i| (i, (i * 31 + 17) % n)));
+    edges.sort_unstable();
+    edges.dedup();
+    bulk_load_keyed(&mut db, "person", "knows", N, &edges, None).unwrap();
+    let age: Vec<u64> = (0..N).map(|i| (i * 37) % 100).collect();
+    // Two floats with different shapes: one climbs and holds no
+    // fraction, so a bound between two of them lands where an integer
+    // bound would, and one is a fraction that repeats every 17 rows.
+    let score: Vec<f64> = (0..N).map(|i| (i % 100) as f64).collect();
+    let ratio: Vec<f64> = (0..N).map(|i| (i % 17) as f64 / 4.0).collect();
+    store_props(
+        &mut db,
+        "person",
+        &[
+            ("age", PropValues::Int(&age)),
+            ("score", PropValues::Float(&score)),
+            ("ratio", PropValues::Float(&ratio)),
+        ],
+    )
+    .unwrap();
+    let amount: Vec<f64> = (0..edges.len())
+        .map(|i| (i % 23) as f64 * 4.5 + 1.0)
+        .collect();
+    let since: Vec<u64> = (0..edges.len() as u64).map(|i| 2000 + i % 25).collect();
+    store_rel_props(
+        &mut db,
+        "knows",
+        &[
+            ("amount", PropValues::Float(&amount)),
+            ("since", PropValues::Int(&since)),
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut db = Zu1File::open(&path).unwrap();
+    let (catalog, schema) = query::load_schema(&mut db).unwrap();
+    for source in [
+        // A float column against a constant, both ways round, and a
+        // whole column summed into an aggregate over it.
+        "MATCH (p:person) WHERE p.score > 50.0 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE 12.5 >= p.ratio RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.ratio <= 2.25 AND p.age > 40 RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.score = 7.0 RETURN p.id AS id ORDER BY id",
+        // Two float columns of one row, and one against arithmetic on
+        // the other, which is where the fraction matters.
+        "MATCH (p:person) WHERE p.ratio < p.score RETURN count(p) AS n",
+        "MATCH (p:person) WHERE p.score <= p.ratio * 8.0 RETURN count(p) AS n",
+        // An edge amount, and the shape the finbench decay filter is:
+        // a hop compared against the hop before it, scaled.
+        "MATCH (a:person)-[e:knows]->(b) WHERE e.amount > 90.0 RETURN count(b) AS n",
+        "MATCH (a:person)-[e:knows]->(b)-[f:knows]->(c) \
+         WHERE f.amount <= e.amount * 0.9 RETURN count(c) AS n",
+        "MATCH (a:person)-[e:knows]->(b)-[f:knows]->(c)-[g:knows]->(d) \
+         WHERE e.since > 2005 AND f.amount <= e.amount * 0.9 AND g.amount <= f.amount * 0.9 \
+         RETURN count(DISTINCT d.id) AS n",
+        // The same for an integer read off a level below, which the
+        // compiler used to hand back whatever it was multiplied by.
+        "MATCH (a:person)-[e:knows]->(b)-[f:knows]->(c) \
+         WHERE f.since <= e.since + 3 RETURN count(c) AS n",
+        "MATCH (a:person)-[e:knows]->(b) WHERE b.age > a.age * 2 RETURN count(b) AS n",
+    ] {
+        covered(&mut db, &catalog, &schema, source);
+    }
+
+    // A float is not a group key here. The row engine holds 0.0 and
+    // -0.0 in one group and every NaN in one group, a stored column
+    // can hold both, and a key on the pipeline is the bytes the value
+    // is stored as, so the grouping stays where the two agree.
+    for source in [
+        "MATCH (p:person) RETURN p.score AS s, count(p) AS n",
+        "MATCH (p:person) RETURN count(DISTINCT p.ratio) AS n",
+        "MATCH (a:person)-[e:knows]->(b) RETURN count(DISTINCT e.amount) AS n",
+    ] {
+        falls_back(&mut db, &catalog, &schema, source);
+    }
+
+    // The bound has to divide the column rather than take all of it or
+    // none, or the two engines would agree without reading a float.
+    let over = score.iter().filter(|&&v| v > 50.0).count() as i64;
+    assert!(over > 0 && over < N as i64, "the bound divides the column");
+    let r = query::run(
+        "MATCH (p:person) WHERE p.score > 50.0 RETURN count(p) AS n",
+        &mut db,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r.rows, [[Value::Int(over)]]);
 }
 
 /// A label bit is not a column, so the pipeline compiler has nothing

@@ -129,3 +129,7 @@ harness = false
 [[bench]]
 name = "stream"
 harness = false
+
+[[bench]]
+name = "convert"
+harness = false

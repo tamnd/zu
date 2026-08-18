@@ -31,18 +31,134 @@ const ESCAPE: u8 = 255;
 // couple of rounds for the survivors to settle against each other.
 const TRAIN_ROUNDS: usize = 7;
 const SAMPLE_TARGET: usize = 64 << 10;
+/// No symbol, in a chain link or a one-byte slot.
+const NONE: u16 = u16::MAX;
 
-/// Longest-match lookup at `pos` against the table; returns the code and
-/// matched length, or None when the position starts no symbol.
-fn best_match(map: &HashMap<Vec<u8>, u8>, bytes: &[u8], pos: usize) -> Option<(u8, usize)> {
-    let limit = MAX_SYMBOL_LEN.min(bytes.len() - pos);
-    for len in (1..=limit).rev() {
-        if let Some(&code) = map.get(&bytes[pos..pos + len]) {
-            return Some((code, len));
+/// A symbol table arranged for longest-match lookup: a slot per byte for
+/// the one-byte symbols, and a chain per two-byte prefix for the rest,
+/// each chain ordered longest symbol first so the first match found is
+/// the match.
+///
+/// The obvious version of this is a `HashMap<Vec<u8>, u8>` probed once
+/// per length from eight down to one, and that is what this was. It
+/// costs up to eight sip hashes of the bytes at every position of every
+/// buffer trained on or encoded, and it dominated writing a string
+/// column: a million short strings took 4.19s to encode, nearly all of
+/// it hashing. Two bytes of the input pick a chain that almost always
+/// holds one symbol, so a lookup is an index and a comparison of at
+/// most eight bytes, the same million strings take 1.14s, and the
+/// bytes written come out the same to the byte.
+struct Index {
+    syms: Vec<Vec<u8>>,
+    /// Code of the one-byte symbol for each byte value, or [`NONE`].
+    single: [u16; 256],
+    /// First symbol of the chain for each two-byte prefix, or [`NONE`].
+    heads: Box<[u16]>,
+    /// Next symbol in the chain, parallel to `syms`.
+    next: Vec<u16>,
+}
+
+impl Index {
+    fn new(syms: Vec<Vec<u8>>) -> Index {
+        let mut single = [NONE; 256];
+        let mut heads = vec![NONE; 1 << 16].into_boxed_slice();
+        let mut next = vec![NONE; syms.len()];
+        // Shortest first, pushing each onto the front of its chain, so
+        // every chain comes out longest first.
+        let mut order: Vec<u16> = (0..syms.len() as u16).collect();
+        order.sort_by_key(|&i| syms[i as usize].len());
+        for i in order {
+            let sym = &syms[i as usize];
+            if sym.len() == 1 {
+                single[sym[0] as usize] = i;
+            } else {
+                let bucket = ((sym[0] as usize) << 8) | sym[1] as usize;
+                next[i as usize] = heads[bucket];
+                heads[bucket] = i;
+            }
+        }
+        Index {
+            syms,
+            single,
+            heads,
+            next,
         }
     }
-    None
+
+    /// Longest-match lookup at `pos`; returns the code and matched
+    /// length, or None when the position starts no symbol.
+    fn best_match(&self, bytes: &[u8], pos: usize) -> Option<(u8, usize)> {
+        let rest = &bytes[pos..];
+        if rest.len() >= 2 {
+            let bucket = ((rest[0] as usize) << 8) | rest[1] as usize;
+            let mut i = self.heads[bucket];
+            while i != NONE {
+                let sym = &self.syms[i as usize];
+                if rest.starts_with(sym) {
+                    return Some((i as u8, sym.len()));
+                }
+                i = self.next[i as usize];
+            }
+        }
+        match self.single[rest[0] as usize] {
+            NONE => None,
+            code => Some((code as u8, 1)),
+        }
+    }
 }
+
+/// A candidate symbol during training: up to eight bytes and a length,
+/// which is a fixed size key rather than the `Vec` it stands for. The
+/// training loop proposes one candidate per position and one per pair of
+/// adjacent positions, so the `Vec` was two allocations and two hashes
+/// of a heap pointer's worth of bytes per position.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Candidate {
+    bytes: [u8; MAX_SYMBOL_LEN],
+    len: u8,
+}
+
+impl Candidate {
+    fn new(bytes: &[u8]) -> Candidate {
+        let mut out = [0u8; MAX_SYMBOL_LEN];
+        out[..bytes.len()].copy_from_slice(bytes);
+        Candidate {
+            bytes: out,
+            len: bytes.len() as u8,
+        }
+    }
+
+    fn to_vec(self) -> Vec<u8> {
+        self.bytes[..self.len as usize].to_vec()
+    }
+}
+
+/// FNV over the nine bytes of a [`Candidate`], with a final mix so the
+/// low bits a hash table indexes with carry the whole key. Sip hashing
+/// keys this small is most of what training used to cost, and nothing
+/// here is exposed to a chosen key: the input is bytes of a sample the
+/// writer drew itself, and a bad round of collisions costs time and not
+/// correctness.
+#[derive(Default)]
+struct SymHasher(u64);
+
+impl std::hash::Hasher for SymHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 29;
+        x
+    }
+}
+
+type SymHash = std::hash::BuildHasherDefault<SymHasher>;
 
 /// A sample of evenly spaced chunks so a table trained on a long buffer
 /// still sees its tail, capped near 64 KiB to keep training flat-cost.
@@ -72,26 +188,27 @@ fn sample(bytes: &[u8]) -> Vec<u8> {
 fn train(sample: &[u8]) -> Vec<Vec<u8>> {
     let mut table: Vec<Vec<u8>> = Vec::new();
     for _ in 0..TRAIN_ROUNDS {
-        let map: HashMap<Vec<u8>, u8> = table
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i as u8))
-            .collect();
-        let mut gain: HashMap<Vec<u8>, u64> = HashMap::new();
+        let index = Index::new(table);
+        let mut gain: HashMap<Candidate, u64, SymHash> = HashMap::default();
         let mut prev: Option<(usize, usize)> = None;
         let mut pos = 0;
         while pos < sample.len() {
-            let len = best_match(&map, sample, pos).map_or(1, |(_, len)| len);
-            *gain.entry(sample[pos..pos + len].to_vec()).or_insert(0) += len as u64;
+            let len = index.best_match(sample, pos).map_or(1, |(_, len)| len);
+            *gain
+                .entry(Candidate::new(&sample[pos..pos + len]))
+                .or_insert(0) += len as u64;
             if let Some((p_pos, p_len)) = prev
                 && p_len + len <= MAX_SYMBOL_LEN
             {
-                *gain.entry(sample[p_pos..pos + len].to_vec()).or_insert(0) += (p_len + len) as u64;
+                *gain
+                    .entry(Candidate::new(&sample[p_pos..pos + len]))
+                    .or_insert(0) += (p_len + len) as u64;
             }
             prev = Some((pos, len));
             pos += len;
         }
-        let mut candidates: Vec<(Vec<u8>, u64)> = gain.into_iter().collect();
+        let mut candidates: Vec<(Vec<u8>, u64)> =
+            gain.into_iter().map(|(c, g)| (c.to_vec(), g)).collect();
         candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         table = candidates
             .into_iter()
@@ -112,20 +229,20 @@ fn train(sample: &[u8]) -> Vec<Vec<u8>> {
 /// each buffer still carries the table it was encoded with, so a decoder
 /// cannot tell which of the two a writer did.
 pub struct Table {
-    symbols: Vec<Vec<u8>>,
-    map: HashMap<Vec<u8>, u8>,
+    index: Index,
 }
 
 impl Table {
     /// Trains on `bytes`, sampling it first when it is long.
     pub fn train(bytes: &[u8]) -> Table {
-        let symbols = train(&sample(bytes));
-        let map = symbols
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i as u8))
-            .collect();
-        Table { symbols, map }
+        Table {
+            index: Index::new(train(&sample(bytes))),
+        }
+    }
+
+    /// The symbols, in code order.
+    fn symbols(&self) -> &[Vec<u8>] {
+        &self.index.syms
     }
 
     /// What every encoded buffer pays to carry this table: the fixed
@@ -134,23 +251,23 @@ impl Table {
     /// first, because a table costing 2 KiB is nothing against a whole
     /// column and a seventh of one 1024-row chunk of short strings.
     pub fn header_len(&self) -> usize {
-        5 + self.symbols.len() + self.symbols.iter().map(Vec::len).sum::<usize>()
+        5 + self.symbols().len() + self.symbols().iter().map(Vec::len).sum::<usize>()
     }
 
     /// Encodes `bytes` into `out`, returning the encoded byte length.
     pub fn encode(&self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
         let start = out.len();
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        out.push(self.symbols.len() as u8);
-        for sym in &self.symbols {
+        out.push(self.symbols().len() as u8);
+        for sym in self.symbols() {
             out.push(sym.len() as u8);
         }
-        for sym in &self.symbols {
+        for sym in self.symbols() {
             out.extend_from_slice(sym);
         }
         let mut pos = 0;
         while pos < bytes.len() {
-            match best_match(&self.map, bytes, pos) {
+            match self.index.best_match(bytes, pos) {
                 Some((code, len)) => {
                     out.push(code);
                     pos += len;

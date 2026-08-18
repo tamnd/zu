@@ -44,11 +44,16 @@ pub enum Dir {
     Bwd,
 }
 
-/// The storage type of a property column, the two the props directory
-/// holds today; the full typed catalog is M3.
+/// The storage type of a property column, the three the props
+/// directory hands the vector layer today; the full typed catalog is
+/// M3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
     Int,
+    /// IEEE double. It rides the same fixed width lane an integer does
+    /// and is stored as its bit pattern, so the read is the integer
+    /// read and only the type on the vector differs.
+    Float,
     Str,
 }
 

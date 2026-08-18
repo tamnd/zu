@@ -1237,7 +1237,7 @@ pub fn store_rel_props_nullable(
 /// caller who has already resolved the name means, and the only way to
 /// reach a table outside the home graph. This is [`store_props_for`] on
 /// the edge side, and the difference is where the columns hang: a node
-/// table's props are the table index entry, an edge table's are a field
+/// table's props are the table index entry, a rel table's are a field
 /// of the directory that entry holds.
 pub fn store_rel_props_for(
     db: &mut Zu1File,

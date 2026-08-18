@@ -994,8 +994,13 @@ fn main() {
 
     // The same question of an edge insert, which is the one write that
     // rebuilds a whole structure rather than rewriting a column of it.
-    let edge_x = edge_large.us / edge_small.us.max(0.001);
-    println!("insert_edge_x: {edge_x:.2}x in time from {SMALL} to {LARGE} edges");
+    // Asked of the processor time and not the clock: a machine whose
+    // sync costs 5 ms carries that in both halves of the ratio and
+    // reads far flatter than it is, and a gate box whose sync is free
+    // does not, so the wall clock version of this number says more
+    // about the storage than about the write path.
+    let edge_x = edge_large.cpu / edge_small.cpu.max(0.001);
+    println!("insert_edge_x: {edge_x:.2}x in processor time from {SMALL} to {LARGE} edges");
 
     let mut failed = false;
     let checks = [

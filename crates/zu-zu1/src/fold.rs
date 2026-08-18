@@ -38,7 +38,7 @@ use crate::graph::{
 };
 use crate::keys::write_key_index;
 use crate::meta;
-use crate::props::{PropsDirectory, free_props, free_props_keeping_labels, load_props_at};
+use crate::props::{PropsDirectory, free_props_keeping_labels, free_props_reusing, load_props_at};
 use crate::segment::{read_segment, write_segment};
 use crate::txn::{Cell, Mvcc};
 use crate::wal::Wal;
@@ -418,8 +418,23 @@ fn fold_props(
             "appended row {offset} carries no value for column '{name}'"
         ))
     };
+    // A column the transaction wrote nothing into comes out of the fold
+    // holding what it went in holding, so the fold neither reads it nor
+    // writes it: the new directory names the segments the old one named
+    // and their blocks stay where they are. That is the difference
+    // between a one cell write costing one column and costing every
+    // column of the table, and it holds only while the row domain does,
+    // because a column that has to grow has to be rewritten to grow.
+    let touched = mvcc.touched_cols(table, epoch);
+    let grew = new_count != base;
+    let mut reused = vec![false; dir.columns.len()];
     let mut columns = Vec::with_capacity(dir.columns.len());
     for (ci, col) in dir.columns.iter().enumerate() {
+        if !grew && !touched.contains(&(ci as u32)) {
+            reused[ci] = true;
+            columns.push(col.clone());
+            continue;
+        }
         // A column holds a null the way storage does, as a row whose
         // validity bit is clear, so the fold carries a mask beside the
         // values: what the base said, widened over the rows the appends
@@ -513,8 +528,12 @@ fn fold_props(
     // per row rather than a word, so a row nothing named keeps what it
     // had and the ones named take their bits on and off.
     let changes = mvcc.label_changes(table, epoch);
+    // The bitset comes through on the same terms a column does: the
+    // same rows, and nothing renamed one of them.
+    let keep_labels = !grew && changes.is_empty();
     let labels = match (&dir.labels, changes.is_empty()) {
         (None, true) => None,
+        (Some(meta), _) if keep_labels => Some(meta.clone()),
         (base_labels, _) => {
             let mut words = Vec::with_capacity(new_count as usize);
             if let Some(meta) = base_labels {
@@ -525,7 +544,7 @@ fn fold_props(
             Some(write_segment(db, &words)?)
         }
     };
-    free_props(db, root)?;
+    free_props_reusing(db, root, keep_labels, &reused)?;
     let new_dir = PropsDirectory {
         node_count: new_count,
         columns,
@@ -1075,6 +1094,54 @@ mod tests {
         );
         let path = dir.path().join("fold.zu1");
         drop(f);
+        crate::verify(&path).unwrap();
+    }
+
+    /// A fold that touched one column leaves the others alone: the new
+    /// directory names the same blocks the old one did for them, and it
+    /// names new blocks for the one that was written. That is what makes
+    /// a one cell write cost one column instead of the whole table, and
+    /// `verify` at the end is what says the reused blocks were not also
+    /// handed to the free list.
+    #[test]
+    fn an_untouched_column_keeps_its_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cols.zu1");
+        let mut db = Zu1File::create(&path).unwrap();
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1)]).unwrap();
+        let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe", b"amy"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20, 30, 40])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .unwrap();
+        let person = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let before = load_props(&mut db, person).unwrap().unwrap();
+        let age = before.columns[0].meta.blocks.clone();
+        let name = before.columns[1].meta.blocks.clone();
+        let labels = before.labels.clone();
+        let mut wal = Wal::open(&dir.path().join("cols.wal")).unwrap();
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update(person, 1, 0, Cell::Int(21));
+        txn.commit(&mut wal).unwrap();
+        checkpoint_fold(&mut db, &mut mvcc, &mut wal).unwrap();
+        let after = load_props(&mut db, person).unwrap().unwrap();
+        assert_ne!(after.columns[0].meta.blocks, age, "age was written");
+        assert_eq!(after.columns[1].meta.blocks, name, "name came through");
+        assert_eq!(after.labels, labels, "the bitset came through");
+        assert_eq!(read_age(&mut db, person, 1), 21);
+        assert_eq!(read_age(&mut db, person, 3), 40);
+        assert_eq!(read_name(&mut db, person, 2), b"joe");
+        drop(db);
         crate::verify(&path).unwrap();
     }
 

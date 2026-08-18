@@ -637,14 +637,58 @@ pub enum PathMode {
     Acyclic,
 }
 
-/// GQL path selector: restricts a variable-length match to minimum-hop
-/// paths per endpoint pair.
+/// GQL path selector (ISO 16.6): how many of the paths a pattern
+/// matches are kept, per pair of endpoints.
+///
+/// `ALL PATHS` keeps every one of them, which is what a pattern with no
+/// selector does, so it has no variant here: the parser reads the words
+/// and lands on `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selector {
-    /// One shortest path per reached endpoint.
+    /// `ANY k PATHS`, and `ANY` on its own, which is `ANY 1`: up to k
+    /// paths per endpoint, whichever ones the search comes to first.
+    /// The standard leaves which ones to the implementation, and says
+    /// so.
+    Any(u64),
+    /// `ANY SHORTEST PATH`: one path of the least length per endpoint.
     AnyShortest,
-    /// Every shortest path per reached endpoint.
+    /// `ALL SHORTEST PATHS`: every path of the least length per
+    /// endpoint.
     AllShortest,
+    /// `SHORTEST k PATHS`: the k of least length per endpoint, which is
+    /// k paths and not k lengths, so it may take some of the paths of
+    /// one length and leave the rest.
+    Shortest(u64),
+    /// `SHORTEST k PATH GROUPS`: every path whose length is one of the
+    /// k least per endpoint, which is k lengths and however many paths
+    /// have them.
+    ShortestGroup(u64),
+}
+
+impl Selector {
+    /// Whether this one keeps paths by their length, which is every
+    /// selector but `ANY`.
+    ///
+    /// It is the question two rules ask. A length-bounded pattern like
+    /// `{3,5}` means one thing to a selector that reads lengths and
+    /// another to one that does not, and an unbounded `WALK` is finite
+    /// under some of these and not under others.
+    pub fn by_length(self) -> bool {
+        !matches!(self, Selector::Any(_))
+    }
+
+    /// Whether a pattern under this selector matches finitely many
+    /// paths even when the mode repeats nodes and edges and no upper
+    /// bound is written.
+    ///
+    /// Only the two that keep the least length alone do. A path of
+    /// least length repeats nothing, so there are finitely many however
+    /// the mode is written, while the second-least length under `WALK`
+    /// is the least length plus a lap of some cycle, and there is no
+    /// end of those.
+    pub fn bounds_a_walk(self) -> bool {
+        matches!(self, Selector::AnyShortest | Selector::AllShortest)
+    }
 }
 
 /// One linear path: a node, then rel-node steps left to right.
@@ -652,9 +696,10 @@ pub enum Selector {
 pub struct PathPattern {
     /// `p = (a)-[]->(b)` binds the path itself.
     pub var: Option<String>,
-    /// `ANY SHORTEST` / `ALL SHORTEST` before the first node.
+    /// The path selector before the first node, `None` for a pattern
+    /// that keeps every path it matches.
     pub selector: Option<Selector>,
-    /// `WALK` / `TRAIL` / `ACYCLIC` before the first node.
+    /// `WALK` / `TRAIL` / `SIMPLE` / `ACYCLIC` before the first node.
     pub mode: PathMode,
     pub start: NodePattern,
     pub steps: Vec<(RelPattern, NodePattern)>,

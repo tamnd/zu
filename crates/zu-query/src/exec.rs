@@ -792,6 +792,20 @@ fn node_tables_text(tables: &[u32], schema: &Schema) -> String {
         .join("|")
 }
 
+/// The selector as the plan listing says it, the empty string for a
+/// pattern that keeps every path. Both listings read it from here, so
+/// what a profile prints and what an explain prints cannot drift.
+pub(crate) fn selector_text(selector: Option<Selector>) -> String {
+    match selector {
+        None => String::new(),
+        Some(Selector::Any(k)) => format!(" any {k}"),
+        Some(Selector::AnyShortest) => " any shortest".into(),
+        Some(Selector::AllShortest) => " all shortest".into(),
+        Some(Selector::Shortest(k)) => format!(" shortest {k}"),
+        Some(Selector::ShortestGroup(k)) => format!(" shortest {k} group"),
+    }
+}
+
 fn rel_text(
     from: &str,
     to: &str,
@@ -881,11 +895,7 @@ fn op_label(
                 PathMode::Simple => " simple",
                 PathMode::Acyclic => " acyclic",
             };
-            let sel = match selector {
-                Some(Selector::AnyShortest) => " any shortest",
-                Some(Selector::AllShortest) => " all shortest",
-                None => "",
-            };
+            let sel = selector_text(*selector);
             let pinned = target.as_ref().map_or(String::new(), |key| {
                 format!(" [id = {}]", expr_text(key, query))
             });
@@ -1823,7 +1833,13 @@ fn compile_match_op(
                 // SHORTEST has to know the minimum hop count of every
                 // node on both sides before it can enumerate, which the
                 // meeting search deliberately never learns.
-                let target = if v.selector == Some(Selector::AnyShortest) {
+                // The lower bound has to be the one hop the meeting
+                // search assumes as well: it answers with the path it
+                // met on, which is a shortest one, and a pattern asking
+                // for at least three hops would have that thrown away
+                // rather than answered from a longer path.
+                let target = if v.selector == Some(Selector::AnyShortest) && v.min.unwrap_or(1) <= 1
+                {
                     lookahead.and_then(|next| match next {
                         LogicalPlan::Filter {
                             expr,
@@ -3177,6 +3193,153 @@ fn edge_passes(ctx: &mut StageCtx, gate: EdgeGate<'_>, rel: &Value) -> Result<bo
     Ok(truth(&verdict?)? == Some(true))
 }
 
+/// How many of the paths a walk finds it keeps, per endpoint, which is
+/// the path selector of ISO 16.6 as the walk sees it.
+///
+/// The selector names a pair of endpoints and one of the two is fixed
+/// for the whole walk, since a `VarExpand` starts from one node per
+/// row, so an endpoint here is the far one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// Every path, in the order the walk came to them.
+    All,
+    /// The first k the walk comes to, which is `ANY k`. Depth first, so
+    /// they are not the shortest k and are not promised to be: the
+    /// standard leaves which ones to the engine.
+    First(u64),
+    /// The k of least length, which is `SHORTEST k`, and `ANY SHORTEST`
+    /// when k is one.
+    Least(u64),
+    /// Every path whose length is one of the k least, which is
+    /// `SHORTEST k GROUP`, and `ALL SHORTEST` when k is one.
+    LeastGroups(u64),
+}
+
+impl Keep {
+    /// What a selector asks the walk for. `None` is `ALL PATHS`.
+    ///
+    /// Two of these are named twice by the standard, which is why the
+    /// pairs land in one place here: `ANY SHORTEST` is one path of the
+    /// least length and so is `SHORTEST 1`, and `ALL SHORTEST` is every
+    /// path of the least length and so is `SHORTEST 1 GROUP`.
+    fn of(selector: Option<Selector>) -> Keep {
+        match selector {
+            None => Keep::All,
+            Some(Selector::Any(k)) => Keep::First(k),
+            Some(Selector::AnyShortest) => Keep::Least(1),
+            Some(Selector::Shortest(k)) => Keep::Least(k),
+            Some(Selector::AllShortest) => Keep::LeastGroups(1),
+            Some(Selector::ShortestGroup(k)) => Keep::LeastGroups(k),
+        }
+    }
+}
+
+/// The paths one endpoint is holding, by their length, shortest first.
+type Lengths = BTreeMap<u64, Vec<Arc<PathLink>>>;
+
+/// The paths a walk is keeping, and the rule it keeps them by.
+///
+/// `All` and `First` answer as the walk runs and hold nothing besides
+/// the answer. The two that go by length cannot: a path of the least
+/// length may turn up after a longer one, so they hold what they have
+/// per endpoint and throw away as they go, which bounds what they hold
+/// by the answer rather than by the graph.
+struct Paths {
+    keep: Keep,
+    far: Vec<Value>,
+    trails: Vec<Value>,
+    /// How many paths each endpoint has taken, for `First`.
+    counts: BTreeMap<(u32, u64), u64>,
+    /// What each endpoint is holding, by path length, for the two that
+    /// go by length.
+    held: BTreeMap<(u32, u64), Lengths>,
+}
+
+impl Paths {
+    fn new(keep: Keep) -> Paths {
+        Paths {
+            keep,
+            far: Vec::new(),
+            trails: Vec::new(),
+            counts: BTreeMap::new(),
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// Offers one path, ending at `(table, offset)`, to the rule.
+    fn push(&mut self, table: u32, offset: u64, link: &Arc<PathLink>) {
+        match self.keep {
+            Keep::All => self.emit(table, offset, link.clone()),
+            Keep::First(k) => {
+                let taken = self.counts.entry((table, offset)).or_insert(0);
+                if *taken >= k {
+                    return;
+                }
+                *taken += 1;
+                self.emit(table, offset, link.clone());
+            }
+            Keep::Least(k) => {
+                let held = self.held.entry((table, offset)).or_default();
+                let total: usize = held.values().map(Vec::len).sum();
+                if total as u64 >= k {
+                    // Full, so this path is worth holding only if it is
+                    // shorter than the longest one held, and the longest
+                    // is the last key because the map is ordered.
+                    let (&longest, _) = held.iter().next_back().expect("a full endpoint holds one");
+                    if link.hops >= longest {
+                        return;
+                    }
+                    let bucket = held.get_mut(&longest).expect("the key was just read");
+                    bucket.pop();
+                    if bucket.is_empty() {
+                        held.remove(&longest);
+                    }
+                }
+                held.entry(link.hops).or_default().push(link.clone());
+            }
+            Keep::LeastGroups(k) => {
+                let held = self.held.entry((table, offset)).or_default();
+                if held.len() as u64 >= k && !held.contains_key(&link.hops) {
+                    // This length is a new group, and the endpoint has
+                    // all the groups it is allowed. It is worth having
+                    // only in place of the longest one held, which then
+                    // goes in full: a group is every path of its length
+                    // or it is not a group.
+                    let (&longest, _) = held.iter().next_back().expect("a full endpoint holds one");
+                    if link.hops >= longest {
+                        return;
+                    }
+                    held.remove(&longest);
+                }
+                held.entry(link.hops).or_default().push(link.clone());
+            }
+        }
+    }
+
+    fn emit(&mut self, table: u32, offset: u64, link: Arc<PathLink>) {
+        self.far.push(Value::Node { table, offset });
+        self.trails.push(Value::Chain(link));
+    }
+
+    /// The two columns the operator answers with: the far node of every
+    /// path kept, and the path.
+    ///
+    /// The rules that held paths back give them up here, endpoint by
+    /// endpoint and shortest first, so the order is the graph's order
+    /// rather than the order the walk happened to stumble on.
+    fn finish(mut self) -> (Vec<Value>, Vec<Value>) {
+        let held = std::mem::take(&mut self.held);
+        for ((table, offset), lengths) in held {
+            for (_, links) in lengths {
+                for link in links {
+                    self.emit(table, offset, link);
+                }
+            }
+        }
+        (self.far, self.trails)
+    }
+}
+
 /// Depth-first path enumeration for `VarExpand`: every path of
 /// `min..=max` hops from the start node under the mode's repeat rule,
 /// WALK unrestricted (the binder guarantees a bound), TRAIL with no
@@ -3194,13 +3357,11 @@ fn enumerate_paths(
     table: u32,
     offset: u64,
     link: &Arc<PathLink>,
-    far: &mut Vec<Value>,
-    trails: &mut Vec<Value>,
+    out: &mut Paths,
 ) -> Result<()> {
     let depth = link.hops;
     if depth >= spec.min && spec.to_tables.contains(&table) {
-        far.push(Value::Node { table, offset });
-        trails.push(Value::Chain(link.clone()));
+        out.push(table, offset, link);
     }
     if spec.max.is_some_and(|m| depth >= m) {
         return Ok(());
@@ -3250,7 +3411,7 @@ fn enumerate_paths(
             },
             hops: depth + 1,
         });
-        enumerate_paths(ctx, spec, next_table, next_offset, &child, far, trails)?;
+        enumerate_paths(ctx, spec, next_table, next_offset, &child, out)?;
     }
     Ok(())
 }
@@ -4298,75 +4459,93 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 c.cur = None;
                 return Ok(true);
             }
-            match selector {
-                Some(Selector::AnyShortest) => {
-                    // Chains build in discovery order, so a node's
-                    // parent chain always exists before its own and
-                    // every endpoint's path is one `Arc` clone.
-                    let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
-                    let mut chains: BTreeMap<(u32, u64), Arc<PathLink>> = BTreeMap::new();
-                    chains.insert((table, offset), chain_root(table, offset));
-                    for &(t, o) in &bfs.order {
-                        if let Some((rel_val, pt, po)) = bfs.parents.get(&(t, o)) {
-                            let parent = chains[&(*pt, *po)].clone();
-                            let hops = parent.hops + 1;
-                            chains.insert(
-                                (t, o),
-                                Arc::new(PathLink {
-                                    prev: Some(parent),
-                                    rel: Some(rel_val.clone()),
-                                    node: Value::Node {
-                                        table: t,
-                                        offset: o,
-                                    },
-                                    hops,
-                                }),
-                            );
-                        }
-                        if bfs.levels[&(t, o)] < *min || !to_tables.contains(&t) {
-                            continue;
-                        }
-                        far.push(Value::Node {
-                            table: t,
-                            offset: o,
-                        });
-                        trails.push(Value::Chain(chains[&(t, o)].clone()));
+            // The two searches that level the graph read a hop count as
+            // the distance from the start, so they answer a pattern
+            // whose lower bound is one hop and not one whose lower bound
+            // is higher: a node's least length is not its least length
+            // of at least three hops. A pattern like that goes to the
+            // walk below, which reads lengths off the paths it built and
+            // so can answer either. The binder leans on this split for
+            // what it lets an unbounded WALK carry.
+            let levelled = matches!(
+                selector,
+                Some(Selector::AnyShortest) | Some(Selector::AllShortest)
+            ) && *min <= 1;
+            if levelled && *selector == Some(Selector::AnyShortest) {
+                // Chains build in discovery order, so a node's parent
+                // chain always exists before its own and every
+                // endpoint's path is one `Arc` clone.
+                let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
+                let mut chains: BTreeMap<(u32, u64), Arc<PathLink>> = BTreeMap::new();
+                chains.insert((table, offset), chain_root(table, offset));
+                for &(t, o) in &bfs.order {
+                    if let Some((rel_val, pt, po)) = bfs.parents.get(&(t, o)) {
+                        let parent = chains[&(*pt, *po)].clone();
+                        let hops = parent.hops + 1;
+                        chains.insert(
+                            (t, o),
+                            Arc::new(PathLink {
+                                prev: Some(parent),
+                                rel: Some(rel_val.clone()),
+                                node: Value::Node {
+                                    table: t,
+                                    offset: o,
+                                },
+                                hops,
+                            }),
+                        );
                     }
+                    if bfs.levels[&(t, o)] < *min || !to_tables.contains(&t) {
+                        continue;
+                    }
+                    far.push(Value::Node {
+                        table: t,
+                        offset: o,
+                    });
+                    trails.push(Value::Chain(chains[&(t, o)].clone()));
                 }
-                Some(Selector::AllShortest) => {
-                    let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
-                    let spec = VarSpec {
-                        rels,
-                        direction: *direction,
-                        to_tables,
-                        min: *min,
-                        max: *max,
-                        mode: *mode,
-                        levels: Some(&bfs.levels),
-                        gate,
-                    };
+            } else if levelled {
+                // ALL SHORTEST. The level map cuts the walk down to the
+                // shortest-path DAG, so every path it finds is one of
+                // the shortest and the walk keeps the lot.
+                let bfs = hop_levels(ctx, rels, *direction, gate, *max, table, offset)?;
+                let spec = VarSpec {
+                    rels,
+                    direction: *direction,
+                    to_tables,
+                    min: *min,
+                    max: *max,
+                    mode: *mode,
+                    levels: Some(&bfs.levels),
+                    gate,
+                };
+                let root = chain_root(table, offset);
+                let mut out = Paths::new(Keep::All);
+                enumerate_paths(ctx, &spec, table, offset, &root, &mut out)?;
+                (far, trails) = out.finish();
+            } else {
+                let spec = VarSpec {
+                    rels,
+                    direction: *direction,
+                    to_tables,
+                    min: *min,
+                    max: *max,
+                    mode: *mode,
+                    levels: None,
+                    gate,
+                };
+                if *reach {
+                    // The rel column stays empty: nothing reads the
+                    // slot, which is what let the paths go. The rewrite
+                    // that sets this asks for no selector, since how
+                    // many paths reach a node is the question a selector
+                    // answers and this walk deliberately forgets it.
+                    far = reach_nodes(ctx, &spec, table, offset)?;
+                } else {
                     let root = chain_root(table, offset);
-                    enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
-                }
-                None => {
-                    let spec = VarSpec {
-                        rels,
-                        direction: *direction,
-                        to_tables,
-                        min: *min,
-                        max: *max,
-                        mode: *mode,
-                        levels: None,
-                        gate,
-                    };
-                    if *reach {
-                        // The rel column stays empty: nothing reads the
-                        // slot, which is what let the paths go.
-                        far = reach_nodes(ctx, &spec, table, offset)?;
-                    } else {
-                        let root = chain_root(table, offset);
-                        enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
-                    }
+                    let mut out = Paths::new(Keep::of(*selector));
+                    enumerate_paths(ctx, &spec, table, offset, &root, &mut out)?;
+                    (far, trails) = out.finish();
                 }
             }
             if far.is_empty() {
@@ -9544,8 +9723,9 @@ mod tests {
             gate: EdgeGate::OPEN,
         };
         let root = chain_root(0, 0);
-        let (mut far, mut trails) = (Vec::new(), Vec::new());
-        enumerate_paths(&mut ctx, &spec, 0, 0, &root, &mut far, &mut trails).expect("enumerate");
+        let mut out = Paths::new(Keep::All);
+        enumerate_paths(&mut ctx, &spec, 0, 0, &root, &mut out).expect("enumerate");
+        let (_far, trails) = out.finish();
         let mut links = BTreeSet::new();
         let mut total_hops = 0u64;
         for trail in &trails {

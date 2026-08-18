@@ -2588,8 +2588,15 @@ impl Binder<'_> {
             steps.push((rel, node));
         }
         if path.selector.is_some() && steps.iter().all(|(rel, _)| rel.range.is_none()) {
+            // A pattern of fixed length matches one path per set of
+            // elements, so there is nothing for a selector to choose
+            // between and no search for it to cut short. Two parallel
+            // edges are the one case where there would be, and picking
+            // between those is not implemented, so it is refused rather
+            // than answered as though the selector had been left out.
             return Err(invalid(
-                "a SHORTEST selector needs a variable-length relationship".into(),
+                "a path selector needs a variable-length relationship to choose between paths"
+                    .into(),
             ));
         }
         if let Some(slot) = slot {
@@ -3094,17 +3101,18 @@ impl Binder<'_> {
                 let (min, max) = (min.unwrap_or(0), max.unwrap_or(0));
                 return Err(invalid(format!("hop range *{min}..{max} is empty")));
             }
-            if selector.is_some() && min.is_some_and(|m| m > 1) {
-                return Err(invalid(
-                    "a SHORTEST selector needs a lower bound of 1; a minimum-hop \
-                     path cannot be forced longer"
-                        .into(),
-                ));
-            }
-            if mode == PathMode::Walk && max.is_none() && selector.is_none() {
+            // What tames an unbounded WALK is a search that cannot walk
+            // a cycle twice, and only the two that keep the least length
+            // and nothing else are that. They are also the two the
+            // executor answers by levelling the graph rather than by
+            // walking the paths, and it can only do that when the lower
+            // bound is one hop, so the same condition stands here: a
+            // pattern this accepts is a pattern that search can answer.
+            let tamed = selector.is_some_and(|s| s.bounds_a_walk()) && !min.is_some_and(|m| m > 1);
+            if mode == PathMode::Walk && max.is_none() && !tamed {
                 return Err(invalid(
                     "an unbounded WALK matches infinitely many paths; add an upper \
-                     bound or a SHORTEST selector"
+                     bound, or a shortest path selector with a lower bound of one hop"
                         .into(),
                 ));
             }
@@ -4892,12 +4900,23 @@ mod tests {
         assert!(e.contains("unbounded WALK"), "got: {e}");
         bound("MATCH WALK (a:Person)-[:KNOWS*1..3]->(b) RETURN b");
         bound("MATCH ANY SHORTEST WALK (a:Person)-[:KNOWS*]->(b) RETURN b");
+        // What tames it is keeping the least length and nothing else. A
+        // counted selector keeps a second length as well, and under WALK
+        // that is the least length plus a lap of a cycle, so there is
+        // still no end of them.
+        let e = bind_err("MATCH SHORTEST 2 WALK (a:Person)-[:KNOWS*]->(b) RETURN b");
+        assert!(e.contains("unbounded WALK"), "got: {e}");
+        let e = bind_err("MATCH ANY 2 WALK (a:Person)-[:KNOWS*]->(b) RETURN b");
+        assert!(e.contains("unbounded WALK"), "got: {e}");
+        bound("MATCH SHORTEST 2 WALK (a:Person)-[:KNOWS*1..4]->(b) RETURN b");
         // A selector without a variable-length rel selects nothing.
         let e = bind_err("MATCH ANY SHORTEST (a:Person)-[:KNOWS]->(b) RETURN b");
         assert!(e.contains("variable-length"), "got: {e}");
-        // Minimum-hop paths cannot be forced longer than one hop.
-        let e = bind_err("MATCH ALL SHORTEST (a:Person)-[:KNOWS*2..3]->(b) RETURN b");
-        assert!(e.contains("lower bound of 1"), "got: {e}");
+        // A lower bound above one hop asks for the least length among
+        // the paths that are long enough, which is a question the walk
+        // answers and the levelling search cannot, so it binds and the
+        // executor picks the search rather than being refused here.
+        bound("MATCH ALL SHORTEST (a:Person)-[:KNOWS*2..3]->(b) RETURN b");
         // The plain modes carry through to the bound rel.
         let q = bound("MATCH ACYCLIC (a:Person)-[:KNOWS*1..3]->(b) RETURN b");
         let BoundClause::Match { patterns, .. } = &q.clauses[0] else {

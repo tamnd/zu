@@ -255,9 +255,10 @@ fn batched(session: &mut Session, seeds: &[i64], deg: &[u32]) -> Tail {
     }
 }
 
-/// Both shapes over one graph, printed, with the friend list's ratio
-/// handed back because that is the one the ceiling sits on.
-fn measure(what: &str, path: &std::path::Path, deg: &[u32], seeds: &[i64]) -> f64 {
+/// Every shape over one graph, printed, with the friend list's ratio
+/// and the batched one handed back because those are the two the
+/// ceilings sit on.
+fn measure(what: &str, path: &std::path::Path, deg: &[u32], seeds: &[i64]) -> (f64, f64) {
     let mut session = Session::open(path).expect("session");
     let list = stream(
         &mut session,
@@ -302,7 +303,7 @@ fn measure(what: &str, path: &std::path::Path, deg: &[u32], seeds: &[i64]) -> f6
         batch.max,
         REQUESTS / BATCH,
     );
-    list.ratio()
+    (list.ratio(), batch.ratio())
 }
 
 fn main() {
@@ -329,13 +330,23 @@ fn main() {
     );
 
     let seeds = seeds();
-    let uniform_x = measure("uniform", &uniform_path, &uniform_deg, &seeds);
-    let power_x = measure("power law", &power_path, &power_deg, &seeds);
+    let (uniform_x, uniform_batch_x) = measure("uniform", &uniform_path, &uniform_deg, &seeds);
+    let (power_x, power_batch_x) = measure("power law", &power_path, &power_deg, &seeds);
 
     if std::env::var("ZU_GATE").as_deref() == Ok("1") {
         for (what, got, key) in [
             ("uniform", uniform_x, "tail_p99_p50_uniform_x"),
             ("power law", power_x, "tail_p99_p50_power_x"),
+            (
+                "uniform batched",
+                uniform_batch_x,
+                "tail_p99_p50_uniform_batch_x",
+            ),
+            (
+                "power law batched",
+                power_batch_x,
+                "tail_p99_p50_power_batch_x",
+            ),
         ] {
             let Some(ceiling) = budget(key) else {
                 continue;

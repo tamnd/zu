@@ -4458,8 +4458,7 @@
       "id": "zu::zu1::algo::wcc",
       "kind": "function",
       "name": "wcc",
-      "signature": "fn wcc(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader) -> zu_common::Result<Vec<u64>>",
-      "doc": "Weakly connected components over the undirected view of the rel\ntable: union-find over the forward lists, which name every edge\nonce. Each node's component id is the smallest id in the component,\nthe Graphalytics convention.\n\nThe smallest id, not the smallest row. A load that reorders rows,\nwhich every load of a real graph does because degree order is what\nmakes the CSR read well, leaves the two unrelated, and the caller\nthat wanted a component id then has to join the answer back to the\nkeys and take a minimum per group. That is a group-by and an unwind\nover the whole node table to repair an answer the kernel already\nhad the parts of."
+      "signature": "fn wcc(db: &mut zu_zu1::file::Zu1File, reader: &mut zu_zu1::graph::GraphReader) -> zu_common::Result<Vec<u64>>"
     },
     {
       "id": "zu::zu1::cache",
@@ -6776,15 +6775,15 @@
       "id": "zu::zu1::keys::key_by_row",
       "kind": "function",
       "name": "key_by_row",
-      "signature": "fn key_by_row(db: &mut zu_zu1::file::Zu1File, index: &KeyIndex) -> zu_common::Result<Vec<u64>>",
-      "doc": "Reads the index back in the shape [`write_key_index`] took it,\n`key_by_row[row]` being the key of that row.\n\nA kernel whose answer is stated in original ids rather than in rows\nneeds every key, and asking for them one at a time costs a fence\nsearch each to learn what two sequential segment scans already say."
+      "signature": "fn key_by_row(db: &mut zu_zu1::file::Zu1File, index: &KeyIndex, node_count: u64) -> zu_common::Result<Vec<Option<u64>>>",
+      "doc": "Reads the index back in the shape [`write_key_index`] took it,\n`key_by_row[row]` being the key of that row over the whole row\ndomain, and `None` where the index holds no key for the row.\n\nA kernel whose answer is stated in original ids rather than in rows\nneeds every key, and asking for them one at a time costs a fence\nsearch each to learn what two sequential segment scans already say.\n\nThe gaps are the rows a DELETE took away, which the index stops\ncovering the moment the fold rebuilds it. They are `None` rather\nthan any particular number because every number is a key some row\ncould legitimately hold."
     },
     {
       "id": "zu::zu1::keys::verify_key_index",
       "kind": "function",
       "name": "verify_key_index",
-      "signature": "fn verify_key_index(db: &mut zu_zu1::file::Zu1File, index: &KeyIndex, node_count: u64) -> zu_common::Result<()>",
-      "doc": "Full check for `zu verify`: both segments decode clean (crc and zone\nincluded via the scan path), the counts match the node domain, the\nkeys ascend strictly, and the rows are a permutation of it."
+      "signature": "fn verify_key_index(db: &mut zu_zu1::file::Zu1File, index: &KeyIndex, node_count: u64, dead: &[u64]) -> zu_common::Result<()>",
+      "doc": "Full check for `zu verify`: both segments decode clean (crc and zone\nincluded via the scan path), the keys ascend strictly, and the rows\nare exactly the live ones, which are the row domain less the sorted\noffsets `dead` names."
     },
     {
       "id": "zu::zu1::keys::write_key_index",
@@ -6792,6 +6791,13 @@
       "name": "write_key_index",
       "signature": "fn write_key_index(db: &mut zu_zu1::file::Zu1File, key_by_row: &[u64]) -> zu_common::Result<KeyIndex>",
       "doc": "Builds the sealed index from `key_by_row`, where `key_by_row[row]` is\nthe key of row `row`. Keys must be unique."
+    },
+    {
+      "id": "zu::zu1::keys::write_key_index_live",
+      "kind": "function",
+      "name": "write_key_index_live",
+      "signature": "fn write_key_index_live(db: &mut zu_zu1::file::Zu1File, key_by_row: &[u64], dead: &[u64]) -> zu_common::Result<KeyIndex>",
+      "doc": "The same over the rows `dead` does not name, which are sorted row\noffsets a DELETE took away.\n\nA row nothing holds any more has no original id, and keeping its key\nwould be worse than pointless: the key is the one thing a later\nINSERT can reasonably ask for back, and an index that still lists it\nrefuses the reuse as a duplicate of a row that is not there. So the\nindex covers the live rows, and a lookup of a key a DELETE took away\nmisses the way a lookup of a key nobody ever held does."
     },
     {
       "id": "zu::zu1::layout",
@@ -7704,6 +7710,13 @@
       "name": "read_segment_pooled",
       "signature": "fn read_segment_pooled(db: &mut zu_zu1::file::Zu1File, pool: &zu_zu1::cache::DecodedPool<Vec<u64>>, meta: &SegmentMeta) -> zu_common::Result<std::sync::Arc<Vec<u64>>>",
       "doc": "Reads a whole segment through `pool`, decoding it at most once per\npooled lifetime. The key is the segment's first block pointer, which\nevery segment has since even an empty one carries its chunk count,\nand which is unique per committed segment version."
+    },
+    {
+      "id": "zu::zu1::segment::rewrite_segment",
+      "kind": "function",
+      "name": "rewrite_segment",
+      "signature": "fn rewrite_segment(db: &mut zu_zu1::file::Zu1File, old: &SegmentMeta, values: &[u64], dirty: &std::collections::BTreeSet<usize>) -> zu_common::Result<SegmentMeta>",
+      "doc": "Writes the segment `values` describes, encoding only the chunks\n`dirty` names and copying the encoded bytes of the rest out of\n`old`.\n\nA fold rewrites a column because a cell of it changed, and picking\nthe cascade is most of what that costs: the selector sizes every\nscheme it knows against a chunk before it takes one, which is the\nright trade for a chunk that is new and pure waste for a chunk that\ncame back out of the file and is going into it unchanged. Those\nbytes are already an encoding of exactly these values, so they are\ncopied and the selector is asked only about what moved. A one cell\nwrite touches one chunk, whatever the table is holding.\n\n`values` is the whole new column rather than the chunks that moved,\nbecause the fences, the zone map and the sorted flag are the\nsegment's rather than a chunk's, and reading them off the values is\none pass over memory beside the encode this is not doing."
     },
     {
       "id": "zu::zu1::segment::write_segment",

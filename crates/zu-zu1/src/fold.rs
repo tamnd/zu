@@ -41,7 +41,7 @@ use crate::meta;
 use crate::props::{
     PropsDirectory, PropsReader, free_props_keeping_labels, free_props_reusing, load_props_at,
 };
-use crate::segment::{read_segment, write_segment};
+use crate::segment::{CHUNK_ROWS, read_segment, rewrite_segment, write_segment};
 use crate::txn::{Cell, Mvcc};
 use crate::wal::Wal;
 
@@ -495,15 +495,24 @@ fn fold_props(
         let meta = if col.is_lane() {
             let mut values = Vec::with_capacity(new_count as usize);
             read_segment(db, &col.meta, &mut values)?;
+            // Which chunks of the segment the fold is about to change,
+            // so that the rest keep the bytes they already encode to
+            // rather than going back through the cascade selector.
+            let mut dirty = BTreeSet::new();
+            let mut touch = |offset: u64| {
+                dirty.insert(offset as usize / CHUNK_ROWS);
+            };
             for offset in 0..new_count {
                 match mvcc.cell(table, base, offset, ci as u32, epoch) {
                     Some(Cell::Int(x)) if offset < base => {
                         values[offset as usize] = x;
                         valid.set(offset);
+                        touch(offset);
                     }
                     Some(Cell::Int(x)) => {
                         values.push(x);
                         valid.set(offset);
+                        touch(offset);
                     }
                     // A removed row keeps a word where its value was,
                     // because the lane is fixed width and a reader that
@@ -514,13 +523,14 @@ fn fold_props(
                             false => values.push(0),
                         }
                         valid.clear(offset);
+                        touch(offset);
                     }
                     Some(Cell::Str(_)) => return Err(mismatch(&col.name, offset)),
                     None if offset < base => {}
                     None => return Err(missing(&col.name, offset)),
                 }
             }
-            write_segment(db, &values)?
+            rewrite_segment(db, &col.meta, &values, &dirty)?
         } else {
             let (mut bytes, mut ends) = (Vec::new(), Vec::new());
             read_blob_segment(db, &col.meta, &mut bytes, &mut ends)?;

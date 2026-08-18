@@ -176,6 +176,23 @@ fn power_iteration(
 /// keys and take a minimum per group. That is a group-by and an unwind
 /// over the whole node table to repair an answer the kernel already
 /// had the parts of.
+/// The original id of every one of `n` rows.
+///
+/// A kernel that answers in ids needs one for each row it walks, and a
+/// row a DELETE took away has none: the index stopped covering it, and
+/// no number stands in for it, since every number is a key some other
+/// row could hold. So a kernel of this kind refuses a table with a
+/// deleted row rather than inventing the id it would have to print.
+fn every_key(db: &mut Zu1File, index: &crate::keys::KeyIndex, n: usize) -> Result<Vec<u64>> {
+    crate::keys::key_by_row(db, index, n as u64)?
+        .into_iter()
+        .collect::<Option<Vec<u64>>>()
+        .ok_or(zu_common::ZuError::Unsupported {
+            what: "a kernel answering in original ids over a table a DELETE took a row from",
+            id: 0,
+        })
+}
+
 pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
     let n = reader.directory().one_domain()? as usize;
     let mut parent: Vec<u64> = (0..n as u64).collect();
@@ -205,13 +222,7 @@ pub fn wcc(db: &mut Zu1File, reader: &mut GraphReader) -> Result<Vec<u64>> {
     let Some(index) = reader.directory().keys.clone() else {
         return Ok(roots);
     };
-    let key = crate::keys::key_by_row(db, &index)?;
-    if key.len() != n {
-        return Err(zu_common::ZuError::Corrupt {
-            what: "key index",
-            detail: format!("{} keys over {n} nodes", key.len()),
-        });
-    }
+    let key = every_key(db, &index, n)?;
     let mut smallest = vec![u64::MAX; n];
     for (row, &root) in roots.iter().enumerate() {
         let slot = &mut smallest[root as usize];
@@ -546,15 +557,9 @@ pub fn cdlp(db: &mut Zu1File, reader: &mut GraphReader, rounds: usize) -> Result
     let n = reader.directory().one_domain()? as usize;
     let index = reader.directory().keys.clone();
     let mut label = match index {
-        Some(index) => crate::keys::key_by_row(db, &index)?,
+        Some(index) => every_key(db, &index, n)?,
         None => (0..n as u64).collect(),
     };
-    if label.len() != n {
-        return Err(zu_common::ZuError::Corrupt {
-            what: "key index",
-            detail: format!("{} keys over {n} nodes", label.len()),
-        });
-    }
     let mut next = label.clone();
     // One scratch vector for the whole sweep: the votes of one node are
     // read and forgotten inside its iteration, and a fresh allocation

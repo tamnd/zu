@@ -18,7 +18,7 @@
 //! and the columns live in the file. So this is where a value meets its
 //! column, and where a value the column cannot hold is refused.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use zu_common::gqlstatus::codes;
 use zu_common::{FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
@@ -277,10 +277,87 @@ impl<'a> Batch<'a> {
         }
     }
 
+    /// The rel tables this run writes into that store something on
+    /// their edges, which are the ones a second edge over a pair
+    /// cannot go into.
+    pub(crate) fn propful(&self) -> BTreeSet<u32> {
+        self.rel_columns
+            .iter()
+            .filter(|(_, cols)| !cols.is_empty())
+            .map(|(&table, _)| table)
+            .collect()
+    }
+
+    /// The rows this run is creating, as table and offset. They are not
+    /// in the store yet, so nothing may be asked of the store about
+    /// them.
+    pub(crate) fn created_rows(&self) -> BTreeSet<(u32, u64)> {
+        self.nodes.iter().map(|n| (n.table, n.offset)).collect()
+    }
+
     /// What the whole run writes, in the order it has to be staged in.
     pub(crate) fn staged(self) -> (Vec<NewNode>, Vec<NewRel>) {
         (self.nodes, self.edges)
     }
+}
+
+/// Refuses a second edge over a pair that a rel table storing edge
+/// properties already holds, before the write reaches the log.
+///
+/// The store holds a pair that runs twice perfectly well: a bulk load
+/// takes every copy the file gave it, the reader answers a pair with
+/// the whole run, and the fold keeps the copies in the order they were
+/// written. What a statement cannot do yet is say afterwards which copy
+/// it means. A DELETE names an edge by the rows it runs between and so
+/// does a property write, so both would reach every copy of the pair
+/// rather than the one the statement matched, and an edge property
+/// nobody can then delete or change on its own is worse than one that
+/// was never written. So the second edge is refused here, where the
+/// statement can be told why, and the refusal goes when those two learn
+/// to carry the ordinal the match already knows.
+///
+/// `propful` names the tables this applies to. A rel table that stores
+/// nothing on its edges has nothing to address by the pair, so a pair
+/// may run through it as many times as the statements say.
+///
+/// `created` names the rows the same statement is making. They have no
+/// edges by definition, and asking the store about a row it does not
+/// hold yet is an error rather than an answer, so an edge onto one is
+/// checked against this statement's own edges and nothing else.
+pub(crate) fn refuse_duplicate_pairs(
+    graph: &mut impl zu_query::exec::Graph,
+    catalog: &Catalog,
+    edges: &[NewRel],
+    propful: &BTreeSet<u32>,
+    created: &BTreeSet<(u32, u64)>,
+) -> Result<()> {
+    let mut written: BTreeSet<(u32, u64, u64)> = BTreeSet::new();
+    for edge in edges {
+        if !propful.contains(&edge.table) {
+            continue;
+        }
+        // Twice in one statement is as much a duplicate as once now
+        // and once before, and the store cannot be asked about the
+        // first of the two because it is not in it yet.
+        let fresh = written.insert((edge.table, edge.src, edge.dst));
+        let ends = catalog.rel_by_id(edge.table);
+        let brand_new = ends.is_some_and(|rel| {
+            created.contains(&(rel.from, edge.src)) || created.contains(&(rel.to, edge.dst))
+        });
+        if fresh && (brand_new || graph.edge_ordinal(edge.table, edge.src, edge.dst)?.is_none()) {
+            continue;
+        }
+        return Err(ZuError::InvalidArgument(format!(
+            "'{}' stores properties on its edges, and rows {} and {} already run through it, \
+             so a second edge between them has nowhere to put its values",
+            catalog
+                .rel_by_id(edge.table)
+                .map_or("?", |rel| rel.name.as_str()),
+            edge.src,
+            edge.dst
+        )));
+    }
+    Ok(())
 }
 
 /// Fills in the stored row of every edge the statement has just
@@ -294,8 +371,9 @@ impl<'a> Batch<'a> {
 /// back what the same statement wrote on `k`.
 ///
 /// A pair of rows that runs more than once names as many edges as it
-/// has copies, and the lookup answers with the first of them, which is
-/// all a caller holding nothing but the pair can be told.
+/// has copies, and the one this statement wrote is the last of them:
+/// the fold keeps the copies in the order they were written and puts
+/// the ones it is adding behind the ones already there.
 pub(crate) fn settle(graph: &mut impl zu_query::exec::Graph, rows: &mut [Value]) -> Result<()> {
     for row in rows {
         let Value::List(values) = row else {
@@ -309,9 +387,9 @@ pub(crate) fn settle(graph: &mut impl zu_query::exec::Graph, rows: &mut [Value])
                 ord,
             } = value
                 && *ord == Value::NO_REL_ROW
-                && let Some(found) = graph.edge_ordinal(*table, *src, *dst)?
+                && let Some((base, count)) = graph.edge_run(*table, *src, *dst)?
             {
-                *ord = found;
+                *ord = base + count - 1;
             }
         }
     }
@@ -1076,6 +1154,45 @@ mod tests {
         let path = dir.path().join(name);
         seeded_with_edge_props(&path);
         Session::open(&path).expect("open")
+    }
+
+    /// A second edge over a pair a table storing edge properties
+    /// already holds is refused where the statement runs, not where the
+    /// fold would have found it, so the log never takes a record the
+    /// fold cannot fold.
+    #[test]
+    fn a_second_edge_over_one_pair_is_refused_before_it_is_logged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open_with_edge_props(&dir, "second-edge.zu1");
+
+        let err = session
+            .run(
+                "MATCH (a:person), (b:person) WHERE a.name = 'ada' AND b.name = 'kay' \
+                 INSERT (a)-[:knows {since: 2020}]->(b)",
+                &[],
+            )
+            .expect_err("rows 0 and 1 already run through knows");
+        let said = err.to_string();
+        assert!(said.contains("rows 0 and 1"), "{said}");
+        assert!(said.contains("knows"), "{said}");
+
+        // Refused where it was written, so nothing is in the file and
+        // the next statement reads the store it always read.
+        let out = session
+            .run("MATCH ()-[k:knows]->() RETURN k.since", &[])
+            .expect("the store is intact");
+        assert_eq!(out.rows.len(), 1);
+
+        // Twice in one statement is the same refusal, and neither of
+        // the two is in the store to be found by the other.
+        let err = session
+            .run(
+                "INSERT (x:person {age: 1, name: 'a'})-[:knows {since: 1}]->(y:person {age: 2, name: 'b'}), \
+                 (x)-[:knows {since: 2}]->(y)",
+                &[],
+            )
+            .expect_err("one statement, one pair, two edges");
+        assert!(err.to_string().contains("rows 2 and 3"), "{err}");
     }
 
     /// The case the milestone line is about: an edge is written

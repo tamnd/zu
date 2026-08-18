@@ -513,7 +513,7 @@ impl<'c> Appender<'c> {
                     ))
                 })?);
             }
-            refuse_keyed(db, &catalog, id)?;
+            refuse_keyed(db, &catalog, id, dir.columns.iter().any(|c| c.name == "id"))?;
             Target::Nodes { table: id, cols }
         } else if let Some(rel) = catalog.rel_by_name(table) {
             Target::Edges {
@@ -692,12 +692,17 @@ pub(crate) fn sidecar(db: &Path) -> PathBuf {
 }
 
 /// Refuses a node table whose row domain a rel table's key index is
-/// built over.
+/// built over and which has no `id` column to key an appended row by.
 ///
-/// Growing the domain would leave that index describing a table that
-/// no longer exists, and the fold says so; saying it here means the
-/// caller learns before buffering a load rather than after.
-fn refuse_keyed(db: &mut Zu1File, catalog: &Catalog, table: u32) -> Result<()> {
+/// The fold grows a key index by reading the key of each appended row
+/// out of that column, so a table that has one can be appended to and a
+/// table that has not cannot. The fold says so either way, and saying
+/// it here means the caller learns before buffering a load rather than
+/// after.
+fn refuse_keyed(db: &mut Zu1File, catalog: &Catalog, table: u32, has_id: bool) -> Result<()> {
+    if has_id {
+        return Ok(());
+    }
     let rels: Vec<String> = catalog
         .rel_tables()
         .iter()
@@ -711,7 +716,7 @@ fn refuse_keyed(db: &mut Zu1File, catalog: &Catalog, table: u32) -> Result<()> {
             .is_some()
         {
             return Err(ZuError::Unsupported {
-                what: "appending rows to a table a keyed rel table is built over",
+                what: "appending rows to a keyed table with no 'id' column to key them by",
                 id: table,
             });
         }

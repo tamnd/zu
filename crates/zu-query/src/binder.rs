@@ -3179,7 +3179,9 @@ impl Binder<'_> {
             Some(name) => match self.scope.get(name).copied() {
                 Some(slot) => {
                     if self.variables[slot].ty != Type::Node {
-                        return Err(invalid(format!(
+                        // The name resolves and resolves to something
+                        // already taken, which is what 42002 is for.
+                        return Err(bad_reference(format!(
                             "'{name}' is already bound as {}, not a node",
                             self.variables[slot].ty
                         )));
@@ -3325,8 +3327,9 @@ impl Binder<'_> {
             Some(name) => {
                 if self.scope.contains_key(name) {
                     // Cypher's relationship uniqueness: a rel variable
-                    // binds exactly once.
-                    return Err(invalid(format!(
+                    // binds exactly once, and a second declaration of a
+                    // name already taken is an invalid reference.
+                    return Err(bad_reference(format!(
                         "relationship variable '{name}' is already bound"
                     )));
                 }

@@ -10,10 +10,13 @@
 
 pub use zu_common::gqlstatus;
 pub use zu_common::{
-    C_ABI_VERSION, DiagnosticRecord, Epoch, GqlStatus, Interrupt, NodeId, Position, Result,
-    Severity, ZuError,
+    C_ABI_VERSION, DiagnosticRecord, DurationKind, Epoch, FloatBits, GqlStatus, IntBits, Interrupt,
+    LogicalType, NodeId, Position, Result, Severity, Temporal, ZuError,
 };
 pub use zu_query::exec::{OpProfile, Profile, StageProfile, Streamed};
+/// Registering a caller's own columns as a table of a connection: the
+/// replacement scan a client's `register()` is built on.
+pub use zu_query::frame::{Column, Frame, Layout};
 pub use zu_query::params;
 pub use zu_query::plan::{PlanNode, QueryPlan, ScalarPlan};
 pub use zu_query::row::{Batch, Flow, FromRow, FromValue, Row, RowIter};

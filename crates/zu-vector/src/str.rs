@@ -3,11 +3,13 @@
 //! A string cell is a fixed 16-byte view: length, a 4-byte prefix, and
 //! either the remaining bytes inline (len <= 12) or a buffer id plus
 //! offset into shared buffers. Comparisons check the prefix word first,
-//! which settles most inequality without touching the payload. Buffers
-//! are shared Arc byte slices: a decoded segment chunk straight from
-//! storage, or bytes a kernel computed. No String allocation and no
-//! UTF-8 revalidation happen on the read path; FSST and FullZip chunks
-//! are validated once at decode.
+//! which settles most inequality without touching the payload. A buffer
+//! is a byte range and a handle that keeps it alive: a decoded segment
+//! chunk straight from storage, bytes a kernel computed, or the data
+//! buffer of a registered frame, which the engine reads where it lies
+//! and never owns. No String allocation and no UTF-8 revalidation
+//! happen on the read path; FSST and FullZip chunks are validated once
+//! at decode.
 
 use std::sync::Arc;
 
@@ -115,12 +117,46 @@ impl StrView {
     }
 }
 
-/// Shared byte buffers backing long string views. Buffer 0 onward are
-/// Arc slices, so a vector holding views into a decoded segment chunk
-/// keeps the chunk alive without copying it.
+/// One byte range long views resolve through, and whatever keeps it
+/// alive.
+///
+/// A pointer and a length, with the owner beside them rather than in
+/// the way of them. Bytes worth pointing at do not all come from the
+/// engine's allocator: the columns of a registered frame are buffers
+/// somebody else owns, and copying them to make them addressable here
+/// would be the copy the registration exists to avoid. Resolving a
+/// view is a bounds check and an add whichever kind of bytes it is.
+struct Buf {
+    ptr: *const u8,
+    len: usize,
+    /// Held, never read. What it is is what its drop is: freeing an
+    /// engine allocation, or calling the release callback a frame
+    /// arrived with.
+    _owner: Owner,
+}
+
+/// What a buffer's bytes belong to.
+enum Owner {
+    /// An allocation of the engine's own.
+    Held(#[allow(dead_code)] Arc<[u8]>),
+    /// Bytes from outside the engine, alive for as long as this handle
+    /// is. Nothing here knows what it is and nothing here needs to.
+    Lent(#[allow(dead_code)] Arc<dyn std::any::Any + Send + Sync>),
+}
+
+// The bytes are immutable for as long as the owner lives and the owner
+// is itself `Send + Sync`, so the pointer beside it carries no thread
+// affinity of its own. Every buffer a vector reads through is read
+// only: writing one is what `RawBuf::borrowed` refuses.
+unsafe impl Send for Buf {}
+unsafe impl Sync for Buf {}
+
+/// Shared byte buffers backing long string views. A vector holding
+/// views into a decoded segment chunk, or into a frame's Arrow data
+/// buffer, keeps what it points at alive without copying it.
 #[derive(Default)]
 pub struct StrBuffers {
-    bufs: Vec<Arc<[u8]>>,
+    bufs: Vec<Buf>,
 }
 
 impl StrBuffers {
@@ -128,15 +164,69 @@ impl StrBuffers {
         Self::default()
     }
 
-    /// Register a buffer and get its id.
+    /// Register an allocation of the engine's own and get its id.
     pub fn push(&mut self, buf: Arc<[u8]>) -> u16 {
+        let (ptr, len) = (buf.as_ptr(), buf.len());
+        self.add(Buf {
+            ptr,
+            len,
+            _owner: Owner::Held(buf),
+        })
+    }
+
+    /// Register bytes from outside the engine and get their id.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at `len` initialized bytes that nobody writes
+    /// or frees for as long as `owner` lives, and dropping `owner`
+    /// must be what releases them. Holding it here is what makes that
+    /// last as long as the views do.
+    pub unsafe fn push_lent(
+        &mut self,
+        ptr: *const u8,
+        len: usize,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> u16 {
+        self.add(Buf {
+            ptr,
+            len,
+            _owner: Owner::Lent(owner),
+        })
+    }
+
+    fn add(&mut self, buf: Buf) -> u16 {
         let id = u16::try_from(self.bufs.len()).expect("string buffer count fits u16");
         self.bufs.push(buf);
         id
     }
 
+    /// How many buffers are registered, which is the id the next one
+    /// will take.
+    pub fn len(&self) -> usize {
+        self.bufs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
+
     pub fn slice(&self, id: u16, offset: u32, len: usize) -> &[u8] {
-        &self.bufs[id as usize][offset as usize..offset as usize + len]
+        let buf = &self.bufs[id as usize];
+        let start = offset as usize;
+        // The same bounds check indexing an `Arc<[u8]>` did, kept in
+        // release as well: a view that has run past its buffer is a bug
+        // in whoever built it, and the other answer is reading whatever
+        // is next in the address space.
+        assert!(
+            start + len <= buf.len,
+            "string view {start}..{} runs past its {}-byte buffer",
+            start + len,
+            buf.len
+        );
+        // Safe by `Buf`'s own contract: the bytes are alive while the
+        // owner is, the owner is held here, and the range is checked.
+        unsafe { std::slice::from_raw_parts(buf.ptr.add(start), len) }
     }
 }
 
@@ -247,6 +337,32 @@ mod tests {
         let a = StrView::long(&p1, i1, 0);
         let b = StrView::long(&p2, i2, 0);
         assert!(!a.eq_with(&bufs, &b, &bufs));
+    }
+
+    #[test]
+    fn lent_bytes_read_where_they_lie() {
+        // What a registered frame hands over: an allocation somebody
+        // else made, pointed at rather than copied, kept alive by the
+        // handle it arrived with.
+        let outside: Arc<Vec<u8>> = Arc::new(b"a string long enough to need a buffer".to_vec());
+        let (ptr, len) = (outside.as_ptr(), outside.len());
+        let mut bufs = StrBuffers::new();
+        let id = unsafe { bufs.push_lent(ptr, len, Arc::clone(&outside) as Arc<_>) };
+        let view = StrView::long(&outside, id, 0);
+        assert_eq!(view.bytes(&bufs), &outside[..]);
+        // The buffers hold it, so the last handle out here is not the
+        // last handle anywhere.
+        assert_eq!(Arc::strong_count(&outside), 2);
+        drop(outside);
+        assert_eq!(view.bytes(&bufs), b"a string long enough to need a buffer");
+    }
+
+    #[test]
+    #[should_panic(expected = "runs past its")]
+    fn a_view_past_its_buffer_is_caught() {
+        let mut bufs = StrBuffers::new();
+        let id = bufs.push(Arc::from(&b"twenty bytes exactly"[..]));
+        bufs.slice(id, 16, 8);
     }
 
     #[test]

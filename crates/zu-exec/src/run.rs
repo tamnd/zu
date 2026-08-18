@@ -1579,8 +1579,9 @@ impl<'a> Worker<'a> {
                 }
             }
             // The compiler only ties a join on an integer column or a
-            // row id, so the key is never a node here.
+            // row id, so the key is never a node or a constant here.
             ScalarRef::Node { .. } => unreachable!("a node is not a join key"),
+            ScalarRef::Const { .. } => unreachable!("a constant is not a join key"),
         }
         v
     }
@@ -2224,6 +2225,7 @@ impl<'a> Worker<'a> {
                 }
                 ScalarRef::RowId { .. } => row_at(last, pos),
                 ScalarRef::Node { .. } => unreachable!("a node is not a join key"),
+                ScalarRef::Const { .. } => unreachable!("a constant is not a join key"),
             };
             keys.push(k);
             rows.push(pos as u16);
@@ -3577,6 +3579,12 @@ fn broadcast(src: &ValueVector, at: usize, len: usize, arena: &mut MorselArena) 
 /// Reads one scalar for the sink: refs on the newest level read at
 /// `pos`, refs on earlier levels read their pinned row.
 fn scalar(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<Value> {
+    // A constant is the same on every row and reads nothing off one, so
+    // it answers before any of the level arithmetic below, which has no
+    // level to do it with.
+    if let ScalarRef::Const { at } = r {
+        return Ok(plan.consts[at].clone());
+    }
     let level = r.level();
     let chunk = &set.chunks[level];
     let idx = if level + 1 == set.chunks.len() {
@@ -3592,6 +3600,7 @@ fn scalar(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<V
     let at = match r {
         ScalarRef::Col { vec, .. } => vec,
         ScalarRef::Node { .. } | ScalarRef::RowId { .. } => 0,
+        ScalarRef::Const { .. } => unreachable!("a constant answered above"),
     };
     if !chunk.vecs[at].is_valid(idx) {
         return Ok(Value::Null);
@@ -3609,6 +3618,7 @@ fn scalar(plan: &ExecPlan, set: &ChunkSet, r: ScalarRef, pos: usize) -> Result<V
             }
             zu_query::snapshot::ColType::Str => Value::Str(str_at(&chunk.vecs[vec], idx)?),
         },
+        ScalarRef::Const { .. } => unreachable!("a constant answered above"),
     })
 }
 
@@ -3633,6 +3643,7 @@ fn int_key(set: &ChunkSet, r: ScalarRef, pos: usize) -> Option<u64> {
             .then(|| chunk.vecs[vec].values::<i64>()[idx] as u64),
         ScalarRef::RowId { .. } => Some(row_at(chunk, idx)),
         ScalarRef::Node { .. } => unreachable!("a node is not a join key"),
+        ScalarRef::Const { .. } => unreachable!("a constant is not a join key"),
     }
 }
 
@@ -3644,6 +3655,7 @@ fn int_scalar(set: &ChunkSet, r: ScalarRef, pos: usize) -> i64 {
         ScalarRef::Col { vec, .. } => chunk.vecs[vec].values::<i64>()[pos],
         ScalarRef::RowId { .. } => row_at(chunk, pos) as i64,
         ScalarRef::Node { .. } => unreachable!("nodes are not integer arguments"),
+        ScalarRef::Const { .. } => unreachable!("a constant is not an aggregate argument"),
     }
 }
 
@@ -3662,6 +3674,9 @@ fn part_kind(r: ScalarRef) -> PartKind {
                 unreachable!("a float is not a key the compiler hands over")
             }
         },
+        // The compiler declines a constant key, so one never reaches a
+        // packer either. See `keyable`.
+        ScalarRef::Const { .. } => unreachable!("a constant is not a key the compiler hands over"),
     }
 }
 
@@ -3685,6 +3700,9 @@ fn fill_key_col(
     let chunk = &set.chunks[level];
     let live = level + 1 == set.chunks.len();
     match r {
+        // The compiler declines a constant key, so one never reaches a
+        // fill. See `keyable`.
+        ScalarRef::Const { .. } => unreachable!("a constant is not a key the compiler hands over"),
         ScalarRef::Node { .. } | ScalarRef::RowId { .. } => {
             // The node's table is the level's table, one word for the
             // whole vector; the row id is the varying half.
@@ -3803,6 +3821,7 @@ fn gather_ints(set: &ChunkSet, r: ScalarRef, sel: Option<&[u16]>, rows: usize, o
             }
         }
         ScalarRef::Node { .. } => unreachable!("nodes are not integer arguments"),
+        ScalarRef::Const { .. } => unreachable!("a constant is not an aggregate argument"),
     }
 }
 
@@ -4084,6 +4103,7 @@ mod tests {
             levels,
             columns: columns.iter().map(|s| s.to_string()).collect(),
             func: None,
+            consts: Vec::new(),
         }
     }
 

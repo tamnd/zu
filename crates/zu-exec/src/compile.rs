@@ -41,6 +41,9 @@ pub(crate) struct ExecPlan {
     /// The kernel ran once while this plan was compiled, so every
     /// worker reads the same answer and none of them runs it again.
     pub func: Option<FuncCol>,
+    /// The values [`ScalarRef::Const`] names, one entry per constant
+    /// the sink writes into its rows.
+    pub consts: Vec<Value>,
 }
 
 /// Where level 0 comes from.
@@ -376,6 +379,10 @@ pub(crate) enum ScalarRef {
         vec: usize,
         ty: ColType,
     },
+    /// A value the query wrote or bound, held on the plan at `at` and
+    /// copied into every row. It reads nothing off the row, which is
+    /// what makes it the one ref with no level.
+    Const { at: usize },
 }
 
 /// Whether two refs read the same thing. A ref carries its column type
@@ -393,16 +400,22 @@ fn same_ref(a: ScalarRef, b: ScalarRef) -> bool {
                 level: y, vec: j, ..
             },
         ) => x == y && i == j,
+        (ScalarRef::Const { at: x }, ScalarRef::Const { at: y }) => x == y,
         _ => false,
     }
 }
 
 impl ScalarRef {
+    /// The level this reads off. A constant reads off none, and says so
+    /// with a level no plan holds, so every `== level` test about it is
+    /// false and anything that would index a chunk with it panics
+    /// rather than reading the wrong one.
     pub(crate) fn level(&self) -> usize {
         match *self {
             ScalarRef::Node { level }
             | ScalarRef::RowId { level }
             | ScalarRef::Col { level, .. } => level,
+            ScalarRef::Const { .. } => usize::MAX,
         }
     }
 }
@@ -792,7 +805,7 @@ fn keyable(r: ScalarRef) -> bool {
         ScalarRef::Col {
             ty: ColType::Float,
             ..
-        }
+        } | ScalarRef::Const { .. }
     )
 }
 
@@ -850,6 +863,7 @@ pub(crate) fn compile(
         func_slot: None,
         func: None,
         marks: HashMap::new(),
+        consts: Vec::new(),
     };
     c.compile(plan)
 }
@@ -946,6 +960,8 @@ struct Compiler<'a> {
     /// holds the answer. A predicate naming the slot compiles into a
     /// read of that column.
     marks: HashMap<usize, (usize, usize)>,
+    /// The constants the sink writes, in the order they were asked for.
+    consts: Vec<Value>,
 }
 
 impl Compiler<'_> {
@@ -2107,6 +2123,7 @@ impl Compiler<'_> {
             },
             ops,
             sink,
+            consts: std::mem::take(&mut self.consts),
             levels: self
                 .levels
                 .drain(..)
@@ -2153,6 +2170,7 @@ impl Compiler<'_> {
                             ScalarRef::Node { level }
                             | ScalarRef::RowId { level }
                             | ScalarRef::Col { level, .. } => *level = map[*level],
+                            ScalarRef::Const { .. } => {}
                         },
                         _ => {}
                     }
@@ -2195,6 +2213,7 @@ impl Compiler<'_> {
                         ScalarRef::Node { level }
                         | ScalarRef::RowId { level }
                         | ScalarRef::Col { level, .. } => *level = map[*level],
+                        ScalarRef::Const { .. } => {}
                     }
                     *to = map[*to];
                 }
@@ -2202,17 +2221,21 @@ impl Compiler<'_> {
                     ScalarRef::Node { level }
                     | ScalarRef::RowId { level }
                     | ScalarRef::Col { level, .. } => *level = map[*level],
+                    ScalarRef::Const { .. } => {}
                 },
                 Op::HasEdge { from, .. } => *from = map[*from],
                 Op::Filter { .. } | Op::BracketHit { .. } => {}
             }
         }
+        // A constant sits beside the levels rather than on one, so
+        // there is nothing in it for the remap to move.
         let fix = |r: &mut ScalarRef| match r {
             ScalarRef::Node { level }
             | ScalarRef::RowId { level }
             | ScalarRef::Col { level, .. } => {
                 *level = map[*level];
             }
+            ScalarRef::Const { .. } => {}
         };
         match sink {
             SinkSpec::Count => {}
@@ -2771,6 +2794,17 @@ impl Compiler<'_> {
         })
     }
 
+    /// Puts a value on the plan and answers the ref that reads it back.
+    /// Two items that wrote the same constant take two entries, because
+    /// a `Value` is cheaper than the walk that would find the first
+    /// one.
+    fn push_const(&mut self, value: Value) -> ScalarRef {
+        self.consts.push(value);
+        ScalarRef::Const {
+            at: self.consts.len() - 1,
+        }
+    }
+
     /// A written constant or a parameter, as the value it stands for.
     fn const_value(&self, expr: &BoundExpr) -> Option<Value> {
         match expr {
@@ -2785,6 +2819,39 @@ impl Compiler<'_> {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// A projected item that stands for one value however the row it
+    /// lands on came about: a written constant, a bound parameter, or a
+    /// list or a record built out of those.
+    ///
+    /// [`Self::const_value`] answers the scalar half of this and is
+    /// what a comparison against a column wants, so the two are kept
+    /// apart: a record is a fine thing to project and not a thing a
+    /// column predicate knows how to test against.
+    fn const_item(&self, expr: &BoundExpr) -> Option<Value> {
+        match expr {
+            BoundExpr::Literal(Literal::Null) => Some(Value::Null),
+            // Whatever the caller bound, whole. A comparison is picky
+            // about this and a projection is not: the old engine hands
+            // the bound value straight out here too.
+            BoundExpr::Param(ix) => self.params.get(*ix).cloned(),
+            BoundExpr::List(items) => items
+                .iter()
+                .map(|item| self.const_item(item))
+                .collect::<Option<_>>()
+                .map(Value::List),
+            // GV45, and the shape `SET p = {age: 41}` writes. The
+            // fields sort on the way in here exactly as they do in the
+            // old engine, so a record is one value whichever engine
+            // built it.
+            BoundExpr::Map(pairs) => pairs
+                .iter()
+                .map(|(name, item)| Some((name.clone(), self.const_item(item)?)))
+                .collect::<Option<Vec<_>>>()
+                .map(Value::record),
+            _ => self.const_value(expr),
         }
     }
 
@@ -3398,6 +3465,19 @@ impl Compiler<'_> {
                 .slot_level
                 .get(slot)
                 .map(|&level| ScalarRef::Node { level })),
+            // A value the query wrote or bound is the same value on
+            // every row, so it goes on the plan once and the sink
+            // copies it out. Statements that write are full of these:
+            // the read half of `SET p.age = 41` projects the row and
+            // the 41 beside it, and before this the 41 alone was enough
+            // to send the whole statement back to the old engine.
+            BoundExpr::Literal(_)
+            | BoundExpr::Param(_)
+            | BoundExpr::List(_)
+            | BoundExpr::Map(_) => match self.const_item(expr) {
+                Some(value) => Ok(Some(self.push_const(value))),
+                None => self.register_expr(expr),
+            },
             BoundExpr::Property { base, key } => {
                 let BoundExpr::Var(slot) = base.as_ref() else {
                     return Ok(None);
@@ -3789,6 +3869,10 @@ impl Compiler<'_> {
                     return Ok(None);
                 };
                 let (from, mut col, ty) = match r {
+                    // A property is never a constant, so this is the
+                    // arm nothing reaches rather than a shape to build
+                    // a program out of.
+                    ScalarRef::Const { .. } => return Ok(None),
                     ScalarRef::RowId { level } => (level, 0, PhysType::Int64),
                     ScalarRef::Col { level, vec, ty } => (
                         level,

@@ -905,6 +905,72 @@ impl SqliteStore {
         rows.collect::<rusqlite::Result<_>>().map_err(sql_err)
     }
 
+    /// The named property columns of node table `n_<table>`, each one
+    /// whole and in row order, dynamically typed the way SQLite stores
+    /// them. The outer vector is indexed by column and the inner one by
+    /// row.
+    ///
+    /// This is [`rel_rows`](Self::rel_rows) over a node table and it is
+    /// here for the same reason: the caller wants the whole column, and
+    /// a value at a time through the index pays a seek per node. A
+    /// conversion reads every property of every node exactly once, so
+    /// the difference between the two routes is the difference between
+    /// one scan and one lookup per node, which on a million nodes is
+    /// the whole cost of the ingest.
+    ///
+    /// Column major rather than row major because that is the order the
+    /// writer wants: a zu1 property column is built one column at a
+    /// time, and handing the values over already grouped lets the
+    /// caller move each value into place instead of copying it out of a
+    /// row it shares with values for other columns.
+    ///
+    /// A node table is dense: `zrow` runs from zero to the row count
+    /// with no holes, because a row is what gives a node its place in
+    /// the zu1 load. A gap would silently shift every property after it
+    /// onto the wrong node, so the read checks rather than trusts.
+    pub fn node_columns_values(&self, table: &str, columns: &[String]) -> Result<Vec<Vec<Value>>> {
+        let count = self.node_count(table)?;
+        let name = ident(table)?;
+        let mut sql = String::from("SELECT zrow");
+        for col in columns {
+            sql.push_str(&format!(", p_{}", ident(col)?));
+        }
+        sql.push_str(&format!(" FROM n_{name} ORDER BY zrow"));
+        let rows = count.max(0) as usize;
+        let mut out: Vec<Vec<Value>> = (0..columns.len())
+            .map(|_| Vec::with_capacity(rows))
+            .collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let mut cursor = stmt.query([]).map_err(sql_err)?;
+        let mut seen = 0i64;
+        while let Some(row) = cursor.next().map_err(sql_err)? {
+            let zrow: i64 = row.get(0).map_err(sql_err)?;
+            if zrow != seen {
+                return Err(ZuError::Corrupt {
+                    what: "sqlite node table",
+                    detail: format!("'{table}' row {seen} is numbered {zrow}; node rows are dense"),
+                });
+            }
+            for (i, column) in out.iter_mut().enumerate() {
+                column.push(match row.get_ref(i + 1).map_err(sql_err)? {
+                    ValueRef::Null => Value::Null,
+                    ValueRef::Integer(v) => Value::Int(v),
+                    ValueRef::Real(v) => Value::Real(v),
+                    ValueRef::Text(v) => Value::Text(String::from_utf8_lossy(v).into_owned()),
+                    ValueRef::Blob(v) => Value::Blob(v.to_vec()),
+                });
+            }
+            seen += 1;
+        }
+        if seen != count {
+            return Err(ZuError::Corrupt {
+                what: "sqlite node table",
+                detail: format!("'{table}' counts {count} rows and reads back {seen}"),
+            });
+        }
+        Ok(out)
+    }
+
     /// Number of rows in node table `n_<table>`.
     pub fn node_count(&self, table: &str) -> Result<i64> {
         self.count("n", table)

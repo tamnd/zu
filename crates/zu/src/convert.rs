@@ -777,8 +777,29 @@ pub fn sqlite_to_zu1(db_path: &Path, zu1_path: &Path) -> Result<()> {
         if !declared.is_empty() {
             let names: Vec<String> = declared.iter().map(|(n, _)| n.clone()).collect();
             let count = sq.node_count(&node.name)? as u64;
+            // One scan rather than a lookup per node. The staging pass
+            // below walks the table column by column, and asking SQLite
+            // for a single value each time it does costs a prepared
+            // statement and an index descent per node per column, which
+            // is what the per node ingest cost was made of.
+            //
+            // Each value is moved out rather than copied, which is why
+            // the cells are options: a string property read a second
+            // time would find the hole the first read left, and saying
+            // so is better than handing back a null that reads as an
+            // absent property.
+            let mut columns = sq.node_columns_values(&node.name, &names)?;
+            let mut columns: Vec<Vec<Option<Value>>> = columns
+                .drain(..)
+                .map(|col| col.into_iter().map(Some).collect())
+                .collect();
             let staged = Staged::read(&node.name, &declared, count, |row, ci| {
-                sq.read_node_prop(&node.name, row as i64, &names[ci])
+                columns[ci][row as usize].take().ok_or_else(|| {
+                    ZuError::InvalidArgument(format!(
+                        "'{}' column '{}' row {row} was read twice",
+                        node.name, names[ci]
+                    ))
+                })
             })?;
             staged.with_inputs(|columns| {
                 store_props_nullable(&mut zu, &node.name, columns)?;

@@ -2335,10 +2335,25 @@ mod tests {
                 "Filter p.id < VALUE {0}",
                 "ScanNodes p: Person",
                 "",
-                "VALUE {0}:",
+                "VALUE {0} (once):",
                 "Aggregate count(*) AS COUNT(*)",
                 "ScanNodes q: Person",
             ],
+            "got:\n{plan}"
+        );
+    }
+
+    /// The same subquery reading a name from the query around it. It
+    /// is still a plan of its own and still not an operator under the
+    /// filter, and the header line says what the other one's does not:
+    /// this one runs per row, and which name makes it.
+    #[test]
+    fn a_value_query_that_reads_a_name_says_it_runs_per_row() {
+        let plan = optimized(
+            "MATCH (p:Person) WHERE p.id < VALUE { MATCH (q:Person) WHERE q.id = p.id RETURN COUNT(*) } RETURN p.id AS id",
+        );
+        assert!(
+            lines(&plan).contains(&"VALUE {0} (per row, reading p):"),
             "got:\n{plan}"
         );
     }

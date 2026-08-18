@@ -1010,6 +1010,14 @@ pub(crate) fn compile_parsed(
 pub(crate) fn bind_args(names: &[String], params: &[(&str, Value)]) -> Result<Vec<Value>> {
     let mut args = Vec::with_capacity(names.len());
     for name in names {
+        // A position the binder made for a value query expression to
+        // read a name of the query around it at. The executor fills it
+        // from the row, so the caller is not missing anything by not
+        // having filled it.
+        if zu_query::binder::is_capture_param(name) {
+            args.push(Value::Null);
+            continue;
+        }
         match params.iter().find(|(n, _)| n == name) {
             Some((_, v)) => args.push(v.clone()),
             None => {

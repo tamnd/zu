@@ -15,7 +15,7 @@ pub use zu_common::{
 };
 pub use zu_query::exec::{OpProfile, Profile, StageProfile, Streamed};
 pub use zu_query::params;
-pub use zu_query::plan::{PlanNode, QueryPlan};
+pub use zu_query::plan::{PlanNode, QueryPlan, ScalarPlan};
 pub use zu_query::row::{Batch, Flow, FromRow, FromValue, Row, RowIter};
 pub use zu_storage::{CheckpointMode, Direction, GraphStore, Snapshot};
 pub use zu_zu1 as zu1;

@@ -675,10 +675,30 @@ pub struct QueryPlan {
     pub columns: Vec<String>,
     pub params: Vec<String>,
     pub notes: Vec<String>,
+    /// The value query expressions this statement holds, in the order
+    /// `VALUE {n}` in the tree names them (GQ18).
+    ///
+    /// Each is a plan of its own rather than an operator of this one,
+    /// because that is what it is: a query written where a value
+    /// belongs is run on its own and what stands in the tree is the
+    /// value it answered.
+    pub scalars: Vec<ScalarPlan>,
+}
+
+/// One value query expression as a plan, and how often it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarPlan {
+    /// The names it reads from the query around it, empty for one that
+    /// reads none. Empty is the whole test for whether it decorrelates:
+    /// a query reading nothing answers the same value for every row and
+    /// is run once, and a query reading a name is run per row.
+    pub reads: Vec<String>,
+    pub plan: QueryPlan,
 }
 
 impl QueryPlan {
-    /// The listing EXPLAIN prints, notes first and the tree under them.
+    /// The listing EXPLAIN prints, notes first, the tree under them,
+    /// and the plan of each value query expression under that.
     pub fn render(&self) -> String {
         let mut out = String::new();
         for note in &self.notes {
@@ -687,18 +707,47 @@ impl QueryPlan {
         if let Some(root) = &self.root {
             root.write(0, &mut out);
         }
+        for (ix, scalar) in self.scalars.iter().enumerate() {
+            let how = if scalar.reads.is_empty() {
+                "once".to_string()
+            } else {
+                format!("per row, reading {}", scalar.reads.join(", "))
+            };
+            let _ = writeln!(out, "\nVALUE {{{ix}}} ({how}):");
+            for line in scalar.plan.render().lines() {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
         out
     }
 }
 
 /// Describes a compiled statement: the operator tree with the columns
-/// and parameter names that go with it.
+/// and parameter names that go with it, and the plan of every value
+/// query expression written in it.
+///
+/// A subquery's plan is built here rather than carried in, the same
+/// way the executor builds it: nothing above the binder holds one, and
+/// a listing that had to be given the plans it prints would be a
+/// listing that could be given the wrong ones.
 pub fn describe(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> QueryPlan {
+    let mut scalars = Vec::with_capacity(query.scalars.len());
+    for scalar in &query.scalars {
+        let Ok(built) = build(scalar) else { continue };
+        let Ok(opt) = crate::optimizer::optimize(built, scalar, schema) else {
+            continue;
+        };
+        scalars.push(ScalarPlan {
+            reads: scalar.captures.iter().map(|c| c.name.clone()).collect(),
+            plan: describe(&opt, scalar, schema),
+        });
+    }
     QueryPlan {
         root: tree(plan, query, schema),
         columns: query.columns.clone(),
         params: query.params.clone(),
         notes: Vec::new(),
+        scalars,
     }
 }
 
@@ -709,28 +758,13 @@ pub fn tree(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<P
 }
 
 /// Renders a plan as the indented tree EXPLAIN prints, top operator
-/// first, one child per line under it.
+/// first, one child per line under it, and the plan of each value
+/// query expression under that.
 ///
-/// This is [`tree`] printed, so the listing and the structure a caller
-/// reads cannot say different things about the same statement.
+/// This is [`describe`] printed, so the listing and the structure a
+/// caller reads cannot say different things about the same statement.
 pub fn explain(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> String {
-    let mut out = tree(plan, query, schema).map_or(String::new(), |root| root.render());
-    // A value query expression is a plan of its own that runs once
-    // before this one, so it is printed once, under it, rather than
-    // wherever the expression reading it stands (GQ18).
-    for (ix, scalar) in query.scalars.iter().enumerate() {
-        let Ok(built) = build(scalar) else { continue };
-        let Ok(opt) = crate::optimizer::optimize(built, scalar, schema) else {
-            continue;
-        };
-        out.push_str(&format!("\nVALUE {{{ix}}}:\n"));
-        for line in explain(&opt, scalar, schema).lines() {
-            out.push_str("  ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
+    describe(plan, query, schema).render()
 }
 
 fn slot_name(query: &BoundQuery, slot: usize) -> &str {

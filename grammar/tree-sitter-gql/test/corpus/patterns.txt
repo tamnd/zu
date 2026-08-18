@@ -441,3 +441,41 @@ MATCH (a)-[:KNOWS]->(b) ((b)-[:KNOWS]->(c)) RETURN c
         (projection_item
           (variable
             (identifier)))))))
+
+================================================================================
+A quantifier behind a parenthesized path pattern
+================================================================================
+
+MATCH (a)((x)-[:LINK]->(y)){2}(b) RETURN SUM(y.step)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (subpath
+            (node
+              (identifier))
+            (relationship
+              (rel_detail
+                (label
+                  (identifier))))
+            (node
+              (identifier)))
+          (quantifier
+            (integer))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (function_call
+            (identifier)
+            (property_access
+              (variable
+                (identifier))
+              (identifier))))))))

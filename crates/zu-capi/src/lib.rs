@@ -177,6 +177,11 @@ pub const ZU_TYPE_LIST: i32 = 7;
 pub const ZU_TYPE_PATH: i32 = 8;
 pub const ZU_TYPE_TEMPORAL: i32 = 9;
 pub const ZU_TYPE_RECORD: i32 = 10;
+/// GV60 and GV61, the two reference values. A host reads neither
+/// through an accessor: a handle has no contents to hand over, so the
+/// tag is the whole of what a binding can say about the cell.
+pub const ZU_TYPE_GRAPH: i32 = 11;
+pub const ZU_TYPE_BINDING_TABLE: i32 = 12;
 
 /// Which temporal a temporal cell is, on [`zu_value_temporal`].
 ///
@@ -1827,6 +1832,8 @@ pub unsafe extern "C" fn zu_result_cell_type(
         Some(Value::Path(_)) | Some(Value::Chain(_)) => ZU_TYPE_PATH,
         Some(Value::Record(_)) => ZU_TYPE_RECORD,
         Some(Value::Temporal(_)) => ZU_TYPE_TEMPORAL,
+        Some(Value::Graph(_)) => ZU_TYPE_GRAPH,
+        Some(Value::BindingTable(_)) => ZU_TYPE_BINDING_TABLE,
         None => return ZuStatus::Misuse,
     };
     unsafe { *out = tag };
@@ -2356,6 +2363,8 @@ pub unsafe extern "C" fn zu_value_type(v: *const ZuValue) -> i32 {
         Some(Value::Path(_) | Value::Chain(_)) => ZU_TYPE_PATH,
         Some(Value::Temporal(_)) => ZU_TYPE_TEMPORAL,
         Some(Value::Record(_)) => ZU_TYPE_RECORD,
+        Some(Value::Graph(_)) => ZU_TYPE_GRAPH,
+        Some(Value::BindingTable(_)) => ZU_TYPE_BINDING_TABLE,
     }
 }
 

@@ -184,6 +184,11 @@ const NOTES: &[&str] = &[
      WITH, and the definitions read left to right so a later one may use a name an earlier one \
      in the same statement gave; the name is a variable, so LET of a property is refused with \
      the statement that does change a property named",
+    "a projection holding an aggregate groups by the items that are not aggregates, and GROUP \
+     BY says that same grouping out loud, so the keys and the non-aggregate items have to be \
+     the same: an item the grouping does not fix has no one value in a group and a key the \
+     projection does not carry leaves no column saying which group a row is, and both are \
+     refused by name rather than answered with a row of the group picked arbitrarily",
     "a page of a result is written OFFSET and LIMIT, and SKIP is the synonym the standard \
      names for OFFSET, so the two words are one clause and writing both of them is refused \
      rather than skipping twice",

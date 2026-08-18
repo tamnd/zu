@@ -500,6 +500,12 @@ pub struct Projection {
     /// `RETURN *`; may still carry explicit items after a comma.
     pub star: bool,
     pub items: Vec<ProjectionItem>,
+    /// The `GROUP BY` keys, written after the items (ISO 16.15, GQ15)
+    /// and empty when the clause was not written at all. Without it a
+    /// projection holding an aggregate groups by everything else it
+    /// projects, which is the Cypher rule and stays; with it the
+    /// grouping is what the reader said it is.
+    pub group_by: Vec<Expr>,
     /// The `ORDER BY` keys, in the order they were written.
     pub order_by: Vec<SortKey<Expr>>,
     pub skip: Option<Expr>,

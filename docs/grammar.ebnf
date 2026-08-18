@@ -155,7 +155,13 @@ where_clause    = "WHERE" , expression ;
 
 projection      = [ "DISTINCT" ] , ( "*" | projection_item ) ,
                   { "," , projection_item } ,
-                  [ order_by ] , [ page ] ;
+                  [ group_by ] , [ order_by ] , [ page ] ;
+
+(* GQ15, ISO 16.15. The grouping the projection would have implied,
+   written out: the items say what a row of a group holds and this
+   says what a group is, so an item that is not an aggregate has to be
+   one of these keys. *)
+group_by        = "GROUP" , "BY" , expression , { "," , expression } ;
 
 (* GQ12 and GQ13, ISO 14.9. OFFSET is the standard's word and SKIP is
    the synonym it names for it, so the two are one clause and only one

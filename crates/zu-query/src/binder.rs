@@ -2173,7 +2173,51 @@ impl Binder<'_> {
                 aggregate: ctx.saw_aggregate,
             });
         }
-        let has_aggregate = items.iter().any(|i| i.aggregate);
+        let mut has_aggregate = items.iter().any(|i| i.aggregate);
+        let mut grouped_without_aggregate = false;
+
+        // An explicit GROUP BY says what a group is, and the items say
+        // what a row of one holds, so the two have to agree: every
+        // item that is not an aggregate is read once per group and can
+        // only be something the grouping already fixed.
+        //
+        // The keys are checked against the items rather than carried
+        // beside them, because the grouping this engine runs is the
+        // non-aggregate items themselves. That is the same grouping
+        // when the two agree, and a key the projection does not carry
+        // is refused by name rather than grouped by silently and
+        // dropped.
+        if !projection.group_by.is_empty() {
+            let mut keys = Vec::new();
+            for key in &projection.group_by {
+                let mut ctx = ExprCtx::new(false);
+                let (bound, _) = self.bind_expr(key, &mut ctx)?;
+                keys.push((bound, text(key)));
+            }
+            for item in items.iter().filter(|item| !item.aggregate) {
+                if !keys.iter().any(|(key, _)| *key == item.expr) {
+                    return Err(invalid(format!(
+                        "'{}' is read once per group, so it has to be one of the GROUP BY keys or an aggregate over the group",
+                        item.name
+                    )));
+                }
+            }
+            for (key, written) in &keys {
+                if !items
+                    .iter()
+                    .any(|item| !item.aggregate && item.expr == *key)
+                {
+                    return Err(invalid(format!(
+                        "the GROUP BY key {written} is not one of the {clause} items, so the rows it groups have no column saying which group they are: project it as well"
+                    )));
+                }
+            }
+            // Grouping with nothing to aggregate answers one row per
+            // group, which is what DISTINCT over the keys is, and the
+            // keys are the items.
+            grouped_without_aggregate = !has_aggregate;
+            has_aggregate = true;
+        }
 
         // ORDER BY and a WITH's WHERE see the projected names; without
         // aggregation the pre-projection variables stay visible too.
@@ -2229,7 +2273,7 @@ impl Binder<'_> {
             }
         }
         Ok(BoundClause::Project {
-            distinct: projection.distinct,
+            distinct: projection.distinct || grouped_without_aggregate,
             items,
             order_by,
             skip,

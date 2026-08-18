@@ -155,6 +155,13 @@ pub(crate) fn run_streamed(
     );
     let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched.work);
     for (idx, &range) in sched.morsels.iter().enumerate() {
+        // Before the break below, because `stop.stopped()` is true for
+        // a quota that is filled and for a caller who interrupted, and
+        // those two end a run differently: the first is an answer that
+        // is all there, the second is an answer that stops partway and
+        // has to say so. Breaking out for both would hand back a
+        // truncated result reported as a whole one.
+        options.interrupt.check()?;
         if !st.wants_more() || stop.stopped() {
             break;
         }

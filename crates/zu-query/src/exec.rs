@@ -468,6 +468,31 @@ pub trait Graph {
     /// One property of one node. The v0 contract is that `id` equals
     /// the offset; everything else is up to the engine.
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value>;
+    /// The same property of many rows of one table, in `out` in the
+    /// caller's row order, the bulk read behind a filter over a
+    /// scanned vector.
+    ///
+    /// The default loops [`Graph::property`], which is what every
+    /// engine did before there was a way to ask for more than one at a
+    /// time. An engine that stores a column together overrides it: a
+    /// vector of rows wants one column, and resolving the name and
+    /// finding the column's chunk once for the vector is the whole
+    /// difference between a filter that reads a column and one that
+    /// looks a property up a thousand times.
+    fn properties(
+        &mut self,
+        table: u32,
+        rows: &[u64],
+        key: &str,
+        out: &mut Vec<Value>,
+    ) -> Result<()> {
+        out.clear();
+        out.reserve(rows.len());
+        for &row in rows {
+            out.push(self.property(table, row, key)?);
+        }
+        Ok(())
+    }
     /// The labels one node carries, one bit per label id of the
     /// graph's dictionary. The default is what an engine that stores no
     /// label beyond the table's own says, and the binder has already
@@ -4674,13 +4699,19 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 if !next(descs, ctx, i - 1)? {
                     return Ok(false);
                 }
-                let size = ctx.chunks[*chunk].size;
-                let mut keep = Vec::with_capacity(size);
-                for pos in 0..size {
-                    ctx.chunks[*chunk].cur = Some(pos);
-                    keep.push(truthy(&eval(ctx, expr)?));
-                }
-                ctx.chunks[*chunk].cur = None;
+                let keep = match vector_filter(ctx, expr, *chunk)? {
+                    Some(keep) => keep,
+                    None => {
+                        let size = ctx.chunks[*chunk].size;
+                        let mut keep = Vec::with_capacity(size);
+                        for pos in 0..size {
+                            ctx.chunks[*chunk].cur = Some(pos);
+                            keep.push(truthy(&eval(ctx, expr)?));
+                        }
+                        ctx.chunks[*chunk].cur = None;
+                        keep
+                    }
+                };
                 if keep.iter().any(|k| *k) {
                     ctx.chunks[*chunk].retain(&keep);
                     return Ok(true);
@@ -4928,6 +4959,38 @@ fn as_f64(v: &Value) -> Option<f64> {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
         _ => None,
+    }
+}
+
+/// What one of the six comparison operators answers for a pair of
+/// settled values.
+///
+/// Its own function because two callers ask it: the expression
+/// evaluator, one row at a time, and the vector filter, which reads a
+/// column for a whole vector and then compares it. Two spellings of a
+/// comparison would be two chances for `WHERE p.age = 30` to mean
+/// something slightly different depending on which one ran.
+fn compare(op: BinaryOp, l: &Value, r: &Value) -> Result<Value> {
+    use BinaryOp::*;
+    match op {
+        Eq | Ne => Ok(match cmp_eq(l, r)? {
+            Some(b) => Value::Bool(if op == Eq { b } else { !b }),
+            None => Value::Null,
+        }),
+        Lt | Le | Gt | Ge => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let ord = cmp_ord(l, r);
+            Ok(Value::Bool(match op {
+                Lt => ord == Ordering::Less,
+                Le => ord != Ordering::Greater,
+                Gt => ord == Ordering::Greater,
+                Ge => ord != Ordering::Less,
+                _ => unreachable!("the outer match is the six comparisons"),
+            }))
+        }
+        other => Err(invalid(format!("{other:?} is not a comparison"))),
     }
 }
 
@@ -5421,6 +5484,103 @@ fn divide_by_zero(op: BinaryOp) -> ZuError {
     gql(codes::C22012, format!("{what} by zero"))
 }
 
+/// A whole vector's worth of a filter, when the filter is one property
+/// of one bound node compared with something the vector does not
+/// depend on, and `None` when it is anything else.
+///
+/// `WHERE p.age = 30` under a scan is that shape, and so is most of
+/// what a workload filters on. Read a row at a time it costs a name
+/// resolved, a table's reader found and a column's chunk located per
+/// row, all of it the same answer every time, and on a hundred
+/// thousand row table that is the statement. Read this way it is one
+/// column read for the vector and a comparison per row.
+///
+/// Every bail here is a correctness one rather than a judgement about
+/// what is worth batching. A row a DELETE took away has to be the
+/// error the row at a time path raises, an overlay value shadows the
+/// vector, and a column of nodes of two tables is two columns.
+fn vector_filter(ctx: &mut StageCtx, expr: &BoundExpr, chunk: usize) -> Result<Option<Vec<bool>>> {
+    let BoundExpr::Binary { op, lhs, rhs } = expr else {
+        return Ok(None);
+    };
+    if !matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+    ) {
+        return Ok(None);
+    }
+    // The property can be on either side, and swapping the sides of an
+    // ordering swaps the operator with them.
+    let (prop, other, op) = match lhs.as_ref() {
+        BoundExpr::Property { .. } => (lhs.as_ref(), rhs.as_ref(), *op),
+        _ => (rhs.as_ref(), lhs.as_ref(), flip(*op)),
+    };
+    let BoundExpr::Property { base, key } = prop else {
+        return Ok(None);
+    };
+    let BoundExpr::Var(slot) = base.as_ref() else {
+        return Ok(None);
+    };
+    if ctx.overlay.contains_key(slot) {
+        return Ok(None);
+    }
+    let Some(&(c, col)) = ctx.slot_loc.get(slot) else {
+        return Ok(None);
+    };
+    if c != chunk {
+        return Ok(None);
+    }
+    // The other side is evaluated once for the vector, so it must not
+    // read anything the vector holds.
+    let mut slots = BTreeSet::new();
+    expr_slots(other, &mut slots);
+    if slots
+        .iter()
+        .any(|s| ctx.slot_loc.get(s).is_some_and(|&(cc, _)| cc == chunk))
+    {
+        return Ok(None);
+    }
+
+    let size = ctx.chunks[chunk].size;
+    let mut rows = Vec::with_capacity(size);
+    let mut table = None;
+    for pos in 0..size {
+        let Value::Node { table: t, offset } = ctx.chunks[chunk].cols[col][pos] else {
+            return Ok(None);
+        };
+        if *table.get_or_insert(t) != t {
+            return Ok(None);
+        }
+        if deleted(ctx.gone, t, offset) {
+            return Ok(None);
+        }
+        rows.push(offset);
+    }
+    let Some(table) = table else {
+        return Ok(Some(Vec::new()));
+    };
+
+    let other = settle(eval(ctx, other)?);
+    let mut values = Vec::with_capacity(size);
+    ctx.graph.properties(table, &rows, key, &mut values)?;
+    let mut keep = Vec::with_capacity(size);
+    for value in values {
+        keep.push(truthy(&compare(op, &settle(value), &other)?));
+    }
+    Ok(Some(keep))
+}
+
+/// The operator that means the same thing with its sides swapped.
+fn flip(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::Le => BinaryOp::Ge,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::Ge => BinaryOp::Le,
+        other => other,
+    }
+}
+
 fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
     match expr {
         BoundExpr::Literal(lit) => Ok(match lit {
@@ -5526,28 +5686,10 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                         _ => Value::Null,
                     })
                 }
-                Eq | Ne => {
+                Eq | Ne | Lt | Le | Gt | Ge => {
                     let l = settle(eval(ctx, lhs)?);
                     let r = settle(eval(ctx, rhs)?);
-                    Ok(match cmp_eq(&l, &r)? {
-                        Some(b) => Value::Bool(if *op == Eq { b } else { !b }),
-                        None => Value::Null,
-                    })
-                }
-                Lt | Le | Gt | Ge => {
-                    let l = settle(eval(ctx, lhs)?);
-                    let r = settle(eval(ctx, rhs)?);
-                    if matches!(l, Value::Null) || matches!(r, Value::Null) {
-                        return Ok(Value::Null);
-                    }
-                    let ord = cmp_ord(&l, &r);
-                    Ok(Value::Bool(match op {
-                        Lt => ord == Ordering::Less,
-                        Le => ord != Ordering::Greater,
-                        Gt => ord == Ordering::Greater,
-                        Ge => ord != Ordering::Less,
-                        _ => unreachable!(),
-                    }))
+                    compare(*op, &l, &r)
                 }
                 Add | Sub | Mul | Div | Mod => {
                     let l = settle(eval(ctx, lhs)?);

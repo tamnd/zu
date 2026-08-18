@@ -3298,6 +3298,14 @@
       "doc": "One runtime value. Nodes and rels carry their table so multi-table\nslots stay unambiguous."
     },
     {
+      "id": "zu::query::Value::BindingTable",
+      "kind": "variant",
+      "name": "BindingTable",
+      "of": "zu::query::Value",
+      "signature": "BindingTable(std::sync::Arc<zu_query::refs::BindingTable>)",
+      "doc": "GV61. A binding table reference: the rows of some earlier\nresult, behind a handle so that passing the table costs a\npointer rather than a copy."
+    },
+    {
       "id": "zu::query::Value::Bool",
       "kind": "variant",
       "name": "Bool",
@@ -3318,6 +3326,14 @@
       "name": "Float",
       "of": "zu::query::Value",
       "signature": "Float(f64)"
+    },
+    {
+      "id": "zu::query::Value::Graph",
+      "kind": "variant",
+      "name": "Graph",
+      "of": "zu::query::Value",
+      "signature": "Graph(zu_query::refs::GraphHandle)",
+      "doc": "GV60. A graph reference: which graph, not the graph. The engine\nhands one out and a query carries it; there is no literal that\nwrites one, because a graph is in the catalog and not in the\ntext."
     },
     {
       "id": "zu::query::Value::Int",
@@ -3528,6 +3544,14 @@
       "name": "Session"
     },
     {
+      "id": "zu::session::Session::binding_table",
+      "kind": "method",
+      "name": "binding_table",
+      "of": "zu::session::Session",
+      "signature": "fn binding_table(&self, result: QueryResult) -> Value",
+      "doc": "A binding table reference over the rows of a result (GV61).\n\nThe rows are taken as they are: a binding table value is a\nresult that has already been read, held behind a handle so that\nhanding it to the next statement costs a pointer. The epoch it\nwas read at rides along, because that is what makes a table\nholding element references answerable later."
+    },
+    {
       "id": "zu::session::Session::catalog",
       "kind": "method",
       "name": "catalog",
@@ -3588,6 +3612,14 @@
       "of": "zu::session::Session",
       "signature": "fn file_mut(&mut self) -> Result<&mut Zu1File>",
       "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs.\n\nThe publish before that is what makes the truncation safe. A\ncommit folds without checkpointing and leaves the frames in the\nlog, so a log cut with the header still behind them would lose\ncommitted statements. Publishing first puts the folds on the\nfile and empties the log itself, and the appender then opens a\nlog that says nothing anyone still needs."
+    },
+    {
+      "id": "zu::session::Session::graph_ref",
+      "kind": "method",
+      "name": "graph_ref",
+      "of": "zu::session::Session",
+      "signature": "fn graph_ref(&mut self, schema: &str, name: &str) -> Result<Value>",
+      "doc": "A graph reference value naming one graph in the catalog (GV60),\nor `42002` when the catalog has no such graph.\n\nThis is where a graph reference comes from. GQL has no literal\nthat writes one and there is no expression yet that returns one\neither, so the engine hands them out: a caller resolves a name\nonce, holds the handle, and passes it to as many statements as\nit likes."
     },
     {
       "id": "zu::session::Session::in_transaction",
@@ -3675,6 +3707,14 @@
       "of": "zu::session::Session",
       "signature": "fn warm(&mut self, source: &str) -> Result<bool>",
       "doc": "Makes sure a statement is compiled and cached, and reports\nwhether it already was. A server preloads its statement set\nwith this at startup; the P0 plan-hit gate times the `true`\npath, which is exactly the work between receiving a known\nquery text and starting execution: the epoch check and the\ncache lookup."
+    },
+    {
+      "id": "zu::session::Session::working_graph_ref",
+      "kind": "method",
+      "name": "working_graph_ref",
+      "of": "zu::session::Session",
+      "signature": "fn working_graph_ref(&mut self) -> Result<Value>",
+      "doc": "A graph reference on the graph this session is working in,\nwhich is what `CURRENT_PROPERTY_GRAPH` will hand back once a\ngraph expression can be written (GE01, G6)."
     },
     {
       "id": "zu::session::Session::write",

@@ -1642,6 +1642,66 @@ pub unsafe extern "C" fn zu_bind_str_z(
     unsafe { zu_bind_str(stmt, name, zlen(name), v, zlen(v)) }
 }
 
+/// Binds a temporal, as one `ZU_TEMPORAL_*` kind and the count in the
+/// unit that kind implies.
+///
+/// This is [`zu_value_temporal`] read backwards, deliberately, and for
+/// the reason [`zu_loader_col_temporal`] is: a caller that read a date
+/// out as 19782 days writes it back in as 19782 days, and a host needs
+/// one mapping rather than two. Unlike the loader this takes the two
+/// zoned kinds, because a parameter is a value on its way through a
+/// statement and not a column in a store with nowhere to keep an
+/// offset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_bind_temporal(
+    stmt: *mut ZuStmt,
+    name: *const c_char,
+    name_len: usize,
+    kind: i32,
+    count: i64,
+    offset: i32,
+) -> ZuStatus {
+    // The narrowings are checked rather than truncated: a date outside
+    // an i32 of days and an offset outside an i16 of minutes are both
+    // callers with a unit confusion, and wrapping one into a value the
+    // engine accepts would answer a statement about a day in another
+    // century without saying so.
+    let Ok(minutes) = i16::try_from(offset) else {
+        return ZuStatus::Misuse;
+    };
+    let held = match kind {
+        ZU_TEMPORAL_DATE => match i32::try_from(count) {
+            Ok(days) => Temporal::Date(days),
+            Err(_) => return ZuStatus::Misuse,
+        },
+        ZU_TEMPORAL_LOCAL_TIME => Temporal::LocalTime(count),
+        ZU_TEMPORAL_ZONED_TIME => Temporal::ZonedTime {
+            nanos: count,
+            offset: minutes,
+        },
+        ZU_TEMPORAL_LOCAL_DATETIME => Temporal::LocalDatetime(count),
+        ZU_TEMPORAL_ZONED_DATETIME => Temporal::ZonedDatetime {
+            nanos: count,
+            offset: minutes,
+        },
+        ZU_TEMPORAL_DURATION_YEAR_MONTH => Temporal::Duration(DurationKind::YearMonth, count),
+        ZU_TEMPORAL_DURATION_DAY_TIME => Temporal::Duration(DurationKind::DayTime, count),
+        _ => return ZuStatus::Misuse,
+    };
+    unsafe { bind(stmt, name, name_len, Value::Temporal(held)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_bind_temporal_z(
+    stmt: *mut ZuStmt,
+    name: *const c_char,
+    kind: i32,
+    count: i64,
+    offset: i32,
+) -> ZuStatus {
+    unsafe { zu_bind_temporal(stmt, name, zlen(name), kind, count, offset) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_bind_null(
     stmt: *mut ZuStmt,

@@ -9,6 +9,12 @@
 //! The expectation is either rows or a condition. A case expecting a
 //! condition names the GQLSTATUS code, not the message, because the
 //! code is the contract and the message is prose that will improve.
+//!
+//! A statement may take parameters, which is the other direction the
+//! same values travel: a case with `params:` writes a value in the
+//! encoding, hands it to the client's own binding call, and asserts
+//! what came back. A client that decodes a date correctly and encodes
+//! it a day early passes every case that has no parameters in it.
 
 use crate::load::Load;
 use crate::value;
@@ -19,7 +25,7 @@ use zu::query::Value;
 /// The schema version a file declares. It exists so that a corpus
 /// unpacked from an old release tells a new runner what it is instead
 /// of failing in the middle.
-pub const SCHEMA: i64 = 2;
+pub const SCHEMA: i64 = 3;
 
 /// What running a case's statement has to produce.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +51,12 @@ pub struct Case {
     /// Statements run before the one under test, against a database
     /// that is this case's alone.
     pub setup: Vec<String>,
+    /// The parameters the statement under test is run with, in the
+    /// order they were written. The setup statements take none: a
+    /// parameter belongs to the case's one assertion, and a fixture
+    /// that needed one would be a second statement under test wearing
+    /// another name.
+    pub params: Vec<(String, Value)>,
     pub query: String,
     pub expect: Expect,
     pub line: usize,
@@ -140,7 +152,9 @@ fn case(node: &Node) -> Result<Case, String> {
         )));
     }
     if let Some(key) = node
-        .unknown(&["name", "doc", "setup", "query", "columns", "rows", "raises"])
+        .unknown(&[
+            "name", "doc", "setup", "params", "query", "columns", "rows", "raises",
+        ])
         .first()
     {
         return Err(at(format!("a case has no key {key:?}")));
@@ -170,6 +184,8 @@ fn case(node: &Node) -> Result<Case, String> {
             })
             .collect::<Result<_, _>>()?,
     };
+
+    let params = params(node)?;
 
     let expect = match (node.get("raises"), node.get("columns")) {
         (Some(_), Some(_)) => {
@@ -225,10 +241,53 @@ fn case(node: &Node) -> Result<Case, String> {
         name,
         doc,
         setup,
+        params,
         query,
         expect,
         line,
     })
+}
+
+/// The parameters a case binds, which is the value encoding with a name
+/// beside it.
+///
+/// A name is what the statement spells after the `$`, so it is checked
+/// against what a statement may spell: a case whose name is `n one` is
+/// one no client can bind, and finding that out here says so with a
+/// line number rather than nine clients each failing their own way.
+fn params(node: &Node) -> Result<Vec<(String, Value)>, String> {
+    let Some(list) = node.get("params") else {
+        return Ok(Vec::new());
+    };
+    let items = list
+        .seq()
+        .ok_or(format!("line {}: `params:` is a sequence", list.line()))?;
+    let mut out: Vec<(String, Value)> = Vec::with_capacity(items.len());
+    for item in items {
+        let line = item.line();
+        if item.map().is_none() {
+            return Err(format!(
+                "line {line}: a parameter is a mapping of `name`, `type` and `value`, and this is \
+                 {}",
+                item.kind()
+            ));
+        }
+        if let Some(key) = item.unknown(&["name", "type", "value"]).first() {
+            return Err(format!("line {line}: a parameter has no key {key:?}"));
+        }
+        let name = field(item, "name")?;
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "line {line}: {name:?} is a parameter name, which is what a statement writes after \
+                 the `$`"
+            ));
+        }
+        if out.iter().any(|(n, _)| *n == name) {
+            return Err(format!("line {line}: two parameters are called {name:?}"));
+        }
+        out.push((name, value::typed(item)?));
+    }
+    Ok(out)
 }
 
 fn rows(node: &Node) -> Result<Vec<Vec<Value>>, String> {
@@ -264,7 +323,7 @@ fn rows(node: &Node) -> Result<Vec<Vec<Value>>, String> {
 mod tests {
     use super::*;
 
-    const HEAD: &str = "schema: 2\nsuite: int\ndoc: the integer tower\n";
+    const HEAD: &str = "schema: 3\nsuite: int\ndoc: the integer tower\n";
 
     fn suite(cases: &str) -> Result<Suite, String> {
         Suite::parse(&format!("{HEAD}\ncases:\n{cases}"))
@@ -303,9 +362,84 @@ mod tests {
     }
 
     #[test]
+    fn a_case_may_bind_parameters_and_they_keep_the_order_they_were_written_in() {
+        let case = one(
+            "  - name: bound\n    doc: a statement with two parameters in it\n    params:\n      - name: n\n        type: INT64\n        value: \"42\"\n      - name: s\n        type: STRING\n        value: ada\n    query: RETURN $n AS n, $s AS s\n    columns:\n      - n\n      - s\n    rows:\n      - values:\n          - type: INT64\n            value: \"42\"\n          - type: STRING\n            value: ada\n",
+        );
+        assert_eq!(
+            case.params,
+            vec![
+                ("n".to_string(), Value::Int(42)),
+                ("s".to_string(), Value::Str("ada".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parameter_is_a_value_of_the_same_encoding_and_is_read_the_same_way() {
+        // A NULL parameter carries no `value`, the quoting rule is the
+        // one every other value follows, and a list is a list. The
+        // whole point of `params:` is that it is the row encoding with
+        // a name added, so what is checked here is that it did not
+        // become a second encoding.
+        let case = one(
+            "  - name: null-param\n    doc: a parameter that is nothing\n    params:\n      - name: n\n        type: NULL\n    query: RETURN $n AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: NULL\n",
+        );
+        assert_eq!(case.params, vec![("n".to_string(), Value::Null)]);
+        let case = one(
+            "  - name: list-param\n    doc: a parameter holding a list of two\n    params:\n      - name: xs\n        type: LIST\n        value:\n          - type: INT8\n            value: 1\n          - type: INT8\n            value: 2\n    query: RETURN size($xs) AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"2\"\n",
+        );
+        assert_eq!(
+            case.params,
+            vec![(
+                "xs".to_string(),
+                Value::List(vec![Value::Int(1), Value::Int(2)])
+            )]
+        );
+        let err = suite(
+            "  - name: a\n    doc: d\n    params:\n      - name: n\n        type: INT64\n        value: 42\n    query: RETURN $n\n    raises: 22012\n",
+        )
+        .expect_err("refused");
+        assert!(err.contains("written in quotes"), "{err}");
+    }
+
+    #[test]
+    fn a_parameter_a_statement_could_not_name_is_refused_where_it_is_written() {
+        for (text, want) in [
+            (
+                "  - name: a\n    doc: d\n    params:\n      - type: INT8\n        value: 1\n    query: RETURN $n\n    raises: 22012\n",
+                "no `name:`",
+            ),
+            (
+                "  - name: a\n    doc: d\n    params:\n      - name: n one\n        type: INT8\n        value: 1\n    query: RETURN $n\n    raises: 22012\n",
+                "is a parameter name",
+            ),
+            (
+                "  - name: a\n    doc: d\n    params:\n      - name: n\n        type: INT8\n        value: 1\n      - name: n\n        type: INT8\n        value: 2\n    query: RETURN $n\n    raises: 22012\n",
+                "two parameters are called \"n\"",
+            ),
+            (
+                "  - name: a\n    doc: d\n    params:\n      - name: n\n        type: INT8\n        value: 1\n        note: hi\n    query: RETURN $n\n    raises: 22012\n",
+                "a parameter has no key \"note\"",
+            ),
+            (
+                "  - name: a\n    doc: d\n    params:\n      - $n\n    query: RETURN $n\n    raises: 22012\n",
+                "a parameter is a mapping",
+            ),
+            (
+                "  - name: a\n    doc: d\n    params: n\n    query: RETURN $n\n    raises: 22012\n",
+                "`params:` is a sequence",
+            ),
+        ] {
+            let err = suite(text).expect_err(&format!("{text:?} is refused"));
+            assert!(err.contains(want), "{text:?} gave {err:?}");
+        }
+    }
+
+    #[test]
     fn a_suite_may_load_a_table_every_case_in_it_reads_back() {
         let suite = Suite::parse(
-            "schema: 2\nsuite: int\ndoc: d\nload:\n  nodes: person\n  edges: knows\n  count: 1\n  columns:\n    - name: age\n      type: INT64\n      values:\n        - \"30\"\ncases:\n  - name: a\n    doc: d\n    query: MATCH (p:person) RETURN p.age AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"30\"\n",
+            "schema: 3\nsuite: int\ndoc: d\nload:\n  nodes: person\n  edges: knows\n  count: 1\n  columns:\n    - name: age\n      type: INT64\n      values:\n        - \"30\"\ncases:\n  - name: a\n    doc: d\n    query: MATCH (p:person) RETURN p.age AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT64\n            value: \"30\"\n",
         )
         .expect("parses");
         let load = suite.load.expect("a load");
@@ -399,7 +533,7 @@ mod tests {
         let err = Suite::parse("schema: 1\nsuite: int\ndoc: d\ncases:\n  - name: a\n")
             .expect_err("refused");
         assert!(
-            err.contains("schema 1 and the runner reads schema 2"),
+            err.contains("schema 1 and the runner reads schema 3"),
             "{err}"
         );
     }

@@ -144,7 +144,15 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
         }
     }
 
-    let result = session.run(&case.query, &[]);
+    // The engine takes the values by value and the case owns them, so
+    // this is where they are copied. It is a copy per case rather than
+    // per row, which is nothing against opening a database.
+    let params: Vec<(&str, Value)> = case
+        .params
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .collect();
+    let result = session.run(&case.query, &params);
     match (&case.expect, result) {
         (Expect::Raises(code), Err(e)) => match e.gqlstatus().map(|s| s.code()) {
             Some(got) if got == code => ran(Outcome::Passed, String::new()),
@@ -230,7 +238,7 @@ mod tests {
     use super::*;
     use crate::case::Suite;
 
-    const HEAD: &str = "schema: 2\nsuite: t\ndoc: a suite for the runner's own tests\n\ncases:\n";
+    const HEAD: &str = "schema: 3\nsuite: t\ndoc: a suite for the runner's own tests\n\ncases:\n";
 
     fn run_cases(cases: &str) -> Report {
         let suite = Suite::parse(&format!("{HEAD}{cases}")).expect("the fixture parses");
@@ -312,6 +320,44 @@ mod tests {
             report.ran[0]
                 .detail
                 .contains("returned rows where the case wants 22012"),
+            "{}",
+            report.ran[0].detail
+        );
+    }
+
+    #[test]
+    fn a_case_with_parameters_runs_the_statement_with_them_bound() {
+        let report = run_cases(
+            "  - name: bound\n    doc: two parameters, one of each of the two encodings\n    params:\n      - name: n\n        type: INT64\n        value: \"42\"\n      - name: s\n        type: STRING\n        value: ada\n    query: RETURN $n + 1 AS n, $s AS s\n    columns:\n      - n\n      - s\n    rows:\n      - values:\n          - type: INT64\n            value: \"43\"\n          - type: STRING\n            value: ada\n",
+        );
+        assert_eq!(report.ran[0].outcome, Outcome::Passed, "{}", report.ran[0]);
+    }
+
+    #[test]
+    fn a_statement_wanting_a_parameter_the_case_did_not_bind_is_a_condition_like_any_other() {
+        // 42002 is what the engine answers a reference that resolves to
+        // nothing, and a parameter nobody bound is one. It is a case
+        // worth writing on purpose, so the runner has to let a case
+        // assert it rather than treating every 42 as a statement the
+        // engine has not implemented.
+        let report = run_cases(
+            "  - name: missing\n    doc: a statement whose parameter nobody bound\n    query: RETURN $n AS n\n    raises: 42002\n",
+        );
+        assert_eq!(report.ran[0].outcome, Outcome::Passed, "{}", report.ran[0]);
+    }
+
+    #[test]
+    fn the_setup_of_a_case_does_not_see_its_parameters() {
+        // A parameter belongs to the one statement under test. A setup
+        // that could take one would be a second statement under test
+        // wearing another name, and this is the assertion that says so
+        // out loud rather than leaving it to be discovered.
+        let report = run_cases(
+            "  - name: setup-unbound\n    doc: a setup statement naming the parameter the query binds\n    setup:\n      - RETURN $n AS n\n    params:\n      - name: n\n        type: INT8\n        value: 1\n    query: RETURN $n AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT8\n            value: 1\n",
+        );
+        assert_ne!(report.ran[0].outcome, Outcome::Passed, "{}", report.ran[0]);
+        assert!(
+            report.ran[0].detail.contains("setup 1: 42002"),
             "{}",
             report.ran[0].detail
         );

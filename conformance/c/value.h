@@ -131,6 +131,12 @@ void *cv_alloc(cv_arena *a, size_t bytes);
  * have. */
 int cv_decode(cv_arena *a, const zy_node *node, cv *out, char *err, size_t err_len);
 
+/* The `type` and `value` of a mapping that carries more than those two,
+ * which is a parameter: it is a value with a name, and the name belongs
+ * to the case rather than to the encoding. The keys are the caller's to
+ * check, since only the caller knows which others it allows. */
+int cv_typed(cv_arena *a, const zy_node *node, cv *out, char *err, size_t err_len);
+
 /* The value a bare payload spells under a type read from somewhere
  * else, which is the encoding with the type factored out: a load column
  * names its type once and its values are payloads under it. The quoting

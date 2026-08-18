@@ -1027,9 +1027,7 @@ int cv_payload(cv_arena *a, const char *ty, const zy_node *value, cv *out, char 
 int cv_decode(cv_arena *a, const zy_node *node, cv *out, char *err, size_t err_len) {
     static const char *const KEYS[2] = {"type", "value"};
     size_t line = node == NULL ? 0 : node->line;
-    const zy_node *type, *value;
     zy_str extra;
-    const char *ty;
     if (node == NULL || node->kind != ZY_MAP) {
         return fail(err, err_len, line,
                     "a value is a mapping of `type` and `value`, and this is %s",
@@ -1039,6 +1037,13 @@ int cv_decode(cv_arena *a, const zy_node *node, cv *out, char *err, size_t err_l
     if (extra.ptr != NULL) {
         return fail(err, err_len, line, "a value has no key \"%s\"", extra.ptr);
     }
+    return cv_typed(a, node, out, err, err_len);
+}
+
+int cv_typed(cv_arena *a, const zy_node *node, cv *out, char *err, size_t err_len) {
+    size_t line = node == NULL ? 0 : node->line;
+    const zy_node *type, *value;
+    const char *ty;
     type = zy_get(node, "type");
     if (type == NULL) {
         return fail(err, err_len, line, "a value with no `type`");

@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 suite: numeric
 doc: Arithmetic, and the places where two languages doing the same sum disagree. Integer division, the sign of a remainder, and what happens at the edge of a type are each decided differently by different host languages, so each one is a case rather than an assumption.
 

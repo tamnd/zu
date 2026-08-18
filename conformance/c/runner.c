@@ -54,7 +54,7 @@
 
 /* The schema this runner reads. A file from another one says so here
  * rather than failing somewhere in the middle of its cases. */
-#define RUNNER_SCHEMA 2
+#define RUNNER_SCHEMA 3
 
 typedef enum outcome { OUT_PASSED, OUT_FAILED, OUT_UNSUPPORTED } outcome;
 
@@ -652,6 +652,113 @@ static void report(run *r, const char *suite, const char *name, size_t line, out
     printf("\n");
 }
 
+/* Binds one parameter of a case onto a prepared statement.
+ *
+ * A parameter is the value encoding with a name beside it, so it is
+ * decoded by the same decoder every row is and then handed to the bind
+ * call its kind picks. A LIST has no bind call, because the ABI has no
+ * way to build a list value: that is a gap in the ABI and it is said in
+ * those words, since a runner that reported it as a wrong answer would
+ * send whoever reads the report looking at the case. */
+static int bind_param(run *r, zu_stmt *stmt, const zy_node *param, char *detail, size_t len) {
+    static const char *const KEYS[3] = {"name", "type", "value"};
+    const zy_node *name;
+    zy_str extra;
+    zu_status status;
+    char err[512];
+    cv v;
+
+    if (param->kind != ZY_MAP) {
+        return say(detail, len, "a parameter is a mapping of `name`, `type` and `value`");
+    }
+    extra = zy_unknown(param, KEYS, 3);
+    if (extra.ptr != NULL) {
+        return say(detail, len, "a parameter has no key \"%s\"", extra.ptr);
+    }
+    name = zy_get(param, "name");
+    if (name == NULL || name->kind != ZY_SCALAR) {
+        return say(detail, len, "a parameter names itself");
+    }
+    if (cv_typed(r->arena, param, &v, err, sizeof err) != 0) {
+        return say(detail, len, "parameter \"%s\": %s", name->text.ptr, err);
+    }
+
+    switch (v.kind) {
+    case CV_NULL:
+        status = zu_bind_null(stmt, name->text.ptr, name->text.len);
+        break;
+    case CV_BOOL:
+        status = zu_bind_bool(stmt, name->text.ptr, name->text.len, v.as.boolean);
+        break;
+    case CV_INT:
+        status = zu_bind_i64(stmt, name->text.ptr, name->text.len, v.as.integer);
+        break;
+    case CV_FLOAT:
+        status = zu_bind_f64(stmt, name->text.ptr, name->text.len, v.as.real);
+        break;
+    case CV_STR:
+        status = zu_bind_str(stmt, name->text.ptr, name->text.len, v.as.str.ptr, v.as.str.len);
+        break;
+    case CV_TEMPORAL:
+        status = zu_bind_temporal(stmt, name->text.ptr, name->text.len,
+                                  (int32_t)v.as.temporal.unit, v.as.temporal.count,
+                                  v.as.temporal.offset);
+        break;
+    default: {
+        char shown[256];
+        cv_show(&v, shown, sizeof shown);
+        return say(detail, len, "parameter \"%s\" is %s, which this ABI has no bind call for",
+                   name->text.ptr, shown);
+    }
+    }
+    if (status != ZU_OK) {
+        return say(detail, len, "parameter \"%s\" would not bind", name->text.ptr);
+    }
+    return 0;
+}
+
+/* Runs the statement under test, with the parameters the case binds.
+ *
+ * A case with none goes through zu_query, which is the call a client
+ * makes when there is nothing to bind. A case with parameters goes
+ * through prepare, bind and execute, because through this ABI that is
+ * the only way a value gets into a statement. Returns -1 for a case
+ * this runner cannot read, with the account in detail, and 0 otherwise
+ * with the status and whatever came back written out. */
+static int statement(run *r, zu_conn *conn, const zy_node *node, const zy_node *query,
+                     zu_status *status, zu_result **result, zu_error **e, char *detail,
+                     size_t len) {
+    const zy_node *params = zy_get(node, "params");
+    zu_stmt *stmt = NULL;
+    size_t i;
+
+    if (params == NULL) {
+        *status = zu_query(conn, query->text.ptr, query->text.len, result, e);
+        return 0;
+    }
+    if (params->kind != ZY_SEQ) {
+        return say(detail, len, "`params:` is a sequence");
+    }
+    *status = zu_prepare(conn, query->text.ptr, query->text.len, &stmt, e);
+    if (*status != ZU_OK) {
+        /* A statement that will not compile is an answer about the
+         * statement and not about the parameters, so it is handed back
+         * as it stands and graded where every other refusal is. */
+        return 0;
+    }
+    for (i = 0; i < params->count; i++) {
+        if (bind_param(r, stmt, &params->items[i], detail, len) != 0) {
+            zu_stmt_close(stmt);
+            return -1;
+        }
+    }
+    *status = zu_execute(stmt, result, e);
+    /* Closed before the result is read, which the ABI allows: a result
+     * owns its values and outlives the statement that made them. */
+    zu_stmt_close(stmt);
+    return 0;
+}
+
 /* The statement under test, and what the case says it has to produce.
  * Returns the outcome and writes the account of why into detail. */
 static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, size_t len) {
@@ -700,7 +807,9 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
         }
     }
 
-    status = zu_query(conn, query->text.ptr, query->text.len, &result, &e);
+    if (statement(r, conn, node, query, &status, &result, &e, detail, len) != 0) {
+        return OUT_FAILED;
+    }
     if (raises != NULL) {
         outcome out;
         if (raises->kind != ZY_SCALAR) {

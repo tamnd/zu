@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 suite: wrong
 doc: Cases the engine does not answer the way they say, so that the two runners can be compared on what they say when a case fails. The corpus itself passes, which is the point of it and also why it can never show this. These are not corpus cases and are not packed with them; they live beside the C runner because they are a test of the C runner.
 
@@ -55,6 +55,20 @@ cases:
     doc: A statement that returns rows, against a case saying it raises. Rows where a condition was expected is a failure and not an unexpected pass.
     query: RETURN 1 AS n
     raises: 22012
+
+  - name: wrong-bound-value
+    doc: A case whose parameter arrives intact and whose answer is still wrong, so the report says the value the statement gave back and not the one that was bound.
+    params:
+      - name: n
+        type: INT64
+        value: "1"
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
 
   - name: ahead-of-the-engine
     doc: A statement this engine does not implement, which is the third outcome and neither of the other two.

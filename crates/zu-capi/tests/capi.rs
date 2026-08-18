@@ -14,22 +14,21 @@ use zu::{
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
     ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
     ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_bool, zu_bind_bool_z, zu_bind_i64, zu_bind_i64_z,
-    zu_bind_str_z, zu_config_init,
-    zu_config_set_z, zu_conn_close, zu_conn_interrupt, zu_conn_rows_read, zu_conn_set_progress,
-    zu_connect, zu_create, zu_create_z, zu_database_close, zu_database_create_z,
-    zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt,
-    zu_error_free, zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable,
-    zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute, zu_loader_col_bool,
-    zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str, zu_loader_col_temporal,
-    zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free, zu_loader_table,
-    zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query, zu_query_z,
-    zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
-    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
-    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
-    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
-    zu_result_free, zu_result_rows, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64,
-    zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type,
-    zu_version,
+    zu_bind_str_z, zu_bind_temporal, zu_bind_temporal_z, zu_config_init, zu_config_set_z,
+    zu_conn_close, zu_conn_interrupt, zu_conn_rows_read, zu_conn_set_progress, zu_connect,
+    zu_create, zu_create_z, zu_database_close, zu_database_create_z, zu_database_open_z,
+    zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt, zu_error_free,
+    zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable, zu_error_severity,
+    zu_error_standard_text, zu_error_status, zu_execute, zu_loader_col_bool, zu_loader_col_f64,
+    zu_loader_col_i64, zu_loader_col_str, zu_loader_col_temporal, zu_loader_create,
+    zu_loader_edges, zu_loader_finish, zu_loader_free, zu_loader_table, zu_loader_table_z, zu_open,
+    zu_open_z, zu_prepare, zu_prepare_z, zu_query, zu_query_z, zu_result_cell, zu_result_cell_str,
+    zu_result_cell_type, zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
+    zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
+    zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
+    zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_rows, zu_stmt_close,
+    zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64, zu_value_len, zu_value_node,
+    zu_value_str, zu_value_temporal, zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -1406,6 +1405,124 @@ fn a_temporal_cell_reads_as_a_kind_a_count_and_an_offset() {
             assert_eq!(offset, want_offset, "{text}");
             zu_result_free(result);
         }
+
+        zu_conn_close(conn);
+    }
+}
+
+/// The two kinds of value a C host could read out of a result and had
+/// no way to put back in. A parameter is how a client passes a value it
+/// was given, so a boolean or a date that can only travel one way is a
+/// statement a client has to build by pasting text together.
+#[test]
+fn a_bool_and_every_temporal_kind_bind_as_parameters_and_come_back_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("bindings.zu1");
+    seeded(&path);
+
+    // The same six kinds and counts the reader is checked against
+    // above, plus the zoned datetime, so that what goes in through
+    // zu_bind_temporal and what comes out through zu_value_temporal are
+    // compared over every kind there is.
+    let temporals: [(i32, i64, i32); 7] = [
+        (ZU_TEMPORAL_DATE, 19782, 0),
+        (ZU_TEMPORAL_LOCAL_TIME, 45_296_123_456_789, 0),
+        (ZU_TEMPORAL_ZONED_TIME, 45_296_000_000_000, 420),
+        (ZU_TEMPORAL_LOCAL_DATETIME, 1_704_067_200_000_000_000, 0),
+        (ZU_TEMPORAL_ZONED_DATETIME, 1_704_067_200_000_000_000, -330),
+        (ZU_TEMPORAL_DURATION_YEAR_MONTH, 14, 0),
+        (ZU_TEMPORAL_DURATION_DAY_TIME, 5_400_000_000_000, 0),
+    ];
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let name = c("v");
+
+        for (want_kind, want_count, want_offset) in temporals {
+            let q = c("RETURN $v AS v");
+            let mut stmt: *mut ZuStmt = ptr::null_mut();
+            assert_eq!(
+                zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
+                ZuStatus::Ok
+            );
+            assert_eq!(
+                zu_bind_temporal_z(stmt, name.as_ptr(), want_kind, want_count, want_offset),
+                ZuStatus::Ok,
+                "kind {want_kind}"
+            );
+            let mut result: *mut ZuResult = ptr::null_mut();
+            assert_eq!(zu_execute(stmt, &mut result, &mut err), ZuStatus::Ok);
+            let value = cell(result, 0, 0);
+            assert_eq!(zu_value_type(value), ZU_TYPE_TEMPORAL, "kind {want_kind}");
+            let (mut kind, mut count, mut offset) = (-1, 0i64, i32::MAX);
+            assert_eq!(
+                zu_value_temporal(value, &mut kind, &mut count, &mut offset),
+                ZuStatus::Ok
+            );
+            assert_eq!(
+                (kind, count, offset),
+                (want_kind, want_count, want_offset),
+                "kind {want_kind}"
+            );
+            zu_result_free(result);
+            zu_stmt_close(stmt);
+        }
+
+        // Nonzero is true, which is what a C caller handing over a
+        // comparison expects, so 2 is the same binding as 1.
+        for (bound, want) in [(1, true), (0, false), (2, true)] {
+            let q = c("RETURN $v AS v");
+            let mut stmt: *mut ZuStmt = ptr::null_mut();
+            assert_eq!(
+                zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
+                ZuStatus::Ok
+            );
+            assert_eq!(zu_bind_bool_z(stmt, name.as_ptr(), bound), ZuStatus::Ok);
+            let mut result: *mut ZuResult = ptr::null_mut();
+            assert_eq!(zu_execute(stmt, &mut result, &mut err), ZuStatus::Ok);
+            let value = cell(result, 0, 0);
+            let mut got = -1;
+            assert_eq!(zu_value_bool(value, &mut got), ZuStatus::Ok);
+            assert_eq!(got != 0, want, "bound {bound}");
+            zu_result_free(result);
+            zu_stmt_close(stmt);
+        }
+
+        // A kind that is not one of the seven, an offset wider than the
+        // minutes an offset is kept in, and a date further from the
+        // epoch than a day count reaches. All three are a caller with a
+        // unit confusion, and a binding that wrapped one into a value
+        // the engine accepts would answer a different statement without
+        // saying so.
+        let q = c("RETURN $v AS v");
+        let mut stmt: *mut ZuStmt = ptr::null_mut();
+        assert_eq!(
+            zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
+            ZuStatus::Ok
+        );
+        for (kind, count, offset) in [
+            (7, 0, 0),
+            (-1, 0, 0),
+            (ZU_TEMPORAL_ZONED_TIME, 0, 40_000),
+            (ZU_TEMPORAL_DATE, i64::from(i32::MAX) + 1, 0),
+        ] {
+            assert_eq!(
+                zu_bind_temporal_z(stmt, name.as_ptr(), kind, count, offset),
+                ZuStatus::Misuse,
+                "kind {kind} count {count} offset {offset}"
+            );
+        }
+        zu_stmt_close(stmt);
+
+        assert_eq!(
+            zu_bind_bool(ptr::null_mut(), ptr::null(), 0, 1),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_bind_temporal(ptr::null_mut(), ptr::null(), 0, ZU_TEMPORAL_DATE, 0, 0),
+            ZuStatus::Misuse
+        );
 
         zu_conn_close(conn);
     }

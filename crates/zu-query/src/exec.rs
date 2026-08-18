@@ -70,9 +70,11 @@ use std::time::Instant;
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
 use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 
-use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
+use crate::ast::{
+    BinaryOp, Conjunction, Literal, PathMode, RelDirection, Selector, SetOp, SortKey, UnaryOp,
+};
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
-use crate::plan::{Bracket, BracketKind, LogicalPlan, expr_text};
+use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
 use crate::refs::{BindingTable, GraphHandle};
 use crate::row::{Batch, Flow};
 
@@ -1582,7 +1584,12 @@ fn expr_slots(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
 
 fn input_of(plan: &LogicalPlan) -> Option<&LogicalPlan> {
     match plan {
-        LogicalPlan::Empty | LogicalPlan::Rows { .. } => None,
+        // A conjoin has two inputs and no one of them is the input, so
+        // it is not a link in a chain and the linearizer stops at it.
+        // It never reaches here in a run: [`execute`] takes the
+        // composite apart above the pipeline and runs each operand as
+        // a query of its own.
+        LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. } => None,
         LogicalPlan::ScanNodes { input, .. }
         | LogicalPlan::Expand { input, .. }
         | LogicalPlan::Filter { input, .. }
@@ -2456,7 +2463,7 @@ fn build_stages(
             continue;
         }
         match linear[i] {
-            LogicalPlan::Empty | LogicalPlan::Rows { .. } => {
+            LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. } => {
                 unreachable!("a leaf never appears in the linearized ops")
             }
             LogicalPlan::ScanNodes { .. }
@@ -6892,6 +6899,9 @@ fn run_stages(
         mut profile,
         mut stream,
     } = extras;
+    if matches!(plan, LogicalPlan::Conjoin { .. }) {
+        return run_conjoin(plan, query, schema, graph, params, options, profile);
+    }
     let stages = build_stages(plan, query, schema, graph, params, options)?;
     let counts: BTreeMap<u32, u64> = schema
         .nodes()
@@ -7008,6 +7018,225 @@ fn run_stages(
         result.notice(record);
     }
     Ok(result)
+}
+
+/// Runs a composite query: each operand as a query of its own, and the
+/// conjunction over the pair of result tables (ISO 12.1).
+///
+/// The operands are run rather than fused because they share nothing.
+/// A variable one of them matched is not a variable the other has, so
+/// there is no row that both could be part of and nothing to push
+/// through: what meets here is two tables of values.
+///
+/// `OTHERWISE` is the exception that proves it: the right operand is
+/// not run at all unless the left answered nothing, which is a thing
+/// only an operator standing above both of them can decide.
+fn run_conjoin(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+    mut profile: Option<&mut Profile>,
+) -> Result<QueryResult> {
+    let LogicalPlan::Conjoin {
+        left,
+        right,
+        how,
+        build,
+    } = plan
+    else {
+        unreachable!("a conjoin was matched before this was called");
+    };
+    // The operands were joined on left to right, so the conjoins below
+    // this one count off the operand it joins.
+    let nth = conjoin_depth(left);
+    let operand = query
+        .conjoined
+        .get(nth)
+        .map_or(query, |joined| joined.query.as_ref());
+    let run = |plan: &LogicalPlan,
+               query: &BoundQuery,
+               graph: &mut dyn Graph,
+               profile: Option<&mut Profile>|
+     -> Result<QueryResult> {
+        run_stages(
+            plan,
+            query,
+            schema,
+            graph,
+            params,
+            options,
+            Extras {
+                profile,
+                stream: None,
+            },
+        )
+    };
+    let mut result = run(left, query, graph, profile.as_deref_mut())?;
+    let (op, all) = match how {
+        Conjunction::Otherwise => {
+            // The left answered, so the right is not a thing that
+            // happened: no scan of it runs and no row of it is read.
+            if !result.rows.is_empty() {
+                return Ok(result);
+            }
+            let mut right = run(right, operand, graph, profile)?;
+            right.columns = query.columns.clone();
+            return Ok(right);
+        }
+        Conjunction::Set { op, all } => (*op, *all),
+    };
+    let other = run(right, operand, graph, profile)?;
+    let notices = {
+        let mut notices = result.notices;
+        notices.extend(other.notices);
+        notices
+    };
+    let rows = conjoin_rows(result.rows, other.rows, op, all, *build);
+    result = QueryResult::new(query.columns.clone(), rows);
+    for record in notices {
+        result.notice(record);
+    }
+    Ok(result)
+}
+
+/// How many conjoins stand on the left spine from here down, this one
+/// counted.
+fn conjoin_depth(plan: &LogicalPlan) -> usize {
+    match plan {
+        LogicalPlan::Conjoin { left, .. } => 1 + conjoin_depth(left),
+        _ => 0,
+    }
+}
+
+/// The rows a set operator makes out of two result tables.
+///
+/// Every one of the six is a statement about how many times a row
+/// appears, so all six are counted rather than tested: the table built
+/// over one operand holds a count per distinct row, and the other
+/// operand is read against it. `ALL` spends those counts one at a
+/// time and `DISTINCT` spends each of them once.
+///
+/// The table is the ordered one this engine's `DISTINCT` and `GROUP
+/// BY` already use, so a value that groups here groups there.
+fn conjoin_rows(
+    left: Vec<Vec<Value>>,
+    right: Vec<Vec<Value>>,
+    op: SetOp,
+    all: bool,
+    build: Side,
+) -> Vec<Vec<Value>> {
+    let key = |row: &[Value]| -> Vec<OrdValue> { row.iter().cloned().map(OrdValue).collect() };
+    let counted = |rows: &[Vec<Value>]| -> BTreeMap<Vec<OrdValue>, usize> {
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            *counts.entry(key(row)).or_insert(0) += 1;
+        }
+        counts
+    };
+    match op {
+        SetOp::Union if all => {
+            // Nothing is built and nothing is held: the rows of one
+            // operand are the answer, and then the rows of the other.
+            let mut out = left;
+            out.extend(right);
+            out
+        }
+        SetOp::Union => {
+            let mut seen = BTreeSet::new();
+            let mut out = Vec::new();
+            for row in left.into_iter().chain(right) {
+                if seen.insert(key(&row)) {
+                    out.push(row);
+                }
+            }
+            out
+        }
+        SetOp::Intersect => {
+            // Symmetric, so the table goes over whichever operand the
+            // optimizer expects to be smaller and the other is read
+            // against it. The answer's rows come from the probing side
+            // either way, which is a choice about which copy of an
+            // equal row is returned and not about which rows are.
+            let (built, probe) = match build {
+                Side::Left => (left, right),
+                Side::Right => (right, left),
+            };
+            let mut counts = counted(&built);
+            let mut out = Vec::new();
+            for row in probe {
+                let Some(left_over) = counts.get_mut(&key(&row)) else {
+                    continue;
+                };
+                if *left_over == 0 {
+                    continue;
+                }
+                if all {
+                    *left_over -= 1;
+                } else {
+                    *left_over = 0;
+                }
+                out.push(row);
+            }
+            out
+        }
+        SetOp::Except => {
+            // Subtracting is not symmetric, but which side is held is:
+            // hold the right and read the left against it, or hold the
+            // left and take the right's rows out of what is held. The
+            // two spend the counts in a different order and arrive at
+            // the same multiset.
+            let mut counts = match build {
+                Side::Right => counted(&right),
+                Side::Left => {
+                    let mut counts = counted(&left);
+                    for row in &right {
+                        if let Some(held) = counts.get_mut(&key(row)) {
+                            *held = if all { held.saturating_sub(1) } else { 0 };
+                        }
+                    }
+                    counts
+                }
+            };
+            let mut out = Vec::new();
+            for row in left {
+                let k = key(&row);
+                let keep = match build {
+                    // The table holds what is being taken away, so a
+                    // row survives when nothing is left to take.
+                    Side::Right => match counts.get_mut(&k) {
+                        Some(subtract) if *subtract > 0 => {
+                            *subtract -= usize::from(all);
+                            false
+                        }
+                        Some(_) => all,
+                        None => true,
+                    },
+                    // The table holds what survived, so a row is
+                    // written out as many times as the table says.
+                    Side::Left => match counts.get_mut(&k) {
+                        Some(left_over) if *left_over > 0 => {
+                            *left_over -= 1;
+                            true
+                        }
+                        _ => false,
+                    },
+                };
+                if !keep {
+                    continue;
+                }
+                // DISTINCT answers once however many times the left
+                // wrote a row, so what has been answered is struck out.
+                if !all {
+                    counts.insert(k, 0);
+                }
+                out.push(row);
+            }
+            out
+        }
+    }
 }
 
 /// available_parallelism, resolved once for the process. On Linux the

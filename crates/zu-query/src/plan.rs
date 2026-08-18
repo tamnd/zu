@@ -14,7 +14,9 @@ use std::fmt::Write as _;
 
 use zu_common::Result;
 
-use crate::ast::{BinaryOp, Literal, PathMode, RelDirection, Selector, SortKey, UnaryOp};
+use crate::ast::{
+    BinaryOp, Conjunction, Literal, PathMode, RelDirection, Selector, SetOp, SortKey, UnaryOp,
+};
 use crate::binder::{
     BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetInto,
     BoundSetItem, Func, MatchKind, Schema, TableFunc,
@@ -240,6 +242,31 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         expr: BoundExpr,
     },
+    /// Two result tables and what is done with the pair (ISO 12.1).
+    ///
+    /// This is the only operator with two inputs that is not a join,
+    /// and the only one that stands at the top of a plan and nowhere
+    /// else: the standard puts the conjunctions above the linear query
+    /// and there is no production that puts one under a clause.
+    Conjoin {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        how: Conjunction,
+        /// Which side the hash table is built over, chosen by the
+        /// optimizer from the two cardinality estimates. `Side::Right`
+        /// is the written order and what an unoptimized plan carries.
+        /// `UNION ALL` and `OTHERWISE` build nothing and leave this at
+        /// the written order.
+        build: Side,
+    },
+}
+
+/// Which operand of a [`LogicalPlan::Conjoin`] the hash table is built
+/// over. The other one probes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
 }
 
 impl LogicalPlan {
@@ -249,8 +276,21 @@ impl LogicalPlan {
 }
 
 /// Builds the logical plan for a bound query.
+///
+/// A composite builds one plan per operand and joins them with a
+/// [`LogicalPlan::Conjoin`] apiece, left to right, which is the order
+/// the operators were written in and the order they associate in.
 pub fn build(query: &BoundQuery) -> Result<LogicalPlan> {
-    build_over(query, LogicalPlan::Empty)
+    let mut plan = build_over(query, LogicalPlan::Empty)?;
+    for joined in &query.conjoined {
+        plan = LogicalPlan::Conjoin {
+            left: plan.boxed(),
+            right: build(&joined.query)?.boxed(),
+            how: joined.how,
+            build: Side::Right,
+        };
+    }
+    Ok(plan)
 }
 
 /// Builds the plan for a bound query over something other than the one
@@ -685,6 +725,44 @@ fn rel_table_names(query: &BoundQuery, schema: &Schema, slot: usize) -> Vec<Stri
         .collect()
 }
 
+/// How many conjoins stand on the left spine from here down, this one
+/// counted. Zero for a plan with no composite in it.
+fn conjoins(plan: &LogicalPlan) -> usize {
+    match plan {
+        LogicalPlan::Conjoin { left, .. } => 1 + conjoins(left),
+        _ => 0,
+    }
+}
+
+/// Whether the conjunction has a build side to choose.
+///
+/// `EXCEPT` and `INTERSECT` hold one operand and read the other
+/// against it, so which one is held is a decision with a cost, and the
+/// optimizer makes it. The other three have nothing to decide:
+/// `UNION ALL` concatenates and holds nothing, `OTHERWISE` chooses an
+/// operand and holds nothing, and `UNION DISTINCT` holds the answer
+/// rather than an operand, so there is no side that could be the
+/// smaller one.
+pub fn chooses_a_build_side(how: Conjunction) -> bool {
+    matches!(
+        how,
+        Conjunction::Set {
+            op: SetOp::Except | SetOp::Intersect,
+            ..
+        }
+    )
+}
+
+/// A conjunction the way the query wrote it.
+fn conjunction_text(how: Conjunction) -> String {
+    match how {
+        Conjunction::Otherwise => "OTHERWISE".to_string(),
+        Conjunction::Set { op, all } => {
+            format!("{} {}", op.keyword(), if all { "ALL" } else { "DISTINCT" })
+        }
+    }
+}
+
 /// The operator for one plan node, its children built underneath it.
 /// `None` for the single starting row, which holds nothing to say.
 fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanNode> {
@@ -952,6 +1030,31 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
         }
         LogicalPlan::Skip { input, expr } => plain("Skip", expr_text(expr, query), under(input)),
         LogicalPlan::Limit { input, expr } => plain("Limit", expr_text(expr, query), under(input)),
+        LogicalPlan::Conjoin {
+            left,
+            right,
+            how,
+            build,
+        } => {
+            // The operands were joined on left to right, so the nth
+            // conjoin counting up from the bottom of the left spine
+            // reads the nth operand the binder put aside.
+            let nth = conjoins(plan) - 1;
+            let operand = query
+                .conjoined
+                .get(nth)
+                .map_or(query, |joined| joined.query.as_ref());
+            let mut children = under(left);
+            children.extend(node(right, operand, schema));
+            let detail = match build {
+                // Nothing is chosen for the other three, so naming a
+                // side would name a decision nobody made.
+                _ if !chooses_a_build_side(*how) => conjunction_text(*how),
+                Side::Left => format!("{} build left", conjunction_text(*how)),
+                Side::Right => format!("{} build right", conjunction_text(*how)),
+            };
+            plain("Conjoin", detail, children)
+        }
     })
 }
 

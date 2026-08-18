@@ -29,7 +29,7 @@ use zu_common::Result;
 
 use crate::ast::{BinaryOp, Literal, RelDirection};
 use crate::binder::{BoundExpr, BoundQuery, COLOR_DRIFT_LIMIT, ColStats, ColorSummary, Schema};
-use crate::plan::{LogicalPlan, VarLength};
+use crate::plan::{LogicalPlan, Side, VarLength};
 
 /// Components larger than this keep their written join order.
 const MAX_DP_RELS: usize = 12;
@@ -55,10 +55,68 @@ pub fn optimize_noted(
     schema: &Schema,
 ) -> Result<(LogicalPlan, Vec<Note>)> {
     let mut notes = Vec::new();
-    staleness_notes(query, schema, &mut notes);
-    let plan = rewrite(plan, query, schema, &mut notes)?;
-    let plan = mark_asp(plan, query, schema).0;
-    Ok((lift_close_filters(plan), notes))
+    let (plan, _) = optimize_operand(plan, query, schema, &mut notes)?;
+    // Two operands naming the same stale table would each say so, and
+    // the caller is being told about the table rather than about the
+    // operand.
+    notes.dedup();
+    Ok((plan, notes))
+}
+
+/// Optimizes one operand of a composite, or the whole plan when there
+/// is no composite, and answers with the rows it is estimated to make.
+///
+/// The estimate is what decides the build side of a conjoin: the hash
+/// table goes over whichever operand is expected to be smaller, and the
+/// other one probes it. That choice is written into the plan rather
+/// than made in the executor so that a test can read it.
+fn optimize_operand(
+    plan: LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    notes: &mut Vec<Note>,
+) -> Result<(LogicalPlan, f64)> {
+    if let LogicalPlan::Conjoin {
+        left, right, how, ..
+    } = plan
+    {
+        // The operands were joined on left to right, so the conjoins
+        // standing below this one count off the operand it joins.
+        let nth = conjoins(&left);
+        let operand = query
+            .conjoined
+            .get(nth)
+            .map_or(query, |joined| joined.query.as_ref());
+        let (left, l) = optimize_operand(*left, query, schema, notes)?;
+        let (right, r) = optimize_operand(*right, operand, schema, notes)?;
+        let build = if !crate::plan::chooses_a_build_side(how) || r <= l {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        return Ok((
+            LogicalPlan::Conjoin {
+                left: Box::new(left),
+                right: Box::new(right),
+                how,
+                build,
+            },
+            l + r,
+        ));
+    }
+    staleness_notes(query, schema, notes);
+    let plan = rewrite(plan, query, schema, notes)?;
+    let (plan, rows) = mark_asp(plan, query, schema);
+    Ok((lift_close_filters(plan), rows))
+}
+
+/// How many conjoins stand on the left spine from here down, this one
+/// counted.
+fn conjoins(plan: &LogicalPlan) -> usize {
+    match plan {
+        LogicalPlan::Conjoin { left, .. } => 1 + conjoins(left),
+        _ => 0,
+    }
 }
 
 /// Moves a predicate out from between an expand and the marked close
@@ -81,7 +139,12 @@ pub fn optimize_noted(
 /// group, so this is a reorder of two row filters and nothing else.
 fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. }) => leaf,
+        // A conjoin stands with the leaves here because the composite
+        // is taken apart above these walks: each operand is optimized
+        // as a plan of its own, so none of them ever meets one.
+        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. }) => {
+            leaf
+        }
         LogicalPlan::ScanNodes {
             input,
             slot,
@@ -499,7 +562,12 @@ fn mark_asp_node(
         // ran, which is a count from the run before this one rather
         // than anything the statistics hold, so it counts as one row
         // the way the empty seed does.
-        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. }) => (leaf, 1.0),
+        // A conjoin is here for the same reason a leaf is: the
+        // composite is taken apart above this walk, so each operand
+        // reaches it as a plan of its own and none of them holds one.
+        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. }) => {
+            (leaf, 1.0)
+        }
         LogicalPlan::ScanNodes {
             input,
             slot,
@@ -815,7 +883,9 @@ fn rewrite(
         return reorder_run(plan, query, schema, notes);
     }
     match plan {
-        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. }) => Ok(leaf),
+        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. }) => {
+            Ok(leaf)
+        }
         LogicalPlan::Filter {
             input,
             expr,
@@ -1546,7 +1616,7 @@ fn place_filters(
 /// Aggregate replace visibility, so the walk stops at them.
 fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
     match plan {
-        LogicalPlan::Empty => {}
+        LogicalPlan::Empty | LogicalPlan::Conjoin { .. } => {}
         LogicalPlan::Rows { slots, .. } => out.extend(slots.iter().copied()),
         LogicalPlan::ScanNodes { input, slot, .. } => {
             out.insert(*slot);
@@ -2408,7 +2478,12 @@ mod tests {
         let mut marks = Vec::new();
         loop {
             match plan {
-                LogicalPlan::Empty | LogicalPlan::Rows { .. } => break,
+                // A conjoin has two inputs and no one spine to walk, and
+                // no source this helper is asked about is written as a
+                // composite.
+                LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. } => {
+                    break;
+                }
                 LogicalPlan::Expand {
                     input, into, wcoj, ..
                 } => {
@@ -2978,5 +3053,82 @@ mod tests {
             "got:\n{text}"
         );
         assert!(text.contains("ScanNodes b: Person"), "got:\n{text}");
+    }
+
+    /// `INTERSECT` and `EXCEPT` hold one operand in a table and stream
+    /// the other past it, so which one they hold decides how much
+    /// memory the answer costs. The optimizer holds the operand it
+    /// estimates fewer rows for, whichever side of the word it is
+    /// written on, and EXPLAIN says which one that was.
+    #[test]
+    fn a_set_operator_builds_over_the_smaller_operand() {
+        let smaller_on_the_right = optimized(
+            "MATCH (a:Person) RETURN a.id AS id \
+             INTERSECT \
+             MATCH (b:Place) RETURN b.id AS id",
+        );
+        assert!(
+            smaller_on_the_right.contains("Conjoin INTERSECT DISTINCT build right"),
+            "1400 places against 9000 people, got:\n{smaller_on_the_right}"
+        );
+        let smaller_on_the_left = optimized(
+            "MATCH (a:Place) RETURN a.id AS id \
+             INTERSECT \
+             MATCH (b:Person) RETURN b.id AS id",
+        );
+        assert!(
+            smaller_on_the_left.contains("Conjoin INTERSECT DISTINCT build left"),
+            "the same two operands the other way round, got:\n{smaller_on_the_left}"
+        );
+        let except = optimized(
+            "MATCH (a:Person) RETURN a.id AS id \
+             EXCEPT ALL \
+             MATCH (b:Place) RETURN b.id AS id",
+        );
+        assert!(
+            except.contains("Conjoin EXCEPT ALL build right"),
+            "got:\n{except}"
+        );
+    }
+
+    /// `UNION ALL` reads both operands through and keeps nothing, and
+    /// `OTHERWISE` reads the second only when the first was empty.
+    /// Neither has a side to build over, so neither claims one.
+    #[test]
+    fn a_conjunction_that_holds_nothing_names_no_build_side() {
+        for source in [
+            "MATCH (a:Person) RETURN a.id AS id UNION ALL MATCH (b:Place) RETURN b.id AS id",
+            "MATCH (a:Person) RETURN a.id AS id OTHERWISE MATCH (b:Place) RETURN b.id AS id",
+        ] {
+            let text = optimized(source);
+            assert!(!text.contains("build"), "got:\n{text}");
+        }
+    }
+
+    /// The operands are planned apart, so the filter each one was
+    /// written with lands under its expand, which is where the
+    /// optimizer would put it in a query written on its own.
+    #[test]
+    fn each_operand_is_optimized_on_its_own() {
+        let text = optimized(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.id = $x RETURN b.id AS id \
+             UNION \
+             MATCH (c:Person)-[:KNOWS]->(d:Person) WHERE c.id = $y RETURN d.id AS id",
+        );
+        assert_eq!(
+            lines(&text),
+            [
+                "Conjoin UNION DISTINCT",
+                "Project b.id AS id",
+                "Expand (a)-[#1:KNOWS]->(b)",
+                "Filter a.id = $x",
+                "ScanNodes a: Person",
+                "Project d.id AS id",
+                "Expand (c)-[#1:KNOWS]->(d)",
+                "Filter c.id = $y",
+                "ScanNodes c: Person",
+            ],
+            "got:\n{text}"
+        );
     }
 }

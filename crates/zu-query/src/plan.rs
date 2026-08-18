@@ -884,6 +884,7 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
                     match v.mode {
                         PathMode::Walk => s.push_str(" walk"),
                         PathMode::Trail => {}
+                        PathMode::Simple => s.push_str(" simple"),
                         PathMode::Acyclic => s.push_str(" acyclic"),
                     }
                     match v.selector {

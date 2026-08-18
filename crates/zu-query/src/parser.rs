@@ -1537,11 +1537,8 @@ impl Parser<'_> {
             PathMode::Trail
         } else if self.eat_kw("ACYCLIC") {
             PathMode::Acyclic
-        } else if self.at_kw("SIMPLE") {
-            return Err(ZuError::gql(
-                codes::C42001,
-                "the SIMPLE path mode is not supported yet; use ACYCLIC",
-            ));
+        } else if self.eat_kw("SIMPLE") {
+            PathMode::Simple
         } else {
             PathMode::default()
         };
@@ -3227,12 +3224,23 @@ mod tests {
     }
 
     #[test]
-    fn bare_shortest_and_simple_read_as_errors() {
+    fn bare_shortest_reads_as_an_error() {
         assert!(
             parse_err("MATCH SHORTEST (a)-[:KNOWS*]->(b) RETURN *")
                 .contains("ANY SHORTEST or ALL SHORTEST")
         );
-        assert!(parse_err("MATCH SIMPLE (a)-[:KNOWS*]->(b) RETURN *").contains("use ACYCLIC"));
+    }
+
+    /// SIMPLE is a mode of its own and used to be turned away with a
+    /// suggestion to write ACYCLIC, which forbids a different set of
+    /// paths, so the two do not read as the same thing here either.
+    #[test]
+    fn simple_is_its_own_mode() {
+        let q = parsed("MATCH SIMPLE (a)-[:KNOWS*]->(b) RETURN *");
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        assert_eq!(patterns[0].mode, PathMode::Simple);
     }
 
     #[test]

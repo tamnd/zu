@@ -627,6 +627,12 @@ pub enum PathMode {
     /// No repeated edge.
     #[default]
     Trail,
+    /// No repeated node, except that the path may end where it began.
+    ///
+    /// That exception is the whole of the difference from `ACYCLIC`, and
+    /// it is why one is not a substitute for the other: a cycle is a
+    /// simple path and is not an acyclic one.
+    Simple,
     /// No repeated node.
     Acyclic,
 }

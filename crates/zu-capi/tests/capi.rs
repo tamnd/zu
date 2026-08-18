@@ -13,7 +13,8 @@ use zu::{
     ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME, ZU_TEMPORAL_LOCAL_TIME,
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
     ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
-    ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_config_init,
+    ZuResult, ZuStatus, ZuStmt, ZuValue, zu_bind_bool, zu_bind_bool_z, zu_bind_i64, zu_bind_i64_z,
+    zu_bind_str_z, zu_config_init,
     zu_config_set_z, zu_conn_close, zu_conn_interrupt, zu_conn_rows_read, zu_conn_set_progress,
     zu_connect, zu_create, zu_create_z, zu_database_close, zu_database_create_z,
     zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt,
@@ -653,6 +654,48 @@ fn the_nul_terminated_variants_agree_with_the_counted_ones() {
         assert_eq!(col_i64(result, 0, 1), [97]);
         zu_result_free(result);
 
+        zu_conn_close(conn);
+    }
+}
+
+/// A boolean goes in as an int and comes back as the value the
+/// statement was given, so a host writing a flag onto a node has a
+/// binding to put it in rather than a literal it has to build the text
+/// around.
+#[test]
+fn a_boolean_binds_from_an_int_and_reads_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("zbool.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let q = c("MATCH (a:person {id: 3}) RETURN $flag AS f");
+        let mut stmt: *mut ZuStmt = ptr::null_mut();
+        assert_eq!(
+            zu_prepare_z(conn, q.as_ptr(), &mut stmt, &mut err),
+            ZuStatus::Ok
+        );
+        let name = c("flag");
+        for (bound, want) in [(1, 1), (0, 0), (-7, 1)] {
+            assert_eq!(zu_bind_bool_z(stmt, name.as_ptr(), bound), ZuStatus::Ok);
+            let mut result: *mut ZuResult = ptr::null_mut();
+            assert_eq!(zu_execute(stmt, &mut result, &mut err), ZuStatus::Ok);
+            let mut got = -1i32;
+            assert_eq!(zu_value_bool(cell(result, 0, 0), &mut got), ZuStatus::Ok);
+            assert_eq!(got, want, "bound {bound}");
+            zu_result_free(result);
+        }
+        // The counted form takes the same name and means the same thing.
+        assert_eq!(zu_bind_bool(stmt, name.as_ptr(), 4, 0), ZuStatus::Ok);
+        let mut result: *mut ZuResult = ptr::null_mut();
+        assert_eq!(zu_execute(stmt, &mut result, &mut err), ZuStatus::Ok);
+        let mut got = -1i32;
+        assert_eq!(zu_value_bool(cell(result, 0, 0), &mut got), ZuStatus::Ok);
+        assert_eq!(got, 0);
+        zu_result_free(result);
+        zu_stmt_close(stmt);
         zu_conn_close(conn);
     }
 }

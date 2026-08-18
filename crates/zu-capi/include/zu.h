@@ -360,6 +360,9 @@ zu_status zu_bind_i64(zu_stmt *stmt, const char *name, size_t name_len, int64_t 
 zu_status zu_bind_i64_z(zu_stmt *stmt, const char *name, int64_t v);
 zu_status zu_bind_f64(zu_stmt *stmt, const char *name, size_t name_len, double v);
 zu_status zu_bind_f64_z(zu_stmt *stmt, const char *name, double v);
+/* A boolean, as an int: nought is false and anything else is true. */
+zu_status zu_bind_bool(zu_stmt *stmt, const char *name, size_t name_len, int v);
+zu_status zu_bind_bool_z(zu_stmt *stmt, const char *name, int v);
 zu_status zu_bind_str(zu_stmt *stmt, const char *name, size_t name_len, const char *v,
                       size_t v_len);
 zu_status zu_bind_str_z(zu_stmt *stmt, const char *name, const char *v);

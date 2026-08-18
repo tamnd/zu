@@ -9,6 +9,34 @@ It is columnar, vectorized, and factorized in the DuckDB and Kùzu mold, with on
 - `sqlite` stores the graph in an ordinary SQLite database file, for interop and as the differential-testing oracle.
 - `s3` is object-storage-native with immutable segments, compare-and-swap manifest commits, and a request accountant that keeps the monthly bill flat.
 
+## Sixty seconds
+
+```rust
+use zudb::{Database, params};
+
+fn main() -> zudb::Result<()> {
+    let db = Database::create("social.zu1")?;
+    let mut conn = db.connect()?;
+
+    conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")?;
+    conn.execute("INSERT (p:person {uid: 2, name: 'grace'})")?;
+
+    let rows = conn.query_with(
+        "MATCH (p:person) WHERE p.uid >= $uid RETURN p.name AS name, p.uid AS uid",
+        &params! { "uid" => 1 },
+    )?;
+    for row in rows.iter() {
+        let (name, uid): (&str, i64) = row.get()?;
+        println!("{name} {uid}");
+    }
+    Ok(())
+}
+```
+
+That is `cargo add zudb` and the whole program: no server, no schema step, no cluster. `create` makes the file and `open` is what you use the second time, because a create that found a database and opened it instead is the call that quietly writes into somebody else's data. The same sixty seconds in Python, `import zudb`, `zudb.connect`, `.to_pandas()`, is in [zu-python](https://github.com/tamnd/zu-python).
+
+The snippet above is a program in this repository, `crates/zu-snippets/examples/sixty-seconds.rs`, and a test holds this README to it character for character and then runs it. A quickstart is the most read and least compiled code a project has, which is how it comes to be wrong.
+
 ## Status
 
 Early. The specification is complete and lives in [docs/](docs/), starting with the [overview](docs/00-overview.md).
@@ -38,6 +66,7 @@ crates/zu-s3         object-storage engine
 crates/zu-query      parser, planner, factorized executor
 crates/zu            the public embedded API (published as zudb)
 crates/zu-cli        the zu binary
+crates/zu-snippets   the snippets this README prints, compiled and run
 docs/                the specification, byte-level where it matters
 ```
 

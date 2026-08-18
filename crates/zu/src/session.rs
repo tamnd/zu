@@ -1342,16 +1342,17 @@ mod tests {
             .expect("create");
 
         // The tables are the home graph's, so a query against the new
-        // graph does not find them: a name is a name in a graph.
-        let err = session
+        // graph does not find them: a name is a name in a graph, and
+        // the same statement counts rows in the one and none in the
+        // other.
+        let elsewhere = session
             .run("USE empty MATCH (a:person) RETURN count(a) AS n", &[])
-            .expect_err("no person there");
-        assert!(err.to_string().contains("person"), "{err}");
-        assert!(
-            session
-                .run("MATCH (a:person) RETURN count(a) AS n", &[])
-                .is_ok()
-        );
+            .expect("the statement runs against the new graph");
+        assert_eq!(elsewhere.rows, vec![vec![Value::Int(0)]]);
+        let home = session
+            .run("MATCH (a:person) RETURN count(a) AS n", &[])
+            .expect("the statement runs against the home graph");
+        assert_ne!(home.rows, vec![vec![Value::Int(0)]]);
     }
 
     #[test]

@@ -1105,8 +1105,12 @@ mod tests {
         let person = catalog.node_by_name("person").expect("person").id;
         assert_eq!(a.node_tables, [person]);
 
-        let err = bind("MATCH (a:nope) RETURN a", &catalog).expect_err("unknown label");
-        assert!(err.to_string().contains("unknown label"), "got: {err}");
+        // A label the graph has never held leaves the variable with no
+        // table to scan, which is how the plan says a pattern matches
+        // nothing without the statement being refused.
+        let q = bind("MATCH (a:nope) RETURN a", &catalog).expect("bind");
+        let a = q.variables.iter().find(|v| v.name == "a").expect("a");
+        assert!(a.node_tables.is_empty(), "got: {:?}", a.node_tables);
 
         let text = explain(
             "MATCH (a:person {id: $src})-[:follows]->(b) RETURN b.id AS friend",
@@ -1787,10 +1791,10 @@ mod tests {
             ids("MATCH (a:person {id: 1})-[:knows]->(b:Manager) RETURN b.id AS id"),
             [Value::Int(2)]
         );
-        // A label the graph never declared names no rows, and saying
-        // so is the binder's job rather than the executor's.
-        let err = run("MATCH (n:Ghost) RETURN n", &mut db, &[]).expect_err("unknown label");
-        assert!(err.to_string().contains("unknown label 'Ghost'"), "{err}");
+        // A label the graph never declared names no rows, and no rows
+        // is what the statement answers with.
+        let r = run("MATCH (n:Ghost) RETURN n", &mut db, &[]).expect("the statement runs");
+        assert!(r.rows.is_empty(), "{r:?}");
     }
 
     #[test]

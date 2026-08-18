@@ -59,9 +59,9 @@ fn an_undirected_edge_is_walked_from_either_end() {
 }
 
 /// The four spellings that admit an undirected edge all walk it, and
-/// the two that ask for a direction find no table to walk at all. A
-/// step that can match nothing is refused where it is bound, the same
-/// as any other step whose tables do not fit.
+/// the ones that ask for a direction find no table to walk at all. A
+/// step no table fits walks nothing and the statement answers with no
+/// rows, the same as any other pattern the graph cannot satisfy.
 #[test]
 fn the_arrows_refuse_an_undirected_edge_and_the_tildes_take_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -72,8 +72,11 @@ fn the_arrows_refuse_an_undirected_edge_and_the_tildes_take_it() {
     }
     for pattern in ["-[:friend]->", "<-[:friend]-", "<-[:friend]->"] {
         let source = format!("MATCH (a:peer){pattern}(b:peer) WHERE a.id = 0 RETURN b.id AS id");
-        let err = run(&source, &mut db, &[]).expect_err(&source).to_string();
-        assert!(err.contains("matches no relationship table"), "{err}");
+        let rows = run(&source, &mut db, &[]).expect(&source).rows;
+        assert!(
+            rows.is_empty(),
+            "{pattern} walked an undirected edge: {rows:?}"
+        );
     }
 }
 
@@ -99,14 +102,17 @@ fn a_directed_edge_refuses_the_tilde() {
         ),
         [0]
     );
-    let err = run(
+    let rows = run(
         "MATCH (a:peer)~[:friend]~(b:peer) RETURN b.id AS id",
         &mut db,
         &[],
     )
-    .expect_err("a directed table is no undirected one")
-    .to_string();
-    assert!(err.contains("matches no relationship table"), "{err}");
+    .expect("the statement runs")
+    .rows;
+    assert!(
+        rows.is_empty(),
+        "a directed table is no undirected one: {rows:?}"
+    );
 }
 
 /// The abbreviated spellings, which drop the bracket and so drop the

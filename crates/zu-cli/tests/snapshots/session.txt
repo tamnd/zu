@@ -54,8 +54,8 @@ $ zu query <graph> -c 'MATCH (n:node) RETURN count(n) AS nodes' --format json
 {"gqlstatus":"00000","columns":["nodes"],"rows":[[4]]}
 
 $ zu query <graph> -c 'MATCH (n:nope) RETURN n'
-! zu query: 42002: unknown label 'nope'
-# exit 1
+n
+(0 rows)
 
 $ zu neighbors <graph> 1
 node 1: degree 2

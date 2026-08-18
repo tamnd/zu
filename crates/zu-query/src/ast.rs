@@ -855,6 +855,15 @@ pub enum Expr {
         patterns: Vec<PathPattern>,
         filter: Option<Box<Expr>>,
     },
+    /// `VALUE { MATCH (p:Person) RETURN COUNT(*) }`, the value query
+    /// expression (ISO 20.6, GQ18): a whole query written where one
+    /// value belongs.
+    ///
+    /// The query inside is a query and not a block: it may chain with
+    /// `NEXT`, join with a set operator and end with an ORDER BY and a
+    /// LIMIT, and it has to end with a RETURN of exactly one column,
+    /// because what stands here is one value.
+    ValueQuery(Box<Query>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

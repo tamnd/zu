@@ -741,6 +741,14 @@ pub struct BoundQuery {
     /// other has, so each gets its own slot table and its own plan and
     /// the operator meets them as two tables of rows.
     pub conjoined: Vec<Conjoined>,
+    /// GQ18. The value query expressions written anywhere in this
+    /// query, in the order they were bound, which is the order
+    /// [`BoundExpr::Scalar`] indexes them in.
+    ///
+    /// Each is a query of its own with its own slots, because a value
+    /// query expression reads nothing from the query around it: the
+    /// two share their parameters and nothing else.
+    pub scalars: Vec<BoundQuery>,
 }
 
 impl BoundQuery {
@@ -1374,6 +1382,16 @@ pub enum BoundExpr {
         slot: usize,
         test: LabelTest,
     },
+    /// GQ18. A value query expression, as an index into
+    /// [`BoundQuery::scalars`].
+    ///
+    /// The query it names reads nothing from the row this expression
+    /// stands in, so its answer is the same value for every row of the
+    /// run and the executor works it out once, before the plan above
+    /// it starts. That is the whole of the decorrelation: what is left
+    /// here is a constant the run is handed, which is why the
+    /// optimizer treats one the way it treats a parameter.
+    Scalar(usize),
 }
 
 /// Who reads the rows a projection makes, which is the whole of the
@@ -1397,13 +1415,34 @@ enum Projected {
 /// to the statement rather than to any one operand, so it is carried
 /// across and each operand's names are appended to it.
 pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
-    let mut operands = Vec::new();
     let mut params = Vec::new();
-    collect_operands(&query.body, &mut operands);
-    let mut bound = bind_linear(operands[0].0, schema, &mut params)?;
+    let mut bound = bind_body(&query.body, schema, &mut params, &[])?;
+    // The parameter list is the statement's, so every operand's plan
+    // reads the same positions the caller filled in.
+    let all = params.clone();
+    spread_params(&mut bound, &all);
+    Ok(bound)
+}
+
+/// Binds the operands of a composite query against one parameter list.
+///
+/// `outer` names what is in scope in the query this one is written
+/// inside, which is nothing at the top level and the names around it
+/// for the query a `VALUE { ... }` carries. Nothing is bound from it:
+/// it is there so that a reference to one of those names is refused by
+/// saying what is wrong rather than by saying the name does not exist.
+fn bind_body(
+    body: &ast::Composite,
+    schema: &Schema,
+    params: &mut Vec<String>,
+    outer: &[String],
+) -> Result<BoundQuery> {
+    let mut operands = Vec::new();
+    collect_operands(body, &mut operands);
+    let mut bound = bind_linear(operands[0].0, schema, params, outer)?;
     for (linear, how) in &operands[1..] {
         let how = how.expect("only the leftmost operand has no conjunction");
-        let right = bind_linear(linear, schema, &mut params)?;
+        let right = bind_linear(linear, schema, params, outer)?;
         // A statement that writes is taken apart at its write and run
         // in parts, and a part is one pipeline. An operand of a
         // composite is a second one, so the two cannot be the same
@@ -1421,14 +1460,20 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
             query: Box::new(right),
         });
     }
-    // The parameter list is the statement's, so every operand's plan
-    // reads the same positions the caller filled in.
-    let all = params.clone();
-    bound.params = all.clone();
-    for joined in &mut bound.conjoined {
-        joined.query.params = all.clone();
-    }
     Ok(bound)
+}
+
+/// Gives every query under this one the statement's whole parameter
+/// list, so that an operand of a composite and a value query
+/// expression read the same positions the caller filled in.
+fn spread_params(query: &mut BoundQuery, all: &[String]) {
+    query.params = all.to_vec();
+    for joined in &mut query.conjoined {
+        spread_params(&mut joined.query, all);
+    }
+    for scalar in &mut query.scalars {
+        spread_params(scalar, all);
+    }
 }
 
 /// Whether a bound clause changes the graph.
@@ -1497,7 +1542,9 @@ fn agree_on_columns(left: &BoundQuery, right: &BoundQuery, how: ast::Conjunction
 /// two places to forget when a variant is added.
 pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
+        // A value query expression reads no slot of this query: that
+        // is what makes it one value for the whole run.
+        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Scalar(_) => {}
         BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => out.extend([*slot]),
         BoundExpr::Property { base, .. } => expr_slots(base, out),
         BoundExpr::Unary { expr, .. } => expr_slots(expr, out),
@@ -1537,6 +1584,7 @@ fn bind_linear(
     linear: &ast::Linear,
     schema: &Schema,
     params: &mut Vec<String>,
+    outer: &[String],
 ) -> Result<BoundQuery> {
     let mut binder = Binder {
         schema,
@@ -1547,6 +1595,8 @@ fn bind_linear(
         path_shapes: BTreeMap::new(),
         pending: Vec::new(),
         marks: None,
+        scalars: Vec::new(),
+        outer: outer.to_vec(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -1593,6 +1643,7 @@ fn bind_linear(
         path_shapes: binder.path_shapes,
         labels: schema.labels.clone(),
         conjoined: Vec::new(),
+        scalars: binder.scalars,
     })
 }
 
@@ -1614,6 +1665,15 @@ struct Binder<'a> {
     /// go, which is anywhere the predicate is not a WHERE standing
     /// straight over the pattern its block reads.
     marks: Option<Vec<BoundClause>>,
+    /// The value query expressions bound so far, which become
+    /// [`BoundQuery::scalars`].
+    scalars: Vec<BoundQuery>,
+    /// The names in scope in the query this one is written inside,
+    /// empty for a query nothing is written inside. A reference to one
+    /// of these is a correlated value query expression, which is a
+    /// thing this engine says it cannot do rather than a name it
+    /// pretends never to have heard of.
+    outer: Vec<String>,
 }
 
 /// Expression context: where aggregates are legal and whether one was
@@ -3185,10 +3245,11 @@ impl Binder<'_> {
                 Ok((BoundExpr::Param(index), Type::Any))
             }
             Expr::Variable(name) => {
-                let slot =
-                    self.scope.get(name).copied().ok_or_else(|| {
-                        bad_reference(format!("variable '{name}' is not defined"))
-                    })?;
+                let slot = self
+                    .scope
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| self.undefined(name))?;
                 Ok((BoundExpr::Var(slot), self.variables[slot].ty.clone()))
             }
             Expr::Property { base, key } => {
@@ -3356,7 +3417,64 @@ impl Binder<'_> {
             Expr::Exists { patterns, filter } => {
                 Ok((self.bind_mark(patterns, filter, false)?, Type::Bool))
             }
+            Expr::ValueQuery(query) => self.bind_value_query(query),
         }
+    }
+
+    /// A name that is not in scope, and what to say about it.
+    ///
+    /// Inside a value query expression the name may well be defined:
+    /// it is defined in the query around this one, and this engine
+    /// works one of these out once for the whole run, which it can
+    /// only do while the answer is the same for every row. Saying so
+    /// beats saying the name does not exist, because it does.
+    fn undefined(&self, name: &str) -> ZuError {
+        if self.outer.iter().any(|n| n == name) {
+            return invalid(format!(
+                "a VALUE query is worked out once for the whole statement, so it cannot read '{name}' from the query around it: lift the query out and join it, or write the value in"
+            ));
+        }
+        bad_reference(format!("variable '{name}' is not defined"))
+    }
+
+    /// GQ18: `VALUE { ... }`, a whole query standing where one value
+    /// belongs (ISO 20.6).
+    ///
+    /// It binds as a query of its own with a scope of its own, because
+    /// it shares nothing with the query around it but the parameters.
+    /// What comes back here is the index the executor reads its answer
+    /// at, and the answer is worked out once, before the plan above it
+    /// runs.
+    fn bind_value_query(&mut self, query: &ast::Query) -> Result<(BoundExpr, Type)> {
+        if query.use_graph.is_some() {
+            return Err(invalid(
+                "a VALUE query runs in the graph the statement runs in, so it may not carry a USE of its own".into(),
+            ));
+        }
+        let mut params = std::mem::take(&mut self.params);
+        let mut outer = self.outer.clone();
+        outer.extend(self.scope.keys().cloned());
+        let bound = bind_body(&query.body, self.schema, &mut params, &outer)?;
+        self.params = params;
+        let mut wrote = false;
+        bound.walk(&mut |q| wrote |= q.clauses.iter().any(writes));
+        if wrote {
+            return Err(invalid(
+                "a VALUE query stands for a value and is read where one belongs, so it may not write to the graph".into(),
+            ));
+        }
+        if bound.columns.len() != 1 {
+            return Err(invalid(format!(
+                "a VALUE query stands for one value, so it has to return one column, and this one returns {}",
+                bound.columns.len()
+            )));
+        }
+        let ty = match bound.clauses.last() {
+            Some(BoundClause::Project { items, .. }) if items.len() == 1 => items[0].ty.clone(),
+            _ => Type::Any,
+        };
+        self.scalars.push(bound);
+        Ok((BoundExpr::Scalar(self.scalars.len() - 1), ty))
     }
 
     fn bind_call(
@@ -3609,6 +3727,7 @@ pub fn text(expr: &Expr) -> String {
         // titles an operator, and a whole match inside one of those
         // reads worse than the word does.
         Expr::Exists { .. } => "EXISTS { ... }".into(),
+        Expr::ValueQuery(_) => "VALUE { ... }".into(),
     }
 }
 

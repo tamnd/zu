@@ -94,35 +94,45 @@ impl<'a> Removals<'a> {
                     ZuError::InvalidArgument(
                         "an element is being deleted that no clause of the statement binds".into(),
                     )
-                })?;
-            let (table, offset) = match value {
-                Value::Node { table, offset } => (*table, *offset),
-                // An edge is named by the rows it runs between, and
-                // that is the whole of it: nothing has to be checked,
-                // because an edge has no edges on it, and nothing else
-                // is staged, because both ends stay.
-                Value::Rel {
-                    table, src, dst, ..
-                } => {
-                    self.edges.insert((*table, *src, *dst));
-                    continue;
-                }
-                // An OPTIONAL MATCH that found nothing binds null, and
-                // taking nothing away is what the statement asked for.
-                Value::Null => continue,
-                other => {
-                    return Err(ZuError::gql(
-                        codes::C22G03,
-                        format!(
-                            "DELETE takes away an element, and this one is {}",
-                            describe(other)
-                        ),
-                    ));
-                }
-            };
-            self.detach(db, table, offset)?;
-            self.rows.insert((table, offset));
+                })?
+                .clone();
+            self.element(db, &value)?;
         }
+        Ok(())
+    }
+
+    /// Takes one element away, whichever kind of delete item named it.
+    /// A variable reads it out of the row and a `VALUE { ... }` gets it
+    /// from the query it ran, and from here on the two are the same
+    /// thing.
+    pub(crate) fn element(&mut self, db: &mut Zu1File, value: &Value) -> Result<()> {
+        let (table, offset) = match value {
+            Value::Node { table, offset } => (*table, *offset),
+            // An edge is named by the rows it runs between, and
+            // that is the whole of it: nothing has to be checked,
+            // because an edge has no edges on it, and nothing else
+            // is staged, because both ends stay.
+            Value::Rel {
+                table, src, dst, ..
+            } => {
+                self.edges.insert((*table, *src, *dst));
+                return Ok(());
+            }
+            // An OPTIONAL MATCH that found nothing binds null, and
+            // taking nothing away is what the statement asked for.
+            Value::Null => return Ok(()),
+            other => {
+                return Err(ZuError::gql(
+                    codes::C22G03,
+                    format!(
+                        "DELETE takes away an element, and this one is {}",
+                        describe(other)
+                    ),
+                ));
+            }
+        };
+        self.detach(db, table, offset)?;
+        self.rows.insert((table, offset));
         Ok(())
     }
 
@@ -534,5 +544,124 @@ mod tests {
             )
             .expect("the other element is still there");
         assert_eq!(names_of(&out), ["kay"]);
+    }
+
+    /// GD03: the delete item is a query rather than a variable, and the
+    /// element it answers is the one that goes.
+    #[test]
+    fn a_delete_item_can_be_a_query_that_names_the_element() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-value.zu1");
+
+        session
+            .run(
+                "DELETE VALUE { MATCH (p:person {name: 'zoe'}) RETURN p }",
+                &[],
+            )
+            .expect("delete");
+
+        assert_eq!(names(&mut session), ["ada", "kay"]);
+    }
+
+    /// The subquery is a statement of its own, so it sees the store and
+    /// not the variables around it. Here it names one element while the
+    /// clauses around it name another, and both go.
+    #[test]
+    fn a_query_item_and_a_variable_item_go_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-value-and-var.zu1");
+
+        session
+            .run(
+                "MATCH (p:person {name: 'ada'}) DETACH DELETE p, VALUE { MATCH (q:person {name: 'zoe'}) RETURN q }",
+                &[],
+            )
+            .expect("delete");
+
+        assert_eq!(names(&mut session), ["kay"]);
+    }
+
+    /// A value query expression is a value, so a query answering two
+    /// rows has not said which element the item is about. Nothing goes.
+    #[test]
+    fn a_query_item_that_answers_more_than_one_element_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-value-two.zu1");
+
+        let err = session
+            .run("DELETE VALUE { MATCH (p:person) RETURN p }", &[])
+            .expect_err("two elements is not one element");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G03"));
+
+        assert_eq!(names(&mut session), ["ada", "kay", "zoe"]);
+    }
+
+    /// The item deletes an element, so a query answering something that
+    /// is not one is refused the same way `DELETE p.name` would be.
+    #[test]
+    fn a_query_item_that_answers_a_property_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-value-prop.zu1");
+
+        let err = session
+            .run(
+                "DELETE VALUE { MATCH (p:person {name: 'zoe'}) RETURN p.name AS name }",
+                &[],
+            )
+            .expect_err("a name is not an element");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("22G03"));
+
+        assert_eq!(names(&mut session), ["ada", "kay", "zoe"]);
+    }
+
+    /// The nested query answers the element, so it reads. One that
+    /// writes is refused when the statement is compiled, before
+    /// anything of either has run.
+    #[test]
+    fn a_query_item_that_writes_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-value-writes.zu1");
+
+        let err = session
+            .run(
+                "DELETE VALUE { INSERT (p:person {name: 'new'}) RETURN p }",
+                &[],
+            )
+            .expect_err("a delete item does not write");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("42001"));
+
+        assert_eq!(names(&mut session), ["ada", "kay", "zoe"]);
+    }
+
+    /// A delete runs once for every row the clauses before it
+    /// answered, so clauses that answered nothing delete nothing, and
+    /// the query inside the item does not run either.
+    #[test]
+    fn a_query_item_under_a_match_that_found_nothing_deletes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-value-no-rows.zu1");
+
+        session
+            .run(
+                "MATCH (p:person {name: 'nobody'}) DELETE VALUE { MATCH (q:person {name: 'zoe'}) RETURN q }",
+                &[],
+            )
+            .expect("nothing to do is not a failure");
+
+        assert_eq!(names(&mut session), ["ada", "kay", "zoe"]);
+    }
+
+    /// `value` is not a reserved word: the brace after it is what tells
+    /// a value query expression from a variable somebody named that.
+    #[test]
+    fn a_variable_called_value_is_still_a_variable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-value-name.zu1");
+
+        session
+            .run("MATCH (value:person {name: 'zoe'}) DELETE value", &[])
+            .expect("delete");
+
+        assert_eq!(names(&mut session), ["ada", "kay"]);
     }
 }

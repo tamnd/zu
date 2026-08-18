@@ -183,6 +183,10 @@ const NOTES: &[&str] = &[
     "a DELETE takes away the element an earlier clause found, a DETACH DELETE takes its edges \
      with it, and a plain DELETE of an element that still has edges on it is refused with the \
      code the standard gives that rather than leaving a dangling edge",
+    "a delete item is a variable an earlier clause bound or a query answering the element, \
+     written VALUE and the query in braces, and the query runs on its own against the same \
+     graph, so it reads the store rather than the variables around it and has to answer one \
+     row of one column because one item takes away one element",
     "an element is created in the node table whose own name is the label the pattern wrote, \
      and a label no node table is named by makes one, out of the properties the pattern \
      writes and under the savepoint the statement holds, so a property written as a value \

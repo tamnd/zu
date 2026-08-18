@@ -235,6 +235,15 @@ const NOTES: &[&str] = &[
      The edges kept apart are those whose steps describe the same pair of ends, which is where \
      any graph at all can answer both patterns with one edge; two steps that end somewhere else \
      coincide only on a graph holding a loop, and that pair is not checked yet",
+    "brackets around part of a pattern match nothing of their own, and what they are for is that \
+     a name, a path mode and a condition can be said about the stretch they hold rather than \
+     about the whole pattern: a name inside them binds a path over that stretch, a mode inside \
+     them governs the steps they hold with the tightest pair of brackets winning, and a WHERE \
+     inside them may read a variable bound outside them, which is the non local predicate. A \
+     factor written straight against another meets it at a node, so the two node patterns there \
+     describe one node and two names written there are two names for one element; a name that \
+     already stands for something else is refused rather than joined to it. A path selector \
+     inside the brackets is refused, the standard writing one in front of a whole pattern",
     "a path variable binds the walk as a path value rather than as the list of the same \
      elements, so PATH builds one, PATH_LENGTH counts its edges, ELEMENTS answers its nodes \
      and edges as a list in the order they were walked, and two paths over the same elements \

@@ -244,6 +244,51 @@ fn and_all(filter: Option<BoundExpr>, tests: Vec<BoundExpr>) -> Option<BoundExpr
     })
 }
 
+/// The slots a stretch of a bound pattern walks, in the order a path
+/// value holds them (docs/07 §5).
+///
+/// `from` and `to` are node positions, the first node of the pattern
+/// being zero, so the whole pattern is `0` to the number of steps and a
+/// bracket around part of it is a shorter run of the same walk. A
+/// stretch of one node and no edge is a path of length zero, which is a
+/// path value like any other.
+fn walk(
+    start: &BoundNode,
+    steps: &[(BoundRel, BoundNode)],
+    from: usize,
+    to: usize,
+) -> Vec<PathPart> {
+    let node = |at: usize| match at {
+        0 => start.slot,
+        at => steps[at - 1].1.slot,
+    };
+    let mut parts = vec![PathPart::Node(node(from))];
+    for (rel, node) in &steps[from..to] {
+        parts.push(match rel.range.is_some() {
+            true => PathPart::VarRel(rel.slot),
+            false => PathPart::Rel(rel.slot),
+        });
+        parts.push(PathPart::Node(node.slot));
+    }
+    parts
+}
+
+/// The path mode a step walks under when the brackets around it named
+/// one, the tightest pair of them winning.
+///
+/// Brackets nest, so a step may sit inside several, and the one nearest
+/// it is the one that speaks about it: `WALK ((a)-[e]->(b) (TRAIL
+/// (b)-[f*]->(c)))` walks the outer stretch and trails the inner. A
+/// bracket that named no mode says nothing and is passed over, which
+/// leaves the mode the pattern or its match mode settles.
+fn subpath_mode(subpaths: &[ast::Subpath], at: usize) -> Option<PathMode> {
+    subpaths
+        .iter()
+        .filter(|sub| sub.mode.is_some() && sub.from <= at && at < sub.to)
+        .min_by_key(|sub| sub.to - sub.from)
+        .and_then(|sub| sub.mode)
+}
+
 /// One node table: a label naming the row domain `0..node_count`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDef {
@@ -1924,7 +1969,17 @@ impl Binder<'_> {
                 // rather than filtering behind it, so a mark there
                 // would have to run inside that bracket and refuses
                 // instead.
-                let filter = self.bind_where(filter, !optional)?;
+                let mut filter = self.bind_where(filter, !optional)?;
+                // A condition written inside a pattern's brackets
+                // decides the match the way the clause's own WHERE
+                // does, so the two fold together rather than one
+                // running behind the other. It is bound after every
+                // pattern of the list, because a condition inside one
+                // bracket may read a name another pattern wrote.
+                for path in patterns {
+                    let inner = self.bind_where(&path.filter, !optional)?;
+                    filter = and_all(filter, inner.into_iter().collect());
+                }
                 let filter = and_all(filter, self.edge_distinctness(patterns, &bound));
                 Ok(BoundClause::Match {
                     kind: match optional {
@@ -1952,6 +2007,11 @@ impl Binder<'_> {
                     if path.selector.is_some() || path.mode.is_some() {
                         return Err(invalid(
                             "a selector or a path mode says which of the walks that are there to pick, and INSERT is making one rather than picking one".into(),
+                        ));
+                    }
+                    if !path.subpaths.is_empty() || path.filter.is_some() {
+                        return Err(invalid(
+                            "brackets around part of a pattern name a stretch of a walk or say something that has to hold of one, and INSERT is writing the elements rather than walking them".into(),
                         ));
                     }
                     let mut left = self.bind_insert_end(&path.start, &mut nodes)?;
@@ -2175,10 +2235,15 @@ impl Binder<'_> {
             self.settle_labels(path);
         }
         let held = self.marks.take();
-        let filter = match &block.filter {
+        let mut filter = match &block.filter {
             Some(expr) => Some(self.bind_bool(expr, "WHERE")?),
             None => None,
         };
+        for path in block.patterns {
+            let Some(expr) = &path.filter else { continue };
+            let inner = self.bind_bool(expr, "WHERE")?;
+            filter = and_all(filter, vec![inner]);
+        }
         let filter = and_all(filter, self.edge_distinctness(block.patterns, &bound));
         self.marks = held;
         self.scope = outer;
@@ -2701,11 +2766,14 @@ impl Binder<'_> {
         };
         let start = self.bind_node(&path.start)?;
         let mut steps = Vec::new();
-        for (rel, node) in &path.steps {
+        for (at, (rel, node)) in path.steps.iter().enumerate() {
             // A pattern that named no path mode walks under the one its
             // match mode settles, which is TRAIL under DIFFERENT EDGES
-            // and WALK under REPEATABLE ELEMENTS.
-            let mode = path.mode.unwrap_or(path.list.mode.path_mode());
+            // and WALK under REPEATABLE ELEMENTS, and a step inside
+            // brackets that named one walks under that instead.
+            let mode = subpath_mode(&path.subpaths, at)
+                .or(path.mode)
+                .unwrap_or(path.list.mode.path_mode());
             let rel = self.bind_rel(rel, mode, path.selector)?;
             let node = self.bind_node(node)?;
             steps.push((rel, node));
@@ -2723,15 +2791,16 @@ impl Binder<'_> {
             ));
         }
         if let Some(slot) = slot {
-            let mut parts = vec![PathPart::Node(start.slot)];
-            for (rel, node) in &steps {
-                parts.push(if rel.range.is_some() {
-                    PathPart::VarRel(rel.slot)
-                } else {
-                    PathPart::Rel(rel.slot)
-                });
-                parts.push(PathPart::Node(node.slot));
-            }
+            let parts = walk(&start, &steps, 0, steps.len());
+            self.path_shapes.insert(slot, parts);
+        }
+        // A subpath variable is the same kind of value over a stretch of
+        // the same walk, so it is bound the same way and told where to
+        // start and stop.
+        for sub in &path.subpaths {
+            let Some(name) = &sub.var else { continue };
+            let slot = self.declare(name, Type::Path)?;
+            let parts = walk(&start, &steps, sub.from, sub.to);
             self.path_shapes.insert(slot, parts);
         }
         Ok(BoundPath { slot, start, steps })
@@ -3209,6 +3278,25 @@ impl Binder<'_> {
                 slot
             }
         };
+        // The other names the node was written under stand for the one
+        // element, so they name the one slot rather than a slot each.
+        // A name already standing for something else is refused: making
+        // it stand for this as well would be two elements under one
+        // name, which is what 42002 is for.
+        for name in &pat.aliases {
+            match self.scope.get(name).copied() {
+                Some(seen) if seen == slot => {}
+                Some(_) => {
+                    return Err(bad_reference(format!(
+                        "'{name}' already stands for something else, and where two stretches of \
+                         a pattern meet it would have to stand for the node they meet at"
+                    )));
+                }
+                None => {
+                    self.scope.insert(name.clone(), slot);
+                }
+            }
+        }
         let props = self.bind_props(&pat.props)?;
         Ok(BoundNode {
             slot,

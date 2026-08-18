@@ -106,6 +106,22 @@ pub struct FileHeader {
     pub flags: u64,
 }
 
+/// Puts the file's name in front of a corruption an open found.
+///
+/// The header decoders work on bytes and have no path to name, and a
+/// process with several databases open learns nothing from "bad magic"
+/// on its own. Anything that is not a corruption is passed through
+/// untouched, since it already says which call failed.
+fn named(error: ZuError, path: &Path) -> ZuError {
+    match error {
+        ZuError::Corrupt { what, detail } => ZuError::Corrupt {
+            what,
+            detail: format!("{}: {detail}", path.display()),
+        },
+        other => other,
+    }
+}
+
 impl FileHeader {
     fn fresh() -> Self {
         Self {
@@ -440,8 +456,26 @@ impl Zu1File {
 
     fn open_kind(mut file: Box<dyn VfsFile>, path: &Path, writable: bool) -> Result<Self> {
         let mut head = [0u8; FILE_HEADER_SIZE + 2 * DB_HEADER_SIZE];
-        file.read_exact_at(&mut head, 0)?;
-        let file_header = FileHeader::decode(&head)?;
+        // Read what the file has rather than what a database would
+        // have. A file too small for the header is usually not a
+        // database at all, and the read that would report it says only
+        // "failed to fill whole buffer", which names neither the file
+        // nor the reason. The bytes past the end stay zero, which no
+        // header slot decodes as valid, so the magic gets to answer
+        // first and a text file gets told it is a text file.
+        let size = file.len()?;
+        let have = usize::try_from(size).unwrap_or(head.len()).min(head.len());
+        file.read_exact_at(&mut head[..have], 0)?;
+        if have < FILE_HEADER_SIZE {
+            return Err(ZuError::Corrupt {
+                what: "file header",
+                detail: format!(
+                    "{}: {size} bytes, too short to be a zu1 database",
+                    path.display()
+                ),
+            });
+        }
+        let file_header = FileHeader::decode(&head).map_err(|error| named(error, path))?;
         let a = DatabaseHeader::decode(&head[FILE_HEADER_SIZE..FILE_HEADER_SIZE + DB_HEADER_SIZE]);
         let b = DatabaseHeader::decode(&head[FILE_HEADER_SIZE + DB_HEADER_SIZE..]);
         let (db, active_slot) = match (a, b) {
@@ -457,7 +491,7 @@ impl Zu1File {
             (None, None) => {
                 return Err(ZuError::Corrupt {
                     what: "database header",
-                    detail: "no valid header in either slot".to_string(),
+                    detail: format!("{}: no valid header in either slot", path.display()),
                 });
             }
         };

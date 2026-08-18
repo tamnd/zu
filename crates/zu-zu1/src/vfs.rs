@@ -19,7 +19,24 @@ use std::os::windows::fs::FileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use zu_common::Result;
+use zu_common::{Result, ZuError};
+
+/// Opens `path` through `how` and puts the path in the message when the
+/// open fails.
+///
+/// The operating system says "No such file or directory" and nothing
+/// about which one, which is the difference between an error a caller
+/// can act on and an error they have to reproduce under a debugger to
+/// understand. The kind is carried across unchanged, so code that asks
+/// [`std::io::Error::kind`] still gets its answer; only the text grows.
+fn opened(how: &OpenOptions, path: &Path) -> Result<File> {
+    how.open(path).map_err(|error| {
+        ZuError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        ))
+    })
+}
 
 /// The syscall surface of one open file. `len` is fstat, hence the
 /// `Result`; emptiness is the caller's question to ask of the value.
@@ -40,38 +57,38 @@ pub struct RealFile(File);
 impl RealFile {
     /// Creates the file, failing when it already exists.
     pub fn create_new(path: &Path) -> Result<Self> {
-        Ok(Self(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)?,
-        ))
+        Ok(Self(opened(
+            OpenOptions::new().read(true).write(true).create_new(true),
+            path,
+        )?))
     }
 
     /// Opens an existing file for reading and writing.
     pub fn open_rw(path: &Path) -> Result<Self> {
-        Ok(Self(OpenOptions::new().read(true).write(true).open(path)?))
+        Ok(Self(opened(
+            OpenOptions::new().read(true).write(true),
+            path,
+        )?))
     }
 
     /// Opens an existing file for reading only, so the operating
     /// system refuses a write this process should not have attempted
     /// and a database on a read-only mount opens at all.
     pub fn open_r(path: &Path) -> Result<Self> {
-        Ok(Self(OpenOptions::new().read(true).open(path)?))
+        Ok(Self(opened(OpenOptions::new().read(true), path)?))
     }
 
     /// Opens for reading and writing, creating when missing, the WAL
     /// contract.
     pub fn open_or_create(path: &Path) -> Result<Self> {
-        Ok(Self(
+        Ok(Self(opened(
             OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
-                .truncate(false)
-                .open(path)?,
-        ))
+                .truncate(false),
+            path,
+        )?))
     }
 }
 

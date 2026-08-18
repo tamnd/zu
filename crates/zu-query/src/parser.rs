@@ -13,11 +13,11 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, DeleteTarget, ElementDefKind, ElementTypeDef, Endpoint, Expr,
-    GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Literal, NodePattern, NullOrder,
-    PathMode, PathPattern, Projection, ProjectionItem, PropertyDef, Query, RelDirection,
-    RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, Statement, TxnStmt,
-    UnaryOp,
+    BinaryOp, CatalogStmt, Clause, Composite, DeleteTarget, ElementDefKind, ElementTypeDef,
+    Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr, Linear, Literal,
+    NodePattern, NullOrder, PathMode, PathPattern, Projection, ProjectionItem, PropertyDef, Query,
+    RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, Simple, SortKey,
+    Statement, TxnStmt, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -74,8 +74,18 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
 const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "MERGE", "FILTER", "LET", "NEXT", "SESSION", "FINISH", "FOR",
+    "CREATE", "MERGE", "FILTER", "LET", "SESSION", "FINISH", "FOR",
 ];
+
+/// How a simple query statement ended, which is what the parser needs
+/// to say when something follows that may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// A result statement, which is `RETURN` today.
+    Result,
+    /// A write that projected nothing.
+    Write,
+}
 
 /// Parses one zuQL query.
 pub fn parse(source: &str) -> Result<Query> {
@@ -772,6 +782,14 @@ impl Parser<'_> {
 
     /// Whether these clauses change the graph, which is what decides
     /// whether the statement may end without a RETURN.
+    /// Whether a statement could end here: the text ran out, or what is
+    /// left belongs to somebody else, which is the semicolon after the
+    /// statement and the `NEXT` that hands its result to the statement
+    /// behind it.
+    fn at_statement_end(&self) -> bool {
+        self.peek().is_none() || self.at(&TokenKind::Semicolon) || self.at_kw("NEXT")
+    }
+
     fn writes(clauses: &[Clause]) -> bool {
         clauses.iter().any(|c| {
             matches!(
@@ -847,8 +865,47 @@ impl Parser<'_> {
         })
     }
 
+    /// A composite query statement: the `USE` in front of it, and the
+    /// linear query statement under it.
+    ///
+    /// The set operators join two of these and are not parsed yet, so
+    /// the composite is one linear query and the loop below is over the
+    /// `NEXT` chain.
     fn parse_query(&mut self) -> Result<Query> {
         let use_graph = self.parse_use_graph()?;
+        let mut statements = Vec::new();
+        loop {
+            let (simple, ending) = self.parse_simple()?;
+            statements.push(simple);
+            // What follows a statement is either the next one in the
+            // chain or nothing at all, and the two errors below say
+            // which of those the reader is short of.
+            if self.eat_kw("NEXT") {
+                continue;
+            }
+            self.eat(&TokenKind::Semicolon);
+            if let Some(token) = self.peek() {
+                let what = match ending {
+                    Ending::Result => "RETURN",
+                    Ending::Write => "the end of a statement",
+                };
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    token.start,
+                    format_args!("nothing may follow {what}, found {}", token.kind.describe()),
+                ));
+            }
+            return Ok(Query {
+                use_graph,
+                body: Composite::Linear(Linear { statements }),
+            });
+        }
+    }
+
+    /// One simple query statement: the primitive statements it is
+    /// written out of, and the result statement it ends with.
+    fn parse_simple(&mut self) -> Result<(Simple, Ending)> {
         let mut clauses = Vec::new();
         loop {
             if self.at_kw("MATCH") || self.at_kw("OPTIONAL") {
@@ -933,39 +990,39 @@ impl Parser<'_> {
                 clauses.push(Clause::With { projection, filter });
             } else if self.eat_kw("RETURN") {
                 let projection = self.parse_projection()?;
-                clauses.push(Clause::Return { projection });
-                self.eat(&TokenKind::Semicolon);
-                if let Some(token) = self.peek() {
-                    return Err(ZuError::gql_in(
-                        codes::C42001,
-                        self.source,
-                        token.start,
-                        format_args!("nothing may follow RETURN, found {}", token.kind.describe()),
-                    ));
-                }
-                return Ok(Query { use_graph, clauses });
-            } else if Self::writes(&clauses)
-                && (self.peek().is_none() || self.at(&TokenKind::Semicolon))
-            {
+                return Ok((
+                    Simple {
+                        clauses,
+                        result: Some(projection),
+                    },
+                    Ending::Result,
+                ));
+            } else if Self::writes(&clauses) && self.at_statement_end() {
                 // A write statement is allowed to end without
                 // projecting anything, and that is the ordinary way to
                 // write one: INSERT (x:Person) is a whole statement and
                 // its answer is that it worked. A read query is not
                 // allowed to, because a query nobody returns anything
                 // from asked a question and threw the answer away.
-                self.eat(&TokenKind::Semicolon);
-                if let Some(token) = self.peek() {
-                    return Err(ZuError::gql_in(
-                        codes::C42001,
-                        self.source,
-                        token.start,
-                        format_args!(
-                            "nothing may follow the end of a statement, found {}",
-                            token.kind.describe()
-                        ),
-                    ));
-                }
-                return Ok(Query { use_graph, clauses });
+                return Ok((
+                    Simple {
+                        clauses,
+                        result: None,
+                    },
+                    Ending::Write,
+                ));
+            } else if self.at_kw("NEXT") {
+                // A read statement in front of NEXT with no RETURN on
+                // it has nothing to hand over, and saying that beats
+                // listing the clauses that could have come next.
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    self.peek().expect("peeked").start,
+                    format_args!(
+                        "NEXT reads what the statement in front of it returned, so that statement has to end with RETURN"
+                    ),
+                ));
             } else if let Some(kw) = UNIMPLEMENTED.iter().find(|kw| self.at_kw(kw)) {
                 return Err(ZuError::gql_in(
                     codes::C42001,
@@ -2219,9 +2276,7 @@ mod tests {
     /// dropped, since what is under test here is the spelling.
     fn typed_against(source: &str) -> LogicalType {
         let q = parsed(source);
-        let Clause::Return { projection } = &q.clauses[0] else {
-            panic!("RETURN");
-        };
+        let projection = q.result().expect("RETURN");
         let ty = match &projection.items[0].expr {
             Expr::IsTyped { ty, .. } => ty.clone(),
             other => panic!("parsed as {other:?}"),
@@ -2658,7 +2713,8 @@ mod tests {
 
     /// The label expression on the first node of the first pattern.
     fn label_of(source: &str) -> LabelExpr {
-        let Clause::Match { patterns, .. } = &parsed(source).clauses[0] else {
+        let q = parsed(source);
+        let Clause::Match { patterns, .. } = q.clauses()[0] else {
             panic!("a MATCH");
         };
         patterns[0].start.label.clone().expect("a label")
@@ -2722,12 +2778,16 @@ mod tests {
     fn point_lookup_shape() {
         // LDBC short-read shape: one labeled node with a param prop.
         let q = parsed("MATCH (n:Person {id: $personId}) RETURN n.firstName AS firstName");
-        assert_eq!(q.clauses.len(), 2);
+        assert_eq!(
+            q.clauses().len(),
+            1,
+            "the MATCH, the RETURN being the result"
+        );
         let Clause::Match {
             optional,
             patterns,
             filter,
-        } = &q.clauses[0]
+        } = &q.clauses()[0]
         else {
             panic!("first clause is MATCH");
         };
@@ -2737,9 +2797,7 @@ mod tests {
         assert_eq!(node.label, Some(LabelExpr::Label("Person".into())));
         assert_eq!(node.props[0].0, "id");
         assert_eq!(node.props[0].1, Expr::Param("personId".into()));
-        let Clause::Return { projection } = &q.clauses[1] else {
-            panic!("second clause is RETURN");
-        };
+        let projection = q.result().expect("RETURN");
         assert_eq!(projection.items[0].alias.as_deref(), Some("firstName"));
     }
 
@@ -2747,7 +2805,7 @@ mod tests {
     fn directions_and_hop_ranges() {
         let q =
             parsed("MATCH (a)-[:KNOWS*1..2]->(b), (a)<-[r:LIKES|FOLLOWS]-(c), (b)--(c) RETURN *");
-        let Clause::Match { patterns, .. } = &q.clauses[0] else {
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
         let (knows, _) = &patterns[0].steps[0];
@@ -2760,9 +2818,7 @@ mod tests {
         let (bare, _) = &patterns[2].steps[0];
         assert_eq!(bare.direction, RelDirection::Any);
         assert!(bare.range.is_none());
-        let Clause::Return { projection } = &q.clauses[1] else {
-            panic!("RETURN");
-        };
+        let projection = q.result().expect("RETURN");
         assert!(projection.star);
     }
 
@@ -2791,7 +2847,7 @@ mod tests {
         ];
         for (pattern, want) in full.into_iter().chain(short) {
             let q = parsed(&format!("MATCH {pattern} RETURN a"));
-            let Clause::Match { patterns, .. } = &q.clauses[0] else {
+            let Clause::Match { patterns, .. } = &q.clauses()[0] else {
                 panic!("MATCH");
             };
             let (rel, _) = &patterns[0].steps[0];
@@ -2836,7 +2892,7 @@ mod tests {
              WALK (a)-[:KNOWS*1..2]->(d), \
              ACYCLIC (a)-[:KNOWS*]->(e) RETURN *",
         );
-        let Clause::Match { patterns, .. } = &q.clauses[0] else {
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
         assert_eq!(patterns[0].var.as_deref(), Some("p"));
@@ -2868,7 +2924,7 @@ mod tests {
             ("*2..", (Some(2), None)),
         ] {
             let q = parsed(&format!("MATCH (a)-[{text}]->(b) RETURN a"));
-            let Clause::Match { patterns, .. } = &q.clauses[0] else {
+            let Clause::Match { patterns, .. } = &q.clauses()[0] else {
                 panic!("MATCH");
             };
             assert_eq!(patterns[0].steps[0].0.range, Some(want), "range {text}");
@@ -2886,7 +2942,7 @@ mod tests {
             "t:transfer*1..3 {kind: 'wire'} WHERE t.ts >= 5",
         ] {
             let q = parsed(&format!("MATCH (a)-[{text}]->(b) RETURN a"));
-            let Clause::Match { patterns, .. } = &q.clauses[0] else {
+            let Clause::Match { patterns, .. } = &q.clauses()[0] else {
                 panic!("MATCH");
             };
             let (rel, _) = &patterns[0].steps[0];
@@ -2908,7 +2964,7 @@ mod tests {
         // Without one the step carries none, so nothing downstream has
         // to tell an absent predicate from one that is always true.
         let q = parsed("MATCH (a)-[t:transfer*1..3]->(b) RETURN a");
-        let Clause::Match { patterns, .. } = &q.clauses[0] else {
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
         assert!(patterns[0].steps[0].0.filter.is_none());
@@ -2920,7 +2976,7 @@ mod tests {
             "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS friends WHERE friends > 5 \
              RETURN DISTINCT a.name, friends ORDER BY friends DESC, a.name SKIP 2 LIMIT 10",
         );
-        let Clause::With { projection, filter } = &q.clauses[1] else {
+        let Clause::With { projection, filter } = &q.clauses()[1] else {
             panic!("WITH");
         };
         assert!(filter.is_some());
@@ -2929,9 +2985,7 @@ mod tests {
         };
         assert_eq!(name, "count");
         assert!(!star);
-        let Clause::Return { projection } = &q.clauses[2] else {
-            panic!("RETURN");
-        };
+        let projection = q.result().expect("RETURN");
         assert!(projection.distinct);
         assert_eq!(projection.order_by.len(), 2);
         assert!(!projection.order_by[0].ascending, "DESC");
@@ -2952,9 +3006,7 @@ mod tests {
     fn a_sort_key_says_where_its_nulls_go() {
         let keys = |tail: &str| {
             let q = parsed(&format!("MATCH (a) RETURN a.x AS x ORDER BY {tail}"));
-            let Clause::Return { projection } = q.clauses.last().expect("RETURN") else {
-                panic!("RETURN");
-            };
+            let projection = q.result().expect("RETURN");
             projection.order_by.clone()
         };
         // The two halves are independent, so all four pairings parse
@@ -2986,7 +3038,7 @@ mod tests {
     #[test]
     fn unwind_and_lists() {
         let q = parsed("UNWIND [1, 2, 3] AS x RETURN x * -1");
-        let Clause::Unwind { expr, alias } = &q.clauses[0] else {
+        let Clause::Unwind { expr, alias } = &q.clauses()[0] else {
             panic!("UNWIND");
         };
         assert_eq!(alias, "x");
@@ -2998,9 +3050,7 @@ mod tests {
                 Expr::Literal(Literal::Int(3)),
             ])
         );
-        let Clause::Return { projection } = &q.clauses[1] else {
-            panic!("RETURN");
-        };
+        let projection = q.result().expect("RETURN");
         let Expr::Binary {
             op: BinaryOp::Mul,
             rhs,
@@ -3015,7 +3065,7 @@ mod tests {
     #[test]
     fn call_parses_args_and_yield_aliases() {
         let q = parsed("CALL sssp('KNOWS', 42) YIELD node AS n, distance RETURN n, distance");
-        let Clause::Call { name, args, yields } = &q.clauses[0] else {
+        let Clause::Call { name, args, yields } = &q.clauses()[0] else {
             panic!("CALL");
         };
         assert_eq!(name, "sssp");
@@ -3050,7 +3100,7 @@ mod tests {
         let Clause::Match {
             filter: Some(filter),
             ..
-        } = &q.clauses[0]
+        } = &q.clauses()[0]
         else {
             panic!("WHERE");
         };
@@ -3095,13 +3145,13 @@ mod tests {
             parsed("MATCH p = (a)-[:KNOWS]->(b) OPTIONAL MATCH (b)-[:WORKS_AT]->(c) RETURN p, c");
         let Clause::Match {
             optional, patterns, ..
-        } = &q.clauses[0]
+        } = &q.clauses()[0]
         else {
             panic!("MATCH");
         };
         assert!(!optional);
         assert_eq!(patterns[0].var.as_deref(), Some("p"));
-        let Clause::Match { optional, .. } = &q.clauses[1] else {
+        let Clause::Match { optional, .. } = &q.clauses()[1] else {
             panic!("OPTIONAL MATCH");
         };
         assert!(optional);
@@ -3165,7 +3215,7 @@ mod tests {
              WHERE EXISTS { MATCH (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c) WHERE c.id > 3 } \
              RETURN a.id AS id",
         );
-        let Clause::Match { filter, .. } = &q.clauses[0] else {
+        let Clause::Match { filter, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
         let Some(Expr::Exists { patterns, filter }) = filter else {
@@ -3181,7 +3231,7 @@ mod tests {
         // MATCH inside the braces is a courtesy to the reader, and NOT
         // in front is an ordinary unary over the block.
         let q = parsed("MATCH (a) WHERE NOT EXISTS { (a)-[:KNOWS]->(b) } RETURN a");
-        let Clause::Match { filter, .. } = &q.clauses[0] else {
+        let Clause::Match { filter, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
         let Some(Expr::Unary {
@@ -3203,7 +3253,7 @@ mod tests {
         // Only a brace makes it the predicate, so a variable or a
         // function of that name reads the way it always did.
         let q = parsed("MATCH (exists:Person) RETURN exists.id AS id");
-        let Clause::Match { patterns, .. } = &q.clauses[0] else {
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
         assert_eq!(patterns[0].start.var.as_deref(), Some("exists"));
@@ -3218,11 +3268,98 @@ mod tests {
         );
     }
 
+    /// The statements of a chain are statements, not clauses in a row:
+    /// each one keeps the result it ends with, and what the reader
+    /// wrote is what the tree says.
+    #[test]
+    fn next_chains_two_statements() {
+        let q = parsed(
+            "MATCH (n:Person) RETURN n AS p NEXT MATCH (p)-[:KNOWS]->(f:Person) RETURN f AS friend",
+        );
+        let Composite::Linear(linear) = &q.body;
+        assert_eq!(linear.statements.len(), 2);
+        assert_eq!(linear.statements[0].clauses.len(), 1, "the MATCH");
+        assert_eq!(
+            linear.statements[0]
+                .result
+                .as_ref()
+                .expect("the first RETURN")
+                .items[0]
+                .alias
+                .as_deref(),
+            Some("p")
+        );
+        assert_eq!(linear.statements[1].clauses.len(), 1, "the second MATCH");
+        assert_eq!(
+            q.result().expect("the last RETURN").items[0]
+                .alias
+                .as_deref(),
+            Some("friend"),
+            "the query answers what the statement at the end of the chain answers"
+        );
+        assert_eq!(q.clauses().len(), 2, "one MATCH from each statement");
+    }
+
+    /// A chain is as long as it is written. Three statements is the
+    /// shape the fused plan is measured on, so the parser has to hold
+    /// three.
+    #[test]
+    fn a_chain_is_as_long_as_it_is_written() {
+        let q = parsed(
+            "MATCH (a:Person) RETURN a AS a NEXT MATCH (a)-[:KNOWS]->(b:Person) RETURN b AS b \
+             NEXT MATCH (b)-[:IS_LOCATED_IN]->(c:Place) RETURN c.name AS name",
+        );
+        let Composite::Linear(linear) = &q.body;
+        assert_eq!(linear.statements.len(), 3);
+    }
+
+    /// A write hands the chain the rows it was given, so it may stand
+    /// in front of a NEXT without projecting anything.
+    #[test]
+    fn a_write_may_stand_in_front_of_next_without_returning() {
+        let q = parsed("INSERT (x:Person) NEXT MATCH (n:Person) RETURN n");
+        let Composite::Linear(linear) = &q.body;
+        assert_eq!(linear.statements.len(), 2);
+        assert!(
+            linear.statements[0].result.is_none(),
+            "the INSERT projected nothing"
+        );
+    }
+
+    /// NEXT reads a result, so a read statement that produced none is
+    /// told that rather than being told which clauses could follow.
+    #[test]
+    fn a_read_in_front_of_next_has_to_return() {
+        let err = parse_err("MATCH (n:Person) NEXT MATCH (n) RETURN n");
+        assert!(
+            err.contains("NEXT reads what the statement in front of it returned"),
+            "{err}"
+        );
+    }
+
+    /// Everything a chain may not be followed by, it is still not
+    /// followed by: the ending is checked once the chain has ended
+    /// rather than at every RETURN in it.
+    #[test]
+    fn nothing_may_follow_the_end_of_a_chain() {
+        let err = parse_err("MATCH (n:Person) RETURN n MATCH (m:Person) RETURN m");
+        assert!(err.contains("nothing may follow RETURN"), "{err}");
+        let err = parse_err("INSERT (x:Person); INSERT (y:Person)");
+        assert!(
+            err.contains("nothing may follow the end of a statement"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn a_use_clause_says_which_graph_the_clauses_are_against() {
         let q = parsed("USE CURRENT_PROPERTY_GRAPH MATCH (n:Person) RETURN n");
         assert_eq!(q.use_graph, Some(GraphRef::Current));
-        assert_eq!(q.clauses.len(), 2);
+        assert_eq!(
+            q.clauses().len(),
+            1,
+            "the MATCH, the RETURN being the result"
+        );
 
         let q = parsed("USE social MATCH (n) RETURN n");
         assert_eq!(
@@ -3255,7 +3392,7 @@ mod tests {
     #[test]
     fn an_insert_carries_the_patterns_it_was_written_with() {
         let q = parsed("INSERT (x:person {name: 'zoe'}), (y:person) RETURN x, y");
-        let Clause::Insert { patterns } = &q.clauses[0] else {
+        let Clause::Insert { patterns } = &q.clauses()[0] else {
             panic!("INSERT");
         };
         assert_eq!(patterns.len(), 2);
@@ -3275,7 +3412,7 @@ mod tests {
     #[test]
     fn an_insert_takes_an_edge_pattern() {
         let q = parsed("INSERT (a:person)-[k:knows]->(b:person)");
-        let Clause::Insert { patterns } = &q.clauses[0] else {
+        let Clause::Insert { patterns } = &q.clauses()[0] else {
             panic!("INSERT");
         };
         assert_eq!(patterns[0].steps.len(), 1);
@@ -3287,17 +3424,17 @@ mod tests {
     #[test]
     fn a_write_can_end_without_a_return_and_a_read_cannot() {
         let q = parsed("INSERT (x:person {name: 'zoe'})");
-        assert_eq!(q.clauses.len(), 1);
+        assert_eq!(q.clauses().len(), 1);
         assert!(parse_err("MATCH (n:person)").contains("RETURN"));
         // A SET is a write too, so the same statement ends the same
         // way.
-        assert_eq!(parsed("MATCH (p:person) SET p.age = 1").clauses.len(), 2);
+        assert_eq!(parsed("MATCH (p:person) SET p.age = 1").clauses().len(), 2);
     }
 
     #[test]
     fn a_set_carries_the_assignments_it_was_written_with() {
         let q = parsed("MATCH (p:person) SET p.age = 37, p.name = 'zoe'");
-        let Clause::Set { items } = &q.clauses[1] else {
+        let Clause::Set { items } = &q.clauses()[1] else {
             panic!("SET");
         };
         assert_eq!(items.len(), 2);
@@ -3312,7 +3449,7 @@ mod tests {
     #[test]
     fn a_set_of_a_whole_record_names_no_key_and_carries_the_fields() {
         let q = parsed("MATCH (p:person) SET p = {age: 37, name: 'zoe'}");
-        let Clause::Set { items } = &q.clauses[1] else {
+        let Clause::Set { items } = &q.clauses()[1] else {
             panic!("SET");
         };
         assert_eq!(items.len(), 1);
@@ -3331,7 +3468,7 @@ mod tests {
     #[test]
     fn a_set_of_an_empty_record_parses() {
         let q = parsed("MATCH (p:person) SET p = {}");
-        let Clause::Set { items } = &q.clauses[1] else {
+        let Clause::Set { items } = &q.clauses()[1] else {
             panic!("SET");
         };
         assert_eq!(items[0].value, Expr::Map(Vec::new()));
@@ -3348,7 +3485,7 @@ mod tests {
     #[test]
     fn a_remove_carries_the_properties_it_was_written_with() {
         let q = parsed("MATCH (p:person) REMOVE p.age, p.name");
-        let Clause::Remove { items } = &q.clauses[1] else {
+        let Clause::Remove { items } = &q.clauses()[1] else {
             panic!("REMOVE");
         };
         assert_eq!(items.len(), 2);
@@ -3357,7 +3494,7 @@ mod tests {
         assert_eq!(items[1].what, Removed::Property("name".into()));
         // A REMOVE is a write, so the statement ends without a RETURN
         // the way a SET does.
-        assert_eq!(q.clauses.len(), 2);
+        assert_eq!(q.clauses().len(), 2);
     }
 
     /// The names of the delete items that are variables, which is what
@@ -3375,14 +3512,14 @@ mod tests {
     #[test]
     fn a_delete_carries_the_variables_it_was_written_with() {
         let q = parsed("MATCH (p:person), (q:person) DELETE p, q");
-        let Clause::Delete { targets, detach } = &q.clauses[1] else {
+        let Clause::Delete { targets, detach } = &q.clauses()[1] else {
             panic!("DELETE");
         };
         assert_eq!(vars(targets), ["p", "q"]);
         assert!(!detach, "no DETACH was written");
         // A DELETE is a write, so the statement ends without a RETURN
         // the way a SET does.
-        assert_eq!(q.clauses.len(), 2);
+        assert_eq!(q.clauses().len(), 2);
     }
 
     /// `DETACH` is the word that says the edges go too, and it reaches
@@ -3390,7 +3527,7 @@ mod tests {
     #[test]
     fn a_detach_delete_says_so_on_the_clause() {
         let q = parsed("MATCH (p:person) DETACH DELETE p");
-        let Clause::Delete { targets, detach } = &q.clauses[1] else {
+        let Clause::Delete { targets, detach } = &q.clauses()[1] else {
             panic!("DELETE");
         };
         assert_eq!(vars(targets), ["p"]);
@@ -3402,7 +3539,7 @@ mod tests {
     #[test]
     fn nodetach_delete_is_a_plain_delete() {
         let q = parsed("MATCH (p:person) NODETACH DELETE p");
-        let Clause::Delete { targets, detach } = &q.clauses[1] else {
+        let Clause::Delete { targets, detach } = &q.clauses()[1] else {
             panic!("DELETE");
         };
         assert_eq!(vars(targets), ["p"]);
@@ -3424,14 +3561,15 @@ mod tests {
     #[test]
     fn a_delete_item_can_be_a_value_query_expression() {
         let q = parsed("DELETE VALUE { MATCH (p:person) WHERE p.age > 30 RETURN p }");
-        let Clause::Delete { targets, detach } = &q.clauses[0] else {
+        let Clause::Delete { targets, detach } = &q.clauses()[0] else {
             panic!("DELETE");
         };
         assert!(!detach, "no DETACH was written");
         let [DeleteTarget::Value(nested)] = &targets[..] else {
             panic!("one item, a query");
         };
-        assert_eq!(nested.clauses.len(), 2, "MATCH and RETURN");
+        assert_eq!(nested.clauses().len(), 1, "the MATCH");
+        assert!(nested.result().is_some(), "the RETURN");
     }
 
     /// The braces are matched over the tokens, so a query with braces
@@ -3442,7 +3580,7 @@ mod tests {
         let q = parsed(
             "MATCH (p:person) DELETE p, VALUE { MATCH (q:person {name: 'ada'}) RETURN q }, p",
         );
-        let Clause::Delete { targets, .. } = &q.clauses[1] else {
+        let Clause::Delete { targets, .. } = &q.clauses()[1] else {
             panic!("DELETE");
         };
         assert_eq!(targets.len(), 3, "two variables around one query");
@@ -3464,7 +3602,7 @@ mod tests {
     #[test]
     fn a_variable_called_value_is_read_as_a_variable() {
         let q = parsed("MATCH (value:person) DELETE value");
-        let Clause::Delete { targets, .. } = &q.clauses[1] else {
+        let Clause::Delete { targets, .. } = &q.clauses()[1] else {
             panic!("DELETE");
         };
         assert_eq!(vars(targets), ["value"]);
@@ -3480,7 +3618,7 @@ mod tests {
             "MATCH (p:person) REMOVE p IS Manager&Bot",
         ] {
             let q = parsed(source);
-            let Clause::Remove { items } = &q.clauses[1] else {
+            let Clause::Remove { items } = &q.clauses()[1] else {
                 panic!("REMOVE");
             };
             assert_eq!(items.len(), 1, "{source}");
@@ -3503,7 +3641,7 @@ mod tests {
             "MATCH (p:person) SET p IS Manager&Bot",
         ] {
             let q = parsed(source);
-            let Clause::Set { items } = &q.clauses[1] else {
+            let Clause::Set { items } = &q.clauses()[1] else {
                 panic!("SET");
             };
             assert_eq!(items.len(), 1, "{source}");
@@ -3586,10 +3724,12 @@ mod tests {
     #[test]
     fn keywords_are_case_insensitive() {
         let q = parsed("match (n:Person) where n.id = 1 return n limit 1");
-        assert_eq!(q.clauses.len(), 2);
-        let Clause::Return { projection } = &q.clauses[1] else {
-            panic!("RETURN");
-        };
+        assert_eq!(
+            q.clauses().len(),
+            1,
+            "the MATCH, the RETURN being the result"
+        );
+        let projection = q.result().expect("RETURN");
         assert!(projection.limit.is_some());
     }
 }

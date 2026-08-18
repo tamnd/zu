@@ -1330,6 +1330,19 @@ pub enum BoundExpr {
     },
 }
 
+/// Who reads the rows a projection makes, which is the whole of the
+/// difference between the three clauses that make one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projected {
+    /// A `WITH`, read by the clauses behind it in the same statement.
+    Onward,
+    /// A `RETURN` with a `NEXT` behind it, read by the statement the
+    /// chain hands its rows to.
+    Chained,
+    /// The `RETURN` the query ends with, read by whoever asked.
+    Answer,
+}
+
 /// Binds a parsed query against a schema.
 pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
     let mut binder = Binder {
@@ -1343,18 +1356,41 @@ pub fn bind(query: &ast::Query, schema: &Schema) -> Result<BoundQuery> {
         marks: None,
     };
     let mut clauses = Vec::new();
-    for (i, clause) in query.clauses.iter().enumerate() {
-        if i > 0 && matches!(clause, Clause::Call { .. }) {
-            return Err(invalid(
-                "CALL must be the first clause, table functions run once over the whole graph"
-                    .into(),
-            ));
+    let ast::Composite::Linear(linear) = &query.body;
+    // Where the clause stands in the whole query rather than in the
+    // statement it was written in, because CALL runs over the graph and
+    // a NEXT in front of it does not change that.
+    let mut written = 0;
+    for (n, simple) in linear.statements.iter().enumerate() {
+        let last = n + 1 == linear.statements.len();
+        for clause in &simple.clauses {
+            if written > 0 && matches!(clause, Clause::Call { .. }) {
+                return Err(invalid(
+                    "CALL must be the first clause, table functions run once over the whole graph"
+                        .into(),
+                ));
+            }
+            written += 1;
+            clauses.push(binder.bind_clause(clause)?);
+            // An existence block written in the clause's WHERE is a
+            // match of its own and runs where the predicate would have,
+            // which is straight after the clause it was written in.
+            clauses.append(&mut binder.pending);
         }
-        clauses.push(binder.bind_clause(clause)?);
-        // An existence block written in the clause's WHERE is a match
-        // of its own and runs where the predicate would have, which is
-        // straight after the clause it was written in.
-        clauses.append(&mut binder.pending);
+        // A result statement in the middle of a chain is what the next
+        // statement reads and not what the caller gets back, so it
+        // binds as a projection that keeps its slots. Only the last one
+        // names the columns of the answer.
+        if let Some(projection) = &simple.result {
+            written += 1;
+            let role = if last {
+                Projected::Answer
+            } else {
+                Projected::Chained
+            };
+            clauses.push(binder.bind_projection(projection, role, &None)?);
+            clauses.append(&mut binder.pending);
+        }
     }
     Ok(BoundQuery {
         clauses,
@@ -1558,8 +1594,9 @@ impl Binder<'_> {
                 Ok(BoundClause::Unwind { expr: bound, slot })
             }
             Clause::Call { name, args, yields } => self.bind_table_call(name, args, yields),
-            Clause::With { projection, filter } => self.bind_projection(projection, false, filter),
-            Clause::Return { projection } => self.bind_projection(projection, true, &None),
+            Clause::With { projection, filter } => {
+                self.bind_projection(projection, Projected::Onward, filter)
+            }
         }
     }
 
@@ -1843,10 +1880,20 @@ impl Binder<'_> {
     fn bind_projection(
         &mut self,
         projection: &Projection,
-        is_return: bool,
+        role: Projected,
         filter: &Option<Expr>,
     ) -> Result<BoundClause> {
-        let clause = if is_return { "RETURN" } else { "WITH" };
+        let clause = match role {
+            Projected::Onward => "WITH",
+            Projected::Chained | Projected::Answer => "RETURN",
+        };
+        // A projection that hands its rows to something else has to
+        // name them, so two items of one name are refused and the names
+        // stay on their slots. The answer has neither problem: nothing
+        // reads it by name, and duplicate column names in a result are
+        // ordinary.
+        let is_answer = role == Projected::Answer;
+        let names_rows = role != Projected::Answer;
         // `*` expands the visible variables in slot order before any
         // explicit items.
         let mut items: Vec<BoundItem> = Vec::new();
@@ -1879,7 +1926,7 @@ impl Binder<'_> {
                 (Some(alias), _) => alias.clone(),
                 (None, Expr::Variable(v)) => v.clone(),
                 (None, other) => {
-                    if !is_return {
+                    if role == Projected::Onward {
                         return Err(invalid(format!(
                             "WITH item {} needs an alias, only plain variables may go unaliased",
                             text(other)
@@ -1903,9 +1950,9 @@ impl Binder<'_> {
         let old_scope = self.scope.clone();
         let mut new_scope: HashMap<String, usize> = HashMap::new();
         for item in &mut items {
-            if !is_return && new_scope.contains_key(&item.name) {
+            if names_rows && new_scope.contains_key(&item.name) {
                 return Err(bad_reference(format!(
-                    "duplicate name '{}' in WITH",
+                    "duplicate name '{}' in {clause}",
                     item.name
                 )));
             }
@@ -1945,7 +1992,7 @@ impl Binder<'_> {
         // neither executor has. The block refuses rather than being
         // lifted somewhere it would read different rows.
         let filter = self.bind_where(filter, false)?;
-        if is_return {
+        if is_answer {
             self.columns = items.iter().map(|i| i.name.clone()).collect();
             for item in &mut items {
                 item.slot = None;
@@ -3301,6 +3348,65 @@ mod tests {
             .iter()
             .find(|v| v.name == name)
             .unwrap_or_else(|| panic!("variable {name}"))
+    }
+
+    /// A chain binds to one list of clauses: the result of a statement
+    /// in the middle is a projection like any other, and the columns
+    /// the caller gets are the last statement's.
+    #[test]
+    fn a_next_chain_binds_to_one_pipeline() {
+        let q = bound(
+            "MATCH (n:Person) RETURN n AS p NEXT MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS name",
+        );
+        assert!(
+            matches!(
+                q.clauses.as_slice(),
+                [
+                    BoundClause::Match { .. },
+                    BoundClause::Project { .. },
+                    BoundClause::Match { .. },
+                    BoundClause::Project { .. },
+                ]
+            ),
+            "{:?}",
+            q.clauses
+        );
+        assert_eq!(q.columns, ["name"], "the chain answers what it ends with");
+    }
+
+    /// The statement behind a NEXT reads its input by name, so two
+    /// items of one name in the result it reads is a question with no
+    /// answer. The last RETURN has no such reader and duplicate column
+    /// names there are ordinary.
+    #[test]
+    fn a_result_that_feeds_a_chain_may_not_name_a_column_twice() {
+        let err = bind_err("MATCH (n:Person) RETURN n.id AS x, n.age AS x NEXT RETURN x");
+        assert!(err.contains("duplicate name 'x' in RETURN"), "{err}");
+        let q = bound("MATCH (n:Person) RETURN n.id AS x, n.age AS x");
+        assert_eq!(q.columns, ["x", "x"]);
+    }
+
+    /// A mid-chain RETURN names what it projects the way any RETURN
+    /// does, so an item written without an alias keeps the name the
+    /// text gives it rather than being turned away for having none,
+    /// which is what a WITH would do with it.
+    #[test]
+    fn a_chained_result_names_an_unaliased_item_the_way_return_does() {
+        let q = bound("MATCH (n:Person) RETURN n.name NEXT RETURN 1 AS one");
+        let BoundClause::Project { items, .. } = &q.clauses[1] else {
+            panic!("the first RETURN");
+        };
+        assert_eq!(items[0].name, "n.name");
+        assert_eq!(q.columns, ["one"]);
+    }
+
+    /// What NEXT hands over is a result table and nothing else, so the
+    /// variables the statement in front of it matched are gone. A chain
+    /// is not the same thing as writing the clauses one after another.
+    #[test]
+    fn what_the_chain_hands_over_is_the_result_and_nothing_else() {
+        let err = bind_err("MATCH (n:Person) RETURN n.name AS name NEXT RETURN n");
+        assert!(err.contains("variable 'n' is not defined"), "{err}");
     }
 
     #[test]

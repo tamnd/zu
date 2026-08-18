@@ -86,7 +86,7 @@ impl Wanted {
 /// path where the tables are all there.
 pub(crate) fn wanted(catalog: &Catalog, graph: u32, parsed: &Query) -> Result<Wanted> {
     let mut wanted = Wanted::default();
-    for clause in &parsed.clauses {
+    for clause in parsed.clauses() {
         let Clause::Insert { patterns } = clause else {
             continue;
         };
@@ -211,10 +211,13 @@ fn end_table(parsed: &Query, rel: &str, node: &NodePattern, side: &str) -> Resul
 /// tables both occurrences allow, and it does that against a catalog
 /// this has already made the table in.
 fn labelled_elsewhere(parsed: &Query, var: &str) -> Option<String> {
-    let patterns = parsed.clauses.iter().flat_map(|clause| match clause {
-        Clause::Match { patterns, .. } | Clause::Insert { patterns } => patterns.as_slice(),
-        _ => &[],
-    });
+    let patterns = parsed
+        .clauses()
+        .into_iter()
+        .flat_map(|clause| match clause {
+            Clause::Match { patterns, .. } | Clause::Insert { patterns } => patterns.as_slice(),
+            _ => &[],
+        });
     for pattern in patterns {
         let nodes = std::iter::once(&pattern.start).chain(pattern.steps.iter().map(|(_, n)| n));
         for node in nodes {

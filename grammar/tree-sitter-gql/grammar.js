@@ -14,7 +14,7 @@
 //
 // It is written from `docs/grammar.ebnf`, production by production, and
 // checked against the engine by parsing every query in the conformance
-// corpus: 945 statements the engine accepts, which must not hold an
+// corpus: 926 statements the engine accepts, which must not hold an
 // error node here. That is the whole gate. A grammar checked only by
 // its own test corpus is a grammar that agrees with its author.
 //
@@ -34,6 +34,16 @@ function kw(word) {
     .map((c) => (/[a-z]/i.test(c) ? `[${c.toLowerCase()}${c.toUpperCase()}]` : c))
     .join("");
   return alias(token(prec(1, new RegExp(pattern))), word);
+}
+
+/**
+ * What every path selector may carry behind its words: the path mode,
+ * then `PATH` or `PATHS`. Both are optional, so this is spread into a
+ * `seq` rather than being a rule of its own, which tree-sitter would
+ * refuse for matching the empty string.
+ */
+function pathTail($) {
+  return [optional($.path_mode), optional($._path_or_paths)];
 }
 
 /** One or more of `rule`, separated by commas. */
@@ -192,15 +202,36 @@ module.exports = grammar({
     path: ($) =>
       seq(
         optional(seq(field("name", $._name), "=")),
-        optional($.selector),
-        optional($.path_mode),
+        optional($.path_prefix),
         $.node,
         repeat(seq($.relationship, $.node)),
       ),
 
-    selector: ($) => seq(choice(kw("ANY"), kw("ALL")), kw("SHORTEST")),
+    // The seven path selectors of ISO 16.6, and the mode, which the
+    // standard puts inside the prefix rather than behind it: the words
+    // come in one order, the selector, then the mode, then PATH or
+    // PATHS, then GROUP last of all. PATH and PATHS are noise the
+    // standard allows, while GROUP is what tells k lengths from k paths
+    // and is the one form whose count may be left out.
+    path_prefix: ($) =>
+      choice(
+        seq(kw("ALL"), optional(kw("SHORTEST")), ...pathTail($)),
+        seq(kw("ANY"), choice(kw("SHORTEST"), optional($.integer)), ...pathTail($)),
+        seq(
+          kw("SHORTEST"),
+          choice(
+            seq($.integer, ...pathTail($), optional($._group_or_groups)),
+            seq(...pathTail($), $._group_or_groups),
+          ),
+        ),
+        seq($.path_mode, optional($._path_or_paths)),
+      ),
 
-    path_mode: ($) => choice(kw("WALK"), kw("TRAIL"), kw("ACYCLIC")),
+    _path_or_paths: ($) => choice(kw("PATH"), kw("PATHS")),
+
+    _group_or_groups: ($) => choice(kw("GROUP"), kw("GROUPS")),
+
+    path_mode: ($) => choice(kw("WALK"), kw("TRAIL"), kw("SIMPLE"), kw("ACYCLIC")),
 
     node: ($) =>
       seq(
@@ -230,6 +261,17 @@ module.exports = grammar({
         $._bar,
         optional(seq(optional($.rel_detail), $._bar)),
         optional(">"),
+        optional($.quantifier),
+      ),
+
+    // The graph pattern quantifier of ISO 16.10, which says what a hop
+    // range inside the brackets says and is the form the standard's own
+    // examples are written in.
+    quantifier: ($) =>
+      choice(
+        "+",
+        "*",
+        seq("{", optional($.integer), optional(seq(",", optional($.integer))), "}"),
       ),
 
     _bar: ($) => choice("-", "~"),

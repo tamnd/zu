@@ -1128,15 +1128,11 @@
           "named": true
         },
         {
-          "type": "path_mode",
+          "type": "path_prefix",
           "named": true
         },
         {
           "type": "relationship",
-          "named": true
-        },
-        {
-          "type": "selector",
           "named": true
         }
       ]
@@ -1228,6 +1224,25 @@
     "type": "path_mode",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "path_prefix",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "integer",
+          "named": true
+        },
+        {
+          "type": "path_mode",
+          "named": true
+        }
+      ]
+    }
   },
   {
     "type": "pattern",
@@ -1627,6 +1642,21 @@
     }
   },
   {
+    "type": "quantifier",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "integer",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "query",
     "named": true,
     "fields": {},
@@ -1770,9 +1800,13 @@
     "named": true,
     "fields": {},
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
+        {
+          "type": "quantifier",
+          "named": true
+        },
         {
           "type": "rel_detail",
           "named": true
@@ -1872,11 +1906,6 @@
         }
       ]
     }
-  },
-  {
-    "type": "selector",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "set_clause",
@@ -2768,6 +2797,10 @@
     "named": false
   },
   {
+    "type": "GROUPS",
+    "named": false
+  },
+  {
     "type": "IF",
     "named": false
   },
@@ -2844,6 +2877,14 @@
     "named": false
   },
   {
+    "type": "PATH",
+    "named": false
+  },
+  {
+    "type": "PATHS",
+    "named": false
+  },
+  {
     "type": "PROPERTIES",
     "named": false
   },
@@ -2881,6 +2922,10 @@
   },
   {
     "type": "SHORTEST",
+    "named": false
+  },
+  {
+    "type": "SIMPLE",
     "named": false
   },
   {

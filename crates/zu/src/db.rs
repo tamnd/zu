@@ -470,8 +470,13 @@ mod tests {
         let mut conn = db.connect().expect("connect");
         let rows = conn.query("RETURN 1 AS n").expect("query");
         assert_eq!(rows.rows.len(), 1);
-        // Empty is empty: a table nobody made is a table nothing finds.
-        assert!(conn.query("MATCH (p:person) RETURN p").is_err());
+        // Empty is empty: a table nobody made is a table nothing finds,
+        // and finding nothing is an empty answer rather than a refusal.
+        let empty = conn.query("MATCH (p:person) RETURN p").expect("query");
+        assert!(
+            empty.rows.is_empty(),
+            "a label nothing carries matches nothing"
+        );
         // And what create wrote is what open reads, rather than a file
         // only the handle that made it can use.
         Database::open(&path).expect("open");
@@ -673,13 +678,12 @@ mod tests {
         let mut conn = db.connect().expect("connect");
         conn.execute("CREATE PROPERTY GRAPH second ANY")
             .expect("create");
-        // The new graph is empty, so a statement against it fails on
-        // the tables it does not have rather than on the name, which is
-        // what says the catalog took the write.
-        let err = conn
-            .query("USE second MATCH (p) RETURN p")
-            .expect_err("no tables there");
-        assert!(err.to_string().contains("no node table"), "{err}");
+        // The new graph is empty, so a statement against it gets past
+        // the name and finds nothing, which is what says the catalog
+        // took the write: an unknown graph is the error, and a graph
+        // with nothing in it is an empty answer.
+        let seen = conn.query("USE second MATCH (p) RETURN p").expect("query");
+        assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }
 
     /// What a connection sees is the database as of when it connected.
@@ -710,13 +714,12 @@ mod tests {
         assert!(stale.to_string().contains("is no graph"), "{stale}");
 
         // The new graph is empty, so a fresh connection gets past the
-        // name and fails on the tables it does not have, which is what
-        // says the write is on disk and being read.
+        // name and finds nothing in it, which is what says the write is
+        // on disk and being read: the stale connection above could not
+        // resolve the name at all.
         let mut fresh = db.connect().expect("connect");
-        let seen = fresh
-            .query("USE second MATCH (p) RETURN p")
-            .expect_err("no tables there");
-        assert!(seen.to_string().contains("no node table"), "{seen}");
+        let seen = fresh.query("USE second MATCH (p) RETURN p").expect("query");
+        assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }
 
     /// A write through the API a caller actually holds: the connection

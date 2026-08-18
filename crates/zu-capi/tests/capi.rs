@@ -1959,7 +1959,7 @@ fn a_finished_loader_is_spent() {
         let mut err: *mut ZuError = ptr::null_mut();
         let mut result: *mut ZuResult = ptr::null_mut();
         let text = "MATCH (p:person) RETURN p.age AS a";
-        assert_ne!(
+        assert_eq!(
             zu_query(
                 conn,
                 text.as_ptr().cast::<c_char>(),
@@ -1967,12 +1967,15 @@ fn a_finished_loader_is_spent() {
                 &mut result,
                 &mut err
             ),
-            ZuStatus::Ok,
-            "nothing was written, so there is no person table"
+            ZuStatus::Ok
         );
-        if !err.is_null() {
-            zu_error_free(err);
-        }
+        assert!(err.is_null());
+        assert_eq!(
+            zu_result_rows(result),
+            0,
+            "nothing was written, so there is no person to find"
+        );
+        zu_result_free(result);
         zu_conn_close(conn);
     }
 }

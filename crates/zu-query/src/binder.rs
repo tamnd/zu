@@ -969,6 +969,13 @@ pub enum LabelTest {
     All(u64),
     /// GQL's `%`: the row carries a label, any label.
     Any,
+    /// A name the graph's label dictionary has never held, so no row
+    /// carries it and no row can. A pattern naming one matches nothing,
+    /// which is an answer rather than an error: the question a label
+    /// asks is which elements carry it, and none is a good answer to
+    /// it. The name is kept so the plan text and a message about the
+    /// pattern can still say what was asked for.
+    Never(String),
     Not(Box<LabelTest>),
     And(Box<LabelTest>, Box<LabelTest>),
     Or(Box<LabelTest>, Box<LabelTest>),
@@ -991,6 +998,9 @@ impl LabelTest {
             LabelTest::All(_) => None,
             // Every row carries its own table's label.
             LabelTest::Any => Some(true),
+            // No row anywhere carries a label the graph does not have,
+            // so every table answers this one the same way.
+            LabelTest::Never(_) => Some(false),
             LabelTest::Not(inner) => inner.constant(declared, primary).map(|b| !b),
             LabelTest::And(lhs, rhs) => {
                 match (
@@ -1038,6 +1048,9 @@ impl LabelTest {
             // Every node carries its own table's label, so asking
             // whether it carries one is asking nothing.
             LabelTest::Any => LabelTest::All(0),
+            // Nothing a table guarantees can make a label the graph
+            // does not have appear on a row.
+            LabelTest::Never(name) => LabelTest::Never(name.clone()),
             LabelTest::Not(inner) => LabelTest::Not(Box::new(inner.prune(guaranteed))),
             LabelTest::And(lhs, rhs) => {
                 LabelTest::and(lhs.prune(guaranteed), rhs.prune(guaranteed))
@@ -1054,6 +1067,7 @@ impl LabelTest {
         match self {
             LabelTest::All(mask) => word & mask == *mask,
             LabelTest::Any => word != 0,
+            LabelTest::Never(_) => false,
             LabelTest::Not(inner) => !inner.matches(word),
             LabelTest::And(lhs, rhs) => lhs.matches(word) && rhs.matches(word),
             LabelTest::Or(lhs, rhs) => lhs.matches(word) || rhs.matches(word),
@@ -1091,6 +1105,7 @@ impl LabelTest {
                 }
             }
             LabelTest::Any => "%".into(),
+            LabelTest::Never(name) => wrap(name.clone(), 3),
             LabelTest::Not(inner) => format!("!{}", inner.text_at(names, 3)),
             LabelTest::And(lhs, rhs) => wrap(
                 format!("{}&{}", lhs.text_at(names, 2), rhs.text_at(names, 2)),
@@ -2336,15 +2351,11 @@ impl Binder<'_> {
             settled &= answer == Some(true);
             candidates.push(node.id);
         }
-        if candidates.is_empty() {
-            let written = test
-                .as_ref()
-                .map_or(String::new(), |t| t.text(&self.schema.labels));
-            return Err(invalid(format!(
-                "no node table can satisfy the labels on '{}:{written}'",
-                pat.var.as_deref().unwrap_or("")
-            )));
-        }
+        // No candidate table left is not a refusal. The labels asked
+        // for something the graph holds nowhere, so the pattern matches
+        // nothing, and a scan over no tables is how that is said: the
+        // statement runs, the clauses after it see an empty binding
+        // table, and an aggregate over it still answers.
         let residue = match settled {
             true => None,
             false => test.map(|test| test.prune(guaranteed(self.schema, &candidates))),
@@ -2366,11 +2377,6 @@ impl Binder<'_> {
                         .copied()
                         .filter(|id| candidates.contains(id))
                         .collect();
-                    if merged.is_empty() {
-                        return Err(invalid(format!(
-                            "no node table satisfies every label on '{name}'"
-                        )));
-                    }
                     self.variables[slot].node_tables = merged;
                     slot
                 }
@@ -2400,13 +2406,15 @@ impl Binder<'_> {
     /// with a single AND.
     fn compile_label(&self, expr: &LabelExpr) -> Result<LabelTest> {
         Ok(match expr {
-            LabelExpr::Label(name) => {
-                let id = self
-                    .schema
-                    .label_id(name)
-                    .ok_or_else(|| bad_reference(format!("unknown label '{name}'")))?;
-                LabelTest::All(1 << id)
-            }
+            // A name the dictionary does not hold is not a mistake to
+            // refuse. GQL asks a label expression of each element, and
+            // an element carrying a label no element carries is a
+            // question with the answer no, so the pattern matches
+            // nothing and the statement runs over no rows.
+            LabelExpr::Label(name) => match self.schema.label_id(name) {
+                Some(id) => LabelTest::All(1 << id),
+                None => LabelTest::Never(name.clone()),
+            },
             LabelExpr::Wildcard => LabelTest::Any,
             LabelExpr::Not(inner) => LabelTest::Not(Box::new(self.compile_label(inner)?)),
             LabelExpr::And(lhs, rhs) => {
@@ -2456,12 +2464,15 @@ impl Binder<'_> {
         if pat.types.is_empty() {
             candidates.extend(self.schema.rels.iter().map(|r| r.id));
         } else {
+            // A type the graph has no table for holds no edges, so a
+            // step asking for it walks nothing. That is the same
+            // reading a label the dictionary does not hold gets: the
+            // pattern matches nothing and the statement answers over
+            // no rows rather than being refused.
             for ty in &pat.types {
-                let rel = self
-                    .schema
-                    .rel_by_name(ty)
-                    .ok_or_else(|| bad_reference(format!("unknown relationship type '{ty}'")))?;
-                candidates.push(rel.id);
+                if let Some(rel) = self.schema.rel_by_name(ty) {
+                    candidates.push(rel.id);
+                }
             }
         }
         if let Some((min, max)) = pat.range {
@@ -2611,12 +2622,6 @@ impl Binder<'_> {
             .filter_map(|id| self.schema.rel_by_id(*id))
             .filter(|r| fits(r, &left_tables, &right_tables))
             .collect();
-        if rels.is_empty() {
-            return Err(invalid(format!(
-                "pattern step at '{}' matches no relationship table",
-                self.variables[rel.slot].name
-            )));
-        }
         let reaches = |node: u32, end: fn(&RelDef, RelDirection) -> (u32, u32)| {
             rels.iter().any(|r| {
                 let Some(d) = step_dir(r) else {
@@ -2650,13 +2655,13 @@ impl Binder<'_> {
                 })
             })
             .collect();
+        // A step no table can carry, or an end no table can be, leaves
+        // the slot with nothing to scan, and that is the same empty
+        // answer a label the graph does not hold gives. Refusing here
+        // would make the shape of the store decide whether a portable
+        // statement runs at all, and would turn a graph that has not
+        // been written into yet into an error rather than into no rows.
         for (slot, tables) in [(left, new_left), (right, new_right)] {
-            if tables.is_empty() {
-                return Err(invalid(format!(
-                    "pattern step at '{}' leaves '{}' with no node table",
-                    self.variables[rel.slot].name, self.variables[slot].name
-                )));
-            }
             self.variables[slot].node_tables = tables;
         }
         self.variables[rel.slot].rel_tables = rels.iter().map(|r| r.id).collect();
@@ -3612,11 +3617,22 @@ mod tests {
     }
 
     #[test]
-    fn impossible_patterns_are_rejected() {
-        let e = bind_err("MATCH (a:Place)-[:KNOWS]->(b) RETURN a");
-        assert!(e.contains("matches no relationship table"), "got: {e}");
-        assert!(bind_err("MATCH (n:Nope) RETURN n").contains("unknown label 'Nope'"));
-        assert!(bind_err("MATCH (a)-[:NOPE]->(b) RETURN a").contains("unknown relationship type"));
+    fn impossible_patterns_match_nothing_rather_than_being_refused() {
+        // A step no table runs, a label the graph does not hold, and a
+        // type no table is named by. Each asks for something the graph
+        // has nowhere, and the answer to that is no rows: the variable
+        // is left with nothing to scan and the statement still runs.
+        for source in [
+            "MATCH (a:Place)-[:KNOWS]->(b) RETURN a",
+            "MATCH (a:Nope) RETURN a",
+            "MATCH (a)-[:NOPE]->(b) RETURN a",
+        ] {
+            let q = bound(source);
+            assert!(
+                var(&q, "a").node_tables.is_empty(),
+                "{source} left something to scan"
+            );
+        }
     }
 
     #[test]
@@ -3805,14 +3821,13 @@ mod tests {
         assert_eq!(var(&q, "n").node_tables, [0]);
         assert_eq!(start_node(&q).label, Some(LabelTest::All(1 << 3 | 1 << 2)));
         // A label the graph does not have, and a set no table declares.
-        assert!(bind_err("MATCH (n:Nope) RETURN n").contains("unknown label 'Nope'"));
-        let err = bind(&parse("MATCH (n:Person:Place) RETURN n").unwrap(), &schema)
-            .expect_err("no table is both")
-            .to_string();
-        assert!(
-            err.contains("no node table can satisfy the labels"),
-            "{err}"
-        );
+        // Neither is a refusal: nothing carries what was asked for, so
+        // the variable is left with no table to scan and the statement
+        // answers over no rows.
+        let q = bound("MATCH (n:Nope) RETURN n");
+        assert!(var(&q, "n").node_tables.is_empty());
+        let q = bound("MATCH (n:Person:Place) RETURN n");
+        assert!(var(&q, "n").node_tables.is_empty());
     }
 
     #[test]
@@ -3865,15 +3880,10 @@ mod tests {
             start_node(&q).label,
             Some(LabelTest::Not(Box::new(LabelTest::All(1 << 3))))
         );
-        // Nothing satisfies a negated wildcard, and the message says
-        // what was asked for.
-        let err = bind(&parse("MATCH (n:!%) RETURN n").unwrap(), &schema)
-            .expect_err("no table has no label")
-            .to_string();
-        assert!(
-            err.contains("no node table can satisfy the labels on 'n:!%'"),
-            "{err}"
-        );
+        // Nothing satisfies a negated wildcard, so every table drops
+        // out and the pattern matches nothing.
+        let q = bound("MATCH (n:!%) RETURN n");
+        assert!(var(&q, "n").node_tables.is_empty());
     }
 
     #[test]

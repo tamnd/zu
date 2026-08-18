@@ -1602,12 +1602,8 @@ fn rel_steps(rel_slot: usize, query: &BoundQuery, schema: &Schema) -> Result<Vec
             undirected: rd.undirected,
         });
     }
-    if steps.is_empty() {
-        return Err(invalid(format!(
-            "relationship '{}' has no candidate tables",
-            var.name
-        )));
-    }
+    // An expand with no table to walk finds nothing, which is the
+    // answer to a step whose type the graph has no table for.
     Ok(steps)
 }
 
@@ -1693,13 +1689,11 @@ fn compile_match_op(
 ) -> Result<bool> {
     match op {
         LogicalPlan::ScanNodes { slot, bracket, .. } => {
+            // No candidate table is a scan over nothing, not a fault.
+            // The binder leaves the list empty when the pattern asked
+            // for labels the graph holds nowhere, and the answer to
+            // that is an empty binding table.
             let tables = query.variables[*slot].node_tables.clone();
-            if tables.is_empty() {
-                return Err(invalid(format!(
-                    "variable '{}' has no candidate node tables",
-                    query.variables[*slot].name
-                )));
-            }
             let fused = lookahead.and_then(|next| match next {
                 LogicalPlan::Filter {
                     expr,
@@ -8327,11 +8321,6 @@ mod tests {
         // just mentions something that is not there, which is the
         // distinction between 42001 and 42002.
         assert_eq!(status_of("MATCH (a:Person) RETURN nope AS x"), "42002");
-        assert_eq!(status_of("MATCH (a:Nonexistent) RETURN a.id AS x"), "42002");
-        assert_eq!(
-            status_of("MATCH (a:Person)-[:NOPE]->(b) RETURN a.id AS x"),
-            "42002"
-        );
         assert_eq!(
             status_of("MATCH (a:Person) RETURN nosuchfunc(a) AS x"),
             "42002"
@@ -8342,6 +8331,19 @@ mod tests {
         );
         // Contrast: this one really is malformed.
         assert_eq!(status_of("MATCH (a:Person) RETURN"), "42001");
+        // And a label or a relationship type the graph does not hold is
+        // neither: nothing carries it, so the pattern matches nothing
+        // and the statement answers with no rows.
+        assert!(
+            run("MATCH (a:Nonexistent) RETURN a.id AS x", &[])
+                .rows
+                .is_empty()
+        );
+        assert!(
+            run("MATCH (a:Person)-[:NOPE]->(b) RETURN a.id AS x", &[])
+                .rows
+                .is_empty()
+        );
         // Not a contrast to make by accident: naming a bound variable
         // again is a join, not a redefinition, and stays legal.
         let r = run("MATCH (a:Person) MATCH (a:Person) RETURN a.id AS x", &[]);

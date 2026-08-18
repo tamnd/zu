@@ -176,7 +176,7 @@ fn the_exit_codes_are_the_ones_the_spec_defines() {
     std::fs::write(&edges, "1 2\n2 3\n").expect("write edges");
     assert_eq!(code(&["copy", &path(&edges), &path(&graph)]), 0, "success");
     assert_eq!(
-        code(&["query", &path(&graph), "-c", "MATCH (n:nope) RETURN n"]),
+        code(&["query", &path(&graph), "-c", "RETURN 1 / 0"]),
         1,
         "a statement the engine refused is a query error"
     );

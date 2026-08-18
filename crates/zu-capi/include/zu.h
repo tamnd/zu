@@ -49,12 +49,14 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.9 and another
- * against what comes next. `cargo xtask package` holds it to the
+ * system tests when it has to compile one way against 0.10 and another
+ * against what comes next. The two numbers are counts and not decimals,
+ * so 0.10 is the revision after 0.9 and a caller comparing them
+ * compares each on its own. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.9"
+#define ZU_ABI_VERSION "0.10"
 
 #ifdef __cplusplus
 extern "C" {
@@ -552,6 +554,46 @@ zu_status zu_value_at(const zu_value *v, uint64_t i, const zu_value **out);
 zu_status zu_value_field(const zu_value *v, uint64_t i, const char **out, size_t *len);
 
 void zu_result_free(zu_result *result);
+
+/* ---- diagnostics ----
+ *
+ * What a statement that worked has to say for itself, which is the half
+ * of the GQLSTATUS envelope a host reading rows and errors could not
+ * see. The status a call returns says whether it worked; this says
+ * which way, in the standard's own terms.
+ *
+ * zu_result_gqlstatus is the completion condition: "00000" for a
+ * statement that answered with columns, and "00001", successful
+ * completion with the result omitted, for one that had none to give
+ * back. It is the value the JSON Lines protocol already writes into
+ * every record and the value a conformance harness grades. It is never
+ * NULL for a result that is not NULL, and it belongs to the result
+ * rather than to the caller, so it is good until zu_result_free and is
+ * not freed on its own.
+ *
+ * The notices are the conditions the statement raised and carried on
+ * through. An exception replaces a result and arrives as an error; a
+ * warning rides along with one, because a statement that dropped a null
+ * out of an aggregate still has rows to give you and the standard still
+ * wants you told. Almost every statement raises none, so a host that
+ * asks and finds nought has paid for one call.
+ *
+ * A notice comes back as a zu_error, which is one shape rather than
+ * two: a diagnostic record is a diagnostic record, the code, its
+ * standard text, the severity, the place, the line and the doc page are
+ * the same accessors either way, and a binding that already turns one
+ * of these into an exception gets its warning class for the cost of
+ * reading zu_error_severity. That is what tells them apart, along with
+ * zu_error_status, which is ZU_OK here because that is what the call
+ * that produced it returned. It is a copy rather than a borrow, so the
+ * rule for every zu_error a host is handed stays the one rule: free it.
+ * The result keeps its own and can be asked again. */
+/* len may be NULL. */
+const char *zu_result_gqlstatus(zu_result *result, size_t *len);
+uint32_t zu_result_notices(zu_result *result);
+/* ZU_DONE with *out NULL past the end, which is what a host walking
+ * them gets at the end of the walk rather than a failure. */
+zu_status zu_result_notice(zu_result *result, uint32_t ix, zu_error **out);
 
 /* ---- bulk load ----
  *

@@ -9,7 +9,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use zu::{
-    ZU_SEVERITY_EXCEPTION, ZU_TEMPORAL_DATE, ZU_TEMPORAL_DURATION_DAY_TIME,
+    ZU_SEVERITY_EXCEPTION, ZU_SEVERITY_WARNING, ZU_TEMPORAL_DATE, ZU_TEMPORAL_DURATION_DAY_TIME,
     ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME, ZU_TEMPORAL_LOCAL_TIME,
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
     ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuAppender, ZuConfig, ZuConn, ZuDatabase, ZuError,
@@ -31,9 +31,9 @@ use zu::{
     zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
     zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
     zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
-    zu_result_free, zu_result_rows, zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool,
-    zu_value_f64, zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal,
-    zu_value_type, zu_version,
+    zu_result_free, zu_result_gqlstatus, zu_result_notice, zu_result_notices, zu_result_rows,
+    zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64,
+    zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -3404,6 +3404,191 @@ fn the_appending_calls_answer_a_null_handle_and_a_closed_connection() {
 
         let conn = open(&path);
         assert_eq!(people(conn), 1);
+        zu_conn_close(conn);
+    }
+}
+
+/* ---- diagnostics ---- */
+
+/// The condition a statement completed with, which every result
+/// carries whether or not anything went wrong.
+unsafe fn gqlstatus_of(result: *mut ZuResult) -> String {
+    let mut len = 0usize;
+    let code = unsafe { zu_result_gqlstatus(result, &mut len) };
+    assert!(!code.is_null(), "a result with no completion condition");
+    let code = unsafe { CStr::from_ptr(code) }.to_str().expect("utf-8");
+    assert_eq!(len, code.len(), "the length and the NUL have to agree");
+    code.to_string()
+}
+
+/// One notice off a result, as the handle every other condition comes
+/// back on.
+unsafe fn notice(result: *mut ZuResult, ix: u32) -> *mut ZuError {
+    let mut out: *mut ZuError = ptr::null_mut();
+    assert_eq!(
+        unsafe { zu_result_notice(result, ix, &mut out) },
+        ZuStatus::Ok
+    );
+    assert!(!out.is_null());
+    out
+}
+
+/// A statement that answered and a statement that had nothing to
+/// answer with are two different completions, and the standard has a
+/// condition for each.
+#[test]
+fn a_result_carries_the_condition_its_statement_completed_with() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("status.zu1");
+    unsafe {
+        let conn = two_people(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        let result = query(conn, "MATCH (p:person) RETURN count(p) AS n", &mut err);
+        assert_eq!(gqlstatus_of(result), "00000");
+        assert_eq!(zu_result_notices(result), 0, "nothing was raised");
+        zu_result_free(result);
+
+        // No rows is still a projection, so it completes the same way a
+        // full one does: what 00000 answers is whether there were
+        // columns, not whether any of them were filled.
+        let result = query(
+            conn,
+            "MATCH (p:person) WHERE p.name = 'nobody' RETURN p.name AS name",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), 0);
+        assert_eq!(gqlstatus_of(result), "00000");
+        zu_result_free(result);
+
+        // A statement with no projection to give back, which is not a
+        // failure and not an empty answer either: 00001 is the
+        // standard's word for exactly this.
+        let result = query(conn, "INSERT (p:person {name: 'zoe'})", &mut err);
+        assert_eq!(zu_result_cols(result), 0);
+        assert_eq!(gqlstatus_of(result), "00001");
+        zu_result_free(result);
+
+        // Every path writes the length, and a handle that is not there
+        // answers rather than being followed.
+        let mut len = usize::MAX;
+        assert!(zu_result_gqlstatus(ptr::null_mut(), &mut len).is_null());
+        assert_eq!(len, 0);
+        assert_eq!(zu_result_notices(ptr::null_mut()), 0);
+
+        zu_conn_close(conn);
+    }
+}
+
+/// A warning rides with the answer rather than replacing it, which is
+/// the whole reason it is not an error: the rows are still rows.
+#[test]
+fn a_condition_a_statement_survived_comes_back_beside_its_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("notice.zu1");
+    seeded(&path);
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+
+        // The optional group misses for most people, so the aggregate
+        // has a null argument on those rows and ignores it. That is
+        // 01G11, and the answer is still an answer.
+        let result = query(
+            conn,
+            "MATCH (a:person) OPTIONAL MATCH (a)-[:follows]->(b) WHERE b.id > 90 \
+             RETURN avg(b.id) AS avg_friend",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), 1, "a warning is not an exception");
+        assert_eq!(gqlstatus_of(result), "00000");
+        assert_eq!(zu_result_notices(result), 1);
+
+        let n = notice(result, 0);
+        let mut len = 0usize;
+        assert_eq!(
+            CStr::from_ptr(zu_error_code(n, &mut len)).to_str(),
+            Ok("01G11")
+        );
+        assert_eq!(len, 5);
+        assert_eq!(
+            zu_error_severity(n),
+            ZU_SEVERITY_WARNING,
+            "the severity is what tells a notice from a failure"
+        );
+        assert_eq!(
+            zu_error_status(n),
+            ZuStatus::Ok,
+            "which is what the call that produced it returned"
+        );
+        let standard = CStr::from_ptr(zu_error_standard_text(n, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert!(standard.contains("null value eliminated"), "{standard}");
+        let url = CStr::from_ptr(zu_error_doc_url(n, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert_eq!(url, "https://zu.dev/docs/errors/01G11");
+        let message = CStr::from_ptr(zu_error_message(n, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert!(message.contains("01G11"), "{message}");
+        assert_eq!(zu_error_retryable(n), 0, "a warning is not a retry");
+        // Raised while the statement ran rather than at a token, so
+        // there is no place and no line, and both say so together.
+        let mut line = 0u32;
+        let mut column = 0u32;
+        assert_eq!(zu_error_position(n, &mut line, &mut column), ZuStatus::Done);
+        let mut offset = 0u32;
+        assert_eq!(zu_error_offset(n, &mut offset), ZuStatus::Done);
+        zu_error_free(n);
+
+        // A copy rather than a borrow: the result still has its own and
+        // answers again, which is what lets a host free the first one
+        // before it asks for the second.
+        let again = notice(result, 0);
+        assert_eq!(
+            CStr::from_ptr(zu_error_code(again, ptr::null_mut())).to_str(),
+            Ok("01G11")
+        );
+        zu_error_free(again);
+
+        // Past the end is the end of the walk rather than a failure.
+        let mut out: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_result_notice(result, 1, &mut out), ZuStatus::Done);
+        assert!(out.is_null());
+        assert_eq!(zu_result_notice(result, u32::MAX, &mut out), ZuStatus::Done);
+        zu_result_free(result);
+
+        // One warning per statement however many groups dropped a null,
+        // because a host wants to know it happened rather than how
+        // often.
+        let result = query(
+            conn,
+            "MATCH (a:person) OPTIONAL MATCH (a)-[:follows]->(b) WHERE b.id > 90 \
+             RETURN a.id AS id, avg(b.id) AS avg_friend",
+            &mut err,
+        );
+        assert!(
+            zu_result_rows(result) > 1,
+            "several groups, several chances"
+        );
+        assert_eq!(zu_result_notices(result), 1);
+        zu_result_free(result);
+
+        // And the ways of asking wrongly.
+        assert_eq!(
+            zu_result_notice(ptr::null_mut(), 0, &mut out),
+            ZuStatus::Misuse
+        );
+        assert!(out.is_null());
+        let result = query(conn, "MATCH (p:person) RETURN count(p) AS n", &mut err);
+        assert_eq!(
+            zu_result_notice(result, 0, ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+        zu_result_free(result);
+
         zu_conn_close(conn);
     }
 }

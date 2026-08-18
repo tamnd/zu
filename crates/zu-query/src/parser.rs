@@ -17,11 +17,148 @@ use crate::ast::{
     ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr,
     LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern,
     PatternList, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
-    RemoveItem, Removed, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, TxnStmt,
-    UnaryOp, YieldItem,
+    RemoveItem, Removed, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath,
+    TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
+
+/// A path being read left to right: the nodes it has reached, the edge
+/// patterns between them, and what the brackets around parts of it
+/// said.
+///
+/// It is the parser's working shape rather than the pattern's own,
+/// because a path is written as a tree of factors and stored as a line
+/// of steps: brackets nest, juxtaposition joins, and both of those are
+/// finished with by the time a pattern reaches the binder. A segment
+/// always holds one more node than it holds edge patterns, which is
+/// what makes `finish` total.
+#[derive(Default)]
+struct Segment {
+    nodes: Vec<NodePattern>,
+    rels: Vec<RelPattern>,
+    subpaths: Vec<Subpath>,
+    filter: Option<Expr>,
+}
+
+impl Segment {
+    /// The node position the next factor written with no edge in front
+    /// of it starts at, which is the one this segment ends at.
+    fn here(&self) -> usize {
+        self.nodes.len().saturating_sub(1)
+    }
+
+    /// Adds a node at the end, joined to whatever is already there: a
+    /// node written against the end of a path is the node the path
+    /// already ended at, described twice.
+    fn join(&mut self, node: NodePattern) {
+        match self.nodes.last_mut() {
+            None => self.nodes.push(node),
+            Some(end) => merge_ends(end, node),
+        }
+    }
+
+    /// Adds an edge pattern and the factor behind it, which starts a
+    /// node of its own rather than joining the one in hand.
+    fn step(&mut self, rel: RelPattern, right: Segment) {
+        self.rels.push(rel);
+        let at = self.nodes.len();
+        self.absorb(right, at);
+    }
+
+    /// Adds a factor written straight against this one, whose first
+    /// node is this one's last (ISO 16.11).
+    fn juxtapose(&mut self, right: Segment) {
+        let at = self.here();
+        let Segment {
+            nodes,
+            rels,
+            subpaths,
+            filter,
+        } = right;
+        let mut nodes = nodes.into_iter();
+        let head = nodes.next().expect("a factor holds a node");
+        self.join(head);
+        self.absorb(
+            Segment {
+                nodes: nodes.collect(),
+                rels,
+                subpaths,
+                filter,
+            },
+            at,
+        );
+    }
+
+    /// Takes the rest of a factor in, moving the node positions its
+    /// brackets pointed at to where they landed here.
+    fn absorb(&mut self, right: Segment, at: usize) {
+        self.nodes.extend(right.nodes);
+        self.rels.extend(right.rels);
+        for mut sub in right.subpaths {
+            sub.from += at;
+            sub.to += at;
+            self.subpaths.push(sub);
+        }
+        self.and(right.filter);
+    }
+
+    /// Folds one more condition into the ones the brackets wrote.
+    fn and(&mut self, filter: Option<Expr>) {
+        let Some(next) = filter else { return };
+        self.filter = Some(match self.filter.take() {
+            None => next,
+            Some(seen) => Expr::Binary {
+                op: BinaryOp::And,
+                lhs: Box::new(seen),
+                rhs: Box::new(next),
+            },
+        });
+    }
+
+    /// The pattern this reads as: the first node, then the rest paired
+    /// with the edge pattern that reaches them.
+    fn finish(self) -> (NodePattern, Vec<(RelPattern, NodePattern)>) {
+        let mut nodes = self.nodes.into_iter();
+        let start = nodes.next().expect("a path holds a node");
+        (start, self.rels.into_iter().zip(nodes).collect())
+    }
+}
+
+/// Two node patterns that describe one node, made into one.
+///
+/// It happens where two stretches of a path meet: `((a)-[e]->(b))
+/// ((b)-[f]->(c))` walks two edges through three nodes, and the `b`
+/// written twice is one node the two brackets each named. What each of
+/// them asked of the node stands, so the labels are joined with an `AND`
+/// and the properties gather.
+///
+/// Two different names there are two names for one node, which is legal
+/// and is what `(a:Step) ((x:Step)-[:LINK]->(y:Step))` writes: one of
+/// them is the pattern's name for the node and the other joins the
+/// aliases, and the binder puts both in scope over the one element.
+fn merge_ends(end: &mut NodePattern, node: NodePattern) {
+    match (&end.var, node.var) {
+        (_, None) => {}
+        (None, Some(name)) => end.var = Some(name),
+        (Some(seen), Some(name)) if *seen == name => {}
+        (Some(_), Some(name)) => {
+            if !end.aliases.contains(&name) {
+                end.aliases.push(name);
+            }
+        }
+    }
+    for name in node.aliases {
+        if end.var.as_deref() != Some(name.as_str()) && !end.aliases.contains(&name) {
+            end.aliases.push(name);
+        }
+    }
+    end.label = match (end.label.take(), node.label) {
+        (None, other) | (other, None) => other,
+        (Some(seen), Some(next)) => Some(LabelExpr::And(Box::new(seen), Box::new(next))),
+    };
+    end.props.extend(node.props);
+}
 
 /// What to call a conjunction in a message, spelled the way the query
 /// would have written it.
@@ -1522,13 +1659,11 @@ impl Parser<'_> {
             None
         };
         let (selector, mode) = self.parse_path_prefix()?;
-        let start = self.parse_node()?;
-        let mut steps = Vec::new();
-        while self.at(&TokenKind::Minus) || self.at(&TokenKind::Lt) || self.at(&TokenKind::Tilde) {
-            let rel = self.parse_rel()?;
-            let node = self.parse_node()?;
-            steps.push((rel, node));
-        }
+        let mut path = Segment::default();
+        self.parse_segment(&mut path)?;
+        let subpaths = std::mem::take(&mut path.subpaths);
+        let filter = path.filter.take();
+        let (start, steps) = path.finish();
         Ok(PathPattern {
             var,
             selector,
@@ -1538,7 +1673,124 @@ impl Parser<'_> {
             list: PatternList::default(),
             start,
             steps,
+            subpaths,
+            filter,
         })
+    }
+
+    /// A stretch of a path: a factor, then whatever follows it, which is
+    /// either an edge pattern and another factor or another factor on
+    /// its own.
+    ///
+    /// A factor written straight after another with no edge between them
+    /// is ISO's juxtaposition (16.11): the two stretches meet at a node,
+    /// and the node the left one ends at is the node the right one
+    /// starts at rather than a second node beside it. So the two node
+    /// patterns at the join describe one node and are merged into one,
+    /// which is what `merge_ends` does.
+    fn parse_segment(&mut self, into: &mut Segment) -> Result<()> {
+        self.parse_factor(into)?;
+        loop {
+            if self.at(&TokenKind::Minus) || self.at(&TokenKind::Lt) || self.at(&TokenKind::Tilde) {
+                let rel = self.parse_rel()?;
+                let mut right = Segment::default();
+                self.parse_factor(&mut right)?;
+                into.step(rel, right);
+                continue;
+            }
+            // A bracket standing where an edge pattern could have stood
+            // is the next factor rather than the next clause, because
+            // every clause a pattern can be followed by opens with a
+            // word.
+            if self.at(&TokenKind::LParen) {
+                let mut right = Segment::default();
+                self.parse_factor(&mut right)?;
+                into.juxtapose(right);
+                continue;
+            }
+            return Ok(());
+        }
+    }
+
+    /// One factor of a path: a node pattern, or a parenthesized path
+    /// pattern (ISO 16.11, feature G038).
+    ///
+    /// What the brackets may carry is a subpath variable, then a path
+    /// mode, then the pattern, then a `WHERE`. A path selector is not on
+    /// that list: the standard writes a selector in front of a whole
+    /// path pattern, because how many paths to keep is a question about
+    /// the answer and not about a stretch of the walk, so one written
+    /// here is refused rather than read as though it had been written
+    /// outside.
+    fn parse_factor(&mut self, into: &mut Segment) -> Result<()> {
+        if !self.at_subpath() {
+            let node = self.parse_node()?;
+            into.join(node);
+            return Ok(());
+        }
+        self.expect(&TokenKind::LParen)?;
+        let var = if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_)))
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            ) {
+            let name = self.expect_name("a subpath variable")?;
+            self.expect(&TokenKind::Eq)?;
+            Some(name)
+        } else {
+            None
+        };
+        let (selector, mode) = self.parse_path_prefix()?;
+        if selector.is_some() {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "a path selector says how many of the paths a pattern matches to keep, \
+                 which is a question about the whole pattern, so write it in front of \
+                 the pattern rather than inside the brackets",
+            ));
+        }
+        let from = into.here();
+        let mut inner = Segment::default();
+        self.parse_segment(&mut inner)?;
+        let filter = self.parse_where()?;
+        self.expect(&TokenKind::RParen)?;
+        let to = from + inner.rels.len();
+        into.juxtapose(inner);
+        into.subpaths.push(Subpath {
+            var,
+            mode,
+            from,
+            to,
+        });
+        into.and(filter);
+        Ok(())
+    }
+
+    /// Whether the `(` in hand opens a parenthesized path pattern rather
+    /// than a node pattern.
+    ///
+    /// The two are told apart by what stands after the bracket, and
+    /// three things say a path: another bracket, a name with an `=`
+    /// behind it, which is a subpath variable, and a path mode word with
+    /// a bracket behind it. Everything else is a node pattern, including
+    /// `(WALK)`, which is a node the query called WALK.
+    fn at_subpath(&self) -> bool {
+        if !self.at(&TokenKind::LParen) {
+            return false;
+        }
+        let next = self.tokens.get(self.pos + 1);
+        let after = self.tokens.get(self.pos + 2);
+        match next.map(|t| &t.kind) {
+            Some(TokenKind::LParen) => true,
+            Some(TokenKind::Ident(word)) => match after.map(|t| &t.kind) {
+                Some(TokenKind::Eq) => true,
+                Some(TokenKind::LParen) => {
+                    ["WALK", "TRAIL", "SIMPLE", "ACYCLIC"].contains(&word.to_uppercase().as_str())
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// A graph pattern (ISO 16.9): the match mode in front of a list of
@@ -1765,7 +2017,12 @@ impl Parser<'_> {
             Vec::new()
         };
         self.expect(&TokenKind::RParen)?;
-        Ok(NodePattern { var, label, props })
+        Ok(NodePattern {
+            var,
+            aliases: Vec::new(),
+            label,
+            props,
+        })
     }
 
     /// A label expression, `|` binding loosest and `!` tightest, the

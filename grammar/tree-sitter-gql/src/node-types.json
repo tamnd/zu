@@ -1157,7 +1157,7 @@
     },
     "children": {
       "multiple": true,
-      "required": true,
+      "required": false,
       "types": [
         {
           "type": "node",
@@ -1169,6 +1169,10 @@
         },
         {
           "type": "relationship",
+          "named": true
+        },
+        {
+          "type": "subpath",
           "named": true
         }
       ]
@@ -2176,6 +2180,52 @@
         },
         {
           "type": "query",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "subpath",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "quoted_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "node",
+          "named": true
+        },
+        {
+          "type": "path_mode",
+          "named": true
+        },
+        {
+          "type": "relationship",
+          "named": true
+        },
+        {
+          "type": "subpath",
+          "named": true
+        },
+        {
+          "type": "where_clause",
           "named": true
         }
       ]

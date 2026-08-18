@@ -365,3 +365,79 @@ MATCH DIFFERENT EDGE BINDINGS (a)-[:KNOWS]->(b) RETURN a
         (projection_item
           (variable
             (identifier)))))))
+
+================================================================================
+A parenthesized path pattern with a name, a mode and a condition
+================================================================================
+
+MATCH (p = TRAIL (a)-[:KNOWS]->(b) WHERE b.age > a.age) RETURN p
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (subpath
+            (identifier)
+            (path_mode)
+            (node
+              (identifier))
+            (relationship
+              (rel_detail
+                (label
+                  (identifier))))
+            (node
+              (identifier))
+            (where_clause
+              (binary_expression
+                (property_access
+                  (variable
+                    (identifier))
+                  (identifier))
+                (property_access
+                  (variable
+                    (identifier))
+                  (identifier))))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+Two stretches of a pattern written against one another
+================================================================================
+
+MATCH (a)-[:KNOWS]->(b) ((b)-[:KNOWS]->(c)) RETURN c
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier))
+          (subpath
+            (node
+              (identifier))
+            (relationship
+              (rel_detail
+                (label
+                  (identifier))))
+            (node
+              (identifier))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))

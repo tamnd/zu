@@ -790,3 +790,53 @@ cases:
       - values:
           - type: STRING
             value: bo
+
+  - name: brackets-around-a-pattern-say-nothing
+    doc: A parenthesized path pattern matches nothing of its own, so the pattern inside the brackets answers what it answers without them. Everything else the brackets are for rests on this.
+    query: MATCH ((a:person)-[:knows]->(b:person)) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-subpath-variable-measures-the-stretch-it-names
+    doc: A name written inside the brackets binds a path over the stretch they hold rather than over the whole walk, so a two hop pattern whose second hop is bracketed answers a path of one hop.
+    query: MATCH (a:person)-[:knows]->(b:person) (q = (b)-[:knows]->(c:person)) WHERE a.name = 'ann' RETURN path_length(q) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: two-stretches-of-a-pattern-meeting-at-one-node
+    doc: A factor written straight against another meets it at a node, so the two node patterns there describe one node under two names and the pattern walks one edge rather than three.
+    query: MATCH (a:person)((x:person)-[:knows]->(y:person))(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-condition-written-inside-the-brackets
+    doc: A WHERE inside the brackets is a condition on the stretch they hold, and the walk from a node to itself is the one this drops.
+    query: MATCH ((a:person)-[:knows]->(b:person) WHERE a.age < b.age) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-path-mode-on-one-stretch-of-a-walk
+    doc: A path mode inside the brackets speaks about the stretch they hold, so an outer walk may hold an inner trail. The walk takes the edge from a node to itself twice and the trail does not.
+    query: MATCH WALK (TRAIL (a:person)-[e:knows*1..2]->(b:person)) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"

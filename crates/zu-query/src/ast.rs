@@ -745,6 +745,42 @@ impl Selector {
     }
 }
 
+/// A parenthesized path pattern (ISO 16.11, feature G038): a stretch of
+/// a path written inside brackets, and what the brackets let it carry.
+///
+/// The brackets themselves match nothing. A path written with them and
+/// the same path written without them walk the same edges in the same
+/// order, which is why this is a note about a stretch of a path rather
+/// than a shape of its own: `from` and `to` are node positions of the
+/// path the brackets sit in, counting the first node as zero, and the
+/// steps between them are the ones the brackets hold.
+///
+/// What the brackets are for is the three things written inside them. A
+/// subpath variable names the stretch, so `((a)-[e]->(b))` is a path
+/// value over two nodes and one edge where the pattern around it may be
+/// longer. A path mode applies to the stretch alone, so an outer walk
+/// may hold an inner trail. A `WHERE` inside the brackets is a condition
+/// on the stretch, and it may read a variable the pattern bound outside
+/// it, which is what makes it a non local predicate rather than a
+/// condition on one element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Subpath {
+    /// `(p = ...)`, the name the stretch is bound to, `None` for
+    /// brackets written to carry a mode or a condition.
+    pub var: Option<String>,
+    /// A path mode written inside the brackets, which the steps between
+    /// `from` and `to` walk under whatever the pattern around them
+    /// walks under.
+    pub mode: Option<PathMode>,
+    /// The node position the stretch starts at, counting the first node
+    /// of the pattern as zero.
+    pub from: usize,
+    /// The node position it ends at. `from == to` is a stretch of one
+    /// node and no edge, which is what a bracket around a single node
+    /// pattern is.
+    pub to: usize,
+}
+
 /// One linear path: a node, then rel-node steps left to right.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathPattern {
@@ -769,11 +805,37 @@ pub struct PathPattern {
     pub list: PatternList,
     pub start: NodePattern,
     pub steps: Vec<(RelPattern, NodePattern)>,
+    /// The parenthesized stretches of this pattern, in the order their
+    /// brackets closed, so a bracket inside another comes first. Each
+    /// points at the node positions of `start` and `steps` it covers.
+    /// Empty for a pattern written with no brackets at all, which is
+    /// every pattern that was legal before G038.
+    pub subpaths: Vec<Subpath>,
+    /// The conditions written inside those brackets, folded together
+    /// with AND.
+    ///
+    /// It is kept on the pattern rather than folded into the clause's
+    /// own `WHERE` because the two are written in different places and a
+    /// reader of an error should be told which one they wrote. What it
+    /// means is the same thing: a condition inside brackets decides the
+    /// match, the way an `OPTIONAL MATCH`'s `WHERE` does, so it is bound
+    /// with the clause condition and not behind it.
+    pub filter: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodePattern {
     pub var: Option<String>,
+    /// The other names this node was written under, which is what two
+    /// stretches of a pattern meeting at it leaves behind (ISO 16.11).
+    ///
+    /// `(a:Step) ((x:Step)-[:LINK]->(y:Step))` describes two nodes and
+    /// not four: the `a` and the `x` are one node the two stretches each
+    /// named, so one of the names is the pattern's and the rest are
+    /// here, and all of them stand for the one element for the rest of
+    /// the query. Empty for every pattern written without brackets, and
+    /// for the ones whose stretches met under one name.
+    pub aliases: Vec<String>,
     /// The label expression after the colon, `None` for a pattern that
     /// names no label and therefore matches whatever it reaches.
     pub label: Option<LabelExpr>,

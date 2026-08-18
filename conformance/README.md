@@ -43,7 +43,7 @@ Every case gets a database of its own. Cases are written as if nothing came befo
 ## What a case looks like
 
 ```yaml
-schema: 2
+schema: 3
 suite: scalar
 doc: The values that cross a language boundary badly.
 
@@ -61,13 +61,14 @@ cases:
 
 | Key | Where | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema` | file | yes | Moves when the shape of a case file changes, not when the cases do. It is `2`, which is where `load` arrived. |
+| `schema` | file | yes | Moves when the shape of a case file changes, not when the cases do. It is `3`, which is where `params` arrived. |
 | `suite` | file | yes | The suite's name, which must equal the file's stem. Two places to write one thing, checked against each other rather than one of them ignored. |
 | `doc` | file and case | yes | Why this is here, in a sentence somebody wrote. A test enforces length and a full stop, which is a floor on effort and not on quality. |
 | `load` | file | no | A table of typed columns and the edges between its rows, put into every case's database through the runner's own bulk load path before the case runs. Most suites have none. |
 | `cases` | file | yes | The cases, in the order they run. |
 | `name` | case | yes | Lower case and dashes, unique within the suite. It is what a report names the case by, so it is stable. |
 | `setup` | case | no | Statements run before `query`, against the case's own empty database. |
+| `params` | case | no | The values the statement under test is run with, each a `name` and a value in the same encoding a row is written in. |
 | `query` | case | yes | The statement under test. |
 | `columns` | case | with `rows` | The projected names, in order. The names are part of the answer. |
 | `rows` | case | with `columns` | The rows, in order. Written as `rows:` with nothing under it when the case expects none, which is a real expectation and needs a spelling. |
@@ -108,6 +109,28 @@ A load belongs to the file rather than to the case, and it is applied to every c
 
 It is bulk load rather than a statement because in v0 that is the only way in: `CREATE` and `INSERT` need a table and no statement makes one. Every client already has to expose a loader, so every runner has something to implement this with. The types a column can hold are the types the v0 property store keeps, which is `INT64`, `STRING`, `BOOL`, `FLOAT64`, `DATE`, `LOCALTIME`, `LOCALDATETIME` and both kinds of `DURATION`. The two zoned types are refused with a message, because the store has nowhere to keep an offset, and so is a null, because a loaded column has no way to spell one yet.
 
+## What a parameter looks like
+
+A `load:` is one way a value gets in and a parameter is the other, and it is the one a client uses every day: a statement written once and run with values bound to it by name.
+
+```yaml
+  - name: in-a-node-pattern
+    doc: A parameter as a property in a node pattern.
+    params:
+      - name: age
+        type: INT64
+        value: "40"
+    query: MATCH (p:person {age: $age}) RETURN p.name AS name
+```
+
+A parameter is a value of the same encoding with a `name` beside it, so everything the encoding says about quoting says it here too. The name is what the statement writes after `$`, it is ASCII letters, digits and underscores, and it is written without the `$`, because the `$` is the statement's spelling of a reference and not part of the name. Two parameters of one name is an error in the file. The order is kept, which matters to a runner whose binding call takes positions.
+
+The parameters belong to `query` and not to `setup`. A parameter is part of the one assertion a case makes, and a fixture that needed one would be a second statement under test wearing another name.
+
+A statement naming a parameter nobody bound raises `42002`, which is a case like any other and is written with `raises:`. A parameter nobody names is ignored, so one map may be bound to several statements.
+
+`LIST` is the one type a parameter cannot be today. The C ABI has `zu_bind_null`, `zu_bind_bool`, `zu_bind_i64`, `zu_bind_f64`, `zu_bind_str` and `zu_bind_temporal`, and no call that carries a composite, so a case binding a list would be a case the C runner could not run. The gap is in the ABI rather than in the engine, and the cases arrive when the call does.
+
 ## What is in it
 
 | Suite | What it pins |
@@ -126,8 +149,9 @@ It is bulk load rather than a statement because in v0 that is the only way in: `
 | `aggregate` | The set functions, where a type changes on the way through and a null stops propagating. |
 | `stored` | Values put in through a client's own loader and read back out through a query, so the value crosses the boundary twice and by two different mechanisms. |
 | `graph` | The shape a load puts into the store, read back by walking it: direction, a row nothing points at, and a row that points at itself. |
+| `param` | Values handed to a statement rather than written in it, which is the client's own encoder rather than its decoder: every type through a binding, the positions a statement takes one in, and the rules about names. |
 
-A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. The two suites that store a value first do it through `load:` rather than through a statement, because the v0 core does not implement `CREATE` yet.
+A case is written at expression level wherever it can be, because an expression is the shortest statement that isolates the thing under test. The suites that store a value first do it through `load:` rather than through a statement, because the v0 core does not implement `CREATE` yet. The few cases that write through a statement instead are the ones asking what a bound value looks like after a round trip through the store, and they declare their table the only way a statement can, which is a bare `INSERT` in `setup:` with the properties the case is about.
 
 ## The artifact
 
@@ -159,7 +183,7 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 `DECIMAL`, `BYTES`, `NODE`, `EDGE`, and `PATH` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
 
-The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 783 values counting the ones inside lists, and both print them the same way.
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 989 values counting the ones inside lists, and both print them the same way.
 
 ## What the Rust runner does not check
 
@@ -177,4 +201,4 @@ The reason is the reason the TOML reader gives: a construct silently reinterpret
 
 Comments are found by the one rule that matters to a case writer: a `#` starts a comment only with whitespace before it, and a quote hides a `#` only if it opens after whitespace and closes on the same line. That last clause is what lets a `query:` hold `cast('  42  ' AS INT64)`, whose closing quote has a space before it and so looks like an opening one. A quote that opens nothing that closes was not a run.
 
-There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 14 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.
+There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 15 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.

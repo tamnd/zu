@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 suite: string
 doc: Text, which every language claims to have solved and each of them solved differently. What a character is, how many of them a string has, and whether two strings that look identical are the same string are three questions with three different answers per language, and each one is a case here.
 

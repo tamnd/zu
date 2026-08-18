@@ -6,7 +6,7 @@
  * by side and a rule that exists in one and not the other is visible.
  * The second takes the case files named on the command line, parses
  * every one, and checks the shape a runner will walk. That half is the
- * one that fires when somebody writes a case: 555 files of hand written
+ * one that fires when somebody writes a case: 652 cases of hand written
  * YAML are a better adversary than any literal in this file.
  *
  * Usage: yaml_test conformance/cases/one.yaml conformance/cases/two.yaml,
@@ -325,8 +325,8 @@ static void what_the_reader_does_not_read_it_refuses_and_says_where(void) {
  * into a shape no runner can walk fails on the machine of whoever wrote
  * it rather than in nine client repositories. */
 static const char *const file_keys[] = {"schema", "suite", "doc", "load", "cases"};
-static const char *const case_keys[] = {"name", "doc", "setup", "query", "columns",
-                                        "rows",  "raises"};
+static const char *const case_keys[] = {"name",  "doc",     "setup", "params",
+                                        "query", "columns", "rows",  "raises"};
 
 static size_t read_case_file(const char *path) {
     char err[512];
@@ -340,7 +340,7 @@ static size_t read_case_file(const char *path) {
         return 0;
     }
     root = zy_root(doc);
-    check_text(zy_get(root, "schema"), "2", path);
+    check_text(zy_get(root, "schema"), "3", path);
     check(zy_text(zy_get(root, "suite")).ptr != NULL, "the file names its suite");
     unknown = zy_unknown(root, file_keys, sizeof file_keys / sizeof file_keys[0]);
     if (unknown.ptr != NULL) {

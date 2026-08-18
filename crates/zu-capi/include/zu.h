@@ -366,6 +366,15 @@ zu_status zu_bind_bool_z(zu_stmt *stmt, const char *name, int v);
 zu_status zu_bind_str(zu_stmt *stmt, const char *name, size_t name_len, const char *v,
                       size_t v_len);
 zu_status zu_bind_str_z(zu_stmt *stmt, const char *name, const char *v);
+/* A temporal parameter, as one ZU_TEMPORAL_ kind and the count in the
+ * unit that kind implies, which is zu_value_temporal read backwards.
+ * The offset is minutes east of UTC and is ignored by every kind but
+ * the two zoned ones. A kind that is not one of the seven, or an
+ * offset or a count the kind cannot hold, is ZU_MISUSE. */
+zu_status zu_bind_temporal(zu_stmt *stmt, const char *name, size_t name_len, int32_t kind,
+                           int64_t count, int32_t offset);
+zu_status zu_bind_temporal_z(zu_stmt *stmt, const char *name, int32_t kind, int64_t count,
+                             int32_t offset);
 zu_status zu_bind_null(zu_stmt *stmt, const char *name, size_t name_len);
 zu_status zu_bind_null_z(zu_stmt *stmt, const char *name);
 zu_status zu_execute(zu_stmt *stmt, zu_result **out, zu_error **err);

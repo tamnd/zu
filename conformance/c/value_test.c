@@ -388,6 +388,36 @@ static void a_report_that_does_not_fit_says_how_much_it_needed(void) {
     check(cv_show(&v, NULL, 0) == need, "a buffer of nothing is a way to ask the length");
 }
 
+/* A parameter is the same encoding with a name beside it, which is a
+ * key cv_decode refuses and cv_typed lets through for the caller to
+ * read. Nothing else about the value changes, quoting included. */
+static void a_parameter_is_the_same_encoding_with_a_name_beside_it(void) {
+    static const char text[] = "name: n\ntype: INT64\nvalue: \"9007199254740993\"\n";
+    zy_doc *doc = zy_parse(text, sizeof text - 1, err, sizeof err);
+    cv v;
+    if (doc == NULL) {
+        printf("FAIL a parameter should parse: %s\n", err);
+        failures++;
+        return;
+    }
+    check(cv_typed(arena, zy_root(doc), &v, err, sizeof err) == 0, "the name is not in the way");
+    check(v.kind == CV_INT && v.as.integer == 9007199254740993LL, "and the value is the value");
+    check(cv_decode(arena, zy_root(doc), &v, err, sizeof err) != 0,
+          "while the door a row comes through still refuses it");
+    zy_free(doc);
+    /* What cv_typed does not stop refusing, since a name is the only
+     * thing it was opened for. */
+    doc = zy_parse("name: n\ntype: INT64\nvalue: 1\n", 28, err, sizeof err);
+    if (doc == NULL) {
+        printf("FAIL a bare int64 should parse: %s\n", err);
+        failures++;
+        return;
+    }
+    check(cv_typed(arena, zy_root(doc), &v, err, sizeof err) != 0,
+          "a bare INT64 is the same mistake with a name on it");
+    zy_free(doc);
+}
+
 /* A payload is the same encoding with the type factored out, which is
  * what a load column is written in: the type once at the top and bare
  * values under it. */
@@ -486,9 +516,23 @@ static size_t read_case_file(const char *path) {
     }
     cases = zy_get(root, "cases");
     for (i = 0; cases != NULL && cases->kind == ZY_SEQ && i < cases->count; i++) {
+        const zy_node *params = zy_get(&cases->items[i], "params");
         const zy_node *rows = zy_get(&cases->items[i], "rows");
         const zy_node *items;
         size_t count;
+        /* A parameter is a value with a name beside it, so it goes
+         * through the door that allows the name rather than the one
+         * that refuses every key it does not know. */
+        for (j = 0; params != NULL && params->kind == ZY_SEQ && j < params->count; j++) {
+            cv v;
+            if (cv_typed(arena, &params->items[j], &v, err, sizeof err) != 0) {
+                printf("FAIL %s: %s\n", path, err);
+                failures++;
+                continue;
+            }
+            check(cv_same(&v, &v), "a bound value is itself");
+            values += counted(&v);
+        }
         if (rows == NULL || zy_seq_or_empty(rows, &items, &count) != 0) {
             continue;
         }
@@ -557,6 +601,7 @@ int main(int argc, char **argv) {
     a_mapping_that_is_not_a_value_is_refused_with_its_line();
     what_a_report_prints_is_what_a_case_would_be_written_as();
     a_report_that_does_not_fit_says_how_much_it_needed();
+    a_parameter_is_the_same_encoding_with_a_name_beside_it();
     a_payload_is_the_same_encoding_with_the_type_named_once();
     an_arena_reset_hands_the_memory_back_without_handing_a_value_over();
     cv_arena_reset(arena);

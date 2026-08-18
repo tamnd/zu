@@ -94,17 +94,27 @@ fn unknown(ty: &str) -> String {
 /// The value a `{type, value}` mapping describes, or what is wrong
 /// with it.
 pub fn decode(node: &Node) -> Result<Value, String> {
-    let line = node.line();
-    let at = |msg: String| format!("line {line}: {msg}");
     if node.map().is_none() {
-        return Err(at(format!(
-            "a value is a mapping of `type` and `value`, and this is {}",
+        return Err(format!(
+            "line {}: a value is a mapping of `type` and `value`, and this is {}",
+            node.line(),
             node.kind()
-        )));
+        ));
     }
     if let Some(key) = node.unknown(&["type", "value"]).first() {
-        return Err(at(format!("a value has no key {key:?}")));
+        return Err(format!("line {}: a value has no key {key:?}", node.line()));
     }
+    typed(node)
+}
+
+/// The `type` and `value` of a mapping that carries more than those
+/// two, which is a parameter: it is a value with a name, and the name
+/// belongs to the case rather than to the encoding. The keys are the
+/// caller's to check, since only the caller knows which others it
+/// allows.
+pub fn typed(node: &Node) -> Result<Value, String> {
+    let line = node.line();
+    let at = |msg: String| format!("line {line}: {msg}");
     let ty = node
         .get("type")
         .ok_or_else(|| at("a value with no `type`".to_string()))?

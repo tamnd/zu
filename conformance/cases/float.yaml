@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 suite: float
 doc: Binary floating point, which every language has and none of them prints the same way. The value is IEEE 754 and the disagreements are all about what surrounds it: how many digits a client emits, whether it keeps the sign of a zero, what it does with a value no decimal literal spells exactly, and whether the three values that are not numbers survive a round trip at all.
 

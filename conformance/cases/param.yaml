@@ -1,0 +1,1393 @@
+schema: 3
+suite: param
+doc: Values handed to a statement rather than written in it. Every other suite asks what a value means on the way out of a client, and a client that reads a date correctly and writes one a day early passes all of them. A parameter is that value going the other way, through the client's own binding call, so a case here fails when the encoder is wrong even where the decoder is right. The statement is kept as small as the position under test allows, because what is being graded is the value and not the plan.
+
+load:
+  nodes: person
+  edges: knows
+  count: 3
+  columns:
+    - name: age
+      type: INT64
+      values:
+        - "30"
+        - "40"
+        - "50"
+    - name: name
+      type: STRING
+      values:
+        - ann
+        - bo
+        - cy
+    - name: born
+      type: DATE
+      values:
+        - "1994-02-28"
+        - "1984-02-29"
+        - "1974-01-01"
+    - name: ok
+      type: BOOL
+      values:
+        - true
+        - false
+        - true
+    - name: score
+      type: FLOAT64
+      values:
+        - "0.5"
+        - "-0.0"
+        - "3.25"
+  pairs:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2
+
+cases:
+  - name: projected
+    doc: A parameter projected straight back out, which is the shortest statement that binds one and the case every other one here builds on.
+    params:
+      - name: n
+        type: INT64
+        value: "42"
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: two-of-them
+    doc: Two parameters in one statement, so a client that binds by position rather than by name gives back the values the other way round.
+    params:
+      - name: a
+        type: INT8
+        value: 2
+      - name: b
+        type: INT8
+        value: 3
+    query: RETURN $a AS a, $b AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: INT8
+            value: 2
+          - type: INT8
+            value: 3
+
+  - name: named-twice
+    doc: One parameter named twice in a statement, which is one binding and not two, and which a client that consumes its values as it walks the text gets wrong.
+    params:
+      - name: n
+        type: INT8
+        value: 4
+    query: RETURN $n + $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 8
+
+  - name: bound-and-unused
+    doc: A parameter the statement never names, which a client may pass and the engine ignores. A client that refuses it cannot bind one map to several statements.
+    params:
+      - name: n
+        type: INT8
+        value: 1
+      - name: spare
+        type: STRING
+        value: unused
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: named-and-not-bound
+    doc: A statement naming a parameter nobody bound, which is a reference that resolves to nothing and is the mistake a client makes most often.
+    query: RETURN $n AS n
+    raises: "42002"
+
+  - name: one-of-two-not-bound
+    doc: The same mistake with another parameter bound beside it, so a client that checks only that some parameters arrived still fails.
+    params:
+      - name: a
+        type: INT8
+        value: 1
+    query: RETURN $a + $b AS n
+    raises: "42002"
+
+  - name: name-is-a-digit
+    doc: A parameter whose name is a digit, which is what a client that numbers its parameters rather than naming them ends up binding.
+    params:
+      - name: "0"
+        type: INT8
+        value: 1
+    query: RETURN $0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: name-with-an-underscore
+    doc: An underscore in a parameter name, which a client that quotes its names into the statement rather than passing them can turn into two words.
+    params:
+      - name: max_age
+        type: INT8
+        value: 9
+    query: RETURN $max_age AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 9
+
+  - name: a-variable-of-the-same-name
+    doc: A variable and a parameter spelled with the same word, which are two namespaces and not a collision. A client that substitutes text rather than binding merges them.
+    params:
+      - name: n
+        type: INT8
+        value: 2
+    query: UNWIND [1] AS n RETURN n + $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 3
+
+  - name: null-is-a-value
+    doc: A null parameter, which is a value that was bound and not a parameter nobody bound. The two are one thing in a client whose map cannot hold a null.
+    params:
+      - name: n
+        type: "NULL"
+    query: RETURN $n IS NULL AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: null-projected
+    doc: A null parameter projected back out, so the value crosses the boundary in both directions rather than only being tested for absence.
+    params:
+      - name: n
+        type: "NULL"
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: "NULL"
+
+  - name: null-in-arithmetic
+    doc: A null parameter in a sum, which is null and not zero, and which a client that binds its absent value as a zero passes every other case with.
+    params:
+      - name: n
+        type: "NULL"
+    query: RETURN $n + 1 IS NULL AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: bool-true
+    doc: A boolean parameter, which a host language with no boolean type hands over as an integer and which the engine then compares as one.
+    params:
+      - name: b
+        type: BOOL
+        value: true
+    query: RETURN $b AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: bool-false
+    doc: A false parameter, which is the value a client that treats its bindings as a truthiness test drops on the floor.
+    params:
+      - name: b
+        type: BOOL
+        value: false
+    query: RETURN $b AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: bool-through-not
+    doc: A boolean parameter through NOT, which is the operator that tells a bound false apart from a bound null.
+    params:
+      - name: b
+        type: BOOL
+        value: false
+    query: RETURN NOT $b AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: bool-through-and
+    doc: A boolean parameter through AND, so a client that binds its false as a string finds out here rather than in a filter that silently keeps every row.
+    params:
+      - name: b
+        type: BOOL
+        value: false
+    query: RETURN $b AND true AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: int8-min
+    doc: The bottom of INT8, bound as INT8, which is a byte in the host languages that have one and where the sign is what goes.
+    params:
+      - name: n
+        type: INT8
+        value: -128
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: -128
+
+  - name: int8-max
+    doc: The top of INT8, which a client with an unsigned byte binds as 127 and one that widened it to a word still gets right, so this is the floor of the tower and not the interesting part of it.
+    params:
+      - name: n
+        type: INT8
+        value: 127
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 127
+
+  - name: int16-min
+    doc: The bottom of INT16, the width most host languages name and few use, and the one a client is most likely to have skipped on the way in.
+    params:
+      - name: n
+        type: INT16
+        value: -32768
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT16
+            value: -32768
+
+  - name: int32-max
+    doc: The top of INT32, which is the largest integer a client written against a language whose numbers are 32 bits can bind without widening.
+    params:
+      - name: n
+        type: INT32
+        value: 2147483647
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT32
+            value: 2147483647
+
+  - name: int64-max
+    doc: The top of INT64, which is the value a client that hands its parameters to a double binds as 9223372036854775808 and which no case with a smaller number catches.
+    params:
+      - name: n
+        type: INT64
+        value: "9223372036854775807"
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9223372036854775807"
+
+  - name: int64-min
+    doc: The bottom of INT64, which is the same defect with the other sign and which a client that binds through a text form gets wrong by writing the negation of a value it cannot hold.
+    params:
+      - name: n
+        type: INT64
+        value: "-9223372036854775808"
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-9223372036854775808"
+
+  - name: int64-past-the-double
+    doc: The first integer a double cannot hold, bound and returned, which comes back one less from a client that widened it on the way in.
+    params:
+      - name: n
+        type: INT64
+        value: "9007199254740993"
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9007199254740993"
+
+  - name: uint8-top
+    doc: The top of UINT8 bound as one, which is a value the engine keeps in a signed integer and a client must not sign extend.
+    params:
+      - name: n
+        type: UINT8
+        value: 255
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT8
+            value: 255
+
+  - name: uint32-top
+    doc: The top of UINT32, which is where a client that binds through a 32 bit signed integer gives back minus one.
+    params:
+      - name: n
+        type: UINT32
+        value: 4294967295
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT32
+            value: 4294967295
+
+  - name: uint64-inside-the-signed-range
+    doc: A UINT64 the engine can hold, which is any of them below the top of INT64. The half above it has nowhere to go and the encoding refuses it rather than wrapping it into a negative.
+    params:
+      - name: n
+        type: UINT64
+        value: "9223372036854775807"
+    query: RETURN $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: UINT64
+            value: "9223372036854775807"
+
+  - name: float-a-tenth
+    doc: A tenth, which is the shortest decimal that is not a double and so is where a client that binds through a decimal text form loses the last bits.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "0.1"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.1"
+
+  - name: float-negative-zero
+    doc: A negative zero, whose sign is the first thing a client loses when it binds a float through an integer or through a comparison with zero.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "-0.0"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-0.0"
+
+  - name: float-nan
+    doc: A NaN parameter projected back out, which several host languages have no literal for and which a client that binds it through JSON turns into a null.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "NaN"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "NaN"
+
+  - name: float-nan-is-not-itself
+    doc: A NaN compared with itself through two names for one binding, which is false, and which a client that bound something else in its place gets right by accident only if that something is also a NaN.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "NaN"
+    query: RETURN $f = $f AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: float-infinity
+    doc: An infinite parameter, which has no JSON spelling and no literal in several host languages and so is where a client's text encoding gives up.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "inf"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "inf"
+
+  - name: float-negative-infinity
+    doc: The other infinity, so a client that special cased one of the two rather than both is caught here.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "-inf"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "-inf"
+
+  - name: float-largest
+    doc: The largest finite double, which a client that binds through a 32 bit float turns into an infinity.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "1.7976931348623157e308"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.7976931348623157e308"
+
+  - name: float-smallest-normal
+    doc: The smallest normal double, which a client that binds through a narrower float rounds to zero.
+    params:
+      - name: f
+        type: FLOAT64
+        value: "2.2250738585072014e-308"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.2250738585072014e-308"
+
+  - name: float32-a-tenth
+    doc: A tenth declared as FLOAT32, which is a different double from the FLOAT64 tenth above and is what a client with a 32 bit float type has to hand over.
+    params:
+      - name: f
+        type: FLOAT32
+        value: "0.1"
+    query: RETURN $f AS f
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT32
+            value: "0.1"
+
+  - name: string-empty
+    doc: An empty string parameter, which is a value and not an absent one, and which a client whose binding treats the empty string as unset drops.
+    params:
+      - name: s
+        type: STRING
+        value: ""
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: ""
+
+  - name: string-plain
+    doc: An ordinary string, which is the case that says the binding works at all before the awkward ones say how well.
+    params:
+      - name: s
+        type: STRING
+        value: ada
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: ada
+
+  - name: string-with-an-accent
+    doc: A string outside ASCII, which is where a client that binds a length in characters against an engine counting bytes truncates.
+    params:
+      - name: s
+        type: STRING
+        value: "héllo"
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "héllo"
+
+  - name: string-outside-the-basic-plane
+    doc: A string that needs a surrogate pair in the languages that keep their strings in sixteen bit units, which is where half a character gets bound.
+    params:
+      - name: s
+        type: STRING
+        value: "🙂"
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "🙂"
+
+  - name: string-with-a-tab
+    doc: A control character in a bound string, which a client that builds its statement as text has to escape and a client that binds does not.
+    params:
+      - name: s
+        type: STRING
+        value: "a\tb"
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "a\tb"
+
+  - name: string-with-a-quote
+    doc: A quote in a bound string, which is the injection a client that pastes its values into the statement text writes and a client that binds cannot.
+    params:
+      - name: s
+        type: STRING
+        value: "o'brien"
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "o'brien"
+
+  - name: string-that-looks-like-a-statement
+    doc: A bound string holding statement text, which is the same injection written out: it is one value here and it is a clause in a client that concatenates.
+    params:
+      - name: s
+        type: STRING
+        value: "' OR 1 = 1"
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "' OR 1 = 1"
+
+  - name: string-with-a-dollar
+    doc: A bound string holding what looks like another parameter, which a client that substitutes text expands a second time.
+    params:
+      - name: s
+        type: STRING
+        value: "$n"
+    query: RETURN $s AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "$n"
+
+  - name: date-leap-day
+    doc: A date on a leap day, bound and returned, which is the day a client that binds through a broken down calendar gets wrong.
+    params:
+      - name: d
+        type: DATE
+        value: "2024-02-29"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-02-29"
+
+  - name: date-epoch
+    doc: The epoch itself, which is zero in the engine's unit and so is where a client that treats an absent binding as zero looks right.
+    params:
+      - name: d
+        type: DATE
+        value: "1970-01-01"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DATE
+            value: "1970-01-01"
+
+  - name: date-before-the-epoch
+    doc: A date before 1970, which is a negative count in the engine's unit and which a client binding an unsigned day count cannot express.
+    params:
+      - name: d
+        type: DATE
+        value: "1900-01-01"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DATE
+            value: "1900-01-01"
+
+  - name: date-far-out
+    doc: A date four digits out, which is past the range of a client that binds its dates through a 32 bit second count.
+    params:
+      - name: d
+        type: DATE
+        value: "9999-12-31"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DATE
+            value: "9999-12-31"
+
+  - name: date-compared-with-a-literal
+    doc: A bound date compared with the same date written in the statement, so a client that is a day out on the way in says so as a false rather than as a value that looks plausible.
+    params:
+      - name: d
+        type: DATE
+        value: "2024-02-29"
+    query: RETURN $d = DATE '2024-02-29' AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: date-with-a-duration-added
+    doc: A bound date with a day added to it, which lands on a leap day and so is wrong by a day in a client that bound the day before.
+    params:
+      - name: d
+        type: DATE
+        value: "2024-02-28"
+    query: RETURN $d + DURATION 'P1D' AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DATE
+            value: "2024-02-29"
+
+  - name: localtime-midnight
+    doc: Midnight as a bound local time, which is zero in the engine's unit and is where an absent binding and a real one look the same.
+    params:
+      - name: t
+        type: LOCALTIME
+        value: "00:00:00"
+    query: RETURN $t AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "00:00:00"
+
+  - name: localtime-to-the-nanosecond
+    doc: A local time with every digit of its fraction filled, which is where a client that binds through a millisecond or microsecond clock loses the tail.
+    params:
+      - name: t
+        type: LOCALTIME
+        value: "23:59:59.999999999"
+    query: RETURN $t AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: LOCALTIME
+            value: "23:59:59.999999999"
+
+  - name: zonedtime-east
+    doc: A zoned time bound with an offset east of UTC, which the engine keeps beside the value rather than folding into it.
+    params:
+      - name: t
+        type: ZONEDTIME
+        value: "12:34:56+07:00"
+    query: RETURN $t AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:34:56+07:00"
+
+  - name: zonedtime-half-hour-west
+    doc: An offset that is not a whole number of hours and is west of UTC, which is where a client binding its offset in hours as an integer has nowhere to put the minutes.
+    params:
+      - name: t
+        type: ZONEDTIME
+        value: "12:34:56-05:30"
+    query: RETURN $t AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: ZONEDTIME
+            value: "12:34:56-05:30"
+
+  - name: localdatetime-bound
+    doc: A local datetime, which is the type a client is most likely to bind as an instant by quietly adding its own machine's zone.
+    params:
+      - name: t
+        type: LOCALDATETIME
+        value: "2024-02-29T12:34:56.5"
+    query: RETURN $t AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: LOCALDATETIME
+            value: "2024-02-29T12:34:56.5"
+
+  - name: zoneddatetime-keeps-its-offset
+    doc: A zoned datetime bound with an offset, which comes back in the offset it was written with and not in UTC. A client that normalises to UTC on the way in gives back the same instant spelled differently, which is the wrong value.
+    params:
+      - name: t
+        type: ZONEDDATETIME
+        value: "2024-01-01T07:00:00+07:00"
+    query: RETURN $t AS t
+    columns:
+      - t
+    rows:
+      - values:
+          - type: ZONEDDATETIME
+            value: "2024-01-01T07:00:00+07:00"
+
+  - name: zoneddatetime-at-utc
+    doc: The same instant bound at UTC, which is a different value from the one above and equal to it, and which is the pair that says whether a client keeps the offset at all.
+    params:
+      - name: t
+        type: ZONEDDATETIME
+        value: "2024-01-01T00:00:00+00:00"
+    query: RETURN $t = ZONED DATETIME '2024-01-01T07:00:00+07:00' AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: duration-day-time
+    doc: A day-time duration, whose unit is nanoseconds, bound and returned. A client that binds it in seconds is a billion times out.
+    params:
+      - name: d
+        type: DURATION
+        value: "PT1H30M"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+
+  - name: duration-year-month
+    doc: A year-month duration, whose unit is months and not nanoseconds, which is the pair of kinds a client that keeps one duration type cannot tell apart.
+    params:
+      - name: d
+        type: DURATION
+        value: "P1Y2M"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1Y2M"
+
+  - name: duration-zero
+    doc: A duration of nothing, which is a value and is what a client that treats a zero duration as an absent one drops.
+    params:
+      - name: d
+        type: DURATION
+        value: "PT0S"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT0S"
+
+  - name: duration-negative
+    doc: A duration running backwards, which a client binding an unsigned count of nanoseconds cannot express.
+    params:
+      - name: d
+        type: DURATION
+        value: "-PT1H"
+    query: RETURN $d AS d
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DURATION
+            value: "-PT1H"
+
+  - name: added
+    doc: Two parameters added, which is the case that says the values arrived as numbers rather than as text that prints the same.
+    params:
+      - name: a
+        type: INT8
+        value: 2
+      - name: b
+        type: INT8
+        value: 3
+    query: RETURN $a + $b AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 5
+
+  - name: subtracted
+    doc: A parameter subtracted from a literal, which puts the bound value on the right of the operator where an argument order mistake shows.
+    params:
+      - name: n
+        type: INT8
+        value: 3
+    query: RETURN 10 - $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 7
+
+  - name: multiplied
+    doc: A parameter multiplied, so a binding that arrived as a string fails here rather than concatenating somewhere later.
+    params:
+      - name: n
+        type: INT8
+        value: 6
+    query: RETURN $n * 7 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 42
+
+  - name: divided
+    doc: Integer division with a bound divisor, which truncates towards zero here and rounds elsewhere.
+    params:
+      - name: n
+        type: INT8
+        value: 2
+    query: RETURN 7 / $n AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 3
+
+  - name: divided-by-a-bound-zero
+    doc: A zero bound as the divisor, which raises rather than giving back an infinity, and which is the condition a client meets when its parameter came from somewhere it did not check.
+    params:
+      - name: n
+        type: INT8
+        value: 0
+    query: RETURN 1 / $n AS n
+    raises: "22012"
+
+  - name: remainder
+    doc: A parameter through the remainder operator, whose sign follows the left operand here and the right one in several host languages.
+    params:
+      - name: n
+        type: INT8
+        value: 7
+    query: RETURN $n % 3 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+
+  - name: compared
+    doc: A parameter on the right of a comparison, which is the shape a filter takes and the one a client uses most.
+    params:
+      - name: n
+        type: INT8
+        value: 3
+    query: RETURN 4 > $n AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: compared-as-a-string
+    doc: Two strings ordered, one of them bound, which is a comparison of code points here and of locale-folded text in a client that reaches for its host language's collator.
+    params:
+      - name: s
+        type: STRING
+        value: b
+    query: RETURN $s > 'a' AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: in-a-literal-list
+    doc: A parameter tested for membership of a list written in the statement, which is the half of IN that binds today.
+    params:
+      - name: n
+        type: INT8
+        value: 2
+    query: RETURN $n IN [1, 2, 3] AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: not-in-a-literal-list
+    doc: The same statement with a value the list does not hold, so a client whose membership test always answers true is caught.
+    params:
+      - name: n
+        type: INT8
+        value: 9
+    query: RETURN $n IN [1, 2, 3] AS b
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: cast-from-a-bound-string
+    doc: A bound string cast to an integer, which is the conversion a client would otherwise do itself and get a different answer for on whitespace or a sign.
+    params:
+      - name: s
+        type: STRING
+        value: "42"
+    query: RETURN cast($s AS INT64) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: cast-from-a-bound-string-that-is-not-a-number
+    doc: The same conversion on a string that is not a number, which raises rather than giving back a zero, as several host languages would.
+    params:
+      - name: s
+        type: STRING
+        value: forty
+    query: RETURN cast($s AS INT64) AS n
+    raises: "22018"
+
+  - name: cast-narrowing-a-bound-integer
+    doc: A bound integer cast to a width it does not fit, which raises rather than wrapping, and which is where a client that did the narrowing itself has already lost the value.
+    params:
+      - name: n
+        type: INT64
+        value: "128"
+    query: RETURN cast($n AS INT8) AS n
+    raises: "22003"
+
+  - name: a-bound-string-and-a-number
+    doc: A string parameter added to an integer, which is a type error and not a concatenation, and which a client that binds every value as text turns into one.
+    params:
+      - name: s
+        type: STRING
+        value: a
+    query: RETURN $s + 1 AS n
+    raises: "22G03"
+
+  - name: concatenated
+    doc: A bound string concatenated with a literal, which is where a client that binds a length loses the last character.
+    params:
+      - name: s
+        type: STRING
+        value: ada
+    query: RETURN $s + '!' AS s
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: ada!
+
+  - name: unwound-rows-filtered-by-a-parameter
+    doc: A parameter in the predicate of a WITH, which is the position a client puts a filter in when the rows came from somewhere other than the store.
+    params:
+      - name: min
+        type: INT8
+        value: 2
+    query: UNWIND [1, 2, 3] AS n WITH n WHERE n >= $min RETURN count(n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: as-a-limit
+    doc: A parameter as the row limit, which is a page size in every client that pages and so is the parameter bound most often after a key.
+    params:
+      - name: n
+        type: INT8
+        value: 2
+    query: UNWIND [1, 2, 3] AS n RETURN n LIMIT $n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 1
+      - values:
+          - type: INT8
+            value: 2
+
+  - name: as-an-offset
+    doc: A parameter as the row offset, which is the other half of a page and the one that is off by one in a client that counts pages rather than rows.
+    params:
+      - name: n
+        type: INT8
+        value: 2
+    query: UNWIND [1, 2, 3] AS n RETURN n SKIP $n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT8
+            value: 3
+
+  - name: as-an-aggregate-argument
+    doc: A parameter counted, which counts the rows rather than the parameter, since a bound value is one value however many rows see it.
+    params:
+      - name: n
+        type: INT8
+        value: 1
+    query: UNWIND [1, 2] AS x RETURN count($n) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: in-a-filter-over-stored-rows
+    doc: A parameter compared with a stored integer, which is the statement a client writes first and the one where the value crosses the boundary in both directions at once.
+    params:
+      - name: min
+        type: INT64
+        value: "40"
+    query: MATCH (p:person) WHERE p.age >= $min RETURN count(p) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: in-a-node-pattern
+    doc: A parameter as a property in a node pattern, which is the lookup by key that every client's first statement is.
+    params:
+      - name: age
+        type: INT64
+        value: "40"
+    query: MATCH (p:person {age: $age}) RETURN p.name AS name
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-bound-string-in-a-node-pattern
+    doc: The same lookup on a string key, which is where a client that binds its strings with a trailing NUL or a length one out finds nothing and reports no rows rather than an error.
+    params:
+      - name: who
+        type: STRING
+        value: cy
+    query: MATCH (p:person {name: $who}) RETURN p.age AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "50"
+
+  - name: a-bound-key-that-matches-nothing
+    doc: A lookup on a value the store does not hold, which is no rows and not an error, and which is what a client that binds the wrong value sees on every one of the cases above.
+    params:
+      - name: who
+        type: STRING
+        value: nobody
+    query: MATCH (p:person {name: $who}) RETURN p.age AS n
+    columns:
+      - n
+    rows:
+
+  - name: a-bound-date-against-a-stored-one
+    doc: A bound date compared with one that went in through the loader, so the case fails when either direction is a day out and passes only when they agree.
+    params:
+      - name: d
+        type: DATE
+        value: "1984-02-29"
+    query: MATCH (p:person) WHERE p.born = $d RETURN p.name AS name
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-bound-bool-against-a-stored-one
+    doc: A boolean parameter filtering on a stored boolean, which is where a client that binds true as the string "true" matches nothing.
+    params:
+      - name: ok
+        type: BOOL
+        value: false
+    query: MATCH (p:person) WHERE p.ok = $ok RETURN p.name AS name
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-bound-float-against-a-stored-one
+    doc: A float parameter filtering on a stored float, which is an exact comparison and so is where a client that binds through a decimal text form matches nothing.
+    params:
+      - name: score
+        type: FLOAT64
+        value: "3.25"
+    query: MATCH (p:person) WHERE p.score = $score RETURN p.name AS name
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-bound-negative-zero-against-a-stored-one
+    doc: A negative zero against a stored one, which compares equal to a positive zero, so this says the comparison happened and not that the sign survived.
+    params:
+      - name: score
+        type: FLOAT64
+        value: "-0.0"
+    query: MATCH (p:person) WHERE p.score = $score RETURN p.name AS name
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: at-the-start-of-a-hop
+    doc: A parameter picking the row a traversal starts at, which is the shape of every statement a client writes about one user.
+    params:
+      - name: who
+        type: STRING
+        value: ann
+    query: MATCH (a:person {name: $who})-[:knows]->(b:person) RETURN b.name AS name
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: in-an-ordering
+    doc: A parameter inside the expression a statement orders by, which is a sort direction in some clients and an arithmetic term here.
+    params:
+      - name: n
+        type: INT64
+        value: "-1"
+    query: MATCH (p:person) RETURN p.name AS name ORDER BY p.age * $n LIMIT 1
+    columns:
+      - name
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: written-into-a-node
+    doc: An integer parameter written into a node and read back in the same statement, which is the whole round trip through the store rather than through an expression.
+    setup:
+      - "INSERT (:thing {n: 1})"
+    params:
+      - name: n
+        type: INT64
+        value: "9007199254740993"
+    query: "INSERT (t:thing {n: $n}) RETURN t.n AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9007199254740993"
+
+  - name: a-string-written-into-a-node
+    doc: A bound string written into a node and read back, so a client whose encoder truncates at a non-ASCII character fails here and not only on the way out.
+    setup:
+      - "INSERT (:thing {s: 'x'})"
+    params:
+      - name: s
+        type: STRING
+        value: "héllo 🙂"
+    query: "INSERT (t:thing {s: $s}) RETURN t.s AS s"
+    columns:
+      - s
+    rows:
+      - values:
+          - type: STRING
+            value: "héllo 🙂"
+
+  - name: a-date-written-into-a-node
+    doc: A bound date written into a node and read back, which is the case that catches an encoder a day out and a decoder a day out the other way at once.
+    setup:
+      - "INSERT (:thing {d: DATE '2000-01-01'})"
+    params:
+      - name: d
+        type: DATE
+        value: "1984-02-29"
+    query: "INSERT (t:thing {d: $d}) RETURN t.d AS d"
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DATE
+            value: "1984-02-29"
+
+  - name: a-float-written-into-a-node
+    doc: A bound float written into a node and read back, at a value that is not a decimal, so a client that stores it as text loses the last bits here.
+    setup:
+      - "INSERT (:thing {f: 1.0})"
+    params:
+      - name: f
+        type: FLOAT64
+        value: "0.1"
+    query: "INSERT (t:thing {f: $f}) RETURN t.f AS f"
+    columns:
+      - f
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.1"
+
+  - name: a-bool-written-into-a-node
+    doc: A bound boolean written into a node and read back, which is where a client that widens its booleans to integers gives back an integer.
+    setup:
+      - "INSERT (:thing {b: true})"
+    params:
+      - name: b
+        type: BOOL
+        value: false
+    query: "INSERT (t:thing {b: $b}) RETURN t.b AS b"
+    columns:
+      - b
+    rows:
+      - values:
+          - type: BOOL
+            value: false
+
+  - name: a-duration-written-into-a-node
+    doc: A bound duration written into a node and read back, whose unit is the thing a client gets wrong and which no expression case can catch on its own.
+    setup:
+      - "INSERT (:thing {d: DURATION 'PT1S'})"
+    params:
+      - name: d
+        type: DURATION
+        value: "PT1H30M"
+    query: "INSERT (t:thing {d: $d}) RETURN t.d AS d"
+    columns:
+      - d
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT1H30M"
+
+  - name: written-into-two-properties-at-once
+    doc: One parameter written into two properties of a node, which is one binding used twice on the way into the store rather than twice on the way through an expression.
+    setup:
+      - "INSERT (:thing {a: 1, b: 1})"
+    params:
+      - name: n
+        type: INT64
+        value: "21"
+    query: "INSERT (t:thing {a: $n, b: $n}) RETURN t.a + t.b AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "42"
+
+  - name: written-over-a-stored-value
+    doc: A parameter through SET, which is the other write a client makes and the one where a wrong binding overwrites a value that was right.
+    setup:
+      - "INSERT (:thing {n: 1})"
+    params:
+      - name: n
+        type: INT64
+        value: "9"
+    query: "MATCH (t:thing) SET t.n = $n RETURN t.n AS n"
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "9"

@@ -344,7 +344,12 @@ pub(crate) fn refuse_duplicate_pairs(
         let brand_new = ends.is_some_and(|rel| {
             created.contains(&(rel.from, edge.src)) || created.contains(&(rel.to, edge.dst))
         });
-        if fresh && (brand_new || graph.edge_ordinal(edge.table, edge.src, edge.dst)?.is_none()) {
+        if fresh
+            && (brand_new
+                || graph
+                    .edge_ordinal(edge.table, edge.src, edge.dst)?
+                    .is_none())
+        {
             continue;
         }
         return Err(ZuError::InvalidArgument(format!(

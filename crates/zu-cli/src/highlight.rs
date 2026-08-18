@@ -348,6 +348,7 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "DROP",
     "EDGE",
     "ENDS",
+    "KEEP",
     "LAST",
     "LIKE",
     "LIST",

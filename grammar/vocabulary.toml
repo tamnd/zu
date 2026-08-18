@@ -57,8 +57,8 @@ words = ["DISTINCT", "AS", "GROUP", "ORDER", "BY", "ASC", "ASCENDING", "DESC", "
 
 [[group]]
 kind = "keyword"
-doc = "Patterns: the selectors, the modes, and the words a path may carry. PATHS and GROUPS are the plurals a selector may be written with, PATH being a word already as the type and the constructor, and GROUP being one as the grouping clause."
-words = ["ALL", "ANY", "SHORTEST", "PATHS", "GROUPS", "WALK", "TRAIL", "ACYCLIC", "SIMPLE"]
+doc = "Patterns: the selectors, the modes, the KEEP that says one of them for a whole list of patterns, and the words a path may carry. PATHS and GROUPS are the plurals a selector may be written with, PATH being a word already as the type and the constructor, and GROUP being one as the grouping clause."
+words = ["ALL", "ANY", "SHORTEST", "PATHS", "GROUPS", "KEEP", "WALK", "TRAIL", "ACYCLIC", "SIMPLE"]
 
 [[group]]
 kind = "keyword"

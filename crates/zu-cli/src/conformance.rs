@@ -216,6 +216,11 @@ const NOTES: &[&str] = &[
      whose length is one of the k least; a selector needs a repeating step to choose between \
      paths, since a pattern of fixed length matches one path per set of elements, and a count \
      of zero is refused because it keeps no path whatever the graph holds",
+    "a KEEP behind a list of patterns says the path mode or the path selector once for every \
+     pattern of that list, instead of once in front of each of them, and it says the same thing, \
+     so the query written either way answers the same rows; it fills in what a pattern left out \
+     rather than overruling what one wrote, so a pattern naming a mode and a KEEP naming another \
+     is refused by name, and so is a KEEP with neither a mode nor a selector after it",
     "a repeated step walks under a path mode, and the default is TRAIL, which repeats no edge: \
      WALK repeats anything, ACYCLIC repeats no node, and SIMPLE repeats no node except that a \
      path may end where it began, so a cycle is a simple path and is not an acyclic one and \

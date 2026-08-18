@@ -35,6 +35,7 @@
 use zu_common::{Result, ZuError};
 use zu_encoding::segment as enc;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::BLOCK_SIZE;
@@ -191,6 +192,91 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
         ends.push(body.len() as u32);
         fences.push(*chunk.last().unwrap());
     }
+    store(db, values, ends, fences, body)
+}
+
+/// Writes the segment `values` describes, encoding only the chunks
+/// `dirty` names and copying the encoded bytes of the rest out of
+/// `old`.
+///
+/// A fold rewrites a column because a cell of it changed, and picking
+/// the cascade is most of what that costs: the selector sizes every
+/// scheme it knows against a chunk before it takes one, which is the
+/// right trade for a chunk that is new and pure waste for a chunk that
+/// came back out of the file and is going into it unchanged. Those
+/// bytes are already an encoding of exactly these values, so they are
+/// copied and the selector is asked only about what moved. A one cell
+/// write touches one chunk, whatever the table is holding.
+///
+/// `values` is the whole new column rather than the chunks that moved,
+/// because the fences, the zone map and the sorted flag are the
+/// segment's rather than a chunk's, and reading them off the values is
+/// one pass over memory beside the encode this is not doing.
+pub fn rewrite_segment(
+    db: &mut Zu1File,
+    old: &SegmentMeta,
+    values: &[u64],
+    dirty: &BTreeSet<usize>,
+) -> Result<SegmentMeta> {
+    if old.structural != Structural::MiniBlock {
+        return write_segment(db, values);
+    }
+    let payload = read_payload(db, old)?;
+    let (index, body) = index_and_body(old, &payload)?;
+    let chunk_count = values.len().div_ceil(CHUNK_ROWS);
+    let mut out = Vec::with_capacity(body.len());
+    let mut ends = Vec::with_capacity(chunk_count);
+    let mut fences = Vec::with_capacity(chunk_count);
+    let mut prev = 0usize;
+    for (i, chunk) in values.chunks(CHUNK_ROWS).enumerate() {
+        // The old chunk at this position, when there is one and it
+        // spans the same rows. A column that grew has a last chunk
+        // that used to be shorter, and short of the row count nothing
+        // about it is the same, so it re-encodes.
+        let kept = match i < old.chunk_count() {
+            true => {
+                let end = u32::from_le_bytes(index[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+                if end < prev || end > body.len() {
+                    return Err(ZuError::Corrupt {
+                        what: "segment",
+                        detail: "chunk index not monotone".to_string(),
+                    });
+                }
+                let span = prev..end;
+                prev = end;
+                match !dirty.contains(&i) && old.chunk_rows(i) == chunk.len() {
+                    true => Some(span),
+                    false => None,
+                }
+            }
+            false => None,
+        };
+        match kept {
+            Some(span) => out.extend_from_slice(&body[span]),
+            None => {
+                enc::encode_auto(chunk, &mut out);
+            }
+        }
+        if out.len() > u32::MAX as usize {
+            return Err(ZuError::InvalidArgument(
+                "segment body exceeds the u32 chunk index range".to_string(),
+            ));
+        }
+        ends.push(out.len() as u32);
+        fences.push(*chunk.last().unwrap());
+    }
+    store(db, values, ends, fences, out)
+}
+
+/// Lays the index, the fences and the body out as a payload, checksums
+/// it, and writes it across freshly allocated blocks.
+fn store(
+    db: &mut Zu1File,
+    values: &[u64],
+    ends: Vec<u32>,
+    fences: Vec<u64>,
+    body: Vec<u8>,
+) -> Result<SegmentMeta> {
     let mut payload = Vec::with_capacity(4 + ends.len() * 12 + body.len());
     payload.extend_from_slice(&(ends.len() as u32).to_le_bytes());
     for e in &ends {
@@ -223,9 +309,8 @@ pub fn write_segment(db: &mut Zu1File, values: &[u64]) -> Result<SegmentMeta> {
     })
 }
 
-/// Reads a segment back, verifying the payload crc, and appends the
-/// decoded values to `out`.
-pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) -> Result<()> {
+/// Reads a segment's payload back off its blocks and verifies the crc.
+fn read_payload(db: &mut Zu1File, meta: &SegmentMeta) -> Result<Vec<u8>> {
     let corrupt = |detail: &str| ZuError::Corrupt {
         what: "segment",
         detail: detail.to_string(),
@@ -247,6 +332,17 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
     if crc32c::crc32c(&payload) != meta.crc {
         return Err(corrupt("payload crc mismatch"));
     }
+    Ok(payload)
+}
+
+/// The chunk index and the body of a payload, bounds checked against
+/// the chunk count the meta names. The fences sit between them and a
+/// caller that wants them takes them out itself.
+fn index_and_body<'p>(meta: &SegmentMeta, payload: &'p [u8]) -> Result<(&'p [u8], &'p [u8])> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
     let chunks = meta.chunk_count();
     let head = payload.get(..4).ok_or_else(|| corrupt("truncated index"))?;
     if u32::from_le_bytes(head.try_into().unwrap()) as usize != chunks {
@@ -256,10 +352,26 @@ pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) ->
     let index = payload
         .get(4..idx_len)
         .ok_or_else(|| corrupt("truncated index"))?;
+    let body = payload
+        .get(idx_len + chunks * 8..)
+        .ok_or_else(|| corrupt("truncated fences"))?;
+    Ok((index, body))
+}
+
+/// Reads a segment back, verifying the payload crc, and appends the
+/// decoded values to `out`.
+pub fn read_segment(db: &mut Zu1File, meta: &SegmentMeta, out: &mut Vec<u64>) -> Result<()> {
+    let corrupt = |detail: &str| ZuError::Corrupt {
+        what: "segment",
+        detail: detail.to_string(),
+    };
+    let payload = read_payload(db, meta)?;
+    let chunks = meta.chunk_count();
+    let (index, body) = index_and_body(meta, &payload)?;
+    let idx_len = 4 + chunks * 4;
     let fences = payload
         .get(idx_len..idx_len + chunks * 8)
         .ok_or_else(|| corrupt("truncated fences"))?;
-    let body = &payload[idx_len + chunks * 8..];
     let first_out = out.len();
     let mut prev = 0usize;
     for i in 0..chunks {
@@ -759,6 +871,37 @@ pub(crate) fn read_payload_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rewrite_keeps_the_chunks_it_was_not_told_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Zu1File::create(&dir.path().join("seg.zu1")).unwrap();
+        let mut values: Vec<u64> = (0..10_000u64).map(|i| i * 7 % 811).collect();
+        let first = write_segment(&mut db, &values).unwrap();
+
+        // Nothing changed, so the rewrite is the same bytes, which is
+        // what says the chunks came across rather than went back
+        // through the selector.
+        let same = rewrite_segment(&mut db, &first, &values, &BTreeSet::new()).unwrap();
+        assert_eq!(same.payload_len, first.payload_len);
+        assert_eq!(same.crc, first.crc);
+
+        // One cell of one chunk, which is the shape of a point write.
+        values[2500] = 900_001;
+        let after = rewrite_segment(&mut db, &first, &values, &BTreeSet::from([2])).unwrap();
+        let mut out = Vec::new();
+        read_segment(&mut db, &after, &mut out).unwrap();
+        assert_eq!(out, values, "and the values read back are the new ones");
+        assert_eq!(after.max, 900_001, "the zone map is the segment's");
+
+        // A column that grew: the last chunk was partial and is not
+        // the same chunk any more, and the ones under it still are.
+        values.extend(5_000..5_400u64);
+        let grown = rewrite_segment(&mut db, &after, &values, &BTreeSet::from([9, 10])).unwrap();
+        let mut out = Vec::new();
+        read_segment(&mut db, &grown, &mut out).unwrap();
+        assert_eq!(out, values);
+    }
 
     #[test]
     fn roundtrip_multi_block_and_meta() {

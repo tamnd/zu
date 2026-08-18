@@ -1,17 +1,33 @@
-//! Segment-level encoding selection, the BtrBlocks-style sampled cascade.
+//! Segment-level encoding selection, the BtrBlocks-style cascade.
 //!
-//! `encode_auto` samples 8 runs of 128 values (about 0.8% of a full node
-//! group), sizes each legal candidate on the sample, encodes with the
-//! winner, and falls back to Plain if the winner loses to Plain on the
-//! full input. The payload is prefixed with one stable `EncodingId` byte,
-//! so `decode_any` needs no side channel.
+//! `encode_auto` reads the chunk once, prices every legal candidate off
+//! what that pass found, encodes with the winner, and falls back to
+//! Plain if the winner loses to Plain on the full input. The payload is
+//! prefixed with one stable `EncodingId` byte, so `decode_any` needs no
+//! side channel.
+//!
+//! Pricing is arithmetic rather than a trial encode, and that is the
+//! whole of what makes a write cheap. Sizing seven candidates by
+//! encoding each of them costs seven encodes of every chunk a column
+//! rewrite touches, and a fold is column rewrites: profiling a stream of
+//! single row writes put two thirds of the engine's processor time
+//! inside the encoders, nearly all of it in candidates that lost. The
+//! containers are simple enough to price exactly instead. Frame of
+//! reference is a minimum and a width per 1024 values, the patched
+//! container prices its own width off a histogram this pass already
+//! builds, and the rest are a count of runs, a count of distinct values
+//! and the count of the value that dominates. Only the winner is
+//! encoded, and the Plain guard below catches an estimate that was
+//! wrong about the shape rather than about the arithmetic.
 
 use zu_common::{Result, ZuError};
 
-use crate::{EncodingId, bool_bitpack, delta, delta_patch, dict, for_bitpack, frequency, rle};
-
-const SAMPLE_RUNS: usize = 8;
-const SAMPLE_RUN_LEN: usize = 128;
+use crate::bitpack::{CHUNK, packed_bytes};
+use crate::counts;
+use crate::delta::zigzag;
+use crate::{
+    EncodingId, bits_needed, bool_bitpack, delta, delta_patch, dict, for_bitpack, frequency, rle,
+};
 
 /// Encodes `values` with the estimated-best encoding, returning the id used.
 pub fn encode_auto(values: &[u64], out: &mut Vec<u8>) -> EncodingId {
@@ -92,66 +108,29 @@ fn choose(values: &[u64]) -> EncodingId {
     if values.is_empty() {
         return EncodingId::Plain;
     }
-    let first = values[0];
-    if values.iter().all(|&v| v == first) {
+    let shape = Shape::read(values);
+    if shape.constant {
         return EncodingId::Constant;
     }
-    let runs = sample_runs(values);
-    let concat: Vec<u64> = runs.concat();
     // Candidate order breaks ties toward the shallower cascade.
-    // BoolBitpack is only legal when the whole input is binary, not just
-    // the sample, or the encoder would corrupt the values it never saw.
-    let mut candidates = Vec::with_capacity(7);
-    if values.iter().all(|&v| v <= 1) {
-        candidates.push(EncodingId::BoolBitpack);
-    }
-    candidates.extend([
+    // BoolBitpack is legal only when the whole input is binary, and Dict
+    // only under the format cap on distinct values, both of which this
+    // pass answers for every value rather than for a sample of them.
+    let mut best = EncodingId::Plain;
+    let mut best_size = 4 + values.len() * 8;
+    let candidates = [
+        EncodingId::BoolBitpack,
         EncodingId::ForBitPack,
         EncodingId::DeltaBitPack,
         EncodingId::DeltaPatch,
         EncodingId::Rle,
         EncodingId::Dict,
         EncodingId::Frequency,
-    ]);
-    let best = size_and_pick(&candidates, &runs, &concat);
-    // Dict is only legal under the format cap on distinct values, a
-    // property the sample cannot vouch for. The proof scans the full
-    // input, so it runs only when Dict actually won the sizing; every
-    // other column skips it, and a failed proof re-picks without Dict.
-    if best == EncodingId::Dict && !dict_legal(values) {
-        let rest: Vec<EncodingId> = candidates
-            .into_iter()
-            .filter(|&id| id != EncodingId::Dict)
-            .collect();
-        return size_and_pick(&rest, &runs, &concat);
-    }
-    best
-}
-
-fn size_and_pick(candidates: &[EncodingId], runs: &[&[u64]], concat: &[u64]) -> EncodingId {
-    let mut best = EncodingId::Plain;
-    let mut best_size = 4 + concat.len() * 8;
-    let mut buf = Vec::new();
-    for &id in candidates {
-        // Delta candidates are sized per run and summed: concatenating the
-        // runs fabricates one wide delta per boundary, which reads as
-        // outliers on data that has none and skews the pick toward the
-        // patched encoding. Value-distribution candidates see the
-        // concatenated sample, since their costs do not depend on
-        // adjacency and the mix of runs is what a real chunk contains.
-        let per_run = matches!(id, EncodingId::DeltaBitPack | EncodingId::DeltaPatch);
-        let mut size = 0usize;
-        if per_run {
-            for run in runs {
-                buf.clear();
-                encode_with(id, run, &mut buf);
-                size += buf.len();
-            }
-        } else {
-            buf.clear();
-            encode_with(id, concat, &mut buf);
-            size = buf.len();
-        }
+    ];
+    for id in candidates {
+        let Some(size) = shape.price(id) else {
+            continue;
+        };
         if size < best_size {
             best = id;
             best_size = size;
@@ -160,29 +139,162 @@ fn size_and_pick(candidates: &[EncodingId], runs: &[&[u64]], concat: &[u64]) -> 
     best
 }
 
-/// Whether the whole input stays under the Dict cardinality cap. Early
-/// exit keeps the scan cheap exactly when Dict is hopeless anyway.
-fn dict_legal(values: &[u64]) -> bool {
-    let mut seen = std::collections::HashSet::with_capacity(1024);
-    for &v in values {
-        seen.insert(v);
-        if seen.len() > dict::MAX_ENTRIES {
-            return false;
-        }
-    }
-    true
+/// What one pass over a chunk says, which is enough to price every
+/// candidate the cascade offers.
+///
+/// The three container sizes are exact: frame of reference stores a
+/// minimum and a width per 1024 values, and the patched container picks
+/// its width off the same width histogram its encoder builds, by the
+/// same suffix walk. The rest are priced off counts, and the only
+/// looseness is the width the exception streams pack at, which is taken
+/// as the chunk's own width rather than the exceptions' own. That
+/// overprices Frequency slightly and never underprices it.
+struct Shape {
+    len: usize,
+    min: u64,
+    max: u64,
+    /// Every value the same, which Constant says in twelve bytes.
+    constant: bool,
+    /// Every value 0 or 1, which is what makes BoolBitpack legal.
+    binary: bool,
+    /// The frame of reference container over the values themselves.
+    for_bytes: usize,
+    /// The same container over the zigzag deltas, which is DeltaBitPack
+    /// below its eight byte base.
+    delta_bytes: usize,
+    /// The patched container over those deltas, which is DeltaPatch
+    /// below the same base.
+    patch_bytes: usize,
+    runs: usize,
+    run_len_min: u64,
+    run_len_max: u64,
+    /// Distinct values, or None past the Dict cap, which is what says
+    /// Dict is not legal here.
+    distinct: Option<usize>,
+    /// How often the most common value appears, which is everything
+    /// Frequency is not an exception of.
+    top_count: usize,
 }
 
-/// Even-spaced runs so ordered data keeps its local structure in the sample.
-fn sample_runs(values: &[u64]) -> Vec<&[u64]> {
-    let want = SAMPLE_RUNS * SAMPLE_RUN_LEN;
-    if values.len() <= want {
-        return vec![values];
+impl Shape {
+    fn read(values: &[u64]) -> Shape {
+        let mut shape = Shape {
+            len: values.len(),
+            min: u64::MAX,
+            max: 0,
+            constant: true,
+            binary: true,
+            for_bytes: 4,
+            delta_bytes: 4,
+            patch_bytes: 4,
+            runs: 0,
+            run_len_min: u64::MAX,
+            run_len_max: 0,
+            distinct: None,
+            top_count: 0,
+        };
+        let first = values[0];
+        // The delta encoders seed the running previous from the first
+        // value, so the first delta is zero and no chunk pays for the
+        // magnitude the column starts at.
+        let mut prev = first;
+        let mut run = 0u64;
+        for block in values.chunks(CHUNK) {
+            let (mut bmin, mut bmax) = (u64::MAX, 0u64);
+            let (mut dmin, mut dmax) = (u64::MAX, 0u64);
+            let mut hist = [0usize; 65];
+            let mut wide = 0u32;
+            for &v in block {
+                bmin = bmin.min(v);
+                bmax = bmax.max(v);
+                shape.constant &= v == first;
+                shape.binary &= v <= 1;
+                let zz = zigzag(v.wrapping_sub(prev) as i64);
+                dmin = dmin.min(zz);
+                dmax = dmax.max(zz);
+                let width = bits_needed(zz);
+                hist[width as usize] += 1;
+                wide = wide.max(width);
+                if v == prev && run > 0 {
+                    run += 1;
+                } else {
+                    shape.close_run(run);
+                    run = 1;
+                }
+                prev = v;
+            }
+            shape.min = shape.min.min(bmin);
+            shape.max = shape.max.max(bmax);
+            shape.for_bytes += 9 + packed_bytes(bits_needed(bmax - bmin), block.len());
+            shape.delta_bytes += 9 + packed_bytes(bits_needed(dmax - dmin), block.len());
+            shape.patch_bytes += 2 + patch_body(&hist, wide, block.len());
+        }
+        shape.close_run(run);
+        // Dict cannot hold more than the format cap, and past it the
+        // count of distinct values buys nothing else, so the table stops
+        // there rather than growing with the column.
+        let counts = counts::count(values, dict::MAX_ENTRIES);
+        shape.distinct = counts.distinct;
+        shape.top_count = counts.top_count;
+        shape
     }
-    let stride = values.len() / SAMPLE_RUNS;
-    (0..SAMPLE_RUNS)
-        .map(|run| &values[run * stride..run * stride + SAMPLE_RUN_LEN])
-        .collect()
+
+    fn close_run(&mut self, len: u64) {
+        if len > 0 {
+            self.runs += 1;
+            self.run_len_min = self.run_len_min.min(len);
+            self.run_len_max = self.run_len_max.max(len);
+        }
+    }
+
+    /// What `id` would cost on this chunk, or None when the format does
+    /// not allow it here.
+    fn price(&self, id: EncodingId) -> Option<usize> {
+        let spread = self.max - self.min;
+        match id {
+            EncodingId::BoolBitpack => self.binary.then(|| 4 + self.len.div_ceil(8)),
+            EncodingId::ForBitPack => Some(self.for_bytes),
+            EncodingId::DeltaBitPack => Some(8 + self.delta_bytes),
+            EncodingId::DeltaPatch => Some(8 + self.patch_bytes),
+            EncodingId::Rle => Some(
+                8 + for_bytes(self.runs, bits_needed(spread))
+                    + for_bytes(self.runs, bits_needed(self.run_len_max - self.run_len_min)),
+            ),
+            EncodingId::Dict => self.distinct.map(|d| {
+                4 + for_bytes(d, bits_needed(spread))
+                    + for_bytes(self.len, bits_needed(d.saturating_sub(1) as u64))
+            }),
+            EncodingId::Frequency => {
+                let exceptions = self.len - self.top_count;
+                Some(
+                    16 + for_bytes(exceptions, bits_needed(self.len as u64))
+                        + for_bytes(exceptions, bits_needed(spread)),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What a frame of reference container costs: its count, then a minimum
+/// and a width per 1024 values, then the packed body.
+fn for_bytes(count: usize, width: u32) -> usize {
+    4 + count.div_ceil(CHUNK) * 9 + packed_bytes(width, count)
+}
+
+/// What the patched container's body costs for one chunk, by the walk
+/// its encoder runs: every width from the widest down, paying the
+/// packed body, the presence bitmap and the exceptions above it.
+fn patch_body(hist: &[usize; 65], wide: u32, take: usize) -> usize {
+    let mut best = packed_bytes(wide, take) + packed_bytes(1, take);
+    let mut exceptions = 0usize;
+    for width in (0..wide).rev() {
+        exceptions += hist[width as usize + 1];
+        let cost =
+            packed_bytes(width, take) + packed_bytes(1, take) + packed_bytes(wide, exceptions);
+        best = best.min(cost);
+    }
+    best
 }
 
 fn encode_plain(values: &[u64], out: &mut Vec<u8>) {

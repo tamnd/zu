@@ -24,6 +24,27 @@ alp_rd = 1.0
 zstd = 0.25
 zstd_fallback = 0.05
 
+# Encode throughput floors, MB/s of input, one core, measured per
+# MiniBlock chunk of 1024 values the way a fold calls the encoder. The
+# decode floors above are the read side of the same contract and this is
+# the write side, which had no gate until the write bench showed the
+# cascade was most of what an edge write costs: the selector used to
+# size every candidate by encoding the whole chunk, so a chunk was
+# encoded about seven times to be written once. Pricing the candidates
+# off one pass over the values took ids from 151 to 627 MB/s, gaps from
+# 218 to 1174, rows from 151 to 1196, categorical from 133 to 349, flags
+# from 291 to 1047 and wide from 140 to 779, with every pick and every
+# ratio unchanged. The floors are set near half the measured number on
+# this laptop so the slower gate machines pass, and the categorical one
+# is lowest because it is the shape that still counts distincts. Raise
+# floors, never lower them.
+encode_ids_mbps = 300.0
+encode_gaps_mbps = 550.0
+encode_rows_mbps = 550.0
+encode_categorical_mbps = 160.0
+encode_flags_mbps = 500.0
+encode_wide_mbps = 350.0
+
 # COPY ingest floors, single core, sort included, parse excluded (B6/B8).
 # The density keys are ceilings, not floors, set just above the measured
 # LiveJournal numbers with per-chunk MiniBlock cascades: raw order 22.31,
@@ -1549,6 +1570,30 @@ set_peak_rss_mb = 128.0
 # them.
 set_fold_x = 6.0
 set_write_x = 4.0
+
+# An INSERT of one edge between two rows that already exist, the shape
+# LinkBench writes most of and the most expensive write there is: a node
+# write rewrites the columns of the table it touched, an edge write
+# rebuilds the whole CSR both ways and then rewrites every edge property
+# column into the new edge order. It is measured at two edge counts for
+# the same reason the SET is, and insert_edge_x is the number that says
+# how much of one edge write is the edges already in the table. Ten
+# would mean the write reads all of them, one would mean it reads none.
+#
+# Measured 9.2 ms wall, 2.9 ms of processor and 231 kB at 10000 edges,
+# and 2.47x in time at 100000 edges. That ratio was 6.15 before the
+# encoder stopped sizing its candidates by encoding the chunk once per
+# candidate, and it is the one of these four that a slow box does not
+# move, so it is the one set tight. The absolute ceilings are loose
+# enough for a shared vCPU and are here to catch another sync or another
+# structure being rebuilt, not drift. Lower these ceilings, never raise
+# them: the P5 target is a point write under 30 us of processor, which
+# this shape is nowhere near, and getting there means the fold stops
+# rewriting edge properties that did not change.
+insert_edge_stmt_us = 250000.0
+insert_edge_stmt_kb = 512.0
+insert_edge_stmt_cpu_us = 8000.0
+insert_edge_x = 4.0
 
 # The typed row layer (dx/04 §4) over the same read written as a match
 # on Value, both timed in one run against one result of 100000 rows and

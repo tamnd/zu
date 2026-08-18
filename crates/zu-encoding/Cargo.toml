@@ -21,5 +21,9 @@ zstd = ["dep:zstd"]
 name = "decode"
 harness = false
 
+[[bench]]
+name = "encode"
+harness = false
+
 [lints]
 workspace = true

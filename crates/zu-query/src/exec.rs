@@ -5625,7 +5625,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
-        BoundExpr::Scalar(ix) => scalar_value(ctx, *ix),
+        BoundExpr::Scalar { ix, .. } => scalar_value(ctx, *ix),
         BoundExpr::Var(slot) => value_of(ctx, *slot),
         BoundExpr::HasLabels { slot, test } => match value_of(ctx, *slot)? {
             Value::Node { table, offset } => {

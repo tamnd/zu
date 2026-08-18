@@ -71,7 +71,12 @@ fn main() -> ExitCode {
             println!("zu {VERSION}");
             ExitCode::SUCCESS
         }
-        Some("--help" | "-h" | "help") | None => help_command(&args[1..]),
+        // Running the command with no arguments at all is the one case
+        // where there is no first word to skip, so it hands over an
+        // empty list rather than slicing one past the end of an empty
+        // one, which panicked where the synopsis should have printed.
+        Some("--help" | "-h" | "help") => help_command(&args[1..]),
+        None => help_command(&[]),
         Some("version") => version_command(&args[1..]),
         Some("stat") => stat_command(&args[1..]),
         // One argument, and a flag is not it. Without the second half a

@@ -386,6 +386,29 @@ pub enum Clause {
         expr: Expr,
         alias: String,
     },
+    /// `FILTER p.age > 30`, the statement that keeps the rows a
+    /// condition holds for (ISO 14.6, GQ08). It is the `WHERE` of a
+    /// `MATCH` standing on its own, over whatever the statement has in
+    /// hand rather than over a pattern the same clause wrote, which is
+    /// how a reader writes a condition on the result of a `CALL` or of
+    /// the statement in front of a `NEXT`. The `WHERE` in
+    /// `FILTER WHERE p.age > 30` is optional and means nothing extra,
+    /// which is the standard's own spelling and not a courtesy to
+    /// Cypher.
+    Filter {
+        expr: Expr,
+    },
+    /// `LET n = a.age + 1, big = n > 40`, the statement that names
+    /// values (ISO 14.7, GQ09). Every variable in hand stays in hand
+    /// and the new names are added to them, which is what makes it a
+    /// different statement from `WITH`: a projection says what the rows
+    /// are from there on, and this says what else they carry.
+    ///
+    /// The definitions read left to right, so a later one may use a
+    /// name an earlier one in the same statement gave.
+    Let {
+        items: Vec<LetItem>,
+    },
     /// `CALL name(args) YIELD col [AS alias], ...`, a table function
     /// producing rows (docs/07 §4).
     Call {
@@ -531,6 +554,16 @@ impl<E> SortKey<E> {
 pub struct ProjectionItem {
     pub expr: Expr,
     pub alias: Option<String>,
+}
+
+/// One name a `LET` gives a value. The name comes first and the value
+/// second, the opposite way round from a projection item, because a
+/// `LET` is a definition rather than a column: the reader is naming
+/// something, not saying what a table looks like.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LetItem {
+    pub name: String,
+    pub expr: Expr,
 }
 
 /// GQL path mode: which repeats a variable-length path may contain.

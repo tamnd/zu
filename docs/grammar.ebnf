@@ -119,10 +119,26 @@ property_type   = name , ( "::" | "TYPED" ) , value_type ;
    so NOT NULL is what makes a property mandatory. One rule about null
    rather than two. *)
 
-reading_clause  = match_clause | unwind_clause | with_clause ;
+reading_clause  = match_clause | unwind_clause | filter_clause
+                | let_clause | with_clause ;
 
 match_clause    = [ "OPTIONAL" ] , "MATCH" , pattern , [ where_clause ] ;
 unwind_clause   = "UNWIND" , expression , "AS" , name ;
+
+(* GQ08, ISO 14.6. The condition on its own, over whatever the
+   statement has in hand rather than over a pattern the same clause
+   wrote. The WHERE is the standard's own optional word and says
+   nothing the FILTER has not already said. *)
+filter_clause   = "FILTER" , [ "WHERE" ] , expression ;
+
+(* GQ09, ISO 14.7. Names for values, added to the names already in
+   hand: a projection says what the rows are from there on and this
+   says what else they carry. The definitions read left to right, so a
+   later one may use a name an earlier one gave, and the name is a
+   variable rather than anything a projection item may be. *)
+let_clause      = "LET" , let_item , { "," , let_item } ;
+let_item        = name , "=" , expression ;
+
 with_clause     = "WITH" , projection , [ where_clause ] ;
 return_clause   = "RETURN" , projection ;
 where_clause    = "WHERE" , expression ;

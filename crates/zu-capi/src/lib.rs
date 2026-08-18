@@ -72,13 +72,16 @@
 //! than allocating, so the reader costs a pointer per value and the
 //! columnar path stays the one a bulk read uses.
 //!
-//! Values get in through [`ZuLoader`], which is the other half and the
-//! only one in v0: `CREATE` and `INSERT` need a table and no statement
-//! makes one, so a host with data and an empty file has nowhere else to
-//! go. A loader is columnar for the same reason a result is, one call
-//! per column rather than one per cell, and it is the entry point the
-//! Rust appender and `zu copy` are both built on rather than a second
-//! way in beside them.
+//! Values get in two ways, because a host with data has one of two
+//! problems. [`ZuLoader`] builds a database that does not exist yet:
+//! `CREATE` and `INSERT` need a table and no statement makes one, so a
+//! host with data and an empty file has nowhere else to go, and it is
+//! columnar for the same reason a result is, one call per column rather
+//! than one per cell. [`ZuAppender`] adds to a database that does
+//! exist, a value at a time into buffers that a flush turns into one
+//! commit, which is what a host reading rows out of somewhere else has
+//! to hand. Both are the entry points the Rust appender and `zu copy`
+//! are built on rather than a second way in beside them.
 
 // The pointer contract (what must be valid, who frees what, in which
 // order) is one contract for the whole surface; it lives in the module
@@ -86,6 +89,7 @@
 // it, not repeated under every function.
 #![allow(clippy::missing_safety_doc)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::mem::{offset_of, size_of};
@@ -95,12 +99,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use zu_common::{DurationKind, Temporal};
+use zu_common::{DurationKind, FloatBits, IntBits, LogicalType, Temporal};
 use zudb::query::{QueryResult, Value};
+use zudb::zu1::catalog::Catalog;
 use zudb::zu1::file::Zu1File;
 use zudb::zu1::graph::bulk_load_keyed;
-use zudb::zu1::props::{PropValues, store_props};
-use zudb::{Config, Connection, Database, Interrupt, Position, Severity, ZuError as EngineError};
+use zudb::zu1::props::{PropValues, load_props, store_props};
+use zudb::{
+    Config, Connection, Database, Field, Interrupt, Position, Severity, ZuError as EngineError,
+};
 
 /// What a call answers, which is control flow and nothing else.
 ///
@@ -3348,6 +3355,932 @@ pub unsafe extern "C" fn zu_loader_free(l: *mut ZuLoader) {
         return;
     }
     drop(unsafe { Box::from_raw(l) });
+}
+
+/* ---- appending ---- */
+
+/// Rows on their way into a table that already exists. Opaque to C,
+/// finished with [`zu_appender_close`], freed with [`zu_appender_free`].
+///
+/// A statement is the wrong shape for loading data. Every row is
+/// parsed, bound, planned and committed, and the commit is the
+/// expensive part, so a million rows is a million commits and the load
+/// is dominated by durability work nobody asked for. [`ZuLoader`] is
+/// the right shape for a database that does not exist yet; this is the
+/// right shape for one that does. Values go into per-column buffers
+/// here, and a flush turns the whole buffer into one commit.
+///
+/// The buffers are here rather than in the engine's own appender, which
+/// this opens for the length of a flush and no longer. That appender
+/// borrows the file its connection reads through for as long as it
+/// lives, which is a promise a C handle cannot make: a host that held
+/// one open across calls and then ran a statement would be two mutable
+/// borrows of one file, which is undefined behaviour rather than
+/// anything a status could report. What the arrangement costs is a
+/// catalog read per flush, against a commit and a fold that both cost
+/// time proportional to the table, so it is not where a load spends its
+/// time.
+///
+/// Not thread-safe, on the same terms as [`ZuConn`] and for a stronger
+/// reason: it takes that connection's claim for every call, so an
+/// appender used from two threads at once, or used while a statement is
+/// running on the same connection, answers
+/// [`ZuStatus::MisuseConcurrent`] instead of tearing a buffer. That is
+/// an atomic swap per value against a push into a vector, which is what
+/// buys the check on the one path where a mistake would otherwise
+/// produce a database rather than an error.
+pub struct ZuAppender {
+    /// The connection this writes through. Followed only after
+    /// [`ConnState::alive`] says it is still open, on the same terms as
+    /// [`ZuStmt`].
+    conn: *mut ZuConn,
+    state: Arc<ConnState>,
+    rows: Rows,
+}
+
+/// What an appender holds and every call mutates, in one field so that
+/// reaching it is one projection off the raw pointer rather than a
+/// borrow of the whole handle: see the note above [`conn_state`].
+struct Rows {
+    table: String,
+    cols: Vec<AppendCol>,
+    /// Rows ended and not yet written, which is what a flush turns into
+    /// one commit.
+    buffered: u64,
+    /// Rows this appender has committed, across every flush.
+    committed: u64,
+    /// How many values of the row being written have been taken. A row
+    /// is a row when [`zu_append_end_row`] says so, which is what tells
+    /// a short row from a row still being written.
+    partial: usize,
+    open: bool,
+}
+
+/// One column of the table, and what has been buffered for it.
+struct AppendCol {
+    /// Kept NUL-terminated because [`zu_appender_col_name`] hands it
+    /// out, and read back as a `&str` for the messages, which a name
+    /// out of the catalog always is.
+    name: CString,
+    values: Cell,
+    /// The node table whose rows this column names, for the two columns
+    /// of a rel table and for nothing else: a row of one is an offset
+    /// into the table the edge runs from and an offset into the table it
+    /// runs to. A negative offset is no row of anything and is refused
+    /// where it was appended, which is the one thing the ingest cannot
+    /// say for itself: it takes the two ends as counts, so a negative
+    /// one reaches it as an enormous positive one and is reported as an
+    /// edge to a row that is not there. Whether the row is there at all
+    /// is the ingest's own check and is left to it, since it knows about
+    /// rows appended and not yet folded and a catalog read here would
+    /// not.
+    ends: Option<u32>,
+}
+
+/// One column's buffered values, in the shape the ingest wants them.
+///
+/// The arms are the storage arms and not the logical types: a date and
+/// a count are both words, and which of the two a word is comes from
+/// the column's declared type, read once when the appender opened.
+/// Buffering in the storage shape means a flush hands the buffer over
+/// with no pass to convert it.
+enum Cell {
+    Int(Vec<i64>),
+    Float(Vec<f64>),
+    Bool(Vec<bool>),
+    /// Strings rather than bytes, because the store wants the bytes and
+    /// the engine's appender wants the `&str`, and a `String` lends out
+    /// either without a copy.
+    Str(Vec<String>),
+    Bytes(Vec<Vec<u8>>),
+    Date(Vec<i32>),
+    LocalTime(Vec<i64>),
+    LocalDatetime(Vec<i64>),
+    Duration(DurationKind, Vec<i64>),
+}
+
+/// What a value call carried: one value and its type, and nothing about
+/// where it goes.
+enum Taken<'a> {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(&'a str),
+    Bytes(&'a [u8]),
+    Temporal(Temporal),
+}
+
+impl Taken<'_> {
+    /// What to call this in a message about a column that would not
+    /// take it.
+    fn names(&self) -> &'static str {
+        match self {
+            Taken::Bool(_) => "a boolean",
+            Taken::Int(_) => "an integer",
+            Taken::Float(_) => "a float",
+            Taken::Str(_) => "a string",
+            Taken::Bytes(_) => "bytes",
+            Taken::Temporal(Temporal::Date(_)) => "a date",
+            Taken::Temporal(Temporal::LocalTime(_)) => "a local time",
+            Taken::Temporal(Temporal::ZonedTime { .. }) => "a zoned time",
+            Taken::Temporal(Temporal::LocalDatetime(_)) => "a local datetime",
+            Taken::Temporal(Temporal::ZonedDatetime { .. }) => "a zoned datetime",
+            Taken::Temporal(Temporal::Duration(DurationKind::YearMonth, _)) => {
+                "a year-month duration"
+            }
+            Taken::Temporal(Temporal::Duration(DurationKind::DayTime, _)) => "a day-time duration",
+        }
+    }
+}
+
+impl Cell {
+    /// The buffer a column of this declared type appends into, or
+    /// `None` for a type the ingest cannot carry.
+    ///
+    /// The match is on the exact declared type rather than on its
+    /// family, because that is what the ingest checks: it compares the
+    /// stored column's type against the type its values claim, so an
+    /// `INT32` column or a `VARCHAR(20)` one has no buffer here even
+    /// though its bits would fit the same lane.
+    fn for_type(ty: &LogicalType) -> Option<Cell> {
+        Some(match ty {
+            LogicalType::Int {
+                signed: true,
+                bits: IntBits::B64,
+                precision: None,
+            } => Cell::Int(Vec::new()),
+            LogicalType::Bool => Cell::Bool(Vec::new()),
+            LogicalType::Float {
+                bits: FloatBits::B64,
+                precision: None,
+            } => Cell::Float(Vec::new()),
+            LogicalType::Date => Cell::Date(Vec::new()),
+            LogicalType::LocalTime => Cell::LocalTime(Vec::new()),
+            LogicalType::LocalDatetime => Cell::LocalDatetime(Vec::new()),
+            LogicalType::Duration(kind) => Cell::Duration(*kind, Vec::new()),
+            LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false,
+            } => Cell::Str(Vec::new()),
+            LogicalType::Bytes {
+                min: None,
+                max: None,
+                fixed: false,
+            } => Cell::Bytes(Vec::new()),
+            _ => return None,
+        })
+    }
+
+    /// One value into this column, or what the column holds instead.
+    fn push(&mut self, taken: Taken<'_>) -> Result<(), &'static str> {
+        match (&mut *self, taken) {
+            (Cell::Int(v), Taken::Int(n)) => v.push(n),
+            (Cell::Float(v), Taken::Float(f)) => v.push(f),
+            (Cell::Bool(v), Taken::Bool(b)) => v.push(b),
+            (Cell::Str(v), Taken::Str(s)) => v.push(s.to_string()),
+            (Cell::Bytes(v), Taken::Bytes(b)) => v.push(b.to_vec()),
+            (Cell::Date(v), Taken::Temporal(Temporal::Date(days))) => v.push(days),
+            (Cell::LocalTime(v), Taken::Temporal(Temporal::LocalTime(nanos))) => v.push(nanos),
+            (Cell::LocalDatetime(v), Taken::Temporal(Temporal::LocalDatetime(nanos))) => {
+                v.push(nanos);
+            }
+            (Cell::Duration(kind, v), Taken::Temporal(Temporal::Duration(was, count)))
+                if *kind == was =>
+            {
+                v.push(count);
+            }
+            _ => return Err(self.holds()),
+        }
+        Ok(())
+    }
+
+    /// What this column takes, worded for the end of a sentence about a
+    /// value that was something else.
+    fn holds(&self) -> &'static str {
+        match self {
+            Cell::Int(_) => "integers",
+            Cell::Float(_) => "floats",
+            Cell::Bool(_) => "booleans",
+            Cell::Str(_) => "strings",
+            Cell::Bytes(_) => "bytes",
+            Cell::Date(_) => "dates",
+            Cell::LocalTime(_) => "local times",
+            Cell::LocalDatetime(_) => "local datetimes",
+            Cell::Duration(DurationKind::YearMonth, _) => "year-month durations",
+            Cell::Duration(DurationKind::DayTime, _) => "day-time durations",
+        }
+    }
+
+    /// The last value back off, for a row that was refused partway.
+    fn pop(&mut self) {
+        match self {
+            Cell::Int(v) => drop(v.pop()),
+            Cell::Float(v) => drop(v.pop()),
+            Cell::Bool(v) => drop(v.pop()),
+            Cell::Str(v) => drop(v.pop()),
+            Cell::Bytes(v) => drop(v.pop()),
+            Cell::Date(v) => drop(v.pop()),
+            Cell::LocalTime(v) => drop(v.pop()),
+            Cell::LocalDatetime(v) => drop(v.pop()),
+            Cell::Duration(_, v) => drop(v.pop()),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Cell::Int(v) => v.clear(),
+            Cell::Float(v) => v.clear(),
+            Cell::Bool(v) => v.clear(),
+            Cell::Str(v) => v.clear(),
+            Cell::Bytes(v) => v.clear(),
+            Cell::Date(v) => v.clear(),
+            Cell::LocalTime(v) => v.clear(),
+            Cell::LocalDatetime(v) => v.clear(),
+            Cell::Duration(_, v) => v.clear(),
+        }
+    }
+
+    /// One buffered value as the engine's appender takes it, borrowed
+    /// rather than copied: on a string column that is the difference
+    /// between one copy on the way in and two.
+    fn field(&self, row: usize) -> Field<'_> {
+        match self {
+            Cell::Int(v) => Field::Int(v[row]),
+            Cell::Float(v) => Field::Float(v[row]),
+            Cell::Bool(v) => Field::Bool(v[row]),
+            Cell::Str(v) => Field::Str(&v[row]),
+            Cell::Bytes(v) => Field::Bytes(&v[row]),
+            Cell::Date(v) => Field::Temporal(Temporal::Date(v[row])),
+            Cell::LocalTime(v) => Field::Temporal(Temporal::LocalTime(v[row])),
+            Cell::LocalDatetime(v) => Field::Temporal(Temporal::LocalDatetime(v[row])),
+            Cell::Duration(kind, v) => Field::Temporal(Temporal::Duration(*kind, v[row])),
+        }
+    }
+}
+
+impl Rows {
+    /// One value into the row being written, or nothing at all.
+    ///
+    /// A value the column will not take ends the row it was in: the
+    /// values that row had already written come back off and the next
+    /// value starts a new row. A row half written and left there would
+    /// make the buffers ragged, which the ingest refuses at the flush, a
+    /// long way from the value that caused it.
+    fn take(&mut self, taken: Taken<'_>) -> Result<(), EngineError> {
+        let at = self.partial;
+        let width = self.cols.len();
+        if at == width {
+            let why = format!(
+                "this row already carries the {width} values '{}' takes: {}",
+                self.table,
+                self.names()
+            );
+            return Err(self.refuse(why));
+        }
+        if let (Taken::Int(offset), Some(_)) = (&taken, self.cols[at].ends)
+            && *offset < 0
+        {
+            let why = format!(
+                "value {at} of this row is {offset}, and column '{}' of '{}' holds row offsets, \
+                 which count from zero",
+                self.named(at),
+                self.table
+            );
+            return Err(self.refuse(why));
+        }
+        let names = taken.names();
+        if let Err(holds) = self.cols[at].values.push(taken) {
+            let why = format!(
+                "value {at} of this row is {names} and column '{}' of '{}' holds {holds}",
+                self.named(at),
+                self.table
+            );
+            return Err(self.refuse(why));
+        }
+        self.partial += 1;
+        Ok(())
+    }
+
+    /// Ends the row being written, which is what makes it a row.
+    fn end_row(&mut self) -> Result<(), EngineError> {
+        let width = self.cols.len();
+        if self.partial != width {
+            let why = format!(
+                "this row carries {} value{} and '{}' takes {width}: {}",
+                self.partial,
+                if self.partial == 1 { "" } else { "s" },
+                self.table,
+                self.names()
+            );
+            return Err(self.refuse(why));
+        }
+        self.partial = 0;
+        self.buffered += 1;
+        Ok(())
+    }
+
+    /// Takes back the values the row being written had managed to
+    /// write, and hands over why it was refused.
+    fn refuse(&mut self, why: String) -> EngineError {
+        self.undo();
+        misuse(why)
+    }
+
+    /// The row being written, taken back off. A row is not a row until
+    /// it is ended, so this loses nothing anybody appended.
+    fn undo(&mut self) {
+        for col in self.cols.iter_mut().take(self.partial) {
+            col.values.pop();
+        }
+        self.partial = 0;
+    }
+
+    /// Everything buffered, gone, which is what a flush and a discard
+    /// both leave behind.
+    fn empty(&mut self) {
+        self.undo();
+        for col in &mut self.cols {
+            col.values.clear();
+        }
+        self.buffered = 0;
+    }
+
+    /// A column's name, for a message about a value that did not fit
+    /// it. A name out of the catalog is UTF-8, so nothing is ever lost
+    /// here.
+    fn named(&self, at: usize) -> Cow<'_, str> {
+        self.cols[at].name.to_string_lossy()
+    }
+
+    /// The columns of the table, named, for a message about a row that
+    /// is the wrong width: a host that miscounted wants to see what the
+    /// count was supposed to be made of.
+    fn names(&self) -> String {
+        self.cols
+            .iter()
+            .map(|col| col.name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The columns of the table an appender was opened on, in the order it
+/// declares them.
+///
+/// A node table's columns are the ones the property store holds, with
+/// the types it holds them as, which is what the engine's appender
+/// checks a row against. A rel table has no property columns: a row of
+/// one is the two ends of an edge, as offsets into the tables it runs
+/// between, so those are the two columns and they are named for what
+/// they are.
+///
+/// Read here rather than left to the flush so that a value that does
+/// not belong in a column is refused by the call that appended it, a
+/// million rows before the flush that would have carried it, and named
+/// rather than guessed at from the values that came before.
+fn shape(conn: &mut Connection, table: &str) -> Result<Vec<AppendCol>, EngineError> {
+    let catalog = Catalog::load(conn.session_mut().file_mut()?)?;
+    if let Some(rel) = catalog.rel_by_name(table) {
+        let named = |id: u32, fallback: &str| {
+            catalog
+                .node_by_id(id)
+                .map_or_else(|| fallback.to_string(), |node| node.name.clone())
+        };
+        // Named for the tables the edge runs between, since that is what
+        // a row of a rel table is and there is nothing else to call the
+        // two columns.
+        return Ok(vec![
+            AppendCol {
+                name: c_message(&format!("from {}", named(rel.from, "the source table"))),
+                values: Cell::Int(Vec::new()),
+                ends: Some(rel.from),
+            },
+            AppendCol {
+                name: c_message(&format!("to {}", named(rel.to, "the destination table"))),
+                values: Cell::Int(Vec::new()),
+                ends: Some(rel.to),
+            },
+        ]);
+    }
+    let id = catalog
+        .node_by_name(table)
+        .map(|node| node.id)
+        .ok_or_else(|| misuse(format!("no node table or rel table '{table}'")))?;
+    let file = conn.session_mut().file_mut()?;
+    let directory = load_props(file, id)?.ok_or_else(|| {
+        misuse(format!(
+            "'{table}' stores no properties, so it has no columns to append to"
+        ))
+    })?;
+    directory
+        .columns
+        .iter()
+        .map(|column| {
+            Ok(AppendCol {
+                name: c_message(&column.name),
+                values: Cell::for_type(&column.ty).ok_or_else(|| {
+                    misuse(format!(
+                        "column '{}' of '{table}' holds {}, which this engine cannot yet \
+                         append to",
+                        column.name, column.ty
+                    ))
+                })?,
+                ends: None,
+            })
+        })
+        .collect()
+}
+
+/// Writes what is buffered and answers what this appender has committed
+/// in all.
+///
+/// One commit, whatever the buffer holds: the values are sealed into
+/// the data file as segments, one frame naming them is synced to the
+/// log, and the fold that follows puts them where every query looks. A
+/// flush with nothing buffered touches no file, so a host can flush on
+/// a timer without writing empty commits.
+///
+/// A row that was never ended is not a row, and comes back off here
+/// rather than going in as a short one.
+unsafe fn write_out(conn: *mut ZuConn, rows: &mut Rows) -> Result<u64, EngineError> {
+    rows.undo();
+    if rows.buffered == 0 {
+        return Ok(rows.committed);
+    }
+    let count = rows.buffered;
+    let conn = unsafe { conn_of(conn) };
+    {
+        let mut appender = conn.appender(&rows.table)?;
+        // One vector, refilled per row rather than allocated per row,
+        // which over a million rows is one allocation rather than a
+        // million.
+        let mut row: Vec<Field<'_>> = Vec::with_capacity(rows.cols.len());
+        for at in 0..count as usize {
+            row.clear();
+            row.extend(rows.cols.iter().map(|col| col.values.field(at)));
+            appender.append_row(&row[..]).map_err(|e| {
+                // The engine reports the value and the column; which row
+                // of the batch it was is the part only this side knows,
+                // and it is the part that says where to look.
+                misuse(format!("row {at} of this batch: {e}"))
+            })?;
+        }
+        appender.close()?;
+    }
+    rows.empty();
+    rows.committed += count;
+    Ok(rows.committed)
+}
+
+/// The state an appender shares with the connection it writes through.
+unsafe fn appender_state(app: *mut ZuAppender) -> Arc<ConnState> {
+    Arc::clone(unsafe { &(*app).state })
+}
+
+/// The connection an appender writes through, as a pointer, so that
+/// nothing here borrows the handle as a whole.
+unsafe fn appender_conn(app: *mut ZuAppender) -> *mut ZuConn {
+    unsafe { (*app).conn }
+}
+
+/// What an appender holds, under a [`Claim`] and projected off the raw
+/// pointer for the reason [`conn_state`] is.
+unsafe fn appender_rows<'a>(app: *mut ZuAppender) -> &'a mut Rows {
+    unsafe { &mut (*app).rows }
+}
+
+/// Claims an appender's connection for one call.
+///
+/// An appender that has been closed answers [`ZuStatus::MisuseClosed`],
+/// which is the same answer a statement gives after its connection
+/// closed and means the same thing: the handle is still safe to free
+/// and nothing else. The flag is read under the claim, which is what
+/// makes reading it a read of a field nobody else is writing.
+unsafe fn claim_appender(app: *mut ZuAppender) -> Result<Claim, ZuStatus> {
+    if app.is_null() {
+        return Err(ZuStatus::Misuse);
+    }
+    let claim = claim(&unsafe { appender_state(app) })?;
+    if !unsafe { appender_rows(app) }.open {
+        return Err(ZuStatus::MisuseClosed);
+    }
+    Ok(claim)
+}
+
+/// Opens an appender on `table`, which is a node table or a rel table
+/// of the graph this connection reads.
+///
+/// An engine appender is opened here and dropped, purely to find out
+/// whether it can be opened at all: a table nothing declares, a column
+/// that holds a null, a table a keyed rel table is built over, and a
+/// read-only connection are all refused here rather than at the first
+/// flush. A host about to buffer a million rows wants to hear about
+/// them now.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_open(
+    conn: *mut ZuConn,
+    table: *const c_char,
+    table_len: usize,
+    out: *mut *mut ZuAppender,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let table = unsafe { counted(table, table_len, "table") }?;
+        let engine = unsafe { conn_of(conn) };
+        engine.appender(table).map(drop)?;
+        let cols = shape(engine, table)?;
+        let app = ZuAppender {
+            conn,
+            state: unsafe { conn_state(conn) },
+            rows: Rows {
+                table: table.to_string(),
+                cols,
+                buffered: 0,
+                committed: 0,
+                partial: 0,
+                open: true,
+            },
+        };
+        unsafe { *out = Box::into_raw(Box::new(app)) };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_open_z(
+    conn: *mut ZuConn,
+    table: *const c_char,
+    out: *mut *mut ZuAppender,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_appender_open(conn, table, zlen(table), out, err) }
+}
+
+/// One value into the row being written, which every `zu_append_*` call
+/// below is.
+///
+/// The value arrives as a closure rather than as a value because two of
+/// the calls have a conversion that can fail (a string that is not
+/// UTF-8, a kind that is no kind), and running it inside the fence is
+/// what lets the error carry the same handle as everything else and end
+/// the row it was in on the same terms.
+unsafe fn append<'a>(
+    app: *mut ZuAppender,
+    err: *mut *mut ZuError,
+    taken: impl FnOnce() -> Result<Taken<'a>, EngineError>,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_appender(app) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let rows = unsafe { appender_rows(app) };
+        // A value that is not a value at all ends its row on the same
+        // terms as one the column would not take, because the next call
+        // is the next value of a row and a row left half written would
+        // put it in the wrong column.
+        let taken = match taken() {
+            Ok(taken) => taken,
+            Err(e) => {
+                rows.undo();
+                return Err(e);
+            }
+        };
+        rows.take(taken)?;
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_bool(
+    app: *mut ZuAppender,
+    v: i32,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { append(app, err, || Ok(Taken::Bool(v != 0))) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_i64(
+    app: *mut ZuAppender,
+    v: i64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { append(app, err, || Ok(Taken::Int(v))) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_f64(
+    app: *mut ZuAppender,
+    v: f64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { append(app, err, || Ok(Taken::Float(v))) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_str(
+    app: *mut ZuAppender,
+    v: *const c_char,
+    v_len: usize,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    let taken = || unsafe { counted(v, v_len, "value") }.map(Taken::Str);
+    unsafe { append(app, err, taken) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_str_z(
+    app: *mut ZuAppender,
+    v: *const c_char,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_append_str(app, v, zlen(v), err) }
+}
+
+/// Bytes into a `BYTES` column, which is the one value that is not a
+/// string and not a number.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_bytes(
+    app: *mut ZuAppender,
+    v: *const u8,
+    v_len: usize,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    let taken = || unsafe { array(v, v_len as u64, "value") }.map(Taken::Bytes);
+    unsafe { append(app, err, taken) }
+}
+
+/// A temporal, as one `ZU_TEMPORAL_*` kind and the count in the unit
+/// that kind implies.
+///
+/// This is [`zu_value_temporal`] read backwards, deliberately, and for
+/// the reason [`zu_loader_col_temporal`] is: a host that read a date out
+/// as 19782 days writes it back in as 19782 days, and needs one mapping
+/// rather than two. `ZU_TEMPORAL_ZONED_TIME` and
+/// `ZU_TEMPORAL_ZONED_DATETIME` answer [`ZuStatus::Unsupported`] for the
+/// reason the loader gives: a stored column has nowhere to keep the
+/// offset that makes those two what they are.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_temporal(
+    app: *mut ZuAppender,
+    kind: i32,
+    count: i64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { append(app, err, || temporal_of(kind, count).map(Taken::Temporal)) }
+}
+
+/// One `ZU_TEMPORAL_*` kind and a count as the value they stand for.
+fn temporal_of(kind: i32, count: i64) -> Result<Temporal, EngineError> {
+    Ok(match kind {
+        ZU_TEMPORAL_DATE => Temporal::Date(
+            i32::try_from(count)
+                .map_err(|_| misuse(format!("{count} days is no date any column could hold")))?,
+        ),
+        ZU_TEMPORAL_LOCAL_TIME => Temporal::LocalTime(count),
+        ZU_TEMPORAL_LOCAL_DATETIME => Temporal::LocalDatetime(count),
+        ZU_TEMPORAL_DURATION_YEAR_MONTH => Temporal::Duration(DurationKind::YearMonth, count),
+        ZU_TEMPORAL_DURATION_DAY_TIME => Temporal::Duration(DurationKind::DayTime, count),
+        ZU_TEMPORAL_ZONED_TIME | ZU_TEMPORAL_ZONED_DATETIME => {
+            return Err(EngineError::Unsupported {
+                what: "a stored column of the zoned temporal kind",
+                id: kind as u32,
+            });
+        }
+        other => return Err(misuse(format!("{other} is no ZU_TEMPORAL_ kind"))),
+    })
+}
+
+/// Ends the row being written, which is what makes it a row.
+///
+/// A row of the wrong width is refused here with nothing of it kept, so
+/// an appender is still usable once the host has fixed its loop.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_append_end_row(
+    app: *mut ZuAppender,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_appender(app) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        unsafe { appender_rows(app) }.end_row()?;
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Writes every buffered row and makes it readable.
+///
+/// On return the buffer is empty and the rows are there: every later
+/// statement on any connection sees them, and before it returns nothing
+/// does. A flush that fails keeps its rows, so what did not go in is
+/// still there to be looked at and tried again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_flush(
+    app: *mut ZuAppender,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_appender(app) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let conn = unsafe { appender_conn(app) };
+        unsafe { write_out(conn, appender_rows(app)) }?;
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Rows buffered and not yet written.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_buffered(app: *mut ZuAppender, out: *mut u64) -> ZuStatus {
+    unsafe { count_of(app, out, |rows| rows.buffered) }
+}
+
+/// Rows this appender has committed, across every flush.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_committed(app: *mut ZuAppender, out: *mut u64) -> ZuStatus {
+    unsafe { count_of(app, out, |rows| rows.committed) }
+}
+
+/// One count off an appender, written before anything can fail so that
+/// a host that ignores the status is never left reading the call
+/// before.
+unsafe fn count_of(app: *mut ZuAppender, out: *mut u64, of: impl Fn(&Rows) -> u64) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0 };
+    guard_status(|| {
+        let _claim = match unsafe { claim_appender(app) } {
+            Ok(claim) => claim,
+            Err(status) => return status,
+        };
+        unsafe { *out = of(appender_rows(app)) };
+        ZuStatus::Ok
+    })
+}
+
+/// How many values a row of this table carries, which is how many
+/// `zu_append_*` calls stand between two `zu_append_end_row` calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_cols(app: *mut ZuAppender, out: *mut u32) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0 };
+    guard_status(|| {
+        let _claim = match unsafe { claim_appender(app) } {
+            Ok(claim) => claim,
+            Err(status) => return status,
+        };
+        unsafe { *out = appender_rows(app).cols.len() as u32 };
+        ZuStatus::Ok
+    })
+}
+
+/// The name of one column, borrowed from the appender and valid until
+/// it is freed.
+///
+/// A row is written by position and the columns are read by name, so a
+/// host that wants to check the order it is writing in, or to say which
+/// column its own data does not fit, needs them both ways.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_col_name(
+    app: *mut ZuAppender,
+    col: u32,
+    len: *mut usize,
+) -> *const c_char {
+    if !len.is_null() {
+        unsafe { *len = 0 };
+    }
+    if app.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(_claim) = (unsafe { claim_appender(app) }) else {
+        return std::ptr::null();
+    };
+    let Some(col) = unsafe { appender_rows(app) }.cols.get(col as usize) else {
+        return std::ptr::null();
+    };
+    if !len.is_null() {
+        unsafe { *len = col.name.as_bytes().len() };
+    }
+    col.name.as_ptr()
+}
+
+/// Throws away what is buffered and answers how many rows that was.
+///
+/// The way out of a load that went wrong halfway. A host that has
+/// noticed the rows are wrong wants them gone, and closing would write
+/// them. Rows an earlier flush committed are committed, and this does
+/// not reach them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_discard(app: *mut ZuAppender, out: *mut u64) -> ZuStatus {
+    if !out.is_null() {
+        unsafe { *out = 0 };
+    }
+    guard_status(|| {
+        let _claim = match unsafe { claim_appender(app) } {
+            Ok(claim) => claim,
+            Err(status) => return status,
+        };
+        let rows = unsafe { appender_rows(app) };
+        let dropped = rows.buffered;
+        rows.empty();
+        if !out.is_null() {
+            unsafe { *out = dropped };
+        }
+        ZuStatus::Ok
+    })
+}
+
+/// Flushes what is left and spends the appender, answering how many
+/// rows it committed in all.
+///
+/// Closing twice is not an error and writes nothing the second time,
+/// because a host that closes in a cleanup path and again where the
+/// load ended would otherwise fail on the way out. A close whose flush
+/// failed leaves the appender open with its rows still buffered, so the
+/// host can fix what was wrong and close again.
+///
+/// Freeing is what is left afterwards: see [`zu_appender_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_close(
+    app: *mut ZuAppender,
+    out: *mut u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if !out.is_null() {
+        unsafe { *out = 0 };
+    }
+    guard(err, || {
+        if app.is_null() {
+            return Ok(ZuStatus::Misuse);
+        }
+        let _claim = match claim(&unsafe { appender_state(app) }) {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let conn = unsafe { appender_conn(app) };
+        let rows = unsafe { appender_rows(app) };
+        if !rows.open {
+            if !out.is_null() {
+                unsafe { *out = rows.committed };
+            }
+            return Ok(ZuStatus::Ok);
+        }
+        let committed = unsafe { write_out(conn, rows) }?;
+        rows.open = false;
+        if !out.is_null() {
+            unsafe { *out = committed };
+        }
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Frees an appender, writing what it still holds.
+///
+/// The flush is here because rows that were appended and never flushed
+/// are rows the host meant to write, and a host that meant the other
+/// thing calls [`zu_appender_discard`] and gets exactly it. What it
+/// cannot do is say that the write failed, which is what
+/// [`zu_appender_close`] is for: close first if the answer matters, and
+/// this frees an appender that has nothing left to write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_appender_free(app: *mut ZuAppender) {
+    if app.is_null() {
+        return;
+    }
+    let state = unsafe { appender_state(app) };
+    if let Ok(_claim) = unsafe { claim_appender(app) } {
+        let conn = unsafe { appender_conn(app) };
+        let rows = unsafe { appender_rows(app) };
+        rows.open = false;
+        // The result goes nowhere because there is nowhere for it to go,
+        // which is the whole reason close() exists. A connection that is
+        // closed or in a call is not written through at all: the claim
+        // above is what says which.
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe { write_out(conn, rows) }));
+    }
+    // Freeing under another thread's call would free memory that thread
+    // is inside of, so this leaks instead, on the same terms as
+    // [`zu_conn_close`].
+    if state.busy.load(Ordering::Acquire) {
+        return;
+    }
+    drop(unsafe { Box::from_raw(app) });
 }
 
 #[cfg(test)]

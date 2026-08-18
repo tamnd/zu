@@ -410,6 +410,170 @@ int main(int argc, char **argv) {
     free(loaded);
   }
 
+  /* The appender, which is the other way values get in: not a database
+   * that does not exist yet but a table that does. It builds one of its
+   * own beside the database this was handed, for the reason the loader
+   * block above builds one, writes rows a value at a time, and reads
+   * them back, because a value that went into the wrong column is a
+   * value that reads back wrong and nothing about the write alone would
+   * say so. */
+  {
+    const char *suffix = ".append";
+    char *appended = (char *)malloc(strlen(argv[1]) + strlen(suffix) + 1);
+    zu_conn *writer = NULL;
+    zu_appender *app = NULL;
+    zu_result *back = NULL;
+    const int64_t *read = NULL;
+    const char *named = NULL;
+    const char *names[2] = {"bo", "cy"};
+    const int64_t ages[2] = {40, 50};
+    uint32_t cols = 0;
+    uint64_t buffered = 0;
+    uint64_t committed = 0;
+    size_t named_len = 0;
+    int i = 0;
+    if (appended == NULL) {
+      zu_conn_close(first);
+      return fail("out of memory");
+    }
+    strcpy(appended, argv[1]);
+    strcat(appended, suffix);
+    remove(appended);
+
+    err = NULL;
+    status = zu_create_z(appended, &writer, &err);
+    if (status != ZU_OK) {
+      free(appended);
+      zu_conn_close(first);
+      return report("a database could not be created to append to", status, err);
+    }
+    /* The one way a C host has of declaring a table is writing a row of
+     * it, and the columns an appender takes are the ones that row
+     * made. */
+    status = zu_query_z(writer, "INSERT (p:person {age: 30, name: 'ann'})", &back, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return report("a table could not be declared to append to", status, err);
+    }
+    zu_result_free(back);
+    back = NULL;
+
+    status = zu_appender_open_z(writer, "person", &app, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return report("an appender would not open", status, err);
+    }
+    named = zu_appender_col_name(app, 0, &named_len);
+    if (zu_appender_cols(app, &cols) != ZU_OK || cols != 2 || named == NULL ||
+        strcmp(named, "age") != 0 || named_len != 3) {
+      zu_appender_free(app);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return fail("an appender named its columns something else");
+    }
+    /* A value the column will not take is refused where it was
+     * appended, with the row it was in taken back off, so what the loop
+     * writes next is a row and not the tail of a broken one. */
+    err = NULL;
+    if (zu_append_str_z(app, "thirty", &err) != ZU_MISUSE || err == NULL) {
+      zu_appender_free(app);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return fail("a string went into a column of integers");
+    }
+    zu_error_free(err);
+    err = NULL;
+    for (i = 0; i < 2; i++) {
+      if (status == ZU_OK) {
+        status = zu_append_i64(app, ages[i], &err);
+      }
+      if (status == ZU_OK) {
+        status = zu_append_str_z(app, names[i], &err);
+      }
+      if (status == ZU_OK) {
+        status = zu_append_end_row(app, &err);
+      }
+    }
+    if (status != ZU_OK) {
+      zu_appender_free(app);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return report("a row would not append", status, err);
+    }
+    /* Buffered until they are asked for: nothing is in the table yet,
+     * and the close is the one commit that puts both rows there. */
+    if (zu_appender_buffered(app, &buffered) != ZU_OK || buffered != 2) {
+      zu_appender_free(app);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return fail("rows were appended and not buffered");
+    }
+    status = zu_appender_close(app, &committed, &err);
+    if (status != ZU_OK || committed != 2) {
+      zu_appender_free(app);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return report("an appender would not close", status, err);
+    }
+    /* Spent, and saying so rather than buffering into a handle the host
+     * forgot to free. */
+    if (zu_append_i64(app, 60, NULL) != ZU_MISUSE_CLOSED) {
+      zu_appender_free(app);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return fail("a closed appender took another value");
+    }
+    zu_appender_free(app);
+    zu_conn_close(writer);
+
+    status = zu_open_z(appended, &writer, &err);
+    if (status != ZU_OK) {
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return report("the appended database did not open", status, err);
+    }
+    status = zu_query_z(writer, "MATCH (p:person) RETURN p.age AS a ORDER BY a", &back, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return report("the appended database did not read", status, err);
+    }
+    if (zu_result_rows(back) != 3 || zu_result_col_i64(back, 0, &read) != ZU_OK || read == NULL ||
+        read[0] != 30 || read[1] != 40 || read[2] != 50) {
+      zu_result_free(back);
+      zu_conn_close(writer);
+      remove(appended);
+      free(appended);
+      zu_conn_close(first);
+      return fail("a row was appended and came back as something else");
+    }
+    zu_result_free(back);
+    zu_conn_close(writer);
+    remove(appended);
+    free(appended);
+  }
+
   /* A well formed query with nothing to return answers ZU_DONE rather
    * than an error, which is the whole reason a status crosses this
    * boundary alongside the pointer. */
@@ -651,8 +815,8 @@ int main(int argc, char **argv) {
 
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
-      "nested list, one load, one watched statement, one transaction, one refusal with a place "
-      "and one without\n",
+      "nested list, one load, one append, one watched statement, one transaction, one refusal "
+      "with a place and one without\n",
       version);
   return 0;
 }

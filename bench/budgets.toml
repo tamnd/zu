@@ -1421,6 +1421,25 @@ set_stmt_us = 250000.0
 insert_stmt_us = 250000.0
 set_stmt_kb = 4096.0
 
+# The processor time of the same two statements, user and system
+# together, per statement. The wall clock above is mostly the storage:
+# one statement is one commit is one fdatasync, 3.9 ms of it on this
+# box, and waiting on a sync is not burning processor time. So the two
+# columns move for different reasons and the latency one cannot see a
+# write path that got twice as expensive.
+#
+# Measured 0.5 to 1.1 ms per SET and 4.1 to 6.2 ms per INSERT at 10000
+# rows, the spread being what a laptop with other work on it does to a
+# run this short. The SET is the one that reads a table and changes one
+# cell of it, which is the shape the read half of a write statement is
+# measured by; the INSERT has no table to read and is nearly all write
+# path. What these ceilings are here to catch is the read half falling
+# back to the row at a time engine, which was 5x the processor time at
+# 100000 rows, so they sit an order of magnitude above the measurement
+# and still catch it. Lower these ceilings, never raise them.
+set_stmt_cpu_us = 10000.0
+insert_stmt_cpu_us = 30000.0
+
 # A DELETE at the same shape, measured 15 ms and 1044 kB at 10000 rows.
 # It is the cheapest of the three because a delete does not compact: the
 # row keeps its offset, so the fold merges one offset into the table's

@@ -31,7 +31,7 @@ use zu_common::{Epoch, Result, ZuError};
 
 use crate::catalog::{Catalog, ElementKind, GraphType, RelTable, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
-use crate::fullzip::{read_blob_segment, rewrite_blob_segment, write_blob_segment};
+use crate::fullzip::{read_blob_segment, rewrite_blob_reordered, rewrite_blob_segment};
 use crate::graph::{
     Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain,
     free_directory_keeping_props, group_bases, group_rows, pad_direction,
@@ -1087,7 +1087,7 @@ fn fold_rel_props(
                     },
                 });
             }
-            write_blob_segment(db, &values)?
+            rewrite_blob_reordered(db, &col.meta, &values)?
         };
         columns.push(crate::props::PropColumn {
             name: col.name.clone(),

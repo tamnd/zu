@@ -19,7 +19,7 @@ use crate::ast::{
 };
 use crate::binder::{
     BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetInto,
-    BoundSetItem, Func, MatchKind, Schema, TableFunc,
+    BoundSetItem, Func, MatchKind, Ordinal, Schema, TableFunc,
 };
 
 /// What a bracket does with an outer row the operators inside it
@@ -160,6 +160,10 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         expr: BoundExpr,
         slot: usize,
+        /// The counter of `WITH ORDINALITY` or `WITH OFFSET`, which
+        /// numbers the elements of each list rather than the rows the
+        /// operator answers, so it starts again at every input row.
+        ordinal: Option<Ordinal>,
     },
     /// Creates the elements an `INSERT` wrote, binding each one to its
     /// slot, one row out for every row in.
@@ -367,12 +371,20 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                     detach: *detach,
                 };
             }
-            BoundClause::Unwind { expr, slot } => {
+            BoundClause::Unwind {
+                expr,
+                slot,
+                ordinal,
+            } => {
                 bound.insert(*slot);
+                if let Some(ordinal) = ordinal {
+                    bound.insert(ordinal.slot);
+                }
                 plan = LogicalPlan::Unwind {
                     input: plan.boxed(),
                     expr: expr.clone(),
                     slot: *slot,
+                    ordinal: *ordinal,
                 };
             }
             BoundClause::Call {
@@ -876,14 +888,28 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
             bracket: *bracket,
             ..plain("Filter", expr_text(expr, query), under(input))
         },
-        LogicalPlan::Unwind { input, expr, slot } => PlanNode {
-            binds: vec![named(*slot)],
-            ..plain(
-                "Unwind",
-                format!("{} AS {}", expr_text(expr, query), named(*slot)),
-                under(input),
-            )
-        },
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            slot,
+            ordinal,
+        } => {
+            let mut binds = vec![named(*slot)];
+            let mut detail = format!("{} AS {}", expr_text(expr, query), named(*slot));
+            if let Some(ordinal) = ordinal {
+                let word = if ordinal.start == 1 {
+                    "ORDINALITY"
+                } else {
+                    "OFFSET"
+                };
+                detail.push_str(&format!(" WITH {word} {}", named(ordinal.slot)));
+                binds.push(named(ordinal.slot));
+            }
+            PlanNode {
+                binds,
+                ..plain("Unwind", detail, under(input))
+            }
+        }
         LogicalPlan::Insert { input, nodes, rels } => {
             let mut written: Vec<String> = nodes
                 .iter()

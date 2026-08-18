@@ -23,6 +23,7 @@ use zu_query::ast::{
     CatalogStmt, ElementDefKind, ElementTypeDef, Endpoint, GraphName, GraphRef, GraphTypeRef,
     GraphTypeSource,
 };
+use zu_query::exec::Value;
 
 use crate::zu1::catalog::{Catalog, ElementKind, ElementType, GraphType, GraphTypeOf, ROOT_SCHEMA};
 use crate::zu1::file::Zu1File;
@@ -42,7 +43,10 @@ pub enum Effect {
 
 /// Runs one catalog statement against `db`, publishing a new catalog
 /// when it changes anything.
-pub fn apply(db: &mut Zu1File, stmt: &CatalogStmt) -> Result<Effect> {
+///
+/// The parameters are here for `AS COPY OF $g`, which names the graph
+/// to copy the way a `USE` names the graph to read.
+pub fn apply(db: &mut Zu1File, stmt: &CatalogStmt, params: &[(&str, Value)]) -> Result<Effect> {
     let mut catalog = Catalog::load(db)?;
     match stmt {
         CatalogStmt::CreateGraphType {
@@ -147,7 +151,7 @@ pub fn apply(db: &mut Zu1File, stmt: &CatalogStmt) -> Result<Effect> {
                 // that was there.
                 let id = existing.id;
                 let graph_type = graph_type_of(&mut catalog, &name, of)?;
-                let source = copy_source(&catalog, copy_of.as_ref())?;
+                let source = copy_source(&catalog, copy_of.as_ref(), params)?;
                 // A replacement frees what the old graph held before it
                 // writes the new one, so a graph asked to become a copy
                 // of itself is asked for a copy of what is about to be
@@ -169,7 +173,7 @@ pub fn apply(db: &mut Zu1File, stmt: &CatalogStmt) -> Result<Effect> {
                 return Ok(Effect::Created);
             }
             let graph_type = graph_type_of(&mut catalog, &name, of)?;
-            let source = copy_source(&catalog, copy_of.as_ref())?;
+            let source = copy_source(&catalog, copy_of.as_ref(), params)?;
             let target = catalog.add_graph(&name, &schema, graph_type)?;
             copy_into(db, &mut catalog, source, target)?;
         }
@@ -247,13 +251,22 @@ fn graph_type_of(catalog: &mut Catalog, name: &str, of: &GraphTypeRef) -> Result
 /// The graph `AS COPY OF` names (GG05), resolved before anything is
 /// created so a statement naming a graph the file does not have leaves
 /// the file alone.
-fn copy_source(catalog: &Catalog, source: Option<&GraphRef>) -> Result<Option<u32>> {
+fn copy_source(
+    catalog: &Catalog,
+    source: Option<&GraphRef>,
+    params: &[(&str, Value)],
+) -> Result<Option<u32>> {
     match source {
         None => Ok(None),
         // The graph the statement is against, which is the home graph:
         // that is the one a query with no `USE` reads and the one a
-        // loaded file put its tables in.
-        Some(GraphRef::Current) => Ok(Some(catalog.home_graph_id())),
+        // loaded file put its tables in. A catalog statement runs
+        // outside any working graph, so the two words are one graph
+        // here.
+        Some(GraphRef::Current) | Some(GraphRef::Home) => Ok(Some(catalog.home_graph_id())),
+        Some(GraphRef::Param(name)) => {
+            Ok(Some(crate::query::graph_of_param(catalog, name, params)?))
+        }
         Some(GraphRef::Named(name)) => {
             let (schema, name) = split(name);
             let graph = catalog.graph(&schema, &name).ok_or_else(|| {
@@ -449,7 +462,7 @@ mod tests {
             let Statement::Catalog(stmt) = parse_statement(source).expect("parse") else {
                 panic!("not a catalog statement");
             };
-            apply(&mut db, &stmt).expect("apply");
+            apply(&mut db, &stmt, &[]).expect("apply");
         }
         Catalog::load(&mut db).expect("catalog")
     }
@@ -535,7 +548,7 @@ mod tests {
         else {
             panic!("not a catalog statement");
         };
-        let err = apply(&mut db, &stmt)
+        let err = apply(&mut db, &stmt, &[])
             .expect_err("no such node type")
             .to_string();
         assert!(

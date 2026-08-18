@@ -197,6 +197,11 @@ const NOTES: &[&str] = &[
      from one and from zero; the number counts the elements of the list rather than the rows \
      the statement has answered, so a FOR under a match starts again at each row that reaches \
      it",
+    "the graph a statement is against is named in front of it, as the graph the session is \
+     working in, the graph it started in, a graph the catalog holds by name or by path, or a \
+     graph the caller passed in as a parameter; the last is a graph reference and not a name, \
+     so a string spelling a graph's name is refused, and a reference to a graph that has been \
+     dropped since it was taken is refused rather than read as whatever holds that place now",
     "a YIELD after a match says which of the names it wrote leave it, and under what name, so \
      a name the yield does not carry is out of scope behind it and a name the match did not \
      write is refused; it narrows the columns and leaves the rows alone, so the rows a match \

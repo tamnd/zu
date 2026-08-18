@@ -1347,10 +1347,7 @@ impl Parser<'_> {
     }
 
     /// A `USE` clause in front of a query, which says which graph the
-    /// clauses after it are against (GQ01). ISO writes the graph as a
-    /// graph expression; a name and `CURRENT_PROPERTY_GRAPH` are the
-    /// two spellings that name a graph without running one, and a
-    /// graph an expression computes is not one this file holds.
+    /// clauses after it are against (GQ01, ISO 16.2).
     fn parse_use_graph(&mut self) -> Result<Option<GraphRef>> {
         if !self.eat_kw("USE") {
             return Ok(None);
@@ -1360,9 +1357,18 @@ impl Parser<'_> {
 
     /// The graph a clause names, which is the same thing written in a
     /// `USE` clause and after `AS COPY OF`.
+    ///
+    /// ISO calls this a graph expression, and the four forms here are
+    /// the four that name a graph: the one the session is working in,
+    /// the one it started in, one in the catalog by name, and one the
+    /// caller passed in. The last is what makes this a reference and
+    /// not a word: `USE $g` says which graph only once `$g` is there.
     fn parse_graph_ref(&mut self) -> Result<GraphRef> {
         if self.eat_kw("CURRENT_PROPERTY_GRAPH") || self.eat_kw("CURRENT_GRAPH") {
             return Ok(GraphRef::Current);
+        }
+        if self.eat_kw("HOME_PROPERTY_GRAPH") || self.eat_kw("HOME_GRAPH") {
+            return Ok(GraphRef::Home);
         }
         // `PROPERTY GRAPH` before the name is the long spelling and
         // says nothing the name does not.
@@ -1370,6 +1376,13 @@ impl Parser<'_> {
             self.expect_kw("GRAPH")?;
         } else {
             self.eat_kw("GRAPH");
+        }
+        // A parameter stands where a name stands, and after the
+        // optional `GRAPH`, because `USE GRAPH $g` and `USE $g` name
+        // the graph the same way.
+        if let Some(TokenKind::Param(name)) = self.peek().map(|t| t.kind.clone()) {
+            self.pos += 1;
+            return Ok(GraphRef::Param(name));
         }
         Ok(GraphRef::Named(self.parse_graph_name()?))
     }
@@ -3992,6 +4005,50 @@ mod tests {
         );
 
         assert_eq!(parsed("MATCH (n) RETURN n").use_graph, None);
+    }
+
+    /// The two graphs a session has words for, and the graph it is
+    /// handed. The last is the graph reference form: the text says
+    /// which parameter, and the parameter says which graph.
+    #[test]
+    fn a_use_clause_takes_a_graph_reference_and_not_only_a_name() {
+        let q = parsed("USE HOME_PROPERTY_GRAPH MATCH (n) RETURN n");
+        assert_eq!(q.use_graph, Some(GraphRef::Home));
+        assert_eq!(
+            parsed("USE HOME_GRAPH MATCH (n) RETURN n").use_graph,
+            Some(GraphRef::Home),
+            "the short spelling is the same graph"
+        );
+
+        let q = parsed("USE $g MATCH (n) RETURN n");
+        assert_eq!(q.use_graph, Some(GraphRef::Param("g".to_string())));
+
+        // A parameter stands where a name stands, so the word in front
+        // of it reads the same way it does in front of a name.
+        assert_eq!(
+            parsed("USE GRAPH $g MATCH (n) RETURN n").use_graph,
+            Some(GraphRef::Param("g".to_string()))
+        );
+        assert_eq!(
+            parsed("USE PROPERTY GRAPH $g MATCH (n) RETURN n").use_graph,
+            Some(GraphRef::Param("g".to_string()))
+        );
+
+        // The graph a copy starts from is written the same way, so it
+        // takes the same references.
+        assert_eq!(
+            catalog_stmt("CREATE GRAPH g ANY AS COPY OF $source"),
+            CatalogStmt::CreateGraph {
+                name: GraphName {
+                    schema: None,
+                    name: "g".to_string(),
+                },
+                if_not_exists: false,
+                or_replace: false,
+                of: GraphTypeRef::Any,
+                copy_of: Some(GraphRef::Param("source".to_string())),
+            }
+        );
     }
 
     #[test]

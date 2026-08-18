@@ -334,8 +334,22 @@ pub enum GraphRef {
     /// working in, which is what the clause names when it names no
     /// name at all.
     Current,
+    /// `USE HOME_PROPERTY_GRAPH`, the graph the session started in.
+    /// It is the working graph until something moves the working
+    /// graph, and it is what a statement names when it wants to go
+    /// back rather than to stay.
+    Home,
     /// A graph in the catalog, by name and by the schema it is in.
     Named(GraphName),
+    /// `USE $g`, a graph the caller passed in (ISO 16.2, a reference
+    /// parameter specification under `graph reference`).
+    ///
+    /// The name here is the parameter's, not the graph's: which graph
+    /// this is is not known while the statement is being read, so the
+    /// graph the statement runs against is settled when the parameter
+    /// arrives. That is the whole of what makes a graph reference an
+    /// expression rather than a word in the text.
+    Param(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

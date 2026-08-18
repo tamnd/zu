@@ -96,6 +96,14 @@ struct CachedPlan {
 /// a bad statement in a loop is the case worth having: it pays for the
 /// parse once instead of on every send, and the refusal it reads is
 /// the one the parse produced.
+/// The cache key of a text whose `USE` named a parameter, which is the
+/// text and the graph it was compiled against. A nul byte joins them
+/// because a statement cannot hold one, so no text can be written that
+/// collides with the key of another.
+fn focused_key(source: &str, graph: u32) -> String {
+    format!("{graph}\0{source}")
+}
+
 enum Compiled {
     Plan(Arc<CachedPlan>),
     /// Only a GQL condition is kept. An io failure reading the stats a
@@ -145,6 +153,16 @@ pub struct Session {
     /// most of what the query costs.
     snap: crate::snapshot::SnapshotCache,
     plans: HashMap<String, Compiled>,
+    /// The texts whose `USE` named a parameter, and the parameter each
+    /// one named.
+    ///
+    /// A plan is against one graph's tables, and one of these texts
+    /// says which graph only once the parameter is there, so its plans
+    /// are held one per graph under [`focused_key`] and never under the
+    /// text alone. This is what the lookup reads to know which of them
+    /// this call wants. It is a map of its own so that a text naming no
+    /// parameter, which is nearly every text, is still one lookup.
+    focused: HashMap<String, String>,
     stmts: HashMap<u64, String>,
     next_stmt: u64,
     /// The execution switches every statement on this session runs
@@ -190,6 +208,7 @@ impl Session {
             epoch,
             snap: crate::snapshot::SnapshotCache::default(),
             plans: HashMap::new(),
+            focused: HashMap::new(),
             stmts: HashMap::new(),
             next_stmt: 1,
             options: exec::Options {
@@ -593,7 +612,7 @@ impl Session {
             let result = self.run(source, params)?;
             return exec::stream_result(result, batch_rows, sink);
         }
-        let cached = self.plan_for(source)?;
+        let cached = self.plan_for(source, params)?;
         let args = query::bind_args(&cached.query.params, params)?;
         if cached.parts.is_some() {
             let result = self.run(source, params)?;
@@ -652,14 +671,14 @@ impl Session {
             Some(NotAQuery::Catalog(stmt)) => {
                 self.refuse_a_write()?;
                 let held = self.hold()?;
-                let out = crate::catalog_stmt::apply(self.graph.file_mut(), &stmt);
+                let out = crate::catalog_stmt::apply(self.graph.file_mut(), &stmt, params);
                 self.settle(out, held)?;
                 self.refresh()?;
                 return Ok(QueryResult::new(Vec::new(), Vec::new()));
             }
             None => {}
         }
-        let cached = match self.plan_for(source) {
+        let cached = match self.plan_for(source, params) {
             Ok(cached) => cached,
             // A label under `INSERT` that names no node table is a table
             // the statement means the graph to have, and there is no
@@ -928,7 +947,7 @@ impl Session {
     /// order.
     pub fn prepare(&mut self, source: &str) -> Result<(u64, Vec<String>)> {
         self.refresh()?;
-        let cached = self.plan_for(source)?;
+        let cached = self.plan_for(source, &[])?;
         let params = cached.query.params.clone();
         let id = self.next_stmt;
         self.next_stmt += 1;
@@ -950,7 +969,7 @@ impl Session {
         if matches!(self.plans.get(source), Some(Compiled::Plan(_))) {
             return Ok(true);
         }
-        self.plan_for(source)?;
+        self.plan_for(source, &[])?;
         Ok(false)
     }
 
@@ -997,7 +1016,7 @@ impl Session {
     /// reads and what a caller prints cannot disagree.
     pub fn explain_plan(&mut self, source: &str) -> Result<QueryPlan> {
         self.refresh()?;
-        let cached = self.plan_for(source)?;
+        let cached = self.plan_for(source, &[])?;
         let mut described = zu_query::plan::describe(&cached.plan, &cached.query, &cached.schema);
         described.notes = cached.notes.clone();
         Ok(described)
@@ -1006,7 +1025,7 @@ impl Session {
     /// EXPLAIN ANALYZE through the session: same cache, same options,
     /// profiled execution.
     pub fn explain_analyze(&mut self, source: &str, params: &[(&str, Value)]) -> Result<String> {
-        let notes = self.plan_for(source)?.notes.clone();
+        let notes = self.plan_for(source, params)?.notes.clone();
         let listing = self.profile(source, params)?.render();
         let listing = match self.decisions(source, params)? {
             Some(d) => format!("{listing}decisions:\n{}", d.render()),
@@ -1029,7 +1048,7 @@ impl Session {
         if !query::exec2_enabled() {
             return Ok(None);
         }
-        let cached = self.plan_for(source)?;
+        let cached = self.plan_for(source, params)?;
         let args = query::bind_args(&cached.query.params, params)?;
         let options = self.options.clone();
         let catalog = self.graph.catalog().clone();
@@ -1053,7 +1072,7 @@ impl Session {
     /// cardinality` reads q-error off this.
     pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<exec::Profile> {
         self.refresh()?;
-        let cached = self.plan_for(source)?;
+        let cached = self.plan_for(source, params)?;
         if cached.parts.is_some() {
             return Err(ZuError::Unsupported {
                 what: "profiling a statement that writes, which runs as the parts it was split at its write into rather than as the one plan a profile describes",
@@ -1093,7 +1112,7 @@ impl Session {
         let Ok(parsed) = zu_query::parser::parse(source) else {
             return Err(failed);
         };
-        let Ok(graph) = query::graph_of(self.graph.catalog(), self.working, &parsed) else {
+        let Ok(graph) = query::graph_of(self.graph.catalog(), self.working, &parsed, params) else {
             return Err(failed);
         };
         let wanted = crate::declare::wanted(self.graph.catalog(), graph, &parsed)?;
@@ -1119,7 +1138,7 @@ impl Session {
         // The tables are published now, and the schemas this session
         // holds describe the catalog from before them.
         self.refresh()?;
-        let cached = self.plan_for(source)?;
+        let cached = self.plan_for(source, params)?;
         let args = query::bind_args(&cached.query.params, params)?;
         let parts = cached.parts.as_ref().ok_or_else(|| {
             ZuError::InvalidArgument(
@@ -1130,29 +1149,78 @@ impl Session {
         self.run_parts(&cached, parts, args, params)
     }
 
-    fn plan_for(&mut self, source: &str) -> Result<Arc<CachedPlan>> {
+    /// The plan for a text, compiled on the first statement that writes
+    /// it and held for the ones after.
+    ///
+    /// The parameters are read only by a text whose `USE` named one,
+    /// because that is the only text whose graph is not in it. Every
+    /// other text is one lookup and nothing else, which is what the P0
+    /// plan-hit gate times.
+    fn plan_for(&mut self, source: &str, params: &[(&str, Value)]) -> Result<Arc<CachedPlan>> {
         if let Some(compiled) = self.plans.get(source) {
             return compiled.result();
         }
-        let compiled = match self.compile(source) {
+        if let Some(name) = self.focused.get(source) {
+            let name = name.clone();
+            let graph = query::graph_of_param(self.graph.catalog(), &name, params)?;
+            let key = focused_key(source, graph);
+            if let Some(compiled) = self.plans.get(&key) {
+                return compiled.result();
+            }
+            return self.keep(key, source, graph);
+        }
+        // The text is parsed before anything is compiled because the
+        // `USE` clause in front of it says which graph's tables the
+        // names below it are names of. A text that will not parse is
+        // held as the refusal it is: it will not parse next time
+        // either.
+        let parsed = match zu_query::parser::parse(source) {
+            Ok(parsed) => parsed,
+            Err(ZuError::Gql(record)) => {
+                self.remember(source.to_string(), Compiled::Refused(record.clone()));
+                return Err(ZuError::Gql(record));
+            }
+            Err(other) => return Err(other),
+        };
+        let graph = query::graph_of(self.graph.catalog(), self.working, &parsed, params)?;
+        // A `USE` that named a parameter is remembered as the parameter
+        // it named, and its plan is held under the graph as well as the
+        // text. Holding it under the text alone would hand the next
+        // call a plan against the graph the call before it passed.
+        if let Some(zu_query::ast::GraphRef::Param(name)) = &parsed.use_graph {
+            self.focused.insert(source.to_string(), name.clone());
+            return self.keep(focused_key(source, graph), source, graph);
+        }
+        self.keep(source.to_string(), source, graph)
+    }
+
+    /// Compiles a text against one graph and holds what came of it
+    /// under `key`, a GQL refusal included: a statement the standard
+    /// refuses is refused the same way however often it is written.
+    fn keep(&mut self, key: String, source: &str, graph: u32) -> Result<Arc<CachedPlan>> {
+        let compiled = match self.compile(source, graph) {
             Ok(plan) => Compiled::Plan(plan),
             Err(ZuError::Gql(record)) => Compiled::Refused(record),
             Err(other) => return Err(other),
         };
         let result = compiled.result();
-        if self.plans.len() >= PLAN_CAP {
-            self.plans.clear();
-        }
-        self.plans.insert(source.to_string(), compiled);
+        self.remember(key, compiled);
         result
     }
 
-    fn compile(&mut self, source: &str) -> Result<Arc<CachedPlan>> {
-        // The text is parsed before anything is compiled because the
-        // `USE` clause in front of it says which graph's tables the
-        // names below it are names of.
+    /// Puts one compiled text in the cache, emptying it first when it
+    /// is full. The two maps are emptied together because one of them
+    /// says where the other one holds a plan.
+    fn remember(&mut self, key: String, compiled: Compiled) {
+        if self.plans.len() >= PLAN_CAP {
+            self.plans.clear();
+            self.focused.clear();
+        }
+        self.plans.insert(key, compiled);
+    }
+
+    fn compile(&mut self, source: &str, graph: u32) -> Result<Arc<CachedPlan>> {
         let parsed = zu_query::parser::parse(source)?;
-        let graph = query::graph_of(self.graph.catalog(), self.working, &parsed)?;
         let schema = self.schema_for(graph)?;
         let (query, plan, notes) = query::compile_parsed(&parsed, &schema)?;
         let parts = crate::split::split(&query, &schema)?;
@@ -1214,6 +1282,7 @@ impl Session {
         self.schemas.clear();
         self.schemas.insert(self.working, Arc::new(schema));
         self.plans.clear();
+        self.focused.clear();
         // The readers the last epoch's snapshots loaded describe a
         // layout that has moved, so they go with the plans.
         self.snap = crate::snapshot::SnapshotCache::default();

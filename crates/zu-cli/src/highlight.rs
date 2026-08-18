@@ -410,12 +410,14 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "INTERSECT",
     "OTHERWISE",
     "DESCENDING",
+    "HOME_GRAPH",
     "ORDINALITY",
     "PROPERTIES",
     "CARDINALITY",
     "PATH_LENGTH",
     "RELATIONSHIP",
     "CURRENT_GRAPH",
+    "HOME_PROPERTY_GRAPH",
     "CURRENT_PROPERTY_GRAPH",
 ];
 

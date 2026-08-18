@@ -68,7 +68,7 @@ words = ["AND", "OR", "XOR", "NOT", "IS", "IN", "STARTS", "ENDS", "CONTAINS", "L
 [[group]]
 kind = "keyword"
 doc = "The catalog statements and what they name."
-words = ["CREATE", "DROP", "SCHEMA", "GRAPH", "PROPERTY", "TYPE", "IF", "REPLACE", "COPY", "OF", "NODE", "EDGE", "RELATIONSHIP", "PROPERTIES", "NO", "CURRENT_GRAPH", "CURRENT_PROPERTY_GRAPH"]
+words = ["CREATE", "DROP", "SCHEMA", "GRAPH", "PROPERTY", "TYPE", "IF", "REPLACE", "COPY", "OF", "NODE", "EDGE", "RELATIONSHIP", "PROPERTIES", "NO", "CURRENT_GRAPH", "CURRENT_PROPERTY_GRAPH", "HOME_GRAPH", "HOME_PROPERTY_GRAPH"]
 
 [[group]]
 kind = "keyword"

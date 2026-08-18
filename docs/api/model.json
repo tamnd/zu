@@ -1665,8 +1665,8 @@
       "id": "zu::catalog_stmt::apply",
       "kind": "function",
       "name": "apply",
-      "signature": "fn apply(db: &mut zu::zu1::file::Zu1File, stmt: &zu_query::ast::CatalogStmt) -> zu_common::Result<Effect>",
-      "doc": "Runs one catalog statement against `db`, publishing a new catalog\nwhen it changes anything."
+      "signature": "fn apply(db: &mut zu::zu1::file::Zu1File, stmt: &zu_query::ast::CatalogStmt, params: &[(&str, zu_query::exec::Value)]) -> zu_common::Result<Effect>",
+      "doc": "Runs one catalog statement against `db`, publishing a new catalog\nwhen it changes anything.\n\nThe parameters are here for `AS COPY OF $g`, which names the graph\nto copy the way a `USE` names the graph to read."
     },
     {
       "id": "zu::convert",

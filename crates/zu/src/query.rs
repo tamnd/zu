@@ -79,7 +79,7 @@ pub fn schema_of_graph(catalog: &Catalog, graph: u32) -> Result<Schema> {
 /// Parses and binds one query against a zu1 catalog.
 pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
     let parsed = parser::parse(source)?;
-    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed)?;
+    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
     binder::bind(&parsed, &schema_of_graph(catalog, graph)?)
 }
 
@@ -87,7 +87,7 @@ pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
 /// EXPLAIN listing of the plan that would execute.
 pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
     let parsed = parser::parse(source)?;
-    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed)?;
+    let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
     let schema = schema_of_graph(catalog, graph)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
@@ -905,25 +905,73 @@ pub(crate) fn schema_with_stats(db: &mut Zu1File, catalog: &Catalog, graph: u32)
 /// The graph a parsed query is against, given the graph the caller is
 /// working in. A `USE` naming a graph the catalog does not hold is a
 /// reference that resolves to nothing, which is what `42002` says.
+///
+/// The parameters are here because `USE $g` names its graph with one,
+/// and that is the one form whose answer is not in the text.
 pub(crate) fn graph_of(
     catalog: &Catalog,
     working: u32,
     query: &zu_query::ast::Query,
+    params: &[(&str, Value)],
 ) -> Result<u32> {
     use zu_query::ast::GraphRef;
-    let Some(GraphRef::Named(name)) = &query.use_graph else {
-        return Ok(working);
+    match &query.use_graph {
+        None | Some(GraphRef::Current) => Ok(working),
+        Some(GraphRef::Home) => Ok(catalog.home_graph_id()),
+        Some(GraphRef::Named(name)) => {
+            let schema = name.schema.as_deref().unwrap_or("/");
+            catalog
+                .graph(schema, &name.name)
+                .map(|g| g.id)
+                .ok_or_else(|| {
+                    ZuError::gql(
+                        codes::C42002,
+                        format!("USE names '{}', which is no graph in '{schema}'", name.name),
+                    )
+                })
+        }
+        Some(GraphRef::Param(name)) => graph_of_param(catalog, name, params),
+    }
+}
+
+/// The graph a `USE $g` names, out of the parameter the caller passed.
+///
+/// The value has to be a graph reference and not a name, because a
+/// name is a thing the catalog looks up now and a reference is a thing
+/// somebody was handed earlier: the point of the form is that the
+/// caller holds the graph. A handle whose graph has been dropped, or
+/// dropped and made again under the same name, is a reference that no
+/// longer resolves, which is the same `42002` a missing name gets.
+pub(crate) fn graph_of_param(
+    catalog: &Catalog,
+    name: &str,
+    params: &[(&str, Value)],
+) -> Result<u32> {
+    let Some((_, value)) = params.iter().find(|(n, _)| *n == name) else {
+        return Err(ZuError::gql(
+            codes::C42002,
+            format!("USE names ${name}, and no parameter of that name was given"),
+        ));
     };
-    let schema = name.schema.as_deref().unwrap_or("/");
-    catalog
-        .graph(schema, &name.name)
-        .map(|g| g.id)
-        .ok_or_else(|| {
-            ZuError::gql(
-                codes::C42002,
-                format!("USE names '{}', which is no graph in '{schema}'", name.name),
-            )
-        })
+    let Value::Graph(handle) = value else {
+        return Err(ZuError::gql(
+            codes::C42002,
+            format!(
+                "USE ${name} names a graph, so ${name} has to be a graph reference and not {}: take one with Session::graph_ref",
+                crate::insert::describe(value)
+            ),
+        ));
+    };
+    match catalog.graph(&handle.schema, &handle.name) {
+        Some(graph) if graph.id == handle.id => Ok(handle.id),
+        _ => Err(ZuError::gql(
+            codes::C42002,
+            format!(
+                "USE ${name} names {}, which is no longer the graph the reference was taken on",
+                handle.label()
+            ),
+        )),
+    }
 }
 
 /// Binds, plans, and optimizes one parsed query against a schema.
@@ -991,7 +1039,7 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
     let parsed = parser::parse(source)?;
     // A one-shot call has no session, so the graph it works in is the
     // home graph and a `USE` is the only way to name another one.
-    let graph = graph_of(&catalog, catalog.home_graph_id(), &parsed)?;
+    let graph = graph_of(&catalog, catalog.home_graph_id(), &parsed, params)?;
     let schema = schema_with_stats(db, &catalog, graph)?;
     let (query, plan, notes) = compile_parsed(&parsed, &schema)?;
     // A write needs the log and the overlay a session owns, and this
@@ -1029,7 +1077,7 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
 pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<QueryResult> {
     match not_a_query(source)? {
         Some(NotAQuery::Catalog(stmt)) => {
-            crate::catalog_stmt::apply(db, &stmt)?;
+            crate::catalog_stmt::apply(db, &stmt, params)?;
             return Ok(QueryResult::new(Vec::new(), Vec::new()));
         }
         // A transaction is several statements held together, and this

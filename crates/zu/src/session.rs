@@ -501,7 +501,7 @@ impl Session {
         if let Some(parts) = &cached.parts {
             self.refuse_a_write()?;
             let held = self.hold()?;
-            let out = self.run_parts(&cached, parts, args);
+            let out = self.run_parts(&cached, parts, args, params);
             return self.settle(out, held);
         }
         let options = self.options.clone();
@@ -546,6 +546,7 @@ impl Session {
         cached: &CachedPlan,
         parts: &[crate::split::Part],
         args: Vec<Value>,
+        params: &[(&str, Value)],
     ) -> Result<QueryResult> {
         // Asked before anything is worked out, so that a read-only
         // connection is told that it is read-only rather than told
@@ -606,6 +607,25 @@ impl Session {
                     next
                 }
                 crate::split::Write::Delete(delete) => {
+                    // The queries the `VALUE { ... }` items hold read
+                    // nothing from the row, so they run once rather
+                    // than once per row. They run before the rows are
+                    // walked because they read the store, and the store
+                    // still holds everything this statement is about to
+                    // take away. A delete runs once per row the clauses
+                    // before it answered, so a statement they answered
+                    // nothing for runs none of this.
+                    let mut named = Vec::with_capacity(delete.queries.len());
+                    if !rows.is_empty() {
+                        for nested in &delete.queries {
+                            named.push(self.one_element(
+                                nested,
+                                &cached.schema,
+                                params,
+                                &options,
+                            )?);
+                        }
+                    }
                     let catalog = self.graph.catalog().clone();
                     let mut removals = crate::delete::Removals::open(delete, catalog);
                     let mut next = Vec::with_capacity(rows.len());
@@ -613,6 +633,9 @@ impl Session {
                         let (carried, _) = row.split_at(carry);
                         removals.row(self.graph.file_mut(), carried)?;
                         next.push(Value::List(carried.to_vec()));
+                    }
+                    for value in &named {
+                        removals.element(self.graph.file_mut(), value)?;
                     }
                     let (rows, edges) = removals.staged();
                     self.write(|txn| crate::delete::stage(txn, &rows, &edges))?;
@@ -645,6 +668,48 @@ impl Session {
             carried = Some(Value::List(next));
         }
         unreachable!("the last part of a split statement writes nothing")
+    }
+
+    /// Runs the query inside a `DELETE VALUE { ... }` and answers the
+    /// one element it named.
+    ///
+    /// A value query expression is a value, so the query has to answer
+    /// one row of one column: two rows have not said which element the
+    /// item is about and no rows have not named one at all, and both
+    /// are 22G03 rather than a delete of nothing. The parameters are
+    /// the caller's, bound again for this query, because the nested
+    /// query names what it names and the statement around it need not
+    /// name the same things.
+    fn one_element(
+        &mut self,
+        nested: &crate::split::Subquery,
+        schema: &zu_query::binder::Schema,
+        params: &[(&str, Value)],
+        options: &zu_query::exec::Options,
+    ) -> Result<Value> {
+        let args = query::bind_args(&nested.query.params, params)?;
+        let out = exec::execute(
+            &nested.plan,
+            &nested.query,
+            schema,
+            &mut self.graph,
+            &args,
+            options,
+        )?;
+        let mut rows = out.rows.into_iter();
+        let (Some(row), None) = (rows.next(), rows.next()) else {
+            return Err(ZuError::gql(
+                codes::C22G03,
+                "the query inside DELETE VALUE names the one element to delete, and this one answered a different number of rows",
+            ));
+        };
+        match <[Value; 1]>::try_from(row) {
+            Ok([value]) => Ok(value),
+            Err(_) => Err(ZuError::gql(
+                codes::C22G03,
+                "the query inside DELETE VALUE names the one element to delete, and this one answered more than one column",
+            )),
+        }
     }
 
     /// Compiles a statement and pins it under an id. The id maps back
@@ -850,7 +915,7 @@ impl Session {
                     .to_string(),
             )
         })?;
-        self.run_parts(&cached, parts, args)
+        self.run_parts(&cached, parts, args, params)
     }
 
     fn plan_for(&mut self, source: &str) -> Result<Arc<CachedPlan>> {

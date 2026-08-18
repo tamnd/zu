@@ -14,7 +14,8 @@
 //! that row before the next part reads it back through
 //! [`zu_query::plan::LogicalPlan::Rows`].
 
-use zu_common::Result;
+use zu_common::gqlstatus::codes;
+use zu_common::{Result, ZuError};
 use zu_query::binder::{
     BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetItem,
     Schema, Type,
@@ -107,11 +108,23 @@ pub(crate) struct Set {
 /// GQL leaves a deleted element bound and reading one is 22G11.
 pub(crate) struct Delete {
     pub(crate) slots: Vec<usize>,
+    /// The delete items written as `VALUE { ... }`, compiled. Each one
+    /// runs on its own and answers the one element that item takes
+    /// away.
+    pub(crate) queries: Vec<Subquery>,
     /// The slots the part before the write projects. A delete carries
     /// nothing behind them.
     pub(crate) carry: Vec<usize>,
     /// Whether the edges on the elements go with them.
     pub(crate) detach: bool,
+}
+
+/// A query nested inside a statement, compiled the way the statement
+/// around it was and run on its own. `DELETE VALUE { ... }` is the one
+/// place a statement holds one.
+pub(crate) struct Subquery {
+    pub(crate) query: BoundQuery,
+    pub(crate) plan: LogicalPlan,
 }
 
 /// Splits a bound statement into the parts the session runs, or
@@ -136,7 +149,7 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
             });
             return Ok(Some(parts));
         };
-        let write = write_of(&rest[at]);
+        let write = write_of(&rest[at], schema)?;
         let mut clauses = rest[..at].to_vec();
         let exprs = write
             .carry()
@@ -180,8 +193,8 @@ fn is_write(clause: &BoundClause) -> bool {
 }
 
 /// The write a clause [`is_write`] answered for describes.
-fn write_of(clause: &BoundClause) -> Write {
-    match clause {
+fn write_of(clause: &BoundClause, schema: &Schema) -> Result<Write> {
+    Ok(match clause {
         BoundClause::Insert { nodes, rels, carry } => Write::Insert(Insert {
             nodes: nodes.clone(),
             rels: rels.clone(),
@@ -198,15 +211,40 @@ fn write_of(clause: &BoundClause) -> Write {
         }),
         BoundClause::Delete {
             slots,
+            queries,
             carry,
             detach,
         } => Write::Delete(Delete {
             slots: slots.clone(),
+            queries: queries
+                .iter()
+                .map(|nested| nested_query(nested, schema))
+                .collect::<Result<Vec<_>>>()?,
             carry: carry.clone(),
             detach: *detach,
         }),
         _ => unreachable!("the position that matched"),
+    })
+}
+
+/// Compiles the query inside a `DELETE VALUE { ... }` against the same
+/// schema the statement around it is compiled against, so the nested
+/// query reads the graph the outer `USE` named.
+///
+/// A nested query that writes is refused here rather than run. The
+/// delete item is a value expression and a value expression does not
+/// change the graph, and an engine that ran one anyway would be
+/// deciding on its own whether the inner write happened before or after
+/// the outer delete.
+fn nested_query(parsed: &zu_query::ast::Query, schema: &Schema) -> Result<Subquery> {
+    let (query, plan, _) = crate::query::compile_parsed(parsed, schema)?;
+    if query.clauses.iter().any(is_write) {
+        return Err(ZuError::gql(
+            codes::C42001,
+            "the query inside DELETE VALUE answers the element to delete, so it reads and does not write",
+        ));
     }
+    Ok(Subquery { query, plan })
 }
 
 /// One item of the projection a part ends in. The name is positional

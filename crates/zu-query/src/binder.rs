@@ -18,8 +18,9 @@ use zu_common::gqlstatus::codes;
 use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
-    self, BinaryOp, Clause, Expr, LabelExpr, Literal, NodePattern, PathMode, Projection,
-    RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, SortKey, UnaryOp,
+    self, BinaryOp, Clause, DeleteTarget, Expr, LabelExpr, Literal, NodePattern, PathMode,
+    Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem, SortKey,
+    UnaryOp,
 };
 
 fn invalid(detail: String) -> ZuError {
@@ -797,6 +798,12 @@ pub enum BoundClause {
     /// the slots they were found in.
     Delete {
         slots: Vec<usize>,
+        /// The delete items written as `VALUE { ... }`, one query each,
+        /// still unbound. A nested query specification is a statement
+        /// against the same graph rather than a piece of this one, so
+        /// it is compiled and run on its own and the element it answers
+        /// is what the item deletes.
+        queries: Vec<crate::ast::Query>,
         /// The slots in scope where the write runs, the same thing
         /// [`BoundClause::Insert::carry`] holds. A `DELETE` creates
         /// nothing either, so the row on the other side of it is what
@@ -1512,12 +1519,24 @@ impl Binder<'_> {
             }
             Clause::Delete { targets, detach } => {
                 let carry = self.carried();
-                let mut slots = Vec::with_capacity(targets.len());
-                for name in targets {
-                    slots.push(self.bind_delete_target(name)?);
+                let mut slots = Vec::new();
+                let mut queries = Vec::new();
+                for target in targets {
+                    match target {
+                        DeleteTarget::Variable(name) => {
+                            slots.push(self.bind_delete_target(name)?);
+                        }
+                        // A nested query specification is a statement of
+                        // its own against the same graph, so it is not
+                        // bound in this scope and does not see the
+                        // variables around it. It is carried through as
+                        // written and compiled where it runs.
+                        DeleteTarget::Value(nested) => queries.push((**nested).clone()),
+                    }
                 }
                 Ok(BoundClause::Delete {
                     slots,
+                    queries,
                     carry,
                     detach: *detach,
                 })

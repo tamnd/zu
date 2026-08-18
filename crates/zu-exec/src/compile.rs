@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use zu_common::Result;
+use zu_common::types::LogicalType;
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 use zu_query::exec::{Options, Sip, Value, Wcoj};
@@ -3601,6 +3602,27 @@ impl Compiler<'_> {
             });
             return Ok(Some(dst));
         }
+        // A type test the column already answers. GV65 to GV68 put IS
+        // TYPED in filter position, and in general the answer is a
+        // question about the value: `x IS TYPED INT8` has to look at
+        // every number, because whether it fits in eight bits is not
+        // something the column's type settles. The case that is settled
+        // is the test that asks a column for the type it has, or for
+        // one that holds it whole, and there the answer is the same for
+        // every row before a row is read. Null included: a null belongs
+        // to every nullable type, and the target has to be nullable to
+        // get past `widens` at all.
+        if let BoundExpr::IsTyped { expr, ty, negated } = expr {
+            let Some(src) = self.value_reg(b, expr, level, false)? else {
+                return Ok(None);
+            };
+            if !widens(b.types[src as usize], ty) {
+                return Ok(None);
+            }
+            let dst = b.push_type(PhysType::Bool)?;
+            b.ops.push(ExprOp::All { on: !*negated, dst });
+            return Ok(Some(dst));
+        }
         let BoundExpr::Binary { op, lhs, rhs } = expr else {
             return Ok(None);
         };
@@ -3806,6 +3828,25 @@ impl Compiler<'_> {
                 b.ops.push(ExprOp::LoadCol { col, dst });
                 Ok(Some(dst))
             }
+            // A cast the values cannot notice. GA05 put CAST in filter
+            // position and a cast is a per-row conversion with a
+            // condition behind it, so it belongs to the row engine in
+            // general. The exception is the cast that does nothing: a
+            // column stored as a 64 bit integer asked for as a 64 bit
+            // or wider integer is the value it already was, and the
+            // same holds for a float column asked for as a float of at
+            // least the width it has. Peeling those keeps a filter
+            // written that way on the kernel.
+            BoundExpr::Cast { expr, ty } => {
+                let Some(src) = self.value_reg(b, expr, level, outer)? else {
+                    return Ok(None);
+                };
+                if widens(b.types[src as usize], ty) {
+                    Ok(Some(src))
+                } else {
+                    Ok(None)
+                }
+            }
             BoundExpr::Binary { op, lhs, rhs } => {
                 let Some(bin) = bin_op(*op) else {
                     return Ok(None);
@@ -4006,6 +4047,46 @@ fn cmp_op(op: BinaryOp) -> Option<CmpOp> {
     }
 }
 
+/// Whether a cast of a register holding `from` to `to` is the identity,
+/// so the cast can be dropped and the filter stay on a kernel.
+///
+/// The bar is high on purpose. A cast is a conversion with a condition
+/// behind it: a narrowing one raises 22003, an unsigned one raises 22003
+/// on a negative, a declared precision is a digit count the engine owes
+/// the user a check on, and a target written NOT NULL raises 22004 on a
+/// null. Every one of those is a per-row decision the kernels have no op
+/// for, so every one of them says no here. What is left is the cast that
+/// asks a value for the type it already has, or for one that holds it
+/// whole: an i64 read as INT64 or wider, and an f64 read as FLOAT64 or
+/// wider. Those change no answer downstream, because the register keeps
+/// the same physical width either way and the comparison it feeds sees
+/// the same bits.
+fn widens(from: PhysType, to: &LogicalType) -> bool {
+    // A target written without NOT NULL is nullable, and a nullable
+    // target is the only one that cannot raise on a null end.
+    let LogicalType::Nullable(inner) = to else {
+        return false;
+    };
+    match (from, inner.as_ref()) {
+        (
+            PhysType::Int64,
+            LogicalType::Int {
+                signed: true,
+                bits,
+                precision: None,
+            },
+        ) => bits.bits() >= 64,
+        (
+            PhysType::Float64,
+            LogicalType::Float {
+                bits,
+                precision: None,
+            },
+        ) => bits.bits() >= 64,
+        _ => false,
+    }
+}
+
 fn bin_op(op: BinaryOp) -> Option<BinOp> {
     match op {
         BinaryOp::Add => Some(BinOp::Add),
@@ -4162,6 +4243,7 @@ fn expand_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zu_common::types::{FloatBits, IntBits};
 
     /// Every integer the rewritten predicate answers the same way the
     /// float one does, which is the whole claim the rewrite makes.
@@ -4210,6 +4292,84 @@ mod tests {
         }
         // Not a comparison, so there is nothing to move.
         assert!(narrow_float(BinaryOp::Add, 1.5).is_none());
+    }
+
+    fn int(signed: bool, bits: IntBits, precision: Option<u16>) -> LogicalType {
+        LogicalType::Int {
+            signed,
+            bits,
+            precision,
+        }
+    }
+
+    fn nullable(ty: LogicalType) -> LogicalType {
+        LogicalType::Nullable(Box::new(ty))
+    }
+
+    /// The cast that can be dropped is the one that asks a value for a
+    /// type it already fits in whole, and nothing else. Each refusal
+    /// here stands for a per row decision the kernels cannot make: a
+    /// narrower width or an unsigned target raises 22003 on a value
+    /// that does not fit, a declared precision is a digit count the
+    /// engine owes the user a check on, and a target written NOT NULL
+    /// raises 22004 on a null.
+    #[test]
+    fn only_a_cast_that_cannot_change_a_value_is_dropped() {
+        for bits in [IntBits::B64, IntBits::B128, IntBits::B256] {
+            assert!(widens(
+                PhysType::Int64,
+                &nullable(int(true, bits, None))
+            ));
+        }
+        for bits in [IntBits::B8, IntBits::B16, IntBits::B32] {
+            assert!(!widens(
+                PhysType::Int64,
+                &nullable(int(true, bits, None))
+            ));
+        }
+        assert!(!widens(
+            PhysType::Int64,
+            &nullable(int(false, IntBits::B64, None))
+        ));
+        assert!(!widens(
+            PhysType::Int64,
+            &nullable(int(true, IntBits::B64, Some(18)))
+        ));
+        assert!(!widens(PhysType::Int64, &int(true, IntBits::B64, None)));
+
+        let f64_ty = |bits| {
+            LogicalType::Float {
+                bits,
+                precision: None,
+            }
+        };
+        for bits in [FloatBits::B64, FloatBits::B128, FloatBits::B256] {
+            assert!(widens(PhysType::Float64, &nullable(f64_ty(bits))));
+        }
+        for bits in [FloatBits::B16, FloatBits::B32] {
+            assert!(!widens(PhysType::Float64, &nullable(f64_ty(bits))));
+        }
+        // The two towers do not cross: an integer read as a float is a
+        // conversion the register would have to carry out, and a float
+        // read as an integer rounds.
+        assert!(!widens(
+            PhysType::Int64,
+            &nullable(f64_ty(FloatBits::B64))
+        ));
+        assert!(!widens(
+            PhysType::Float64,
+            &nullable(int(true, IntBits::B64, None))
+        ));
+        // A string is stored as a view and every string type carries a
+        // length bound, so no string cast is free.
+        assert!(!widens(
+            PhysType::Str,
+            &nullable(LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false,
+            })
+        ));
     }
 
     fn hop(from: usize, to: usize) -> Op {

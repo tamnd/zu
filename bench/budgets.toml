@@ -1595,6 +1595,18 @@ insert_edge_stmt_kb = 512.0
 insert_edge_stmt_cpu_us = 8000.0
 insert_edge_x = 4.0
 
+# The same insert against edges that also carry a 64 character payload,
+# which is what LinkBench really writes. A string column is the one the
+# rewrite cannot just shuffle: the blob is re-encoded, and re-encoding
+# used to mean training a fresh FSST symbol table on a column that had
+# already trained one. Measured 6.2 ms of processor at 10000 edges,
+# against 28.8 ms before the rewrite started reading the table off the
+# segment it is replacing, so the ceiling is set to catch training
+# coming back and not to track drift. The wall clock one is loose for
+# the same reason as above, it is mostly the sync.
+insert_edge_str_stmt_us = 250000.0
+insert_edge_str_stmt_cpu_us = 20000.0
+
 # The typed row layer (dx/04 §4) over the same read written as a match
 # on Value, both timed in one run against one result of 100000 rows and
 # two columns, best of five passes each. This is the same obligation

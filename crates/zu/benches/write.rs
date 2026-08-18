@@ -384,6 +384,44 @@ fn build_edge_props(dir: &Path, rows: u64) -> std::path::PathBuf {
     path
 }
 
+/// The same again with a string on the edges as well, which is the
+/// table LinkBench actually writes: its LINK carries a payload of 64
+/// random characters, and a string column is the expensive one to
+/// rewrite because the blob has to be re-encoded and not just moved.
+fn build_edge_payload(dir: &Path, rows: u64) -> std::path::PathBuf {
+    let path = build(dir, rows);
+    let mut db = Zu1File::open(&path).expect("open");
+    let since: Vec<u64> = (0..rows).collect();
+    let loads: Vec<Vec<u8>> = (0..rows).map(payload).collect();
+    let refs: Vec<&[u8]> = loads.iter().map(Vec::as_slice).collect();
+    store_rel_props(
+        &mut db,
+        "follows",
+        &[
+            ("since", PropValues::Int(&since)),
+            ("payload", PropValues::Str(&refs)),
+        ],
+    )
+    .expect("rel props");
+    path
+}
+
+/// 64 characters that look like the payload LinkBench hands an edge:
+/// drawn from a small alphabet so the column compresses the way a real
+/// one does, and varying per edge so a symbol table cannot cheat it.
+fn payload(i: u64) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut seed = i
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (0..64)
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ALPHABET[(seed >> 33) as usize % ALPHABET.len()]
+        })
+        .collect()
+}
+
 /// The same table with a label beyond its own name declared on it,
 /// which is what a `SET` of a label is measured against: a label the
 /// table has not declared is one the statement declares, and a catalog
@@ -728,14 +766,30 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
 /// and the fold rebuilds the CSR and rewrites the edge columns into the
 /// new order. Run at two sizes, the number says whether the statement
 /// pays for the edge it added or for every edge the table already had.
-fn run_insert_edge(dir: &Path, rows: u64) -> Cost {
-    let path = build_edge_props(dir, rows);
+///
+/// With `strings` on, the edges carry a payload as well, which is the
+/// LinkBench shape: the rewrite then has to re-encode a blob and not
+/// just shuffle fixed width values.
+fn run_insert_edge(dir: &Path, rows: u64, strings: bool) -> Cost {
+    let path = if strings {
+        build_edge_payload(dir, rows)
+    } else {
+        build_edge_props(dir, rows)
+    };
     let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
     let mut conn = db.connect().expect("connect");
     let insert = |i: u64| {
+        let props = if strings {
+            format!(
+                "since: {i}, payload: '{}'",
+                String::from_utf8(payload(i)).expect("ascii")
+            )
+        } else {
+            format!("since: {i}")
+        };
         format!(
             "MATCH (a:person), (b:person) WHERE a.age = {} AND b.age = {} \
-             INSERT (a)-[:follows {{since: {i}}}]->(b)",
+             INSERT (a)-[:follows {{{props}}}]->(b)",
             i % rows,
             (i * 7 + 3) % rows,
         )
@@ -911,11 +965,17 @@ fn main() {
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"), sync);
 
-    let edge_small = run_insert_edge(&root.path().join("insert-edge-small"), SMALL);
+    let edge_small = run_insert_edge(&root.path().join("insert-edge-small"), SMALL, false);
     edge_small.report(&format!("INSERT an edge, {SMALL} edges"), sync);
 
-    let edge_large = run_insert_edge(&root.path().join("insert-edge-large"), LARGE);
+    let edge_large = run_insert_edge(&root.path().join("insert-edge-large"), LARGE, false);
     edge_large.report(&format!("INSERT an edge, {LARGE} edges"), sync);
+
+    let edge_str = run_insert_edge(&root.path().join("insert-edge-str"), SMALL, true);
+    edge_str.report(
+        &format!("INSERT an edge with a payload, {SMALL} edges"),
+        sync,
+    );
 
     let delete = run_delete(&root.path().join("delete"), SMALL);
     delete.report(&format!("DELETE, {SMALL} rows"), sync);
@@ -953,6 +1013,8 @@ fn main() {
         ("insert_edge_stmt_us", edge_small.us),
         ("insert_edge_stmt_kb", edge_small.written / 1024.0),
         ("insert_edge_stmt_cpu_us", edge_small.cpu),
+        ("insert_edge_str_stmt_us", edge_str.us),
+        ("insert_edge_str_stmt_cpu_us", edge_str.cpu),
         ("insert_edge_x", edge_x),
         ("delete_stmt_us", delete.us),
         ("detach_stmt_us", detach.us),

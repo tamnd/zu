@@ -404,6 +404,24 @@ fn column_value(
     }
 }
 
+/// What a batch of rows reads for a property no column holds: the id,
+/// which without a stored `id` column is the offset, and an error for
+/// anything else. The single row read says the same thing.
+fn every_row_is_its_own_offset(
+    rows: &[u64],
+    key: &str,
+    table: u32,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    if key != "id" {
+        return Err(ZuError::InvalidArgument(format!(
+            "unknown property '{key}' on table {table}"
+        )));
+    }
+    out.extend(rows.iter().map(|&row| Value::Int(row as i64)));
+    Ok(())
+}
+
 impl Graph for Zu1Graph<'_> {
     fn neighbors(&mut self, rel: u32, node: u64, reversed: bool, out: &mut Vec<u64>) -> Result<()> {
         self.ensure_reader(rel)?;
@@ -486,6 +504,42 @@ impl Graph for Zu1Graph<'_> {
                 "unknown property '{other}' on table {table}"
             ))),
         }
+    }
+
+    fn properties(
+        &mut self,
+        table: u32,
+        rows: &[u64],
+        key: &str,
+        out: &mut Vec<Value>,
+    ) -> Result<()> {
+        self.ensure_props(table)?;
+        out.clear();
+        out.reserve(rows.len());
+        let Self { db, props, .. } = self;
+        let Some(reader) = props.get_mut(&table).expect("just loaded") else {
+            return every_row_is_its_own_offset(rows, key, table, out);
+        };
+        let Some(col) = reader.col(key) else {
+            return every_row_is_its_own_offset(rows, key, table, out);
+        };
+        // A fixed width column with nothing missing from it is the one
+        // this is for: the rows gather through one decode of each chunk
+        // they land in, and the word each of them holds becomes a value
+        // without the column being found again.
+        if reader.columns()[col].is_lane() && !reader.is_nullable(col) {
+            let mut words = Vec::with_capacity(rows.len());
+            reader.gather_int(db, col, rows, &mut words)?;
+            let ty = &reader.columns()[col].ty;
+            for word in words {
+                out.push(word_value(ty, word, key)?);
+            }
+            return Ok(());
+        }
+        for &row in rows {
+            out.push(column_value(db, reader, col, row, key)?);
+        }
+        Ok(())
     }
 
     fn labels(&mut self, table: u32, offset: u64) -> Result<u64> {
@@ -2162,6 +2216,156 @@ mod tests {
             &mut db,
         );
         assert!(line.contains("est       250"), "got: {line}");
+    }
+
+    /// The batched property read says what the row at a time one says,
+    /// which is the whole of its contract: a filter over a scanned
+    /// vector reads its column through the batch, and it must not see
+    /// anything a `RETURN a.x` would not.
+    #[test]
+    fn a_vector_of_rows_reads_what_one_row_at_a_time_reads() {
+        use crate::zu1::props::{PropInput, PropValues, store_props_nullable};
+
+        const ROWS: usize = 3000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vector.zu1");
+        let mut db = Zu1File::create(&path).expect("create");
+        // More rows than the 1024 a chunk holds, so a gather that
+        // decoded the chunk the first row landed in and read the rest
+        // out of it would be caught.
+        let ages: Vec<u64> = (0..ROWS as u64).map(|i| i % 101).collect();
+        let scores: Vec<f64> = (0..ROWS).map(|i| i as f64 / 8.0).collect();
+        let flags: Vec<bool> = (0..ROWS).map(|i| i % 3 == 0).collect();
+        let names: Vec<Vec<u8>> = (0..ROWS).map(|i| format!("p{i}").into_bytes()).collect();
+        let name_refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        let ranks: Vec<u64> = (0..ROWS as u64).map(|i| i * 3).collect();
+        let nicks: Vec<Vec<u8>> = (0..ROWS).map(|i| format!("n{i}").into_bytes()).collect();
+        let nick_refs: Vec<&[u8]> = nicks.iter().map(Vec::as_slice).collect();
+        // Every fourth row holds no rank and no nick, one column of
+        // each width, because a null is read through the mask rather
+        // than gathered and the two paths have to agree about that too.
+        let held = |row: usize| !row.is_multiple_of(4);
+        let validity: Vec<u64> = (0..ROWS.div_ceil(64))
+            .map(|word| {
+                (0..64).fold(0u64, |bits, bit| {
+                    let row = word * 64 + bit;
+                    if row < ROWS && held(row) {
+                        bits | 1 << bit
+                    } else {
+                        bits
+                    }
+                })
+            })
+            .collect();
+        graph::bulk_load_as(&mut db, "person", "knows", ROWS as u64, &[(0u32, 1u32)])
+            .expect("load");
+        store_props_nullable(
+            &mut db,
+            "person",
+            &[
+                PropInput::dense("age", PropValues::Int(&ages)),
+                PropInput::dense("score", PropValues::Float(&scores)),
+                PropInput::dense("flag", PropValues::Bool(&flags)),
+                PropInput::dense("name", PropValues::Str(&name_refs)),
+                PropInput {
+                    name: "rank",
+                    values: PropValues::Int(&ranks),
+                    validity: Some(&validity),
+                },
+                PropInput {
+                    name: "nick",
+                    values: PropValues::Str(&nick_refs),
+                    validity: Some(&validity),
+                },
+            ],
+        )
+        .expect("props");
+        drop(db);
+
+        let mut db = Zu1File::open(&path).expect("open");
+        {
+            let catalog = Catalog::load(&mut db).expect("catalog");
+            let table = catalog.node_by_name("person").expect("person").id;
+            let mut graph = Zu1Graph::new(&mut db, catalog);
+            // Out of order, one row twice, either end of the table and
+            // both sides of two chunk boundaries.
+            let rows: Vec<u64> = vec![0, 1, 7, 1023, 1024, 1025, 2047, 2048, 2999, 4, 1024];
+            let mut batch = Vec::new();
+            for key in ["age", "score", "flag", "name", "rank", "nick", "id"] {
+                graph.properties(table, &rows, key, &mut batch).expect(key);
+                let one: Vec<Value> = rows
+                    .iter()
+                    .map(|&row| graph.property(table, row, key).expect(key))
+                    .collect();
+                assert_eq!(batch, one, "{key}");
+            }
+            // A property no column holds is refused either way.
+            assert!(graph.properties(table, &rows, "nope", &mut batch).is_err());
+            assert!(graph.property(table, 0, "nope").is_err());
+        }
+
+        // The same read behind a filter, which is what the batch is
+        // for. The counts are worked out from the columns rather than
+        // written down, so the query and the data cannot drift.
+        let count_of = |source: &str, db: &mut Zu1File| -> i64 {
+            let r = run(source, db, &[]).expect(source);
+            match r.rows.as_slice() {
+                [row] => match row.as_slice() {
+                    [Value::Int(n)] => *n,
+                    other => panic!("got: {other:?}"),
+                },
+                other => panic!("got: {other:?}"),
+            }
+        };
+        let want = ages.iter().filter(|&&age| age == 7).count() as i64;
+        assert_eq!(
+            count_of(
+                "MATCH (a:person) WHERE a.age = 7 RETURN count(*) AS n",
+                &mut db
+            ),
+            want
+        );
+        // The property on the right, so the filter has to read the
+        // operator the other way round.
+        let want = ages.iter().filter(|&&age| age < 7).count() as i64;
+        assert_eq!(
+            count_of(
+                "MATCH (a:person) WHERE 7 > a.age RETURN count(*) AS n",
+                &mut db
+            ),
+            want
+        );
+        // A null is not equal to anything, including the value the row
+        // would have held.
+        let want = (0..ROWS).filter(|&i| held(i) && ranks[i] == 9).count() as i64;
+        assert_eq!(
+            count_of(
+                "MATCH (a:person) WHERE a.rank = 9 RETURN count(*) AS n",
+                &mut db
+            ),
+            want
+        );
+        let want = (0..ROWS).filter(|&i| held(i) && nicks[i] == b"n5").count() as i64;
+        assert_eq!(
+            count_of(
+                "MATCH (a:person) WHERE a.nick = 'n5' RETURN count(*) AS n",
+                &mut db
+            ),
+            want
+        );
+        // Two properties of the same row, which no batch can answer
+        // because both sides move with the row, so this one falls back
+        // to reading a row at a time and still has to be right.
+        let want = (0..ROWS)
+            .filter(|&i| held(i) && ages[i] == ranks[i])
+            .count() as i64;
+        assert_eq!(
+            count_of(
+                "MATCH (a:person) WHERE a.age = a.rank RETURN count(*) AS n",
+                &mut db
+            ),
+            want
+        );
     }
 
     #[test]

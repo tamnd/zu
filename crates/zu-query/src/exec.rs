@@ -2765,10 +2765,11 @@ struct Morsel {
 struct StageCtx<'a> {
     graph: &'a mut dyn Graph,
     params: &'a [Value],
-    /// What each value query expression in this query answered, worked
-    /// out once before the first stage ran and read here by
-    /// [`BoundExpr::Scalar`] (GQ18).
-    scalars: &'a [Value],
+    /// The value query expressions of this query, read here by
+    /// [`BoundExpr::Scalar`] (GQ18): the ones that decorrelated as the
+    /// values they answered before the first stage ran, and the ones
+    /// that did not as the plans this run works out per row.
+    scalars: &'a Scalars<'a>,
     counts: &'a BTreeMap<u32, u64>,
     /// The rows a delete took away, which a scan of a table's extent
     /// walks straight over and every source here filters out.
@@ -5588,6 +5589,31 @@ fn flip(op: BinaryOp) -> BinaryOp {
     }
 }
 
+/// The value of one value query expression on the row the evaluator is
+/// standing on (GQ18).
+///
+/// One that decorrelated was answered before the plan started and is
+/// read straight out. One that did not is run here, on this row, with
+/// the values it captured written into the parameters it reads them
+/// at. That is the cost the statement was warned about: the query
+/// inside runs once for each row the query outside has.
+fn scalar_value(ctx: &mut StageCtx, ix: usize) -> Result<Value> {
+    let query = &ctx.scalars.queries[ix];
+    if query.captures.is_empty() {
+        return Ok(ctx.scalars.once[ix].clone());
+    }
+    let mut params = ctx.params.to_vec();
+    for capture in &query.captures {
+        params[capture.param] = value_of(ctx, capture.slot)?;
+    }
+    let schema = ctx.scalars.schema;
+    let options = ctx.scalars.options;
+    let plan = ctx.scalars.plans[ix]
+        .as_ref()
+        .expect("a query that captures was planned as one that runs per row");
+    one_value(plan, query, schema, &mut *ctx.graph, &params, options)
+}
+
 fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
     match expr {
         BoundExpr::Literal(lit) => Ok(match lit {
@@ -5599,7 +5625,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
-        BoundExpr::Scalar(ix) => Ok(ctx.scalars[*ix].clone()),
+        BoundExpr::Scalar(ix) => scalar_value(ctx, *ix),
         BoundExpr::Var(slot) => value_of(ctx, *slot),
         BoundExpr::HasLabels { slot, test } => match value_of(ctx, *slot)? {
             Value::Node { table, offset } => {
@@ -6640,8 +6666,11 @@ struct StageJob<'a> {
     gone: &'a DeletedRows,
     params: &'a [Value],
     /// What each value query expression answered, worked out once for
-    /// the whole statement and read the same way by every worker.
-    scalars: &'a [Value],
+    /// the whole statement and read the same way by every worker. A
+    /// statement holding one that is answered per row does not reach
+    /// this path: it runs a query inside the expression evaluator, and
+    /// a worker's graph reader is not somewhere to start one.
+    scalars: &'a Scalars<'a>,
     stop: &'a Interrupt,
 }
 
@@ -6892,54 +6921,133 @@ struct Extras<'a, 's> {
     stream: Option<&'a mut Streaming<'s>>,
 }
 
-/// Answers every value query expression of `query`, in the order
-/// [`BoundExpr::Scalar`] indexes them (GQ18).
+/// The value query expressions of a statement, ready to be read
+/// (GQ18), in the order [`BoundExpr::Scalar`] indexes them.
 ///
-/// Each one is a query with a plan of its own and it is run here, once
-/// for the whole statement, because it reads nothing from the rows the
-/// statement is working on. A query that answers no row stands for a
-/// null, one row for the value in it, and more than one row is 21000:
-/// what was written stands for one value and there are several.
+/// There are two kinds and the difference is the whole of the
+/// decorrelation. One that reads nothing from the query around it
+/// answers the same value for every row, so it is run once before the
+/// plan that reads it starts and what is left where it was written is
+/// a constant. One that reads a name cannot be: the value it stands
+/// for is the row's, so it is run again for each of them, with the
+/// row's values written into the parameters its captures name.
 ///
-/// The plan is built here rather than carried in beside the statement's
-/// because that keeps every caller that holds a bound query and a plan
-/// working without knowing this exists. It costs a plan build and an
-/// optimizer pass per run of the statement, over a query the writer
-/// meant to run anyway.
-fn scalar_values(
+/// The plan is built here rather than carried in beside the
+/// statement's because that keeps every caller that holds a bound
+/// query and a plan working without knowing this exists. It is built
+/// once per run of the statement either way, never once per row.
+struct Scalars<'a> {
+    /// The value of each one that was worked out once. A correlated
+    /// one holds null here and never reads it.
+    once: Vec<Value>,
+    /// The plan of each correlated one, `None` for the rest.
+    plans: Vec<Option<LogicalPlan>>,
+    queries: &'a [BoundQuery],
+    schema: &'a Schema,
+    options: &'a Options,
+}
+
+impl<'a> Scalars<'a> {
+    /// Answers the ones that read nothing and plans the ones that do.
+    fn prepare(
+        query: &'a BoundQuery,
+        schema: &'a Schema,
+        graph: &mut dyn Graph,
+        params: &[Value],
+        options: &'a Options,
+    ) -> Result<Self> {
+        let mut once = Vec::with_capacity(query.scalars.len());
+        let mut plans = Vec::with_capacity(query.scalars.len());
+        for scalar in &query.scalars {
+            let built = crate::plan::build(scalar)?;
+            let plan = crate::optimizer::optimize(built, scalar, schema)?;
+            if scalar.captures.is_empty() {
+                once.push(one_value(&plan, scalar, schema, graph, params, options)?);
+                plans.push(None);
+            } else {
+                once.push(Value::Null);
+                plans.push(Some(plan));
+            }
+        }
+        Ok(Scalars {
+            once,
+            plans,
+            queries: &query.scalars,
+            schema,
+            options,
+        })
+    }
+
+    /// Which of them are answered per row, which is what the statement
+    /// carries a warning for.
+    fn correlated(&self) -> impl Iterator<Item = &BoundQuery> {
+        self.queries.iter().filter(|q| !q.captures.is_empty())
+    }
+
+    /// None at all, for a plan run with no query written inside it.
+    #[cfg(test)]
+    fn none(schema: &'a Schema, options: &'a Options) -> Self {
+        Scalars {
+            once: Vec::new(),
+            plans: Vec::new(),
+            queries: &[],
+            schema,
+            options,
+        }
+    }
+}
+
+/// Runs one value query expression and reads the value out of it.
+///
+/// A query that answers no row stands for a null, one row for the
+/// value in it, and more than one row is an error: what was written
+/// stands for one value and there are several.
+fn one_value(
+    plan: &LogicalPlan,
     query: &BoundQuery,
     schema: &Schema,
     graph: &mut dyn Graph,
     params: &[Value],
     options: &Options,
-) -> Result<Vec<Value>> {
-    let mut out = Vec::with_capacity(query.scalars.len());
-    for scalar in &query.scalars {
-        let built = crate::plan::build(scalar)?;
-        let plan = crate::optimizer::optimize(built, scalar, schema)?;
-        let result = run_stages(
-            &plan,
-            scalar,
-            schema,
-            graph,
-            params,
-            options,
-            Extras::default(),
-        )?;
-        out.push(match result.rows.len() {
-            0 => Value::Null,
-            1 => result.rows[0].first().cloned().unwrap_or(Value::Null),
-            n => {
-                return Err(ZuError::gql(
-                    codes::C22000,
-                    format!(
-                        "a VALUE query stands for one value, and this one answered {n} rows: cut it down with LIMIT 1 or aggregate it"
-                    ),
-                ));
-            }
-        });
+) -> Result<Value> {
+    let result = run_stages(
+        plan,
+        query,
+        schema,
+        graph,
+        params,
+        options,
+        Extras::default(),
+    )?;
+    match result.rows.len() {
+        0 => Ok(Value::Null),
+        1 => Ok(result.rows[0].first().cloned().unwrap_or(Value::Null)),
+        n => Err(ZuError::gql(
+            codes::C22000,
+            format!(
+                "a VALUE query stands for one value, and this one answered {n} rows: cut it down with LIMIT 1 or aggregate it"
+            ),
+        )),
     }
-    Ok(out)
+}
+
+/// The warning a statement carries for every value query expression it
+/// could not decorrelate.
+///
+/// It rides with the answer rather than replacing it, because the
+/// statement is answerable and what is wrong with it is what it costs:
+/// one run of the query inside per row of the query around it. The
+/// text names what the query read, since that is the thing to take out
+/// of it to get the cost back.
+fn correlated_warning(query: &BoundQuery) -> DiagnosticRecord {
+    let read: Vec<&str> = query.captures.iter().map(|c| c.name.as_str()).collect();
+    DiagnosticRecord::new(
+        codes::C01000,
+        format!(
+            "a VALUE query reading {} from the query around it is answered once per row rather than once: lift it out and join it if the row count is large",
+            read.join(", ")
+        ),
+    )
 }
 
 fn run_stages(
@@ -6958,11 +7066,11 @@ fn run_stages(
     if matches!(plan, LogicalPlan::Conjoin { .. }) {
         return run_conjoin(plan, query, schema, graph, params, options, profile);
     }
-    // Every value query expression this query holds, answered before
-    // the plan that reads them starts (GQ18). They are the same value
-    // for every row by construction, so this is the whole cost of one
-    // however many rows read it.
-    let scalars = scalar_values(query, schema, graph, params, options)?;
+    // Every value query expression this query holds (GQ18). The ones
+    // that read nothing from the rows around them are answered here,
+    // once, which is the whole cost of one however many rows read it.
+    // The ones that do are planned here and run per row.
+    let scalars = Scalars::prepare(query, schema, graph, params, options)?;
     let stages = build_stages(plan, query, schema, graph, params, options)?;
     let counts: BTreeMap<u32, u64> = schema
         .nodes()
@@ -6986,7 +7094,13 @@ fn run_stages(
     // the fully sequential baseline.
     let mut forks: Option<Vec<Box<dyn Graph + Send>>> = None;
     let mut rows = Vec::new();
-    let mut notices = Vec::new();
+    // The warning for every value query expression that did not
+    // decorrelate, raised here rather than where one is run so that a
+    // statement answering no row is warned about as loudly as one
+    // answering a million. A run that reaches the parallel path has
+    // none of these, which is why the two facts are settled together.
+    let mut notices: Vec<DiagnosticRecord> = scalars.correlated().map(correlated_warning).collect();
+    let per_row = !notices.is_empty();
     let last = stages.len() - 1;
     for (ix, stage) in stages.iter().enumerate() {
         // Only the last stage can stream, because every earlier one is
@@ -6997,6 +7111,7 @@ fn run_stages(
         let streaming = stream.is_some() && ix == last && streamable(&stage.sink);
         if !streaming
             && threads > 1
+            && !per_row
             && profile.is_none()
             && !options.flat
             && let Some(morsels) = plan_morsels(stage, &counts, options.morsel_rows)
@@ -9348,11 +9463,13 @@ mod tests {
         let shapes = BTreeMap::new();
         let gone = DeletedRows::new();
         let stop = Interrupt::default();
+        let options = Options::default();
+        let scalars = Scalars::none(&schema, &options);
         let mut graph = mock();
         let mut ctx = StageCtx {
             graph: &mut graph,
             params: &[],
-            scalars: &[],
+            scalars: &scalars,
             counts: &counts,
             gone: &gone,
             slot_loc: &slot_loc,

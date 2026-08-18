@@ -746,9 +746,52 @@ pub struct BoundQuery {
     /// [`BoundExpr::Scalar`] indexes them in.
     ///
     /// Each is a query of its own with its own slots, because a value
-    /// query expression reads nothing from the query around it: the
-    /// two share their parameters and nothing else.
+    /// query expression shares nothing with the query around it but
+    /// its parameters and whatever it captures.
     pub scalars: Vec<BoundQuery>,
+    /// What this query reads from the query it is written inside,
+    /// empty for every query that reads nothing from one.
+    ///
+    /// Only a value query expression ever has any: it is the only
+    /// query written inside another. An empty list is the whole test
+    /// for whether it decorrelates, because a query that reads nothing
+    /// from the rows around it answers the same value for all of them
+    /// and is worked out once.
+    pub captures: Vec<Capture>,
+}
+
+/// One name a value query expression reads from the query around it
+/// (ISO 20.6, GQ18).
+///
+/// The value arrives in a parameter, so the query inside reads it the
+/// way it reads anything the caller passed in and nothing below the
+/// binder has to know where it came from. What the executor does with
+/// one of these is fill that position from the row it is standing on,
+/// once per row, which is what a correlated subquery costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capture {
+    /// The name as written, for the message and the EXPLAIN line.
+    pub name: String,
+    /// The slot the value is read out of, in the query around this one.
+    pub slot: usize,
+    /// The parameter position this query reads that value at.
+    pub param: usize,
+}
+
+/// The parameter name a capture is given, which is the variable's own
+/// name behind a nul byte.
+///
+/// No writer can name a parameter this, because no statement can hold
+/// a nul, so a capture never takes a position the caller meant to fill
+/// and a caller never fills one the binder meant for a capture.
+fn capture_param(name: &str) -> String {
+    format!("\0{name}")
+}
+
+/// Whether a parameter position is one the binder made for a capture
+/// rather than one the caller is expected to fill.
+pub fn is_capture_param(name: &str) -> bool {
+    name.starts_with('\0')
 }
 
 impl BoundQuery {
@@ -1597,6 +1640,7 @@ fn bind_linear(
         marks: None,
         scalars: Vec::new(),
         outer: outer.to_vec(),
+        captures: Vec::new(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -1644,6 +1688,7 @@ fn bind_linear(
         labels: schema.labels.clone(),
         conjoined: Vec::new(),
         scalars: binder.scalars,
+        captures: binder.captures,
     })
 }
 
@@ -1670,10 +1715,14 @@ struct Binder<'a> {
     scalars: Vec<BoundQuery>,
     /// The names in scope in the query this one is written inside,
     /// empty for a query nothing is written inside. A reference to one
-    /// of these is a correlated value query expression, which is a
-    /// thing this engine says it cannot do rather than a name it
-    /// pretends never to have heard of.
+    /// of these is what makes a value query expression correlated, so
+    /// reading one is not an undefined name: it is a name that arrives
+    /// per row.
     outer: Vec<String>,
+    /// The names read out of `outer` so far, which become
+    /// [`BoundQuery::captures`]. The slot in each is filled in by the
+    /// binder around this one, which is the one that has it.
+    captures: Vec<Capture>,
 }
 
 /// Expression context: where aggregates are legal and whether one was
@@ -3245,12 +3294,18 @@ impl Binder<'_> {
                 Ok((BoundExpr::Param(index), Type::Any))
             }
             Expr::Variable(name) => {
-                let slot = self
-                    .scope
-                    .get(name)
-                    .copied()
-                    .ok_or_else(|| self.undefined(name))?;
-                Ok((BoundExpr::Var(slot), self.variables[slot].ty.clone()))
+                if let Some(slot) = self.scope.get(name).copied() {
+                    return Ok((BoundExpr::Var(slot), self.variables[slot].ty.clone()));
+                }
+                // A name the query around this one defined, which this
+                // query may read: it makes the value query expression
+                // correlated, and a correlated one is answered per row
+                // rather than once. What stands here is the parameter
+                // the row's value arrives in.
+                if self.outer.iter().any(|n| n == name) {
+                    return Ok((BoundExpr::Param(self.capture(name)), Type::Any));
+                }
+                Err(bad_reference(format!("variable '{name}' is not defined")))
             }
             Expr::Property { base, key } => {
                 let (bound, ty) = self.bind_expr(base, ctx)?;
@@ -3421,30 +3476,75 @@ impl Binder<'_> {
         }
     }
 
-    /// A name that is not in scope, and what to say about it.
+    /// Records that this query reads `name` from the query around it,
+    /// and answers with the parameter position the value arrives at.
     ///
-    /// Inside a value query expression the name may well be defined:
-    /// it is defined in the query around this one, and this engine
-    /// works one of these out once for the whole run, which it can
-    /// only do while the answer is the same for every row. Saying so
-    /// beats saying the name does not exist, because it does.
-    fn undefined(&self, name: &str) -> ZuError {
-        if self.outer.iter().any(|n| n == name) {
-            return invalid(format!(
-                "a VALUE query is worked out once for the whole statement, so it cannot read '{name}' from the query around it: lift the query out and join it, or write the value in"
-            ));
+    /// One position per name however often it is read, and the same
+    /// position at every level of nesting, because the parameter list
+    /// is the whole statement's: a query two levels in reads the value
+    /// the query that has the slot wrote there.
+    fn capture(&mut self, name: &str) -> usize {
+        let param = capture_param(name);
+        let index = match self.params.iter().position(|p| *p == param) {
+            Some(ix) => ix,
+            None => {
+                self.params.push(param);
+                self.params.len() - 1
+            }
+        };
+        if !self.captures.iter().any(|c| c.param == index) {
+            self.captures.push(Capture {
+                name: name.to_string(),
+                // Filled in by the binder around this one, which is
+                // the one the name is in scope in.
+                slot: usize::MAX,
+                param: index,
+            });
         }
-        bad_reference(format!("variable '{name}' is not defined"))
+        index
+    }
+
+    /// Gives the captures of a value query expression the slots they
+    /// are read out of, which is a thing only this binder knows.
+    ///
+    /// The operands of a composite each captured on their own, and
+    /// they run as one value query expression, so the lists are joined
+    /// into the one the executor reads. A name this binder does not
+    /// have is one from further out still: this query captures it too,
+    /// at the same parameter position, and the entry leaves the list
+    /// inside because the level that fills that position is this one.
+    fn settle_captures(&mut self, bound: &mut BoundQuery) {
+        let mut all = std::mem::take(&mut bound.captures);
+        for joined in &mut bound.conjoined {
+            for capture in std::mem::take(&mut joined.query.captures) {
+                if !all.iter().any(|c| c.param == capture.param) {
+                    all.push(capture);
+                }
+            }
+        }
+        all.retain_mut(|capture| match self.scope.get(&capture.name).copied() {
+            Some(slot) => {
+                capture.slot = slot;
+                true
+            }
+            None => {
+                self.capture(&capture.name);
+                false
+            }
+        });
+        bound.captures = all;
     }
 
     /// GQ18: `VALUE { ... }`, a whole query standing where one value
     /// belongs (ISO 20.6).
     ///
     /// It binds as a query of its own with a scope of its own, because
-    /// it shares nothing with the query around it but the parameters.
-    /// What comes back here is the index the executor reads its answer
-    /// at, and the answer is worked out once, before the plan above it
-    /// runs.
+    /// it shares nothing with the query around it but the parameters
+    /// and the names it reads out of the scope here. What comes back
+    /// is the index the executor reads its answer at. A query that
+    /// read no name is worked out once, before the plan above it runs;
+    /// one that read a name is worked out per row of the query it
+    /// stands in, and the names it read are its captures.
     fn bind_value_query(&mut self, query: &ast::Query) -> Result<(BoundExpr, Type)> {
         if query.use_graph.is_some() {
             return Err(invalid(
@@ -3454,8 +3554,9 @@ impl Binder<'_> {
         let mut params = std::mem::take(&mut self.params);
         let mut outer = self.outer.clone();
         outer.extend(self.scope.keys().cloned());
-        let bound = bind_body(&query.body, self.schema, &mut params, &outer)?;
+        let mut bound = bind_body(&query.body, self.schema, &mut params, &outer)?;
         self.params = params;
+        self.settle_captures(&mut bound);
         let mut wrote = false;
         bound.walk(&mut |q| wrote |= q.clauses.iter().any(writes));
         if wrote {

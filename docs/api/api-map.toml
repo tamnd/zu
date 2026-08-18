@@ -137,6 +137,11 @@ tier = 2
 reason = "the rows of a result borrowed one at a time, the other half of that cursor"
 
 [[group]]
+prefix = "zu::ScalarPlan"
+tier = 2
+reason = "one value query expression of a plan, with the names it reads from the query around it, which is what says whether it runs once or once per row; it goes wherever the plan tree goes"
+
+[[group]]
 prefix = "zu::Severity"
 tier = 1
 reason = "whether a condition stopped the statement, which decides whether a binding raises or warns"

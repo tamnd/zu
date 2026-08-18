@@ -209,8 +209,9 @@ const NOTES: &[&str] = &[
     "a VALUE query is a whole query written where one value belongs, so it may chain and sort \
      and aggregate the way any other query does, and it has to return one column because one \
      value is what stands there; a query answering no row stands for a null and one answering \
-     several rows is refused; it reads nothing from the query around it, which is what lets the \
-     engine answer it once for the whole statement rather than once for every row",
+     several rows is refused; one reading nothing from the query around it is answered once for \
+     the whole statement, and one reading a name from it is answered once for every row and \
+     says so in the plan and in a warning beside the rows",
     "a block of match statements stands wherever one does: an EXISTS takes one and asks \
      whether it answered a row, and an OPTIONAL takes one and keeps what it answered. The \
      statements of a block are all required and they share the names they write, so a block is \

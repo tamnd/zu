@@ -936,6 +936,51 @@ impl Parser<'_> {
     /// this is a fold rather than a precedence climb: each operand read
     /// joins onto everything read before it.
     fn parse_query(&mut self) -> Result<Query> {
+        let (query, ending) = self.parse_query_body()?;
+        self.eat(&TokenKind::Semicolon);
+        if let Some(token) = self.peek() {
+            let what = match ending {
+                Ending::Result => "RETURN",
+                Ending::Write => "the end of a statement",
+            };
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                token.start,
+                format_args!("nothing may follow {what}, found {}", token.kind.describe()),
+            ));
+        }
+        Ok(query)
+    }
+
+    /// The query a `VALUE { ... }` carries, the brace unconsumed
+    /// (GQ18).
+    ///
+    /// It is a whole query and stops at the closing brace rather than
+    /// at the end of the text, and it has to end with a RETURN: a
+    /// statement that writes has no result table, and one value is
+    /// what this stands for.
+    fn parse_nested_query(&mut self) -> Result<Query> {
+        let at = self.peek().map(|t| t.start).unwrap_or(0);
+        self.expect(&TokenKind::LBrace)?;
+        let (query, ending) = self.parse_query_body()?;
+        if ending != Ending::Result {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "a VALUE query stands for one value, so it has to end with RETURN",
+            ));
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(query)
+    }
+
+    /// The body of a composite query and how its last statement ended,
+    /// stopping wherever the operands run out. What may follow is the
+    /// caller's business: the end of the text for a statement, a
+    /// closing brace for a nested query.
+    fn parse_query_body(&mut self) -> Result<(Query, Ending)> {
         let use_graph = self.parse_use_graph()?;
         let (linear, ending) = self.parse_linear()?;
         let mut body = Composite::Linear(linear);
@@ -964,20 +1009,7 @@ impl Parser<'_> {
                 right,
             };
         }
-        self.eat(&TokenKind::Semicolon);
-        if let Some(token) = self.peek() {
-            let what = match ending {
-                Ending::Result => "RETURN",
-                Ending::Write => "the end of a statement",
-            };
-            return Err(ZuError::gql_in(
-                codes::C42001,
-                self.source,
-                token.start,
-                format_args!("nothing may follow {what}, found {}", token.kind.describe()),
-            ));
-        }
-        Ok(Query { use_graph, body })
+        Ok((Query { use_graph, body }, ending))
     }
 
     /// A linear query statement: simple statements chained by `NEXT`,
@@ -2048,6 +2080,13 @@ impl Parser<'_> {
         // leaves `exists` free to be an ordinary variable name.
         if name.eq_ignore_ascii_case("EXISTS") && self.at(&TokenKind::LBrace) {
             return self.parse_exists();
+        }
+        // GQ18, and here for the same reason EXISTS is: VALUE carries
+        // a query and no expression grammar produces one. A brace has
+        // to follow, so `value` is still an ordinary variable name
+        // everywhere else.
+        if name.eq_ignore_ascii_case("VALUE") && self.at(&TokenKind::LBrace) {
+            return Ok(Expr::ValueQuery(Box::new(self.parse_nested_query()?)));
         }
         if !self.at(&TokenKind::LParen) {
             return Ok(Expr::Variable(name));
@@ -3549,6 +3588,28 @@ mod tests {
             "a CALL yields its columns, got {:?}",
             q.clauses()[0]
         );
+    }
+
+    /// GQ18. A value query expression carries a whole query: it may
+    /// chain, sort and cut, and `value` is still a variable name where
+    /// no brace follows it.
+    #[test]
+    fn a_value_query_carries_a_whole_query() {
+        let q = parsed("RETURN VALUE { MATCH (p:Person) RETURN COUNT(*) } AS total");
+        let items = &q.result().expect("a RETURN").items;
+        let Expr::ValueQuery(inner) = &items[0].expr else {
+            panic!("the item is a value query, got {:?}", items[0].expr);
+        };
+        assert_eq!(inner.clauses().len(), 1, "the MATCH inside it");
+        assert!(inner.result().is_some(), "and the RETURN it ends with");
+        // A query and not a block: what may follow the RETURN inside is
+        // what may follow any other one.
+        let q = parsed("RETURN VALUE { MATCH (p:Person) RETURN p.id ORDER BY p.id LIMIT 1 } AS v");
+        let items = &q.result().expect("a RETURN").items;
+        assert!(matches!(&items[0].expr, Expr::ValueQuery(_)));
+        // The word is free everywhere a brace does not follow it.
+        let q = parsed("MATCH (value:Person) RETURN value.id AS id");
+        assert_eq!(q.result().expect("a RETURN").items.len(), 1);
     }
 
     /// GQ21. An OPTIONAL takes a block as well as a single statement,

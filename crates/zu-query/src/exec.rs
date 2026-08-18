@@ -2765,6 +2765,10 @@ struct Morsel {
 struct StageCtx<'a> {
     graph: &'a mut dyn Graph,
     params: &'a [Value],
+    /// What each value query expression in this query answered, worked
+    /// out once before the first stage ran and read here by
+    /// [`BoundExpr::Scalar`] (GQ18).
+    scalars: &'a [Value],
     counts: &'a BTreeMap<u32, u64>,
     /// The rows a delete took away, which a scan of a table's extent
     /// walks straight over and every source here filters out.
@@ -5595,6 +5599,7 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
+        BoundExpr::Scalar(ix) => Ok(ctx.scalars[*ix].clone()),
         BoundExpr::Var(slot) => value_of(ctx, *slot),
         BoundExpr::HasLabels { slot, test } => match value_of(ctx, *slot)? {
             Value::Node { table, offset } => {
@@ -6634,6 +6639,9 @@ struct StageJob<'a> {
     counts: &'a BTreeMap<u32, u64>,
     gone: &'a DeletedRows,
     params: &'a [Value],
+    /// What each value query expression answered, worked out once for
+    /// the whole statement and read the same way by every worker.
+    scalars: &'a [Value],
     stop: &'a Interrupt,
 }
 
@@ -6673,6 +6681,7 @@ fn drive_worker(
     let mut ctx = StageCtx {
         graph,
         params: job.params,
+        scalars: job.scalars,
         counts: job.counts,
         gone: job.gone,
         slot_loc: &stage.slot_loc,
@@ -6781,6 +6790,7 @@ fn run_stage_parallel(
     let mut ctx = StageCtx {
         graph,
         params: job.params,
+        scalars: job.scalars,
         counts: job.counts,
         gone: job.gone,
         slot_loc: &stage.slot_loc,
@@ -6882,6 +6892,56 @@ struct Extras<'a, 's> {
     stream: Option<&'a mut Streaming<'s>>,
 }
 
+/// Answers every value query expression of `query`, in the order
+/// [`BoundExpr::Scalar`] indexes them (GQ18).
+///
+/// Each one is a query with a plan of its own and it is run here, once
+/// for the whole statement, because it reads nothing from the rows the
+/// statement is working on. A query that answers no row stands for a
+/// null, one row for the value in it, and more than one row is 21000:
+/// what was written stands for one value and there are several.
+///
+/// The plan is built here rather than carried in beside the statement's
+/// because that keeps every caller that holds a bound query and a plan
+/// working without knowing this exists. It costs a plan build and an
+/// optimizer pass per run of the statement, over a query the writer
+/// meant to run anyway.
+fn scalar_values(
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(query.scalars.len());
+    for scalar in &query.scalars {
+        let built = crate::plan::build(scalar)?;
+        let plan = crate::optimizer::optimize(built, scalar, schema)?;
+        let result = run_stages(
+            &plan,
+            scalar,
+            schema,
+            graph,
+            params,
+            options,
+            Extras::default(),
+        )?;
+        out.push(match result.rows.len() {
+            0 => Value::Null,
+            1 => result.rows[0].first().cloned().unwrap_or(Value::Null),
+            n => {
+                return Err(ZuError::gql(
+                    codes::C22000,
+                    format!(
+                        "a VALUE query stands for one value, and this one answered {n} rows: cut it down with LIMIT 1 or aggregate it"
+                    ),
+                ));
+            }
+        });
+    }
+    Ok(out)
+}
+
 fn run_stages(
     plan: &LogicalPlan,
     query: &BoundQuery,
@@ -6898,6 +6958,11 @@ fn run_stages(
     if matches!(plan, LogicalPlan::Conjoin { .. }) {
         return run_conjoin(plan, query, schema, graph, params, options, profile);
     }
+    // Every value query expression this query holds, answered before
+    // the plan that reads them starts (GQ18). They are the same value
+    // for every row by construction, so this is the whole cost of one
+    // however many rows read it.
+    let scalars = scalar_values(query, schema, graph, params, options)?;
     let stages = build_stages(plan, query, schema, graph, params, options)?;
     let counts: BTreeMap<u32, u64> = schema
         .nodes()
@@ -6948,6 +7013,7 @@ fn run_stages(
                     counts: &counts,
                     gone: &gone,
                     params,
+                    scalars: &scalars,
                     stop: &options.interrupt,
                 };
                 rows = run_stage_parallel(&job, graph, forks, morsels, &mut notices)?;
@@ -6957,6 +7023,7 @@ fn run_stages(
         let mut ctx = StageCtx {
             graph: &mut *graph,
             params,
+            scalars: &scalars,
             counts: &counts,
             gone: &gone,
             slot_loc: &stage.slot_loc,
@@ -9285,6 +9352,7 @@ mod tests {
         let mut ctx = StageCtx {
             graph: &mut graph,
             params: &[],
+            scalars: &[],
             counts: &counts,
             gone: &gone,
             slot_loc: &slot_loc,

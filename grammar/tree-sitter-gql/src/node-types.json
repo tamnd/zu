@@ -471,6 +471,10 @@
       "required": true,
       "types": [
         {
+          "type": "keep_clause",
+          "named": true
+        },
+        {
           "type": "pattern",
           "named": true
         },
@@ -767,6 +771,21 @@
     }
   },
   {
+    "type": "keep_clause",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "path_prefix",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "label",
     "named": true,
     "fields": {},
@@ -949,6 +968,10 @@
       "multiple": true,
       "required": true,
       "types": [
+        {
+          "type": "keep_clause",
+          "named": true
+        },
         {
           "type": "pattern",
           "named": true
@@ -2814,6 +2837,10 @@
   },
   {
     "type": "IS",
+    "named": false
+  },
+  {
+    "type": "KEEP",
     "named": false
   },
   {

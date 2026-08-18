@@ -197,7 +197,14 @@ null_ordering   = "NULLS" , ( "FIRST" | "LAST" ) ;
 
 (* Patterns. *)
 
-pattern         = path , { "," , path } ;
+pattern         = path , { "," , path } , [ keep_clause ] ;
+keep_clause     = "KEEP" , path_prefix ;
+(* ISO 16.9, features G006 and G007. A KEEP says a prefix once for the
+   whole list rather than once in front of each pattern of it, and what
+   it does is fill in what the patterns left out: a pattern that named no
+   selector takes the KEEP's, one that named no mode takes its mode, and
+   one that named the same kind the KEEP names is refused rather than
+   settled by a rule of precedence. *)
 path            = [ name , "=" ] , [ path_prefix ] ,
                   node , { relationship , node } ;
 path_prefix     = "ALL" , [ "SHORTEST" ] , path_tail

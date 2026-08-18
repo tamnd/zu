@@ -699,8 +699,15 @@ pub struct PathPattern {
     /// The path selector before the first node, `None` for a pattern
     /// that keeps every path it matches.
     pub selector: Option<Selector>,
-    /// `WALK` / `TRAIL` / `SIMPLE` / `ACYCLIC` before the first node.
-    pub mode: PathMode,
+    /// `WALK` / `TRAIL` / `SIMPLE` / `ACYCLIC` before the first node,
+    /// `None` for a pattern that names no mode and therefore walks under
+    /// the default.
+    ///
+    /// The default is what `PathMode::default` says, and a pattern that
+    /// wrote it and one that wrote nothing walk the same way, so the two
+    /// are only told apart in one place: a `KEEP` fills in what the
+    /// patterns left out, and it has to know what they left out.
+    pub mode: Option<PathMode>,
     pub start: NodePattern,
     pub steps: Vec<(RelPattern, NodePattern)>,
 }

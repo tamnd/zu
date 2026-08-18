@@ -1831,7 +1831,7 @@ impl Binder<'_> {
                             "INSERT binding the path it wrote, which is a walk over rows that are being made rather than found,",
                         ));
                     }
-                    if path.selector.is_some() || path.mode != PathMode::default() {
+                    if path.selector.is_some() || path.mode.is_some() {
                         return Err(invalid(
                             "a selector or a path mode says which of the walks that are there to pick, and INSERT is making one rather than picking one".into(),
                         ));
@@ -2583,7 +2583,7 @@ impl Binder<'_> {
         let start = self.bind_node(&path.start)?;
         let mut steps = Vec::new();
         for (rel, node) in &path.steps {
-            let rel = self.bind_rel(rel, path.mode, path.selector)?;
+            let rel = self.bind_rel(rel, path.mode.unwrap_or_default(), path.selector)?;
             let node = self.bind_node(node)?;
             steps.push((rel, node));
         }

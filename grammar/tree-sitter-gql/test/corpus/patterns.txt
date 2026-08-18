@@ -258,3 +258,43 @@ MATCH SHORTEST ACYCLIC PATHS GROUPS (a)-[:KNOWS]->+(b) RETURN b
         (projection_item
           (variable
             (identifier)))))))
+
+================================================================================
+A KEEP behind the patterns says the prefix for every one of them
+================================================================================
+
+MATCH (a)-[:KNOWS]->+(b), (b)-[:KNOWS]->+(c) KEEP ALL SHORTEST RETURN c
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier)))
+            (quantifier))
+          (node
+            (identifier)))
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier)))
+            (quantifier))
+          (node
+            (identifier))))
+      (keep_clause
+        (path_prefix)))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))

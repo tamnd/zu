@@ -1563,3 +1563,23 @@ stream_stop_x = 0.10
 # machine does, because the gate machines are slower vCPUs and because
 # 350000 is the number the plan owes. Raise this floor, never lower it.
 convert_nodes_s = 350000.0
+
+# What a declared type is worth on disk, in bits of property data per
+# element (gql plan/09 section 4.2, zu#116). The same 200000 node ring
+# with four node properties and one edge property is written three
+# ways: with no properties, with a column per property and a graph type
+# in the catalog naming them, and with one document per element
+# carrying its own key names, which is what a store with no catalog has
+# to write and what Ladybug's 1094 to 3267 bits/edge is measuring. The
+# topology store is subtracted from both, so these are property bytes
+# and nothing else.
+#
+# Measured 94.4 closed and 125.8 schemaless, so the catalog is worth
+# 1.33x and not the 4x the key names weigh, because the string
+# compressor trains on the column and a key name repeated in every row
+# is exactly what it is good at. Both figures are byte counts of a
+# deterministic fixture and do not move with the machine; the headroom
+# in the ceilings is one 64 KiB block, which is the granularity a file
+# size lands on. Lower these ceilings, never raise them.
+density_closed_prop_bits = 96.0
+density_schemaless_prop_bits = 128.0

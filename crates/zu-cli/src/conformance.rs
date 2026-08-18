@@ -163,6 +163,10 @@ const NOTES: &[&str] = &[
      of edges between the elements a statement has in scope, SET and REMOVE of properties and \
      of labels, and DELETE and DETACH DELETE of elements, so a case that writes anything else \
      is answered with an error rather than a skip",
+    "several statements chain with NEXT, and what one hands the next is the result it returned \
+     and nothing else it had in hand, so a variable the statement before it matched is out of \
+     scope behind the NEXT; the chain runs as one pipeline rather than materialising a table \
+     between statements",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",

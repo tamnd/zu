@@ -175,14 +175,87 @@ pub struct PropertyDef {
     pub optional: bool,
 }
 
-/// A whole query: clauses in source order, ending in `RETURN`.
+/// A whole query, which GQL builds out of four levels (ISO 12.1
+/// through 12.4) rather than one list of clauses.
+///
+/// The levels are what the operators need. A set operator joins two
+/// whole queries and cannot be written as a clause in a list, because
+/// there is no list either side of it belongs to; `NEXT` joins two
+/// statements that each end in a result of their own; and a result
+/// statement is the one thing a statement may end with and nothing may
+/// follow. Writing all four out is what lets `UNION`, `OTHERWISE` and
+/// `NEXT` mean here what they mean in the standard, instead of being
+/// bolted onto a flat clause list that has no room for them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
-    /// GQ01: the graph the clauses below run against, written as a
+    /// GQ01: the graph the statements below run against, written as a
     /// `USE` clause in front of them. `None` is a query with no `USE`,
     /// which runs against whatever graph the session is working in.
     pub use_graph: Option<GraphRef>,
+    pub body: Composite,
+}
+
+impl Query {
+    /// Every primitive statement in the query, in written order,
+    /// whichever statement of a `NEXT` chain it stands in.
+    ///
+    /// This answers questions about the text as a whole: which tables
+    /// does it name, does it write anything. A caller whose answer
+    /// depends on where a statement stands walks the levels instead,
+    /// because this deliberately forgets where the joins were.
+    pub fn clauses(&self) -> Vec<&Clause> {
+        let Composite::Linear(linear) = &self.body;
+        linear
+            .statements
+            .iter()
+            .flat_map(|simple| simple.clauses.iter())
+            .collect()
+    }
+
+    /// The projection the query ends with, or `None` for a write that
+    /// ends without one.
+    pub fn result(&self) -> Option<&Projection> {
+        let Composite::Linear(linear) = &self.body;
+        linear.statements.last()?.result.as_ref()
+    }
+}
+
+/// A composite query statement (ISO 12.1): one linear query statement,
+/// or two of them joined by an operator over their result tables.
+///
+/// Only the one-statement form is parsed today. The level exists
+/// because `UNION`, `EXCEPT`, `INTERSECT` and `OTHERWISE` join here and
+/// nowhere else, and every consumer that walks a query has to be
+/// written to expect more than one of them before any of them can land.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Composite {
+    Linear(Linear),
+}
+
+/// A linear query statement (ISO 12.2): simple statements chained by
+/// `NEXT`, each one reading the binding table the one before it
+/// answered.
+///
+/// One statement is the ordinary query. Two or more is a chain, and the
+/// chain is not the same thing as writing the clauses one after the
+/// other: each statement of it ends with a result of its own, and what
+/// the next one sees is that result and nothing else the statement
+/// before it had in hand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Linear {
+    pub statements: Vec<Simple>,
+}
+
+/// A simple query statement (ISO 12.3): the primitive statements it is
+/// written out of, and the result statement it ends with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Simple {
     pub clauses: Vec<Clause>,
+    /// The primitive result statement (ISO 12.4), which is `RETURN` and
+    /// what it projects. `None` is a statement that writes and ends
+    /// without projecting, which is the ordinary way to write one: the
+    /// answer to `INSERT (x:Person)` is that it worked.
+    pub result: Option<Projection>,
 }
 
 /// What a `USE` clause names (ISO 16.2, `use graph clause`).
@@ -256,9 +329,6 @@ pub enum Clause {
     With {
         projection: Projection,
         filter: Option<Expr>,
-    },
-    Return {
-        projection: Projection,
     },
 }
 

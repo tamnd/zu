@@ -887,11 +887,7 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
                         PathMode::Simple => s.push_str(" simple"),
                         PathMode::Acyclic => s.push_str(" acyclic"),
                     }
-                    match v.selector {
-                        Some(Selector::AnyShortest) => s.push_str(" any shortest"),
-                        Some(Selector::AllShortest) => s.push_str(" all shortest"),
-                        None => {}
-                    }
+                    s.push_str(&crate::exec::selector_text(v.selector));
                     // The step's own predicate prints inside the
                     // brackets it was written in, because that is where
                     // it runs: on the edge, before the walk takes it.

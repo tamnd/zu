@@ -154,8 +154,8 @@ MATCH p = ANY SHORTEST TRAIL (a)-[:KNOWS]->(b) RETURN p
       (pattern
         (path
           (identifier)
-          (selector)
-          (path_mode)
+          (path_prefix
+            (path_mode))
           (node
             (identifier))
           (relationship
@@ -189,6 +189,68 @@ MATCH (a)~[:KNOWS]~(b) RETURN a
             (rel_detail
               (label
                 (identifier))))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A counted shortest group selector, and a quantifier behind the arrow
+================================================================================
+
+MATCH SHORTEST 2 GROUPS (a)-[:KNOWS]->{1,3}(b) RETURN b
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (path_prefix
+            (integer))
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier)))
+            (quantifier
+              (integer)
+              (integer)))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+The path mode sits inside the prefix, and GROUPS comes after it
+================================================================================
+
+MATCH SHORTEST ACYCLIC PATHS GROUPS (a)-[:KNOWS]->+(b) RETURN b
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (path_prefix
+            (path_mode))
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier)))
+            (quantifier))
           (node
             (identifier)))))
     (return_clause

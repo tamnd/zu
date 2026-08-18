@@ -1517,31 +1517,7 @@ impl Parser<'_> {
         } else {
             None
         };
-        let selector = if self.eat_kw("ANY") {
-            self.expect_kw("SHORTEST")?;
-            Some(Selector::AnyShortest)
-        } else if self.eat_kw("ALL") {
-            self.expect_kw("SHORTEST")?;
-            Some(Selector::AllShortest)
-        } else if self.at_kw("SHORTEST") {
-            return Err(ZuError::gql(
-                codes::C42001,
-                "SHORTEST needs a quantity: write ANY SHORTEST or ALL SHORTEST",
-            ));
-        } else {
-            None
-        };
-        let mode = if self.eat_kw("WALK") {
-            PathMode::Walk
-        } else if self.eat_kw("TRAIL") {
-            PathMode::Trail
-        } else if self.eat_kw("ACYCLIC") {
-            PathMode::Acyclic
-        } else if self.eat_kw("SIMPLE") {
-            PathMode::Simple
-        } else {
-            PathMode::default()
-        };
+        let (selector, mode) = self.parse_path_prefix()?;
         let start = self.parse_node()?;
         let mut steps = Vec::new();
         while self.at(&TokenKind::Minus) || self.at(&TokenKind::Lt) || self.at(&TokenKind::Tilde) {
@@ -1556,6 +1532,101 @@ impl Parser<'_> {
             start,
             steps,
         })
+    }
+
+    /// What a pattern carries in front of its first node (ISO 16.6): a
+    /// path selector, a path mode, or both, and in that order.
+    ///
+    /// The selector says how many of the paths the pattern matches are
+    /// kept per pair of endpoints, and there are seven of them: `ALL`,
+    /// `ANY`, `ANY k`, `ALL SHORTEST`, `ANY SHORTEST`, `SHORTEST k` and
+    /// `SHORTEST k GROUP`. The mode sits inside the prefix rather than
+    /// behind it, so the words come in one fixed order: the selector,
+    /// then the mode, then `PATH` or `PATHS`, then `GROUP` last of all.
+    ///
+    /// `PATH` and `PATHS` are noise the standard allows so that a prefix
+    /// reads as English, and they say nothing the rest of it has not
+    /// said, so they are eaten and dropped. `GROUP` is no such word: it
+    /// is the whole of the difference between keeping k paths and
+    /// keeping every path of the k shortest lengths.
+    fn parse_path_prefix(&mut self) -> Result<(Option<Selector>, PathMode)> {
+        // The head words, which are all that tells the seven apart bar
+        // the `GROUP` at the very end. A bare `SHORTEST` head is held
+        // aside as `grouped`, count and all, because whether it counts
+        // paths or lengths is not known until that last word is read.
+        let mut selector = None;
+        let mut grouped = None;
+        if self.eat_kw("ALL") {
+            // `ALL PATHS` is every path the pattern matches, which is
+            // what a pattern with no prefix at all keeps, so it lands
+            // where that lands rather than carrying a selector nothing
+            // downstream would act on.
+            selector = self.eat_kw("SHORTEST").then_some(Selector::AllShortest);
+        } else if self.eat_kw("ANY") {
+            selector = Some(if self.eat_kw("SHORTEST") {
+                Selector::AnyShortest
+            } else {
+                // `ANY` on its own is `ANY 1`: one path, and the
+                // standard leaves which one to the engine.
+                Selector::Any(self.take_path_count("ANY")?.unwrap_or(1))
+            });
+        } else if self.eat_kw("SHORTEST") {
+            grouped = Some(self.take_path_count("SHORTEST")?);
+        }
+        let mode = if self.eat_kw("WALK") {
+            PathMode::Walk
+        } else if self.eat_kw("TRAIL") {
+            PathMode::Trail
+        } else if self.eat_kw("ACYCLIC") {
+            PathMode::Acyclic
+        } else if self.eat_kw("SIMPLE") {
+            PathMode::Simple
+        } else {
+            PathMode::default()
+        };
+        self.eat_paths();
+        if let Some(count) = grouped {
+            let groups = self.eat_kw("GROUPS") || self.eat_kw("GROUP");
+            selector = Some(match (count, groups) {
+                // A group count left out is one group, and one group is
+                // every path of the least length, so bare `SHORTEST
+                // GROUPS` is `ALL SHORTEST` written the other way.
+                (count, true) => Selector::ShortestGroup(count.unwrap_or(1)),
+                (Some(k), false) => Selector::Shortest(k),
+                (None, false) => {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        "SHORTEST needs a quantity: write SHORTEST k for k paths, \
+                         SHORTEST k GROUP for every path of the k least lengths, \
+                         or ANY SHORTEST or ALL SHORTEST for one length",
+                    ));
+                }
+            });
+        }
+        Ok((selector, mode))
+    }
+
+    /// The number of paths a selector asks for, refused rather than
+    /// obeyed when it is zero: a pattern that keeps no path answers
+    /// nothing whatever the graph holds, so it is a query somebody
+    /// wrote by mistake.
+    fn take_path_count(&mut self, word: &str) -> Result<Option<u64>> {
+        let at = self.tokens[self.pos.saturating_sub(1)].start;
+        match self.take_int() {
+            Some(0) => Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                format!("{word} 0 keeps no path at all; a path count starts at 1"),
+            )),
+            other => Ok(other),
+        }
+    }
+
+    /// `PATH` or `PATHS` after a selector, which the standard allows and
+    /// which means nothing more than the selector already said.
+    fn eat_paths(&mut self) {
+        let _ = self.eat_kw("PATHS") || self.eat_kw("PATH");
     }
 
     fn parse_node(&mut self) -> Result<NodePattern> {
@@ -3285,12 +3356,109 @@ mod tests {
         assert_eq!(patterns[3].mode, PathMode::Acyclic);
     }
 
+    /// `SHORTEST` on its own says shortest of how many, and there is no
+    /// answer to read into it: `SHORTEST 1` and `ALL SHORTEST` are both
+    /// shortest and are different questions.
     #[test]
     fn bare_shortest_reads_as_an_error() {
-        assert!(
-            parse_err("MATCH SHORTEST (a)-[:KNOWS*]->(b) RETURN *")
-                .contains("ANY SHORTEST or ALL SHORTEST")
-        );
+        let e = parse_err("MATCH SHORTEST (a)-[:KNOWS*]->(b) RETURN *");
+        assert!(e.contains("needs a quantity"), "got: {e}");
+    }
+
+    /// All seven selectors of ISO 16.6, and the noise words the standard
+    /// lets them carry. `ALL PATHS` is every path a pattern matches,
+    /// which is what a pattern with no selector keeps, so it reads as
+    /// none rather than as a selector of its own.
+    #[test]
+    fn every_path_selector_reads_as_itself() {
+        for (source, want) in [
+            ("ALL", None),
+            ("ALL PATHS", None),
+            ("ALL PATH", None),
+            ("ANY", Some(Selector::Any(1))),
+            ("ANY PATHS", Some(Selector::Any(1))),
+            ("ANY 3", Some(Selector::Any(3))),
+            ("ANY 3 PATHS", Some(Selector::Any(3))),
+            ("ALL SHORTEST", Some(Selector::AllShortest)),
+            ("ALL SHORTEST PATHS", Some(Selector::AllShortest)),
+            ("ANY SHORTEST", Some(Selector::AnyShortest)),
+            ("ANY SHORTEST PATH", Some(Selector::AnyShortest)),
+            ("SHORTEST 2", Some(Selector::Shortest(2))),
+            ("SHORTEST 2 PATHS", Some(Selector::Shortest(2))),
+            ("SHORTEST 2 GROUP", Some(Selector::ShortestGroup(2))),
+            ("SHORTEST 2 GROUPS", Some(Selector::ShortestGroup(2))),
+        ] {
+            let q = parsed(&format!("MATCH {source} (a)-[:KNOWS*1..3]->(b) RETURN *"));
+            let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+                panic!("MATCH");
+            };
+            assert_eq!(patterns[0].selector, want, "{source}");
+        }
+    }
+
+    /// The mode belongs inside the prefix, between the selector and the
+    /// noise words, and `GROUP` comes after all of it. A group count
+    /// left out means one group, which is the one case where `SHORTEST`
+    /// stands without a number of its own.
+    #[test]
+    fn the_mode_sits_inside_the_selector_and_group_comes_last() {
+        for (source, selector, mode) in [
+            ("ALL TRAIL PATHS", None, PathMode::Trail),
+            ("ALL WALK", None, PathMode::Walk),
+            ("TRAIL PATHS", None, PathMode::Trail),
+            (
+                "ANY 2 ACYCLIC PATHS",
+                Some(Selector::Any(2)),
+                PathMode::Acyclic,
+            ),
+            (
+                "ANY SHORTEST SIMPLE PATH",
+                Some(Selector::AnyShortest),
+                PathMode::Simple,
+            ),
+            (
+                "ALL SHORTEST ACYCLIC PATHS",
+                Some(Selector::AllShortest),
+                PathMode::Acyclic,
+            ),
+            (
+                "SHORTEST 2 SIMPLE PATHS",
+                Some(Selector::Shortest(2)),
+                PathMode::Simple,
+            ),
+            (
+                "SHORTEST 2 ACYCLIC PATHS GROUPS",
+                Some(Selector::ShortestGroup(2)),
+                PathMode::Acyclic,
+            ),
+            (
+                "SHORTEST GROUPS",
+                Some(Selector::ShortestGroup(1)),
+                PathMode::Trail,
+            ),
+            (
+                "SHORTEST TRAIL GROUP",
+                Some(Selector::ShortestGroup(1)),
+                PathMode::Trail,
+            ),
+        ] {
+            let q = parsed(&format!("MATCH {source} (a)-[:KNOWS*1..3]->(b) RETURN *"));
+            let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+                panic!("MATCH");
+            };
+            assert_eq!(patterns[0].selector, selector, "{source}");
+            assert_eq!(patterns[0].mode, mode, "{source}");
+        }
+    }
+
+    /// A selector that keeps no path answers nothing whatever the graph
+    /// holds, so the count is refused rather than obeyed.
+    #[test]
+    fn a_path_count_of_zero_is_refused() {
+        for source in ["ANY 0", "SHORTEST 0", "SHORTEST 0 GROUPS"] {
+            let e = parse_err(&format!("MATCH {source} (a)-[:KNOWS*]->(b) RETURN *"));
+            assert!(e.contains("keeps no path at all"), "{source}: {e}");
+        }
     }
 
     /// SIMPLE is a mode of its own and used to be turned away with a

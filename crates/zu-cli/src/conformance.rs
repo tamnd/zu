@@ -208,6 +208,14 @@ const NOTES: &[&str] = &[
      rather than one of them being read and the other dropped; a repetition that may take no hop \
      at all, a bare `*` or a range starting at zero, is refused with that as the reason rather \
      than answered as though it had been written `+`",
+    "a path selector says how many of the paths a pattern matches are kept per pair of \
+     endpoints, and all seven are read: ALL keeps every one of them and is what a pattern with \
+     no selector keeps, ANY and ANY k keep that many and the standard leaves which ones to the \
+     engine, ANY SHORTEST and ALL SHORTEST keep one and every path of the least length, \
+     SHORTEST k keeps k paths counted shortest first, and SHORTEST k GROUP keeps every path \
+     whose length is one of the k least; a selector needs a repeating step to choose between \
+     paths, since a pattern of fixed length matches one path per set of elements, and a count \
+     of zero is refused because it keeps no path whatever the graph holds",
     "a repeated step walks under a path mode, and the default is TRAIL, which repeats no edge: \
      WALK repeats anything, ACYCLIC repeats no node, and SIMPLE repeats no node except that a \
      path may end where it began, so a cycle is a simple path and is not an acyclic one and \

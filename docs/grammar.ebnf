@@ -198,9 +198,30 @@ null_ordering   = "NULLS" , ( "FIRST" | "LAST" ) ;
 (* Patterns. *)
 
 pattern         = path , { "," , path } ;
-path            = [ name , "=" ] , [ selector ] , [ path_mode ] ,
+path            = [ name , "=" ] , [ path_prefix ] ,
                   node , { relationship , node } ;
-selector        = ( "ANY" | "ALL" ) , "SHORTEST" ;
+path_prefix     = "ALL" , [ "SHORTEST" ] , path_tail
+                | "ANY" , ( "SHORTEST" | [ integer ] ) , path_tail
+                | "SHORTEST" , ( integer , path_tail , [ group_or_groups ]
+                               | [ integer ] , path_tail , group_or_groups )
+                | path_mode , [ path_or_paths ] ;
+path_tail       = [ path_mode ] , [ path_or_paths ] ;
+path_or_paths   = "PATH" | "PATHS" ;
+group_or_groups = "GROUP" | "GROUPS" ;
+(* The seven path selectors of ISO 16.6, and the mode that sits inside
+   the prefix with them rather than behind it: the words come in one
+   order, the selector, then the mode, then PATH or PATHS, then GROUP
+   last of all. ALL keeps every path a pattern matches, which is what a
+   pattern with no selector keeps. ANY keeps one per pair of endpoints
+   and ANY k keeps k, whichever ones the search comes to. The four
+   shortest forms go by length: ANY SHORTEST keeps one of the least
+   length, ALL SHORTEST keeps every path of it, SHORTEST k keeps k paths
+   counted shortest first, and SHORTEST k GROUP keeps every path whose
+   length is one of the k least. PATH and PATHS say nothing the rest of
+   the prefix has not, while GROUP is the whole of the difference between
+   counting paths and counting lengths, and a group count left out is one
+   group. A count of zero is refused: it keeps no path whatever the graph
+   holds. *)
 path_mode       = "WALK" | "TRAIL" | "SIMPLE" | "ACYCLIC" ;
 (* The four differ only in the repeat they forbid: none, a repeated
    edge, a repeated node except the one the path started at, and a

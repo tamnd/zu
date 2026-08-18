@@ -4037,8 +4037,8 @@
       "kind": "method",
       "name": "list_threshold",
       "of": "zu::snapshot::Snapshot",
-      "signature": "fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<usize>",
-      "doc": "How many lists of one group a caller has to want before pinning\nthe group beats reading each list on its own. A pin decodes the\ngroup's whole neighbor array, so it is the right read for a scan\nand the wrong one for a point lookup: a seed with sixteen\nfriends does not need the two million edges its group holds\ndecoded, and on a working set larger than the decoded pool it\ndoes not even get to keep them. Backends that decode nothing\nlazily answer 0, which asks for the pin every time."
+      "signature": "fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<Option<usize>>",
+      "doc": "How many lists of one group a caller has to want before pinning\nthe group beats reading each list on its own. A pin decodes the\ngroup's whole neighbor array, so it is the right read for a scan\nand the wrong one for a point lookup: a seed with sixteen\nfriends does not need the two million edges its group holds\ndecoded, and on a working set larger than the decoded pool it\ndoes not even get to keep them. Backends that decode nothing\nlazily answer 0, which asks for the pin every time.\n\n`None` is not a very high threshold, it is a refusal: this group\nmust be read a list at a time whatever the caller wants. A\nbackend answers that when a pin would be wrong rather than\nmerely expensive, which is what an unfolded edge over the group\nmakes it, since a pin hands out the arrays the file holds and\nthose are the ones the edge is not in."
     },
     {
       "id": "zu::snapshot::Snapshot::resolve_col",
@@ -4224,10 +4224,47 @@
     },
     {
       "id": "zu::write::Patches",
-      "kind": "type-alias",
+      "kind": "struct",
       "name": "Patches",
+      "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nThree shapes, because there are three ways a change can sit above a\ncolumn nobody has rewritten: a new word for a row the column already\nholds, a whole new row past the end of it, and a new edge, which is\na row of the rel table's property columns and a pair the adjacency\nreader has to merge into two lists."
+    },
+    {
+      "id": "zu::write::Patches::cells",
+      "kind": "field",
+      "name": "cells",
+      "of": "zu::write::Patches",
       "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::LanePatch>>",
-      "doc": "The unsealed cells of every table that has any, which is what a\nreader is handed so that it reads a deferred commit."
+      "doc": "New words, by table."
+    },
+    {
+      "id": "zu::write::Patches::edges",
+      "kind": "field",
+      "name": "edges",
+      "of": "zu::write::Patches",
+      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::graph::EdgePatch>>",
+      "doc": "New edges, by rel table."
+    },
+    {
+      "id": "zu::write::Patches::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::write::Patches",
+      "signature": "fn is_empty(&self) -> bool"
+    },
+    {
+      "id": "zu::write::Patches::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::write::Patches",
+      "signature": "fn new() -> Self"
+    },
+    {
+      "id": "zu::write::Patches::rows",
+      "kind": "field",
+      "name": "rows",
+      "of": "zu::write::Patches",
+      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::RowPatch>>",
+      "doc": "New rows, by table. Only rel tables have any so far: a node\nappend moves the row count every reader is bounded by, and\nnothing reads through that yet."
     },
     {
       "id": "zu::write::Writer",
@@ -6457,6 +6494,59 @@
       "doc": "Rows of the node table the edges arrive at, the domain a\ndestination id and the backward CSR are numbered in. Equal to\n`from_count` when both ends are the same table, which is what a\nload naming one node table produces."
     },
     {
+      "id": "zu::zu1::graph::EdgePatch",
+      "kind": "struct",
+      "name": "EdgePatch",
+      "doc": "Read access to a bulk-loaded graph, caching the most recently decoded\ngroup per direction so sequential scans decode each group once. The\ntwo directions cache independently because a plan often walks both\non the same rel row by row, an expand backward feeding a count\nforward, and a shared slot would decode a full group per row.\nThe edges committed since the last fold, held the way a reader\nwants them rather than the way the log wrote them.\n\nAn edge added to a rel table does not have to wait for a fold to be\nreadable: the file holds a sorted list per node per direction, and\na handful of extra edges merge into one of those as it is read. So\na commit that only adds edges leaves them here, the reader merges,\nand the CSR is rebuilt once for the run of them rather than once\neach.\n\nAn edge's ordinal is its row in the rel table's property columns.\nThe base holds `base` of them, in the order the forward CSR lays\nthem out, and an edge in here takes the next one after those, so\nthe two spaces do not overlap and an unfolded edge names its own\nvalues. Both directions carry the ordinal, which is what makes the\nsame edge read forward and read backward carry the same row."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::add",
+      "kind": "method",
+      "name": "add",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn add(&mut self, src: u64, dst: u64) -> u64",
+      "doc": "Takes one edge and answers with the ordinal it was given."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::base",
+      "kind": "method",
+      "name": "base",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn base(&self) -> u64",
+      "doc": "The first ordinal this patch handed out, so a caller holding one\ncan tell an edge in here from an edge in the file."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::holds",
+      "kind": "method",
+      "name": "holds",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn holds(&self, src: u64, dst: u64) -> bool",
+      "doc": "Whether this holds an edge from `src` to `dst`, which is what a\nwriter asks before adding one: two edges over one pair would\ntake ordinals that are not consecutive, and every read of an\nedge property counts on a pair's copies being so."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn is_empty(&self) -> bool"
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn len(&self) -> u64",
+      "doc": "How many edges this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn new(base: u64) -> Self",
+      "doc": "An empty patch over a base holding `base` edges."
+    },
+    {
       "id": "zu::zu1::graph::Ends",
       "kind": "struct",
       "name": "Ends",
@@ -6495,8 +6585,7 @@
     {
       "id": "zu::zu1::graph::GraphReader",
       "kind": "struct",
-      "name": "GraphReader",
-      "doc": "Read access to a bulk-loaded graph, caching the most recently decoded\ngroup per direction so sequential scans decode each group once. The\ntwo directions cache independently because a plan often walks both\non the same rel row by row, an expand backward feeding a count\nforward, and a shared slot would decode a full group per row."
+      "name": "GraphReader"
     },
     {
       "id": "zu::zu1::graph::GraphReader::csr_group",
@@ -6582,8 +6671,7 @@
       "kind": "method",
       "name": "list_chunks",
       "of": "zu::zu1::graph::GraphReader",
-      "signature": "fn list_chunks(&self, group: usize, dir: Direction) -> usize",
-      "doc": "Chunks the neighbor array of `group` in `dir` is stored in,\ndirectory only, no decode. This is what says whether pinning a\ngroup is worth it: the pin decodes every one of these chunks,\nand reading one node's list as a range decodes about one of\nthem, so a caller wanting fewer lists than there are chunks is\nbetter off reading each one. It is the same rule\n[`Self::degrees_into`] uses on the offset array."
+      "signature": "fn list_chunks(&self, group: usize, dir: Direction) -> usize"
     },
     {
       "id": "zu::zu1::graph::GraphReader::load",
@@ -6631,7 +6719,7 @@
       "name": "neighbors_dir",
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]>",
-      "doc": "Returns `node`'s sorted list in `dir`, decoding the node's group\non a cache miss."
+      "doc": "Returns `node`'s sorted list in `dir`, decoding the node's group\non a cache miss.\n\nA node with unfolded edges is answered out of the merge buffer\ninstead of the decoded group, because the list it wants is not\none the file holds anywhere. Every other node, which on a patch\nof a few hundred edges is very nearly all of them, takes the\nslice the group cache already has."
     },
     {
       "id": "zu::zu1::graph::GraphReader::neighbors_dir_into",
@@ -6656,6 +6744,22 @@
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn out_neighbors_from(&mut self, db: &mut Zu1File, node: u64) -> Result<(&[u64], u64)>",
       "doc": "`node`'s forward list together with the ordinal of the first\nedge in it, so the `i`th neighbor is edge `base + i` of the load\norder and an edge property is a slice index rather than a\nsearch.\n\n[`Self::edge_ordinal`] answers the same question for one pair\nand costs a binary search to do it, which is the right trade for\nan edge that arrived from somewhere else. A kernel walking the\nforward lists already knows where it is, and on a graph where a\npair can repeat the count is the only thing that tells the\ncopies apart."
+    },
+    {
+      "id": "zu::zu1::graph::GraphReader::pinnable",
+      "kind": "method",
+      "name": "pinnable",
+      "of": "zu::zu1::graph::GraphReader",
+      "signature": "fn pinnable(&self, group: usize, dir: Direction) -> bool",
+      "doc": "Chunks the neighbor array of `group` in `dir` is stored in,\ndirectory only, no decode. This is what says whether pinning a\ngroup is worth it: the pin decodes every one of these chunks,\nand reading one node's list as a range decodes about one of\nthem, so a caller wanting fewer lists than there are chunks is\nbetter off reading each one. It is the same rule\n[`Self::degrees_into`] uses on the offset array.\nWhether pinning `group` in `dir` is still the cheap read. A\ngroup the patch reaches into is built on every pin, so while a\npatch is up the caller is better off taking one list at a time\nhowever many it wants."
+    },
+    {
+      "id": "zu::zu1::graph::GraphReader::set_edges",
+      "kind": "method",
+      "name": "set_edges",
+      "of": "zu::zu1::graph::GraphReader",
+      "signature": "fn set_edges(&mut self, edges: Option<Arc<EdgePatch>>)",
+      "doc": "Hands this reader the edges committed since the last fold, or\ntakes them back away with `None`. Every read below merges them\ninto what the file holds, so a caller that sets this reads a\ngraph the CSR does not hold yet."
     },
     {
       "id": "zu::zu1::graph::GroupMeta",
@@ -7463,6 +7567,14 @@
       "doc": "Reads the string values of rows `start..end` of `col`, the scan\nunit for string columns: values concatenated in `bytes`, row\n`i - start` ending at `ends[i - start]`."
     },
     {
+      "id": "zu::zu1::props::PropsReader::set_added",
+      "kind": "method",
+      "name": "set_added",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn set_added(&mut self, added: Option<Arc<RowPatch>>)",
+      "doc": "The same for the committed rows past the end of them."
+    },
+    {
       "id": "zu::zu1::props::PropsReader::set_patch",
       "kind": "method",
       "name": "set_patch",
@@ -7477,6 +7589,51 @@
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn zone(&self, col: usize) -> Option<(u64, u64)>",
       "doc": "The value bounds of the whole of `col`, which is what says\nwhether a scan has to look at the column at all. `None` for an\nempty column, which bounds nothing.\n\nThis is [`Self::meta`] with the unsealed words folded in, and\nthe reason to ask it rather than read the bounds off the meta is\nthat a write the columns do not hold yet can sit outside them."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch",
+      "kind": "struct",
+      "name": "RowPatch",
+      "doc": "The rows a commit added that no fold has put in the columns yet.\n\n[`LanePatch`] carries a new word for a row the columns already hold,\nwhich is an update. This carries whole rows past the end of them,\nwhich is what an edge insert leaves behind once the adjacency reader\nstopped needing the CSR rebuilt to see it: the edge takes the next\nordinal, its property values sit here under that ordinal, and a\ngather asking for it reads them from here rather than off a column\nthat has not been rewritten.\n\nAny value at all, unlike the lane patch, because these rows are not\nstored anywhere yet and there is nothing to lay a word over: a\nstring is the bytes and an absent value is [`Cell::Null`]."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::base",
+      "kind": "method",
+      "name": "base",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn base(&self) -> u64",
+      "doc": "The first row this holds, so a caller with a row number can tell\nan unfolded row from a stored one."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn is_empty(&self) -> bool"
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many rows this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn new(base: u64) -> Self",
+      "doc": "An empty patch over columns holding `base` rows."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::push",
+      "kind": "method",
+      "name": "push",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn push(&mut self, cells: Vec<Cell>) -> u64",
+      "doc": "Takes one row, a cell per column, and answers with the row\nnumber it was given."
     },
     {
       "id": "zu::zu1::props::list_elements",
@@ -8168,6 +8325,28 @@
       "signature": "Str(Vec<u8>)"
     },
     {
+      "id": "zu::zu1::txn::Deferred",
+      "kind": "enum",
+      "name": "Deferred",
+      "doc": "One change a reader can be shown before a fold has sealed it."
+    },
+    {
+      "id": "zu::zu1::txn::Deferred::Edge",
+      "kind": "variant",
+      "name": "Edge",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "Edge(u32, u64, u64, Vec<(u32, Cell)>)",
+      "doc": "An edge added to a rel table: the table, the rows it runs\nbetween, and the cell it holds in each column the table stores,\nby position in the props directory."
+    },
+    {
+      "id": "zu::zu1::txn::Deferred::Lane",
+      "kind": "variant",
+      "name": "Lane",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "Lane(LaneWrite)",
+      "doc": "A word written onto a column of a row that is already there."
+    },
+    {
       "id": "zu::zu1::txn::IngestPayload",
       "kind": "enum",
       "name": "IngestPayload",
@@ -8337,14 +8516,6 @@
       "doc": "What `table` has had put on its rows' labels and taken off them\nby `epoch`, keyed by offset: one pair of masks per row, the bits\nto set and the bits to clear.\n\nA row's chain is composed rather than read at its end, because\ntwo statements can change two labels of one row and both have to\nland. Composing keeps the two masks disjoint, so the fold can\nwrite `(word | add) & !remove` and get the same answer whichever\norder it applies them in."
     },
     {
-      "id": "zu::zu1::txn::Mvcc::lane_only",
-      "kind": "method",
-      "name": "lane_only",
-      "of": "zu::zu1::txn::Mvcc",
-      "signature": "fn lane_only(&self) -> bool",
-      "doc": "Whether everything this store holds is an integer write onto an\nexisting row, which is the shape a reader can be shown without a\nfold sealing it first."
-    },
-    {
       "id": "zu::zu1::txn::Mvcc::neighbors",
       "kind": "method",
       "name": "neighbors",
@@ -8393,6 +8564,14 @@
       "doc": "Seeds tombstones a checkpoint persisted into the base file. They\nenter at epoch 0 so every reader sees them, matching their state\nas folded rather than freshly deleted."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::soft",
+      "kind": "method",
+      "name": "soft",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn soft(&self) -> bool",
+      "doc": "Whether everything this store holds is a shape a reader can be\nshown without a fold sealing it first."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc::tables_touched",
       "kind": "method",
       "name": "tables_touched",
@@ -8401,12 +8580,12 @@
       "doc": "Node tables holding any overlay state, sorted so a fold walks\nthem deterministically."
     },
     {
-      "id": "zu::zu1::txn::Mvcc::take_lanes",
+      "id": "zu::zu1::txn::Mvcc::take_deferred",
       "kind": "method",
-      "name": "take_lanes",
+      "name": "take_deferred",
       "of": "zu::zu1::txn::Mvcc",
-      "signature": "fn take_lanes(&mut self) -> Vec<LaneWrite>",
-      "doc": "The integer writes the last commit published, in statement\norder. Empty when that commit was of any other shape, and empty\nagain once it has been read."
+      "signature": "fn take_deferred(&mut self) -> Vec<Deferred>",
+      "doc": "The changes the last commit published, in statement order.\nEmpty when that commit held anything of another shape, and\nempty again once it has been read."
     },
     {
       "id": "zu::zu1::txn::Mvcc::tombstones",

@@ -313,6 +313,25 @@ fn chain_has_node(link: &PathLink, table: u32, offset: u64) -> bool {
     false
 }
 
+/// The node a chain begins at, which is the root link's, read by
+/// walking to the root.
+///
+/// Only SIMPLE asks, and it asks once per node the walk stands on
+/// rather than once per edge, so the walk it costs is the one
+/// [`chain_has_node`] does anyway.
+fn chain_start(link: &PathLink) -> (u32, u64) {
+    let mut cur = link;
+    while let Some(prev) = cur.prev.as_deref() {
+        cur = prev;
+    }
+    match cur.node {
+        Value::Node { table, offset } => (table, offset),
+        // A chain's links hold nodes, and the root's is the node the
+        // walk was started from.
+        ref other => unreachable!("a path chain begins at a node, not at {other:?}"),
+    }
+}
+
 /// The rows a query returns, one column name per RETURN item, plus any
 /// conditions raised along the way that did not stop it.
 ///
@@ -859,6 +878,7 @@ fn op_label(
             let mode = match mode {
                 PathMode::Walk => " walk",
                 PathMode::Trail => "",
+                PathMode::Simple => " simple",
                 PathMode::Acyclic => " acyclic",
             };
             let sel = match selector {
@@ -3160,7 +3180,8 @@ fn edge_passes(ctx: &mut StageCtx, gate: EdgeGate<'_>, rel: &Value) -> Result<bo
 /// Depth-first path enumeration for `VarExpand`: every path of
 /// `min..=max` hops from the start node under the mode's repeat rule,
 /// WALK unrestricted (the binder guarantees a bound), TRAIL with no
-/// repeated edge, ACYCLIC with no repeated node. A path whose endpoint
+/// repeated edge, ACYCLIC with no repeated node, SIMPLE with no
+/// repeated node but for the one the path started at. A path whose endpoint
 /// sits in `to_tables` emits one node value and its PMR chain, which
 /// is one `Arc` clone of the current link; sibling branches share every
 /// ancestor link, so emitting all paths costs one link per path, not
@@ -3184,6 +3205,19 @@ fn enumerate_paths(
     if spec.max.is_some_and(|m| depth >= m) {
         return Ok(());
     }
+    // Where the path began, which SIMPLE is the one mode to care about:
+    // it is the node the path may come back to, and the node it may not
+    // walk on from once it has.
+    let began = match spec.mode {
+        PathMode::Simple => Some(chain_start(link)),
+        _ => None,
+    };
+    if began == Some((table, offset)) && depth > 0 {
+        // A simple path standing where it began. Every node ahead of it
+        // is one the path already holds, or the start a second time, so
+        // there is nothing legal left to walk.
+        return Ok(());
+    }
     for (rel_val, next_table, next_offset) in
         hop_edges(ctx, spec.rels, spec.direction, spec.gate, table, offset)?
     {
@@ -3196,6 +3230,12 @@ fn enumerate_paths(
                 PathMode::Walk => false,
                 PathMode::Trail => chain_has_rel(link, &rel_val),
                 PathMode::Acyclic => chain_has_node(link, next_table, next_offset),
+                // The step back to the start is the one repeat SIMPLE
+                // allows, and the guard above stops the path there.
+                PathMode::Simple => {
+                    began != Some((next_table, next_offset))
+                        && chain_has_node(link, next_table, next_offset)
+                }
             };
             if repeats {
                 continue;

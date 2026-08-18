@@ -1314,6 +1314,135 @@ mod tests {
         .expect("acyclic count");
         assert_eq!(r.rows, [[Value::Int(acyclic_total)]]);
 
+        // A variable-length step whose paths the stage throws away
+        // walks each node once instead of once per path, so it has to
+        // reach the same endpoints the enumeration reaches. The oracle
+        // is a brute-force walk of the same mode over the edge list.
+        // rule is (acyclic, min hops, max hops).
+        fn ends(
+            edges: &[(u32, u32)],
+            at: u32,
+            used: &mut (Vec<(u32, u32)>, Vec<u32>),
+            rule: (bool, usize, usize),
+            out: &mut std::collections::BTreeSet<u32>,
+        ) {
+            let (acyclic, lo, hi) = rule;
+            let d = used.0.len();
+            if d >= lo {
+                out.insert(at);
+            }
+            if d == hi {
+                return;
+            }
+            for &e in edges {
+                if e.0 != at {
+                    continue;
+                }
+                if acyclic {
+                    if used.1.contains(&e.1) {
+                        continue;
+                    }
+                } else if used.0.contains(&e) {
+                    continue;
+                }
+                used.0.push(e);
+                used.1.push(e.1);
+                ends(edges, e.1, used, rule, out);
+                used.0.pop();
+                used.1.pop();
+            }
+        }
+        let reach_set = |acyclic: bool, lo: usize, hi: usize| {
+            let mut out = std::collections::BTreeSet::new();
+            let mut used = (Vec::new(), vec![src]);
+            ends(&edges, src, &mut used, (acyclic, lo, hi), &mut out);
+            out
+        };
+        let reach_len =
+            |acyclic: bool, lo: usize, hi: usize| reach_set(acyclic, lo, hi).len() as i64;
+        // The start node comes back through a cycle under TRAIL and
+        // never under ACYCLIC, which is the one endpoint the two modes
+        // disagree about and the reason the walk emits it separately.
+        assert!(reach_set(false, 1, 3).contains(&src));
+        assert!(!reach_set(true, 1, 3).contains(&src));
+
+        // DISTINCT over the projected rows, which is the shape a WITH
+        // writes, and a DISTINCT aggregate, which is the shape a
+        // RETURN writes. Both throw the duplicates away, so both take
+        // the walk.
+        for text in [
+            "MATCH (a:person {id: $src})-[:follows*1..3]->(b) \
+             WITH DISTINCT a, b RETURN count(*) AS n",
+            "MATCH (a:person {id: $src})-[:follows*1..3]->(b) \
+             RETURN count(DISTINCT b) AS n",
+        ] {
+            let plan = explain_analyze(text, &mut db, &[("src", Value::Int(i64::from(src)))])
+                .expect("plan");
+            assert!(plan.contains("reach"), "{text}\n{plan}");
+            let r = run(text, &mut db, &[("src", Value::Int(i64::from(src)))]).expect("reach");
+            assert_eq!(r.rows, [[Value::Int(reach_len(false, 1, 3))]], "{text}");
+        }
+
+        // ACYCLIC cannot end where it started, so the start node is
+        // the one the walk has to leave out.
+        let r = run(
+            "MATCH ACYCLIC (a:person {id: $src})-[:follows*1..3]->(b) \
+             WITH DISTINCT a, b RETURN count(*) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("acyclic reach");
+        assert_eq!(r.rows, [[Value::Int(reach_len(true, 1, 3))]]);
+
+        // A minimum above one hop keeps the enumeration: the walk
+        // reaches a node at the fewest hops that reach it and never
+        // again, so a node this wants only further out would go
+        // missing.
+        let r = run(
+            "MATCH (a:person {id: $src})-[:follows*2..3]->(b) \
+             WITH DISTINCT a, b RETURN count(*) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("min two reach");
+        assert_eq!(r.rows, [[Value::Int(reach_len(false, 2, 3))]]);
+        let plan = explain_analyze(
+            "MATCH (a:person {id: $src})-[:follows*2..3]->(b) \
+             WITH DISTINCT a, b RETURN count(*) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("plan");
+        assert!(!plan.contains("reach"), "{plan}");
+
+        // A stage that keeps the duplicates still enumerates: this
+        // counts paths and not endpoints.
+        fn count_trails(edges: &[(u32, u32)], at: u32, used: &mut Vec<(u32, u32)>, n: &mut i64) {
+            if !used.is_empty() {
+                *n += 1;
+            }
+            if used.len() == 3 {
+                return;
+            }
+            for &e in edges {
+                if e.0 != at || used.contains(&e) {
+                    continue;
+                }
+                used.push(e);
+                count_trails(edges, e.1, used, n);
+                used.pop();
+            }
+        }
+        let mut paths = 0i64;
+        count_trails(&edges, src, &mut Vec::new(), &mut paths);
+        let r = run(
+            "MATCH (a:person {id: $src})-[:follows*1..3]->(b) RETURN count(b) AS n",
+            &mut db,
+            &[("src", Value::Int(i64::from(src)))],
+        )
+        .expect("paths kept");
+        assert_eq!(r.rows, [[Value::Int(paths)]]);
+
         // Path returns on real storage, checked structurally against
         // the BFS levels: every path alternates node, rel, node, its
         // length is twice the endpoint's level plus one, its rels are

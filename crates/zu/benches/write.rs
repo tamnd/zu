@@ -719,6 +719,57 @@ fn run_insert(dir: &Path, rows: u64) -> Cost {
     }
 }
 
+/// An `INSERT` of one edge between two rows that are already there,
+/// `WRITES` times over.
+///
+/// This is the shape LinkBench writes most of, and it is the one that
+/// costs the most: a rel table holds its edges sorted by the row they
+/// leave, so an edge added in the middle moves every edge behind it,
+/// and the fold rebuilds the CSR and rewrites the edge columns into the
+/// new order. Run at two sizes, the number says whether the statement
+/// pays for the edge it added or for every edge the table already had.
+fn run_insert_edge(dir: &Path, rows: u64) -> Cost {
+    let path = build_edge_props(dir, rows);
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    let insert = |i: u64| {
+        format!(
+            "MATCH (a:person), (b:person) WHERE a.age = {} AND b.age = {} \
+             INSERT (a)-[:follows {{since: {i}}}]->(b)",
+            i % rows,
+            (i * 7 + 3) % rows,
+        )
+    };
+    conn.query(&insert(0)).expect("warmup");
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        conn.query(&insert(i + 1)).expect("insert");
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    assert_eq!(
+        one(
+            &mut conn,
+            "MATCH (p:person)-[f:follows]->(q:person) RETURN count(*) AS n"
+        ),
+        (rows + WRITES + 1) as i64,
+        "every edge written is readable"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
 /// A `DELETE` of one element, `WRITES` times over, at the same shape as
 /// the other two.
 ///
@@ -860,6 +911,12 @@ fn main() {
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"), sync);
 
+    let edge_small = run_insert_edge(&root.path().join("insert-edge-small"), SMALL);
+    edge_small.report(&format!("INSERT an edge, {SMALL} edges"), sync);
+
+    let edge_large = run_insert_edge(&root.path().join("insert-edge-large"), LARGE);
+    edge_large.report(&format!("INSERT an edge, {LARGE} edges"), sync);
+
     let delete = run_delete(&root.path().join("delete"), SMALL);
     delete.report(&format!("DELETE, {SMALL} rows"), sync);
 
@@ -875,6 +932,11 @@ fn main() {
     println!("set_fold_x:  {fold_x:.2}x in time from {SMALL} to {LARGE} rows");
     println!("set_write_x: {write_x:.2}x in bytes written from {SMALL} to {LARGE} rows");
 
+    // The same question of an edge insert, which is the one write that
+    // rebuilds a whole structure rather than rewriting a column of it.
+    let edge_x = edge_large.us / edge_small.us.max(0.001);
+    println!("insert_edge_x: {edge_x:.2}x in time from {SMALL} to {LARGE} edges");
+
     let mut failed = false;
     let checks = [
         ("set_stmt_us", set_small.us),
@@ -888,6 +950,10 @@ fn main() {
         ("set_label_stmt_us", set_label.us),
         ("set_label_stmt_kb", set_label.written / 1024.0),
         ("insert_stmt_us", insert.us),
+        ("insert_edge_stmt_us", edge_small.us),
+        ("insert_edge_stmt_kb", edge_small.written / 1024.0),
+        ("insert_edge_stmt_cpu_us", edge_small.cpu),
+        ("insert_edge_x", edge_x),
         ("delete_stmt_us", delete.us),
         ("detach_stmt_us", detach.us),
         ("set_stmt_kb", set_small.written / 1024.0),

@@ -814,6 +814,7 @@ fn op_label(
             selector,
             target,
             edge_filter,
+            reach,
             chunk,
             ..
         } => {
@@ -837,10 +838,14 @@ fn op_label(
             let gate = edge_filter.as_ref().map_or(String::new(), |expr| {
                 format!(" where {}", expr_text(expr, query))
             });
+            // The walk that keeps endpoints rather than paths reads
+            // as `reach`, because the row count it produces is the
+            // reachable set and not the path count.
+            let kind = if *reach { " reach" } else { "" };
             (
                 "VarExpand",
                 format!(
-                    "*{min}..{max}{mode}{sel} {}{pinned}{gate}",
+                    "*{min}..{max}{mode}{sel}{kind} {}{pinned}{gate}",
                     rel_text(
                         var(*from),
                         var(stage.chunk_slots[*chunk][0]),
@@ -1221,6 +1226,11 @@ enum OpDesc {
         /// through an edge that fails it is never built.
         edge_filter: Option<BoundExpr>,
         edge_slot: Option<usize>,
+        /// True when the stage throws the paths away and keeps the
+        /// endpoints: nothing reads the rel slot and the answer is a
+        /// set. The walk then visits each node once instead of once
+        /// per path. See [`rewrite_reach_varlen`].
+        reach: bool,
         chunk: usize,
     },
     /// Both endpoints bound: an edge probe instead of a list read.
@@ -1801,6 +1811,7 @@ fn compile_match_op(
                     target,
                     edge_filter: v.edge_filter.clone(),
                     edge_slot: v.edge_slot,
+                    reach: false,
                     chunk,
                 });
                 b.produced(chunk);
@@ -2217,6 +2228,90 @@ fn rewrite_count_expand(
     }
 }
 
+/// The reachability rewrite over a finished stage: a variable-length
+/// expand whose paths the stage throws away walks each node once
+/// instead of once per path.
+///
+/// Two things have to hold. Nothing outside the expand reads its rel
+/// slot, so no path is ever looked at; the edge predicate does not
+/// count, since it reads the edge being walked rather than the answer.
+/// And the stage answers a set: either a DISTINCT over the projected
+/// rows, or a grouping every one of whose aggregates is a DISTINCT of
+/// its own. Everything between the expand and the sink is a function
+/// of the row, so a duplicate in makes a duplicate out and nothing
+/// else, and the duplicate is what both of those throw away.
+///
+/// A minimum above one hop is refused. The walk visits a node at the
+/// fewest hops that reach it and never again, so a node the query
+/// wants only at three hops but that also sits at one would go
+/// missing. The endpoint set is otherwise the same as the enumeration
+/// would find, for every path mode: the fewest-hops walk to a node
+/// repeats no node and so repeats no edge, which is a path all three
+/// modes allow. The one node that needs saying twice is the start,
+/// which the walk marks before it moves and which a cycle can still
+/// reach, so it is emitted on being met again unless the mode forbids
+/// a repeated node.
+fn rewrite_reach_varlen(
+    b: &mut StageBuilder,
+    items: &[BoundItem],
+    aggs: &[AggSpec],
+    post: &[PostOp],
+    extra: &BTreeSet<usize>,
+    aggregate: bool,
+) {
+    let a_set = if aggregate {
+        !aggs.is_empty() && aggs.iter().all(|spec| spec.distinct)
+    } else {
+        post.iter().any(|op| matches!(op, PostOp::Distinct))
+            // A window over rows that are a set is still a window over
+            // the order they arrive in, and this changes that order.
+            && !post
+                .iter()
+                .any(|op| matches!(op, PostOp::Skip(_) | PostOp::Limit(_)))
+    };
+    if !a_set {
+        return;
+    }
+    // A bracket decides its own multiplicity, and the DISTINCT this
+    // read is outside it: leave those stages alone.
+    if b.descs
+        .iter()
+        .any(|d| matches!(d, OpDesc::BracketBegin | OpDesc::BracketEnd { .. }))
+    {
+        return;
+    }
+    let mut refs = BTreeSet::new();
+    for desc in &b.descs {
+        desc_refs(desc, &mut refs);
+    }
+    for item in items {
+        expr_slots(&item.expr, &mut refs);
+    }
+    for spec in aggs {
+        if let Some(arg) = &spec.arg {
+            expr_slots(arg, &mut refs);
+        }
+    }
+    post_refs(post, &mut refs);
+    refs.extend(extra.iter().copied());
+    b.expand_shapes(&mut refs);
+    for desc in &mut b.descs {
+        if let OpDesc::VarExpand {
+            min,
+            selector: None,
+            target: None,
+            reach,
+            chunk,
+            ..
+        } = desc
+            && *min <= 1
+            && !refs.contains(&b.chunk_slots[*chunk][1])
+        {
+            *reach = true;
+        }
+    }
+}
+
 /// The estimator's reader, over the same storage the query is about to
 /// run on and the same parameter values it was called with. Every
 /// answer is a lookup or an offsets subtraction, so asking costs about
@@ -2458,6 +2553,7 @@ fn build_stages(
                 }
 
                 rewrite_count_expand(&mut b, &items, &mut aggs, &post, &extra, aggregate);
+                rewrite_reach_varlen(&mut b, &items, &aggs, &post, &extra, aggregate);
 
                 let unflat = (0..b.chunk_flat.len())
                     .filter(|&c| !b.chunk_flat[c])
@@ -3078,6 +3174,138 @@ fn enumerate_paths(
         enumerate_paths(ctx, spec, next_table, next_offset, &child, far, trails)?;
     }
     Ok(())
+}
+
+/// The set of rows a walk has already been to, one bit per row per
+/// table. Row ids are dense and the walk asks about every edge it
+/// sees, so a direct index beats hashing two words that many times.
+#[derive(Default)]
+struct Seen(BTreeMap<u32, Vec<u64>>);
+
+impl Seen {
+    fn holds(&self, table: u32, offset: u64) -> bool {
+        let ix = offset as usize;
+        self.0
+            .get(&table)
+            .and_then(|bits| bits.get(ix / 64))
+            .is_some_and(|w| w >> (ix % 64) & 1 == 1)
+    }
+
+    /// Marks a row, answering whether it was not already marked.
+    fn mark(&mut self, table: u32, offset: u64) -> bool {
+        let bits = self.0.entry(table).or_default();
+        let ix = offset as usize;
+        if bits.len() <= ix / 64 {
+            bits.resize(ix / 64 + 1, 0);
+        }
+        let was = bits[ix / 64] >> (ix % 64) & 1 == 1;
+        bits[ix / 64] |= 1 << (ix % 64);
+        !was
+    }
+}
+
+/// The endpoints a variable-length step reaches, each once, for a
+/// stage that keeps the set and throws the paths away. A node enters
+/// the walk at the fewest hops that reach it and is never walked to
+/// again, so the cost is the reachable subgraph rather than every path
+/// through it.
+///
+/// The step's predicate is asked only about an edge that would reach
+/// somewhere new. An edge into a node the walk already holds changes
+/// nothing whether it passes or not, and on a graph where the walk
+/// covers its component quickly that is nearly every edge, so the
+/// reads the predicate needs fall away with them.
+///
+/// The start is marked before the walk moves, so the only way it comes
+/// back is as somebody's neighbor, and that is where it is emitted:
+/// a cycle through it is a path that ends where it began, which WALK
+/// and TRAIL both allow and ACYCLIC does not.
+fn reach_nodes(ctx: &mut StageCtx, spec: &VarSpec, table: u32, offset: u64) -> Result<Vec<Value>> {
+    let mut far = Vec::new();
+    let mut seen = Seen::default();
+    seen.mark(table, offset);
+    if spec.min == 0 && spec.to_tables.contains(&table) {
+        far.push(Value::Node { table, offset });
+    }
+    // Whether the start has been dealt with: it is not one of the far
+    // ends, or the mode forbids a path that returns to it, or the zero
+    // hop above already put it out. Until then it is the one node the
+    // walk is allowed to arrive at a second time.
+    let mut start_again =
+        spec.mode == PathMode::Acyclic || !spec.to_tables.contains(&table) || spec.min == 0;
+    let mut frontier = vec![(table, offset)];
+    let mut nbrs = Vec::new();
+    let mut ords = Vec::new();
+    let mut depth = 0u64;
+    while !frontier.is_empty() && spec.max.is_none_or(|m| depth < m) {
+        depth += 1;
+        let mut next = Vec::new();
+        for (t, o) in frontier {
+            for step in spec.rels {
+                let Some(direction) = spec.direction.resolve(step.undirected) else {
+                    continue;
+                };
+                for backwards in [false, true] {
+                    let walks = if backwards {
+                        direction.walks_in() && t == step.to_table
+                    } else {
+                        direction.walks_out() && t == step.from_table
+                    };
+                    if !walks {
+                        continue;
+                    }
+                    let far_table = if backwards {
+                        step.from_table
+                    } else {
+                        step.to_table
+                    };
+                    ctx.graph.neighbors(step.id, o, backwards, &mut nbrs)?;
+                    ctx.graph
+                        .neighbor_ordinals(step.id, o, backwards, nbrs.len(), &mut ords)?;
+                    for i in 0..nbrs.len() {
+                        let other = nbrs[i];
+                        let ord = ords[i];
+                        let back = (far_table, other) == (table, offset);
+                        if back && start_again {
+                            continue;
+                        }
+                        if !back && seen.holds(far_table, other) {
+                            continue;
+                        }
+                        let rel = Value::Rel {
+                            table: step.id,
+                            src: if backwards { other } else { o },
+                            dst: if backwards { o } else { other },
+                            ord,
+                        };
+                        if !edge_passes(ctx, spec.gate, &rel)? {
+                            continue;
+                        }
+                        if back {
+                            if depth >= spec.min {
+                                start_again = true;
+                                far.push(Value::Node {
+                                    table: far_table,
+                                    offset: other,
+                                });
+                            }
+                            continue;
+                        }
+                        seen.mark(far_table, other);
+                        next.push((far_table, other));
+                        if depth >= spec.min && spec.to_tables.contains(&far_table) {
+                            far.push(Value::Node {
+                                table: far_table,
+                                offset: other,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    Ok(far)
 }
 
 /// The root of a PMR chain: zero hops at the start node.
@@ -3938,6 +4166,7 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             target,
             edge_filter,
             edge_slot,
+            reach,
             chunk,
         } => loop {
             if !next(descs, ctx, i - 1)? {
@@ -4051,8 +4280,14 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         levels: None,
                         gate,
                     };
-                    let root = chain_root(table, offset);
-                    enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
+                    if *reach {
+                        // The rel column stays empty: nothing reads the
+                        // slot, which is what let the paths go.
+                        far = reach_nodes(ctx, &spec, table, offset)?;
+                    } else {
+                        let root = chain_root(table, offset);
+                        enumerate_paths(ctx, &spec, table, offset, &root, &mut far, &mut trails)?;
+                    }
                 }
             }
             if far.is_empty() {

@@ -244,6 +244,15 @@ const NOTES: &[&str] = &[
      describe one node and two names written there are two names for one element; a name that \
      already stands for something else is refused rather than joined to it. A path selector \
      inside the brackets is refused, the standard writing one in front of a whole pattern",
+    "a quantifier behind those brackets repeats the stretch they hold, and a fixed count is \
+     written out as that many copies of the steps, so a stretch written `{2}` walks two edges \
+     and keeps its copies apart the way a repeated step does; a variable count is refused \
+     rather than answered for one of its lengths, a stretch of several lengths being a union \
+     of patterns. Every repetition binds the names inside the brackets again, so a name there \
+     stands for one element per repetition rather than for one element: reading it answers the \
+     list of them in the order the walk took them, reading a property of it answers the list of \
+     the properties, and an aggregate written around it folds that row's bindings rather than \
+     the rows, which is one row in and one row out and no grouping under it",
     "a path variable binds the walk as a path value rather than as the list of the same \
      elements, so PATH builds one, PATH_LENGTH counts its edges, ELEMENTS answers its nodes \
      and edges as a list in the order they were walked, and two paths over the same elements \

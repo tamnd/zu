@@ -1140,6 +1140,24 @@ fn item_text(item: &BoundItem, query: &BoundQuery) -> String {
     }
 }
 
+/// What a function is called in a plan listing, which is the name the
+/// query wrote it under.
+fn func_name(func: Func) -> &'static str {
+    match func {
+        Func::Count => "count",
+        Func::Sum => "sum",
+        Func::Avg => "avg",
+        Func::Min => "min",
+        Func::Max => "max",
+        Func::Collect => "collect",
+        Func::Id => "id",
+        Func::Size => "size",
+        Func::Cardinality => "cardinality",
+        Func::PathLength => "path_length",
+        Func::Elements => "elements",
+    }
+}
+
 /// Renders a bound expression back to query-shaped text for EXPLAIN and
 /// filter display.
 pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
@@ -1209,19 +1227,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             star,
             args,
         } => {
-            let name = match func {
-                Func::Count => "count",
-                Func::Sum => "sum",
-                Func::Avg => "avg",
-                Func::Min => "min",
-                Func::Max => "max",
-                Func::Collect => "collect",
-                Func::Id => "id",
-                Func::Size => "size",
-                Func::Cardinality => "cardinality",
-                Func::PathLength => "path_length",
-                Func::Elements => "elements",
-            };
+            let name = func_name(*func);
             let inner = if *star {
                 "*".to_string()
             } else {
@@ -1232,6 +1238,23 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 format!("{name}(DISTINCT {inner})")
             } else {
                 format!("{name}({inner})")
+            }
+        }
+        // The GROUP says the fold is over one row's bindings rather than
+        // over the rows, which is the whole difference between this and
+        // the aggregate spelled the same way in the query.
+        BoundExpr::Fold {
+            func,
+            distinct,
+            args,
+        } => {
+            let name = func_name(*func);
+            let rendered: Vec<String> = args.iter().map(|a| expr_text(a, query)).collect();
+            let inner = rendered.join(", ");
+            if *distinct {
+                format!("{name}(DISTINCT GROUP [{inner}])")
+            } else {
+                format!("{name}(GROUP [{inner}])")
             }
         }
         BoundExpr::List(items) => {

@@ -220,7 +220,7 @@ keep_clause     = "KEEP" , path_prefix ;
    settled by a rule of precedence. *)
 path            = [ name , "=" ] , [ path_prefix ] , path_body ;
 path_body       = factor , { ( relationship , factor ) | factor } ;
-factor          = node | subpath ;
+factor          = node | subpath , [ quantifier ] ;
 subpath         = "(" , [ name , "=" ] , [ path_mode ] , path_body ,
                   [ where_clause ] , ")" ;
 (* ISO 16.11, feature G038. Brackets around part of a pattern match
@@ -233,11 +233,22 @@ subpath         = "(" , [ name , "=" ] , [ path_mode ] , path_body ,
    A factor written straight against another with no edge pattern between
    them is juxtaposition, and the node the left one ends at is the node
    the right one starts at rather than a second node beside it, so the
-   two node patterns there describe one node. Two different names written
-   there is one node under two names and is refused, since a slot carries
-   one name. A path selector is not on the list of what the brackets may
-   carry: how many paths to keep is a question about the whole pattern,
-   so the standard writes it in front of one. *)
+   two node patterns there describe one node and two names written there
+   are two names for one element. A path selector is not on the list of
+   what the brackets may carry: how many paths to keep is a question
+   about the whole pattern, so the standard writes it in front of one.
+
+   A quantifier behind the brackets repeats the stretch they hold (ISO
+   16.11, feature G035). A fixed count is a longer pattern of the same
+   shape, which is what the parser writes it out as; a range is a pattern
+   matching several lengths, which is a union of patterns and is refused
+   until there is a union to write it as. Every repetition binds the
+   names inside the brackets again, so such a name stands for one element
+   per repetition rather than for one element, which is the group
+   variable of feature GQ17: reading it answers the list, reading a
+   property of it answers the list of the properties, and an aggregate
+   around it folds that row's group rather than the rows, which is the
+   horizontal aggregate of feature GE09. *)
 path_prefix     = "ALL" , [ "SHORTEST" ] , path_tail
                 | "ANY" , ( "SHORTEST" | [ integer ] ) , path_tail
                 | "SHORTEST" , ( integer , path_tail , [ group_or_groups ]

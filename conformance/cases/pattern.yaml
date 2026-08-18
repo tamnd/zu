@@ -840,3 +840,40 @@ cases:
       - values:
           - type: INT64
             value: "4"
+
+  - name: a-quantifier-behind-the-brackets-repeats-what-they-hold
+    doc: A count behind a parenthesized path pattern repeats the stretch the brackets hold, so a pattern of one edge written twice walks two of them. The one walk this graph answers is ann to bo to cy, since the edge from a node to itself cannot be taken twice under the default trail.
+    query: MATCH (a:person)((x:person)-[:knows]->(y:person)){2}(b:person) RETURN a.name AS x, b.name AS y
+    columns:
+      - x
+      - y
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+          - type: STRING
+            value: cy
+
+  - name: a-name-inside-a-repeated-stretch-is-a-group
+    doc: Every repetition binds the names written inside the brackets again, so a name there stands for one element per repetition rather than for one element, and reading a property of it answers the list of the properties in the order the walk took them.
+    query: MATCH (a:person)((x:person)-[:knows]->(y:person)){2}(b:person) RETURN y.name AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: STRING
+                value: bo
+              - type: STRING
+                value: cy
+
+  - name: an-aggregate-over-a-group-folds-one-rows-bindings
+    doc: An aggregate written around a group variable folds what that row bound rather than folding the rows, which is the horizontal aggregate, so it answers one row per walk the way any other expression does.
+    query: MATCH (a:person)((x:person)-[:knows]->(y:person)){2}(b:person) RETURN sum(y.age) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "90"

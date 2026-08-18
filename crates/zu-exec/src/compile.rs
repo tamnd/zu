@@ -4316,16 +4316,10 @@ mod tests {
     #[test]
     fn only_a_cast_that_cannot_change_a_value_is_dropped() {
         for bits in [IntBits::B64, IntBits::B128, IntBits::B256] {
-            assert!(widens(
-                PhysType::Int64,
-                &nullable(int(true, bits, None))
-            ));
+            assert!(widens(PhysType::Int64, &nullable(int(true, bits, None))));
         }
         for bits in [IntBits::B8, IntBits::B16, IntBits::B32] {
-            assert!(!widens(
-                PhysType::Int64,
-                &nullable(int(true, bits, None))
-            ));
+            assert!(!widens(PhysType::Int64, &nullable(int(true, bits, None))));
         }
         assert!(!widens(
             PhysType::Int64,
@@ -4337,11 +4331,9 @@ mod tests {
         ));
         assert!(!widens(PhysType::Int64, &int(true, IntBits::B64, None)));
 
-        let f64_ty = |bits| {
-            LogicalType::Float {
-                bits,
-                precision: None,
-            }
+        let f64_ty = |bits| LogicalType::Float {
+            bits,
+            precision: None,
         };
         for bits in [FloatBits::B64, FloatBits::B128, FloatBits::B256] {
             assert!(widens(PhysType::Float64, &nullable(f64_ty(bits))));
@@ -4352,10 +4344,7 @@ mod tests {
         // The two towers do not cross: an integer read as a float is a
         // conversion the register would have to carry out, and a float
         // read as an integer rounds.
-        assert!(!widens(
-            PhysType::Int64,
-            &nullable(f64_ty(FloatBits::B64))
-        ));
+        assert!(!widens(PhysType::Int64, &nullable(f64_ty(FloatBits::B64))));
         assert!(!widens(
             PhysType::Float64,
             &nullable(int(true, IntBits::B64, None))

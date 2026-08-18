@@ -12,8 +12,12 @@ use zu::{
     ZU_SEVERITY_EXCEPTION, ZU_TEMPORAL_DATE, ZU_TEMPORAL_DURATION_DAY_TIME,
     ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME, ZU_TEMPORAL_LOCAL_TIME,
     ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
-    ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuConfig, ZuConn, ZuDatabase, ZuError, ZuLoader,
-    ZuResult, ZuStatus, ZuStmt, ZuValue, zu_begin, zu_bind_bool, zu_bind_bool_z, zu_bind_i64,
+    ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuAppender, ZuConfig, ZuConn, ZuDatabase, ZuError,
+    ZuLoader, ZuResult, ZuStatus, ZuStmt, ZuValue, zu_append_bool, zu_append_bytes,
+    zu_append_end_row, zu_append_f64, zu_append_i64, zu_append_str_z, zu_append_temporal,
+    zu_appender_buffered, zu_appender_close, zu_appender_col_name, zu_appender_cols,
+    zu_appender_committed, zu_appender_discard, zu_appender_flush, zu_appender_free,
+    zu_appender_open, zu_appender_open_z, zu_begin, zu_bind_bool, zu_bind_bool_z, zu_bind_i64,
     zu_bind_i64_z, zu_bind_str_z, zu_bind_temporal, zu_bind_temporal_z, zu_commit, zu_config_init,
     zu_config_set_z, zu_conn_close, zu_conn_in_transaction, zu_conn_interrupt, zu_conn_rows_read,
     zu_conn_set_progress, zu_connect, zu_create, zu_create_z, zu_database_close,
@@ -2735,5 +2739,671 @@ fn the_transaction_calls_answer_a_null_handle_and_a_closed_one() {
         );
         assert!(result.is_null());
         zu_stmt_close(stmt);
+    }
+}
+
+/* ---- appending ---- */
+
+/// A database whose person table has a column of every type an appender
+/// takes, declared by the one means a C host has for declaring a table
+/// at all: writing a row of it. The five columns come out in the order
+/// the statement named them, which is the order every row below is
+/// written in.
+unsafe fn five_columns(path: &std::path::Path) -> *mut ZuConn {
+    let path = path.to_str().expect("utf-8 path");
+    let mut conn: *mut ZuConn = ptr::null_mut();
+    let mut err: *mut ZuError = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            zu_create(
+                path.as_ptr().cast::<c_char>(),
+                path.len(),
+                &mut conn,
+                &mut err,
+            )
+        },
+        ZuStatus::Ok
+    );
+    let text = "INSERT (p:person {uid: 1, name: 'ada', born: DATE '2024-03-01', \
+                ok: true, score: 1.5})";
+    let result = unsafe { query(conn, text, &mut err) };
+    unsafe { zu_result_free(result) };
+    conn
+}
+
+unsafe fn appender(conn: *mut ZuConn, table: &str) -> *mut ZuAppender {
+    let table = c(table);
+    let mut app: *mut ZuAppender = ptr::null_mut();
+    let mut err: *mut ZuError = ptr::null_mut();
+    assert_eq!(
+        unsafe { zu_appender_open_z(conn, table.as_ptr(), &mut app, &mut err) },
+        ZuStatus::Ok
+    );
+    assert!(err.is_null());
+    assert!(!app.is_null());
+    app
+}
+
+/// One row of the five-column table, a value at a time and ended, which
+/// is the loop this whole section exists for.
+unsafe fn five(app: *mut ZuAppender, uid: i64, name: &str, born: i64, ok: i32, score: f64) {
+    let mut err: *mut ZuError = ptr::null_mut();
+    let name = c(name);
+    unsafe {
+        assert_eq!(zu_append_i64(app, uid, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_str_z(app, name.as_ptr(), &mut err), ZuStatus::Ok);
+        assert_eq!(
+            zu_append_temporal(app, ZU_TEMPORAL_DATE, born, &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(zu_append_bool(app, ok, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_f64(app, score, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_end_row(app, &mut err), ZuStatus::Ok);
+    }
+    assert!(err.is_null(), "a row that went in left an error behind");
+}
+
+/// What a refused call said, freed on the way out for the reason
+/// [`code_of`] frees it.
+unsafe fn message_of(err: *mut ZuError) -> String {
+    assert!(!err.is_null(), "a refusal with no error handle");
+    let mut len = 0usize;
+    let text = unsafe { zu_error_message(err, &mut len) };
+    assert!(!text.is_null(), "a refusal with no message");
+    let text = unsafe { CStr::from_ptr(text) }
+        .to_str()
+        .expect("utf-8")
+        .to_string();
+    assert_eq!(len, text.len());
+    unsafe { zu_error_free(err) };
+    text
+}
+
+unsafe fn buffered(app: *mut ZuAppender) -> u64 {
+    let mut out = u64::MAX;
+    assert_eq!(unsafe { zu_appender_buffered(app, &mut out) }, ZuStatus::Ok);
+    out
+}
+
+unsafe fn committed(app: *mut ZuAppender) -> u64 {
+    let mut out = u64::MAX;
+    assert_eq!(
+        unsafe { zu_appender_committed(app, &mut out) },
+        ZuStatus::Ok
+    );
+    out
+}
+
+/// The columns of an appender, counted and named, which is what a host
+/// checks its own column order against.
+unsafe fn shape_of(app: *mut ZuAppender) -> Vec<String> {
+    let mut cols = u32::MAX;
+    assert_eq!(unsafe { zu_appender_cols(app, &mut cols) }, ZuStatus::Ok);
+    (0..cols)
+        .map(|col| {
+            let mut len = 0usize;
+            let name = unsafe { zu_appender_col_name(app, col, &mut len) };
+            assert!(!name.is_null(), "column {col} of {cols} has no name");
+            let name = unsafe { CStr::from_ptr(name) }
+                .to_str()
+                .expect("utf-8")
+                .to_string();
+            assert_eq!(len, name.len(), "the length and the NUL have to agree");
+            name
+        })
+        .collect()
+}
+
+/// How many edges there are, which is what the rel table test watches.
+unsafe fn edges(conn: *mut ZuConn) -> i64 {
+    let mut err: *mut ZuError = ptr::null_mut();
+    let result = unsafe {
+        query(
+            conn,
+            "MATCH ()-[e:follows]->() RETURN count(e) AS n",
+            &mut err,
+        )
+    };
+    let n = unsafe { col_i64(result, 0, 1) }[0];
+    unsafe { zu_result_free(result) };
+    n
+}
+
+/// What the whole thing is for: rows written a value at a time, buffered
+/// until they are asked for, and put in by one commit that every later
+/// statement sees.
+#[test]
+fn rows_appended_a_value_at_a_time_go_in_at_one_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("append.zu1");
+    unsafe {
+        let conn = five_columns(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let app = appender(conn, "person");
+
+        five(app, 10, "grace", 19800, 1, 2.5);
+        five(app, 11, "zoe", 19801, 0, -0.5);
+        five(app, 12, "raj", 19802, 1, 0.0);
+        assert_eq!(buffered(app), 3);
+        assert_eq!(committed(app), 0);
+        assert_eq!(people(conn), 1, "nothing is there before the flush");
+
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        assert_eq!(buffered(app), 0);
+        assert_eq!(committed(app), 3);
+        assert_eq!(people(conn), 4);
+
+        // Every value of every column, read back the way it went in.
+        let result = query(conn, "MATCH (p:person) RETURN p.uid AS uid", &mut err);
+        assert_eq!(col_i64(result, 0, 4), [1, 10, 11, 12]);
+        zu_result_free(result);
+        let result = query(
+            conn,
+            "MATCH (p:person) WHERE p.uid = 11 \
+             RETURN p.name AS name, p.born AS born, p.ok AS ok, p.score AS score",
+            &mut err,
+        );
+        let mut len = 0usize;
+        let mut name: *const c_char = ptr::null();
+        assert_eq!(
+            zu_result_cell_str(result, 0, 0, &mut name, &mut len),
+            ZuStatus::Ok
+        );
+        assert_eq!(CStr::from_ptr(name).to_str(), Ok("zoe"));
+        let mut kind = -1i32;
+        let mut count = 0i64;
+        let mut offset = 1i32;
+        assert_eq!(
+            zu_value_temporal(cell(result, 0, 1), &mut kind, &mut count, &mut offset),
+            ZuStatus::Ok
+        );
+        assert_eq!((kind, count), (ZU_TEMPORAL_DATE, 19801));
+        let mut ok = -1i32;
+        assert_eq!(zu_value_bool(cell(result, 0, 2), &mut ok), ZuStatus::Ok);
+        assert_eq!(ok, 0);
+        let mut score = f64::NAN;
+        assert_eq!(zu_value_f64(cell(result, 0, 3), &mut score), ZuStatus::Ok);
+        assert_eq!(score, -0.5);
+        zu_result_free(result);
+
+        // A flush with nothing buffered is not a commit, and says so by
+        // leaving the count where it was.
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::Ok);
+        assert_eq!(committed(app), 3);
+
+        zu_appender_free(app);
+        zu_conn_close(conn);
+
+        // And the flush is what a reopen finds, which is what a commit
+        // promises.
+        let conn = open(&path);
+        assert_eq!(people(conn), 4);
+        zu_conn_close(conn);
+    }
+}
+
+/// A value that does not belong in the column it landed in, which is
+/// the mistake a host writing by position actually makes.
+#[test]
+fn a_value_a_column_will_not_take_ends_its_row_and_names_the_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("wrong-value.zu1");
+    unsafe {
+        let conn = five_columns(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let app = appender(conn, "person");
+
+        // A string where the first column takes integers, named both
+        // ways round: what the value was and what the column holds.
+        let text = c("nope");
+        assert_eq!(
+            zu_append_str_z(app, text.as_ptr(), &mut err),
+            ZuStatus::Misuse
+        );
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(message.contains("column 'uid' of 'person'"), "{message}");
+        assert!(message.contains("a string"), "{message}");
+        assert!(message.contains("integers"), "{message}");
+
+        // Two values in and the third refused, which is the case that
+        // has something to take back off.
+        assert_eq!(zu_append_i64(app, 10, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_str_z(app, text.as_ptr(), &mut err), ZuStatus::Ok);
+        assert_eq!(
+            zu_append_bytes(app, b"raw".as_ptr(), 3, &mut err),
+            ZuStatus::Misuse
+        );
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(message.contains("column 'born' of 'person'"), "{message}");
+        assert!(message.contains("bytes"), "{message}");
+        assert!(message.contains("dates"), "{message}");
+        assert_eq!(buffered(app), 0, "a row that was refused was never a row");
+
+        // A temporal of a kind no stored column can hold, and a kind
+        // that is no kind: values that are not values at all, which end
+        // their row the way a value the column refused does. The next
+        // call is the next value of a row, and a row left half written
+        // would put it in the wrong column.
+        assert_eq!(zu_append_i64(app, 10, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_str_z(app, text.as_ptr(), &mut err), ZuStatus::Ok);
+        assert_eq!(
+            zu_append_temporal(app, ZU_TEMPORAL_ZONED_DATETIME, 0, &mut err),
+            ZuStatus::Unsupported
+        );
+        assert!(message_of(err).contains("zoned"));
+        err = ptr::null_mut();
+        assert_eq!(zu_append_i64(app, 10, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_str_z(app, text.as_ptr(), &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_temporal(app, 99, 0, &mut err), ZuStatus::Misuse);
+        assert!(message_of(err).contains("99"));
+        err = ptr::null_mut();
+
+        // And the appender is still the appender: a good row after all
+        // of that goes in on its own, which it could not if any of the
+        // refused ones had left a value behind.
+        five(app, 10, "grace", 19800, 1, 2.5);
+        assert_eq!(buffered(app), 1);
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::Ok);
+        assert_eq!(people(conn), 2);
+
+        zu_appender_free(app);
+        zu_conn_close(conn);
+    }
+}
+
+/// A row that is not the width of the table, both ways round: too few
+/// values when it was ended, and one value too many before it was.
+#[test]
+fn a_row_of_the_wrong_width_is_refused_with_nothing_of_it_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("width.zu1");
+    unsafe {
+        let conn = five_columns(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let app = appender(conn, "person");
+
+        assert_eq!(zu_append_i64(app, 10, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_end_row(app, &mut err), ZuStatus::Misuse);
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(
+            message.contains("carries 1 value and 'person' takes 5"),
+            "{message}"
+        );
+        assert!(
+            message.contains("uid, name, born, ok, score"),
+            "a host that miscounted is shown what the count is made of: {message}"
+        );
+        assert_eq!(buffered(app), 0);
+
+        // A sixth value on a five-column row, refused at the value
+        // rather than left to make the buffers ragged.
+        let name = c("grace");
+        assert_eq!(zu_append_i64(app, 10, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_str_z(app, name.as_ptr(), &mut err), ZuStatus::Ok);
+        assert_eq!(
+            zu_append_temporal(app, ZU_TEMPORAL_DATE, 19800, &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(zu_append_bool(app, 1, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_f64(app, 2.5, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_i64(app, 99, &mut err), ZuStatus::Misuse);
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(
+            message.contains("already carries the 5 values"),
+            "{message}"
+        );
+        assert_eq!(buffered(app), 0, "the row it was too many for is gone too");
+
+        // A row that was started and never ended is not a row, and the
+        // flush takes it back off rather than writing a short one.
+        five(app, 10, "grace", 19800, 1, 2.5);
+        assert_eq!(zu_append_i64(app, 11, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        assert_eq!(committed(app), 1);
+        assert_eq!(people(conn), 2);
+
+        zu_appender_free(app);
+        zu_conn_close(conn);
+    }
+}
+
+/// A row is written by position and the columns are read by name, so a
+/// host that wants to check the order it is writing in can.
+#[test]
+fn the_columns_a_row_carries_are_there_to_be_read_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("columns.zu1");
+    unsafe {
+        let conn = five_columns(&path);
+        let app = appender(conn, "person");
+        assert_eq!(shape_of(app), ["uid", "name", "born", "ok", "score"]);
+
+        // Out of range is NULL rather than a name that is not there,
+        // and the length is written on that path too.
+        let mut len = usize::MAX;
+        assert!(zu_appender_col_name(app, 5, &mut len).is_null());
+        assert_eq!(len, 0);
+        assert!(zu_appender_col_name(app, u32::MAX, ptr::null_mut()).is_null());
+
+        zu_appender_free(app);
+        zu_conn_close(conn);
+    }
+}
+
+/// The two ways of ending a load that is not going to be flushed by
+/// hand: throw the rows away, or let the free write them.
+#[test]
+fn a_discard_throws_the_rows_away_and_a_free_writes_them() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("discard.zu1");
+    unsafe {
+        let conn = five_columns(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let app = appender(conn, "person");
+
+        five(app, 10, "grace", 19800, 1, 2.5);
+        five(app, 11, "zoe", 19801, 0, -0.5);
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::Ok);
+
+        five(app, 12, "raj", 19802, 1, 0.0);
+        five(app, 13, "ida", 19803, 1, 1.0);
+        let mut dropped = u64::MAX;
+        assert_eq!(zu_appender_discard(app, &mut dropped), ZuStatus::Ok);
+        assert_eq!(dropped, 2);
+        assert_eq!(buffered(app), 0);
+        assert_eq!(
+            committed(app),
+            2,
+            "rows an earlier flush committed are committed"
+        );
+        assert_eq!(people(conn), 3);
+
+        // A discard with nothing buffered is nothing, and out may be
+        // NULL for a host that does not care how many it was.
+        assert_eq!(zu_appender_discard(app, ptr::null_mut()), ZuStatus::Ok);
+        assert_eq!(buffered(app), 0);
+
+        // And the free is the other answer: rows that were appended are
+        // rows the host meant to write.
+        five(app, 14, "kay", 19804, 0, 3.5);
+        zu_appender_free(app);
+        assert_eq!(people(conn), 4);
+        zu_conn_close(conn);
+    }
+}
+
+/// A rel table has no property columns: a row of one is the two ends of
+/// an edge, and the two things that can be wrong with one are answered
+/// in the two different places they are known.
+#[test]
+fn a_rel_table_takes_the_two_ends_of_an_edge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("edges.zu1");
+    seeded(&path);
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let app = appender(conn, "follows");
+        assert_eq!(shape_of(app), ["from person", "to person"]);
+        let before = edges(conn);
+
+        // An offset that is no row of anything, refused by the call that
+        // appended it: the ingest takes the two ends as counts, so a
+        // negative one would reach it as an enormous positive one and be
+        // reported as an edge to a row that is not there.
+        assert_eq!(zu_append_i64(app, -1, &mut err), ZuStatus::Misuse);
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(message.contains("'from person' of 'follows'"), "{message}");
+        assert!(message.contains("count from zero"), "{message}");
+
+        // An edge to a row that is not there, refused at the flush,
+        // before anything is written and with the rows still buffered.
+        assert_eq!(zu_append_i64(app, 3, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_i64(app, 9999, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_end_row(app, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::Misuse);
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(message.contains("(3, 9999)"), "{message}");
+        assert_eq!(buffered(app), 1, "a flush that failed keeps its rows");
+        assert_eq!(committed(app), 0);
+        assert_eq!(edges(conn), before, "and the file is left as it was");
+
+        let mut dropped = 0u64;
+        assert_eq!(zu_appender_discard(app, &mut dropped), ZuStatus::Ok);
+        assert_eq!(dropped, 1);
+
+        // An edge between two rows that are there, which goes in.
+        assert_eq!(zu_append_i64(app, 3, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_i64(app, 96, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_append_end_row(app, &mut err), ZuStatus::Ok);
+        let mut total = 0u64;
+        assert_eq!(zu_appender_close(app, &mut total, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        assert_eq!(total, 1);
+        assert_eq!(edges(conn), before + 1);
+
+        zu_appender_free(app);
+        zu_conn_close(conn);
+    }
+}
+
+/// What an open refuses, which is where a host about to buffer a
+/// million rows wants to hear about it.
+#[test]
+fn an_appender_opens_on_a_table_or_says_at_once_why_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("open.zu1");
+    seeded(&path);
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut app: *mut ZuAppender = ptr::null_mut();
+
+        // A table nothing declares.
+        let table = c("nobody");
+        assert_eq!(
+            zu_appender_open_z(conn, table.as_ptr(), &mut app, &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(app.is_null(), "a refused open writes NULL through out");
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(
+            message.contains("no node table or rel table 'nobody'"),
+            "{message}"
+        );
+
+        // A node table that stores no properties, which has no columns
+        // for a row to be made of.
+        let table = c("person");
+        assert_eq!(
+            zu_appender_open_z(conn, table.as_ptr(), &mut app, &mut err),
+            ZuStatus::Unsupported
+        );
+        assert!(app.is_null());
+        let message = message_of(err);
+        err = ptr::null_mut();
+        assert!(message.contains("stores no properties"), "{message}");
+
+        // A name that is not UTF-8, and an out-parameter that is not
+        // there to be written.
+        assert_eq!(
+            zu_appender_open(
+                conn,
+                b"\xff".as_ptr().cast::<c_char>(),
+                1,
+                &mut app,
+                &mut err
+            ),
+            ZuStatus::Misuse
+        );
+        assert!(message_of(err).contains("table"));
+        err = ptr::null_mut();
+        assert_eq!(
+            zu_appender_open(conn, table.as_ptr(), 6, ptr::null_mut(), &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(message_of(err).contains("out is NULL"));
+
+        zu_conn_close(conn);
+    }
+}
+
+/// Closing spends the appender and says what it wrote, and every call
+/// after that says the handle is spent rather than pretending.
+#[test]
+fn a_closed_appender_is_spent_and_closing_twice_is_not_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("close.zu1");
+    unsafe {
+        let conn = five_columns(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let app = appender(conn, "person");
+
+        five(app, 10, "grace", 19800, 1, 2.5);
+        five(app, 11, "zoe", 19801, 0, -0.5);
+        let mut total = 0u64;
+        assert_eq!(zu_appender_close(app, &mut total, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+        assert_eq!(total, 2);
+        assert_eq!(people(conn), 3);
+
+        // Closing again writes nothing and answers the same count, so a
+        // cleanup path may close what the load already did.
+        let mut again = 0u64;
+        assert_eq!(zu_appender_close(app, &mut again, &mut err), ZuStatus::Ok);
+        assert_eq!(again, 2);
+        assert_eq!(people(conn), 3);
+
+        // Everything else is spent.
+        let mut out = u64::MAX;
+        assert_eq!(zu_append_i64(app, 12, &mut err), ZuStatus::MisuseClosed);
+        assert!(err.is_null(), "a spent handle is misuse, not a failure");
+        assert_eq!(zu_append_end_row(app, &mut err), ZuStatus::MisuseClosed);
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::MisuseClosed);
+        assert_eq!(zu_appender_buffered(app, &mut out), ZuStatus::MisuseClosed);
+        assert_eq!(out, 0, "the out-parameter is written on every path");
+        assert_eq!(zu_appender_committed(app, &mut out), ZuStatus::MisuseClosed);
+        let mut cols = u32::MAX;
+        assert_eq!(zu_appender_cols(app, &mut cols), ZuStatus::MisuseClosed);
+        assert_eq!(cols, 0);
+        assert!(zu_appender_col_name(app, 0, ptr::null_mut()).is_null());
+        assert_eq!(zu_appender_discard(app, &mut out), ZuStatus::MisuseClosed);
+
+        zu_appender_free(app);
+        zu_conn_close(conn);
+    }
+}
+
+/// The ways of calling these wrongly, all of them answered rather than
+/// left to the debugger.
+#[test]
+fn the_appending_calls_answer_a_null_handle_and_a_closed_connection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("append-misuse.zu1");
+    unsafe {
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut app: *mut ZuAppender = ptr::null_mut();
+        let table = c("person");
+        assert_eq!(
+            zu_appender_open_z(ptr::null_mut(), table.as_ptr(), &mut app, &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(app.is_null());
+        assert_eq!(
+            zu_append_bool(ptr::null_mut(), 1, &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_append_i64(ptr::null_mut(), 1, &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_append_f64(ptr::null_mut(), 1.0, &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_append_str_z(ptr::null_mut(), table.as_ptr(), &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_append_bytes(ptr::null_mut(), b"x".as_ptr(), 1, &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_append_temporal(ptr::null_mut(), ZU_TEMPORAL_DATE, 0, &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_append_end_row(ptr::null_mut(), &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_appender_flush(ptr::null_mut(), &mut err),
+            ZuStatus::Misuse
+        );
+        let mut out = u64::MAX;
+        assert_eq!(
+            zu_appender_buffered(ptr::null_mut(), &mut out),
+            ZuStatus::Misuse
+        );
+        assert_eq!(out, 0);
+        assert_eq!(
+            zu_appender_committed(ptr::null_mut(), &mut out),
+            ZuStatus::Misuse
+        );
+        let mut cols = u32::MAX;
+        assert_eq!(
+            zu_appender_cols(ptr::null_mut(), &mut cols),
+            ZuStatus::Misuse
+        );
+        assert_eq!(cols, 0);
+        assert!(zu_appender_col_name(ptr::null_mut(), 0, ptr::null_mut()).is_null());
+        assert_eq!(
+            zu_appender_discard(ptr::null_mut(), &mut out),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_appender_close(ptr::null_mut(), &mut out, &mut err),
+            ZuStatus::Misuse
+        );
+        // Freeing nothing is nothing, like every other free here.
+        zu_appender_free(ptr::null_mut());
+
+        let conn = five_columns(&path);
+        let app = appender(conn, "person");
+        // The out-parameters that are not optional.
+        assert_eq!(zu_appender_buffered(app, ptr::null_mut()), ZuStatus::Misuse);
+        assert_eq!(
+            zu_appender_committed(app, ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+        assert_eq!(zu_appender_cols(app, ptr::null_mut()), ZuStatus::Misuse);
+
+        // An appender outliving its connection answers the way a
+        // statement does, because it keeps that connection's state
+        // alive for exactly this: the rows it still held are gone with
+        // the connection they were going to be written through.
+        five(app, 10, "grace", 19800, 1, 2.5);
+        zu_conn_close(conn);
+        assert_eq!(zu_append_i64(app, 11, &mut err), ZuStatus::MisuseClosed);
+        assert_eq!(zu_appender_flush(app, &mut err), ZuStatus::MisuseClosed);
+        assert_eq!(
+            zu_appender_close(app, &mut out, &mut err),
+            ZuStatus::MisuseClosed
+        );
+        zu_appender_free(app);
+
+        let conn = open(&path);
+        assert_eq!(people(conn), 1);
+        zu_conn_close(conn);
     }
 }

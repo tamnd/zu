@@ -668,10 +668,11 @@ mod tests {
         assert_eq!(abi.declared, sorted);
         assert!(abi.declared.iter().all(|n| n.starts_with("zu_")));
         // dx/02 §8 is the v0.5 restructure, and the error model, the
-        // cancellation calls and the transaction boundaries added to it
-        // are all additive, so this is 0.8: the number a binding tests
-        // for when it wants to know whether zu_begin is there.
-        assert_eq!(abi.revision, ("0.8".to_string(), "0.8".to_string()));
+        // cancellation calls, the transaction boundaries and the
+        // appender added to it are all additive, so this is 0.9: the
+        // number a binding tests for when it wants to know whether
+        // zu_appender_open is there.
+        assert_eq!(abi.revision, ("0.9".to_string(), "0.9".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

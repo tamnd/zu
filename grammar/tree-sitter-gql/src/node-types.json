@@ -1168,6 +1168,10 @@
           "named": true
         },
         {
+          "type": "quantifier",
+          "named": true
+        },
+        {
           "type": "relationship",
           "named": true
         },
@@ -2214,6 +2218,10 @@
         },
         {
           "type": "path_mode",
+          "named": true
+        },
+        {
+          "type": "quantifier",
           "named": true
         },
         {

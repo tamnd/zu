@@ -14,11 +14,11 @@ use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
     BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, ElementDefKind,
-    ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr,
-    LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal, PathMode, PathPattern,
-    PatternList, Projection, ProjectionItem, PropertyDef, Query, RelDirection, RelPattern,
-    RemoveItem, Removed, Selector, SetInto, SetItem, SetOp, Simple, SortKey, Statement, Subpath,
-    TxnStmt, UnaryOp, YieldItem,
+    ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, Group,
+    GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal,
+    PathMode, PathPattern, PatternList, Projection, ProjectionItem, PropertyDef, Query,
+    RelDirection, RelPattern, RemoveItem, Removed, Repeat, Selector, SetInto, SetItem, SetOp,
+    Simple, SortKey, Statement, Subpath, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -33,11 +33,13 @@ use crate::value_type;
 /// finished with by the time a pattern reaches the binder. A segment
 /// always holds one more node than it holds edge patterns, which is
 /// what makes `finish` total.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Segment {
     nodes: Vec<NodePattern>,
     rels: Vec<RelPattern>,
     subpaths: Vec<Subpath>,
+    groups: Vec<Group>,
+    repeats: Vec<Repeat>,
     filter: Option<Expr>,
 }
 
@@ -74,6 +76,8 @@ impl Segment {
             nodes,
             rels,
             subpaths,
+            groups,
+            repeats,
             filter,
         } = right;
         let mut nodes = nodes.into_iter();
@@ -84,6 +88,8 @@ impl Segment {
                 nodes: nodes.collect(),
                 rels,
                 subpaths,
+                groups,
+                repeats,
                 filter,
             },
             at,
@@ -93,6 +99,7 @@ impl Segment {
     /// Takes the rest of a factor in, moving the node positions its
     /// brackets pointed at to where they landed here.
     fn absorb(&mut self, right: Segment, at: usize) {
+        let step_at = self.rels.len();
         self.nodes.extend(right.nodes);
         self.rels.extend(right.rels);
         for mut sub in right.subpaths {
@@ -100,7 +107,32 @@ impl Segment {
             sub.to += at;
             self.subpaths.push(sub);
         }
+        for mut group in right.groups {
+            let shift = match group.kind {
+                GroupKind::Node => at,
+                GroupKind::Rel => step_at,
+            };
+            for pos in &mut group.at {
+                *pos += shift;
+            }
+            self.merge_group(group);
+        }
+        for mut repeat in right.repeats {
+            repeat.from += step_at;
+            repeat.to += step_at;
+            self.repeats.push(repeat);
+        }
         self.and(right.filter);
+    }
+
+    /// Records a group, joining it to one of the same name already
+    /// here. Two stretches that each bound a name go on binding the one
+    /// name, so the bindings gather into one list in written order.
+    fn merge_group(&mut self, group: Group) {
+        match self.groups.iter_mut().find(|seen| seen.name == group.name) {
+            Some(seen) if seen.kind == group.kind => seen.at.extend(group.at),
+            _ => self.groups.push(group),
+        }
     }
 
     /// Folds one more condition into the ones the brackets wrote.
@@ -158,6 +190,79 @@ fn merge_ends(end: &mut NodePattern, node: NodePattern) {
         (Some(seen), Some(next)) => Some(LabelExpr::And(Box::new(seen), Box::new(next))),
     };
     end.props.extend(node.props);
+}
+
+/// The names a repeated stretch binds, and where each repetition binds
+/// them (ISO 16.11, feature GQ17).
+///
+/// A name written inside a stretch that repeats stands for one element
+/// per repetition, so it names a list rather than an element. The
+/// positions are worked out rather than recorded as the copies are made,
+/// because a copy lands a fixed distance behind the one before it: a
+/// stretch holding `width` edges advances the node positions by `width`
+/// per repetition, and the step positions with them.
+fn group_names(
+    inner: &Segment,
+    count: usize,
+    node_at: usize,
+    step_at: usize,
+    width: usize,
+) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut record = |name: &str, kind: GroupKind, local: usize| {
+        let base = match kind {
+            GroupKind::Node => node_at,
+            GroupKind::Rel => step_at,
+        };
+        let at = (0..count).map(|k| base + k * width + local).collect();
+        match groups
+            .iter_mut()
+            .find(|seen| seen.name == name && seen.kind == kind)
+        {
+            // A name written twice inside one stretch is one name over
+            // both places it was written, so its bindings interleave the
+            // way the walk took them.
+            Some(seen) => {
+                let mut both: Vec<usize> = seen.at.iter().copied().chain(at).collect();
+                both.sort_unstable();
+                both.dedup();
+                seen.at = both;
+            }
+            None => groups.push(Group {
+                name: name.to_string(),
+                kind,
+                at,
+            }),
+        }
+    };
+    for (local, node) in inner.nodes.iter().enumerate() {
+        for name in node.var.iter().chain(&node.aliases) {
+            record(name, GroupKind::Node, local);
+        }
+    }
+    for (local, rel) in inner.rels.iter().enumerate() {
+        if let Some(name) = &rel.var {
+            record(name, GroupKind::Rel, local);
+        }
+    }
+    groups
+}
+
+/// Drops the names off a copy of a repeated stretch.
+///
+/// Every repetition binds the same names to elements of its own, so a
+/// name cannot stay on the copies: what it stands for is the list of
+/// those elements, and that is the group the positions describe. The
+/// elements themselves are bound anonymously, which is what they were
+/// already for a pattern that named nothing.
+fn forget_names(copy: &mut Segment) {
+    for node in &mut copy.nodes {
+        node.var = None;
+        node.aliases.clear();
+    }
+    for rel in &mut copy.rels {
+        rel.var = None;
+    }
 }
 
 /// What to call a conjunction in a message, spelled the way the query
@@ -1662,6 +1767,8 @@ impl Parser<'_> {
         let mut path = Segment::default();
         self.parse_segment(&mut path)?;
         let subpaths = std::mem::take(&mut path.subpaths);
+        let groups = std::mem::take(&mut path.groups);
+        let repeats = std::mem::take(&mut path.repeats);
         let filter = path.filter.take();
         let (start, steps) = path.finish();
         Ok(PathPattern {
@@ -1674,6 +1781,8 @@ impl Parser<'_> {
             start,
             steps,
             subpaths,
+            groups,
+            repeats,
             filter,
         })
     }
@@ -1753,17 +1862,115 @@ impl Parser<'_> {
         let mut inner = Segment::default();
         self.parse_segment(&mut inner)?;
         let filter = self.parse_where()?;
+        let close = self.peek().map(|t| t.start).unwrap_or(self.source.len());
         self.expect(&TokenKind::RParen)?;
-        let to = from + inner.rels.len();
-        into.juxtapose(inner);
-        into.subpaths.push(Subpath {
-            var,
-            mode,
-            from,
-            to,
-        });
-        into.and(filter);
+        let Some(times) = self.parse_edge_quantifier()? else {
+            let to = from + inner.rels.len();
+            into.juxtapose(inner);
+            into.subpaths.push(Subpath {
+                var,
+                mode,
+                from,
+                to,
+            });
+            into.and(filter);
+            return Ok(());
+        };
+        let count = self.fixed_count(times, close)?;
+        if var.is_some() {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                close,
+                "a repeated stretch is walked once per repetition, so a name written on \
+                 it would stand for as many paths as the quantifier asks for rather than \
+                 for one, and a list of paths is not a value this engine has",
+            ));
+        }
+        if filter.is_some() || inner.filter.is_some() {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                close,
+                "a condition inside a repeated stretch is asked once per repetition, and \
+                 a name inside it stands for that repetition's element rather than for \
+                 the group, which is not implemented yet; write the condition behind the \
+                 pattern",
+            ));
+        }
+        if inner.subpaths.iter().any(|sub| sub.var.is_some()) {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                close,
+                "a name on a stretch inside a repeated one names as many paths as the \
+                 quantifier asks for, which is not a value this engine has",
+            ));
+        }
+        let width = inner.rels.len();
+        let node_at = from;
+        let step_at = into.rels.len();
+        for group in group_names(&inner, count, node_at, step_at, width) {
+            into.merge_group(group);
+        }
+        for _ in 0..count {
+            let mut copy = inner.clone();
+            forget_names(&mut copy);
+            into.juxtapose(copy);
+        }
+        if mode.is_some() {
+            into.subpaths.push(Subpath {
+                var: None,
+                mode,
+                from: node_at,
+                to: node_at + count * width,
+            });
+        }
+        if width > 0 {
+            // The copies are the same step written out several times, so
+            // a loop where the stretch begins answers all of them with
+            // one edge, and a repeated stretch walks a trail by default.
+            into.repeats.push(Repeat {
+                from: step_at,
+                to: step_at + count * width,
+            });
+        }
         Ok(())
+    }
+
+    /// How many times a quantifier on a stretch repeats it.
+    ///
+    /// A stretch repeated a fixed number of times is a longer pattern of
+    /// the same shape, which is what the parser writes it out as. A
+    /// stretch repeated a variable number of times is not: it matches
+    /// paths of several lengths, so it stands for as many patterns as
+    /// the range holds and the answer is their union. That is the
+    /// alternation work and it is not implemented yet, so a range is
+    /// refused by name rather than answered for one of its lengths.
+    fn fixed_count(&self, times: (Option<u64>, Option<u64>), at: usize) -> Result<usize> {
+        let count = match times {
+            (Some(min), Some(max)) if min == max => min,
+            _ => {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    "a stretch repeated a variable number of times matches paths of \
+                     several lengths, which is a union of patterns rather than one \
+                     pattern, and that is not implemented yet; write a fixed count",
+                ));
+            }
+        };
+        if count == 0 {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "a stretch repeated no times at all leaves nothing where the brackets \
+                 stood; write the pattern without them",
+            ));
+        }
+        Ok(count as usize)
     }
 
     /// Whether the `(` in hand opens a parenthesized path pattern rather

@@ -174,6 +174,7 @@ fn peel_exists<'a>(expr: &'a Expr, out: &mut Vec<ExistsBlock<'a>>) -> Option<Exp
 
 /// One edge pattern of a list, as edge distinctness reads it: what it
 /// was written as, what it bound, and the two ends it joins.
+#[derive(Clone, Copy)]
 struct Step<'a> {
     pat: &'a ast::RelPattern,
     rel: &'a BoundRel,
@@ -216,6 +217,26 @@ fn disjoint_types(lhs: &ast::RelPattern, rhs: &ast::RelPattern) -> bool {
         return false;
     }
     !lhs.types.iter().any(|name| rhs.types.contains(name))
+}
+
+/// The test that keeps two edge patterns apart, which is an inequality
+/// between what they bound when both walked one edge and a membership
+/// test when one of them walked a list of edges.
+///
+/// Two steps that both repeat would need a test between two lists, and
+/// there is no such test to write yet, so that pair answers nothing.
+fn distinct_test(left: &Step<'_>, right: &Step<'_>) -> Option<BoundExpr> {
+    let (left, right) = (left.rel, right.rel);
+    match (left.range.is_some(), right.range.is_some()) {
+        (false, false) => Some(BoundExpr::Binary {
+            op: BinaryOp::Ne,
+            lhs: Box::new(BoundExpr::Var(left.slot)),
+            rhs: Box::new(BoundExpr::Var(right.slot)),
+        }),
+        (false, true) => Some(not_among(left.slot, right.slot)),
+        (true, false) => Some(not_among(right.slot, left.slot)),
+        (true, true) => None,
+    }
 }
 
 /// `NOT (edge IN walked)`: the edge one step bound is none of the edges
@@ -1566,6 +1587,19 @@ pub enum BoundExpr {
         args: Vec<BoundExpr>,
     },
     List(Vec<BoundExpr>),
+    /// GE09. An aggregate over a group variable, which folds the
+    /// elements one row bound rather than the rows a clause answered.
+    ///
+    /// It is an expression and not an aggregate: nothing groups for it,
+    /// it answers one value per row, and the arguments are the row's
+    /// bindings written out, so folding one reads the row and allocates
+    /// nothing. Null elements are skipped, which is what an aggregate
+    /// over a column does with a null row.
+    Fold {
+        func: Func,
+        distinct: bool,
+        args: Vec<BoundExpr>,
+    },
     Map(Vec<(String, BoundExpr)>),
     /// GE06. The elements of a path, in the order the query wrote
     /// them. Whether they make a path is a runtime question, because
@@ -1772,7 +1806,7 @@ pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
         }
         BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
         BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
-        BoundExpr::Call { args, .. } => {
+        BoundExpr::Call { args, .. } | BoundExpr::Fold { args, .. } => {
             for arg in args {
                 expr_slots(arg, out);
             }
@@ -1816,6 +1850,7 @@ fn bind_linear(
         scalars: Vec::new(),
         outer: outer.to_vec(),
         captures: Vec::new(),
+        groups: HashMap::new(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -1898,6 +1933,25 @@ struct Binder<'a> {
     /// [`BoundQuery::captures`]. The slot in each is filled in by the
     /// binder around this one, which is the one that has it.
     captures: Vec<Capture>,
+    /// The group variables the patterns of the clause being bound wrote
+    /// (ISO 16.11, feature GQ17), by name.
+    ///
+    /// A group variable is not in `scope`, because it is not a slot: a
+    /// stretch repeated n times binds its names n times and what the
+    /// name stands for is those n bindings as a list. So it is kept
+    /// here, as the slots it gathers, and reading the name builds the
+    /// list out of the row the walk already filled. A query that never
+    /// reads the name costs nothing for it.
+    groups: HashMap<String, GroupVar>,
+}
+
+/// A group variable: what the elements are and where the row holds them.
+#[derive(Debug, Clone)]
+struct GroupVar {
+    /// The type of one element, which is what says whether the group is
+    /// a list of nodes or a list of edges.
+    element: Type,
+    slots: Vec<usize>,
 }
 
 /// Expression context: where aggregates are legal and whether one was
@@ -2009,7 +2063,8 @@ impl Binder<'_> {
                             "a selector or a path mode says which of the walks that are there to pick, and INSERT is making one rather than picking one".into(),
                         ));
                     }
-                    if !path.subpaths.is_empty() || path.filter.is_some() {
+                    if !path.subpaths.is_empty() || path.filter.is_some() || !path.groups.is_empty()
+                    {
                         return Err(invalid(
                             "brackets around part of a pattern name a stretch of a walk or say something that has to hold of one, and INSERT is writing the elements rather than walking them".into(),
                         ));
@@ -2224,6 +2279,9 @@ impl Binder<'_> {
     /// where it stands.
     fn bind_exists(&mut self, block: ExistsBlock, mark: Option<usize>) -> Result<BoundClause> {
         let outer = self.scope.clone();
+        // A group the block's own patterns write is the block's, the
+        // same as a name they write, so it goes out of scope with them.
+        let held_groups = self.groups.clone();
         let mut bound = Vec::new();
         for path in block.patterns {
             bound.push(self.bind_path(path)?);
@@ -2247,6 +2305,7 @@ impl Binder<'_> {
         let filter = and_all(filter, self.edge_distinctness(block.patterns, &bound));
         self.marks = held;
         self.scope = outer;
+        self.groups = held_groups;
         Ok(BoundClause::Match {
             kind: match (mark, block.negated) {
                 (Some(slot), negated) => MatchKind::Mark { slot, negated },
@@ -2568,6 +2627,12 @@ impl Binder<'_> {
         // block runs after the projection, so it reads the projected
         // names and nothing the projection dropped.
         self.scope = new_scope;
+        // A group stands for slots the walk filled, and behind a
+        // projection those slots are gone: what a clause behind one
+        // reads is the columns it projected. A group carried across is
+        // carried as a list under a name of its own, which is what
+        // projecting the group writes.
+        self.groups.clear();
         // A WITH's WHERE runs over projected rows, and a mark there
         // would be a match under a projection, which is a shape
         // neither executor has. The block refuses rather than being
@@ -2704,6 +2769,12 @@ impl Binder<'_> {
         let mut scope = HashMap::new();
         for item in items {
             let Some(&slot) = self.scope.get(&item.name) else {
+                if self.groups.contains_key(&item.name) {
+                    return Err(invalid(format!(
+                        "'{}' stands for one element per repetition of the stretch that bound it, which is a list rather than a variable the match wrote, so a YIELD cannot carry it: project it in a RETURN or a WITH",
+                        item.name
+                    )));
+                }
                 return Err(invalid(format!(
                     "YIELD lets a variable out of the match in front of it, and '{}' is not one: yield a name the match wrote",
                     item.name
@@ -2725,6 +2796,7 @@ impl Binder<'_> {
             });
         }
         self.scope = scope;
+        self.groups.clear();
         Ok(BoundClause::Project {
             distinct: false,
             items: bound,
@@ -2803,6 +2875,33 @@ impl Binder<'_> {
             let parts = walk(&start, &steps, sub.from, sub.to);
             self.path_shapes.insert(slot, parts);
         }
+        // A name a repeated stretch bound stands for the elements of
+        // every repetition, so it points at the slots the walk filled
+        // rather than at a slot of its own.
+        for group in &path.groups {
+            if self.scope.contains_key(&group.name) {
+                return Err(bad_reference(format!(
+                    "'{}' already stands for one element, and a name inside a repeated \
+                     stretch stands for one per repetition",
+                    group.name
+                )));
+            }
+            let element = match group.kind {
+                ast::GroupKind::Node => Type::Node,
+                ast::GroupKind::Rel => Type::Rel,
+            };
+            let slots = group
+                .at
+                .iter()
+                .map(|&at| match group.kind {
+                    ast::GroupKind::Node if at == 0 => start.slot,
+                    ast::GroupKind::Node => steps[at - 1].1.slot,
+                    ast::GroupKind::Rel => steps[at].0.slot,
+                })
+                .collect();
+            self.groups
+                .insert(group.name.clone(), GroupVar { element, slots });
+        }
         Ok(BoundPath { slot, start, steps })
     }
 
@@ -2835,11 +2934,9 @@ impl Binder<'_> {
         patterns: &[ast::PathPattern],
         bound: &[BoundPath],
     ) -> Vec<BoundExpr> {
+        let mut tests = Vec::new();
         let mut lists: Vec<(u32, Vec<Step<'_>>)> = Vec::new();
         for (path, bound) in patterns.iter().zip(bound) {
-            if path.list.mode != ast::MatchMode::DifferentEdges {
-                continue;
-            }
             let mut near = bound.start.slot;
             let mut steps = Vec::with_capacity(path.steps.len());
             for ((pat, _), (rel, node)) in path.steps.iter().zip(&bound.steps) {
@@ -2850,32 +2947,64 @@ impl Binder<'_> {
                 });
                 near = node.slot;
             }
+            tests.extend(self.repeat_distinctness(path, &steps));
+            if path.list.mode != ast::MatchMode::DifferentEdges {
+                continue;
+            }
             match lists.iter_mut().find(|(at, _)| *at == path.list.at) {
                 Some((_, edges)) => edges.append(&mut steps),
                 None => lists.push((path.list.at, steps)),
             }
         }
-        let mut tests = Vec::new();
         for (_, edges) in &lists {
             for (at, left) in edges.iter().enumerate() {
                 for right in &edges[at + 1..] {
                     if !same_ends(left, right) || disjoint_types(left.pat, right.pat) {
                         continue;
                     }
-                    let (left, right) = (left.rel, right.rel);
-                    tests.extend(match (left.range.is_some(), right.range.is_some()) {
-                        (false, false) => Some(BoundExpr::Binary {
-                            op: BinaryOp::Ne,
-                            lhs: Box::new(BoundExpr::Var(left.slot)),
-                            rhs: Box::new(BoundExpr::Var(right.slot)),
-                        }),
-                        (false, true) => Some(not_among(left.slot, right.slot)),
-                        (true, false) => Some(not_among(right.slot, left.slot)),
-                        // Two walks, where the test would be between two
-                        // lists of edges rather than between two edges,
-                        // and there is no such test to write yet.
-                        (true, true) => None,
-                    });
+                    tests.extend(distinct_test(left, right));
+                }
+            }
+        }
+        tests
+    }
+
+    /// The edges a quantified stretch has to keep apart.
+    ///
+    /// A stretch repeated a fixed number of times is written out as that
+    /// many copies of the same steps, so the ends test above passes the
+    /// copies over: they end at different nodes of the pattern, and only
+    /// a graph holding a loop answers two of them with one edge. Here
+    /// the engine knows the steps are copies of one step rather than two
+    /// steps that happen to look alike, so the pair is worth testing and
+    /// the cost is paid only by a query that wrote the quantifier. It is
+    /// what makes `((x)-[:knows]->(y)){2}` answer what `-[:knows*2..2]->`
+    /// answers on a graph with a loop in it.
+    ///
+    /// The stretch walks under the mode the pattern around it settles,
+    /// which is `TRAIL` under `DIFFERENT EDGES` and `WALK` under
+    /// `REPEATABLE ELEMENTS`, and a walk repeats what it likes.
+    fn repeat_distinctness(&self, path: &ast::PathPattern, steps: &[Step<'_>]) -> Vec<BoundExpr> {
+        let mut tests = Vec::new();
+        for repeat in &path.repeats {
+            let mode = subpath_mode(&path.subpaths, repeat.from)
+                .or(path.mode)
+                .unwrap_or(path.list.mode.path_mode());
+            if mode == PathMode::Walk {
+                continue;
+            }
+            let copies = &steps[repeat.from..repeat.to];
+            for (at, left) in copies.iter().enumerate() {
+                for right in &copies[at + 1..] {
+                    // The pair the ends test already wrote, and a pair
+                    // no graph answers with one edge because the two
+                    // steps name types with nothing in common.
+                    let written =
+                        path.list.mode == ast::MatchMode::DifferentEdges && same_ends(left, right);
+                    if written || disjoint_types(left.pat, right.pat) {
+                        continue;
+                    }
+                    tests.extend(distinct_test(left, right));
                 }
             }
         }
@@ -3577,6 +3706,19 @@ impl Binder<'_> {
 
     // Expressions.
 
+    /// The group a name stands for, if it stands for one. A name in
+    /// scope is a slot and wins, since a group name is refused where one
+    /// is already in scope and the other way round.
+    fn group_of(&self, expr: &Expr) -> Option<GroupVar> {
+        let Expr::Variable(name) = expr else {
+            return None;
+        };
+        if self.scope.contains_key(name) {
+            return None;
+        }
+        self.groups.get(name).cloned()
+    }
+
     fn bind_expr(&mut self, expr: &Expr, ctx: &mut ExprCtx) -> Result<(BoundExpr, Type)> {
         match expr {
             Expr::Literal(lit) => {
@@ -3608,6 +3750,14 @@ impl Binder<'_> {
                 if let Some(slot) = self.scope.get(name).copied() {
                     return Ok((BoundExpr::Var(slot), self.variables[slot].ty.clone()));
                 }
+                // A group variable stands for one element per repetition
+                // of the stretch that bound it, which is a list, and the
+                // elements are already in the row.
+                if let Some(group) = self.groups.get(name) {
+                    let ty = Type::List(Box::new(group.element.clone()));
+                    let items = group.slots.iter().map(|&slot| BoundExpr::Var(slot));
+                    return Ok((BoundExpr::List(items.collect()), ty));
+                }
                 // A name the query around this one defined, which this
                 // query may read: it makes the value query expression
                 // correlated, and a correlated one is answered per row
@@ -3617,6 +3767,20 @@ impl Binder<'_> {
                     return Ok((BoundExpr::Param(self.capture(name)), Type::Any));
                 }
                 Err(bad_reference(format!("variable '{name}' is not defined")))
+            }
+            // A property read on a group variable is read of each of
+            // its elements, and the row holds the list of the answers
+            // in the order the walk took them (ISO 22.7, feature GQ17).
+            Expr::Property { base, key } if self.group_of(base).is_some() => {
+                let slots = self.group_of(base).expect("the guard just matched").slots;
+                let reads = slots.into_iter().map(|slot| BoundExpr::Property {
+                    base: Box::new(BoundExpr::Var(slot)),
+                    key: key.clone(),
+                });
+                Ok((
+                    BoundExpr::List(reads.collect()),
+                    Type::List(Box::new(Type::Any)),
+                ))
             }
             Expr::Property { base, key } => {
                 let (bound, ty) = self.bind_expr(base, ctx)?;
@@ -3896,6 +4060,78 @@ impl Binder<'_> {
         ))
     }
 
+    /// Whether an expression reads a group variable, which is what tells
+    /// an aggregate over a group from an aggregate over the rows.
+    ///
+    /// The two are written alike and mean different things, so what
+    /// picks between them is the argument: `SUM(y.step)` where `y` is a
+    /// group folds that row's group, and `SUM(b.step)` where `b` is one
+    /// node folds the column. Only the two shapes a group can be read
+    /// in are looked for, the group itself and a property of it, because
+    /// those are the two the fold below knows how to write out.
+    fn reads_a_group(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Property { base, .. } => self.group_of(base).is_some(),
+            other => self.group_of(other).is_some(),
+        }
+    }
+
+    /// An aggregate over a group variable (ISO 20.9, feature GE09).
+    ///
+    /// It folds the elements one row bound rather than the rows a clause
+    /// answered, so it is a scalar expression and not an aggregate: the
+    /// projection around it does not group, and the answer is one value
+    /// per row the way an addition is. The elements are read straight
+    /// out of the slots the walk filled, so the fold builds no list to
+    /// walk down.
+    fn bind_horizontal(
+        &mut self,
+        func: Func,
+        distinct: bool,
+        star: bool,
+        arg: &Expr,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        if star {
+            return Err(invalid(
+                "count(*) counts the rows a clause answered, and a group is one row's, \
+                 so write count of the group itself"
+                    .into(),
+            ));
+        }
+        let (bound, ty) = self.bind_expr(arg, ctx)?;
+        let BoundExpr::List(args) = bound else {
+            return Err(invalid(
+                "an aggregate over a group variable folds the elements that variable \
+                 stands for, so what is written inside it has to be the group or a \
+                 property of it"
+                    .into(),
+            ));
+        };
+        let element = match ty {
+            Type::List(element) => *element,
+            other => other,
+        };
+        let out = match func {
+            Func::Count => Type::Int,
+            Func::Avg => Type::Float,
+            Func::Collect => Type::List(Box::new(element)),
+            // A property read answers a value the static lattice does
+            // not know, which is what a group of properties folds to as
+            // well, and the runtime checks what it was handed.
+            Func::Sum | Func::Min | Func::Max => element,
+            _ => unreachable!("only the aggregates reach here"),
+        };
+        Ok((
+            BoundExpr::Fold {
+                func,
+                distinct,
+                args,
+            },
+            out,
+        ))
+    }
+
     fn bind_call(
         &mut self,
         name: &str,
@@ -3906,6 +4142,12 @@ impl Binder<'_> {
     ) -> Result<(BoundExpr, Type)> {
         let func = Func::resolve(name)
             .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
+        if func.is_aggregate()
+            && let [arg] = args
+            && self.reads_a_group(arg)
+        {
+            return self.bind_horizontal(func, distinct, star, arg, ctx);
+        }
         if func.is_aggregate() {
             if !ctx.allow_aggregates {
                 return Err(invalid(format!(

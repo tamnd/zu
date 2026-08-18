@@ -236,13 +236,16 @@ module.exports = grammar({
     _path_body: ($) =>
       seq($._factor, repeat(choice(seq($.relationship, $._factor), $._factor))),
 
-    _factor: ($) => choice($.node, $.subpath),
+    _factor: ($) => choice($.node, seq($.subpath, optional($.quantifier))),
 
     // The parenthesized path pattern of ISO 16.11. The brackets match
     // nothing of their own: what they carry is a name for the stretch
     // they hold, a path mode for it, and a condition that has to hold of
     // it. A factor written straight against another is juxtaposition,
-    // and the two node patterns where they meet describe one node.
+    // and the two node patterns where they meet describe one node. A
+    // quantifier behind the brackets repeats the stretch they hold, and
+    // every repetition binds the names inside them again, which is what
+    // makes such a name stand for a list.
     subpath: ($) =>
       seq(
         "(",

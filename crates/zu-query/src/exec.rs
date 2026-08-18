@@ -6251,6 +6251,29 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 "aggregate call outside a projection, this is a bug".into(),
             )),
         },
+        // GE09. An aggregate over a group variable, which folds what one
+        // row bound rather than what the rows held. The accumulator is
+        // the one the grouped aggregates use, so a null element is
+        // dropped here the way a null row is dropped there, and the
+        // elements are read one at a time rather than gathered into a
+        // list to walk down.
+        BoundExpr::Fold {
+            func,
+            distinct,
+            args,
+        } => {
+            let mut state = AggState::new(&AggSpec {
+                func: *func,
+                distinct: *distinct,
+                star: false,
+                arg: None,
+                arg_chunk: None,
+            });
+            for arg in args {
+                state.add(eval(ctx, arg)?, 1)?;
+            }
+            state.finalize()
+        }
         BoundExpr::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {

@@ -781,6 +781,55 @@ pub struct Subpath {
     pub to: usize,
 }
 
+/// A name a quantified stretch bound more than once (ISO 16.11, feature
+/// GQ17): the group variable, and where in the pattern its bindings are.
+///
+/// A stretch repeated n times binds every name inside it n times, once
+/// per repetition, so the name does not stand for one element the way an
+/// ordinary pattern variable does. It stands for all of them, in the
+/// order the walk took them, and that is a list. `at` holds the
+/// positions of the bindings in the flattened pattern, which the binder
+/// turns into slots: the group is read out of the row the walk already
+/// filled rather than gathered into a place of its own, so a query that
+/// does not read the group costs nothing for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    pub name: String,
+    /// Whether the positions are node positions or step positions,
+    /// which is what says whether the group is a list of nodes or a
+    /// list of edges.
+    pub kind: GroupKind,
+    /// The positions the name was bound at, in written order. Node
+    /// positions count the first node of the pattern as zero, and step
+    /// positions count the first edge as zero.
+    pub at: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupKind {
+    Node,
+    Rel,
+}
+
+/// A stretch of a pattern that a quantifier repeated (ISO 16.11,
+/// feature G035), as the step positions the repetitions occupy.
+///
+/// The repetitions are written out into the one linear pattern, so
+/// nothing downstream can tell that two steps came from one step
+/// repeated. Edge distinctness is where that matters: two copies of one
+/// step answer the same edge whenever the graph holds a loop where the
+/// stretch begins, and a quantified stretch walks a trail by default, so
+/// the copies have to be kept apart. This records which steps are the
+/// copies, and the binder writes the test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Repeat {
+    /// The step position the first repetition starts at, counting the
+    /// first edge of the pattern as zero.
+    pub from: usize,
+    /// One past the step position the last repetition ends at.
+    pub to: usize,
+}
+
 /// One linear path: a node, then rel-node steps left to right.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathPattern {
@@ -811,6 +860,14 @@ pub struct PathPattern {
     /// Empty for a pattern written with no brackets at all, which is
     /// every pattern that was legal before G038.
     pub subpaths: Vec<Subpath>,
+    /// The names a quantified stretch of this pattern bound more than
+    /// once, in the order they were written. Empty for a pattern with no
+    /// quantified stretch in it, which is every pattern whose names each
+    /// stand for one element.
+    pub groups: Vec<Group>,
+    /// The stretches a quantifier repeated, in the order the brackets
+    /// closed. Empty for a pattern with no quantifier on brackets in it.
+    pub repeats: Vec<Repeat>,
     /// The conditions written inside those brackets, folded together
     /// with AND.
     ///

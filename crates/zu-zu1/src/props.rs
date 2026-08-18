@@ -830,7 +830,7 @@ pub(crate) fn copy_props(db: &mut Zu1File, root: BlockPtr) -> Result<BlockPtr> {
 }
 
 pub(crate) fn free_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
-    free_props_parts(db, root, true)
+    free_props_parts(db, root, true, &[])
 }
 
 /// Frees everything a props chain owns apart from the label bitset,
@@ -838,17 +838,40 @@ pub(crate) fn free_props(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
 /// one. Storing a property column has nothing to say about which labels
 /// a row holds, so it leaves that segment where it is.
 pub(crate) fn free_props_keeping_labels(db: &mut Zu1File, root: BlockPtr) -> Result<()> {
-    free_props_parts(db, root, false)
+    free_props_parts(db, root, false, &[])
 }
 
-fn free_props_parts(db: &mut Zu1File, root: BlockPtr, labels: bool) -> Result<()> {
+/// Frees a props chain apart from the parts the caller is carrying
+/// into the directory that replaces it, whether that is the label
+/// bitset or a column: `keep_cols[i]` says the `i`th column's segments
+/// are named by the new directory too, so its blocks stay where they
+/// are and the two directories share the bytes. A slice shorter than
+/// the column list keeps nothing past its end.
+pub(crate) fn free_props_reusing(
+    db: &mut Zu1File,
+    root: BlockPtr,
+    keep_labels: bool,
+    keep_cols: &[bool],
+) -> Result<()> {
+    free_props_parts(db, root, !keep_labels, keep_cols)
+}
+
+fn free_props_parts(
+    db: &mut Zu1File,
+    root: BlockPtr,
+    labels: bool,
+    keep_cols: &[bool],
+) -> Result<()> {
     let directory = PropsDirectory::decode(&meta::read_chain(db, root)?)?;
     if labels {
         for &ptr in directory.labels.iter().flat_map(|m| &m.blocks) {
             db.free_block(ptr)?;
         }
     }
-    for col in &directory.columns {
+    for (ci, col) in directory.columns.iter().enumerate() {
+        if keep_cols.get(ci) == Some(&true) {
+            continue;
+        }
         for &ptr in &col.meta.blocks {
             db.free_block(ptr)?;
         }

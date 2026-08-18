@@ -52,18 +52,31 @@ fn corrupt(detail: &str) -> ZuError {
 /// and being generous costs one memcpy.
 const TRAIN_SAMPLE: usize = 256 << 10;
 
-/// One symbol table for the whole column, trained on values drawn at an
-/// even stride so a column whose tail looks nothing like its head is
-/// still represented. Training is 96% of what encoding a chunk costs, so
-/// training per chunk is what made writing a string column slow: 2M urls
-/// took 23.3s to encode, of which all but a second was 1953 tables. The
-/// sample is zipped the way a chunk is, lengths and all, because that is
-/// what the table will be asked to encode.
+/// How many places down a column the sample is drawn from. Enough of
+/// them that a column whose tail looks nothing like its head is still
+/// represented, few enough that each one is a long run.
+const TRAIN_RUNS: usize = 16;
+
+/// One symbol table for the whole column, trained on runs of consecutive
+/// values drawn from evenly spaced places down it. Training is 96% of
+/// what encoding a chunk costs, so training per chunk is what made
+/// writing a string column slow: 2M urls took 23.3s to encode, of which
+/// all but a second was 1953 tables. The sample is zipped the way a
+/// chunk is, lengths and all, because that is what the table will be
+/// asked to encode.
 ///
-/// The stride comes from the column's bytes rather than its row count,
-/// which matters: a stride that counts rows stops at the budget partway
-/// down a column of long values, and a table that never saw the second
-/// half leaves those chunks falling back to plain.
+/// The runs are what keeps the sample the same column the chunks are.
+/// Taking one value every so many instead reads a column with a period
+/// in it as a different column whenever the two share a factor: a
+/// version column cycling 0 through 9, sampled every second row, is a
+/// column cycling 0, 2, 4, 6, 8, and a table trained on that costs four
+/// times the codes on the real thing. Every chunk then measures badly
+/// against the sample and buys a table of its own, which is the cost
+/// this function exists to avoid, and it showed up as 100ms to rewrite
+/// one 100k row column on a single cell write.
+///
+/// A column that fits in the budget is sampled whole, since runs over
+/// one that small would overlap and train on the same bytes twice.
 ///
 /// The table comes back with what it was worth on the sample, because
 /// that is the yardstick for a chunk that does not fit it: a column of
@@ -72,11 +85,28 @@ const TRAIN_SAMPLE: usize = 256 << 10;
 /// own ratio buys a table rather than shipping uncompressed.
 fn column_table(values: &[&[u8]]) -> (fsst::Table, u64, u64) {
     let total: usize = values.iter().map(|v| v.len() + 4).sum();
-    let stride = total.div_ceil(TRAIN_SAMPLE).max(1);
     let mut sample = Vec::with_capacity(total.min(TRAIN_SAMPLE + BLOCK_SIZE as usize));
-    for v in values.iter().step_by(stride) {
+    let mut push = |v: &[u8]| {
         sample.extend_from_slice(&(v.len() as u32).to_le_bytes());
         sample.extend_from_slice(v);
+    };
+    if total <= TRAIN_SAMPLE {
+        for v in values {
+            push(v);
+        }
+    } else {
+        let run = TRAIN_SAMPLE.div_ceil(TRAIN_RUNS);
+        for r in 0..TRAIN_RUNS {
+            let start = values.len() * r / TRAIN_RUNS;
+            let mut taken = 0usize;
+            for v in &values[start..] {
+                if taken >= run {
+                    break;
+                }
+                taken += v.len() + 4;
+                push(v);
+            }
+        }
     }
     let table = fsst::Table::train(&sample);
     let mut probe = Vec::new();
@@ -467,6 +497,37 @@ mod tests {
     fn value<'a>(bytes: &'a [u8], ends: &[u64], i: usize) -> &'a [u8] {
         let lo = if i == 0 { 0 } else { ends[i - 1] as usize };
         &bytes[lo..ends[i] as usize]
+    }
+
+    /// A column with a period in it trains a table that fits its own
+    /// chunks, so no chunk buys one of its own. Taking one value every
+    /// so many read this column as a different column: a version column
+    /// cycling 0 through 9 sampled every second row is a column cycling
+    /// 0, 2, 4, 6, 8, the table that came off it cost four times the
+    /// codes on the real chunks, all 98 of them trained their own, and
+    /// rewriting the column on a one cell write took 100ms.
+    ///
+    /// The assertion is the encoder's own retrain test, run against the
+    /// first chunk, because that is the thing that must not fire.
+    #[test]
+    fn a_periodic_column_trains_on_itself() {
+        let values: Vec<Vec<u8>> = (0..100_000u32)
+            .map(|i| (i % 10).to_string().into_bytes())
+            .collect();
+        let values = refs(&values);
+        let (table, fit_packed, fit_raw) = column_table(&values);
+        let mut zipped = Vec::new();
+        for v in &values[..CHUNK_ROWS] {
+            zipped.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            zipped.extend_from_slice(v);
+        }
+        let mut packed = Vec::new();
+        let codes = (table.encode(&zipped, &mut packed) - table.header_len()) as u64;
+        assert!(
+            codes * 2 * fit_raw <= fit_packed * 3 * zipped.len() as u64,
+            "chunk packs {codes} from {}, sample packed {fit_packed} from {fit_raw}",
+            zipped.len()
+        );
     }
 
     #[test]

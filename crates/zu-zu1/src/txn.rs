@@ -17,7 +17,7 @@
 //! crash on either side of the sync leaves the pre-txn or post-txn
 //! state and nothing else.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use zu_common::{Epoch, GROUP_ROWS, Result, ZuError};
 
@@ -603,6 +603,20 @@ impl Mvcc {
             t.updates
                 .values()
                 .any(|chain| chain.iter().any(|&(e, _)| e <= epoch))
+        })
+    }
+
+    /// Which columns of `table` hold an update chain entry visible at
+    /// `epoch`, the columns a fold has to rewrite. The ones outside it
+    /// come through untouched, and answering the whole set in one pass
+    /// is what keeps that check off the column count.
+    pub fn touched_cols(&self, table: u32, epoch: Epoch) -> BTreeSet<u32> {
+        self.tables.get(&table).map_or_else(BTreeSet::new, |t| {
+            t.updates
+                .iter()
+                .filter(|(_, chain)| chain.iter().any(|&(e, _)| e <= epoch))
+                .map(|(&(_, col), _)| col)
+                .collect()
         })
     }
 

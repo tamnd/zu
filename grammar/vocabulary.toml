@@ -1,0 +1,116 @@
+schema = 1
+doc = "The words of zuQL, grouped by what they are, for the three things that colour them."
+audited = "2026-08-18"
+
+# One list of words, three consumers. The shell scans a statement as it
+# is typed and colours the words it recognises, the tree-sitter grammar
+# parses a statement that is finished, and the Shiki grammar colours a
+# statement printed on a page. A word that three files agree on is one
+# word; three files that each keep their own list agree until they do
+# not, and the day they stop is the day a keyword the engine added is
+# blue in the shell, plain on the website and an identifier in an
+# editor.
+#
+# So the lists live here and `cargo xtask grammar` puts them where each
+# consumer needs them: `grammar/tree-sitter-gql/queries/highlights.scm`
+# and `grammar/shiki/gql.tmLanguage.json` are written from this file, and
+# `crates/zu-cli/src/highlight.rs` is checked against it, because the
+# shell's table is sorted for a binary search and is read by a scanner
+# on the keystroke path rather than by a generator.
+#
+# What a `kind` means:
+#   keyword   a word the parser gives meaning to by position
+#   literal   NULL and the two booleans, which are values and not words
+#   function  a built-in the binder resolves by name
+#   algorithm a graph algorithm, called as a table function
+#   type      a value type name, from `crates/zu-query/src/value_type.rs`
+#
+# The shell shows the first three and not the last two, and that is a
+# decision rather than an oversight: a type name is a name until the
+# grammar around it makes it a type, `DATE` is a legal variable and
+# `RETURN date` is a variable read, and a scanner with no grammar behind
+# it would colour the variable as a type. The tree-sitter and Shiki
+# grammars have the context to tell them apart, so they get the fourth
+# list too.
+#
+# None of this is the parser's own table. The parser has no keyword
+# table: keywords are ordinary identifiers to the lexer and the parser
+# matches them by position, which is what makes `RETURN match` legal.
+# A word missing from here is a word that comes out uncoloured, which
+# is a cosmetic drift and not a wrong answer, and that is the trade for
+# not making three highlighters depend on the parser's internals.
+
+[[group]]
+kind = "keyword"
+doc = "The clauses a query is made of, in the order they may appear."
+words = ["USE", "OPTIONAL", "MATCH", "UNWIND", "WITH", "WHERE", "RETURN", "YIELD"]
+
+[[group]]
+kind = "keyword"
+doc = "Projection and ordering."
+words = ["DISTINCT", "AS", "ORDER", "BY", "ASC", "ASCENDING", "DESC", "DESCENDING", "NULLS", "FIRST", "LAST", "SKIP", "LIMIT"]
+
+[[group]]
+kind = "keyword"
+doc = "Patterns: the selectors, the modes, and the words a path may carry."
+words = ["ALL", "ANY", "SHORTEST", "WALK", "TRAIL", "ACYCLIC", "SIMPLE"]
+
+[[group]]
+kind = "keyword"
+doc = "Predicates and the operators spelled as words."
+words = ["AND", "OR", "XOR", "NOT", "IS", "IN", "STARTS", "ENDS", "CONTAINS", "LIKE", "EXISTS", "TYPED", "CAST"]
+
+[[group]]
+kind = "keyword"
+doc = "The catalog statements and what they name."
+words = ["CREATE", "DROP", "SCHEMA", "GRAPH", "PROPERTY", "TYPE", "IF", "REPLACE", "COPY", "OF", "NODE", "EDGE", "RELATIONSHIP", "PROPERTIES", "NO", "CURRENT_GRAPH", "CURRENT_PROPERTY_GRAPH"]
+
+[[group]]
+kind = "keyword"
+doc = "Value type words that are grammar rather than type names: the list types and the open types."
+words = ["LIST", "ARRAY", "GROUP", "RECORD", "VALUE"]
+
+[[group]]
+kind = "keyword"
+doc = "The write clauses and the procedure call, which the parser reads like any other clause."
+words = ["INSERT", "SET", "REMOVE", "DELETE", "DETACH", "NODETACH", "CALL"]
+
+[[group]]
+kind = "keyword"
+doc = "The transaction statements, which the parser reads and the session runs, since a transaction outlives the statement that opened it."
+words = ["START", "COMMIT", "ROLLBACK"]
+
+[[group]]
+kind = "keyword"
+doc = "Words the parser knows and refuses by name, because a statement that writes one is a statement somebody expected to work. CREATE is refused the same way and is in the catalog group, being the one word that opens a statement here and a different one in Cypher. They are coloured for the reason they are refused by name: a word that comes out plain reads as a variable, and the error is easier to believe when the word looked like a word."
+words = ["MERGE", "FILTER", "LET", "NEXT", "FOR", "SESSION", "FINISH"]
+
+[[group]]
+kind = "literal"
+doc = "The three values that are written as words."
+words = ["NULL", "TRUE", "FALSE"]
+
+[[group]]
+kind = "function"
+doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID and PATH_LENGTH are the two that read something only the graph knows."
+words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH"]
+
+[[group]]
+kind = "algorithm"
+doc = "The graph algorithms, which are table functions called in a CALL and read through a YIELD. Written lower case here because that is how a statement writes them, and the match is case-insensitive either way."
+words = ["pagerank", "wcc", "bfs", "sssp", "sssp_weighted", "cdlp", "lcc", "triangle_count", "betweenness", "louvain"]
+
+[[group]]
+kind = "type"
+doc = "The integer tower, its word spellings, and the exact numbers."
+words = ["INT8", "INT16", "INT32", "INT64", "INT128", "INT256", "UINT8", "UINT16", "UINT32", "UINT64", "UINT128", "UINT256", "SMALLINT", "USMALLINT", "INT", "INTEGER", "UINT", "BIGINT", "UBIGINT", "DECIMAL", "DEC", "NUMERIC"]
+
+[[group]]
+kind = "type"
+doc = "The approximate numbers, the booleans, and the two string families."
+words = ["FLOAT16", "FLOAT32", "FLOAT64", "FLOAT128", "FLOAT256", "REAL", "DOUBLE", "PRECISION", "FLOAT", "BOOL", "BOOLEAN", "STRING", "VARCHAR", "CHAR", "BYTES", "VARBINARY", "BINARY"]
+
+[[group]]
+kind = "type"
+doc = "The temporals and the immaterial types. LOCAL and ZONED are words of a two word name rather than names of their own, and a bare TIME or DATETIME carries a zone, which is GQL's default."
+words = ["DATE", "TIME", "DATETIME", "TIMESTAMP", "LOCAL", "ZONED", "DURATION", "INTERVAL", "PATH", "BINDING", "TABLE", "NOTHING"]

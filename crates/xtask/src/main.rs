@@ -18,8 +18,8 @@
 //! reads two committed files and needs nothing.
 
 use xtask::{
-    apimap, artifacts, corpus, model, package, packaging, pins, platforms, repos, rustdoc, tarball,
-    terms,
+    apimap, artifacts, corpus, grammar, model, package, packaging, pins, platforms, repos, rustdoc,
+    tarball, terms,
 };
 
 use std::path::{Path, PathBuf};
@@ -98,6 +98,15 @@ cargo xtask terms [--table PATH] [--list] [PATH ...]
   --table PATH      the terminology table (default zu-web/style/zu/terms.yml, here or one level up)
   --list            print `group<TAB>term<TAB>definition` for every term, and check nothing
   PATH ...          what to check (default docs, crates, README.md, conformance/README.md)
+
+cargo xtask grammar [--table PATH] [--root DIR] [--check] [--list] [--queries DIR] [--cases DIR]
+
+  --table PATH      the word list (default grammar/vocabulary.toml)
+  --root DIR        the tree the highlighters live in (default .)
+  --check           write nothing; nonzero if a generated file or a hand-written table has drifted
+  --list            print `kind<TAB>word` for every word, and check nothing
+  --queries DIR     write every corpus statement into DIR for the tree-sitter check to parse
+  --cases DIR       the case files those statements come from (default conformance/cases)
 ";
 
 /// The crates whose public items reach the surface of `zu` through a
@@ -119,6 +128,7 @@ fn main() -> ExitCode {
         Some("packaging") => run(packaging_command(&args[1..])),
         Some("repos") => run(repos_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
+        Some("grammar") => run(grammar_command(&args[1..])),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -784,7 +794,13 @@ fn repos_command(args: &[String]) -> Result<ExitCode, String> {
 /// comments that become reference pages. The engine's own source is in
 /// here because a doc comment is a reference page, not because a
 /// comment is prose; nothing outside `//!` and `///` is read.
-const PROSE: [&str; 4] = ["docs", "crates", "README.md", "conformance/README.md"];
+const PROSE: [&str; 5] = [
+    "docs",
+    "crates",
+    "README.md",
+    "conformance/README.md",
+    "grammar/README.md",
+];
 
 fn terms_command(args: &[String]) -> Result<ExitCode, String> {
     let mut table: Option<PathBuf> = None;
@@ -893,6 +909,101 @@ fn walk(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn grammar_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut table = PathBuf::from(grammar::PATH);
+    let mut root = PathBuf::from(".");
+    let mut cases = PathBuf::from("conformance/cases");
+    let mut queries: Option<PathBuf> = None;
+    let mut check = false;
+    let mut list = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--check" => check = true,
+            "--list" => list = true,
+            "--table" => {
+                table = PathBuf::from(args.get(i + 1).ok_or("--table wants a path")?);
+                i += 1;
+            }
+            "--root" => {
+                root = PathBuf::from(args.get(i + 1).ok_or("--root wants a path")?);
+                i += 1;
+            }
+            "--cases" => {
+                cases = PathBuf::from(args.get(i + 1).ok_or("--cases wants a path")?);
+                i += 1;
+            }
+            "--queries" => {
+                queries = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--queries wants a path")?,
+                ));
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+
+    // The corpus statements are a different job from the word list and
+    // take none of it, so this leaves before the list is read.
+    if let Some(dir) = &queries {
+        let (taken, refused) = grammar::queries(&cases, dir)?;
+        println!(
+            "{} statements written to {}, {refused} of them into refused/ because the engine \
+             answers them with a syntax error",
+            taken + refused,
+            dir.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let vocabulary = grammar::Vocabulary::load(&table)?;
+
+    if list {
+        for (word, kind) in vocabulary.all() {
+            println!("{}\t{word}", kind.name());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let counted = |kind: grammar::Kind| vocabulary.words(kind).len();
+    let summary = format!(
+        "{} words, audited {}: {} keywords, {} literals, {} functions, {} algorithms, {} types",
+        vocabulary.all().len(),
+        vocabulary.audited,
+        counted(grammar::Kind::Keyword),
+        counted(grammar::Kind::Literal),
+        counted(grammar::Kind::Function),
+        counted(grammar::Kind::Algorithm),
+        counted(grammar::Kind::Type),
+    );
+
+    let notes = if check {
+        vocabulary.check(&root)?
+    } else {
+        // Writing first, so that the drift a write fixes is not
+        // reported as something to fix by hand.
+        for path in vocabulary.write(&root)? {
+            println!("{path}");
+        }
+        vocabulary.consistency(&root)?
+    };
+    if notes.is_empty() {
+        println!("{summary}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    eprintln!(
+        "\n{} to fix. The words of zuQL are {}, and the shell, the editor grammar and the \
+         website all colour a statement from that one list.",
+        notes.len(),
+        table.display()
+    );
+    Ok(ExitCode::FAILURE)
 }
 
 fn api_map_command(args: &[String]) -> Result<ExitCode, String> {

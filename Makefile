@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt bench gate check-artifacts
+.PHONY: build test lint fmt bench gate check-artifacts grammar
 
 # The ISO/IEC 39075:2024 conditions artifact is checked in, and the
 # generated status table is derived from it. This verifies the bytes are
@@ -25,3 +25,10 @@ lint:
 
 fmt:
 	cargo fmt --all
+
+# The word list against the three things that colour a statement, and
+# the two grammars against the conformance corpus. The second half wants
+# node, which is why it is a target of its own rather than part of lint.
+grammar:
+	cargo run -p xtask -- grammar --check
+	cd grammar && npm ci && npm test

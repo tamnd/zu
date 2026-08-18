@@ -97,8 +97,8 @@ words = ["NULL", "TRUE", "FALSE"]
 
 [[group]]
 kind = "function"
-doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID and PATH_LENGTH are the two that read something only the graph knows."
-words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH"]
+doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, PATH_LENGTH and ELEMENTS are the three that read something only the graph knows."
+words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS"]
 
 [[group]]
 kind = "algorithm"

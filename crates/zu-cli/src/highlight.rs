@@ -404,6 +404,7 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "SESSION",
     "CONTAINS",
     "DISTINCT",
+    "ELEMENTS",
     "NODETACH",
     "OPTIONAL",
     "PROPERTY",

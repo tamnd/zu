@@ -1034,7 +1034,19 @@ impl Compiler<'_> {
         // whose variable is not what the scan seeks on, goes back to
         // the old engine whole.
         let mut unwound = None;
-        if let Some(LogicalPlan::Unwind { expr, slot, .. }) = it.peek() {
+        if let Some(LogicalPlan::Unwind {
+            expr,
+            slot,
+            ordinal,
+            ..
+        }) = it.peek()
+        {
+            // A counter is a second column this source does not make,
+            // since the list here becomes the keys of a scan rather
+            // than rows of its own, so the statement goes back whole.
+            if ordinal.is_some() {
+                return Ok(None);
+            }
             let Some(keys) = self.const_keys(expr) else {
                 return Ok(None);
             };

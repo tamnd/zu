@@ -351,25 +351,19 @@ pub enum Clause {
     /// this one a write is the clause in front of them, and a pattern
     /// here is a description of an element to create rather than one to
     /// look for.
-    Insert {
-        patterns: Vec<PathPattern>,
-    },
+    Insert { patterns: Vec<PathPattern> },
     /// `SET p.age = 37`, the statement that changes what an element
     /// already there holds (ISO 13.3). The element is named by a
     /// variable an earlier clause bound, because a statement changes
     /// what it found rather than what it can describe.
-    Set {
-        items: Vec<SetItem>,
-    },
+    Set { items: Vec<SetItem> },
     /// `REMOVE p.age`, the statement that takes a property off an
     /// element (ISO 13.4). GQL defines it as setting the property to
     /// null, so what it does is a `SET` with nothing on the right of
     /// it; it is its own clause here because it is its own syntax, and
     /// because what a reader of an EXPLAIN listing wrote is what the
     /// listing should say back.
-    Remove {
-        items: Vec<RemoveItem>,
-    },
+    Remove { items: Vec<RemoveItem> },
     /// `DELETE n`, the statement that takes an element out of the graph
     /// (ISO 13.5). Each item names one element, either as a variable an
     /// earlier clause bound or as a query that answers one.
@@ -382,9 +376,21 @@ pub enum Clause {
         targets: Vec<DeleteTarget>,
         detach: bool,
     },
+    /// `FOR x IN [1, 2, 3]`, the statement that makes a row out of
+    /// every element of a list (ISO 14.8, GQ10), and `UNWIND [1, 2, 3]
+    /// AS x`, which is the Cypher spelling of the same thing and the
+    /// one this engine accepted first.
+    ///
+    /// `ordinal` is the counter GQL lets the statement number its own
+    /// rows with, `WITH ORDINALITY i` from one (GQ11) and `WITH OFFSET
+    /// i` from zero (GQ24). It counts the elements of the list rather
+    /// than the rows the statement answers, so a `FOR` under a match
+    /// starts again at each row that reaches it, which is what makes
+    /// the number the position of the element and not a row id.
     Unwind {
         expr: Expr,
         alias: String,
+        ordinal: Option<Ordinal>,
     },
     /// `FILTER p.age > 30`, the statement that keeps the rows a
     /// condition holds for (ISO 14.6, GQ08). It is the `WHERE` of a
@@ -395,9 +401,7 @@ pub enum Clause {
     /// `FILTER WHERE p.age > 30` is optional and means nothing extra,
     /// which is the standard's own spelling and not a courtesy to
     /// Cypher.
-    Filter {
-        expr: Expr,
-    },
+    Filter { expr: Expr },
     /// `LET n = a.age + 1, big = n > 40`, the statement that names
     /// values (ISO 14.7, GQ09). Every variable in hand stays in hand
     /// and the new names are added to them, which is what makes it a
@@ -406,9 +410,7 @@ pub enum Clause {
     ///
     /// The definitions read left to right, so a later one may use a
     /// name an earlier one in the same statement gave.
-    Let {
-        items: Vec<LetItem>,
-    },
+    Let { items: Vec<LetItem> },
     /// `CALL name(args) YIELD col [AS alias], ...`, a table function
     /// producing rows (docs/07 §4).
     Call {
@@ -564,6 +566,17 @@ pub struct ProjectionItem {
 pub struct LetItem {
     pub name: String,
     pub expr: Expr,
+}
+
+/// The counter a `FOR` numbers its rows with: the name it binds and
+/// the number the first element of the list takes. `WITH ORDINALITY`
+/// counts from one, the way the standard counts the members of a list
+/// everywhere else, and `WITH OFFSET` counts from zero, which is what
+/// a reader wants when the number is going to index something.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ordinal {
+    pub name: String,
+    pub start: i64,
 }
 
 /// GQL path mode: which repeats a variable-length path may contain.

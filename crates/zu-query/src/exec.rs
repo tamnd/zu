@@ -951,7 +951,7 @@ fn op_label(
             )
         }
         OpDesc::Filter { expr, .. } => ("Filter", expr_text(expr, query)),
-        OpDesc::Unwind { expr, chunk } => (
+        OpDesc::Unwind { expr, chunk, .. } => (
             "Unwind",
             format!(
                 "{} AS {}",
@@ -1342,6 +1342,12 @@ enum OpDesc {
     Unwind {
         expr: BoundExpr,
         chunk: usize,
+        /// Where in the chunk the counter of a `WITH ORDINALITY` or a
+        /// `WITH OFFSET` goes, and what its first element is numbered.
+        /// The chunk holds the value and the number side by side, so
+        /// the operator writes two columns of the same length rather
+        /// than the counter being an operator of its own.
+        ordinal: Option<i64>,
     },
     /// A table function source: one engine kernel call fills the chunk
     /// with every row at once, node column first. The kernel sweeps
@@ -2451,14 +2457,22 @@ fn build_stages(
                     i += 1;
                 }
             }
-            LogicalPlan::Unwind { expr, slot, .. } => {
+            LogicalPlan::Unwind {
+                expr,
+                slot,
+                ordinal,
+                ..
+            } => {
                 for c in b.unflat_of(expr)? {
                     b.ensure_flat(c);
                 }
-                let chunk = b.new_chunk(vec![*slot], false);
+                let mut slots = vec![*slot];
+                slots.extend(ordinal.map(|ordinal| ordinal.slot));
+                let chunk = b.new_chunk(slots, false);
                 b.push(OpDesc::Unwind {
                     expr: expr.clone(),
                     chunk,
+                    ordinal: ordinal.map(|ordinal| ordinal.start),
                 });
                 b.produced(chunk);
             }
@@ -4695,7 +4709,11 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 }
             },
         },
-        OpDesc::Unwind { expr, chunk } => loop {
+        OpDesc::Unwind {
+            expr,
+            chunk,
+            ordinal,
+        } => loop {
             if !next(descs, ctx, i - 1)? {
                 return Ok(false);
             }
@@ -4711,6 +4729,14 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             }
             let c = &mut ctx.chunks[*chunk];
             c.size = items.len();
+            if let Some(start) = ordinal {
+                // The counter is the position in this list, so it runs
+                // from the start over the elements this row's list has
+                // and begins again at the next row's.
+                c.cols[1] = (0..items.len())
+                    .map(|i| Value::Int(start + i as i64))
+                    .collect();
+            }
             c.cols[0] = items;
             c.cur = None;
             return Ok(true);

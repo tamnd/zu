@@ -119,10 +119,20 @@ property_type   = name , ( "::" | "TYPED" ) , value_type ;
    so NOT NULL is what makes a property mandatory. One rule about null
    rather than two. *)
 
-reading_clause  = match_clause | unwind_clause | filter_clause
+reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
                 | let_clause | with_clause ;
 
 match_clause    = [ "OPTIONAL" ] , "MATCH" , pattern , [ where_clause ] ;
+(* GQ10, GQ11 and GQ24, ISO 14.8. One row per element of a list, with
+   an optional counter over the elements: ORDINALITY counts from one
+   and OFFSET from zero. The WITH here is read two tokens at a time,
+   since WITH is also a clause and the word after it is what says
+   which of the two was written. *)
+for_clause      = "FOR" , name , "IN" , expression ,
+                  [ "WITH" , ( "ORDINALITY" | "OFFSET" ) , name ] ;
+
+(* The Cypher spelling of the same statement, which names the value
+   after the list rather than before it and carries no counter. *)
 unwind_clause   = "UNWIND" , expression , "AS" , name ;
 
 (* GQ08, ISO 14.6. The condition on its own, over whatever the

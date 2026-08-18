@@ -1158,7 +1158,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         // operator, and a whole query inside one reads worse than the
         // reference does. [`explain`] prints the plan for it under the
         // plan that reads it.
-        BoundExpr::Scalar(ix) => format!("VALUE {{{ix}}}"),
+        BoundExpr::Scalar { ix, .. } => format!("VALUE {{{ix}}}"),
         BoundExpr::Var(slot) => slot_name(query, *slot).to_string(),
         BoundExpr::HasLabels { slot, test } => {
             format!("{}:{}", slot_name(query, *slot), test.text(&query.labels))

@@ -8649,7 +8649,7 @@
       "id": "zu::zu1::wal::Wal",
       "kind": "struct",
       "name": "Wal",
-      "doc": "The open sidecar log: an append position and the frame codec around\nit. Commit durability is one `fdatasync` per commit; the 1 ms\ngroup-commit window from docs/08 arrives with the writer queue."
+      "doc": "The open sidecar log: an append position, a staging buffer and the\nframe codec around them. Commit durability is one `fdatasync` per\ncommit; the 1 ms group-commit window from docs/08 arrives with the\nwriter queue.\n\nA transaction's frames are built in memory and go to the file in one\nwrite at commit, because a small write is nearly all syscall: a one\ncell update is a begin frame, an update frame and a commit frame,\nthree pwrites of about thirty bytes each, and on this laptop those\nthree cost more processor time than everything the statement did\nbefore them. Nothing about durability changes, since the commit\nframe is still what reaches the disk last and the sync still follows\nit."
     },
     {
       "id": "zu::zu1::wal::Wal::append",
@@ -8657,7 +8657,7 @@
       "name": "append",
       "of": "zu::zu1::wal::Wal",
       "signature": "fn append(&mut self, epoch: Epoch, rec: &WalRecord) -> Result<()>",
-      "doc": "Appends one frame without syncing. Durability comes from\n[`Wal::commit`]; a crash before it tears the tail and replay\ndrops the whole uncommitted txn."
+      "doc": "Stages one frame. Nothing reaches the file until the buffer\nfills or the commit pushes it, and durability comes from\n[`Wal::commit`] either way: a crash before it leaves the staged\nframes unwritten, or leaves a spilled prefix with no commit\nframe after it, and replay drops the whole uncommitted txn in\nboth cases."
     },
     {
       "id": "zu::zu1::wal::Wal::commit",
@@ -8665,7 +8665,7 @@
       "name": "commit",
       "of": "zu::zu1::wal::Wal",
       "signature": "fn commit(&mut self, epoch: Epoch) -> Result<()>",
-      "doc": "Appends the txn's `TxnCommit` frame and syncs the file. The\nrecord hitting disk is the commit point: replay delivers a txn\nexactly when this frame verifies."
+      "doc": "Stages the txn's `TxnCommit` frame, writes everything the txn\nstaged in one go and syncs the file. The commit record hitting\ndisk is the commit point: replay delivers a txn exactly when\nthat frame verifies, and it is last in the buffer, so a write\nthe disk tears anywhere leaves a txn replay refuses."
     },
     {
       "id": "zu::zu1::wal::Wal::is_empty",
@@ -8680,7 +8680,7 @@
       "name": "len",
       "of": "zu::zu1::wal::Wal",
       "signature": "fn len(&self) -> u64",
-      "doc": "Bytes of intact frames, the input to the checkpoint trigger."
+      "doc": "Bytes of intact frames, the input to the checkpoint trigger.\nStaged frames count: they are what the next commit is about to\nmake durable, and a trigger that ignored them would read a log\nmid-transaction as shorter than it is about to be."
     },
     {
       "id": "zu::zu1::wal::Wal::open",

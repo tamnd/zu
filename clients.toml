@@ -1,0 +1,183 @@
+schema = 1
+doc = "The clients of this engine, who maintains each one, and what its tier promises."
+audited = "2026-08-19"
+
+# The scorecard of dx/01 section 5. A tier is a promise, and a promise
+# with nobody's name on it is a commitment nobody made, so every client
+# here carries the repository it lives in and the person who answers for
+# it. Both fields are published, at /docs/clients/overview, which this
+# table renders.
+#
+# A scorecard has three axes and a tier is the threshold on each:
+#
+#   surface       how much of the API model this client names, out of
+#                 the entities its tier owes. Measured per release, from
+#                 the map completeness check of section 6.
+#   conformance   how much of the cross-client corpus it passes.
+#                 Measured per release, by the corpus runner.
+#   practice      the apparatus below. Scored from this file, because
+#                 every item in it is a thing the repository either has
+#                 or does not, and a release does not change the answer.
+#
+# The first two are measured by the release and collected by the
+# conductor, which is why they are not columns here: a number a person
+# types is a number nobody measured. The third is the half that can be
+# checked today, and `cargo xtask clients --gate` fails on a client
+# under its tier's threshold.
+
+[[tier]]
+level = 1
+surface = 100
+conformance = 100
+practice = 90
+doc = "Everything, and the apparatus that keeps it. dx/15 section 8 puts a tier 1 release at 100/100/>=90, which leaves room for one ten point item to be missing and no room for two."
+
+[[tier]]
+level = 2
+surface = 100
+conformance = 95
+practice = 75
+doc = "The whole surface, and a corpus that may have declared skips in it. A tier 2 client is one somebody can depend on and not one the release blocks for."
+
+[[tier]]
+level = 3
+surface = 90
+conformance = 90
+practice = 50
+doc = "Built with the kit, published by whoever wanted it. The threshold is what makes a tier 3 binding worth listing at all rather than a name on a page."
+
+# The practice axis, item by item. The weights are out of 100 and they
+# have to be, because a score out of a number that moves is not a score.
+#
+# An item with a `report` applies only where the repository owes that
+# report back to the release, and the score is out of the weight that
+# applies. That is not a loophole: zu-c has no api-map because the C
+# names are zu.h and zu.h is generated in the engine, so scoring it
+# against a map it should not have would mark a correct decision wrong.
+
+[[item]]
+name = "quickstart"
+weight = 10
+doc = "The README's programs are run by CI as printed. A quickstart is the most read and least executed code a client has, and it goes wrong a rename at a time."
+
+[[item]]
+name = "reference"
+weight = 10
+doc = "A generated API reference, published with the release rather than written by hand beside it."
+
+[[item]]
+name = "idiom"
+weight = 15
+doc = "The language's own shapes: how it iterates, how it releases a resource, how it awaits, what it raises. A binding that reads like the C ABI in another syntax is a binding nobody wants to write against."
+
+[[item]]
+name = "conditions"
+weight = 10
+doc = "Every failure carries the standard's condition code, the place, and the doc URL, checked by a test rather than promised in a page."
+
+[[item]]
+name = "misuse"
+weight = 15
+doc = "The misuse and lifecycle suite of dx/15 section 4: deliberately wrong programs, and for each one no crash, no leak, and a clear message."
+
+[[item]]
+name = "leaks"
+weight = 10
+doc = "Sanitizer and leak jobs in CI. A binding holds native memory, and the process that finds out later is the user's."
+
+[[item]]
+name = "install"
+weight = 10
+doc = "A clean-machine install test, nightly, in a container holding the language runtime and nothing else."
+
+[[item]]
+name = "stability"
+weight = 10
+doc = "An API stability gate wired in, from dx/15 section 6: the tool that tells a reviewer the public surface moved before a user finds out."
+
+[[item]]
+name = "api-map"
+weight = 5
+report = "api-map"
+doc = "An api-map.toml, checked both ways against the ledger, so an entity nobody named is a failure and not a gap."
+
+[[item]]
+name = "perf"
+weight = 5
+report = "perf"
+doc = "Benchmark numbers published for the version being released, against the engine's own, so the overhead of the binding is a number and not a claim."
+
+# One row per client. The name is read off the repository, because the
+# link is the thing that has to be right: a row whose text says one
+# client and whose URL is another sends a reader somewhere else, and the
+# URL is what they follow.
+
+[[client]]
+repository = "https://github.com/tamnd/zu-python"
+language = "Python"
+package = "zudb"
+registry = "PyPI"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 1
+holds = ["quickstart", "conditions", "idiom", "misuse"]
+doc = "PyO3, three wheels per platform. The DB-API layer, the asyncio one and the notebook rendering are submodules a caller asks for by name."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-node"
+language = "TypeScript"
+package = "zudb"
+registry = "npm"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 1
+holds = ["conditions", "idiom"]
+doc = "napi-rs, platform packages under optionalDependencies, plus the WASM build that is the browser and fallback path. Node, Bun and Deno are all first class."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-go"
+language = "Go"
+package = "github.com/tamnd/zu-go"
+registry = "Go modules"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 1
+holds = []
+doc = "cgo with a purego path. Its publish is a git tag, which is the one that cannot be taken back."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-java"
+language = "Java"
+package = "dev.zudb"
+registry = "Maven Central"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 1
+holds = []
+doc = "Panama with a JNI fallback, and the Kotlin and Scala layers on top of it."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-c"
+language = "C and C++"
+package = "zu"
+registry = "vcpkg and Conan"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 1
+holds = []
+doc = "The developer kit for the ABI itself: examples, the header-only C++ wrapper, the packaging and the sanitizer suites. It owes no api-map, because the C names are zu.h and zu.h is generated in the engine."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-dotnet"
+language = "C#"
+package = "ZuDb"
+registry = "NuGet"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 2
+holds = []
+doc = "Source-generated P/Invoke, NativeAOT-clean."
+
+[[client]]
+repository = "https://github.com/tamnd/zu-kit"
+language = "Rust"
+package = "zu-kit"
+registry = "crates.io"
+maintainer = "Tam Nguyen Duc <@tamnd>"
+tier = 3
+holds = []
+doc = "The binding kit rather than a binding: generated FFI declarations, corpus runners, the scorecard tool, and the reference binding whose scorecard is the kit's own."

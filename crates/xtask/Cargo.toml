@@ -45,6 +45,10 @@ name = "repos"
 harness = false
 
 [[bench]]
+name = "clients"
+harness = false
+
+[[bench]]
 name = "sha256"
 harness = false
 

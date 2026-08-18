@@ -4,6 +4,7 @@
 
 pub mod apimap;
 pub mod artifacts;
+pub mod clients;
 pub mod corpus;
 pub mod fixture;
 pub mod grammar;

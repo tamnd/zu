@@ -87,6 +87,8 @@ This repository holds the engine, the Rust SDK, the CLI, the C ABI and its gener
 | [zu-kit](https://github.com/tamnd/zu-kit) | The binding kit: generated FFI declarations, corpus runners, a reference binding, the scorecard tool | 3 |
 | [zu-web](https://github.com/tamnd/zu-web) | The documentation site. Two thirds of it is generated from this repository's release artifacts | |
 
+A tier is a promise, so who answers for each client and what its tier asks of it are published rather than implied: [docs/clients/overview.md](docs/clients/overview.md) is the maintainer, the repository and the scorecard of every one of them, rendered from `clients.toml` and held to the table above.
+
 If a bug reproduces through the `zu` CLI it belongs here, whichever client you found it through. Every client repository's bug template asks that first, because engine bugs filed in client trackers are the standard way a multi-repository project loses track of them.
 
 ## Installing

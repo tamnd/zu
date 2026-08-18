@@ -856,7 +856,9 @@ fn is_keyed(db: &mut Zu1File, index: &TableIndex, rel: u32) -> Result<bool> {
     let Some(root) = index.get(rel) else {
         return Ok(false);
     };
-    Ok(Directory::decode(&meta::read_chain(db, root)?)?.keys.is_some())
+    Ok(Directory::decode(&meta::read_chain(db, root)?)?
+        .keys
+        .is_some())
 }
 
 /// The rows of a node table that a DELETE took away, sorted, as the
@@ -896,13 +898,13 @@ fn read_appended_keys(
     if by_row.len() as u64 <= base {
         return Ok(());
     }
-    let root = index.get(rel.from).ok_or_else(|| ZuError::Unsupported {
+    let root = index.get(rel.from).ok_or(ZuError::Unsupported {
         what: "growing a keyed table whose node table stores no properties",
         id: rel.id,
     })?;
     let dir = load_props_at(db, root)?;
     let mut reader = PropsReader::new(dir);
-    let col = reader.col("id").ok_or_else(|| ZuError::Unsupported {
+    let col = reader.col("id").ok_or(ZuError::Unsupported {
         what: "growing a keyed table whose node table has no 'id' column to take a key from",
         id: rel.id,
     })?;

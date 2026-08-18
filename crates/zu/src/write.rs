@@ -607,8 +607,10 @@ mod tests {
         drop(session);
 
         assert_eq!(published_people(&path), 7);
-        let log = std::fs::metadata(sidecar(&path)).expect("the log is there");
-        assert_eq!(log.len(), 0, "the close left frames in the log");
+        // The file keeps the room it took, so what says the log is
+        // empty is what is in it rather than how long it is.
+        let log = crate::zu1::wal::Wal::open(&sidecar(&path)).expect("the log is there");
+        assert!(log.is_empty(), "the close left frames in the log");
     }
 
     /// A statement that writes twice and then raises is undone whole,

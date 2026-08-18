@@ -82,6 +82,16 @@
 //! commit, which is what a host reading rows out of somewhere else has
 //! to hand. Both are the entry points the Rust appender and `zu copy`
 //! are built on rather than a second way in beside them.
+//!
+//! Values also get in without getting in at all, which is [`ZuFrame`].
+//! A host holding columns in memory names them as a table of one
+//! connection and queries them where they lie: nothing is copied, at
+//! registration or at read, and a release callback the host gave says
+//! when the engine is finished with the bytes. That is the third
+//! problem a host with data has, and it is the one a dataframe binding
+//! has: the rows are already columns, the columns are already the
+//! widths this engine reads, and loading them into a database to answer
+//! one statement about them would copy the whole thing to no end.
 
 // The pointer contract (what must be valid, who frees what, in which
 // order) is one contract for the whole surface; it lives in the module
@@ -89,12 +99,14 @@
 // it, not repeated under every function.
 #![allow(clippy::missing_safety_doc)]
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::mem::{offset_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -106,8 +118,8 @@ use zudb::zu1::file::Zu1File;
 use zudb::zu1::graph::bulk_load_keyed;
 use zudb::zu1::props::{PropValues, load_props, store_props};
 use zudb::{
-    Config, Connection, Database, DiagnosticRecord, Field, Interrupt, Position, Severity,
-    ZuError as EngineError,
+    Column, Config, Connection, Database, DiagnosticRecord, Field, Frame, Interrupt, Layout,
+    Position, Severity, ZuError as EngineError,
 };
 
 /// What a call answers, which is control flow and nothing else.
@@ -205,6 +217,12 @@ pub const ZU_TEMPORAL_LOCAL_DATETIME: i32 = 3;
 pub const ZU_TEMPORAL_ZONED_DATETIME: i32 = 4;
 pub const ZU_TEMPORAL_DURATION_YEAR_MONTH: i32 = 5;
 pub const ZU_TEMPORAL_DURATION_DAY_TIME: i32 = 6;
+
+/// What [`zu_frame_int`] is told when a column of integers is a column
+/// of integers and nothing else. Negative so that the tags above, which
+/// count up from zero and are the rest of what that parameter takes,
+/// keep their numbering.
+pub const ZU_FRAME_PLAIN: i32 = -1;
 
 /// What went wrong, as fields. Opaque to C, read through the
 /// accessors, freed with [`zu_error_free`].
@@ -640,6 +658,11 @@ unsafe fn conn_of<'a>(conn: *mut ZuConn) -> &'a mut Connection {
     unsafe { &mut (*conn).conn }
 }
 
+/// The frame names this connection last read, under a [`Claim`].
+unsafe fn conn_registered<'a>(conn: *mut ZuConn) -> &'a mut Vec<String> {
+    unsafe { &mut (*conn).registered }
+}
+
 /// The word a running statement reads, cloned so the caller holds no
 /// borrow. This is the one field a second thread touches on purpose
 /// while the first is inside a call.
@@ -686,6 +709,11 @@ pub struct ZuConn {
     state: Arc<ConnState>,
     stop: Interrupt,
     progress: Mutex<Option<Hook>>,
+    /// The registered frame names as [`zu_conn_registered_count`] last
+    /// read them, kept because [`zu_conn_registered_name`] hands out
+    /// pointers into them and a name has to be somewhere to be pointed
+    /// at.
+    registered: Vec<String>,
 }
 
 impl ZuConn {
@@ -699,6 +727,7 @@ impl ZuConn {
             }),
             stop,
             progress: Mutex::new(None),
+            registered: Vec::new(),
         }
     }
 
@@ -4402,6 +4431,646 @@ pub unsafe extern "C" fn zu_appender_free(app: *mut ZuAppender) {
         return;
     }
     drop(unsafe { Box::from_raw(app) });
+}
+
+/* ---- frames ---- */
+
+/// The host's claim on the bytes a frame points at, and the call that
+/// gives it back.
+///
+/// Held by the frame, by every registration of it, and by every vector
+/// a scan built over one, and never read. Dropping the last of them is
+/// what calls `release`, which is the only thing this type does: a host
+/// cannot be told "the engine has finished with your arrays" by a
+/// return value, because the engine finishes with them at a moment when
+/// no call of the host's is on the stack.
+struct Released {
+    owner: *mut c_void,
+    release: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+// `Send` and `Sync` are asserted rather than derived, on the same terms
+// as [`Hook`]: the pointer is the host's and Rust cannot know what is
+// behind it. The header says what the assertion is. The frame travels
+// to every worker of a parallel scan, so whatever the pointer names has
+// to survive being read from several threads at once, and the release
+// runs once, on whichever thread happened to drop the last handle.
+unsafe impl Send for Released {}
+unsafe impl Sync for Released {}
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        if let Some(release) = self.release {
+            // A host callback that panics would unwind out of a drop,
+            // and an unwind out of a drop during another unwind aborts
+            // the process. Fenced here rather than left to chance.
+            let _ = catch_unwind(AssertUnwindSafe(|| unsafe { release(self.owner) }));
+        }
+    }
+}
+
+/// Columns of a host's own memory, named as a table of a connection.
+/// Opaque to C, freed with [`zu_frame_free`], and not thread-safe on
+/// the same terms as [`ZuLoader`].
+///
+/// The other two ways in copy: a loader writes a database and an
+/// appender writes rows. This one does not, at registration or at
+/// read. A statement over a registered frame reads vectors that point
+/// straight at the host's buffers wherever the layouts agree, and
+/// widens a value at a time into a scratch arena where they do not, so
+/// a host with a hundred columns pays for the one the statement named.
+///
+/// A frame is described once and may be registered on any number of
+/// connections, because a description is names, widths and pointers and
+/// registering copies none of the data behind them. The handle stays
+/// the caller's on every path: registering does not spend it, and
+/// [`zu_frame_free`] is what ends it.
+pub struct ZuFrame {
+    parts: Parts,
+    state: Arc<ConnState>,
+}
+
+/// What a frame has been told so far, which is everything but the
+/// concurrency flag, so that one projection off the raw pointer covers
+/// it: see the note above [`conn_state`].
+struct Parts {
+    name: String,
+    rows: u64,
+    columns: Vec<Column>,
+    owner: Arc<dyn Any + Send + Sync>,
+}
+
+/// Claims a frame for one call, on the terms [`claim_loader`] states.
+unsafe fn claim_frame(f: *mut ZuFrame) -> Result<Claim, ZuStatus> {
+    if f.is_null() {
+        return Err(ZuStatus::Misuse);
+    }
+    claim(&Arc::clone(unsafe { &(*f).state }))
+}
+
+/// The frame being described, under a [`Claim`].
+unsafe fn frame_parts<'a>(f: *mut ZuFrame) -> &'a mut Parts {
+    unsafe { &mut (*f).parts }
+}
+
+/// A pointer the host says one of its buffers starts at.
+///
+/// Refused rather than dereferenced when it is `NULL`, which is the one
+/// mistake this library can catch: everything else about a borrowed
+/// buffer, that it is as long as the row count implies and that it
+/// outlives the registration, is the promise the header asks for and
+/// the release callback is the other half of.
+fn at(p: *const c_void, what: &str) -> Result<NonNull<u8>, EngineError> {
+    NonNull::new(p as *mut u8).ok_or_else(|| misuse(format!("{what} is NULL")))
+}
+
+/// The integer width a host gave in bits.
+fn int_bits(bits: i32) -> Result<IntBits, EngineError> {
+    match bits {
+        8 => Ok(IntBits::B8),
+        16 => Ok(IntBits::B16),
+        32 => Ok(IntBits::B32),
+        64 => Ok(IntBits::B64),
+        _ => Err(misuse(format!(
+            "a frame column of integers is 8, 16, 32 or 64 bits wide, not {bits}"
+        ))),
+    }
+}
+
+/// The float width a host gave in bits.
+fn float_bits(bits: i32) -> Result<FloatBits, EngineError> {
+    match bits {
+        32 => Ok(FloatBits::B32),
+        64 => Ok(FloatBits::B64),
+        _ => Err(misuse(format!(
+            "a frame column of floats is 32 or 64 bits wide, not {bits}"
+        ))),
+    }
+}
+
+/// What a column of integers means, which is the whole difference
+/// between a number and a count of days.
+fn int_meaning(temporal: i32, bits: IntBits, signed: bool) -> Result<LogicalType, EngineError> {
+    match temporal {
+        ZU_FRAME_PLAIN => Ok(LogicalType::Int {
+            signed,
+            bits,
+            precision: None,
+        }),
+        ZU_TEMPORAL_DATE => Ok(LogicalType::Date),
+        ZU_TEMPORAL_LOCAL_TIME => Ok(LogicalType::LocalTime),
+        ZU_TEMPORAL_LOCAL_DATETIME => Ok(LogicalType::LocalDatetime),
+        ZU_TEMPORAL_DURATION_YEAR_MONTH => Ok(LogicalType::Duration(DurationKind::YearMonth)),
+        ZU_TEMPORAL_DURATION_DAY_TIME => Ok(LogicalType::Duration(DurationKind::DayTime)),
+        ZU_TEMPORAL_ZONED_TIME | ZU_TEMPORAL_ZONED_DATETIME => Err(EngineError::Unsupported {
+            what: "a frame column of the zoned temporal kind",
+            id: temporal as u32,
+        }),
+        other => Err(misuse(format!(
+            "{other} is neither ZU_FRAME_PLAIN nor a ZU_TEMPORAL_ kind"
+        ))),
+    }
+}
+
+/// Takes one column, once the call that produced it has turned the
+/// host's arguments into a layout.
+///
+/// The row count is checked here rather than at registration so that a
+/// column of the wrong length is refused at the call that passed it,
+/// where the caller still knows which column it was describing.
+fn describe(
+    parts: &mut Parts,
+    name: &str,
+    count: u64,
+    ty: LogicalType,
+    layout: Layout,
+) -> Result<ZuStatus, EngineError> {
+    if name.is_empty() {
+        return Err(misuse("a column has a name"));
+    }
+    if count != parts.rows {
+        return Err(misuse(format!(
+            "column {name:?} has {count} values against a frame of {} rows",
+            parts.rows
+        )));
+    }
+    if parts.columns.iter().any(|c| c.name == name) {
+        return Err(misuse(format!("column {name:?} was given twice")));
+    }
+    parts.columns.push(Column {
+        name: name.to_string(),
+        ty,
+        layout,
+    });
+    Ok(ZuStatus::Ok)
+}
+
+/// Starts describing a frame of `rows` rows under `name`.
+///
+/// `owner` is whatever the host holds its buffers by, and `release` is
+/// called on it once, when the engine has finished with every one of
+/// them. Both may be `NULL` for a host whose buffers outlive the
+/// process anyway, a static array or a memory map it never unmaps.
+///
+/// The callback runs on a thread of this library's and at a moment of
+/// this library's choosing, which is after the last statement reading
+/// the frame ends and not at the unregister that preceded it. A host
+/// that has to take a lock, or a runtime's global interpreter lock, to
+/// let go of what it passed takes it inside the callback.
+///
+/// A frame of no rows is refused, on the same terms as a load of none:
+/// a table nothing can be read back from is a caller who meant
+/// something else, and every pointer a column call takes has to name a
+/// place for as long as the frame lives.
+///
+/// The frame belongs to the caller until [`zu_frame_free`], and this
+/// call takes on `owner` only when it answers `ZU_OK`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_new(
+    name: *const c_char,
+    name_len: usize,
+    rows: u64,
+    owner: *mut c_void,
+    release: Option<unsafe extern "C" fn(*mut c_void)>,
+    out: *mut *mut ZuFrame,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let name = unsafe { counted(name, name_len, "name") }?;
+        if name.is_empty() {
+            return Err(misuse(
+                "a frame has a name, which is what a statement calls it by",
+            ));
+        }
+        if rows == 0 {
+            return Err(misuse(
+                "a frame of no rows is a table nothing can be read back from",
+            ));
+        }
+        let frame = ZuFrame {
+            parts: Parts {
+                name: name.to_string(),
+                rows,
+                columns: Vec::new(),
+                owner: Arc::new(Released { owner, release }),
+            },
+            state: Arc::new(ConnState {
+                alive: AtomicBool::new(true),
+                busy: AtomicBool::new(false),
+            }),
+        };
+        unsafe { *out = Box::into_raw(Box::new(frame)) };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_new_z(
+    name: *const c_char,
+    rows: u64,
+    owner: *mut c_void,
+    release: Option<unsafe extern "C" fn(*mut c_void)>,
+    out: *mut *mut ZuFrame,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_frame_new(name, zlen(name), rows, owner, release, out, err) }
+}
+
+/// Describes a column of integers `bits` wide, `count` of them back to
+/// back at `values`.
+///
+/// `scale` is what one of them is multiplied by to reach the unit the
+/// column's meaning counts in: 1 for an integer and for a date, and
+/// 1000 for the microseconds Arrow keeps a time or a timestamp in
+/// against the nanoseconds this engine keeps them in. `temporal` is
+/// that meaning, `ZU_FRAME_PLAIN` for a column of numbers or one of the
+/// `ZU_TEMPORAL_` kinds otherwise, with the two zoned kinds refused for
+/// the reason [`zu_loader_col_temporal`] gives.
+///
+/// Sixty-four signed bits at scale 1 is the lane this engine reads
+/// natively, so that column is read where it lies. Every other width,
+/// an unsigned column and any scale but 1 are widened a chunk at a time
+/// as the statement reaches them, which is the only work a frame ever
+/// does with a value. Whether the widening can fail is settled at
+/// registration, not at read: an unsigned value too large for the
+/// signed lane, a scale that would overflow and a date outside the
+/// proleptic Gregorian range are all refused there.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_col_int(
+    f: *mut ZuFrame,
+    name: *const c_char,
+    name_len: usize,
+    values: *const c_void,
+    count: u64,
+    bits: i32,
+    is_signed: i32,
+    scale: i64,
+    temporal: i32,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_frame(f) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let ptr = at(values, "values")?;
+        let bits = int_bits(bits)?;
+        let signed = is_signed != 0;
+        let ty = int_meaning(temporal, bits, signed)?;
+        describe(
+            unsafe { frame_parts(f) },
+            name,
+            count,
+            ty,
+            Layout::Int {
+                ptr,
+                bits,
+                signed,
+                scale,
+            },
+        )
+    })
+}
+
+/// Describes a column of IEEE floats `bits` wide. Sixty-four is the
+/// lane, so a column of doubles is read where it lies and a column of
+/// singles is widened as the statement reaches it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_col_float(
+    f: *mut ZuFrame,
+    name: *const c_char,
+    name_len: usize,
+    values: *const c_void,
+    count: u64,
+    bits: i32,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_frame(f) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let ptr = at(values, "values")?;
+        let bits = float_bits(bits)?;
+        describe(
+            unsafe { frame_parts(f) },
+            name,
+            count,
+            LogicalType::Float {
+                bits,
+                precision: None,
+            },
+            Layout::Float { ptr, bits },
+        )
+    })
+}
+
+/// Describes a column of booleans, one bit a row, low bit of the first
+/// byte first, which is Arrow's bitmap and this engine's alike.
+///
+/// A host holding a slice of somebody else's array, with a bit offset
+/// of its own, owes the shift before it gets here: a bitmap that starts
+/// partway into a byte is not a thing a pointer can say.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_col_bool(
+    f: *mut ZuFrame,
+    name: *const c_char,
+    name_len: usize,
+    bitmap: *const c_void,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_frame(f) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let ptr = at(bitmap, "bitmap")?;
+        describe(
+            unsafe { frame_parts(f) },
+            name,
+            count,
+            LogicalType::Bool,
+            Layout::Bool { ptr },
+        )
+    })
+}
+
+/// Describes a column of strings as characters end to end with offsets
+/// cutting them up: Arrow's `Utf8` when `wide` is nought and its
+/// `LargeUtf8` when it is not, which is 32-bit and 64-bit offsets.
+/// There are `count + 1` offsets, the last of them the length of what
+/// is used at `data`.
+///
+/// The characters are never copied, at registration or at read. What a
+/// scan builds is the sixteen-byte view a row of this engine's string
+/// lane is, and that view points back into `data`, which is why the
+/// buffer has to stay where it is until the release callback runs. The
+/// offsets are checked once, here, so that no read of a registered
+/// frame can walk off the end of it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_col_str(
+    f: *mut ZuFrame,
+    name: *const c_char,
+    name_len: usize,
+    offsets: *const c_void,
+    wide: i32,
+    data: *const c_void,
+    data_len: usize,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_frame(f) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let offsets = at(offsets, "offsets")?;
+        let data = at(data, "data")?;
+        describe(
+            unsafe { frame_parts(f) },
+            name,
+            count,
+            LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false,
+            },
+            Layout::Str {
+                offsets,
+                wide: wide != 0,
+                data,
+                data_len,
+            },
+        )
+    })
+}
+
+/// Describes a column of strings as Arrow's `Utf8View`: sixteen bytes a
+/// row at `views`, over `buffers` data buffers named by the two arrays
+/// `data` and `data_lens`.
+///
+/// A short string in that layout is already this engine's own view,
+/// byte for byte, and is read without being touched. A long one names
+/// its buffer and offset in a different order and is rebuilt into a
+/// view over the same bytes, which is sixteen bytes written per row of
+/// a scanned chunk and no character copied.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_col_view(
+    f: *mut ZuFrame,
+    name: *const c_char,
+    name_len: usize,
+    views: *const c_void,
+    data: *const *const c_void,
+    data_lens: *const usize,
+    buffers: usize,
+    count: u64,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _claim = match unsafe { claim_frame(f) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let views = at(views, "views")?;
+        let ptrs = unsafe { array(data, buffers as u64, "data") }?;
+        let lens = unsafe { array(data_lens, buffers as u64, "data_lens") }?;
+        let mut held = Vec::with_capacity(ptrs.len());
+        for (i, (&ptr, &len)) in ptrs.iter().zip(lens).enumerate() {
+            held.push((at(ptr, &format!("data buffer {i}"))?, len));
+        }
+        describe(
+            unsafe { frame_parts(f) },
+            name,
+            count,
+            LogicalType::Str {
+                min: None,
+                max: None,
+                fixed: false,
+            },
+            Layout::View { views, data: held },
+        )
+    })
+}
+
+/// Frees a frame. The buffers it named are the host's and are not
+/// touched; the release callback runs when the last registration of
+/// this frame, and the last statement reading one, is finished with
+/// them, which may be after this call and may be before it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_frame_free(f: *mut ZuFrame) {
+    if f.is_null() {
+        return;
+    }
+    let state = Arc::clone(unsafe { &(*f).state });
+    state.alive.store(false, Ordering::Release);
+    // Freeing under another thread's call would free memory that thread
+    // is inside of, so this leaks instead, on the same terms as
+    // [`zu_conn_close`].
+    if state.busy.load(Ordering::Acquire) {
+        return;
+    }
+    drop(unsafe { Box::from_raw(f) });
+}
+
+/// Registers a frame as a table of this connection, under the name it
+/// carries.
+///
+/// This is the replacement scan: a host holding columns in memory gets
+/// to name them in a statement without loading them into the database
+/// first. A name a stored table already holds is refused, a name
+/// another frame holds replaces that frame, and the registration is
+/// this connection's alone and goes when the connection does.
+///
+/// Registering does not spend the frame handle. The same one may be
+/// registered on another connection, and [`zu_frame_free`] is what ends
+/// it either way.
+///
+/// The engine reads a frame and never writes one, so a statement that
+/// would insert into, set on or delete from a registered name is
+/// refused with `25G03` and the reason, rather than left to fail
+/// somewhere lower down. Registering inside a transaction is `25G01`:
+/// a table appearing halfway through one is not a thing the transaction
+/// could then be rolled back over.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_register(
+    conn: *mut ZuConn,
+    frame: *mut ZuFrame,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    guard(err, || {
+        let _held = match unsafe { claim_frame(frame) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let parts = unsafe { frame_parts(frame) };
+        // Cloned rather than taken, because the handle is still the
+        // caller's and a second registration has to find it whole.
+        // What is cloned is names, widths and pointers.
+        let built = unsafe {
+            Frame::new(
+                parts.name.clone(),
+                parts.rows,
+                parts.columns.clone(),
+                Arc::clone(&parts.owner),
+            )
+        }?;
+        unsafe { conn_of(conn) }.register(built)?;
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Drops a registered frame, writing through `out`, which may be
+/// `NULL`, whether there was one under that name.
+///
+/// A statement already running keeps the frame it started with, and the
+/// release callback waits for it: unregistering says what the next
+/// statement sees, not what this instant frees.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_unregister(
+    conn: *mut ZuConn,
+    name: *const c_char,
+    name_len: usize,
+    out: *mut i32,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if !out.is_null() {
+        unsafe { *out = 0 };
+    }
+    guard(err, || {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let name = unsafe { counted(name, name_len, "name") }?;
+        let gone = unsafe { conn_of(conn) }.unregister(name)?;
+        if !out.is_null() {
+            unsafe { *out = i32::from(gone) };
+        }
+        Ok(ZuStatus::Ok)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_unregister_z(
+    conn: *mut ZuConn,
+    name: *const c_char,
+    out: *mut i32,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    unsafe { zu_conn_unregister(conn, name, zlen(name), out, err) }
+}
+
+/// How many frames are registered on this connection, and the call that
+/// refreshes the names [`zu_conn_registered_name`] hands out.
+///
+/// The two are separate because the names have to be somewhere for a
+/// borrowed pointer to point at, and a host walking a list wants every
+/// pointer it took to still be good when it reaches the end. This is
+/// what rebuilds that list; the accessor only reads it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_registered_count(conn: *mut ZuConn, out: *mut u64) -> ZuStatus {
+    if out.is_null() {
+        return ZuStatus::Misuse;
+    }
+    unsafe { *out = 0 };
+    guard_status(|| {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return status,
+        };
+        let names = unsafe { conn_of(conn) }.registered();
+        let held = unsafe { conn_registered(conn) };
+        *held = names;
+        unsafe { *out = held.len() as u64 };
+        ZuStatus::Ok
+    })
+}
+
+/// One registered name, in the sorted order [`zu_conn_registered_count`]
+/// last read them in, or `NULL` out of range. `len` may be `NULL`.
+///
+/// Borrowed from the connection and valid until the next
+/// [`zu_conn_registered_count`] on it or until it closes, whichever
+/// comes first. Not NUL-terminated, which is why the length is there.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_registered_name(
+    conn: *mut ZuConn,
+    index: u64,
+    len: *mut usize,
+) -> *const c_char {
+    if !len.is_null() {
+        unsafe { *len = 0 };
+    }
+    if conn.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(_claim) = (unsafe { claim_conn(conn) }) else {
+        return std::ptr::null();
+    };
+    let Ok(index) = usize::try_from(index) else {
+        return std::ptr::null();
+    };
+    let Some(name) = unsafe { conn_registered(conn) }.get(index) else {
+        return std::ptr::null();
+    };
+    if !len.is_null() {
+        unsafe { *len = name.len() };
+    }
+    name.as_ptr().cast::<c_char>()
 }
 
 #[cfg(test)]

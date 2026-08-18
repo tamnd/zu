@@ -4,36 +4,41 @@
 //! extern "C" functions and raw pointers; nothing reaches into the Rust
 //! types behind them.
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zu::{
-    ZU_SEVERITY_EXCEPTION, ZU_SEVERITY_WARNING, ZU_TEMPORAL_DATE, ZU_TEMPORAL_DURATION_DAY_TIME,
-    ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME, ZU_TEMPORAL_LOCAL_TIME,
-    ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT, ZU_TYPE_LIST, ZU_TYPE_NODE,
-    ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuAppender, ZuConfig, ZuConn, ZuDatabase, ZuError,
-    ZuLoader, ZuResult, ZuStatus, ZuStmt, ZuValue, zu_append_bool, zu_append_bytes,
-    zu_append_end_row, zu_append_f64, zu_append_i64, zu_append_str_z, zu_append_temporal,
-    zu_appender_buffered, zu_appender_close, zu_appender_col_name, zu_appender_cols,
-    zu_appender_committed, zu_appender_discard, zu_appender_flush, zu_appender_free,
-    zu_appender_open, zu_appender_open_z, zu_begin, zu_bind_bool, zu_bind_bool_z, zu_bind_i64,
-    zu_bind_i64_z, zu_bind_str_z, zu_bind_temporal, zu_bind_temporal_z, zu_commit, zu_config_init,
-    zu_config_set_z, zu_conn_close, zu_conn_in_transaction, zu_conn_interrupt, zu_conn_rows_read,
-    zu_conn_set_progress, zu_connect, zu_create, zu_create_z, zu_database_close,
-    zu_database_create_z, zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url,
-    zu_error_excerpt, zu_error_free, zu_error_message, zu_error_offset, zu_error_position,
-    zu_error_retryable, zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute,
-    zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
-    zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
-    zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare, zu_prepare_z, zu_query,
-    zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
-    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
-    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
-    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
-    zu_result_free, zu_result_gqlstatus, zu_result_notice, zu_result_notices, zu_result_rows,
-    zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64,
-    zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type, zu_version,
+    ZU_FRAME_PLAIN, ZU_SEVERITY_EXCEPTION, ZU_SEVERITY_WARNING, ZU_TEMPORAL_DATE,
+    ZU_TEMPORAL_DURATION_DAY_TIME, ZU_TEMPORAL_DURATION_YEAR_MONTH, ZU_TEMPORAL_LOCAL_DATETIME,
+    ZU_TEMPORAL_LOCAL_TIME, ZU_TEMPORAL_ZONED_DATETIME, ZU_TEMPORAL_ZONED_TIME, ZU_TYPE_INT,
+    ZU_TYPE_LIST, ZU_TYPE_NODE, ZU_TYPE_NULL, ZU_TYPE_STR, ZU_TYPE_TEMPORAL, ZuAppender, ZuConfig,
+    ZuConn, ZuDatabase, ZuError, ZuFrame, ZuLoader, ZuResult, ZuStatus, ZuStmt, ZuValue,
+    zu_append_bool, zu_append_bytes, zu_append_end_row, zu_append_f64, zu_append_i64,
+    zu_append_str_z, zu_append_temporal, zu_appender_buffered, zu_appender_close,
+    zu_appender_col_name, zu_appender_cols, zu_appender_committed, zu_appender_discard,
+    zu_appender_flush, zu_appender_free, zu_appender_open, zu_appender_open_z, zu_begin,
+    zu_bind_bool, zu_bind_bool_z, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_bind_temporal,
+    zu_bind_temporal_z, zu_commit, zu_config_init, zu_config_set_z, zu_conn_close,
+    zu_conn_in_transaction, zu_conn_interrupt, zu_conn_register, zu_conn_registered_count,
+    zu_conn_registered_name, zu_conn_rows_read, zu_conn_set_progress, zu_conn_unregister_z,
+    zu_connect, zu_create, zu_create_z, zu_database_close, zu_database_create_z,
+    zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt,
+    zu_error_free, zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable,
+    zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute, zu_frame_col_bool,
+    zu_frame_col_float, zu_frame_col_int, zu_frame_col_str, zu_frame_col_view, zu_frame_free,
+    zu_frame_new, zu_frame_new_z, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64,
+    zu_loader_col_str, zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish,
+    zu_loader_free, zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare,
+    zu_prepare_z, zu_query, zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type,
+    zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
+    zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
+    zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
+    zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_gqlstatus, zu_result_notice,
+    zu_result_notices, zu_result_rows, zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool,
+    zu_value_f64, zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal,
+    zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -3589,6 +3594,857 @@ fn a_condition_a_statement_survived_comes_back_beside_its_rows() {
         );
         zu_result_free(result);
 
+        zu_conn_close(conn);
+    }
+}
+
+/* ---- frames ---- */
+
+/// The arrays a C host would already be holding: allocated by the host,
+/// handed over as the owner, and given back through the release
+/// callback when the engine has finished reading them.
+///
+/// `freed` is a count and not a flag, because "exactly once" is what
+/// the callback promises and a flag could not tell one call from three.
+struct Held {
+    ns: Vec<i64>,
+    scores: Vec<f64>,
+    ages: Vec<i32>,
+    names: Vec<u8>,
+    ends: Vec<i32>,
+    freed: Arc<AtomicUsize>,
+}
+
+impl Held {
+    /// Five rows of four columns: an eight-byte integer and a double,
+    /// which are the lane and are read where they lie, a four-byte
+    /// integer, which widens, and strings, which build views over
+    /// characters nothing copies.
+    fn rows(freed: &Arc<AtomicUsize>) -> Held {
+        let mut names = Vec::new();
+        let mut ends = vec![0i32];
+        for name in ["ada", "grace", "alan", "edsger", "barbara"] {
+            names.extend_from_slice(name.as_bytes());
+            ends.push(names.len() as i32);
+        }
+        Held {
+            ns: vec![10, 20, 30, 40, 50],
+            scores: vec![1.5, 2.5, 3.5, 4.5, 5.5],
+            ages: vec![36, 45, 41, 54, 92],
+            names,
+            ends,
+            freed: Arc::clone(freed),
+        }
+    }
+}
+
+/// What a host passes as `release`: takes its allocation back and says
+/// so. The engine calls this once, when the last frame and the last
+/// statement reading one are done.
+unsafe extern "C" fn give_back(owner: *mut c_void) {
+    let held = unsafe { Box::from_raw(owner.cast::<Held>()) };
+    held.freed.fetch_add(1, Ordering::Release);
+}
+
+/// One column call, named so the assertion says which one failed.
+fn col(name: &str, call: impl FnOnce(*const c_char, usize) -> ZuStatus) {
+    assert_eq!(
+        call(name.as_ptr().cast::<c_char>(), name.len()),
+        ZuStatus::Ok,
+        "column {name}"
+    );
+}
+
+/// [`Held::rows`] as a frame, with the raw pointer to the host's own
+/// allocation handed back so a test can write through it.
+unsafe fn lent(name: &str, freed: &Arc<AtomicUsize>) -> (*mut ZuFrame, *mut Held) {
+    let held = Box::into_raw(Box::new(Held::rows(freed)));
+    let mut f: *mut ZuFrame = ptr::null_mut();
+    let mut err: *mut ZuError = ptr::null_mut();
+    let status = unsafe {
+        zu_frame_new(
+            name.as_ptr().cast::<c_char>(),
+            name.len(),
+            5,
+            held.cast::<c_void>(),
+            Some(give_back),
+            &mut f,
+            &mut err,
+        )
+    };
+    assert_eq!(status, ZuStatus::Ok);
+    assert!(!f.is_null() && err.is_null());
+
+    let h = unsafe { &*held };
+    unsafe {
+        col("n", |p, l| {
+            zu_frame_col_int(
+                f,
+                p,
+                l,
+                h.ns.as_ptr().cast(),
+                5,
+                64,
+                1,
+                1,
+                ZU_FRAME_PLAIN,
+                &mut err,
+            )
+        });
+        col("score", |p, l| {
+            zu_frame_col_float(f, p, l, h.scores.as_ptr().cast(), 5, 64, &mut err)
+        });
+        col("age", |p, l| {
+            zu_frame_col_int(
+                f,
+                p,
+                l,
+                h.ages.as_ptr().cast(),
+                5,
+                32,
+                1,
+                1,
+                ZU_FRAME_PLAIN,
+                &mut err,
+            )
+        });
+        col("name", |p, l| {
+            zu_frame_col_str(
+                f,
+                p,
+                l,
+                h.ends.as_ptr().cast(),
+                0,
+                h.names.as_ptr().cast(),
+                h.names.len(),
+                5,
+                &mut err,
+            )
+        });
+    }
+    (f, held)
+}
+
+/// A frame is a table of the connection it was registered on: a
+/// statement names it, the rows come back, and the stored tables are
+/// still there beside it, which is what the two id spaces are for.
+#[test]
+fn a_registered_frame_is_a_table_of_the_connection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("frames.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let freed = Arc::new(AtomicUsize::new(0));
+        let (f, _) = lent("people", &freed);
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Ok);
+        assert!(err.is_null());
+
+        let result = query(
+            conn,
+            "MATCH (p:people) RETURN p.n AS n, p.name AS name ORDER BY n",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), 5);
+        assert_eq!(col_i64(result, 0, 5), [10, 20, 30, 40, 50]);
+        let mut read = Vec::new();
+        for row in 0..5 {
+            let mut out: *const c_char = ptr::null();
+            let mut len = 0usize;
+            assert_eq!(
+                zu_value_str(cell(result, row, 1), &mut out, &mut len),
+                ZuStatus::Ok
+            );
+            read.push(
+                std::str::from_utf8(std::slice::from_raw_parts(out.cast::<u8>(), len))
+                    .expect("utf-8")
+                    .to_string(),
+            );
+        }
+        assert_eq!(read, ["ada", "grace", "alan", "edsger", "barbara"]);
+        zu_result_free(result);
+
+        // The widening column filters and the double sums, which is the
+        // whole read path over a frame rather than one lane of it.
+        let result = query(
+            conn,
+            "MATCH (p:people) WHERE p.age > 44 RETURN count(p) AS n, sum(p.score) AS total",
+            &mut err,
+        );
+        assert_eq!(col_i64(result, 0, 1), [3]);
+        zu_result_free(result);
+
+        // The stored table is untouched, which is what the frame ids
+        // counting down from the top of the space are for.
+        let result = query(conn, "MATCH (p:person) RETURN count(p) AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [97]);
+        zu_result_free(result);
+
+        zu_frame_free(f);
+        zu_conn_close(conn);
+    }
+}
+
+/// The claim the whole thing rests on: a registered frame is read where
+/// it lies. Nothing here can look at an address, so it does the one
+/// thing that tells a read from a copy: it writes a new value into the
+/// host's own array after registering, and asks again.
+///
+/// A copy taken at registration would answer the old value. Both lanes
+/// are checked, the eight-byte one that points straight at the array
+/// and the four-byte one that widens, because a widening done once at
+/// registration would look exactly like a copy from out here.
+#[test]
+fn a_frame_is_read_where_it_lies_rather_than_copied() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("lies.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let freed = Arc::new(AtomicUsize::new(0));
+        let (f, held) = lent("people", &freed);
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Ok);
+
+        let result = query(conn, "MATCH (p:people) RETURN sum(p.n) AS total", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [150]);
+        zu_result_free(result);
+
+        // The host writes into its own array, which is a thing it is
+        // entitled to do between statements and which no copy could
+        // see.
+        let mine = &mut *held;
+        mine.ns[0] = 1_000;
+        mine.ages[0] = 99;
+
+        let result = query(
+            conn,
+            "MATCH (p:people) WHERE p.age > 44 RETURN sum(p.n) AS total",
+            &mut err,
+        );
+        assert_eq!(
+            col_i64(result, 0, 1),
+            [1_000 + 20 + 40 + 50],
+            "the engine answered from a copy rather than from the array"
+        );
+        zu_result_free(result);
+
+        zu_frame_free(f);
+        zu_conn_close(conn);
+    }
+}
+
+/// The other half of the borrow: the host is told, exactly once, when
+/// the engine has finished with what it lent.
+///
+/// Not at the unregister, because a statement that started before it is
+/// still reading, and not at the free, because a registration outlives
+/// the handle it was made from. The last one to let go is what calls
+/// back.
+#[test]
+fn a_frame_gives_the_host_arrays_back_once_and_not_before() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("release.zu1");
+    seeded(&path);
+
+    let freed = Arc::new(AtomicUsize::new(0));
+    unsafe {
+        let conn = open(&path);
+        let (f, _) = lent("people", &freed);
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Ok);
+
+        // Freeing the handle is not letting go: the registration made
+        // from it still reads the same arrays.
+        zu_frame_free(f);
+        assert_eq!(freed.load(Ordering::Acquire), 0);
+        let result = query(conn, "MATCH (p:people) RETURN count(p) AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [5]);
+        zu_result_free(result);
+        assert_eq!(freed.load(Ordering::Acquire), 0);
+
+        let mut gone = 0i32;
+        assert_eq!(
+            zu_conn_unregister_z(conn, c("people").as_ptr(), &mut gone, &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(gone, 1);
+        assert_eq!(
+            freed.load(Ordering::Acquire),
+            1,
+            "let go once, at the last one"
+        );
+
+        // And a name that is not there is a nought rather than a
+        // refusal, so a host's cleanup path may run twice.
+        assert_eq!(
+            zu_conn_unregister_z(conn, c("people").as_ptr(), &mut gone, &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(gone, 0);
+        assert_eq!(freed.load(Ordering::Acquire), 1);
+
+        zu_conn_close(conn);
+    }
+    assert_eq!(freed.load(Ordering::Acquire), 1, "and never again");
+}
+
+/// A description is pointers and widths, so one of them registers on as
+/// many connections as the host has, and the arrays go back when the
+/// last of them lets go.
+#[test]
+fn one_description_registers_on_two_connections_over_the_same_memory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("shared.zu1");
+    seeded(&path);
+
+    let freed = Arc::new(AtomicUsize::new(0));
+    unsafe {
+        let first = open(&path);
+        let second = open(&path);
+        let (f, _) = lent("people", &freed);
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_conn_register(first, f, &mut err), ZuStatus::Ok);
+        assert_eq!(zu_conn_register(second, f, &mut err), ZuStatus::Ok);
+        zu_frame_free(f);
+
+        for conn in [first, second] {
+            let result = query(conn, "MATCH (p:people) RETURN count(p) AS n", &mut err);
+            assert_eq!(col_i64(result, 0, 1), [5]);
+            zu_result_free(result);
+        }
+
+        zu_conn_close(first);
+        assert_eq!(
+            freed.load(Ordering::Acquire),
+            0,
+            "one connection closing is not the last reader letting go"
+        );
+        zu_conn_close(second);
+    }
+    assert_eq!(freed.load(Ordering::Acquire), 1);
+}
+
+/// The names, walked the way a host walks them: the count refreshes the
+/// list and every pointer taken while walking it is still good at the
+/// end.
+#[test]
+fn the_registered_names_are_counted_and_read_in_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("names.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut count = 9u64;
+        assert_eq!(zu_conn_registered_count(conn, &mut count), ZuStatus::Ok);
+        assert_eq!(count, 0);
+        assert!(zu_conn_registered_name(conn, 0, ptr::null_mut()).is_null());
+
+        let freed = Arc::new(AtomicUsize::new(0));
+        for name in ["people", "others"] {
+            let (f, _) = lent(name, &freed);
+            assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Ok);
+            zu_frame_free(f);
+        }
+        // A name already registered replaces what was under it rather
+        // than joining it, so the count says two and not three.
+        let (f, _) = lent("people", &freed);
+        assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Ok);
+        zu_frame_free(f);
+        assert_eq!(freed.load(Ordering::Acquire), 1, "the replaced one let go");
+
+        assert_eq!(zu_conn_registered_count(conn, &mut count), ZuStatus::Ok);
+        assert_eq!(count, 2);
+        let mut read = Vec::new();
+        let mut held = Vec::new();
+        for i in 0..count {
+            let mut len = 0usize;
+            let name = zu_conn_registered_name(conn, i, &mut len);
+            assert!(!name.is_null());
+            held.push((name, len));
+            read.push(
+                std::str::from_utf8(std::slice::from_raw_parts(name.cast::<u8>(), len))
+                    .expect("utf-8")
+                    .to_string(),
+            );
+        }
+        assert_eq!(read, ["others", "people"], "sorted, so a host can compare");
+        // The pointers taken at the start of the walk still say what
+        // they said, which is what the count refreshing and the
+        // accessor not is for.
+        for ((name, len), was) in held.iter().zip(&read) {
+            let now = std::str::from_utf8(std::slice::from_raw_parts(name.cast::<u8>(), *len))
+                .expect("utf-8");
+            assert_eq!(now, was);
+        }
+
+        assert!(zu_conn_registered_name(conn, 2, ptr::null_mut()).is_null());
+        assert_eq!(
+            zu_conn_registered_name(ptr::null_mut(), 0, ptr::null_mut()),
+            ptr::null()
+        );
+        assert_eq!(
+            zu_conn_registered_count(conn, ptr::null_mut()),
+            ZuStatus::Misuse
+        );
+        zu_conn_close(conn);
+    }
+}
+
+/// Every way of describing a frame wrongly, answered where the caller
+/// made the mistake rather than at the read that would have crashed.
+#[test]
+fn a_frame_described_wrongly_is_refused_at_the_call_that_got_it_wrong() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("refused.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut f: *mut ZuFrame = ptr::null_mut();
+
+        // A frame has a name and rows to read back.
+        assert_eq!(
+            zu_frame_new_z(
+                c("").as_ptr(),
+                5,
+                ptr::null_mut(),
+                None,
+                &mut f,
+                ptr::null_mut()
+            ),
+            ZuStatus::Misuse
+        );
+        assert!(f.is_null());
+        assert_eq!(
+            zu_frame_new_z(
+                c("people").as_ptr(),
+                0,
+                ptr::null_mut(),
+                None,
+                &mut f,
+                ptr::null_mut()
+            ),
+            ZuStatus::Misuse
+        );
+        assert!(f.is_null());
+        assert_eq!(
+            zu_frame_new_z(
+                c("people").as_ptr(),
+                5,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut()
+            ),
+            ZuStatus::Misuse
+        );
+
+        // A host with buffers that outlive the process passes neither
+        // an owner nor a release, and that is not an error.
+        assert_eq!(
+            zu_frame_new_z(
+                c("people").as_ptr(),
+                5,
+                ptr::null_mut(),
+                None,
+                &mut f,
+                &mut err
+            ),
+            ZuStatus::Ok
+        );
+        assert!(!f.is_null() && err.is_null());
+
+        let ns: Vec<i64> = vec![1, 2, 3, 4, 5];
+        let name = c("n");
+        // Its own error slot, so that the assertions below say what the
+        // status was and the one call that reads a message keeps its
+        // own handle.
+        let ok = |bits, signed, scale, temporal, count| {
+            let mut spare: *mut ZuError = ptr::null_mut();
+            let status = zu_frame_col_int(
+                f,
+                name.as_ptr(),
+                1,
+                ns.as_ptr().cast(),
+                count,
+                bits,
+                signed,
+                scale,
+                temporal,
+                &mut spare,
+            );
+            zu_error_free(spare);
+            status
+        };
+        // A width nothing reads, a count that is not the frame's, a
+        // pointer that is nowhere, and a kind that is not a kind.
+        assert_eq!(ok(24, 1, 1, ZU_FRAME_PLAIN, 5), ZuStatus::Misuse);
+        assert_eq!(ok(64, 1, 1, ZU_FRAME_PLAIN, 4), ZuStatus::Misuse);
+        assert_eq!(ok(64, 1, 1, 77, 5), ZuStatus::Misuse);
+        // A zoned kind has nowhere to keep the offset that makes it
+        // what it is, which is not the host's mistake but ours.
+        assert_eq!(
+            ok(64, 1, 1, ZU_TEMPORAL_ZONED_TIME, 5),
+            ZuStatus::Unsupported
+        );
+        assert_eq!(
+            zu_frame_col_int(
+                f,
+                name.as_ptr(),
+                1,
+                ptr::null(),
+                5,
+                64,
+                1,
+                1,
+                ZU_FRAME_PLAIN,
+                &mut err
+            ),
+            ZuStatus::Misuse
+        );
+        zu_error_free(err);
+        err = ptr::null_mut();
+        assert_eq!(
+            zu_frame_col_float(f, name.as_ptr(), 1, ns.as_ptr().cast(), 5, 16, &mut err),
+            ZuStatus::Misuse
+        );
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        // A frame with no columns is a table with nothing in it, and
+        // that is refused at the registration rather than described.
+        assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Misuse);
+        assert!(!err.is_null());
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        // The one that took is the one that took: a name given twice is
+        // refused, and the frame is registered with the first.
+        assert_eq!(ok(64, 1, 1, ZU_FRAME_PLAIN, 5), ZuStatus::Ok);
+        assert_eq!(ok(64, 1, 1, ZU_FRAME_PLAIN, 5), ZuStatus::Misuse);
+
+        // A name a stored table holds is not a name a frame may take.
+        let stored = c("person");
+        let mut clash: *mut ZuFrame = ptr::null_mut();
+        assert_eq!(
+            zu_frame_new_z(
+                stored.as_ptr(),
+                5,
+                ptr::null_mut(),
+                None,
+                &mut clash,
+                &mut err
+            ),
+            ZuStatus::Ok
+        );
+        assert_eq!(
+            zu_frame_col_int(
+                clash,
+                name.as_ptr(),
+                1,
+                ns.as_ptr().cast(),
+                5,
+                64,
+                1,
+                1,
+                ZU_FRAME_PLAIN,
+                &mut err
+            ),
+            ZuStatus::Ok
+        );
+        assert_eq!(zu_conn_register(conn, clash, &mut err), ZuStatus::Misuse);
+        let message = CStr::from_ptr(zu_error_message(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert!(
+            message.contains("already a table"),
+            "unexpected error {message}"
+        );
+        zu_error_free(err);
+        err = ptr::null_mut();
+        zu_frame_free(clash);
+
+        // And the NULL handles, on every call.
+        assert_eq!(
+            zu_frame_col_int(
+                ptr::null_mut(),
+                name.as_ptr(),
+                1,
+                ns.as_ptr().cast(),
+                5,
+                64,
+                1,
+                1,
+                ZU_FRAME_PLAIN,
+                &mut err
+            ),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_conn_register(conn, ptr::null_mut(), &mut err),
+            ZuStatus::Misuse
+        );
+        assert_eq!(
+            zu_conn_register(ptr::null_mut(), f, &mut err),
+            ZuStatus::Misuse
+        );
+        zu_frame_free(ptr::null_mut());
+
+        zu_frame_free(f);
+        zu_conn_close(conn);
+    }
+}
+
+/// A frame is read only, and both ways of finding that out say so: a
+/// statement that would write one, and a registration that would appear
+/// halfway through a transaction.
+#[test]
+fn a_frame_is_read_only_and_arrives_outside_a_transaction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("readonly.zu1");
+    seeded(&path);
+
+    unsafe {
+        let conn = open(&path);
+        let freed = Arc::new(AtomicUsize::new(0));
+        let (f, _) = lent("people", &freed);
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Ok);
+
+        let text = "MATCH (p:people) WHERE p.n = 10 SET p.n = 11";
+        let mut result: *mut ZuResult = ptr::null_mut();
+        assert_eq!(
+            zu_query(
+                conn,
+                text.as_ptr().cast::<c_char>(),
+                text.len(),
+                &mut result,
+                &mut err
+            ),
+            ZuStatus::Error
+        );
+        assert!(result.is_null());
+        let message = CStr::from_ptr(zu_error_message(err, ptr::null_mut()))
+            .to_str()
+            .expect("utf-8");
+        assert!(
+            message.contains("registered frame"),
+            "unexpected error {message}"
+        );
+        assert_eq!(
+            CStr::from_ptr(zu_error_code(err, ptr::null_mut()))
+                .to_str()
+                .expect("utf-8"),
+            "25G03"
+        );
+        zu_error_free(err);
+        err = ptr::null_mut();
+
+        assert_eq!(zu_begin(conn, 0, &mut err), ZuStatus::Ok);
+        let (inside, _) = lent("later", &freed);
+        assert_eq!(zu_conn_register(conn, inside, &mut err), ZuStatus::Error);
+        assert_eq!(
+            CStr::from_ptr(zu_error_code(err, ptr::null_mut()))
+                .to_str()
+                .expect("utf-8"),
+            "25G01"
+        );
+        zu_error_free(err);
+        err = ptr::null_mut();
+        assert_eq!(zu_rollback(conn, &mut err), ZuStatus::Ok);
+        // Outside it, the same frame registers.
+        assert_eq!(zu_conn_register(conn, inside, &mut err), ZuStatus::Ok);
+
+        zu_frame_free(inside);
+        zu_frame_free(f);
+        zu_conn_close(conn);
+    }
+}
+
+/// Every layout a host can hand over, read back as what it means.
+///
+/// The point of the widths is that none of them is a conversion the
+/// host had to do: an Arrow array of 32-bit integers, of singles, of
+/// packed bits, of days since the epoch, of microseconds, and of the
+/// sixteen-byte views a `Utf8View` array holds are all passed as they
+/// lie and read as this engine's own types.
+#[test]
+fn every_layout_a_host_holds_is_read_as_what_it_means() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("layouts.zu1");
+    seeded(&path);
+
+    // Two rows, and the values are chosen so that a width read wrongly
+    // is a value read wrongly rather than the same number again.
+    let counts: Vec<u32> = vec![4_000_000_000, 7];
+    let smalls: Vec<i16> = vec![-300, 21];
+    let singles: Vec<f32> = vec![0.5, 2.25];
+    // Low bit of the first byte first: row 0 true, row 1 false.
+    let flags: Vec<u8> = vec![0b0000_0001];
+    let days: Vec<i32> = vec![19_782, 0];
+    let micros: Vec<i64> = vec![1_000_001, 0];
+    // A Utf8View row is a length, four inline bytes, then either the
+    // rest inline or a buffer and an offset. The first is short enough
+    // to live in the view; the second is not.
+    let long = b"a string too long to live inside a view".to_vec();
+    let mut views = [0u8; 32];
+    views[0..4].copy_from_slice(&3u32.to_le_bytes());
+    views[4..7].copy_from_slice(b"ada");
+    views[16..20].copy_from_slice(&(long.len() as u32).to_le_bytes());
+    views[20..24].copy_from_slice(&long[..4]);
+    views[24..28].copy_from_slice(&0u32.to_le_bytes());
+    views[28..32].copy_from_slice(&0u32.to_le_bytes());
+
+    unsafe {
+        let conn = open(&path);
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut f: *mut ZuFrame = ptr::null_mut();
+        assert_eq!(
+            zu_frame_new_z(
+                c("wide").as_ptr(),
+                2,
+                ptr::null_mut(),
+                None,
+                &mut f,
+                &mut err
+            ),
+            ZuStatus::Ok
+        );
+        let add_int = |name: &str, p: *const c_void, bits, signed, scale, temporal| {
+            let mut spare: *mut ZuError = ptr::null_mut();
+            assert_eq!(
+                zu_frame_col_int(
+                    f,
+                    name.as_ptr().cast::<c_char>(),
+                    name.len(),
+                    p,
+                    2,
+                    bits,
+                    signed,
+                    scale,
+                    temporal,
+                    &mut spare
+                ),
+                ZuStatus::Ok,
+                "column {name}"
+            );
+        };
+        add_int("count", counts.as_ptr().cast(), 32, 0, 1, ZU_FRAME_PLAIN);
+        add_int("small", smalls.as_ptr().cast(), 16, 1, 1, ZU_FRAME_PLAIN);
+        add_int("day", days.as_ptr().cast(), 32, 1, 1, ZU_TEMPORAL_DATE);
+        // Microseconds against the nanoseconds this engine counts in,
+        // which is the one scale every Arrow timestamp needs.
+        add_int(
+            "at",
+            micros.as_ptr().cast(),
+            64,
+            1,
+            1_000,
+            ZU_TEMPORAL_LOCAL_DATETIME,
+        );
+        assert_eq!(
+            zu_frame_col_float(
+                f,
+                "single".as_ptr().cast::<c_char>(),
+                6,
+                singles.as_ptr().cast(),
+                2,
+                32,
+                &mut err
+            ),
+            ZuStatus::Ok
+        );
+        assert_eq!(
+            zu_frame_col_bool(
+                f,
+                "flag".as_ptr().cast::<c_char>(),
+                4,
+                flags.as_ptr().cast(),
+                2,
+                &mut err
+            ),
+            ZuStatus::Ok
+        );
+        let buffers: [*const c_void; 1] = [long.as_ptr().cast()];
+        let lens: [usize; 1] = [long.len()];
+        assert_eq!(
+            zu_frame_col_view(
+                f,
+                "word".as_ptr().cast::<c_char>(),
+                4,
+                views.as_ptr().cast(),
+                buffers.as_ptr(),
+                lens.as_ptr(),
+                1,
+                2,
+                &mut err,
+            ),
+            ZuStatus::Ok
+        );
+        assert_eq!(zu_conn_register(conn, f, &mut err), ZuStatus::Ok);
+
+        let result = query(
+            conn,
+            "MATCH (r:wide) RETURN r.count AS count, r.small AS small, r.single AS single, \
+             r.flag AS flag, r.day AS day, r.at AS at, r.word AS word ORDER BY r.small",
+            &mut err,
+        );
+        assert_eq!(zu_result_rows(result), 2);
+        // Ordered by the 16-bit column, so row 0 is the one that was
+        // written second only if the width was read as signed.
+        assert_eq!(col_i64(result, 0, 2), [4_000_000_000, 7]);
+        assert_eq!(col_i64(result, 1, 2), [-300, 21]);
+
+        let mut single = 0f64;
+        assert_eq!(zu_value_f64(cell(result, 0, 2), &mut single), ZuStatus::Ok);
+        assert_eq!(single, 0.5);
+        let mut flag = 0i32;
+        assert_eq!(zu_value_bool(cell(result, 0, 3), &mut flag), ZuStatus::Ok);
+        assert_eq!(flag, 1);
+        assert_eq!(zu_value_bool(cell(result, 1, 3), &mut flag), ZuStatus::Ok);
+        assert_eq!(flag, 0);
+
+        let mut kind = -1i32;
+        let mut count = 0i64;
+        assert_eq!(
+            zu_value_temporal(cell(result, 0, 4), &mut kind, &mut count, ptr::null_mut()),
+            ZuStatus::Ok
+        );
+        assert_eq!((kind, count), (ZU_TEMPORAL_DATE, 19_782));
+        assert_eq!(
+            zu_value_temporal(cell(result, 0, 5), &mut kind, &mut count, ptr::null_mut()),
+            ZuStatus::Ok
+        );
+        assert_eq!(
+            (kind, count),
+            (ZU_TEMPORAL_LOCAL_DATETIME, 1_000_001_000),
+            "microseconds became the nanoseconds this engine counts in"
+        );
+
+        for (row, want) in [
+            (0u64, "ada"),
+            (1, "a string too long to live inside a view"),
+        ] {
+            let mut out: *const c_char = ptr::null();
+            let mut len = 0usize;
+            assert_eq!(
+                zu_value_str(cell(result, row, 6), &mut out, &mut len),
+                ZuStatus::Ok
+            );
+            let got = std::str::from_utf8(std::slice::from_raw_parts(out.cast::<u8>(), len))
+                .expect("utf-8");
+            assert_eq!(got, want);
+        }
+        zu_result_free(result);
+
+        zu_frame_free(f);
         zu_conn_close(conn);
     }
 }

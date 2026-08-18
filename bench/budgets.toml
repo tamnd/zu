@@ -1175,6 +1175,23 @@ refuse_calibration_ns = 498
 tail_p99_p50_uniform_x = 5.0
 tail_p99_p50_power_x = 10.0
 
+# The same two graphs read a page of ids at a time, eight to a request,
+# which is what a service sends when it has a list of people in hand
+# rather than one. Same ceilings as the single seed streams above, and
+# they sit further off the engine than those do: a batch of eight
+# averages eight seeds together, so the spread across requests is
+# narrower by construction, and the local M series reads 1.14x with no
+# skew and 2.23x with it.
+#
+# What these gate is the batch being cut into work rather than into
+# equal counts of keys. Split by position, one worker draws the
+# celebrity and runs the whole request alone while the rest sit idle,
+# and the requests holding one are the p99. The power law ceiling is the
+# looser of the two because a batch of eight really can hold a seed
+# worth a hundred thousand edges, and answering that is the job.
+tail_p99_p50_uniform_batch_x = 5.0
+tail_p99_p50_power_batch_x = 10.0
+
 # One shell frame through the JSON reader, ns (benches/json.rs in
 # zu-json). This is the transport in front of every statement a client
 # sends over the pipe, so it is gated against the warm point read it

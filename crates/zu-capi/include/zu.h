@@ -49,14 +49,14 @@
 #include <stdint.h>
 
 /* The revision of this ABI (dx/02 section 8), which is what a build
- * system tests when it has to compile one way against 0.10 and another
+ * system tests when it has to compile one way against 0.11 and another
  * against what comes next. The two numbers are counts and not decimals,
- * so 0.10 is the revision after 0.9 and a caller comparing them
+ * so 0.11 is the revision after 0.10 and a caller comparing them
  * compares each on its own. `cargo xtask package` holds it to the
  * constant the rest of the workspace reports, `zu version` included,
  * so a header and a binary that disagree is a failed check rather than
  * a caller's afternoon. */
-#define ZU_ABI_VERSION "0.10"
+#define ZU_ABI_VERSION "0.11"
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,6 +75,9 @@ typedef struct zu_loader zu_loader;
 /* Rows on their way into a table that already exists. See the appending
  * section at the end. */
 typedef struct zu_appender zu_appender;
+/* Columns of the host's own memory, named as a table of a connection
+ * and read where they lie. See the frames section at the end. */
+typedef struct zu_frame zu_frame;
 
 /* The name a connection had before the database was split out of it.
  * Kept for one release, along with zu_close below, so that code written
@@ -161,6 +164,12 @@ typedef enum zu_status {
 #define ZU_TEMPORAL_ZONED_DATETIME 4
 #define ZU_TEMPORAL_DURATION_YEAR_MONTH 5
 #define ZU_TEMPORAL_DURATION_DAY_TIME 6
+
+/* What zu_frame_col_int is told when a column of integers is a column
+ * of integers and nothing else. Negative so that the kinds above, which
+ * count up from nought and are the rest of what that parameter takes,
+ * keep their numbering. */
+#define ZU_FRAME_PLAIN (-1)
 
 /* Static version string; do not free. */
 const char *zu_version(void);
@@ -763,6 +772,117 @@ zu_status zu_appender_discard(zu_appender *app, uint64_t *out);
  * committed in all through out, which may be NULL. */
 zu_status zu_appender_close(zu_appender *app, uint64_t *out, zu_error **err);
 void zu_appender_free(zu_appender *app);
+
+/* ---- frames ----
+ *
+ * How values get queried without getting in at all. A host holding
+ * columns in memory names them as a table of one connection and runs
+ * statements over them where they lie. Nothing is copied, at
+ * registration or at read: a scan builds vectors that point straight at
+ * the host's buffers wherever the layouts agree, and widens a value at
+ * a time into a scratch arena where they do not, so a host with a
+ * hundred columns pays for the one the statement named and a frame of
+ * ten million rows registers in the time it takes to walk its columns.
+ *
+ * The layouts that agree are the ones Arrow and this engine both keep:
+ * 64-bit signed integers, doubles, one bit a row for a boolean, and
+ * characters end to end with offsets cutting them up. A narrower
+ * integer, an unsigned one, a single-precision float and a count of
+ * microseconds against the nanoseconds this engine keeps time in are
+ * all widened as the statement reaches them. Strings never copy their
+ * characters either way: what a scan builds is the sixteen-byte view a
+ * row of the string lane is, and that view points back into the host's
+ * data buffer.
+ *
+ * The order is create, then a column call per column, then register.
+ * Every column call takes the count of values it is passing and a
+ * mismatch with the frame's row count is refused at that call, where
+ * the caller still knows which column it was describing. Everything
+ * else that can fail is settled at zu_conn_register: alignment, an
+ * unsigned value too large for the signed lane, a scale that would
+ * overflow, an offset that leaves its buffer. A read of a registered
+ * frame cannot fail, which is what lets a scan be a loop.
+ *
+ * The buffers stay the host's and this library never writes one. What
+ * it asks for is that each stays where it is, unwritten and unfreed,
+ * until the release callback runs. That callback is how a host learns
+ * the engine is finished: it runs once, on a thread of this library's,
+ * after the last statement reading the frame ends, which is not the
+ * unregister that preceded it and not necessarily the free either. A
+ * host that has to take a lock, or a runtime's interpreter lock, to let
+ * go of what it passed takes it inside the callback. Both owner and
+ * release may be NULL for a host whose buffers outlive the process.
+ *
+ * A frame is described once and registered as often as you like. The
+ * handle stays the caller's on every path, so registering it on two
+ * connections registers the same memory twice, and zu_frame_free is
+ * what ends it either way.
+ *
+ * A frame is read only and has no edges. A statement that would insert
+ * into, set on or delete from a registered name is refused with 25G03
+ * and the reason. A name a stored table already holds is refused;
+ * a name another frame holds replaces that frame. Registering inside a
+ * transaction is 25G01, since a table appearing halfway through one is
+ * not a thing the transaction could then be rolled back over.
+ *
+ * A frame is used from one thread, like the connection it registers on,
+ * and a second thread in a call answers ZU_MISUSE_CONCURRENT. */
+zu_status zu_frame_new(const char *name, size_t name_len, uint64_t rows, void *owner,
+                       void (*release)(void *), zu_frame **out, zu_error **err);
+zu_status zu_frame_new_z(const char *name, uint64_t rows, void *owner, void (*release)(void *),
+                         zu_frame **out, zu_error **err);
+/* bits is 8, 16, 32 or 64. scale is what one value is multiplied by to
+ * reach the unit its meaning counts in: 1 for an integer and a date,
+ * 1000 for the microseconds Arrow keeps a time or a timestamp in.
+ * temporal is that meaning, ZU_FRAME_PLAIN for a column of numbers or
+ * one of the ZU_TEMPORAL_ kinds otherwise, with the two zoned kinds
+ * answering ZU_UNSUPPORTED for the reason zu_loader_col_temporal gives.
+ * Sixty-four signed bits at scale 1 is the lane this engine reads
+ * natively and is the column that costs nothing at all. */
+zu_status zu_frame_col_int(zu_frame *f, const char *name, size_t name_len, const void *values,
+                           uint64_t count, int32_t bits, int32_t is_signed, int64_t scale,
+                           int32_t temporal, zu_error **err);
+/* bits is 32 or 64, and 64 is the lane. */
+zu_status zu_frame_col_float(zu_frame *f, const char *name, size_t name_len, const void *values,
+                             uint64_t count, int32_t bits, zu_error **err);
+/* One bit a row, low bit of the first byte first, which is Arrow's
+ * bitmap and this engine's alike. A host holding a slice with a bit
+ * offset of its own owes the shift before it gets here: a bitmap that
+ * starts partway into a byte is not a thing a pointer can say. */
+zu_status zu_frame_col_bool(zu_frame *f, const char *name, size_t name_len, const void *bitmap,
+                            uint64_t count, zu_error **err);
+/* Arrow's Utf8 when wide is nought and its LargeUtf8 when it is not,
+ * which is 32-bit and 64-bit offsets. There are count + 1 of them and
+ * the last is how much of data is used. */
+zu_status zu_frame_col_str(zu_frame *f, const char *name, size_t name_len, const void *offsets,
+                           int32_t wide, const void *data, size_t data_len, uint64_t count,
+                           zu_error **err);
+/* Arrow's Utf8View: sixteen bytes a row at views, over buffers data
+ * buffers named by the two arrays data and data_lens. A short string in
+ * that layout is already this engine's own view, byte for byte. */
+zu_status zu_frame_col_view(zu_frame *f, const char *name, size_t name_len, const void *views,
+                            const void *const *data, const size_t *data_lens, size_t buffers,
+                            uint64_t count, zu_error **err);
+void zu_frame_free(zu_frame *f);
+/* Registers the frame as a table of this connection under the name it
+ * carries. Does not spend the handle. */
+zu_status zu_conn_register(zu_conn *conn, zu_frame *f, zu_error **err);
+/* Drops one, writing through out, which may be NULL, whether there was
+ * one under that name. A statement already running keeps the frame it
+ * started with, and the release callback waits for it. */
+zu_status zu_conn_unregister(zu_conn *conn, const char *name, size_t name_len, int32_t *out,
+                             zu_error **err);
+zu_status zu_conn_unregister_z(zu_conn *conn, const char *name, int32_t *out, zu_error **err);
+/* How many are registered, and the call that refreshes the names the
+ * accessor below hands out. The two are separate so that every pointer
+ * a host took while walking the list is still good when it reaches the
+ * end. */
+zu_status zu_conn_registered_count(zu_conn *conn, uint64_t *out);
+/* One name, in the sorted order the count call last read them in, or
+ * NULL out of range. Borrowed from the connection and valid until the
+ * next zu_conn_registered_count on it or until it closes. Not
+ * NUL-terminated, which is what len is for; len may be NULL. */
+const char *zu_conn_registered_name(zu_conn *conn, uint64_t index, size_t *len);
 
 #ifdef __cplusplus
 }

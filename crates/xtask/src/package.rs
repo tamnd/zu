@@ -215,7 +215,7 @@ impl Abi {
 /// what survives.
 fn declared(header: &str) -> Vec<String> {
     let mut names = Vec::new();
-    for statement in strip_comments(header).split(';') {
+    for statement in declarations(header).split(';') {
         if statement.contains('{') {
             continue;
         }
@@ -295,8 +295,24 @@ fn identifier_before(text: &str) -> String {
     name.chars().rev().collect()
 }
 
-/// The header without its block comments, which is where every mention
-/// of a function that is not a declaration lives.
+/// The header with nothing left in it but declarations.
+///
+/// The comments go because that is where every mention of a function
+/// that is not a declaration lives. The preprocessor lines go because a
+/// declaration is read as the identifier before the first parenthesis
+/// after the last semicolon, and a `#define` with parentheses in its
+/// value sits between the two: it would answer for the declaration that
+/// follows it, and the function that declaration names would be read as
+/// exported and undeclared.
+fn declarations(text: &str) -> String {
+    strip_comments(text)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The header without its block comments.
 fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -668,12 +684,12 @@ mod tests {
         assert_eq!(abi.declared, sorted);
         assert!(abi.declared.iter().all(|n| n.starts_with("zu_")));
         // dx/02 §8 is the v0.5 restructure, and the error model, the
-        // cancellation calls, the transaction boundaries, the appender
-        // and the diagnostics added to it are all additive, so this is
-        // 0.10: the number a binding tests for when it wants to know
-        // whether zu_result_notice is there. The two parts are counts
-        // rather than a decimal, so 0.10 is the one after 0.9.
-        assert_eq!(abi.revision, ("0.10".to_string(), "0.10".to_string()));
+        // cancellation calls, the transaction boundaries, the appender,
+        // the diagnostics and the frames added to it are all additive,
+        // so this is 0.11: the number a binding tests for when it wants
+        // to know whether zu_conn_register is there. The two parts are
+        // counts rather than a decimal, so 0.10 is the one after 0.9.
+        assert_eq!(abi.revision, ("0.11".to_string(), "0.11".to_string()));
     }
 
     /// A revision the header and the workspace disagree about is worse

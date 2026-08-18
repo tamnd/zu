@@ -46,6 +46,28 @@ static int ticked(void *user_data, uint64_t rows, uint64_t ms) {
   return 1;
 }
 
+/* Columns a host keeps in its own memory, which a frame names as a
+ * table without copying any of it. The offsets are Arrow's Utf8: one
+ * more than there are rows, the last being how much of names is used.
+ */
+struct lent {
+  int64_t ns[3];
+  double scores[3];
+  int32_t ends[4];
+  char names[9];
+};
+
+/* How many times the library said it was finished with the arrays
+ * above. A count rather than a flag, because once is the contract and
+ * twice would be a double free the sanitizer would have to catch on
+ * its own. */
+static int handed_back = 0;
+
+static void give_back(void *owner) {
+  handed_back += 1;
+  free(owner);
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     return fail("usage: smoke <database>");
@@ -861,6 +883,171 @@ int main(int argc, char **argv) {
     return fail("a committed transaction is still running");
   }
 
+  /* Columns of the host's own memory, named as a table of this
+   * connection and read where they lie. Nothing here reaches the
+   * database the test was handed: a frame is a table of the connection
+   * and of nothing on disk. */
+  {
+    struct lent *mine = (struct lent *)malloc(sizeof(struct lent));
+    if (mine == NULL) {
+      zu_conn_close(first);
+      return fail("no memory for a frame to point at");
+    }
+    mine->ns[0] = 10;
+    mine->ns[1] = 20;
+    mine->ns[2] = 30;
+    mine->scores[0] = 1.5;
+    mine->scores[1] = 2.5;
+    mine->scores[2] = 3.5;
+    mine->ends[0] = 0;
+    mine->ends[1] = 3;
+    mine->ends[2] = 6;
+    mine->ends[3] = 9;
+    memcpy(mine->names, "annbobcat", 9);
+
+    zu_frame *frame = NULL;
+    err = NULL;
+    status = zu_frame_new_z("people", 3, mine, give_back, &frame, &err);
+    if (status != ZU_OK || frame == NULL) {
+      free(mine);
+      zu_conn_close(first);
+      return report("a frame would not begin", status, err);
+    }
+    err = NULL;
+    status = zu_frame_col_int(frame, "n", 1, mine->ns, 3, 64, 1, 1, ZU_FRAME_PLAIN, &err);
+    if (status == ZU_OK) {
+      status = zu_frame_col_float(frame, "score", 5, mine->scores, 3, 64, &err);
+    }
+    if (status == ZU_OK) {
+      status = zu_frame_col_str(frame, "name", 4, mine->ends, 0, mine->names, sizeof mine->names, 3,
+                                &err);
+    }
+    if (status != ZU_OK) {
+      zu_frame_free(frame);
+      zu_conn_close(first);
+      return report("a column the host holds was refused", status, err);
+    }
+    err = NULL;
+    status = zu_conn_register(first, frame, &err);
+    if (status != ZU_OK) {
+      zu_frame_free(frame);
+      zu_conn_close(first);
+      return report("a frame would not register", status, err);
+    }
+    /* The description has been read and the registration holds the
+     * arrays now, so the handle goes here and the memory stays. */
+    zu_frame_free(frame);
+
+    const int64_t *totals = NULL;
+    result = NULL;
+    err = NULL;
+    status = zu_query_z(first, "MATCH (p:people) RETURN sum(p.n) AS n", &result, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("a registered frame would not answer a statement", status, err);
+    }
+    if (zu_result_rows(result) != 1 || zu_result_col_i64(result, 0, &totals) != ZU_OK ||
+        totals == NULL || totals[0] != 60) {
+      zu_result_free(result);
+      zu_conn_close(first);
+      return fail("a frame answered with something other than what the host holds");
+    }
+    zu_result_free(result);
+
+    /* Written through the host's own pointer between two statements.
+     * The second answers with the new value, which nothing that took a
+     * copy at registration could do. */
+    mine->ns[0] = 1000;
+    totals = NULL;
+    result = NULL;
+    err = NULL;
+    status = zu_query_z(first, "MATCH (p:people) RETURN sum(p.n) AS n", &result, &err);
+    if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("a frame stopped answering after the host wrote into it", status, err);
+    }
+    if (zu_result_rows(result) != 1 || zu_result_col_i64(result, 0, &totals) != ZU_OK ||
+        totals == NULL || totals[0] != 1050) {
+      zu_result_free(result);
+      zu_conn_close(first);
+      return fail("a frame was read from a copy rather than where it lies");
+    }
+    zu_result_free(result);
+
+    /* The strings are the host's bytes too: only the offsets and the
+     * lengths crossed. */
+    result = NULL;
+    err = NULL;
+    status = zu_query_z(first, "MATCH (p:people) WHERE p.n = 30 RETURN p.name AS name", &result,
+                        &err);
+    if (status != ZU_OK) {
+      zu_conn_close(first);
+      return report("a frame's strings would not read", status, err);
+    }
+    {
+      const zu_value *held = NULL;
+      const char *text = NULL;
+      size_t text_len = 0;
+      if (zu_result_rows(result) != 1 || zu_result_cell(result, 0, 0, &held) != ZU_OK ||
+          zu_value_str(held, &text, &text_len) != ZU_OK || text_len != 3 ||
+          memcmp(text, "cat", 3) != 0) {
+        zu_result_free(result);
+        zu_conn_close(first);
+        return fail("a frame's strings came back as something else");
+      }
+    }
+    zu_result_free(result);
+
+    /* What is registered, counted and then read, which is the order
+     * that keeps every borrowed name good until the walk ends. */
+    uint64_t registered = 0;
+    size_t listed_len = 0;
+    const char *listed = NULL;
+    if (zu_conn_registered_count(first, &registered) != ZU_OK || registered != 1) {
+      zu_conn_close(first);
+      return fail("one registered frame was counted as something else");
+    }
+    listed = zu_conn_registered_name(first, 0, &listed_len);
+    if (listed == NULL || listed_len != 6 || memcmp(listed, "people", 6) != 0) {
+      zu_conn_close(first);
+      return fail("a registered frame was listed under another name");
+    }
+    if (zu_conn_registered_name(first, 1, NULL) != NULL) {
+      zu_conn_close(first);
+      return fail("a frame was listed past the end of the list");
+    }
+
+    if (handed_back != 0) {
+      zu_conn_close(first);
+      return fail("a frame's memory was handed back while a table still named it");
+    }
+    int32_t dropped = -1;
+    err = NULL;
+    status = zu_conn_unregister_z(first, "people", &dropped, &err);
+    if (status != ZU_OK || dropped != 1) {
+      zu_conn_close(first);
+      return report("a registered frame would not drop", status, err);
+    }
+    /* The last table naming those arrays has gone, so the host has
+     * them back, once, and mine is not to be touched again. */
+    if (handed_back != 1) {
+      zu_conn_close(first);
+      return fail("a frame's memory was not handed back when the last table naming it went");
+    }
+    if (zu_conn_registered_count(first, &registered) != ZU_OK || registered != 0) {
+      zu_conn_close(first);
+      return fail("a dropped frame is still registered");
+    }
+    /* Dropping one that is not there is a no rather than a failure. */
+    dropped = -1;
+    err = NULL;
+    status = zu_conn_unregister_z(first, "people", &dropped, &err);
+    if (status != ZU_OK || dropped != 0) {
+      zu_conn_close(first);
+      return report("dropping a frame that was not there was not a plain no", status, err);
+    }
+  }
+
   /* A statement that outlives its connection answers rather than
    * following the pointer it still holds, and is still safe to close. */
   zu_stmt *stmt = NULL;
@@ -881,7 +1068,8 @@ int main(int argc, char **argv) {
   printf(
       "smoke: libzu %s on this platform, two connections, four nodes, one chunk, one date, one "
       "nested list, one load, one append, one warning carried alongside its rows, one watched "
-      "statement, one transaction, one refusal with a place and one without\n",
+      "statement, one transaction, one frame read where it lies and handed back once, one refusal "
+      "with a place and one without\n",
       version);
   return 0;
 }

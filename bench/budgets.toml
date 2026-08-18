@@ -1548,3 +1548,18 @@ typed_str_x = 2.0
 stream_x = 2.0
 stream_bytes_x = 0.05
 stream_stop_x = 0.10
+
+# Nodes a second through `zu convert`, the route the conformance harness
+# ingests by and the only one that carries labels and properties (gql
+# plan/09 section 4.3, zu#116). This is a floor, and it is the one
+# performance number the plan set out loud: 350000, ten times the 35359
+# Neo4j reaches over Bolt on the same fixture, against 493 to 2691 for
+# Ladybug. The harness numbers zu was quoted at, 107681 to 136863, were
+# a SQLite point query per node per column plus a symbol table trained
+# per 1024 row chunk; one scan of the staging table and a symbol lookup
+# that indexes instead of hashing put a million nodes with two
+# properties at 553135 and 562865 nodes/s on the M-series laptop. The
+# floor stays at the contract line rather than just under what this
+# machine does, because the gate machines are slower vCPUs and because
+# 350000 is the number the plan owes. Raise this floor, never lower it.
+convert_nodes_s = 350000.0

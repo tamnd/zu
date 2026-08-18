@@ -349,10 +349,13 @@ mod tests {
             "the statement failed where the test meant it to: {err}"
         );
 
-        let err = session
+        let gone = session
             .run("MATCH (c:city) RETURN c.name AS name", &[])
-            .expect_err("there is no such table");
-        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("42002"));
+            .expect("the statement runs");
+        assert!(
+            gone.rows.is_empty(),
+            "the table went with the statement that made it"
+        );
     }
 
     /// A rollback takes the table the same way, because the savepoint
@@ -368,10 +371,13 @@ mod tests {
             .expect("insert");
         session.run("ROLLBACK", &[]).expect("rollback");
 
-        let err = session
+        let gone = session
             .run("MATCH (c:city) RETURN c.name AS name", &[])
-            .expect_err("there is no such table");
-        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("42002"));
+            .expect("the statement runs");
+        assert!(
+            gone.rows.is_empty(),
+            "the table went with the statement that made it"
+        );
     }
 
     /// A pattern with no properties says nothing about what the table

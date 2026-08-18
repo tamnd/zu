@@ -334,11 +334,13 @@ mod tests {
     #[test]
     fn each_case_gets_a_database_of_its_own() {
         let report = run_cases(
-            "  - name: creates\n    doc: a case that leaves a table behind it\n    setup:\n      - CREATE NODE TABLE Leak(name STRING)\n    query: MATCH (n:Leak) RETURN n.name AS name\n    columns:\n      - name\n    rows:\n  - name: sees-nothing\n    doc: the next case must not see the table the one above made\n    query: MATCH (n:Leak) RETURN n.name AS name\n    columns:\n      - name\n    rows:\n",
+            "  - name: creates\n    doc: a case that leaves a row behind it\n    setup:\n      - \"INSERT (n:Leak {name: 'x'})\"\n    query: MATCH (n:Leak) RETURN count(n) AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT8\n            value: 1\n  - name: sees-nothing\n    doc: the next case must not see the row the one above wrote\n    query: MATCH (n:Leak) RETURN count(n) AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT8\n            value: 0\n",
         );
-        // The second case asks for a table that only the first made.
-        // It must not answer with rows, and it must not answer at all.
-        assert_ne!(report.ran[1].outcome, Outcome::Passed, "{}", report.ran[1]);
+        // The second case counts what only the first case wrote. A
+        // label the graph does not hold counts nothing, so a database
+        // that leaked would answer one here and the case would fail.
+        assert_eq!(report.ran[0].outcome, Outcome::Passed, "{}", report.ran[0]);
+        assert_eq!(report.ran[1].outcome, Outcome::Passed, "{}", report.ran[1]);
     }
 
     #[test]

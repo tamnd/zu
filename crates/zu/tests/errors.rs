@@ -86,12 +86,14 @@ fn a_failure_with_no_place_has_none_rather_than_a_guessed_one() {
     // wants the page for.
     assert_eq!(record.doc_url(), "https://zu.dev/docs/errors/22012");
 
-    // A label the catalog does not hold is a condition the standard
+    // A graph the catalog does not hold is a condition the standard
     // names, raised after the text has been read and thrown away, so
-    // it carries a code and a page but no place.
+    // it carries a code and a page but no place. A label the catalog
+    // does not hold is not one of these: no element carries it, so the
+    // pattern matches nothing and the statement answers with no rows.
     let err = conn
-        .query("MATCH (p:nothing) RETURN p.id AS id")
-        .expect_err("no such label");
+        .query("USE nowhere MATCH (p) RETURN p")
+        .expect_err("no such graph");
     let record = err.diagnostic().expect("a condition");
     assert_eq!(record.status.code(), "42002");
     assert_eq!(record.doc_url(), "https://zu.dev/docs/errors/42002");

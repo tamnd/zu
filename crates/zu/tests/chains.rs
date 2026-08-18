@@ -119,3 +119,37 @@ fn a_write_may_stand_in_a_chain() {
         "the delete in front of the NEXT happened"
     );
 }
+
+/// What the chain costs, read off the plan rather than the clock. Three
+/// statements joined by NEXT plan into one pipeline with no operator
+/// between the statements to hold a result table: the listing is the
+/// listing of the same question written with WITH, operator for
+/// operator, and a chain that materialised between its statements
+/// could not be.
+#[test]
+fn a_chain_plans_as_one_pipeline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fuse.zu1");
+    seeded(&path);
+    let mut session = zu::session::Session::open(&path).expect("open");
+    let chained = session
+        .explain(
+            "MATCH (p:person) WHERE p.id < 3 RETURN p AS p \
+             NEXT MATCH (p)-[:knows]->(f) RETURN f AS f \
+             NEXT RETURN f.id AS id ORDER BY id",
+        )
+        .expect("a plan");
+    let withs = session
+        .explain(
+            "MATCH (p:person) WHERE p.id < 3 WITH p AS p \
+             MATCH (p)-[:knows]->(f) WITH f AS f \
+             RETURN f.id AS id ORDER BY id",
+        )
+        .expect("a plan");
+    assert_eq!(chained, withs, "the chain plans differently from the WITH");
+    assert_eq!(
+        chained.lines().filter(|l| l.contains("ScanNodes")).count(),
+        1,
+        "one scan drives the whole chain, got:\n{chained}"
+    );
+}

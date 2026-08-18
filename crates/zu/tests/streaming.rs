@@ -15,19 +15,28 @@ use zu::{Database, Flow};
 
 const NODES: u32 = 500;
 
-fn seeded(path: &std::path::Path) {
+/// Rows enough for a scan to advance in several steps rather than one,
+/// which is what a test about stopping partway needs: a run that hands
+/// its whole table over in a single step has no partway to stop at.
+const MANY: u32 = 8 * 1024;
+
+fn seeded(path: &std::path::Path, nodes: u32) {
     let mut db = Zu1File::create(path).expect("create");
-    let mut edges: Vec<(u32, u32)> = (0..NODES)
-        .flat_map(|i| [(i, (i + 1) % NODES), (i, (i + 7) % NODES)])
+    let mut edges: Vec<(u32, u32)> = (0..nodes)
+        .flat_map(|i| [(i, (i + 1) % nodes), (i, (i + 7) % nodes)])
         .collect();
     edges.sort_unstable();
-    bulk_load_as(&mut db, "person", "knows", NODES.into(), &edges).expect("load");
+    bulk_load_as(&mut db, "person", "knows", nodes.into(), &edges).expect("load");
 }
 
 fn opened(name: &str) -> (tempfile::TempDir, Database) {
+    opened_with(name, NODES)
+}
+
+fn opened_with(name: &str, nodes: u32) -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);
-    seeded(&path);
+    seeded(&path, nodes);
     let db = Database::open(&path).expect("open");
     (dir, db)
 }
@@ -223,6 +232,55 @@ fn the_two_executors_stream_the_same_rows_in_the_same_order() {
         assert!(pipeline.2 && old.2, "both streamed {source}");
         assert!(!pipeline.0.is_empty(), "{source} returned nothing");
     }
+}
+
+/// A stop the caller asked for is a failure, and a stop the sink asked
+/// for is an answer. Both end the scan partway, and telling them apart
+/// is the whole of what a caller can do about it: a truncated result
+/// reported as a whole one is the one outcome nobody can defend
+/// against, because there is nothing in it to notice.
+///
+/// Both executors, because a client is what raises this and a client
+/// does not know which one took its statement.
+#[test]
+fn a_statement_interrupted_partway_through_a_stream_says_so() {
+    let (_dir, db) = opened_with("interrupt.zu1", MANY);
+    let mut conn = db.connect().expect("connect");
+    let interrupt = conn.session_mut().interrupt();
+
+    let stopping = |conn: &mut zu::Connection| {
+        let mut rows = 0u64;
+        let out =
+            conn.query_stream_batched("MATCH (p:person) RETURN p.id AS id", &[], 16, |batch| {
+                rows += batch.len() as u64;
+                // From inside the sink, which is where a signal fires
+                // in a client handing rows to a caller: the statement
+                // is between batches and most of the table is left.
+                interrupt.stop();
+                Ok(Flow::More)
+            });
+        (rows, out)
+    };
+
+    for engine in ["1", "0"] {
+        // SAFETY: single-threaded test, and the variable is read back
+        // by this process only.
+        unsafe { std::env::set_var("ZU_EXEC2", engine) };
+        let (rows, out) = stopping(&mut conn);
+        let err = out.expect_err("the statement was interrupted");
+        assert!(matches!(err, zu::ZuError::Interrupted), "{engine}: {err}");
+        assert!(
+            rows < u64::from(MANY),
+            "{engine}: {rows} rows is the whole scan"
+        );
+        interrupt.clear();
+    }
+    unsafe { std::env::remove_var("ZU_EXEC2") };
+
+    // Exactly as it was: a statement that was stopped leaves the
+    // session holding nothing, so the next one reads the whole table.
+    let all = buffered(&mut conn, "MATCH (p:person) RETURN p.id AS id");
+    assert_eq!(all.len(), MANY as usize);
 }
 
 #[test]

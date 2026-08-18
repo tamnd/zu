@@ -31,7 +31,7 @@ use zu_common::{Epoch, Result, ZuError};
 
 use crate::catalog::{Catalog, ElementKind, GraphType, RelTable, TableIndex};
 use crate::file::{BlockPtr, NULL_BLOCK, Zu1File};
-use crate::fullzip::{read_blob_segment, write_blob_segment};
+use crate::fullzip::{read_blob_segment, rewrite_blob_segment, write_blob_segment};
 use crate::graph::{
     Direction, Directory, GraphReader, GroupMeta, build_direction, free_chain,
     free_directory_keeping_props, group_bases, group_rows, pad_direction,
@@ -545,18 +545,16 @@ fn fold_props(
             }
             rewrite_segment(db, &col.meta, &values, &dirty)?
         } else {
-            let (mut bytes, mut ends) = (Vec::new(), Vec::new());
-            read_blob_segment(db, &col.meta, &mut bytes, &mut ends)?;
-            let mut values: Vec<Vec<u8>> = Vec::with_capacity(new_count as usize);
-            let mut start = 0usize;
-            for &end in &ends {
-                values.push(bytes[start..end as usize].to_vec());
-                start = end as usize;
-            }
+            // The blob side carries the rows a statement wrote rather
+            // than the column they are in, because reading the column
+            // to change one cell of it is the cost the rewrite exists
+            // to avoid: the segment reads back only the chunks these
+            // rows land in.
+            let mut updates = BTreeMap::new();
             for (offset, cell) in mvcc.col_updates(table, ci as u32, base, epoch) {
                 match cell {
                     Cell::Str(s) => {
-                        values[offset as usize] = s;
+                        updates.insert(offset, s);
                         valid.set(offset);
                     }
                     // The blob side stores the absence as the empty
@@ -564,28 +562,28 @@ fn fold_props(
                     // addressed by its ends and two equal ends are no
                     // bytes at all.
                     Cell::Null => {
-                        values[offset as usize].clear();
+                        updates.insert(offset, Vec::new());
                         valid.clear(offset);
                     }
                     Cell::Int(_) => return Err(mismatch(&col.name, offset)),
                 }
             }
+            let mut appended = Vec::with_capacity((new_count - base) as usize);
             for offset in base..new_count {
                 match mvcc.cell(table, base, offset, ci as u32, epoch) {
                     Some(Cell::Str(s)) => {
-                        values.push(s);
+                        appended.push(s);
                         valid.set(offset);
                     }
                     Some(Cell::Null) => {
-                        values.push(Vec::new());
+                        appended.push(Vec::new());
                         valid.clear(offset);
                     }
                     Some(Cell::Int(_)) => return Err(mismatch(&col.name, offset)),
                     None => return Err(missing(&col.name, offset)),
                 }
             }
-            let refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
-            write_blob_segment(db, &refs)?
+            rewrite_blob_segment(db, &col.meta, &updates, &appended)?
         };
         columns.push(crate::props::PropColumn {
             name: col.name.clone(),

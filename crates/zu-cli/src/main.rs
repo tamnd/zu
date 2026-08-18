@@ -1506,6 +1506,13 @@ fn write_json_value(out: &mut String, v: &Value) {
         // The executor settles every PMR chain into an edge list before
         // a value leaves the pipeline, so a result never carries one.
         Value::Chain(_) => out.push_str("null"),
+        // GV60 and GV61. A handle goes out as the string that names
+        // it, because there is nothing else honest to write: the graph
+        // is in the file and the table is behind the reference, and a
+        // JSON object holding either would be a copy of something the
+        // value deliberately did not copy.
+        Value::Graph(g) => write_json_str(out, &g.label()),
+        Value::BindingTable(t) => write_json_str(out, &t.label()),
     }
 }
 
@@ -1622,6 +1629,8 @@ fn display_value(v: &Value) -> String {
             parts.join("-")
         }
         Value::Chain(_) => "path".to_owned(),
+        Value::Graph(g) => g.label(),
+        Value::BindingTable(t) => t.label(),
     }
 }
 

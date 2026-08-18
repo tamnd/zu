@@ -1933,7 +1933,22 @@ impl Parser<'_> {
             if self.eat_kw("GRAPH") {
                 return Ok(LogicalType::Graph(None));
             }
+            // GV61's open spelling, with `BINDING` optional the same
+            // way it is on the bare name.
+            if self.eat_kw("BINDING") {
+                self.expect_kw("TABLE")?;
+                return Ok(LogicalType::BindingTable(None));
+            }
+            if self.eat_kw("TABLE") {
+                return Ok(LogicalType::BindingTable(None));
+            }
             if self.eat_kw("PROPERTY") {
+                // `ANY PROPERTY GRAPH` is GV60 written the long way and
+                // `ANY PROPERTY VALUE` is GV68, which is why the word
+                // after PROPERTY is read rather than assumed.
+                if self.eat_kw("GRAPH") {
+                    return Ok(LogicalType::Graph(None));
+                }
                 self.expect_kw("VALUE")?;
                 return Ok(LogicalType::AnyProperty);
             }
@@ -2197,6 +2212,46 @@ mod tests {
             Endpoint::Inline(def) => def.labels.clone(),
             Endpoint::Named(name) => panic!("'{name}' is a reference, not a pattern"),
         }
+    }
+
+    /// The type an `IS TYPED` in the first return item is checking,
+    /// with the nullability a type written without NOT NULL picks up
+    /// dropped, since what is under test here is the spelling.
+    fn typed_against(source: &str) -> LogicalType {
+        let q = parsed(source);
+        let Clause::Return { projection } = &q.clauses[0] else {
+            panic!("RETURN");
+        };
+        let ty = match &projection.items[0].expr {
+            Expr::IsTyped { ty, .. } => ty.clone(),
+            other => panic!("parsed as {other:?}"),
+        };
+        match ty {
+            LogicalType::Nullable(inner) => *inner,
+            other => other,
+        }
+    }
+
+    /// GV60 and GV61 are each written four ways, two of them opened by
+    /// ANY, and all four name the one type. ANY reads the word after
+    /// PROPERTY rather than assuming it, because `ANY PROPERTY GRAPH`
+    /// and `ANY PROPERTY VALUE` part company there.
+    #[test]
+    fn a_reference_type_is_read_in_all_of_its_spellings() {
+        let graph = LogicalType::Graph(None);
+        let table = LogicalType::BindingTable(None);
+        assert_eq!(typed_against("RETURN 1 IS TYPED GRAPH"), graph);
+        assert_eq!(typed_against("RETURN 1 IS TYPED PROPERTY GRAPH"), graph);
+        assert_eq!(typed_against("RETURN 1 IS TYPED ANY GRAPH"), graph);
+        assert_eq!(typed_against("RETURN 1 IS TYPED ANY PROPERTY GRAPH"), graph);
+        assert_eq!(typed_against("RETURN 1 IS TYPED BINDING TABLE"), table);
+        assert_eq!(typed_against("RETURN 1 IS TYPED TABLE"), table);
+        assert_eq!(typed_against("RETURN 1 IS TYPED ANY BINDING TABLE"), table);
+        assert_eq!(typed_against("RETURN 1 IS TYPED ANY TABLE"), table);
+        assert_eq!(
+            typed_against("RETURN 1 IS TYPED ANY PROPERTY VALUE"),
+            LogicalType::AnyProperty
+        );
     }
 
     fn text_type() -> LogicalType {

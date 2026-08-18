@@ -138,6 +138,11 @@ typedef enum zu_status {
 #define ZU_TYPE_PATH 8
 #define ZU_TYPE_TEMPORAL 9
 #define ZU_TYPE_RECORD 10
+/* GV60 and GV61, the two reference values. Neither reads through an
+   accessor: a handle has no contents to hand over, so the tag is the
+   whole of what a binding can say about the cell. */
+#define ZU_TYPE_GRAPH 11
+#define ZU_TYPE_BINDING_TABLE 12
 
 /* Which temporal a temporal cell is, from zu_value_temporal. The unit
  * follows the kind: days for a date, months for a year-month duration,

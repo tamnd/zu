@@ -122,12 +122,18 @@ static NAMES: &[(&str, Family)] = &[
         "INTERVAL",
         Family::Simple(LogicalType::Duration(DurationKind::DayTime)),
     ),
-    // GV55, GV61 and the two immaterial types, GV71 and GV72.
+    // GV55, GV60, GV61 and the two immaterial types, GV71 and GV72.
     ("PATH", Family::Simple(LogicalType::Path(None))),
+    ("GRAPH", Family::Simple(LogicalType::Graph(None))),
+    // `PROPERTY GRAPH` is the long spelling of the same type and says
+    // nothing the short one does not, which is also how a `USE` clause
+    // reads the pair.
+    ("PROPERTY GRAPH", Family::Simple(LogicalType::Graph(None))),
     (
         "BINDING TABLE",
         Family::Simple(LogicalType::BindingTable(None)),
     ),
+    ("TABLE", Family::Simple(LogicalType::BindingTable(None))),
     ("NULL", Family::Simple(LogicalType::Null)),
     ("NOTHING", Family::Simple(LogicalType::Nothing)),
 ];
@@ -341,5 +347,17 @@ mod tests {
         // hold, and 39 digits is past what the carrier holds at all.
         assert_eq!(spelled("DECIMAL", &[2, 5]), None);
         assert_eq!(spelled("DECIMAL", &[39, 0]), None);
+    }
+
+    /// GV60 and GV61 each have a long spelling and a short one, and the
+    /// pair names one type, the same way a `USE` clause reads `GRAPH`
+    /// and `PROPERTY GRAPH` as the one word.
+    #[test]
+    fn a_reference_type_has_two_spellings_and_one_meaning() {
+        assert_eq!(t("GRAPH"), Some(LogicalType::Graph(None)));
+        assert_eq!(t("PROPERTY GRAPH"), t("GRAPH"));
+        assert_eq!(t("BINDING TABLE"), Some(LogicalType::BindingTable(None)));
+        assert_eq!(t("TABLE"), t("BINDING TABLE"));
+        assert_eq!(t("GRAPH TABLE"), None);
     }
 }

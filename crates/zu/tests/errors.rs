@@ -106,3 +106,55 @@ fn a_failure_with_no_place_has_none_rather_than_a_guessed_one() {
     // with.
     assert!(ZuError::Conflict("the swap was lost".into()).retryable());
 }
+
+/// Three refusals the standard gives a code of its own, where the
+/// obvious code is the wrong one.
+///
+/// A value written where a value belongs and out of range is not a
+/// syntax error, and a name that resolves to something already taken is
+/// not an argument the caller got wrong, so each of these carries the
+/// condition ISO names for it rather than the class the refusal was
+/// easiest to raise from.
+#[test]
+fn a_condition_the_standard_names_is_the_one_raised() {
+    let (_dir, db) = opened("named.zu1");
+    let mut conn = db.connect().expect("connect");
+
+    // 22G0F invalid number of paths or groups. The statement parses and
+    // the count sits where a count belongs, so what is wrong is the
+    // number and not the text.
+    let err = conn
+        .query("MATCH SHORTEST 0 (a:person)-[:knows]->{1,3}(b:person) RETURN COUNT(*) AS n")
+        .expect_err("a selector keeping no path");
+    assert_eq!(
+        err.diagnostic().expect("a condition").status.code(),
+        "22G0F"
+    );
+
+    // 22G0H invalid duration format, which is the duration's own code
+    // where the rest of the temporals raise 22007.
+    let err = conn
+        .query("RETURN DURATION 'not a duration' AS v")
+        .expect_err("a duration nobody can read");
+    assert_eq!(
+        err.diagnostic().expect("a condition").status.code(),
+        "22G0H"
+    );
+    let err = conn
+        .query("RETURN DATE 'not a date' AS v")
+        .expect_err("a date nobody can read");
+    assert_eq!(
+        err.diagnostic().expect("a condition").status.code(),
+        "22007"
+    );
+
+    // 42002 invalid reference: the name resolves, and resolves to
+    // something already bound as an edge.
+    let err = conn
+        .query("MATCH (p:person)-[k:knows]->(q:person), (k:person) RETURN p.id AS id")
+        .expect_err("a name bound twice, two ways");
+    assert_eq!(
+        err.diagnostic().expect("a condition").status.code(),
+        "42002"
+    );
+}

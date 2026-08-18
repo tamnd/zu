@@ -1716,11 +1716,17 @@ impl Parser<'_> {
     /// obeyed when it is zero: a pattern that keeps no path answers
     /// nothing whatever the graph holds, so it is a query somebody
     /// wrote by mistake.
+    ///
+    /// The standard gives that its own code, 22G0F invalid number of
+    /// paths or groups, rather than the syntax error the rest of a
+    /// malformed selector gets: the number is written where a number
+    /// belongs and the statement parses, it is the value that is out of
+    /// range.
     fn take_path_count(&mut self, word: &str) -> Result<Option<u64>> {
         let at = self.tokens[self.pos.saturating_sub(1)].start;
         match self.take_int() {
             Some(0) => Err(ZuError::gql_in(
-                codes::C42001,
+                codes::C22G0F,
                 self.source,
                 at,
                 format!("{word} 0 keeps no path at all; a path count starts at 1"),
@@ -2465,12 +2471,15 @@ impl Parser<'_> {
             return Ok(None);
         }
         self.pos += skip + 1;
-        let value = Temporal::parse(&ty, &text).ok_or_else(|| {
-            ZuError::gql(
-                codes::C22007,
-                format!("'{text}' is not a {ty} anyone can read"),
-            )
-        })?;
+        // 22G0H is the duration's own code and 22007 covers the rest of
+        // the temporals, so which one this is depends on what was
+        // written rather than on where the reading failed.
+        let code = match ty {
+            LogicalType::Duration(_) => codes::C22G0H,
+            _ => codes::C22007,
+        };
+        let value = Temporal::parse(&ty, &text)
+            .ok_or_else(|| ZuError::gql(code, format!("'{text}' is not a {ty} anyone can read")))?;
         Ok(Some(Expr::Literal(Literal::Temporal(value))))
     }
 

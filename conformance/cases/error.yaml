@@ -322,14 +322,14 @@ cases:
     raises: "22007"
 
   - name: a-duration-with-no-content
-    doc: An empty duration literal, which is read by the duration reader and reported the way a bad date is.
+    doc: An empty duration literal, which raises the duration's own condition rather than the one a bad date gets, the same as the cast below.
     query: RETURN DURATION '' AS a
-    raises: "22007"
+    raises: "22G0H"
 
   - name: a-duration-with-a-unit-nobody-has
     doc: A quarter, which is a unit people write and ISO 8601 does not have.
     query: RETURN DURATION 'P1Q' AS a
-    raises: "22007"
+    raises: "22G0H"
 
   - name: a-string-cast-to-a-date-that-is-not-one
     doc: The same bad content arriving through a cast rather than a literal, which is a separate path and worth its own case.

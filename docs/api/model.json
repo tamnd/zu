@@ -8067,6 +8067,14 @@
       "doc": "The newest overlay value of one cell at `epoch`: an update chain\nentry first, then an appended row's stored column. `base_count`\nis the row count of the sealed file, where appended offsets\nstart. Returns `None` when the base file holds the answer."
     },
     {
+      "id": "zu::zu1::txn::Mvcc::col_updates",
+      "kind": "method",
+      "name": "col_updates",
+      "of": "zu::zu1::txn::Mvcc",
+      "signature": "fn col_updates(&self, table: u32, col: u32, base_count: u64, epoch: Epoch) -> Vec<(u64, Cell)>",
+      "doc": "The rows of one column the overlay holds a value for at\n`epoch`, ascending, as the pairs a fold applies to the column it\nis rewriting.\n\nThis is [`Mvcc::cell`] turned around. A fold asking `cell` about\nevery row of a column pays a hash probe per row to be told that\nalmost none of them were written, so folding a one cell write\ninto a hundred thousand row table cost a hundred thousand\nprobes to find the one. The overlay already knows which rows it\nholds, and those are the rows a write changed.\n\nAppended rows are not in here even when a later statement wrote\nover one. They arrive with the batch that appended them, which\na fold reads whole because every one of its rows is new, so\n`cell` stays the way to read them and stays the one place the\nchain wins over the batch."
+    },
+    {
       "id": "zu::zu1::txn::Mvcc::dead_edges",
       "kind": "method",
       "name": "dead_edges",

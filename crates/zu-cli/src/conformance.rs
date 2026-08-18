@@ -187,6 +187,9 @@ const NOTES: &[&str] = &[
      and a label no node table is named by makes one, out of the properties the pattern \
      writes and under the savepoint the statement holds, so a property written as a value \
      that has to be worked out first is refused rather than guessed at",
+    "an edge type no rel table is named by makes one as well, between the node tables the two \
+     ends of the step are in, and an end nothing gives a label to is refused rather than \
+     guessed at because a rel table has to have both of its ends",
     "a graph with a closed graph type is checked at the write rather than at the read, so a \
      label change that would leave an element carrying a label set no element type of that \
      graph type describes is refused with the code the standard gives that, naming the row \

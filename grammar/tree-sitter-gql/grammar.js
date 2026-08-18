@@ -110,10 +110,25 @@ module.exports = grammar({
       seq(
         optional(kw("OPTIONAL")),
         kw("MATCH"),
+        optional($.match_mode),
         $.pattern,
         optional($.keep_clause),
         optional($.where_clause),
       ),
+
+    // ISO 16.9, features G002 and G003. A match mode speaks about the
+    // whole list of patterns where a path mode speaks about one path of
+    // it: DIFFERENT EDGES, which is what a list naming none means, says
+    // that no one edge answers two of the edge patterns of the list, and
+    // REPEATABLE ELEMENTS lifts that. The singular noun and the BINDINGS
+    // behind it are spellings of the same mode.
+    match_mode: ($) =>
+      choice(
+        seq(kw("REPEATABLE"), choice(kw("ELEMENT"), kw("ELEMENTS")), optional($._binding_s)),
+        seq(kw("DIFFERENT"), choice(kw("EDGE"), kw("EDGES")), optional($._binding_s)),
+      ),
+
+    _binding_s: ($) => choice(kw("BINDING"), kw("BINDINGS")),
 
     // ISO 16.9. A KEEP says a prefix once for a whole list of patterns
     // rather than once in front of each of them, and it belongs to a
@@ -397,6 +412,7 @@ module.exports = grammar({
           field("name", $.identifier),
           "{",
           optional(kw("MATCH")),
+          optional($.match_mode),
           $.pattern,
           optional($.keep_clause),
           optional($.where_clause),

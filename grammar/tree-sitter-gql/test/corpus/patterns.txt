@@ -298,3 +298,70 @@ MATCH (a)-[:KNOWS]->+(b), (b)-[:KNOWS]->+(c) KEEP ALL SHORTEST RETURN c
         (projection_item
           (variable
             (identifier)))))))
+
+================================================================================
+A match mode in front of a pattern list
+================================================================================
+
+MATCH REPEATABLE ELEMENTS (a)-[e:KNOWS]->(b), (a)-[f:KNOWS]->(b) RETURN e
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (match_mode)
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (identifier)
+              (label
+                (identifier))))
+          (node
+            (identifier)))
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (identifier)
+              (label
+                (identifier))))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A match mode written with the singular noun and BINDINGS behind it
+================================================================================
+
+MATCH DIFFERENT EDGE BINDINGS (a)-[:KNOWS]->(b) RETURN a
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (match_mode)
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))

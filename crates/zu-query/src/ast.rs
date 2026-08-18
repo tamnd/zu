@@ -618,6 +618,60 @@ pub struct Ordinal {
     pub start: i64,
 }
 
+/// GQL match mode (ISO 16.9, features G002 and G003): what a list of
+/// path patterns is allowed to bind twice.
+///
+/// A path mode speaks about one path and this speaks about the list of
+/// them, which is why the two are separate words in the standard and
+/// separate types here. The mode is written once in front of the list
+/// and it settles two things at once: the path mode a pattern that
+/// named none walks under, and whether the patterns of the list may
+/// share an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchMode {
+    /// `DIFFERENT EDGES`, which is what a list that names no mode
+    /// means: no edge of the graph answers two of the edge patterns of
+    /// the list at once, and each path is a trail.
+    #[default]
+    DifferentEdges,
+    /// `REPEATABLE ELEMENTS`: an edge may answer as many of the edge
+    /// patterns as it fits, and a path under it is a walk.
+    RepeatableElements,
+}
+
+impl MatchMode {
+    /// The path mode a pattern of this list walks under when it names
+    /// none of its own.
+    ///
+    /// `DIFFERENT EDGES` says no path repeats an edge, which is what
+    /// `TRAIL` says, and `REPEATABLE ELEMENTS` lifts that, which leaves
+    /// `WALK`. The rule that an unbounded walk needs a selector still
+    /// holds under it, so `REPEATABLE ELEMENTS` on an unbounded pattern
+    /// is refused rather than run forever.
+    pub fn path_mode(self) -> PathMode {
+        match self {
+            MatchMode::DifferentEdges => PathMode::Trail,
+            MatchMode::RepeatableElements => PathMode::Walk,
+        }
+    }
+}
+
+/// Which list of path patterns a pattern was written in, and under
+/// which match mode (ISO 16.9).
+///
+/// Both halves are said once for a whole list, and both are carried per
+/// pattern because a match statement block gathers the lists of several
+/// statements into one clause. The number is what tells those lists
+/// apart afterwards: `DIFFERENT EDGES` speaks about the patterns of one
+/// list, so two patterns of two statements may bind the same edge even
+/// though two of one statement may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PatternList {
+    pub mode: MatchMode,
+    /// Which list, counted as the statement was read.
+    pub at: u32,
+}
+
 /// GQL path mode: which repeats a variable-length path may contain.
 /// The default is `TRAIL`, GQL's `DIFFERENT EDGES` match mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -708,6 +762,11 @@ pub struct PathPattern {
     /// are only told apart in one place: a `KEEP` fills in what the
     /// patterns left out, and it has to know what they left out.
     pub mode: Option<PathMode>,
+    /// The list this pattern was written in, which says the match mode
+    /// it walks under and which of a block's lists it belongs to. A
+    /// pattern written where no list is read, an `INSERT` pattern, takes
+    /// the default and nothing asks it anything.
+    pub list: PatternList,
     pub start: NodePattern,
     pub steps: Vec<(RelPattern, NodePattern)>,
 }

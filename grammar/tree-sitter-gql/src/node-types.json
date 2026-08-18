@@ -475,6 +475,10 @@
           "named": true
         },
         {
+          "type": "match_mode",
+          "named": true
+        },
+        {
           "type": "pattern",
           "named": true
         },
@@ -973,6 +977,10 @@
           "named": true
         },
         {
+          "type": "match_mode",
+          "named": true
+        },
+        {
           "type": "pattern",
           "named": true
         },
@@ -982,6 +990,11 @@
         }
       ]
     }
+  },
+  {
+    "type": "match_mode",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "node",
@@ -2736,6 +2749,14 @@
     "named": false
   },
   {
+    "type": "BINDING",
+    "named": false
+  },
+  {
+    "type": "BINDINGS",
+    "named": false
+  },
+  {
     "type": "BY",
     "named": false
   },
@@ -2784,6 +2805,10 @@
     "named": false
   },
   {
+    "type": "DIFFERENT",
+    "named": false
+  },
+  {
     "type": "DISTINCT",
     "named": false
   },
@@ -2793,6 +2818,18 @@
   },
   {
     "type": "EDGE",
+    "named": false
+  },
+  {
+    "type": "EDGES",
+    "named": false
+  },
+  {
+    "type": "ELEMENT",
+    "named": false
+  },
+  {
+    "type": "ELEMENTS",
     "named": false
   },
   {
@@ -2929,6 +2966,10 @@
   },
   {
     "type": "REMOVE",
+    "named": false
+  },
+  {
+    "type": "REPEATABLE",
     "named": false
   },
   {

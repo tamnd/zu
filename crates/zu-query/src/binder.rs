@@ -1824,6 +1824,7 @@ impl Binder<'_> {
                 })
             }
             Clause::Let { items } => self.bind_let(items),
+            Clause::Yield { items } => self.bind_yield(items),
             Clause::With { projection, filter } => {
                 self.bind_projection(projection, Projected::Onward, filter)
             }
@@ -2375,6 +2376,57 @@ impl Binder<'_> {
         let first = built.remove(0);
         self.pending.extend(built);
         Ok(first)
+    }
+
+    /// Binds a `YIELD`: the names that leave the match it stands after.
+    ///
+    /// It binds to the projection a `WITH` of the same names binds to,
+    /// which is what the clause means and needs no operator of its own
+    /// to say: projecting a plain variable keeps the slot it was
+    /// already in, so the values the yield carries are the ones the
+    /// match matched rather than copies of them. It does not group, it
+    /// does not order and it does not cut, so the rows a match answered
+    /// are the rows the yield answers.
+    ///
+    /// An item is a variable rather than an expression, so a name the
+    /// match did not write is refused here rather than bound to
+    /// whatever else is in scope, and two items ending under one name
+    /// are refused for the reason a `WITH` refuses them, which is that
+    /// the clause after this one would have two things to read for it.
+    fn bind_yield(&mut self, items: &[ast::YieldItem]) -> Result<BoundClause> {
+        let mut bound = Vec::with_capacity(items.len());
+        let mut scope = HashMap::new();
+        for item in items {
+            let Some(&slot) = self.scope.get(&item.name) else {
+                return Err(invalid(format!(
+                    "YIELD lets a variable out of the match in front of it, and '{}' is not one: yield a name the match wrote",
+                    item.name
+                )));
+            };
+            let name = item.alias.clone().unwrap_or_else(|| item.name.clone());
+            if scope.contains_key(&name) {
+                return Err(invalid(format!(
+                    "YIELD names '{name}' twice, so the clause after it would have two of them to read: write one of them AS another name"
+                )));
+            }
+            scope.insert(name.clone(), slot);
+            bound.push(BoundItem {
+                expr: BoundExpr::Var(slot),
+                ty: self.variables[slot].ty.clone(),
+                name,
+                slot: Some(slot),
+                aggregate: false,
+            });
+        }
+        self.scope = scope;
+        Ok(BoundClause::Project {
+            distinct: false,
+            items: bound,
+            order_by: Vec::new(),
+            skip: None,
+            limit: None,
+            filter: None,
+        })
     }
 
     fn bind_count_limit(&mut self, expr: &Option<Expr>, what: &str) -> Result<Option<BoundExpr>> {

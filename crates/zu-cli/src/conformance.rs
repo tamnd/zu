@@ -197,6 +197,10 @@ const NOTES: &[&str] = &[
      from one and from zero; the number counts the elements of the list rather than the rows \
      the statement has answered, so a FOR under a match starts again at each row that reaches \
      it",
+    "a YIELD after a match says which of the names it wrote leave it, and under what name, so \
+     a name the yield does not carry is out of scope behind it and a name the match did not \
+     write is refused; it narrows the columns and leaves the rows alone, so the rows a match \
+     answered are the rows the yield answers",
     "a block of match statements stands wherever one does: an EXISTS takes one and asks \
      whether it answered a row, and an OPTIONAL takes one and keeps what it answered. The \
      statements of a block are all required and they share the names they write, so a block is \

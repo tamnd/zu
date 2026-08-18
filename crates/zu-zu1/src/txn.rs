@@ -620,6 +620,47 @@ impl Mvcc {
         })
     }
 
+    /// The rows of one column the overlay holds a value for at
+    /// `epoch`, ascending, as the pairs a fold applies to the column it
+    /// is rewriting.
+    ///
+    /// This is [`Mvcc::cell`] turned around. A fold asking `cell` about
+    /// every row of a column pays a hash probe per row to be told that
+    /// almost none of them were written, so folding a one cell write
+    /// into a hundred thousand row table cost a hundred thousand
+    /// probes to find the one. The overlay already knows which rows it
+    /// holds, and those are the rows a write changed.
+    ///
+    /// Appended rows are not in here even when a later statement wrote
+    /// over one. They arrive with the batch that appended them, which
+    /// a fold reads whole because every one of its rows is new, so
+    /// `cell` stays the way to read them and stays the one place the
+    /// chain wins over the batch.
+    pub fn col_updates(
+        &self,
+        table: u32,
+        col: u32,
+        base_count: u64,
+        epoch: Epoch,
+    ) -> Vec<(u64, Cell)> {
+        let Some(overlay) = self.tables.get(&table) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(u64, Cell)> = overlay
+            .updates
+            .iter()
+            .filter(|&(&(offset, c), _)| c == col && offset < base_count)
+            .filter_map(|(&(offset, _), chain)| {
+                let (_, cell) = chain.iter().rev().find(|(e, _)| *e <= epoch)?;
+                Some((offset, cell.clone()))
+            })
+            .collect();
+        // Ascending because the caller writes into a decoded column and
+        // a run of rows sharing a chunk is worth keeping together.
+        out.sort_unstable_by_key(|&(offset, _)| offset);
+        out
+    }
+
     /// What `table` has had put on its rows' labels and taken off them
     /// by `epoch`, keyed by offset: one pair of masks per row, the bits
     /// to set and the bits to clear.
@@ -1123,6 +1164,51 @@ mod tests {
         // At epoch 0 nothing exists.
         assert_eq!(mvcc.appended_rows(1, 0), 0);
         assert_eq!(mvcc.cell(1, 0, 0, 0, 0), None);
+    }
+
+    /// The overlay answers which rows of a column it holds, and the
+    /// answer agrees with what asking about each row one at a time
+    /// would have said.
+    #[test]
+    fn a_column_says_which_rows_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = wal_in(&dir);
+        let mut mvcc = Mvcc::new(0);
+        let mut txn = mvcc.begin();
+        txn.update(1, 40, 0, Cell::Int(7));
+        txn.update(1, 9, 0, Cell::Int(8));
+        txn.update(1, 9, 1, Cell::Str(b"ada".to_vec()));
+        let e1 = txn.commit(&mut wal).unwrap();
+        let mut txn = mvcc.begin();
+        txn.update(1, 40, 0, Cell::Int(70));
+        txn.update(1, 100, 0, Cell::Int(9));
+        let e2 = txn.commit(&mut wal).unwrap();
+
+        // Ascending, this column only, the newest entry at or below the
+        // epoch, and nothing at or past the base count, which is where
+        // the appended rows the fold reads whole begin.
+        assert_eq!(
+            mvcc.col_updates(1, 0, 100, e2),
+            vec![(9, Cell::Int(8)), (40, Cell::Int(70))]
+        );
+        assert_eq!(
+            mvcc.col_updates(1, 0, 100, e1),
+            vec![(9, Cell::Int(8)), (40, Cell::Int(7))]
+        );
+        assert_eq!(
+            mvcc.col_updates(1, 1, 100, e2),
+            vec![(9, Cell::Str(b"ada".to_vec()))]
+        );
+        assert!(mvcc.col_updates(1, 0, 100, 0).is_empty());
+        assert!(mvcc.col_updates(2, 0, 100, e2).is_empty());
+
+        // The same rows the row at a time reading finds, which is the
+        // point: this is that reading turned around, not a different
+        // answer arrived at faster.
+        let one_by_one: Vec<(u64, Cell)> = (0..100)
+            .filter_map(|row| mvcc.cell(1, 100, row, 0, e2).map(|cell| (row, cell)))
+            .collect();
+        assert_eq!(mvcc.col_updates(1, 0, 100, e2), one_by_one);
     }
 
     /// Recovery rebuilds exactly what commit published: the same cells,

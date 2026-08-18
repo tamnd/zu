@@ -502,33 +502,46 @@ fn fold_props(
             let mut touch = |offset: u64| {
                 dirty.insert(offset as usize / CHUNK_ROWS);
             };
-            for offset in 0..new_count {
-                match mvcc.cell(table, base, offset, ci as u32, epoch) {
-                    Some(Cell::Int(x)) if offset < base => {
+            // The overlay says which rows it holds rather than being
+            // asked about each one in turn. Asking row by row is a
+            // probe per row of the table to find the handful a
+            // statement wrote, and that is the whole of what a one
+            // cell write into a wide table used to cost.
+            for (offset, cell) in mvcc.col_updates(table, ci as u32, base, epoch) {
+                match cell {
+                    Cell::Int(x) => {
                         values[offset as usize] = x;
                         valid.set(offset);
-                        touch(offset);
-                    }
-                    Some(Cell::Int(x)) => {
-                        values.push(x);
-                        valid.set(offset);
-                        touch(offset);
                     }
                     // A removed row keeps a word where its value was,
                     // because the lane is fixed width and a reader that
                     // has been told the bit is clear never looks at it.
-                    Some(Cell::Null) => {
-                        match offset < base {
-                            true => values[offset as usize] = 0,
-                            false => values.push(0),
-                        }
+                    Cell::Null => {
+                        values[offset as usize] = 0;
                         valid.clear(offset);
-                        touch(offset);
+                    }
+                    Cell::Str(_) => return Err(mismatch(&col.name, offset)),
+                }
+                touch(offset);
+            }
+            // The rows the appends added, which are new and so are all
+            // of them dirty. `cell` rather than the batch directly,
+            // because a statement can write over a row another one in
+            // the same fold window appended.
+            for offset in base..new_count {
+                match mvcc.cell(table, base, offset, ci as u32, epoch) {
+                    Some(Cell::Int(x)) => {
+                        values.push(x);
+                        valid.set(offset);
+                    }
+                    Some(Cell::Null) => {
+                        values.push(0);
+                        valid.clear(offset);
                     }
                     Some(Cell::Str(_)) => return Err(mismatch(&col.name, offset)),
-                    None if offset < base => {}
                     None => return Err(missing(&col.name, offset)),
                 }
+                touch(offset);
             }
             rewrite_segment(db, &col.meta, &values, &dirty)?
         } else {
@@ -540,29 +553,34 @@ fn fold_props(
                 values.push(bytes[start..end as usize].to_vec());
                 start = end as usize;
             }
-            for offset in 0..new_count {
-                match mvcc.cell(table, base, offset, ci as u32, epoch) {
-                    Some(Cell::Str(s)) if offset < base => {
+            for (offset, cell) in mvcc.col_updates(table, ci as u32, base, epoch) {
+                match cell {
+                    Cell::Str(s) => {
                         values[offset as usize] = s;
-                        valid.set(offset);
-                    }
-                    Some(Cell::Str(s)) => {
-                        values.push(s);
                         valid.set(offset);
                     }
                     // The blob side stores the absence as the empty
                     // string, which costs the row nothing: a blob is
                     // addressed by its ends and two equal ends are no
                     // bytes at all.
+                    Cell::Null => {
+                        values[offset as usize].clear();
+                        valid.clear(offset);
+                    }
+                    Cell::Int(_) => return Err(mismatch(&col.name, offset)),
+                }
+            }
+            for offset in base..new_count {
+                match mvcc.cell(table, base, offset, ci as u32, epoch) {
+                    Some(Cell::Str(s)) => {
+                        values.push(s);
+                        valid.set(offset);
+                    }
                     Some(Cell::Null) => {
-                        match offset < base {
-                            true => values[offset as usize].clear(),
-                            false => values.push(Vec::new()),
-                        }
+                        values.push(Vec::new());
                         valid.clear(offset);
                     }
                     Some(Cell::Int(_)) => return Err(mismatch(&col.name, offset)),
-                    None if offset < base => {}
                     None => return Err(missing(&col.name, offset)),
                 }
             }

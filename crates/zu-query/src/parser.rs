@@ -17,7 +17,7 @@ use crate::ast::{
     ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr,
     LetItem, Linear, Literal, NodePattern, NullOrder, Ordinal, PathMode, PathPattern, Projection,
     ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Selector,
-    SetInto, SetItem, SetOp, Simple, SortKey, Statement, TxnStmt, UnaryOp,
+    SetInto, SetItem, SetOp, Simple, SortKey, Statement, TxnStmt, UnaryOp, YieldItem,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -1048,6 +1048,18 @@ impl Parser<'_> {
                     patterns,
                     filter,
                 });
+                // GQ19. A yield belongs to the match it stands after,
+                // and what it does is narrow what the match wrote, so
+                // it is a clause of its own here and a statement of the
+                // match in the standard. Nothing may stand between the
+                // two, which is what makes the two readings the same.
+                if self.eat_kw("YIELD") {
+                    let mut items = vec![self.parse_yield_item()?];
+                    while self.eat(&TokenKind::Comma) {
+                        items.push(self.parse_yield_item()?);
+                    }
+                    clauses.push(Clause::Yield { items });
+                }
             } else if self.eat_kw("INSERT") {
                 let mut patterns = vec![self.parse_path()?];
                 while self.eat(&TokenKind::Comma) {
@@ -2057,6 +2069,17 @@ impl Parser<'_> {
     /// Everything a full MATCH may say after the patterns is refused
     /// here: an ORDER BY or a LIMIT inside a predicate would be sorting
     /// and cutting a set whose only use is whether it is empty.
+    /// One item of a `YIELD`: a variable the match wrote, and the name
+    /// it leaves the match under.
+    fn parse_yield_item(&mut self) -> Result<YieldItem> {
+        let name = self.expect_name("a variable name after YIELD")?;
+        let alias = match self.eat_kw("AS") {
+            true => Some(self.expect_name("a name after AS")?),
+            false => None,
+        };
+        Ok(YieldItem { name, alias })
+    }
+
     fn parse_exists(&mut self) -> Result<Expr> {
         let (patterns, filter) = self.parse_match_block()?;
         Ok(Expr::Exists {
@@ -3502,6 +3525,29 @@ mod tests {
                 }
             ),
             "the two WHEREs fold into one condition, got {inner:?}"
+        );
+    }
+
+    /// GQ19. A yield belongs to the match in front of it and says
+    /// which of the names that match wrote leave it, so it reads as a
+    /// clause of its own straight behind the match.
+    #[test]
+    fn a_match_may_yield_some_of_what_it_wrote() {
+        let q = parsed("MATCH (a:Person)-[:KNOWS]->(b) YIELD b, a AS friend RETURN b.id AS id");
+        let Clause::Yield { items } = &q.clauses()[1] else {
+            panic!("the yield is a clause of its own, got {:?}", q.clauses()[1]);
+        };
+        assert_eq!(items[0].name, "b");
+        assert_eq!(items[0].alias, None);
+        assert_eq!(items[1].name, "a");
+        assert_eq!(items[1].alias.as_deref(), Some("friend"));
+        // The word is a table function's too, and that reading is the
+        // one a CALL still gets.
+        let q = parsed("CALL pagerank(0.85) YIELD score RETURN score AS s");
+        assert!(
+            matches!(&q.clauses()[0], Clause::Call { yields, .. } if yields.len() == 1),
+            "a CALL yields its columns, got {:?}",
+            q.clauses()[0]
         );
     }
 

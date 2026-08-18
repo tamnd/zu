@@ -122,9 +122,16 @@ property_type   = name , ( "::" | "TYPED" ) , value_type ;
 reading_clause  = match_clause | for_clause | unwind_clause | filter_clause
                 | let_clause | with_clause ;
 
-match_clause    = "MATCH" , pattern , [ where_clause ]
-                | "OPTIONAL" , ( "MATCH" , pattern , [ where_clause ]
-                               | match_block ) ;
+match_clause    = ( "MATCH" , pattern , [ where_clause ]
+                  | "OPTIONAL" , ( "MATCH" , pattern , [ where_clause ]
+                                 | match_block ) ) , [ yield_clause ] ;
+(* GQ19, ISO 16.14. Which of the names a match wrote leave it, and what
+   they are called after it. An item is a variable rather than an
+   expression, since a yield says what leaves the match and not what to
+   compute out of it. The word is a table function's too, and that
+   reading is the one a CALL gets. *)
+yield_clause    = "YIELD" , yield_item , { "," , yield_item } ;
+yield_item      = name , [ "AS" , name ] ;
 (* GQ21 and GQ22, ISO 14.4 and 19.4. A block of match statements is one
    conjunction: its statements are all required and they share the names
    they write, so an OPTIONAL over a block keeps what the whole block

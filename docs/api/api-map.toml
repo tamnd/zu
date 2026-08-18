@@ -27,6 +27,11 @@ tier = 1
 reason = "the bulk load path: a binding that can only load through statements pays a commit per row, which is the difference between a load that takes seconds and one that takes an hour"
 
 [[group]]
+prefix = "zu::Batch"
+tier = 2
+reason = "the rows a streaming sink is handed, borrowed for the length of its call; a binding that gives its user a cursor hands these on, and one that answers with the whole result never names it"
+
+[[group]]
 prefix = "zu::CheckpointMode"
 tier = 2
 reason = "how much work a checkpoint does, which only a binding that exposes checkpointing needs"
@@ -62,6 +67,21 @@ tier = 1
 reason = "one value on its way into a column, which is the appender's half of the conversion code every binding writes"
 
 [[group]]
+prefix = "zu::Flow"
+tier = 2
+reason = "what a streaming sink answers to carry on or to stop, which is only a name in a binding that exposes streaming at all"
+
+[[group]]
+prefix = "zu::FromRow"
+tier = 3
+reason = "the trait that reads a row into a struct the caller declared, which is Rust asking for a type it named; every other language reads a row as the dynamic thing it already is"
+
+[[group]]
+prefix = "zu::FromValue"
+tier = 3
+reason = "the same conversion for one value, and the same argument"
+
+[[group]]
 prefix = "zu::GqlStatus"
 tier = 1
 reason = "the ISO 39075 condition code on every error and every warning"
@@ -72,14 +92,49 @@ tier = 3
 reason = "the trait the storage engines implement, chosen by the path a session opens rather than by a caller"
 
 [[group]]
+prefix = "zu::Interrupt"
+tier = 2
+reason = "the flag a running statement checks, set from another thread; the C ABI exposes the act of cancelling rather than the flag, so a binding that hands its user a cancellation token names this and one with a cancel call does not"
+
+[[group]]
 prefix = "zu::NodeId"
 tier = 1
 reason = "a node value carries one, so every binding that returns a node returns this"
 
 [[group]]
+prefix = "zu::OpProfile"
+tier = 2
+reason = "one operator's line of a PROFILE: rows in, rows out, the time it spent and how far its estimate was off, which a binding exposing profiling gives back and the rest do not"
+
+[[group]]
+prefix = "zu::PlanNode"
+tier = 2
+reason = "one operator of a plan as a node rather than as the line EXPLAIN prints, for a binding that draws the tree instead of printing it"
+
+[[group]]
 prefix = "zu::Position"
 tier = 1
 reason = "where in a statement a condition was raised, which every binding hands on so a caller can point at the token"
+
+[[group]]
+prefix = "zu::Profile"
+tier = 2
+reason = "what PROFILE answers, the plan with the counters the run put on it, which follows whatever the binding decided about the plan"
+
+[[group]]
+prefix = "zu::QueryPlan"
+tier = 2
+reason = "the plan EXPLAIN answers, as a tree; every binding can print it as text through the session, and this is for the one that wants the shape"
+
+[[group]]
+prefix = "zu::Row"
+tier = 2
+reason = "one row borrowed out of a result, with its column names, which a binding with a cursor hands over a row at a time and one that answers with columns and rows of values never builds"
+
+[[group]]
+prefix = "zu::RowIter"
+tier = 2
+reason = "the rows of a result borrowed one at a time, the other half of that cursor"
 
 [[group]]
 prefix = "zu::Severity"
@@ -90,6 +145,16 @@ reason = "whether a condition stopped the statement, which decides whether a bin
 prefix = "zu::Snapshot"
 tier = 3
 reason = "the engine's read view at a fixed epoch, an interface the executor uses and no caller holds"
+
+[[group]]
+prefix = "zu::StageProfile"
+tier = 2
+reason = "one pipeline stage of a profile, which is where the time went rather than which operator spent it"
+
+[[group]]
+prefix = "zu::Streamed"
+tier = 2
+reason = "what a streaming call answers once the rows are gone: the column names, how many went over, whether the caller stopped it and whether the engine made them as it handed them over"
 
 [[group]]
 prefix = "zu::ZuError"
@@ -170,6 +235,11 @@ reason = "one constant per condition, useful to a binding that wants named codes
 prefix = "zu::list_text"
 tier = 3
 reason = "the JSON a staged list column holds while it crosses sqlite, a detail of bulk load"
+
+[[group]]
+prefix = "zu::params"
+tier = 3
+reason = "the macro that writes a parameter list as a literal on the caller's stack, which is Rust's spelling of the keyword arguments the other languages already have"
 
 [[group]]
 prefix = "zu::query"

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use zu_common::gqlstatus::codes;
+use zu_common::gqlstatus::{DiagnosticRecord, codes};
 use zu_common::{Interrupt, Result, ZuError};
 use zu_query::ast::TxnStmt;
 use zu_query::binder::BoundQuery;
@@ -84,6 +84,35 @@ struct CachedPlan {
     notes: Vec<String>,
 }
 
+/// What a statement text came to when this session last compiled it,
+/// which is either a plan or the condition it was refused with.
+///
+/// The refusal is kept for the same reason the plan is. Compiling
+/// depends on the text and the schema and on nothing else, so a
+/// statement that does not parse, or that names a variable nothing
+/// bound, is refused the same way every time until the epoch moves,
+/// and the epoch is already what empties this cache. A client sending
+/// a bad statement in a loop is the case worth having: it pays for the
+/// parse once instead of on every send, and the refusal it reads is
+/// the one the parse produced.
+enum Compiled {
+    Plan(Arc<CachedPlan>),
+    /// Only a GQL condition is kept. An io failure reading the stats a
+    /// schema is built from says something about the moment rather
+    /// than about the text, and remembering one would go on refusing a
+    /// statement that has nothing wrong with it.
+    Refused(Box<DiagnosticRecord>),
+}
+
+impl Compiled {
+    fn result(&self) -> Result<Arc<CachedPlan>> {
+        match self {
+            Compiled::Plan(plan) => Ok(plan.clone()),
+            Compiled::Refused(record) => Err(ZuError::Gql(record.clone())),
+        }
+    }
+}
+
 /// The explicit transaction a session is inside, from the
 /// `START TRANSACTION` that opened it to the `COMMIT` or `ROLLBACK`
 /// that ends it.
@@ -114,7 +143,7 @@ pub struct Session {
     /// reopens the table readers it needs, which on a small graph is
     /// most of what the query costs.
     snap: crate::snapshot::SnapshotCache,
-    plans: HashMap<String, Arc<CachedPlan>>,
+    plans: HashMap<String, Compiled>,
     stmts: HashMap<u64, String>,
     next_stmt: u64,
     /// The execution switches every statement on this session runs
@@ -735,7 +764,10 @@ impl Session {
     /// cache lookup.
     pub fn warm(&mut self, source: &str) -> Result<bool> {
         self.refresh()?;
-        if self.plans.contains_key(source) {
+        // A text that is held as a refusal is not warm: it has nothing
+        // to run, and the call below hands the caller the condition it
+        // was refused with rather than reporting a cache hit.
+        if matches!(self.plans.get(source), Some(Compiled::Plan(_))) {
             return Ok(true);
         }
         self.plan_for(source)?;
@@ -919,9 +951,23 @@ impl Session {
     }
 
     fn plan_for(&mut self, source: &str) -> Result<Arc<CachedPlan>> {
-        if let Some(cached) = self.plans.get(source) {
-            return Ok(cached.clone());
+        if let Some(compiled) = self.plans.get(source) {
+            return compiled.result();
         }
+        let compiled = match self.compile(source) {
+            Ok(plan) => Compiled::Plan(plan),
+            Err(ZuError::Gql(record)) => Compiled::Refused(record),
+            Err(other) => return Err(other),
+        };
+        let result = compiled.result();
+        if self.plans.len() >= PLAN_CAP {
+            self.plans.clear();
+        }
+        self.plans.insert(source.to_string(), compiled);
+        result
+    }
+
+    fn compile(&mut self, source: &str) -> Result<Arc<CachedPlan>> {
         // The text is parsed before anything is compiled because the
         // `USE` clause in front of it says which graph's tables the
         // names below it are names of.
@@ -930,18 +976,13 @@ impl Session {
         let schema = self.schema_for(graph)?;
         let (query, plan, notes) = query::compile_parsed(&parsed, &schema)?;
         let parts = crate::split::split(&query, &schema)?;
-        let cached = Arc::new(CachedPlan {
+        Ok(Arc::new(CachedPlan {
             schema,
             query,
             plan,
             parts,
             notes,
-        });
-        if self.plans.len() >= PLAN_CAP {
-            self.plans.clear();
-        }
-        self.plans.insert(source.to_string(), cached.clone());
-        Ok(cached)
+        }))
     }
 
     /// The schema of one graph, built on the first statement that names
@@ -1492,6 +1533,48 @@ mod tests {
             .run(source, &[("src", Value::Int(3))])
             .expect("after epoch move");
         assert_eq!(session.snap.readers.len(), 1);
+    }
+
+    #[test]
+    fn a_refused_statement_is_held_and_goes_with_the_epoch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("refused.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let bad = "MATCH (a:person) RETURN c.id AS n";
+        let first = session.run(bad, &[]).expect_err("undefined reference");
+        assert_eq!(first.gqlstatus(), Some(codes::C42002));
+        assert_eq!(session.plans.len(), 1, "the refusal is held");
+        // The second send reads the held condition rather than parsing
+        // and binding again, and reads the same one.
+        let second = session.run(bad, &[]).expect_err("still refused");
+        assert_eq!(second.to_string(), first.to_string());
+        // A statement that is refused is not warm, because there is
+        // nothing to run.
+        assert!(session.warm(bad).is_err(), "warm reports the refusal");
+
+        // A moved epoch describes a catalog the refusal was decided
+        // against, so it goes with the plans.
+        session.graph.file_mut().db_header_mut().epoch += 1;
+        session.refresh().expect("refresh");
+        assert!(session.plans.is_empty(), "the refusal went with the epoch");
+    }
+
+    #[test]
+    fn a_refusal_the_schema_decided_is_reconsidered_once_it_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reconsider.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let source = "USE other MATCH (a:person) RETURN count(a) AS n";
+        assert!(session.run(source, &[]).is_err(), "no such graph yet");
+        session
+            .run("CREATE GRAPH other ANY AS COPY OF home", &[])
+            .expect("create");
+        let answered = session.run(source, &[]).expect("after the table exists");
+        assert_eq!(answered.rows.len(), 1);
     }
 
     #[test]

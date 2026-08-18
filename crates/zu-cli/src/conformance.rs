@@ -118,8 +118,8 @@ const DATA: &[Declared] = &[
     },
     Declared {
         key: "parallel-edge-properties",
-        supported: false,
-        why: "an edge property is addressed by searching the forward list for the destination, and two edges over one pair answer that search the same way",
+        supported: true,
+        why: "an edge property is addressed by the ordinal the match bound, not by searching the forward list for the destination, so two edges over one pair carry their own values",
     },
 ];
 

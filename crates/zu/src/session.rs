@@ -205,9 +205,18 @@ impl Session {
     /// a fresh one. That costs a recovery pass and loses nothing: a
     /// writer that has folded holds an empty overlay store, so what it
     /// was holding is what recovery reconstructs.
-    pub fn file_mut(&mut self) -> &mut Zu1File {
-        self.writer = None;
-        self.graph.file_mut()
+    ///
+    /// The publish before that is what makes the truncation safe. A
+    /// commit folds without checkpointing and leaves the frames in the
+    /// log, so a log cut with the header still behind them would lose
+    /// committed statements. Publishing first puts the folds on the
+    /// file and empties the log itself, and the appender then opens a
+    /// log that says nothing anyone still needs.
+    pub fn file_mut(&mut self) -> Result<&mut Zu1File> {
+        if let Some(mut writer) = self.writer.take() {
+            writer.fold(self.graph.file_mut())?;
+        }
+        Ok(self.graph.file_mut())
     }
 
     /// The catalog this session last loaded, which is how a caller
@@ -383,8 +392,20 @@ impl Session {
     /// The writer goes first. It holds the log and the overlay store for
     /// epochs that are about to stop existing, and its next commit would
     /// number itself off them; opening a fresh one costs a log open and
-    /// a recovery pass over a log the last fold truncated.
+    /// a recovery pass.
+    ///
+    /// The log is cut before it is let go of. A fold that did not
+    /// checkpoint did not truncate either, so the frames of the
+    /// statements this is taking back are still there, and a fresh
+    /// writer would replay them straight back on top of the roots
+    /// going in. The cut stops at the floor the savepoint kept, which
+    /// is where the log stood when the transaction began, so frames
+    /// somebody else committed before it are left alone.
     fn undo(&mut self) -> Result<()> {
+        let floor = self.graph.file().savepoint_floor();
+        if let (Some(writer), Some(floor)) = (self.writer.as_mut(), floor) {
+            writer.discard_above(floor)?;
+        }
         self.writer = None;
         self.graph.file_mut().rollback_savepoint()?;
         self.refresh()
@@ -1025,11 +1046,21 @@ impl Session {
 /// left published. Nothing here can report a failure to do that, which
 /// is the reason to end a transaction with a statement and not with a
 /// drop: the statement says what went wrong.
+///
+/// A session that goes away with nothing running publishes what its
+/// folds left staged. Skipping it would lose nothing, because the log
+/// beside the file holds every one of those commits and the next open
+/// replays them, but it would make an ordinary close leave work for an
+/// ordinary open, and a process that only ever writes would leave a
+/// log as long as its life.
 impl Drop for Session {
     fn drop(&mut self) {
         if self.txn.is_some() && self.graph.file().in_savepoint() {
-            self.writer = None;
-            let _ = self.graph.file_mut().rollback_savepoint();
+            let _ = self.undo();
+            return;
+        }
+        if let Some(mut writer) = self.writer.take() {
+            let _ = writer.fold(self.graph.file_mut());
         }
     }
 }

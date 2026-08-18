@@ -3586,8 +3586,8 @@
       "kind": "method",
       "name": "file_mut",
       "of": "zu::session::Session",
-      "signature": "fn file_mut(&mut self) -> &mut Zu1File",
-      "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs."
+      "signature": "fn file_mut(&mut self) -> Result<&mut Zu1File>",
+      "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs.\n\nThe publish before that is what makes the truncation safe. A\ncommit folds without checkpointing and leaves the frames in the\nlog, so a log cut with the header still behind them would lose\ncommitted statements. Publishing first puts the folds on the\nfile and empties the log itself, and the appender then opens a\nlog that says nothing anyone still needs."
     },
     {
       "id": "zu::session::Session::in_transaction",
@@ -4134,13 +4134,21 @@
       "id": "zu::write",
       "kind": "module",
       "name": "write",
-      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nEvery commit that changed something folds, and that is worth being\nplain about, because it is not where this ends up. A fold rewrites\nevery column of every table the transaction touched, so paying one\nper statement is the wrong shape for a write workload, and the\noverlay exists precisely so a reader can see a committed row\nwithout one. But [`Zu1Graph`] reads the sealed file and nothing\nelse, so today a change that is not folded is a change the next\n`MATCH` cannot see, and a write nobody can read is not a write.\nFolding here keeps the visibility contract honest while the read\npath catches up; once it consults overlays this becomes a policy\nand a background checkpoint, and the only thing that changes here\nis when [`Writer::fold`] gets called.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
+      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nEvery commit that changed something folds, and that is worth being\nplain about, because it is not obviously the right cost. A fold\nrewrites the columns the transaction touched, and the overlay\nexists precisely so a reader could see a committed row without one.\nBut [`Zu1Graph`] reads the sealed file and nothing else, so today a\nchange that is not folded is a change the next `MATCH` cannot see,\nand a write nobody can read is not a write. Folding here keeps the\nvisibility contract honest while the read path catches up.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
     },
     {
       "id": "zu::write::Writer",
       "kind": "struct",
       "name": "Writer",
       "doc": "The write side of one open database.\n\nOne of these is the single writer: it holds the only handle on its\noverlay store, and [`Mvcc::begin`] hands out that store's only\nmutable borrow, so a second transaction cannot exist while one is\nopen. Two writers over one file would be two overlay stores and one\nlog between them, and neither would be right, so there is exactly\none place a [`Writer`] lives, which is inside the session that owns\nthe file handle. An appender is the other writer of the same log,\nand it is kept apart the same way: it borrows the file, and a\nsession hands the file out only after dropping its writer."
+    },
+    {
+      "id": "zu::write::Writer::discard_above",
+      "kind": "method",
+      "name": "discard_above",
+      "of": "zu::write::Writer",
+      "signature": "fn discard_above(&mut self, floor: Epoch) -> Result<()>",
+      "doc": "Cuts the log back to where it stood at `floor`, which is what a\nrollback owes a log the folds it is undoing never truncated. A\nwriter is dropped straight after, because the store it holds\ndescribes epochs that have stopped existing."
     },
     {
       "id": "zu::write::Writer::epoch",
@@ -4156,7 +4164,7 @@
       "name": "fold",
       "of": "zu::write::Writer",
       "signature": "fn fold(&mut self, db: &mut Zu1File) -> Result<()>",
-      "doc": "Seals every committed overlay into the file and truncates the\nlog. On return the file alone answers what the overlays\nanswered, and the header epoch has moved, so anything caching\nthe catalog or a decoded layout has to reload."
+      "doc": "Seals every committed overlay into the file, publishes it and\ntruncates the log. On return the file alone answers what the\noverlays answered, and the header epoch has moved, so anything\ncaching the catalog or a decoded layout has to reload."
     },
     {
       "id": "zu::write::Writer::open",
@@ -6041,6 +6049,14 @@
       "doc": "Ends the transaction by putting the file back where it started\nand publishing that, so a reader after this reads what a reader\nbefore the transaction read.\n\nThe epoch is the one thing not put back: the kept header is\nrepublished with the next epoch after the newest, because a\nheader written with a lower epoch than the other slot would be\nthe older of the two and the transaction's last state would win\nthe next open. Blocks the transaction wrote past the kept\nhigh-water mark are outside the file the header describes, so the\nnext writer hands them out again; blocks it freed are still\nreferenced by the header going back in, so what it freed is\ndropped rather than published."
     },
     {
+      "id": "zu::zu1::file::Zu1File::savepoint_floor",
+      "kind": "method",
+      "name": "savepoint_floor",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn savepoint_floor(&self) -> Option<Epoch>",
+      "doc": "Where the log stood when the open transaction began, which a\nrollback needs because the frames above it are the ones going\naway and a fold that did not publish did not cut them."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::set_memory_limit",
       "kind": "method",
       "name": "set_memory_limit",
@@ -6049,12 +6065,28 @@
       "doc": "Rebuilds the caches sized off `memory_limit`: half of it block\nframes per perf/04, 8% CSR offsets, 20% adjacency, 4% fences.\nForks made before the call keep the old caches."
     },
     {
+      "id": "zu::zu1::file::Zu1File::stage_fold",
+      "kind": "method",
+      "name": "stage_fold",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn stage_fold(&mut self)",
+      "doc": "Says a fold moved the roots this handle reads and stopped short\nof putting them on disk, which is what a writer that folds every\ncommit and checkpoints on a threshold does most of the time.\n\nTwo things follow. The epoch moves, because everything above\nkeys its cached catalogs, readers and plans on it and the roots\nthey describe have moved. And a savepoint open over the fold is\nnow holding against something a crash would find, because the\nframes the fold folded are in the log and nothing has cut them,\nwhich is the same position a publish leaves it in and wants the\nsame marker."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::sync_data",
       "kind": "method",
       "name": "sync_data",
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn sync_data(&mut self) -> Result<()>",
       "doc": "Syncs staged data writes without publishing anything: the header\nslots do not move and a plain reopen still sees the committed\nepoch. The ingest path calls this so its sealed segments are\ndurable before the WAL frame referencing them is."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::unpublished_blocks",
+      "kind": "method",
+      "name": "unpublished_blocks",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn unpublished_blocks(&self) -> u64",
+      "doc": "Blocks allocated since the last checkpoint. A writer that folds\nwithout publishing watches this, because until it publishes\nnothing it freed can be handed back out and the file grows by\neverything the folds rewrote."
     },
     {
       "id": "zu::zu1::file::Zu1File::write_block",
@@ -6089,7 +6121,7 @@
       "kind": "function",
       "name": "checkpoint_fold",
       "signature": "fn checkpoint_fold(db: &mut zu_zu1::file::Zu1File, mvcc: &mut zu_zu1::txn::Mvcc, wal: &mut zu_zu1::wal::Wal) -> zu_common::Result<()>",
-      "doc": "Folds every overlay at the store's current epoch into new sealed\nsegments and truncates the WAL. On return the overlay store is\nempty at the same epoch with persisted tombstones reseeded, and the\nfile reads identically to the pre-fold snapshot at that epoch. On\nerror nothing published: the header, the WAL, and the store are\nexactly as they were, and any blocks written are unreferenced."
+      "doc": "Folds every overlay at the store's current epoch into new sealed\nsegments, publishes them, and truncates the WAL. On return the\noverlay store is empty at the same epoch with persisted tombstones\nreseeded, and the file reads identically to the pre-fold snapshot\nat that epoch. On error nothing published: the header, the WAL, and\nthe store are exactly as they were, and any blocks written are\nunreferenced."
     },
     {
       "id": "zu::zu1::fold::decode_tombstones",
@@ -6111,6 +6143,13 @@
       "name": "recover",
       "signature": "fn recover(db: &mut zu_zu1::file::Zu1File, wal: &mut zu_zu1::wal::Wal) -> zu_common::Result<zu_zu1::txn::Mvcc>",
       "doc": "Rebuilds the overlay store after a crash or reopen: committed txns\nabove the header's `wal_seq` replay from the log, an `IngestRef`\nresolves back into its payload by reading the sealed segments it\nnames, then every persisted tombstone chain seeds back in at epoch\n0.\n\nA file with a transaction still open on it is put back first. The\nlog is cut to what the state going back in had folded, because a\nframe above that is a statement of the transaction being taken back\nand replaying it would put the transaction back on as an overlay,\nand then the kept state is published. Nothing here is a special case\nafterwards: the file reads as one whose last statement was the one\nbefore the transaction started."
+    },
+    {
+      "id": "zu::zu1::fold::staged_fold",
+      "kind": "function",
+      "name": "staged_fold",
+      "signature": "fn staged_fold(db: &mut zu_zu1::file::Zu1File, mvcc: &mut zu_zu1::txn::Mvcc, wal: &mut zu_zu1::wal::Wal) -> zu_common::Result<()>",
+      "doc": "Folds the same way, and stops before the header flip.\n\nThis is the shape a write statement wants. The fold is what makes a\ncommitted change something the next `MATCH` reads, so it has to\nhappen per commit; the flip is what makes it something the next\nprocess reads, and the log already says that. Two full syncs of the\nthree a one cell write pays are the flip, and the frame the commit\nsynced covers exactly the window skipping them opens: a crash finds\nthe older header and replays the log back to where the fold had\ngot to.\n\nWhat it costs is file growth. Nothing freed can be handed out again\nuntil a checkpoint publishes, so every fold in between takes fresh\nblocks for what it rewrites, and the caller watches\n[`Zu1File::unpublished_blocks`] and publishes on a threshold."
     },
     {
       "id": "zu::zu1::fullzip",

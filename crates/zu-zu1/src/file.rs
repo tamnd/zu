@@ -359,6 +359,13 @@ pub struct Zu1File {
     /// already free when it began, because a block the transaction
     /// frees is a block the state being kept still reads.
     savepoint: Option<Savepoint>,
+    /// Blocks this handle has allocated since its last checkpoint,
+    /// which is what a caller deferring one has to watch. Nothing
+    /// allocated since then can be given back until a checkpoint
+    /// publishes, because the header on disk still reads the blocks
+    /// they replaced, so a writer that never checkpoints grows the file
+    /// by everything it rewrites.
+    unpublished: u64,
     /// The epoch a crash left published, when this handle opened a file
     /// with a transaction still open on it. The header in hand is the
     /// one that transaction was holding, so every read is already of
@@ -399,6 +406,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            unpublished: 0,
             interrupted: None,
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -456,25 +464,40 @@ impl Zu1File {
         // A transaction was open when the process went away if the
         // third slot holds a header, and the state it was holding is
         // the state to read: the one in the slot the checkpoint last
-        // flipped to is the middle of that transaction. A slot naming
-        // an epoch the file never reached is not a state to go back to,
-        // so it is left alone and reported nowhere.
+        // flipped to is the middle of that transaction.
         let mut kept = [0u8; DB_HEADER_SIZE];
         let holding = match file.len()? >= TXN_SLOT + DB_HEADER_SIZE as u64 {
             true => {
                 file.read_exact_at(&mut kept, TXN_SLOT)?;
-                decode_marker(&kept).filter(|(held, _)| held.epoch <= db.epoch)
+                decode_marker(&kept)
             }
             false => None,
         };
         let (db, interrupted) = match holding {
-            Some((held, log_floor)) => (
+            Some((held, log_floor)) if held.epoch <= db.epoch => (
                 held,
                 Some(Interrupted {
                     published: db.epoch,
                     log_floor,
                 }),
             ),
+            // The kept state is ahead of what is published, which is
+            // what a transaction that folded without checkpointing
+            // leaves behind: none of what it did reached the file, so
+            // the published header is already the state to go back to
+            // and the marker is worth only its floor, which says how
+            // much of the log the transaction wrote and a replay must
+            // not put back on.
+            Some((_, log_floor)) => {
+                let published = db.epoch;
+                (
+                    db,
+                    Some(Interrupted {
+                        published,
+                        log_floor,
+                    }),
+                )
+            }
             None => (db, None),
         };
         let mut this = Self {
@@ -489,6 +512,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            unpublished: 0,
             pin_memo: None,
             forks: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             writable,
@@ -543,6 +567,7 @@ impl Zu1File {
             free_chain: Vec::new(),
             frozen: Vec::new(),
             savepoint: None,
+            unpublished: 0,
             interrupted: None,
             pin_memo: None,
             forks: Some(Arc::clone(pool)),
@@ -592,11 +617,45 @@ impl Zu1File {
     /// [`Self::frozen`] until the transaction ends and this list holds
     /// only what was free before it began.
     pub fn allocate_block(&mut self) -> BlockPtr {
+        self.unpublished += 1;
         if let Some(ptr) = self.free.pop() {
             return ptr;
         }
         self.db.block_count += 1;
         self.db.block_count
+    }
+
+    /// Blocks allocated since the last checkpoint. A writer that folds
+    /// without publishing watches this, because until it publishes
+    /// nothing it freed can be handed back out and the file grows by
+    /// everything the folds rewrote.
+    pub fn unpublished_blocks(&self) -> u64 {
+        self.unpublished
+    }
+
+    /// Says a fold moved the roots this handle reads and stopped short
+    /// of putting them on disk, which is what a writer that folds every
+    /// commit and checkpoints on a threshold does most of the time.
+    ///
+    /// Two things follow. The epoch moves, because everything above
+    /// keys its cached catalogs, readers and plans on it and the roots
+    /// they describe have moved. And a savepoint open over the fold is
+    /// now holding against something a crash would find, because the
+    /// frames the fold folded are in the log and nothing has cut them,
+    /// which is the same position a publish leaves it in and wants the
+    /// same marker.
+    pub fn stage_fold(&mut self) {
+        self.db.epoch += 1;
+        if let Some(saved) = &mut self.savepoint {
+            saved.published = true;
+        }
+    }
+
+    /// Where the log stood when the open transaction began, which a
+    /// rollback needs because the frames above it are the ones going
+    /// away and a fold that did not publish did not cut them.
+    pub fn savepoint_floor(&self) -> Option<Epoch> {
+        self.savepoint.as_ref().map(|saved| saved.log_floor)
     }
 
     /// Keeps what the file is now, so that [`Self::rollback_savepoint`]
@@ -1032,6 +1091,7 @@ impl Zu1File {
             }
             None => self.free = all,
         }
+        self.unpublished = 0;
         Ok(())
     }
 

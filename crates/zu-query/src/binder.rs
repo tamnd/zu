@@ -1428,13 +1428,24 @@ pub enum BoundExpr {
     /// GQ18. A value query expression, as an index into
     /// [`BoundQuery::scalars`].
     ///
-    /// The query it names reads nothing from the row this expression
-    /// stands in, so its answer is the same value for every row of the
-    /// run and the executor works it out once, before the plan above
-    /// it starts. That is the whole of the decorrelation: what is left
-    /// here is a constant the run is handed, which is why the
-    /// optimizer treats one the way it treats a parameter.
-    Scalar(usize),
+    /// A query that reads nothing from the row this expression stands in
+    /// answers the same value for every row of the run, so the executor
+    /// works it out once, before the plan above it starts. That is the
+    /// whole of the decorrelation: what is left here is a constant the
+    /// run is handed, which is why the optimizer treats one the way it
+    /// treats a parameter.
+    Scalar {
+        ix: usize,
+        /// The slots of this query the one inside reads, which is
+        /// [`BoundQuery::captures`] of `scalars[ix]` by slot and is
+        /// empty for a query that decorrelated.
+        ///
+        /// It is written here as well because the slots an expression
+        /// reads is a question asked of the expression alone, in a
+        /// dozen places that have no query to hand, and a slot read
+        /// per row has to be flattened like any other.
+        reads: Vec<usize>,
+    },
 }
 
 /// Who reads the rows a projection makes, which is the whole of the
@@ -1585,9 +1596,11 @@ fn agree_on_columns(left: &BoundQuery, right: &BoundQuery, how: ast::Conjunction
 /// two places to forget when a variant is added.
 pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     match expr {
-        // A value query expression reads no slot of this query: that
-        // is what makes it one value for the whole run.
-        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Scalar(_) => {}
+        BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
+        // A value query expression reads the slots the query inside it
+        // captured, and nothing at all when it captured none, which is
+        // what makes that one a single value for the whole run.
+        BoundExpr::Scalar { reads, .. } => out.extend(reads.iter().copied()),
         BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => out.extend([*slot]),
         BoundExpr::Property { base, .. } => expr_slots(base, out),
         BoundExpr::Unary { expr, .. } => expr_slots(expr, out),
@@ -3574,8 +3587,15 @@ impl Binder<'_> {
             Some(BoundClause::Project { items, .. }) if items.len() == 1 => items[0].ty.clone(),
             _ => Type::Any,
         };
+        let reads = bound.captures.iter().map(|c| c.slot).collect();
         self.scalars.push(bound);
-        Ok((BoundExpr::Scalar(self.scalars.len() - 1), ty))
+        Ok((
+            BoundExpr::Scalar {
+                ix: self.scalars.len() - 1,
+                reads,
+            },
+            ty,
+        ))
     }
 
     fn bind_call(

@@ -245,6 +245,22 @@ fn a_name_two_levels_out_reaches_the_query_that_reads_it() {
     assert_eq!(result.rows[0][0], Value::Int(3));
 }
 
+/// A correlated one in a WHERE, which is where the corpus case for the
+/// feature puts it. Every person finds exactly itself, so the count is
+/// one on every row and all five rows survive the filter.
+#[test]
+fn a_correlated_query_stands_in_a_filter() {
+    let mut fx = Fixture::open("value-correlated-filter.zu1");
+    assert_eq!(
+        fx.one(
+            "MATCH (p:person) \
+             WHERE VALUE { MATCH (q:person) WHERE q.id = p.id RETURN count(*) } = 1 \
+             RETURN count(*) AS n"
+        ),
+        5
+    );
+}
+
 /// It stands where a value belongs and is read there, so it may not
 /// change the graph on the way.
 #[test]

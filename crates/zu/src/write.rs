@@ -50,10 +50,12 @@ use std::sync::Arc;
 use zu_common::{Epoch, Result, ZuError};
 
 use crate::append::sidecar;
+use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::fold::{checkpoint_fold, recover, staged_fold};
-use crate::zu1::props::{LanePatch, PropsDirectory, load_props};
-use crate::zu1::txn::{LaneWrite, Mvcc, WriteTxn};
+use crate::zu1::graph::{EdgePatch, GraphReader};
+use crate::zu1::props::{LanePatch, PropsDirectory, RowPatch, load_props, load_rel_props};
+use crate::zu1::txn::{Cell, Deferred, Mvcc, WriteTxn};
 use crate::zu1::wal::Wal;
 
 /// How much a run of folds may take before one of them checkpoints.
@@ -84,9 +86,43 @@ const DEFERRED_COMMITS: u32 = 256;
 /// the two segment writes a fold costs.
 const DEFERRED_CELLS: usize = 1024;
 
-/// The unsealed cells of every table that has any, which is what a
-/// reader is handed so that it reads a deferred commit.
-pub type Patches = HashMap<u32, Arc<LanePatch>>;
+/// Everything the commits since the last fold left for the readers to
+/// read through, which is what makes a deferred commit visible.
+///
+/// Three shapes, because there are three ways a change can sit above a
+/// column nobody has rewritten: a new word for a row the column already
+/// holds, a whole new row past the end of it, and a new edge, which is
+/// a row of the rel table's property columns and a pair the adjacency
+/// reader has to merge into two lists.
+#[derive(Debug, Default)]
+pub struct Patches {
+    /// New words, by table.
+    pub cells: HashMap<u32, Arc<LanePatch>>,
+    /// New rows, by table. Only rel tables have any so far: a node
+    /// append moves the row count every reader is bounded by, and
+    /// nothing reads through that yet.
+    pub rows: HashMap<u32, Arc<RowPatch>>,
+    /// New edges, by rel table.
+    pub edges: HashMap<u32, Arc<EdgePatch>>,
+}
+
+impl Patches {
+    pub fn new() -> Self {
+        Patches::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty() && self.rows.is_empty() && self.edges.is_empty()
+    }
+
+    /// How many cells everything in here holds between them, which is
+    /// what a writer bounds when it decides whether to keep deferring.
+    fn cells(&self) -> usize {
+        self.cells.values().map(|p| p.cells()).sum::<usize>()
+            + self.rows.values().map(|p| p.len()).sum::<usize>()
+            + self.edges.values().map(|p| p.len() as usize).sum::<usize>()
+    }
+}
 
 /// What one [`Writer::write`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +163,19 @@ pub struct Writer {
     patches: Arc<Patches>,
     /// How many commits have gone without a fold.
     deferred: u32,
+    /// The rows the deferred commits added, by table, in the running
+    /// form the patch above is built from.
+    added: HashMap<u32, RowPatch>,
+    /// The edges they added, by rel table, the same way.
+    fresh: HashMap<u32, EdgePatch>,
+    /// Adjacency readers of the rel tables a deferred commit has added
+    /// an edge to, which is what says whether the pair is already
+    /// there and how many edges the file holds. A fold moves what
+    /// these describe, so it empties this.
+    readers: HashMap<u32, GraphReader>,
+    /// The catalog those readers were loaded through, for the same
+    /// stretch and dropped at the same fold.
+    catalog: Option<Catalog>,
     /// Props directories of the tables a deferred commit has written
     /// into, which is how a commit is checked against the columns it
     /// names without reading the directory chain per statement. A fold
@@ -172,6 +221,10 @@ impl Writer {
             pending: HashMap::new(),
             patches: Arc::new(Patches::new()),
             deferred: 0,
+            added: HashMap::new(),
+            fresh: HashMap::new(),
+            readers: HashMap::new(),
+            catalog: None,
             dirs: HashMap::new(),
         };
         writer.fold(db)?;
@@ -215,9 +268,9 @@ impl Writer {
         }
         let epoch = txn.commit(&mut self.wal)?;
         if staged {
-            let lanes = self.mvcc.take_lanes();
-            if self.defers(db, &lanes)? {
-                self.stage_patch(lanes);
+            let changes = self.mvcc.take_deferred();
+            if self.defers(db, &changes)? {
+                self.stage_patch(changes);
             } else {
                 match db.unpublished_blocks() >= THRESHOLD_BLOCKS {
                     true => self.fold(db)?,
@@ -246,30 +299,118 @@ impl Writer {
     /// Whether this commit can be left in the overlay for a later fold
     /// to seal.
     ///
-    /// A commit that only wrote words onto rows that are already there
-    /// can, because the patch carries exactly that and a reader reads
-    /// through it. Anything else, a new row, a deleted one, a string, a
-    /// null, a label, an edge, folds the way it always did. On top of
-    /// the shape there are three bounds: how many commits may go
-    /// unfolded, how many cells they may hold, and the block growth the
-    /// checkpoint threshold already bounds.
-    fn defers(&mut self, db: &mut Zu1File, lanes: &[LaneWrite]) -> Result<bool> {
-        if lanes.is_empty() || !self.mvcc.lane_only() {
+    /// Two shapes can. A word written onto a row that is already there,
+    /// because the patch carries exactly that and a reader reads
+    /// through it. An edge added to a rel table, because the adjacency
+    /// reader merges it into the two lists it belongs in and its
+    /// property values sit under the ordinal it was given. Anything
+    /// else, a new node, a deleted row, a label, an edge taken away,
+    /// folds the way it always did. On top of the shape there are three
+    /// bounds: how many commits may go unfolded, how many cells they
+    /// may hold, and the block growth the checkpoint threshold already
+    /// bounds.
+    fn defers(&mut self, db: &mut Zu1File, changes: &[Deferred]) -> Result<bool> {
+        if changes.is_empty() || !self.mvcc.soft() {
             return Ok(false);
         }
         if self.deferred >= DEFERRED_COMMITS
-            || self.patches.values().map(|p| p.cells()).sum::<usize>() + lanes.len()
-                > DEFERRED_CELLS
+            || self.patches.cells() + changes.len() > DEFERRED_CELLS
             || db.unpublished_blocks() >= THRESHOLD_BLOCKS
         {
             return Ok(false);
         }
-        for &(table, row, col, _) in lanes {
-            if !self.patchable(db, table, row, col as usize)? {
+        for change in changes {
+            let takes = match change {
+                Deferred::Lane((table, row, col, _)) => {
+                    self.patchable(db, *table, *row, *col as usize)?
+                }
+                Deferred::Edge(rel, src, dst, cols) => {
+                    self.edge_patchable(db, *rel, *src, *dst, cols)?
+                }
+            };
+            if !takes {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Whether a reader can be shown this edge without the CSR being
+    /// rebuilt around it.
+    ///
+    /// The pair has to be one the graph does not run through yet. An
+    /// edge in the patch takes an ordinal past everything the file
+    /// holds, so a second edge over a pair the file already has would
+    /// leave a run of copies whose ordinals are not consecutive, and
+    /// the whole of the ordinal side is built on their being so. A
+    /// table that stores properties refuses the second copy at write
+    /// time anyway; this is what keeps the other kind honest.
+    ///
+    /// Every column the table stores has to be given a value of its own
+    /// kind, because that row is served out of the patch and there is
+    /// no column underneath it to fall back on. That is also what the
+    /// fold demands of an added edge, so an insert that skips a column
+    /// is an error either way and this only decides where it is raised.
+    fn edge_patchable(
+        &mut self,
+        db: &mut Zu1File,
+        rel: u32,
+        src: u64,
+        dst: u64,
+        cols: &[(u32, Cell)],
+    ) -> Result<bool> {
+        if self.fresh.get(&rel).is_some_and(|p| p.holds(src, dst)) {
+            return Ok(false);
+        }
+        self.load_reader(db, rel)?;
+        let Some(reader) = self.readers.get(&rel) else {
+            return Ok(false);
+        };
+        let directory = reader.directory();
+        if src >= directory.from_count || dst >= directory.to_count {
+            return Ok(false);
+        }
+        if reader.has_edge(db, src, dst)? {
+            return Ok(false);
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(rel) {
+            slot.insert(load_rel_props(db, rel)?);
+        }
+        let Some(directory) = self.dirs[&rel].as_ref() else {
+            return Ok(cols.is_empty());
+        };
+        Ok(directory.columns.iter().enumerate().all(|(at, column)| {
+            match cols.iter().find(|(c, _)| *c as usize == at) {
+                Some((_, Cell::Int(_))) => column.is_lane(),
+                Some((_, Cell::Str(_))) => !column.is_lane(),
+                Some((_, Cell::Null)) => true,
+                None => false,
+            }
+        }))
+    }
+
+    /// Loads the adjacency reader of `rel` if this run of deferred
+    /// commits has not needed it yet. A rel table with no directory
+    /// entry is one nothing can be added to, and leaves the slot empty
+    /// so the caller folds.
+    fn load_reader(&mut self, db: &mut Zu1File, rel: u32) -> Result<()> {
+        if self.readers.contains_key(&rel) {
+            return Ok(());
+        }
+        if self.catalog.is_none() {
+            self.catalog = Some(Catalog::load(db)?);
+        }
+        let name = self
+            .catalog
+            .as_ref()
+            .expect("just loaded")
+            .rel_by_id(rel)
+            .map(|table| table.name.clone());
+        if let Some(name) = name {
+            self.readers
+                .insert(rel, GraphReader::load_table(db, &name)?);
+        }
+        Ok(())
     }
 
     /// Whether a reader can be shown a word written onto this cell
@@ -299,37 +440,93 @@ impl Writer {
     /// Only the tables this commit wrote into are rebuilt. The others
     /// keep the `Arc` they already had, so a reader that has read one
     /// of them is not made to look at it again.
-    fn stage_patch(&mut self, lanes: Vec<LaneWrite>) {
-        let mut patches = Patches::clone(&self.patches);
-        let mut touched: Vec<u32> = Vec::new();
-        for (table, row, col, word) in lanes {
-            self.pending
-                .entry(table)
-                .or_default()
-                .entry(col as usize)
-                .or_default()
-                .insert(row, word);
-            if !touched.contains(&table) {
-                touched.push(table);
+    fn stage_patch(&mut self, changes: Vec<Deferred>) {
+        let mut cells: Vec<u32> = Vec::new();
+        let mut rels: Vec<u32> = Vec::new();
+        for change in changes {
+            match change {
+                Deferred::Lane((table, row, col, word)) => {
+                    self.pending
+                        .entry(table)
+                        .or_default()
+                        .entry(col as usize)
+                        .or_default()
+                        .insert(row, word);
+                    if !cells.contains(&table) {
+                        cells.push(table);
+                    }
+                }
+                Deferred::Edge(rel, src, dst, cols) => {
+                    self.stage_edge(rel, src, dst, cols);
+                    if !rels.contains(&rel) {
+                        rels.push(rel);
+                    }
+                }
             }
         }
-        for table in touched {
+        let mut patches = Patches {
+            cells: self.patches.cells.clone(),
+            rows: self.patches.rows.clone(),
+            edges: self.patches.edges.clone(),
+        };
+        for table in cells {
             let cols = self.pending[&table]
                 .iter()
                 .map(|(&col, rows)| (col, rows.iter().map(|(&r, &w)| (r, w)).collect()))
                 .collect();
-            patches.insert(table, Arc::new(LanePatch::new(cols)));
+            patches.cells.insert(table, Arc::new(LanePatch::new(cols)));
+        }
+        for rel in rels {
+            patches
+                .edges
+                .insert(rel, Arc::new(self.fresh[&rel].clone()));
+            if let Some(rows) = self.added.get(&rel) {
+                patches.rows.insert(rel, Arc::new(rows.clone()));
+            }
         }
         self.patches = Arc::new(patches);
         self.deferred += 1;
+    }
+
+    /// Puts one edge in the running patch of its table: the pair in the
+    /// two adjacency lists, and a row of cells under the ordinal that
+    /// hands it, one per column the table stores.
+    ///
+    /// The ordinal and the row number are the same number, because a
+    /// rel table's property columns are dense over its edges in load
+    /// order and an added edge goes on the end of both.
+    fn stage_edge(&mut self, rel: u32, src: u64, dst: u64, cols: Vec<(u32, Cell)>) {
+        let edges = self.readers[&rel].directory().edge_count;
+        self.fresh
+            .entry(rel)
+            .or_insert_with(|| EdgePatch::new(edges))
+            .add(src, dst);
+        let Some(directory) = self.dirs.get(&rel).and_then(Option::as_ref) else {
+            return;
+        };
+        let row = (0..directory.columns.len())
+            .map(|at| {
+                cols.iter()
+                    .find(|(c, _)| *c as usize == at)
+                    .map_or(Cell::Null, |(_, cell)| cell.clone())
+            })
+            .collect();
+        self.added
+            .entry(rel)
+            .or_insert_with(|| RowPatch::new(edges))
+            .push(row);
     }
 
     /// Drops the patch a fold has just sealed into the columns.
     fn sealed(&mut self) {
         self.deferred = 0;
         self.dirs.clear();
-        if !self.pending.is_empty() {
+        self.readers.clear();
+        self.catalog = None;
+        if !self.patches.is_empty() {
             self.pending.clear();
+            self.added.clear();
+            self.fresh.clear();
             self.patches = Arc::new(Patches::new());
         }
     }
@@ -396,6 +593,42 @@ mod tests {
             ],
         )
         .expect("props");
+    }
+
+    /// The same four people, with a year and a note on every edge. The
+    /// note is a string, so an edge added to this table has to land a
+    /// cell on both sides of the props store: the lane a word goes
+    /// straight onto, and the blob a byte string comes out of.
+    fn seeded_dated(path: &Path) {
+        let mut db = Zu1File::create(path).expect("create");
+        bulk_load_as(&mut db, "person", "knows", 4, &[(0, 1), (1, 2), (2, 3)]).expect("load");
+        let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe", b"amy"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20, 30, 40])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .expect("props");
+        let notes: Vec<&[u8]> = vec![b"school", b"work", b"club"];
+        crate::zu1::props::store_rel_props(
+            &mut db,
+            "knows",
+            &[
+                ("since", PropValues::Int(&[1990, 2000, 2010])),
+                ("note", PropValues::Str(&notes)),
+            ],
+        )
+        .expect("edge props");
+    }
+
+    fn string(row: &[Value], at: usize) -> String {
+        match &row[at] {
+            Value::Str(s) => s.clone(),
+            other => panic!("expected a string, got {other:?}"),
+        }
     }
 
     fn names(session: &mut Session) -> Vec<String> {
@@ -481,6 +714,142 @@ mod tests {
             })
             .expect("write");
         assert_eq!(reached(&mut session), ["ada", "amy", "joe", "kay"]);
+    }
+
+    /// An edge insert is a commit, not a fold: the epoch stays where it
+    /// was, and the edge is read out of the overlay, in both
+    /// directions, carrying the cells it was written with.
+    ///
+    /// This is the whole point of the deferral. A fold rebuilds both
+    /// adjacency sides and rewrites every edge property column into the
+    /// new edge order, which is work linear in the edges already there,
+    /// so an insert that folds costs more the bigger the table gets.
+    #[test]
+    fn an_edge_insert_is_read_before_it_is_folded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edge-defer.zu1");
+        seeded_dated(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        // The first write opens the writer, which recovers and folds,
+        // so the epoch to hold against is the one after it.
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        // amy to ada closes the cycle the three seeded edges leave
+        // open, and it is the pair that sorts first in ada's backward
+        // list, so the merge has to place it rather than append it.
+        session
+            .run(
+                "MATCH (a:person), (b:person) WHERE a.name = 'amy' AND b.name = 'ada' \
+                 INSERT (a)-[:knows {since: 2020, note: 'gym'}]->(b)",
+                &[],
+            )
+            .expect("write an edge");
+        assert_eq!(session.epoch(), before, "an edge insert folded");
+
+        let out = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) \
+                 RETURN a.name AS from, b.name AS to, k.since AS since, k.note AS note \
+                 ORDER BY from",
+                &[],
+            )
+            .expect("walk forward");
+        let forward: Vec<(String, String, Value, String)> = out
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    string(row, 0),
+                    string(row, 1),
+                    row[2].clone(),
+                    string(row, 3),
+                )
+            })
+            .collect();
+        assert_eq!(
+            forward,
+            [
+                (
+                    "ada".into(),
+                    "kay".into(),
+                    Value::Int(1990),
+                    "school".into()
+                ),
+                ("amy".into(), "ada".into(), Value::Int(2020), "gym".into()),
+                ("joe".into(), "amy".into(), Value::Int(2010), "club".into()),
+                ("kay".into(), "joe".into(), Value::Int(2000), "work".into()),
+            ]
+        );
+
+        // Backward, ada is now somebody's neighbor, and the ordinal the
+        // added edge took has to resolve to the cells it was written
+        // with rather than to the seeded edge that shares its slot.
+        let back = session
+            .run(
+                "MATCH (a:person)<-[k:knows]-(b:person) WHERE a.name = 'ada' \
+                 RETURN b.name AS from, k.since AS since, k.note AS note",
+                &[],
+            )
+            .expect("walk backward");
+        assert_eq!(back.rows.len(), 1);
+        assert_eq!(string(&back.rows[0], 0), "amy");
+        assert_eq!(back.rows[0][1], Value::Int(2020));
+        assert_eq!(string(&back.rows[0], 2), "gym");
+
+        // And a degree is the merged one, on both sides.
+        let counts = session
+            .run(
+                "MATCH (a:person)-[:knows]->(b:person) RETURN count(b) AS n",
+                &[],
+            )
+            .expect("count");
+        assert_eq!(counts.rows[0][0], Value::Int(4));
+    }
+
+    /// What the overlay answered, the file answers on its own once the
+    /// fold has sealed it, at an epoch that has moved.
+    #[test]
+    fn a_folded_edge_reads_the_same_as_the_deferred_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edge-fold.zu1");
+        seeded_dated(&path);
+
+        let years = |session: &mut Session| -> Vec<(String, i64)> {
+            session
+                .run(
+                    "MATCH (a:person)-[k:knows]->(b:person) \
+                     RETURN a.name AS from, k.since AS since ORDER BY from",
+                    &[],
+                )
+                .expect("read")
+                .rows
+                .iter()
+                .map(|row| match row[1] {
+                    Value::Int(n) => (string(row, 0), n),
+                    ref other => panic!("expected a year, got {other:?}"),
+                })
+                .collect()
+        };
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run(
+                "MATCH (a:person), (b:person) WHERE a.name = 'amy' AND b.name = 'ada' \
+                 INSERT (a)-[:knows {since: 2020, note: 'gym'}]->(b)",
+                &[],
+            )
+            .expect("write an edge");
+        let deferred = years(&mut session);
+        let before = session.epoch();
+
+        // Taking the file folds what the writer was holding.
+        session.file_mut().expect("fold");
+        assert_eq!(years(&mut session), deferred);
+        assert!(session.epoch() > before, "a fold published no epoch");
     }
 
     /// A transaction whose staging raises leaves the database exactly
@@ -861,6 +1230,39 @@ mod tests {
         assert_eq!(ages(&mut session), [20, 30, 40, 77]);
     }
 
+    /// So is an edge insert. The pair and the cells it carries are in
+    /// the frame the commit synced, so a process that dies with the
+    /// fold still owed comes back to an edge that is there.
+    #[test]
+    fn an_edge_insert_survives_a_crash_before_the_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crash-edge.zu1");
+        seeded_dated(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run(
+                "MATCH (a:person), (b:person) WHERE a.name = 'amy' AND b.name = 'ada' \
+                 INSERT (a)-[:knows {since: 2020, note: 'gym'}]->(b)",
+                &[],
+            )
+            .expect("write an edge");
+        std::mem::forget(session);
+
+        let mut session = Session::open(&path).expect("reopen");
+        let out = session
+            .run(
+                "MATCH (a:person)<-[k:knows]-(b:person) WHERE a.name = 'ada' \
+                 RETURN b.name AS from, k.since AS since, k.note AS note",
+                &[],
+            )
+            .expect("read");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(string(&out.rows[0], 0), "amy");
+        assert_eq!(out.rows[0][1], Value::Int(2020));
+        assert_eq!(string(&out.rows[0], 2), "gym");
+    }
+
     /// A point write inside a transaction that rolls back goes away,
     /// which is the one thing the readers holding the unsealed cells
     /// must not keep.
@@ -878,5 +1280,39 @@ mod tests {
         assert_eq!(ages(&mut session), [20, 30, 40, 88]);
         session.run("ROLLBACK", &[]).expect("roll back");
         assert_eq!(ages(&mut session), [10, 20, 30, 40]);
+    }
+
+    /// And an edge insert inside one goes away with it, adjacency and
+    /// cells together, which is what says the overlay is dropped rather
+    /// than only the log frame.
+    #[test]
+    fn a_rolled_back_edge_insert_goes_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rollback-edge.zu1");
+        seeded_dated(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let into_ada = |session: &mut Session| -> usize {
+            session
+                .run(
+                    "MATCH (a:person)<-[:knows]-(b:person) WHERE a.name = 'ada' RETURN b.name",
+                    &[],
+                )
+                .expect("read")
+                .rows
+                .len()
+        };
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run(
+                "MATCH (a:person), (b:person) WHERE a.name = 'amy' AND b.name = 'ada' \
+                 INSERT (a)-[:knows {since: 2020, note: 'gym'}]->(b)",
+                &[],
+            )
+            .expect("write an edge");
+        assert_eq!(into_ada(&mut session), 1);
+        session.run("ROLLBACK", &[]).expect("roll back");
+        assert_eq!(into_ada(&mut session), 0);
     }
 }

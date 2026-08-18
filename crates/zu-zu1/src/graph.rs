@@ -44,6 +44,7 @@
 //! (see [`GraphReader::edge_ordinal`]), and nothing in either direction
 //! costs a permutation on disk.
 
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
@@ -1469,6 +1470,115 @@ pub(crate) fn copy_blocks(db: &mut Zu1File, blocks: &[BlockPtr]) -> Result<Vec<B
 /// two directions cache independently because a plan often walks both
 /// on the same rel row by row, an expand backward feeding a count
 /// forward, and a shared slot would decode a full group per row.
+/// The edges committed since the last fold, held the way a reader
+/// wants them rather than the way the log wrote them.
+///
+/// An edge added to a rel table does not have to wait for a fold to be
+/// readable: the file holds a sorted list per node per direction, and
+/// a handful of extra edges merge into one of those as it is read. So
+/// a commit that only adds edges leaves them here, the reader merges,
+/// and the CSR is rebuilt once for the run of them rather than once
+/// each.
+///
+/// An edge's ordinal is its row in the rel table's property columns.
+/// The base holds `base` of them, in the order the forward CSR lays
+/// them out, and an edge in here takes the next one after those, so
+/// the two spaces do not overlap and an unfolded edge names its own
+/// values. Both directions carry the ordinal, which is what makes the
+/// same edge read forward and read backward carry the same row.
+#[derive(Debug, Default, Clone)]
+pub struct EdgePatch {
+    /// Ordinals the base file already holds, which is the first
+    /// ordinal an edge in here can take.
+    base: u64,
+    /// Destinations and their ordinals per source, ascending, which is
+    /// the order the forward lists are in.
+    fwd: BTreeMap<u64, Vec<(u64, u64)>>,
+    /// Sources and their ordinals per destination, the same the other
+    /// way round.
+    bwd: BTreeMap<u64, Vec<(u64, u64)>>,
+    /// How many edges are in here, which is what the next one's
+    /// ordinal counts from.
+    added: u64,
+}
+
+impl EdgePatch {
+    /// An empty patch over a base holding `base` edges.
+    pub fn new(base: u64) -> Self {
+        EdgePatch {
+            base,
+            ..EdgePatch::default()
+        }
+    }
+
+    /// Takes one edge and answers with the ordinal it was given.
+    pub fn add(&mut self, src: u64, dst: u64) -> u64 {
+        let ord = self.base + self.added;
+        put(&mut self.fwd, src, dst, ord);
+        put(&mut self.bwd, dst, src, ord);
+        self.added += 1;
+        ord
+    }
+
+    /// The first ordinal this patch handed out, so a caller holding one
+    /// can tell an edge in here from an edge in the file.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// How many edges this holds, which is what a writer bounds when it
+    /// decides whether to keep deferring the fold.
+    pub fn len(&self) -> u64 {
+        self.added
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.added == 0
+    }
+
+    /// Whether this holds an edge from `src` to `dst`, which is what a
+    /// writer asks before adding one: two edges over one pair would
+    /// take ordinals that are not consecutive, and every read of an
+    /// edge property counts on a pair's copies being so.
+    pub fn holds(&self, src: u64, dst: u64) -> bool {
+        let list = self.of(src, Direction::Fwd);
+        let at = list.partition_point(|&(n, _)| n < dst);
+        list.get(at).is_some_and(|&(n, _)| n == dst)
+    }
+
+    /// Whether any node of `group` has an unfolded edge in `dir`, which
+    /// is what says a pinned group has to be built rather than handed
+    /// over as the file holds it.
+    fn touches(&self, group: usize, dir: Direction) -> bool {
+        let base = group as u64 * GROUP_ROWS as u64;
+        self.side(dir)
+            .range(base..base + GROUP_ROWS as u64)
+            .next()
+            .is_some()
+    }
+
+    fn side(&self, dir: Direction) -> &BTreeMap<u64, Vec<(u64, u64)>> {
+        match dir {
+            Direction::Fwd => &self.fwd,
+            Direction::Bwd => &self.bwd,
+        }
+    }
+
+    /// `node`'s edges in `dir`, as neighbor and ordinal pairs in list
+    /// order.
+    fn of(&self, node: u64, dir: Direction) -> &[(u64, u64)] {
+        self.side(dir).get(&node).map_or(&[][..], Vec::as_slice)
+    }
+}
+
+/// Puts one end of one edge in its list, keeping the list in the order
+/// a CSR list is in: by neighbor, and by ordinal where a pair repeats.
+fn put(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64, ord: u64) {
+    let list = side.entry(node).or_default();
+    let at = list.partition_point(|&(n, o)| (n, o) < (other, ord));
+    list.insert(at, (other, ord));
+}
+
 #[derive(Debug)]
 pub struct GraphReader {
     directory: Directory,
@@ -1480,6 +1590,17 @@ pub struct GraphReader {
     /// chunk ago, and at eight workers that lock is the profile.
     cached_offsets: [Option<(usize, Arc<Vec<u64>>)>; 2],
     key_reader: Option<KeyReader>,
+    /// The edges committed since the last fold, which the reads below
+    /// merge into the lists the file holds. `None` is a reader over a
+    /// file nothing is being written to, which is every read path but
+    /// the session's own.
+    edges: Option<Arc<EdgePatch>>,
+    /// Where a merged list is built, so a caller asking for a slice
+    /// gets one without an allocation per call.
+    merged: Vec<(u64, u64)>,
+    /// The neighbors of that list on their own, which is what the
+    /// slice-returning reads hand back.
+    flat: Vec<u64>,
 }
 
 /// One decoded CSR group: its index, offsets, and neighbor values. The
@@ -1528,6 +1649,9 @@ impl GraphReader {
             cached_groups: [None, None],
             cached_offsets: [None, None],
             key_reader: None,
+            edges: None,
+            merged: Vec::new(),
+            flat: Vec::new(),
         })
     }
 
@@ -1569,19 +1693,121 @@ impl GraphReader {
         ))
     }
 
+    /// Hands this reader the edges committed since the last fold, or
+    /// takes them back away with `None`. Every read below merges them
+    /// into what the file holds, so a caller that sets this reads a
+    /// graph the CSR does not hold yet.
+    pub fn set_edges(&mut self, edges: Option<Arc<EdgePatch>>) {
+        self.edges = edges;
+    }
+
+    /// How many of `node`'s edges in `dir` are unfolded, which is zero
+    /// on a reader nobody has handed a patch to.
+    fn added(&self, node: u64, dir: Direction) -> usize {
+        self.edges
+            .as_ref()
+            .map_or(0, |patch| patch.of(node, dir).len())
+    }
+
     /// Returns `node`'s sorted list in `dir`, decoding the node's group
     /// on a cache miss.
+    ///
+    /// A node with unfolded edges is answered out of the merge buffer
+    /// instead of the decoded group, because the list it wants is not
+    /// one the file holds anywhere. Every other node, which on a patch
+    /// of a few hundred edges is very nearly all of them, takes the
+    /// slice the group cache already has.
     pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
+        if self.added(node, dir) == 0 {
+            return self.base_neighbors(db, node, dir);
+        }
+        let mut pairs = std::mem::take(&mut self.merged);
+        let built = self.list_with_ordinals(db, node, dir, &mut pairs);
+        self.merged = pairs;
+        built?;
+        self.flat.clear();
+        self.flat.extend(self.merged.iter().map(|&(n, _)| n));
+        Ok(&self.flat)
+    }
+
+    /// `node`'s list in `dir` as the file holds it, patch or no patch.
+    /// This is what the merge reads to build the answer above, so it is
+    /// the one adjacency read that must not consult the patch.
+    fn base_neighbors(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
         let (g, row) = self.locate(node, dir)?;
         let idx = dir as usize;
         if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
-            let (offsets, nbrs) = self.csr_group(db, g, dir)?;
+            let (offsets, nbrs) = self.base_csr_group(db, g, dir)?;
             self.cached_groups[idx] = Some((g, offsets, nbrs));
         }
         let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().unwrap();
         let lo = offsets[row] as usize;
         let hi = offsets[row + 1] as usize;
         Ok(&nbrs[lo..hi])
+    }
+
+    /// `node`'s list in `dir` as neighbor and ordinal pairs, the file's
+    /// edges and the unfolded ones together, in the order a folded CSR
+    /// would hold them: by neighbor, and by ordinal where the same pair
+    /// runs more than once.
+    ///
+    /// Forward the file's ordinals are the group's base plus the slot,
+    /// which is a range. Backward the slot in the reverse array says
+    /// nothing about the forward one, so each run of one source is
+    /// looked up once and its copies counted off from there. An
+    /// unfolded edge carries the ordinal the patch handed it, past
+    /// everything the file holds, and that is why it sorts last inside
+    /// its own neighbor value.
+    fn list_with_ordinals(
+        &mut self,
+        db: &mut Zu1File,
+        node: u64,
+        dir: Direction,
+        out: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        out.clear();
+        match dir {
+            Direction::Fwd => {
+                let (list, base) = self.base_out_from(db, node)?;
+                out.extend(list.iter().enumerate().map(|(i, &n)| (n, base + i as u64)));
+            }
+            Direction::Bwd => {
+                // The sources land in `out` first and their ordinals are
+                // filled in after, because the forward lookup below wants
+                // the reader and the backward list borrows it.
+                out.extend(
+                    self.base_neighbors(db, node, Direction::Bwd)?
+                        .iter()
+                        .map(|&src| (src, 0)),
+                );
+                let mut i = 0;
+                while i < out.len() {
+                    let src = out[i].0;
+                    let mut j = i + 1;
+                    while j < out.len() && out[j].0 == src {
+                        j += 1;
+                    }
+                    let base = self.base_edge_run(db, src, node)?.map(|(b, _)| b);
+                    let base = base.ok_or_else(|| ZuError::Corrupt {
+                        what: "adjacency",
+                        detail: format!(
+                            "the in-list of node {node} holds {src}, and no forward edge does"
+                        ),
+                    })?;
+                    for (k, slot) in out[i..j].iter_mut().enumerate() {
+                        slot.1 = base + k as u64;
+                    }
+                    i = j;
+                }
+            }
+        }
+        if let Some(patch) = self.edges.clone() {
+            for &(other, ord) in patch.of(node, dir) {
+                let at = out.partition_point(|&(n, o)| (n, o) < (other, ord));
+                out.insert(at, (other, ord));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the sorted out-neighbor list of `node`.
@@ -1601,11 +1827,19 @@ impl GraphReader {
     /// pair can repeat the count is the only thing that tells the
     /// copies apart.
     pub fn out_neighbors_from(&mut self, db: &mut Zu1File, node: u64) -> Result<(&[u64], u64)> {
+        self.base_out_from(db, node)
+    }
+
+    /// The same over the file's edges alone. An unfolded edge takes an
+    /// ordinal past everything the file holds, so a list holding one is
+    /// not a range and cannot be reported this way; the merge reads
+    /// this and puts the rest on itself.
+    fn base_out_from(&mut self, db: &mut Zu1File, node: u64) -> Result<(&[u64], u64)> {
         let (g, row) = self.locate(node, Direction::Fwd)?;
         let base = self.directory.groups[g].edge_base;
         let idx = Direction::Fwd as usize;
         if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
-            let (offsets, nbrs) = self.csr_group(db, g, Direction::Fwd)?;
+            let (offsets, nbrs) = self.base_csr_group(db, g, Direction::Fwd)?;
             self.cached_groups[idx] = Some((g, offsets, nbrs));
         }
         let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().expect("just cached");
@@ -1621,6 +1855,14 @@ impl GraphReader {
     /// them, so a caller wanting fewer lists than there are chunks is
     /// better off reading each one. It is the same rule
     /// [`Self::degrees_into`] uses on the offset array.
+    /// Whether pinning `group` in `dir` is still the cheap read. A
+    /// group the patch reaches into is built on every pin, so while a
+    /// patch is up the caller is better off taking one list at a time
+    /// however many it wants.
+    pub fn pinnable(&self, group: usize, dir: Direction) -> bool {
+        !self.edges.as_ref().is_some_and(|p| p.touches(group, dir))
+    }
+
     pub fn list_chunks(&self, group: usize, dir: Direction) -> usize {
         match self.directory.groups.get(group) {
             Some(g) => g.dir(dir).neighbors.chunk_count(),
@@ -1633,6 +1875,47 @@ impl GraphReader {
     /// probes and two `Arc` clones, no decode and no copy, which is
     /// what the Snapshot csr surface lends out as borrowed slices.
     pub fn csr_group(&self, db: &mut Zu1File, group: usize, dir: Direction) -> Result<CsrArrays> {
+        let (offsets, neighbors) = self.base_csr_group(db, group, dir)?;
+        let Some(patch) = self.edges.as_ref().filter(|p| p.touches(group, dir)) else {
+            return Ok((offsets, neighbors));
+        };
+        // A group the patch reaches into is built rather than pinned:
+        // the pooled arrays are what the file holds and the answer is
+        // not, so the merge happens here and the caller is handed a
+        // pair of its own. This costs a copy of the group, which is
+        // why the reads that can say so tell the executor to take one
+        // list at a time while a patch is up ([`Self::pinnable`]).
+        let rows = offsets.len() - 1;
+        let base = group as u64 * GROUP_ROWS as u64;
+        let mut merged_offsets = Vec::with_capacity(offsets.len());
+        let mut merged = Vec::with_capacity(neighbors.len() + patch.len() as usize);
+        merged_offsets.push(0);
+        for row in 0..rows {
+            let lo = offsets[row] as usize;
+            let hi = offsets[row + 1] as usize;
+            let added = patch.of(base + row as u64, dir);
+            match added.is_empty() {
+                true => merged.extend_from_slice(&neighbors[lo..hi]),
+                false => {
+                    let mut at = lo;
+                    for &(other, _) in added {
+                        let take = at + neighbors[at..hi].partition_point(|&n| n <= other);
+                        merged.extend_from_slice(&neighbors[at..take]);
+                        merged.push(other);
+                        at = take;
+                    }
+                    merged.extend_from_slice(&neighbors[at..hi]);
+                }
+            }
+            merged_offsets.push(merged.len() as u64);
+        }
+        Ok((Arc::new(merged_offsets), Arc::new(merged)))
+    }
+
+    /// One group's CSR as the file holds it, which is what the merge
+    /// above reads and the only adjacency read that does not consult
+    /// the patch.
+    fn base_csr_group(&self, db: &mut Zu1File, group: usize, dir: Direction) -> Result<CsrArrays> {
         let meta = self
             .directory
             .groups
@@ -1658,7 +1941,7 @@ impl GraphReader {
         let meta = self.directory.groups[g].dir(dir);
         let pools = db.pools();
         let offs = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
-        Ok(offs[row + 1] - offs[row])
+        Ok(offs[row + 1] - offs[row] + self.added(node, dir) as u64)
     }
 
     /// The pooled offset array of `group` in `dir` through the
@@ -1738,7 +2021,7 @@ impl GraphReader {
                 let offs = Arc::clone(self.offsets(db, group, dir)?);
                 for (i, &node) in (at..end).zip(&nodes[at..end]) {
                     let (_, row) = self.locate(node, dir)?;
-                    sink(i, offs[row + 1] - offs[row]);
+                    sink(i, offs[row + 1] - offs[row] + self.added(node, dir) as u64);
                 }
             } else {
                 let meta = &self.directory.groups[group].dir(dir).offsets;
@@ -1747,7 +2030,7 @@ impl GraphReader {
                     let (_, row) = self.locate(node, dir)?;
                     pair.clear();
                     read_range(db, meta, row as u64, row as u64 + 2, &mut pair)?;
-                    sink(i, pair[1] - pair[0]);
+                    sink(i, pair[1] - pair[0] + self.added(node, dir) as u64);
                 }
             }
             at = end;
@@ -1771,7 +2054,19 @@ impl GraphReader {
         let meta = self.directory.groups[g].dir(dir);
         let mut offs = Vec::with_capacity(2);
         read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
-        read_range(db, &meta.neighbors, offs[0], offs[1], out)
+        let from = out.len();
+        read_range(db, &meta.neighbors, offs[0], offs[1], out)?;
+        // The unfolded edges go into the list they belong in rather than
+        // on the end of it, because the caller is owed a sorted list and
+        // reads it as one. Each goes after the run of its own value, so
+        // this and the ordinals below agree slot for slot.
+        if let Some(patch) = &self.edges {
+            for &(other, _) in patch.of(node, dir) {
+                let at = from + out[from..].partition_point(|&n| n <= other);
+                out.insert(at, other);
+            }
+        }
+        Ok(())
     }
 
     /// Point access to the out-neighbor list.
@@ -1791,6 +2086,13 @@ impl GraphReader {
         other: u64,
         dir: Direction,
     ) -> Result<bool> {
+        if let Some(patch) = &self.edges {
+            let added = patch.of(node, dir);
+            let at = added.partition_point(|&(n, _)| n < other);
+            if added.get(at).is_some_and(|&(n, _)| n == other) {
+                return Ok(true);
+            }
+        }
         let (g, row) = self.locate(node, dir)?;
         let meta = self.directory.groups[g].dir(dir);
         let mut offs = Vec::with_capacity(2);
@@ -1844,11 +2146,33 @@ impl GraphReader {
     /// `partition_point` for its start and a scan for its end, and the
     /// scan is over equal values a decoded group already holds.
     pub fn edge_run(&mut self, db: &mut Zu1File, src: u64, dst: u64) -> Result<Option<(u64, u64)>> {
+        if let Some(patch) = self.edges.clone() {
+            let added = patch.of(src, Direction::Fwd);
+            let at = added.partition_point(|&(n, _)| n < dst);
+            if let Some(&(n, ord)) = added.get(at)
+                && n == dst
+            {
+                // An unfolded edge is only ever deferred over a pair the
+                // graph does not hold, so the run it names is itself
+                // and there is nothing of the file's to count in.
+                return Ok(Some((ord, 1)));
+            }
+        }
+        self.base_edge_run(db, src, dst)
+    }
+
+    /// The run `src -> dst` holds in the file alone.
+    fn base_edge_run(
+        &mut self,
+        db: &mut Zu1File,
+        src: u64,
+        dst: u64,
+    ) -> Result<Option<(u64, u64)>> {
         let (g, row) = self.locate(src, Direction::Fwd)?;
         let base = self.directory.groups[g].edge_base;
         let idx = Direction::Fwd as usize;
         if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
-            let (offsets, nbrs) = self.csr_group(db, g, Direction::Fwd)?;
+            let (offsets, nbrs) = self.base_csr_group(db, g, Direction::Fwd)?;
             self.cached_groups[idx] = Some((g, offsets, nbrs));
         }
         let (_, offsets, nbrs) = self.cached_groups[idx].as_ref().expect("just cached");
@@ -1903,9 +2227,16 @@ impl GraphReader {
         out: &mut Vec<u64>,
     ) -> Result<()> {
         out.clear();
+        if self.added(node, dir) > 0 {
+            let mut pairs = std::mem::take(&mut self.merged);
+            let built = self.list_with_ordinals(db, node, dir, &mut pairs);
+            out.extend(pairs.iter().map(|&(_, ord)| ord));
+            self.merged = pairs;
+            return built;
+        }
         match dir {
             Direction::Fwd => {
-                let (list, base) = self.out_neighbors_from(db, node)?;
+                let (list, base) = self.base_out_from(db, node)?;
                 let len = list.len() as u64;
                 out.extend(base..base + len);
             }
@@ -1924,13 +2255,12 @@ impl GraphReader {
                     // The backward list holds this edge, so the forward
                     // one does too, and a missing ordinal means the two
                     // arrays disagree about the graph.
-                    let base = self.edge_ordinal(db, src, node)?.ok_or_else(|| {
-                        ZuError::Corrupt {
-                            what: "adjacency",
-                            detail: format!(
-                                "the in-list of node {node} holds {src}, and no forward edge does"
-                            ),
-                        }
+                    let base = self.base_edge_run(db, src, node)?.map(|(b, _)| b);
+                    let base = base.ok_or_else(|| ZuError::Corrupt {
+                        what: "adjacency",
+                        detail: format!(
+                            "the in-list of node {node} holds {src}, and no forward edge does"
+                        ),
                     })?;
                     for (k, slot) in out[i..j].iter_mut().enumerate() {
                         *slot = base + k as u64;
@@ -2161,6 +2491,108 @@ mod tests {
         assert_eq!(reader.lookup_key(&mut db, 15).unwrap(), None);
         let row = reader.lookup_key(&mut db, 14).unwrap().unwrap();
         assert_eq!(reader.neighbors(&mut db, row).unwrap(), &[2]);
+    }
+
+    /// Every read a reader offers agrees with the patch: the two
+    /// lists, the two degrees, the probe, the merged group, and the
+    /// ordinals the property columns are addressed by.
+    ///
+    /// The added edges are picked to land in the middle of the lists
+    /// they join rather than on the end, because placing them is the
+    /// part a merge gets wrong. Their ordinals go past everything the
+    /// file holds, which is what puts them last inside their own
+    /// neighbor value.
+    #[test]
+    fn a_patch_is_merged_into_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.zu1");
+        let mut edges = vec![(0u32, 1u32), (0, 3), (1, 2), (3, 0), (3, 1), (4, 4)];
+        {
+            let mut db = Zu1File::create(&path).unwrap();
+            bulk_load(&mut db, 5, sorted_edges(&mut edges)).unwrap();
+        }
+        let mut db = Zu1File::open(&path).unwrap();
+        let mut reader = GraphReader::load(&mut db).unwrap();
+        let base = reader.directory().edge_count;
+        assert_eq!(base, 6);
+
+        let mut patch = EdgePatch::new(base);
+        assert_eq!(patch.add(0, 2), base);
+        assert_eq!(patch.add(3, 4), base + 1);
+        reader.set_edges(Some(Arc::new(patch)));
+
+        // 0 gains 2 between its 1 and its 3, and 3 gains 4 after both.
+        let fwd: &[(u64, &[u64])] = &[
+            (0, &[1, 2, 3]),
+            (1, &[2]),
+            (2, &[]),
+            (3, &[0, 1, 4]),
+            (4, &[4]),
+        ];
+        let bwd: &[(u64, &[u64])] = &[
+            (0, &[3]),
+            (1, &[0, 3]),
+            (2, &[0, 1]),
+            (3, &[0]),
+            (4, &[3, 4]),
+        ];
+        for (dir, want) in [(Direction::Fwd, fwd), (Direction::Bwd, bwd)] {
+            for &(node, list) in want {
+                assert_eq!(
+                    reader.neighbors_dir(&mut db, node, dir).unwrap(),
+                    list,
+                    "list of {node} in {dir:?}"
+                );
+                let mut point = Vec::new();
+                reader
+                    .neighbors_dir_into(&mut db, node, dir, &mut point)
+                    .unwrap();
+                assert_eq!(point, list, "point list of {node} in {dir:?}");
+                assert_eq!(
+                    reader.degree_of(&mut db, node, dir).unwrap(),
+                    list.len() as u64,
+                    "degree of {node} in {dir:?}"
+                );
+                let mut degrees = [0u64];
+                reader
+                    .degrees_into(&mut db, &[node], dir, &mut degrees)
+                    .unwrap();
+                assert_eq!(degrees[0], list.len() as u64, "batch degree of {node}");
+            }
+            // The group a patch touches is not pinnable, because a pin
+            // hands out the arrays the file holds.
+            assert!(!reader.pinnable(0, dir), "a touched group pinned");
+            let (offsets, neighbors) = reader.csr_group(&mut db, 0, dir).unwrap();
+            for &(node, list) in want {
+                let lo = offsets[node as usize] as usize;
+                let hi = offsets[node as usize + 1] as usize;
+                assert_eq!(&neighbors[lo..hi], list, "group list of {node} in {dir:?}");
+            }
+        }
+
+        // The probe answers for a patched pair and still refuses one
+        // neither side holds.
+        assert!(reader.has_edge(&mut db, 0, 2).unwrap());
+        assert!(reader.has_edge(&mut db, 3, 4).unwrap());
+        assert!(!reader.has_edge(&mut db, 2, 0).unwrap());
+        assert_eq!(reader.edge_ordinal(&mut db, 0, 2).unwrap(), Some(base));
+        assert_eq!(reader.edge_ordinal(&mut db, 3, 4).unwrap(), Some(base + 1));
+
+        // The ordinals are the rows the property columns are read at,
+        // so they have to line up with the lists above value by value.
+        let ords: &[(u64, Direction, &[u64])] = &[
+            (0, Direction::Fwd, &[0, 6, 1]),
+            (3, Direction::Fwd, &[3, 4, 7]),
+            (2, Direction::Bwd, &[6, 2]),
+            (4, Direction::Bwd, &[7, 5]),
+        ];
+        let mut out = Vec::new();
+        for &(node, dir, want) in ords {
+            reader
+                .neighbor_ordinals_into(&mut db, node, dir, &mut out)
+                .unwrap();
+            assert_eq!(out, want, "ordinals of {node} in {dir:?}");
+        }
     }
 
     #[test]

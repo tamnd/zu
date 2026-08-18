@@ -217,8 +217,15 @@ pub trait Snapshot {
     /// decoded, and on a working set larger than the decoded pool it
     /// does not even get to keep them. Backends that decode nothing
     /// lazily answer 0, which asks for the pin every time.
-    fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<usize> {
-        Ok(0)
+    ///
+    /// `None` is not a very high threshold, it is a refusal: this group
+    /// must be read a list at a time whatever the caller wants. A
+    /// backend answers that when a pin would be wrong rather than
+    /// merely expensive, which is what an unfolded edge over the group
+    /// makes it, since a pin hands out the arrays the file holds and
+    /// those are the ones the edge is not in.
+    fn list_threshold(&mut self, _rel: RelId, _group: GroupId, _dir: Dir) -> Result<Option<usize>> {
+        Ok(Some(0))
     }
 
     /// Appends one node's sorted neighbor list in `dir` to `out`,

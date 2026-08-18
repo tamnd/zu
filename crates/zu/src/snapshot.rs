@@ -146,8 +146,12 @@ impl SnapshotCache {
     pub fn set_patches(&mut self, patches: Arc<Patches>) {
         for (table, reader) in &mut self.props {
             if let Some(reader) = reader {
-                reader.set_patch(patches.get(table).cloned());
+                reader.set_patch(patches.cells.get(table).cloned());
+                reader.set_added(patches.rows.get(table).cloned());
             }
+        }
+        for (rel, reader) in &mut self.readers {
+            reader.set_edges(patches.edges.get(rel).cloned());
         }
         self.patches = patches;
     }
@@ -202,7 +206,8 @@ impl<'a> Zu1Snapshot<'a> {
             .ok_or_else(|| ZuError::InvalidArgument(format!("unknown rel table {rel}")))?
             .name
             .clone();
-        let reader = GraphReader::load_table(&mut self.db, &name)?;
+        let mut reader = GraphReader::load_table(&mut self.db, &name)?;
+        reader.set_edges(self.patches.edges.get(&rel).cloned());
         self.readers.insert(rel, reader);
         Ok(())
     }
@@ -211,10 +216,12 @@ impl<'a> Zu1Snapshot<'a> {
         if self.props.contains_key(&table) {
             return Ok(());
         }
-        let patch = self.patches.get(&table).cloned();
+        let patch = self.patches.cells.get(&table).cloned();
+        let added = self.patches.rows.get(&table).cloned();
         let reader = load_props(&mut self.db, table)?.map(|directory| {
             let mut reader = PropsReader::new(directory);
             reader.set_patch(patch);
+            reader.set_added(added);
             reader
         });
         self.props.insert(table, reader);
@@ -229,7 +236,14 @@ impl<'a> Zu1Snapshot<'a> {
         if self.props.contains_key(&rel) {
             return Ok(());
         }
-        let reader = load_rel_props(&mut self.db, rel)?.map(PropsReader::new);
+        let patch = self.patches.cells.get(&rel).cloned();
+        let added = self.patches.rows.get(&rel).cloned();
+        let reader = load_rel_props(&mut self.db, rel)?.map(|directory| {
+            let mut reader = PropsReader::new(directory);
+            reader.set_patch(patch);
+            reader.set_added(added);
+            reader
+        });
         self.props.insert(rel, reader);
         Ok(())
     }
@@ -574,16 +588,22 @@ impl Snapshot for Zu1Snapshot<'_> {
         Ok(CsrPin { offsets, neighbors })
     }
 
-    fn list_threshold(&mut self, rel: RelId, group: GroupId, dir: Dir) -> Result<usize> {
+    fn list_threshold(&mut self, rel: RelId, group: GroupId, dir: Dir) -> Result<Option<usize>> {
         // The point path only comes up on groups far larger than a test
         // builds, so ZU_POINT_READS=1 asks for it everywhere and the
         // whole query suite runs through it. Nothing outside a test run
         // sets this.
         if forced_point_reads() {
-            return Ok(usize::MAX);
+            return Ok(None);
         }
         self.ensure_reader(rel)?;
         let reader = self.readers.get(&rel).expect("just loaded");
+        // A group holding edges no fold has sealed is built on every
+        // pin rather than decoded once, so while that is true the
+        // caller reads one list at a time however many it wants.
+        if !reader.pinnable(group as usize, direction(dir)) {
+            return Ok(None);
+        }
         // Reading one list decodes about four chunks: two on the
         // offsets to find where the list starts and ends, and one or
         // two on the neighbors to cover it. The pin decodes every
@@ -591,7 +611,7 @@ impl Snapshot for Zu1Snapshot<'_> {
         // roughly a quarter as many lists as the group has chunks,
         // and a scan morsel is far past that while a seed is far
         // short of it.
-        Ok(reader.list_chunks(group as usize, direction(dir)) / 4)
+        Ok(Some(reader.list_chunks(group as usize, direction(dir)) / 4))
     }
 
     fn list_into(&mut self, rel: RelId, node: u64, dir: Dir, out: &mut Vec<u64>) -> Result<()> {

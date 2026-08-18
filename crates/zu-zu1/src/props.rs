@@ -44,6 +44,7 @@ use crate::segment::{
     load_chunk_directory_pooled, read_one_cached, write_segment,
 };
 use crate::stats;
+use crate::txn::Cell;
 
 /// Version 1 held a one byte type that could say string or integer and
 /// nothing else. Version 2 holds a code from [`TYPE_CODES`], which is
@@ -1452,6 +1453,90 @@ impl LanePatch {
     }
 }
 
+/// The rows a commit added that no fold has put in the columns yet.
+///
+/// [`LanePatch`] carries a new word for a row the columns already hold,
+/// which is an update. This carries whole rows past the end of them,
+/// which is what an edge insert leaves behind once the adjacency reader
+/// stopped needing the CSR rebuilt to see it: the edge takes the next
+/// ordinal, its property values sit here under that ordinal, and a
+/// gather asking for it reads them from here rather than off a column
+/// that has not been rewritten.
+///
+/// Any value at all, unlike the lane patch, because these rows are not
+/// stored anywhere yet and there is nothing to lay a word over: a
+/// string is the bytes and an absent value is [`Cell::Null`].
+#[derive(Debug, Default, Clone)]
+pub struct RowPatch {
+    /// The first row this holds, which is what the columns count.
+    base: u64,
+    /// One entry per unfolded row in ordinal order, each a cell for
+    /// every column the table stores, by position in the directory.
+    rows: Vec<Vec<Cell>>,
+}
+
+impl RowPatch {
+    /// An empty patch over columns holding `base` rows.
+    pub fn new(base: u64) -> Self {
+        RowPatch {
+            base,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Takes one row, a cell per column, and answers with the row
+    /// number it was given.
+    pub fn push(&mut self, cells: Vec<Cell>) -> u64 {
+        let row = self.base + self.rows.len() as u64;
+        self.rows.push(cells);
+        row
+    }
+
+    /// The first row this holds, so a caller with a row number can tell
+    /// an unfolded row from a stored one.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// How many rows this holds, which is what a writer bounds when it
+    /// decides whether to keep deferring the fold.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The cell row `row` holds in `col`, or `None` when the row is one
+    /// the columns already hold or the column was never given a value.
+    fn get(&self, col: usize, row: u64) -> Option<&Cell> {
+        let at = row.checked_sub(self.base)? as usize;
+        self.rows.get(at)?.get(col)
+    }
+
+    /// The word row `row` holds in `col`, for the lane read paths. A
+    /// string or an absence in a lane column is a patch the writer
+    /// should not have built, and reads as zero rather than raising
+    /// from inside a gather.
+    fn word(&self, col: usize, row: u64) -> Option<u64> {
+        match self.get(col, row) {
+            Some(Cell::Int(word)) => Some(*word),
+            Some(_) => Some(0),
+            None => None,
+        }
+    }
+
+    /// The bytes row `row` holds in `col`, empty where it holds none.
+    fn bytes(&self, col: usize, row: u64) -> Option<&[u8]> {
+        match self.get(col, row) {
+            Some(Cell::Str(bytes)) => Some(bytes),
+            Some(_) => Some(&[]),
+            None => None,
+        }
+    }
+}
+
 /// Point reads over one table's property columns, keeping decoded
 /// chunks between reads the way the key reader does: integer columns
 /// through the segment chunk cache, string columns as the last decoded
@@ -1475,6 +1560,8 @@ pub struct PropsReader {
     /// Committed words the columns below do not hold yet. Shared,
     /// because a query hands the same patch to every worker it forks.
     patch: Option<Arc<LanePatch>>,
+    /// Committed rows they do not hold yet, the same way.
+    added: Option<Arc<RowPatch>>,
 }
 
 impl PropsReader {
@@ -1487,6 +1574,7 @@ impl PropsReader {
             label_state: None,
             order_scratch: Vec::new(),
             patch: None,
+            added: None,
         }
     }
 
@@ -1496,12 +1584,20 @@ impl PropsReader {
         self.patch = patch.filter(|p| !p.is_empty());
     }
 
+    /// The same for the committed rows past the end of them.
+    pub fn set_added(&mut self, added: Option<Arc<RowPatch>>) {
+        self.added = added.filter(|p| !p.is_empty());
+    }
+
     /// Whether row `row` of `col` holds a value.
     ///
     /// A column with no validity segment holds one in every row, which
     /// is the answer without a read, so a graph that stores no null
     /// pays nothing for the question.
     pub fn is_valid(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<bool> {
+        if let Some(cell) = self.added.as_ref().and_then(|p| p.get(col, row)) {
+            return Ok(!matches!(cell, Cell::Null));
+        }
         let Some(meta) = self.directory.columns[col].validity.clone() else {
             return Ok(true);
         };
@@ -1671,6 +1767,13 @@ impl PropsReader {
             out.extend_from_slice(&buf);
         }
         out.truncate(rows);
+        // The unfolded rows are past the end of the column, so they go
+        // on the end here, which is the order their ordinals are in.
+        if let Some(added) = &self.added {
+            for row in 0..added.len() as u64 {
+                out.push(added.word(col, added.base() + row).unwrap_or(0));
+            }
+        }
         Ok(())
     }
 
@@ -1696,6 +1799,9 @@ impl PropsReader {
     }
 
     pub fn read_int(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<u64> {
+        if let Some(word) = self.added.as_ref().and_then(|p| p.word(col, row)) {
+            return Ok(word);
+        }
         let meta = &self.directory.columns[col].meta;
         if let std::collections::btree_map::Entry::Vacant(slot) = self.int_state.entry(col) {
             let pools = db.pools();
@@ -1752,21 +1858,37 @@ impl PropsReader {
         while i < order.len() {
             let row = rows[order[i] as usize];
             if row >= meta.value_count {
-                return Err(ZuError::InvalidArgument(format!(
-                    "row {row} out of 0..{}",
-                    meta.value_count
-                )));
+                // Sorted by row, so everything left is past the column
+                // too, and the unfolded rows are read as a tail below.
+                break;
             }
             let chunk = (row / CHUNK_ROWS as u64) as usize;
             let values = cached_chunk(db, meta, dir, cache, chunk)?;
             while i < order.len() {
                 let r = rows[order[i] as usize];
-                if r / CHUNK_ROWS as u64 != chunk as u64 {
+                // A row past the column can share a chunk with the last
+                // one in it, so the tail is cut here as well as above.
+                if r >= meta.value_count || r / CHUNK_ROWS as u64 != chunk as u64 {
                     break;
                 }
                 out[order[i] as usize] = values[(r % CHUNK_ROWS as u64) as usize];
                 i += 1;
             }
+        }
+        while i < order.len() {
+            let at = order[i] as usize;
+            let row = rows[at];
+            out[at] = self
+                .added
+                .as_ref()
+                .and_then(|p| p.word(col, row))
+                .ok_or_else(|| {
+                    ZuError::InvalidArgument(format!(
+                        "row {row} out of 0..{}",
+                        self.directory.columns[col].meta.value_count
+                    ))
+                })?;
+            i += 1;
         }
         // The unsealed words go over the gathered ones at the end
         // rather than inside the walk above, because the walk is sorted
@@ -1815,10 +1937,21 @@ impl PropsReader {
         for &ix in order.iter() {
             let row = rows[ix as usize];
             if row >= meta.value_count {
-                return Err(ZuError::InvalidArgument(format!(
-                    "row {row} out of 0..{}",
-                    meta.value_count
-                )));
+                // Past the column, so the bytes come from the rows no
+                // fold has written into it yet.
+                let bytes = self
+                    .added
+                    .as_ref()
+                    .and_then(|p| p.bytes(col, row))
+                    .ok_or_else(|| {
+                        ZuError::InvalidArgument(format!(
+                            "row {row} out of 0..{}",
+                            meta.value_count
+                        ))
+                    })?;
+                spans[ix as usize] = (staged.len(), staged.len() + bytes.len());
+                staged.extend_from_slice(bytes);
+                continue;
             }
             let chunk = row / CHUNK_ROWS as u64;
             if chunk != cur_chunk {
@@ -1862,6 +1995,10 @@ impl PropsReader {
         row: u64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
+        if let Some(bytes) = self.added.as_ref().and_then(|p| p.bytes(col, row)) {
+            out.extend_from_slice(bytes);
+            return Ok(());
+        }
         let meta = &self.directory.columns[col].meta;
         if row >= meta.value_count {
             return Err(ZuError::InvalidArgument(format!(
@@ -1987,6 +2124,70 @@ mod tests {
         );
         // And so does gathering across the type divide.
         assert!(reader.gather_int(&mut db, scol, &rows, &mut out).is_err());
+    }
+
+    /// Rows appended past the end of a column are read out of the
+    /// patch by every path that reads the column: the point reads, the
+    /// batched gathers, and the whole-column read a scan takes.
+    #[test]
+    fn appended_rows_are_read_by_every_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe", b"amy"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20, 30, 40])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        let (age, name) = (reader.col("age").unwrap(), reader.col("name").unwrap());
+
+        let mut patch = RowPatch::new(4);
+        assert_eq!(
+            patch.push(vec![Cell::Int(50), Cell::Str(b"eva".to_vec())]),
+            4
+        );
+        assert_eq!(patch.push(vec![Cell::Int(60), Cell::Null]), 5);
+        reader.set_added(Some(Arc::new(patch)));
+
+        assert_eq!(reader.read_int(&mut db, age, 4).unwrap(), 50);
+        let mut bytes = Vec::new();
+        reader.read_str(&mut db, name, 4, &mut bytes).unwrap();
+        assert_eq!(bytes, b"eva");
+        assert!(reader.is_valid(&mut db, name, 4).unwrap());
+        assert!(!reader.is_valid(&mut db, name, 5).unwrap());
+
+        // Gathers take rows in caller order and cross the end of the
+        // column in the middle of the batch.
+        let rows = [5u64, 1, 4, 0];
+        let mut out = Vec::new();
+        reader.gather_int(&mut db, age, &rows, &mut out).unwrap();
+        assert_eq!(out, [60, 20, 50, 10]);
+        let mut ends = Vec::new();
+        bytes.clear();
+        reader
+            .gather_str(&mut db, name, &[4, 2], &mut bytes, &mut ends)
+            .unwrap();
+        assert_eq!(ends, [3, 6]);
+        assert_eq!(&bytes[..], b"evajoe");
+
+        // The whole column is the stored rows with the appended ones
+        // after them, in the order they arrived.
+        let mut column = Vec::new();
+        reader.read_int_column(&mut db, age, &mut column).unwrap();
+        assert_eq!(column, [10, 20, 30, 40, 50, 60]);
+
+        // A row past the patch is still out of range.
+        assert!(reader.gather_int(&mut db, age, &[6], &mut out).is_err());
     }
 
     #[test]

@@ -1582,6 +1582,28 @@ pub unsafe extern "C" fn zu_bind_i64_z(stmt: *mut ZuStmt, name: *const c_char, v
     unsafe { bind(stmt, name, zlen(name), Value::Int(v)) }
 }
 
+/// Binds a boolean. The C side has no bool of its own that a header
+/// can promise across compilers, so the value is an int and anything
+/// other than nought is true, which is what C means by a condition.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_bind_bool(
+    stmt: *mut ZuStmt,
+    name: *const c_char,
+    name_len: usize,
+    v: c_int,
+) -> ZuStatus {
+    unsafe { bind(stmt, name, name_len, Value::Bool(v != 0)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_bind_bool_z(
+    stmt: *mut ZuStmt,
+    name: *const c_char,
+    v: c_int,
+) -> ZuStatus {
+    unsafe { bind(stmt, name, zlen(name), Value::Bool(v != 0)) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_bind_f64(
     stmt: *mut ZuStmt,

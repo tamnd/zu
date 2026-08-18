@@ -48,6 +48,10 @@ harness = false
 name = "sha256"
 harness = false
 
+[[bench]]
+name = "grammar"
+harness = false
+
 [dependencies]
 crc32c.workspace = true
 zstd.workspace = true

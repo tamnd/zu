@@ -1,0 +1,198 @@
+================================================================================
+The four edge patterns that carry an arrowhead
+================================================================================
+
+MATCH (a)-[:KNOWS]->(b), (c)<-[:KNOWS]-(d), (e)-[:KNOWS]-(f), (g)-->(h)
+RETURN a
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))
+        (path
+          (node
+            (identifier))
+          (relationship)
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A label expression of conjunction, disjunction and negation
+================================================================================
+
+MATCH (n:Person|Robot), (m:!Robot&Employee), (o:%) RETURN n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier)
+            (label_expr
+              (label
+                (identifier))
+              (label
+                (identifier)))))
+        (path
+          (node
+            (identifier)
+            (label_expr
+              (label
+                (identifier))
+              (label
+                (identifier)))))
+        (path
+          (node
+            (identifier)
+            (label_expr)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A quantified edge, bounded and unbounded
+================================================================================
+
+MATCH (a)-[:KNOWS*]->(b), (c)-[:KNOWS*1..3]->(d), (e)-[r:KNOWS*2..]->(f)
+RETURN a
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))
+              (hop_range
+                (integer)
+                (integer))))
+          (node
+            (identifier)))
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (identifier)
+              (label
+                (identifier))
+              (hop_range
+                (integer))))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A path bound to a name, with a selector and a mode
+================================================================================
+
+MATCH p = ANY SHORTEST TRAIL (a)-[:KNOWS]->(b) RETURN p
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (identifier)
+          (selector)
+          (path_mode)
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+An edge written with a tilde takes no arrowhead
+================================================================================
+
+MATCH (a)~[:KNOWS]~(b) RETURN a
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (label
+                (identifier))))
+          (node
+            (identifier)))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))

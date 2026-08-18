@@ -15,6 +15,7 @@ pub mod binder;
 pub mod cast;
 pub mod csr;
 pub mod exec;
+pub mod frame;
 pub mod kernels;
 pub mod lexer;
 pub mod optimizer;

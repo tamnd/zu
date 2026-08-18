@@ -201,6 +201,16 @@ impl StrBuffers {
         id
     }
 
+    /// How many buffers are registered, which is the id the next one
+    /// will take.
+    pub fn len(&self) -> usize {
+        self.bufs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
+
     pub fn slice(&self, id: u16, offset: u32, len: usize) -> &[u8] {
         let buf = &self.bufs[id as usize];
         let start = offset as usize;

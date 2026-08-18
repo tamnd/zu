@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use zu_common::{Interrupt, Result, ZuError};
 use zu_query::exec::{self, Profile, Streamed};
+use zu_query::frame::Frame;
 use zu_query::plan::QueryPlan;
 use zu_query::row::{Batch, Flow};
 
@@ -382,6 +383,29 @@ impl Connection {
             ));
         }
         Appender::open(self.session.file_mut()?, table)
+    }
+
+    /// Registers a frame as a table of this connection, under the name
+    /// it carries.
+    ///
+    /// This is the replacement scan: a caller holding columns in memory
+    /// gets to name them in a statement without loading them into the
+    /// database first. Nothing is copied, at registration or at read.
+    /// The frame is this connection's alone and goes when it does, and
+    /// a name a stored table already holds is refused.
+    pub fn register(&mut self, frame: Frame) -> Result<()> {
+        self.session.register_frame(frame)
+    }
+
+    /// Drops a registered frame, answering whether there was one under
+    /// that name.
+    pub fn unregister(&mut self, name: &str) -> Result<bool> {
+        self.session.unregister_frame(name)
+    }
+
+    /// The names registered on this connection, sorted.
+    pub fn registered(&self) -> Vec<String> {
+        self.session.registered_frames()
     }
 
     /// Whether this connection refuses writes.

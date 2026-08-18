@@ -10,6 +10,7 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, DeletedRows, Graph};
+use zu_query::frame::FrameSet;
 use zu_query::{optimizer, parser, plan};
 
 use crate::deleted::Deleted;
@@ -74,6 +75,27 @@ pub fn schema_of_graph(catalog: &Catalog, graph: u32) -> Result<Schema> {
         schema.set_bound_disagreement(factor);
     }
     Ok(schema)
+}
+
+/// Merges the registered frames into a schema as node tables of it,
+/// answering the label each one's name took.
+///
+/// A frame is a table to everything above the binder and nothing at all
+/// to the catalog, so this runs after the schema is built rather than
+/// inside the build: a schema loaded with statistics keeps them, and a
+/// registration costs the merge and not a reload.
+pub fn merge_frames(schema: &mut Schema, frames: &FrameSet) -> Result<Vec<u16>> {
+    frames
+        .iter()
+        .map(|frame| {
+            schema.add_node_table(NodeDef {
+                id: frame.id(),
+                name: frame.name().to_string(),
+                node_count: frame.rows(),
+                labels: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 /// Parses and binds one query against a zu1 catalog.
@@ -200,6 +222,10 @@ pub struct Zu1Graph<'a> {
     /// reader reads through these, which is what lets a write be
     /// visible without the column it wrote into being rewritten.
     patches: Arc<Patches>,
+    /// The frames registered on the session, read where they lie. They
+    /// are tables of the graph as far as a statement is concerned and
+    /// nothing to do with the file, so the catalog never sees them.
+    frames: Arc<FrameSet>,
 }
 
 impl<'a> Zu1Graph<'a> {
@@ -211,6 +237,7 @@ impl<'a> Zu1Graph<'a> {
             props: HashMap::new(),
             gone: None,
             patches: Arc::new(Patches::new()),
+            frames: Arc::new(FrameSet::new()),
         }
     }
 
@@ -227,6 +254,7 @@ impl<'a> Zu1Graph<'a> {
             props: HashMap::new(),
             gone: None,
             patches: Arc::new(Patches::new()),
+            frames: Arc::new(FrameSet::new()),
         }
     }
 
@@ -240,6 +268,18 @@ impl<'a> Zu1Graph<'a> {
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// The frames a statement run through this graph reads as tables.
+    pub fn frames(&self) -> &Arc<FrameSet> {
+        &self.frames
+    }
+
+    /// Hands over the session's frames. Registering builds a new set
+    /// rather than editing this one, so a statement already running
+    /// keeps reading the set it started with.
+    pub fn set_frames(&mut self, frames: Arc<FrameSet>) {
+        self.frames = frames;
     }
 
     /// Swaps in a fresh catalog and drops every cached reader; the
@@ -520,6 +560,19 @@ impl Graph for Zu1Graph<'_> {
     }
 
     fn property(&mut self, table: u32, offset: u64, key: &str) -> Result<Value> {
+        if let Some(frame) = self.frames.get(table) {
+            return match frame.column(key) {
+                Some(col) => Ok(frame.value(col, offset)),
+                // A frame has no stored id either, so the row is it,
+                // which is the same answer a table without the column
+                // gives.
+                None if key == "id" => Ok(Value::Int(offset as i64)),
+                None => Err(ZuError::InvalidArgument(format!(
+                    "unknown property '{key}' on frame '{}'",
+                    frame.name()
+                ))),
+            };
+        }
         self.ensure_props(table)?;
         let Self { db, props, .. } = self;
         if let Some(reader) = props.get_mut(&table).expect("just loaded")
@@ -544,9 +597,16 @@ impl Graph for Zu1Graph<'_> {
         key: &str,
         out: &mut Vec<Value>,
     ) -> Result<()> {
-        self.ensure_props(table)?;
         out.clear();
         out.reserve(rows.len());
+        if let Some(frame) = self.frames.get(table) {
+            let Some(col) = frame.column(key) else {
+                return every_row_is_its_own_offset(rows, key, table, out);
+            };
+            out.extend(rows.iter().map(|&row| frame.value(col, row)));
+            return Ok(());
+        }
+        self.ensure_props(table)?;
         let Self { db, props, .. } = self;
         let Some(reader) = props.get_mut(&table).expect("just loaded") else {
             return every_row_is_its_own_offset(rows, key, table, out);
@@ -574,6 +634,11 @@ impl Graph for Zu1Graph<'_> {
     }
 
     fn labels(&mut self, table: u32, offset: u64) -> Result<u64> {
+        // Every row of a frame carries the one label its name became,
+        // and there is no bitset to read because nothing wrote one.
+        if let Some(frame) = self.frames.get(table) {
+            return Ok(frame.labels());
+        }
         self.ensure_props(table)?;
         // A table whose rows all carry its own label and nothing else
         // stores no bitset, and the catalog is then the whole answer.
@@ -646,6 +711,10 @@ impl Graph for Zu1Graph<'_> {
     }
 
     fn lookup_key(&mut self, table: u32, key: u64) -> Result<Option<u64>> {
+        // A frame has no index over it, so the key is the row.
+        if let Some(frame) = self.frames.get(table) {
+            return Ok((key < frame.rows()).then_some(key));
+        }
         // The primary-key index lives in the group directory of a rel
         // table loaded over this node table's rows, so find one and ask
         // it. A table with no keyed rel keeps the dense contract where
@@ -690,6 +759,8 @@ impl Graph for Zu1Graph<'_> {
             props: HashMap::new(),
             gone: self.gone.clone(),
             patches: Arc::clone(&self.patches),
+            // Somebody else's memory, shared rather than reopened.
+            frames: Arc::clone(&self.frames),
         }))
     }
 

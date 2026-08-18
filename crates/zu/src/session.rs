@@ -22,6 +22,7 @@ use zu_common::{Interrupt, Result, ZuError};
 use zu_query::ast::TxnStmt;
 use zu_query::binder::BoundQuery;
 use zu_query::exec::{self, Streamed};
+use zu_query::frame::{Frame, FrameSet};
 use zu_query::plan::{LogicalPlan, QueryPlan};
 use zu_query::refs::{BindingTable, GraphHandle};
 use zu_query::row::{Batch, Flow};
@@ -168,6 +169,12 @@ pub struct Session {
     /// over again costs a pointer comparison on a session that only
     /// reads.
     patches: Arc<Patches>,
+    /// The frames registered on this session, as both read paths were
+    /// last given them. A registration builds a new set rather than
+    /// editing this one, so a statement already running keeps the set
+    /// it started with and an unregistered frame stays readable until
+    /// that statement ends.
+    frames: Arc<FrameSet>,
 }
 
 impl Session {
@@ -200,6 +207,7 @@ impl Session {
             txn: None,
             dirs: crate::set::Dirs::default(),
             patches: Arc::new(Patches::new()),
+            frames: Arc::new(FrameSet::new()),
         })
     }
 
@@ -242,6 +250,102 @@ impl Session {
     /// The epoch this session last reloaded at.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Registers a frame as a table of the working graph, under the
+    /// name it carries.
+    ///
+    /// Nothing is copied. The frame says where the caller's columns are
+    /// and holds whatever keeps them alive, and a statement that reads
+    /// it reads those bytes where they lie. Registering a name that is
+    /// already registered replaces what it stands for and keeps the
+    /// table id, so a prepared statement over it stays bound to the same
+    /// table. A name a stored table already holds is refused.
+    pub fn register_frame(&mut self, frame: Frame) -> Result<()> {
+        if self.txn.is_some() {
+            return Err(ZuError::gql(
+                codes::C25G01,
+                "a frame is registered on the session and not inside a transaction, and this session has one running".to_string(),
+            ));
+        }
+        let catalog = self.graph.catalog();
+        let taken = |id: u32| {
+            catalog.node_by_id(id).is_some() || catalog.rel_tables().iter().any(|r| r.id == id)
+        };
+        let set = self.frames.with(frame, &taken)?;
+        self.publish_frames(set)
+    }
+
+    /// Drops a registered frame, answering whether there was one under
+    /// that name. The bytes go when the caller's handle on them does,
+    /// which is not necessarily now: a statement still reading the frame
+    /// holds it until it ends.
+    pub fn unregister_frame(&mut self, name: &str) -> Result<bool> {
+        let Some(set) = self.frames.without(name) else {
+            return Ok(false);
+        };
+        self.publish_frames(set)?;
+        Ok(true)
+    }
+
+    /// The registered names, sorted.
+    pub fn registered_frames(&self) -> Vec<String> {
+        self.frames.names()
+    }
+
+    /// Hands a new frame set to the two read paths.
+    ///
+    /// The labels are settled here rather than at registration, because
+    /// a label is a position in the schema's label list and the schema
+    /// is built from the catalog of the epoch this session is on. Both
+    /// caches go: a plan compiled before this bound its table names
+    /// against a schema that did not hold these frames.
+    fn publish_frames(&mut self, mut set: FrameSet) -> Result<()> {
+        let catalog = self.graph.catalog().clone();
+        let mut schema = query::schema_of_graph(&catalog, self.working)?;
+        set.set_labels(&query::merge_frames(&mut schema, &set)?);
+        let set = Arc::new(set);
+        self.graph.set_frames(Arc::clone(&set));
+        self.snap.set_frames(Arc::clone(&set));
+        self.frames = set;
+        self.schemas.clear();
+        self.plans.clear();
+        Ok(())
+    }
+
+    /// Refuses a write that names a frame, before it stages anything.
+    ///
+    /// A frame is the caller's memory and this engine only reads it, so
+    /// the refusal names the frame rather than letting the write fail
+    /// against a catalog that has never heard of the table.
+    fn refuse_a_frame_write(&self, write: &crate::split::Write, rows: &[Vec<Value>]) -> Result<()> {
+        if self.frames.is_empty() {
+            return Ok(());
+        }
+        let named = match write {
+            crate::split::Write::Insert(insert) => insert
+                .nodes
+                .iter()
+                .find_map(|node| self.frames.get(node.table)),
+            // A `SET` and a `DELETE` name their elements through the
+            // row, so the row is where the table comes from.
+            crate::split::Write::Set(_) | crate::split::Write::Delete(_) => {
+                rows.iter().flatten().find_map(|value| match value {
+                    Value::Node { table, .. } => self.frames.get(*table),
+                    _ => None,
+                })
+            }
+        };
+        match named {
+            Some(frame) => Err(ZuError::gql(
+                codes::C25G03,
+                format!(
+                    "'{}' is a registered frame, which is read where it lies and never written",
+                    frame.name()
+                ),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Runs one write transaction: `stage` describes the change
@@ -745,6 +849,7 @@ impl Session {
             let rows = self
                 .read_part(&part.plan, &part.query, &cached.schema, &args, &options)?
                 .rows;
+            self.refuse_a_frame_write(write, &rows)?;
             // The row holds the slots the write carries across it and
             // then the values it wrote, which is the order the
             // projection at the end of this part wrote them in.
@@ -1172,11 +1277,14 @@ impl Session {
             return Ok(schema.clone());
         }
         let catalog = self.graph.catalog().clone();
-        let schema = Arc::new(query::schema_with_stats(
-            self.graph.file_mut(),
-            &catalog,
-            graph,
-        )?);
+        let mut built = query::schema_with_stats(self.graph.file_mut(), &catalog, graph)?;
+        // The frames go in after the statistics, so a schema loaded
+        // with them keeps them, and they go into the working graph
+        // because that is the graph they were registered on.
+        if graph == self.working {
+            query::merge_frames(&mut built, &self.frames)?;
+        }
+        let schema = Arc::new(built);
         self.schemas.insert(graph, schema.clone());
         Ok(schema)
     }
@@ -1225,6 +1333,15 @@ impl Session {
         // where the columns of a table are.
         self.dirs = crate::set::Dirs::default();
         self.epoch = epoch;
+        // The frames survive the epoch, because they were never in the
+        // file. What does not survive is where they sit in a schema:
+        // the caches above were built from the old catalog, so the set
+        // goes back through the registration path and comes out with
+        // the labels the new one gives it.
+        if !self.frames.is_empty() {
+            let set = self.frames.as_ref().clone();
+            self.publish_frames(set)?;
+        }
         Ok(())
     }
 }

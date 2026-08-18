@@ -17,6 +17,7 @@ use std::sync::Arc;
 use zu_common::{FloatBits, IntBits, LogicalType, Result, ZuError};
 use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
 
+use zu_query::frame::FrameSet;
 pub use zu_query::snapshot::{
     ColId, ColType, CsrPin, Dir, FuncCol, GroupId, RelId, SCAN_ROWS, ScanChunk, Snapshot, TableId,
     ZonePred,
@@ -108,6 +109,10 @@ pub struct Zu1Snapshot<'a> {
     /// props readers read through. A fork carries them, so every worker
     /// of a parallel query reads the same database.
     patches: Arc<Patches>,
+    /// The frames registered on the session this snapshot was opened
+    /// for. They are read where they lie and have nothing to do with
+    /// the file, so a fork shares them rather than reopening anything.
+    frames: Arc<FrameSet>,
 }
 
 /// What a snapshot learns while it reads, kept in a value of its own
@@ -133,9 +138,16 @@ pub struct SnapshotCache {
     str_ends: Vec<u64>,
     gone: Option<Deleted>,
     patches: Arc<Patches>,
+    frames: Arc<FrameSet>,
 }
 
 impl SnapshotCache {
+    /// Hands over the frames registered on the session, which the
+    /// snapshots built from this cache read as tables of the graph.
+    pub fn set_frames(&mut self, frames: Arc<FrameSet>) {
+        self.frames = frames;
+    }
+
     /// Hands the cached readers the cells a commit has left in the
     /// overlay, and keeps them for the readers a later snapshot loads.
     ///
@@ -170,6 +182,7 @@ impl<'a> Zu1Snapshot<'a> {
             str_ends: cache.str_ends,
             gone: cache.gone,
             patches: cache.patches,
+            frames: cache.frames,
         }
     }
 
@@ -183,6 +196,7 @@ impl<'a> Zu1Snapshot<'a> {
             str_ends: self.str_ends,
             gone: self.gone,
             patches: self.patches,
+            frames: self.frames,
         }
     }
 
@@ -395,6 +409,9 @@ impl Snapshot for Zu1Snapshot<'_> {
     }
 
     fn table_rows(&mut self, table: TableId) -> Result<u64> {
+        if let Some(frame) = self.frames.get(table) {
+            return Ok(frame.rows());
+        }
         Ok(self
             .catalog
             .node_by_id(table)
@@ -403,6 +420,9 @@ impl Snapshot for Zu1Snapshot<'_> {
     }
 
     fn resolve_col(&mut self, table: TableId, name: &str) -> Result<Option<(ColId, ColType)>> {
+        if let Some(frame) = self.frames.get(table) {
+            return Ok(frame.resolve(name));
+        }
         self.ensure_props(table)?;
         let Some(reader) = self.props.get(&table).expect("just loaded") else {
             return Ok(None);
@@ -426,6 +446,13 @@ impl Snapshot for Zu1Snapshot<'_> {
         pred: Option<&ZonePred>,
         arena: &mut MorselArena,
     ) -> Result<Option<ScanChunk>> {
+        // A frame is somebody else's memory and the whole of what a
+        // scan of one does is point at it. Nothing here applies: there
+        // are no zones to skip by, no chunks to decode and no
+        // tombstones, because nothing has ever written one.
+        if let Some(frame) = self.frames.get(table) {
+            return Ok(Arc::clone(frame).scan(chunk, cols, pred, arena));
+        }
         // A bare row-id scan needs only the catalog extent; tables
         // loaded without properties still scan and expand fine.
         if cols.is_empty() && pred.is_none() {
@@ -631,6 +658,9 @@ impl Snapshot for Zu1Snapshot<'_> {
         rows: &[u64],
         arena: &mut MorselArena,
     ) -> Result<ValueVector> {
+        if let Some(frame) = self.frames.get(table) {
+            return Ok(Arc::clone(frame).gather(col, rows, arena));
+        }
         self.ensure_props(table)?;
         let Self {
             db,
@@ -684,6 +714,12 @@ impl Snapshot for Zu1Snapshot<'_> {
     }
 
     fn seek_key(&mut self, table: TableId, key: u64) -> Result<Option<u64>> {
+        // A frame has no key index and no tombstones, so a key is the
+        // row, which is the dense contract every table without a keyed
+        // rel over it already reads by.
+        if let Some(frame) = self.frames.get(table) {
+            return Ok((key < frame.rows()).then_some(key));
+        }
         // The key index lives in the group directory of a rel table
         // loaded over this node table's rows, so find one and ask it.
         // No keyed rel means the dense contract, where the id is the
@@ -791,6 +827,10 @@ impl Snapshot for Zu1Snapshot<'_> {
             // table index again.
             gone: self.gone.clone(),
             patches: Arc::clone(&self.patches),
+            // Frames are the caller's memory and have nothing to do
+            // with the file, so a fork shares them rather than
+            // reopening anything.
+            frames: Arc::clone(&self.frames),
         }))
     }
 }

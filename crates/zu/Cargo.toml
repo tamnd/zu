@@ -85,6 +85,10 @@ name = "batch"
 harness = false
 
 [[bench]]
+name = "frames"
+harness = false
+
+[[bench]]
 name = "call"
 harness = false
 

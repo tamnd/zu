@@ -34,14 +34,17 @@ simple_query    = { reading_clause } , return_clause
                 | { reading_clause } ;
 
 (* GQ01, ISO 16.2. The graph the clauses after it are against. ISO
-   writes it as a graph expression; a name and CURRENT_PROPERTY_GRAPH
-   are the two spellings that name a graph without running one, and a
-   graph an expression computes is not a graph this file holds. A query
-   with no USE is against the graph the session is working in, which is
-   the home graph. *)
+   writes it as a graph expression, and the four forms here are the
+   four that name a graph: the one the session is working in, the one
+   it started in, one in the catalog by name, and one the caller passed
+   in. A parameter is what makes this a reference rather than a word,
+   because which graph it is is settled when the parameter arrives and
+   not while the statement is being read. A query with no USE is
+   against the graph the session is working in. *)
 use_clause      = "USE" , graph_ref ;
 graph_ref       = "CURRENT_PROPERTY_GRAPH" | "CURRENT_GRAPH"
-                  | [ [ "PROPERTY" ] , "GRAPH" ] , graph_name ;
+                  | "HOME_PROPERTY_GRAPH" | "HOME_GRAPH"
+                  | [ [ "PROPERTY" ] , "GRAPH" ] , ( graph_name | parameter ) ;
 
 (* Catalog statements (docs/07 §9). They change what the file declares
    and answer no rows, so they are told apart from a query by their

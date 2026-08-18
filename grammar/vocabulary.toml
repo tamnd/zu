@@ -47,6 +47,11 @@ words = ["USE", "OPTIONAL", "MATCH", "UNWIND", "WITH", "WHERE", "RETURN", "YIELD
 
 [[group]]
 kind = "keyword"
+doc = "The conjunctions, which join two result tables rather than two clauses. The set quantifier after a set operator is ALL or DISTINCT, both of which are already words, and leaving it out means DISTINCT. OTHERWISE is not a set operator: it answers the right operand only when the left had no rows."
+words = ["UNION", "EXCEPT", "INTERSECT", "OTHERWISE"]
+
+[[group]]
+kind = "keyword"
 doc = "Projection and ordering."
 words = ["DISTINCT", "AS", "ORDER", "BY", "ASC", "ASCENDING", "DESC", "DESCENDING", "NULLS", "FIRST", "LAST", "SKIP", "LIMIT"]
 

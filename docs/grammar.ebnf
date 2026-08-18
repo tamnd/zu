@@ -7,7 +7,20 @@
    spec change to docs/07 first. *)
 
 statement       = query | catalog_statement ;
-query           = [ use_clause ] , linear_query , [ ";" ] ;
+query           = [ use_clause ] , composite_query , [ ";" ] ;
+
+(* GQ02 to GQ07, ISO 12.1. A composite query meets two result tables.
+   Every conjunction is at one level and the fold is to the left, so
+   there is no precedence between UNION and INTERSECT the way there is
+   in SQL, and a reader who wants one writes the operands in the order
+   they should be met. Leaving the set quantifier out means DISTINCT.
+   OTHERWISE is not a set operator: it answers the left operand, and
+   the right one only when the left had no rows at all. Both operands
+   of a conjunction have to have the same columns, and neither may
+   write. *)
+composite_query = linear_query , { query_conjunction , linear_query } ;
+query_conjunction = set_operator , [ "ALL" | "DISTINCT" ] | "OTHERWISE" ;
+set_operator    = "UNION" | "EXCEPT" | "INTERSECT" ;
 
 (* GQ20, ISO 12.2. A query is one statement or several chained by NEXT,
    and what a statement hands the one behind it is the result it

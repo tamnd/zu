@@ -204,32 +204,101 @@ impl Query {
     /// depends on where a statement stands walks the levels instead,
     /// because this deliberately forgets where the joins were.
     pub fn clauses(&self) -> Vec<&Clause> {
-        let Composite::Linear(linear) = &self.body;
-        linear
-            .statements
-            .iter()
-            .flat_map(|simple| simple.clauses.iter())
-            .collect()
+        let mut out = Vec::new();
+        self.body.walk(&mut |linear| {
+            for simple in &linear.statements {
+                out.extend(simple.clauses.iter());
+            }
+        });
+        out
     }
 
     /// The projection the query ends with, or `None` for a write that
     /// ends without one.
+    ///
+    /// For a composite this is the leftmost operand's, because that is
+    /// the one whose column names the answer carries: the operands of a
+    /// set operator have to agree on their columns, so the leftmost
+    /// speaks for all of them.
     pub fn result(&self) -> Option<&Projection> {
-        let Composite::Linear(linear) = &self.body;
-        linear.statements.last()?.result.as_ref()
+        self.body.leftmost().statements.last()?.result.as_ref()
     }
 }
 
 /// A composite query statement (ISO 12.1): one linear query statement,
-/// or two of them joined by an operator over their result tables.
+/// or several of them joined by operators over their result tables.
 ///
-/// Only the one-statement form is parsed today. The level exists
-/// because `UNION`, `EXCEPT`, `INTERSECT` and `OTHERWISE` join here and
-/// nowhere else, and every consumer that walks a query has to be
-/// written to expect more than one of them before any of them can land.
+/// The joins are left associative and all at one level, which is what
+/// the standard's `composite query expression` production says: there
+/// is no precedence between `UNION` and `INTERSECT` here, and a query
+/// that wants one writes the operands in the order it wants them read.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Composite {
     Linear(Linear),
+    /// Two operands and the conjunction between them. The left is a
+    /// composite so that a third operand joins onto the pair rather
+    /// than nesting to the right.
+    Conjoined {
+        left: Box<Composite>,
+        how: Conjunction,
+        right: Linear,
+    },
+}
+
+impl Composite {
+    /// The leftmost linear operand, which is the one the answer takes
+    /// its column names from.
+    pub fn leftmost(&self) -> &Linear {
+        match self {
+            Composite::Linear(linear) => linear,
+            Composite::Conjoined { left, .. } => left.leftmost(),
+        }
+    }
+
+    /// Calls `f` on every linear operand, left to right.
+    pub fn walk<'a>(&'a self, f: &mut dyn FnMut(&'a Linear)) {
+        match self {
+            Composite::Linear(linear) => f(linear),
+            Composite::Conjoined { left, right, .. } => {
+                left.walk(f);
+                f(right);
+            }
+        }
+    }
+}
+
+/// What joins two operands of a composite query (ISO 12.1, `query
+/// conjunction`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conjunction {
+    /// GQ03 to GQ07: a set operator over the two result tables.
+    Set { op: SetOp, all: bool },
+    /// GQ02: the right operand is evaluated only if the left answered
+    /// no rows at all. This is not a set operator. It is a choice
+    /// between two answers, and when the left has rows the right never
+    /// runs.
+    Otherwise,
+}
+
+/// Which set operator (ISO 12.1, `set operator`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    /// GQ03: everything either operand answered.
+    Union,
+    /// GQ04 and GQ05: what the left answered and the right did not.
+    Except,
+    /// GQ06 and GQ07: what both answered.
+    Intersect,
+}
+
+impl SetOp {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION",
+            SetOp::Except => "EXCEPT",
+            SetOp::Intersect => "INTERSECT",
+        }
+    }
 }
 
 /// A linear query statement (ISO 12.2): simple statements chained by

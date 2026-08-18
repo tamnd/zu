@@ -1001,6 +1001,11 @@ impl Compiler<'_> {
                 | LogicalPlan::Rows { .. } => {
                     return Ok(None);
                 }
+                // A composite is two pipelines and an operator over
+                // the pair, and this engine compiles one pipeline. The
+                // statement goes back to the engine that runs the
+                // operands and meets them.
+                LogicalPlan::Conjoin { .. } => return Ok(None),
                 LogicalPlan::ScanNodes { input, .. }
                 | LogicalPlan::Expand { input, .. }
                 | LogicalPlan::Filter { input, .. }

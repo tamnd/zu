@@ -280,6 +280,10 @@ fn compile(
         columns,
         path_shapes: query.path_shapes.clone(),
         labels: query.labels.clone(),
+        // A part is one pipeline of the statement being taken apart at
+        // its write, and a statement that writes is one operand: the
+        // binder refuses a write in a composite.
+        conjoined: Vec::new(),
     };
     let leaf = match base {
         // The rows the part before this one carried arrive as one

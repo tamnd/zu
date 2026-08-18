@@ -167,6 +167,16 @@ const NOTES: &[&str] = &[
      and nothing else it had in hand, so a variable the statement before it matched is out of \
      scope behind the NEXT; the chain runs as one pipeline rather than materialising a table \
      between statements",
+    "two result tables meet with UNION, EXCEPT or INTERSECT in both their forms, ALL keeping \
+     every copy and DISTINCT keeping one, and leaving the quantifier out means DISTINCT; the \
+     conjunctions are all at one level and fold to the left, so there is no precedence between \
+     UNION and INTERSECT, and EXCEPT and INTERSECT hold whichever operand the planner estimates \
+     fewer rows for and stream the other past it",
+    "OTHERWISE answers the left operand, and runs the right one only when the left answered no \
+     rows at all",
+    "the operands of a conjunction have to have the same columns, in the same order and under \
+     the same names, and neither of them may write, because how many times a write ran would \
+     otherwise depend on which operand the planner chose to hold",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",

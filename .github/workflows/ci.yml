@@ -111,6 +111,19 @@ jobs:
       # arrive one repository at a time. What this measures is that
       # holding three files to the table stays flat per repository.
       - run: cargo bench -p xtask --bench repos
+      # The promise on top of that list: who maintains each client, what
+      # its tier asks of it, and where it stands. The page it publishes
+      # is rendered rather than written, so this is the check that a
+      # hand edit, or a tier that moved in one table and not the other,
+      # fails here rather than on the site. The thresholds are behind
+      # --gate and are the release's, because every client is under its
+      # threshold until the apparatus of DX3 to DX5 exists.
+      - run: cargo run -p xtask -- clients --check
+      # Seven clients will not be seven forever either. What this
+      # measures is that scoring and rendering stay flat per client, so
+      # the tier 3 bindings arriving through the kit cost a lookup each
+      # rather than a walk of everything before them.
+      - run: cargo bench -p xtask --bench clients
 
   deny:
     runs-on: ubuntu-latest

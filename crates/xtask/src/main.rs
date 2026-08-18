@@ -18,8 +18,8 @@
 //! reads two committed files and needs nothing.
 
 use xtask::{
-    apimap, artifacts, corpus, grammar, model, package, packaging, pins, platforms, repos, rustdoc,
-    tarball, terms,
+    apimap, artifacts, clients, corpus, grammar, model, package, packaging, pins, platforms, repos,
+    rustdoc, tarball, terms,
 };
 
 use std::path::{Path, PathBuf};
@@ -93,6 +93,14 @@ cargo xtask repos [--table PATH] [--list]
   --table PATH      the repository table (default repos.toml)
   --list            print `role<TAB>name<TAB>tier<TAB>reports` for every row, and check nothing
 
+cargo xtask clients [--table PATH] [--root DIR] [--check] [--list] [--gate]
+
+  --table PATH      the client table (default clients.toml)
+  --root DIR        the tree to read the split from and write the page into (default .)
+  --check           render and compare, writing nothing; nonzero on drift
+  --list            print `tier<TAB>client<TAB>practice<TAB>maintainer` for every row, and check nothing
+  --gate            also fail on a client under its tier's practice threshold, which is the release's run
+
 cargo xtask terms [--table PATH] [--list] [PATH ...]
 
   --table PATH      the terminology table (default zu-web/style/zu/terms.yml, here or one level up)
@@ -127,6 +135,7 @@ fn main() -> ExitCode {
         Some("artifacts") => run(artifacts_command(&args[1..])),
         Some("packaging") => run(packaging_command(&args[1..])),
         Some("repos") => run(repos_command(&args[1..])),
+        Some("clients") => run(clients_command(&args[1..])),
         Some("terms") => run(terms_command(&args[1..])),
         Some("grammar") => run(grammar_command(&args[1..])),
         Some("--help" | "-h") | None => {
@@ -786,6 +795,91 @@ fn repos_command(args: &[String]) -> Result<ExitCode, String> {
          the artifact contract all read that list.",
         notes.len(),
         path.display()
+    );
+    Ok(ExitCode::FAILURE)
+}
+
+fn clients_command(args: &[String]) -> Result<ExitCode, String> {
+    let mut path = PathBuf::from(clients::PATH);
+    let mut root = PathBuf::from(".");
+    let mut check = false;
+    let mut list = false;
+    let mut gate = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--check" => check = true,
+            "--list" => list = true,
+            "--gate" => gate = true,
+            "--table" => {
+                path = PathBuf::from(args.get(i + 1).ok_or("--table wants a path")?);
+                i += 1;
+            }
+            "--root" => {
+                root = PathBuf::from(args.get(i + 1).ok_or("--root wants a path")?);
+                i += 1;
+            }
+            other => return Err(format!("no option {other:?}\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let table = clients::Table::load(&path)?;
+    let split = repos::Table::load(&root.join(repos::PATH))?;
+
+    if list {
+        for client in &table.clients {
+            println!(
+                "{}\t{}\t{}\t{}",
+                client.tier,
+                client.name,
+                table.score(client, &split).practice,
+                client.maintainer
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Without `--check` the page is written first and then checked,
+    // which leaves the split and the thresholds as the only things the
+    // check can have anything to say about. The page is generated
+    // rather than maintained for the same reason the package manifests
+    // are: a hand edited page is the one that still names last year's
+    // maintainer.
+    if !check {
+        let page = root.join(clients::PAGE);
+        if let Some(dir) = page.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&page, table.render(&split))
+            .map_err(|e| format!("writing {}: {e}", page.display()))?;
+        println!("{}: {} clients", page.display(), table.clients.len());
+    }
+
+    let notes = table.check(&root, gate)?;
+    if notes.is_empty() {
+        let met = table
+            .clients
+            .iter()
+            .filter(|c| table.score(c, &split).met())
+            .count();
+        println!(
+            "{} clients, {} of them tier 1, {met} at their tier's practice threshold, published \
+             to {}",
+            table.clients.len(),
+            table.clients.iter().filter(|c| c.tier == 1).count(),
+            clients::URL
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    eprintln!(
+        "\n{} to fix. A tier is a promise and {} is where it is made, so the maintainer, the \
+         repository and the scorecard reach {} by being a row in it.",
+        notes.len(),
+        path.display(),
+        clients::URL
     );
     Ok(ExitCode::FAILURE)
 }

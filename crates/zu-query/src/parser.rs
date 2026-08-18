@@ -15,9 +15,9 @@ use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 use crate::ast::{
     BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, ElementDefKind,
     ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, LabelExpr,
-    Linear, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection, ProjectionItem,
-    PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto, SetItem,
-    SetOp, Simple, SortKey, Statement, TxnStmt, UnaryOp,
+    LetItem, Linear, Literal, NodePattern, NullOrder, PathMode, PathPattern, Projection,
+    ProjectionItem, PropertyDef, Query, RelDirection, RelPattern, RemoveItem, Removed, Selector,
+    SetInto, SetItem, SetOp, Simple, SortKey, Statement, TxnStmt, UnaryOp,
 };
 use crate::lexer::{Token, TokenKind, lex};
 use crate::value_type;
@@ -82,9 +82,7 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// told the parser expected MATCH has been sent looking for a typo
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
-const UNIMPLEMENTED: &[&str] = &[
-    "CREATE", "MERGE", "FILTER", "LET", "SESSION", "FINISH", "FOR",
-];
+const UNIMPLEMENTED: &[&str] = &["CREATE", "MERGE", "SESSION", "FINISH", "FOR"];
 
 /// How a simple query statement ended, which is what the parser needs
 /// to say when something follows that may not.
@@ -886,6 +884,30 @@ impl Parser<'_> {
         })
     }
 
+    /// One definition of a `LET`: a name, an equals sign and the value
+    /// the name stands for.
+    ///
+    /// The name is a plain identifier rather than anything a projection
+    /// item may be, because this defines a variable and a variable is a
+    /// name. `LET p.age = 30` is a write written where a definition
+    /// goes, so it is refused by saying what a definition looks like.
+    fn parse_let_item(&mut self) -> Result<LetItem> {
+        let name = self.expect_name("a variable name after LET")?;
+        if self.at(&TokenKind::Dot) {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.peek().expect("peeked").start,
+                format_args!(
+                    "LET names a value, so the name is a variable of its own; changing a property of an element is SET"
+                ),
+            ));
+        }
+        self.expect(&TokenKind::Eq)?;
+        let expr = self.parse_expr()?;
+        Ok(LetItem { name, expr })
+    }
+
     /// A composite query statement: the `USE` in front of it, and the
     /// linear query statements it joins.
     ///
@@ -1059,6 +1081,18 @@ impl Parser<'_> {
                 self.expect_kw("AS")?;
                 let alias = self.expect_name("an alias after AS")?;
                 clauses.push(Clause::Unwind { expr, alias });
+            } else if self.eat_kw("FILTER") {
+                // The WHERE is the standard's own optional word and
+                // says nothing the FILTER has not already said.
+                self.eat_kw("WHERE");
+                let expr = self.parse_expr()?;
+                clauses.push(Clause::Filter { expr });
+            } else if self.eat_kw("LET") {
+                let mut items = vec![self.parse_let_item()?];
+                while self.eat(&TokenKind::Comma) {
+                    items.push(self.parse_let_item()?);
+                }
+                clauses.push(Clause::Let { items });
             } else if self.eat_kw("WITH") {
                 let projection = self.parse_projection()?;
                 let filter = self.parse_where()?;
@@ -3447,6 +3481,51 @@ mod tests {
         let err = parse_err("INSERT (x:Person); INSERT (y:Person)");
         assert!(
             err.contains("nothing may follow the end of a statement"),
+            "{err}"
+        );
+    }
+
+    /// A FILTER is a statement of its own, so it stands where a clause
+    /// stands and takes the standard's optional WHERE without meaning
+    /// anything different by it.
+    #[test]
+    fn filter_takes_its_condition_with_or_without_where() {
+        for source in [
+            "MATCH (n:Person) FILTER n.age > 30 RETURN n",
+            "MATCH (n:Person) FILTER WHERE n.age > 30 RETURN n",
+        ] {
+            let q = parsed(source);
+            let clauses = q.clauses();
+            assert_eq!(clauses.len(), 2, "the MATCH and the FILTER");
+            let Clause::Filter { expr } = clauses[1] else {
+                panic!("the second clause is the FILTER");
+            };
+            assert!(matches!(expr, Expr::Binary { .. }), "{expr:?}");
+        }
+    }
+
+    /// A LET is a list of definitions, name first, and each name is a
+    /// variable rather than anything a projection item may be.
+    #[test]
+    fn let_reads_a_list_of_definitions() {
+        let q = parsed("MATCH (n:Person) LET a = n.age, b = a + 1 RETURN b");
+        let clauses = q.clauses();
+        let Clause::Let { items } = clauses[1] else {
+            panic!("the second clause is the LET");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "a");
+        assert_eq!(items[1].name, "b");
+    }
+
+    /// `LET p.age = 30` is a write written where a definition goes, and
+    /// the error names the statement that does it rather than reporting
+    /// something unexpected at the dot.
+    #[test]
+    fn a_let_of_a_property_names_the_statement_that_writes() {
+        let err = parse_err("MATCH (n:Person) LET n.age = 30 RETURN n");
+        assert!(
+            err.contains("changing a property of an element is SET"),
             "{err}"
         );
     }

@@ -176,7 +176,7 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
                 } = below
                 {
                     let mut slots = HashSet::new();
-                    expr_slots(&expr, &mut slots);
+                    crate::binder::expr_slots(&expr, &mut slots);
                     if filter_bracket != bracket || slots.contains(&rel) {
                         below = LogicalPlan::Filter {
                             input: inner,
@@ -1331,7 +1331,7 @@ fn order_component(
         .iter()
         .map(|f| {
             let mut s = HashSet::new();
-            expr_slots(f, &mut s);
+            crate::binder::expr_slots(f, &mut s);
             s
         })
         .collect();
@@ -1599,7 +1599,7 @@ fn place_filters(
             continue;
         }
         let mut slots = HashSet::new();
-        expr_slots(filter, &mut slots);
+        crate::binder::expr_slots(filter, &mut slots);
         if slots.is_subset(bound) {
             placed[ix] = true;
             plan = LogicalPlan::Filter {
@@ -1683,44 +1683,6 @@ fn split_and(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
         split_and(*rhs, out);
     } else {
         out.push(expr);
-    }
-}
-
-fn expr_slots(expr: &BoundExpr, out: &mut HashSet<usize>) {
-    match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
-        BoundExpr::Var(slot) | BoundExpr::HasLabels { slot, .. } => {
-            out.insert(*slot);
-        }
-        BoundExpr::Property { base, key: _ } => expr_slots(base, out),
-        BoundExpr::Unary { expr, .. } => expr_slots(expr, out),
-        BoundExpr::Binary { lhs, rhs, .. } => {
-            expr_slots(lhs, out);
-            expr_slots(rhs, out);
-        }
-        BoundExpr::IsNull { expr, .. } => expr_slots(expr, out),
-        BoundExpr::IsTyped { expr, .. } => expr_slots(expr, out),
-        BoundExpr::Call { args, .. } => {
-            for arg in args {
-                expr_slots(arg, out);
-            }
-        }
-        BoundExpr::List(items) => {
-            for item in items {
-                expr_slots(item, out);
-            }
-        }
-        BoundExpr::Map(entries) => {
-            for (_, value) in entries {
-                expr_slots(value, out);
-            }
-        }
-        BoundExpr::Path(elements) => {
-            for element in elements {
-                expr_slots(element, out);
-            }
-        }
-        BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
     }
 }
 
@@ -3127,6 +3089,29 @@ mod tests {
                 "Expand (c)-[#1:KNOWS]->(d)",
                 "Filter c.id = $y",
                 "ScanNodes c: Person",
+            ],
+            "got:\n{text}"
+        );
+    }
+    /// A FILTER is a filter and a LET is a projection, so what EXPLAIN
+    /// prints for them is what the reader wrote, in the place they
+    /// wrote it.
+    #[test]
+    fn filter_and_let_read_as_what_they_are() {
+        let text = optimized(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             LET gap = b.id - a.id \
+             FILTER gap > 0 \
+             RETURN a.id AS id",
+        );
+        assert_eq!(
+            lines(&text),
+            [
+                "Project a.id AS id",
+                "Filter gap > 0",
+                "Project a, b, b.id - a.id AS gap",
+                "Expand (a)-[#1:KNOWS]->(b)",
+                "ScanNodes a: Person",
             ],
             "got:\n{text}"
         );

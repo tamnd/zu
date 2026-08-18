@@ -68,10 +68,7 @@ fn stage(path: &std::path::Path) {
         sq.insert_node_at(
             "person",
             row,
-            &[
-                SqlValue::Int(row),
-                SqlValue::Text(format!("person-{row}")),
-            ],
+            &[SqlValue::Int(row), SqlValue::Text(format!("person-{row}"))],
         )
         .expect("node");
     }

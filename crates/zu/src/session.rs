@@ -600,6 +600,9 @@ impl Session {
                     }
                     let (new, edges) = batch.staged();
                     self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
+                    // The edges have rows of their own now, which they
+                    // had not when the row that carries them was built.
+                    crate::insert::settle(&mut self.graph, &mut next)?;
                     next
                 }
                 crate::split::Write::Delete(delete) => {
@@ -833,7 +836,7 @@ impl Session {
         source: &str,
         params: &[(&str, Value)],
         graph: u32,
-        wanted: &[crate::declare::NewTable],
+        wanted: &crate::declare::Wanted,
     ) -> Result<QueryResult> {
         crate::declare::create(self.graph.file_mut(), graph, wanted)?;
         // The tables are published now, and the schemas this session

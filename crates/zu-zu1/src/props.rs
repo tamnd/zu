@@ -1207,11 +1207,26 @@ pub fn store_rel_props_nullable(
         .rel_by_name(rel_table)
         .ok_or_else(|| ZuError::InvalidArgument(format!("no rel table '{rel_table}'")))?;
     let (rel_id, edge_count) = (rel.id, rel.edge_count);
+    store_rel_props_for(db, rel_id, edge_count, columns)
+}
+
+/// The same store over a rel table named by its id, which is what a
+/// caller who has already resolved the name means, and the only way to
+/// reach a table outside the home graph. This is [`store_props_for`] on
+/// the edge side, and the difference is where the columns hang: a node
+/// table's props are the table index entry, an edge table's are a field
+/// of the directory that entry holds.
+pub fn store_rel_props_for(
+    db: &mut Zu1File,
+    rel_id: u32,
+    edge_count: u64,
+    columns: &[PropInput],
+) -> Result<PropsDirectory> {
     check_columns(edge_count, columns)?;
     let mut index = TableIndex::load(db)?;
     let root = index.get(rel_id).ok_or_else(|| ZuError::Corrupt {
         what: "table index",
-        detail: format!("rel table '{rel_table}' has no directory entry"),
+        detail: format!("rel table {rel_id} has no directory entry"),
     })?;
     let mut directory = crate::graph::Directory::decode(&meta::read_chain(db, root)?)?;
     if directory.props != crate::file::NULL_BLOCK {

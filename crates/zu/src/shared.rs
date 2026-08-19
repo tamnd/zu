@@ -33,7 +33,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use zu_common::Result;
 
 use crate::write::{Patches, Writer, Written};
-use crate::zu1::file::{DatabaseHeader, Zu1File};
+use crate::zu1::file::{DatabaseHeader, Shared, Zu1File};
 use crate::zu1::txn::WriteTxn;
 
 /// Replays a sidecar WAL that a previous writer left behind.
@@ -245,6 +245,10 @@ pub struct FileHandle {
     /// published state in one lock, so a reader is counted before it
     /// can read anything the write side might reclaim.
     readers: Mutex<BTreeMap<u64, usize>>,
+    /// The caches every handle on this file reads through, kept here
+    /// so a reader that has to open its own descriptor takes them up
+    /// rather than starting a second cache nothing invalidates.
+    shared: Shared,
 }
 
 /// The queue in front of the write side.
@@ -329,8 +333,10 @@ impl FileHandle {
             patches: Arc::new(Patches::new()),
             version: 1,
         };
+        let shared = file.shared();
         let handle = Arc::new(FileHandle {
             key: key.clone(),
+            shared,
             gate: Mutex::new(Gate {
                 side: Some(WriteSide { file, writer: None }),
                 next: 0,
@@ -387,6 +393,7 @@ impl FileHandle {
                     true => Zu1File::open(&self.key.0)?,
                     false => Zu1File::open_read_only(&self.key.0)?,
                 };
+                file.adopt(&self.shared);
                 file.follow(published.header(), published.slot());
                 Ok(file)
             }
@@ -572,6 +579,52 @@ mod tests {
             thread.join().expect("join");
         }
         assert_eq!(served, vec![0, 1, 2, 3], "served in the order they asked");
+    }
+
+    /// A reader that had to open its own descriptor, because somebody
+    /// was writing when it asked for one, reads through the same block
+    /// cache as the writer. A cache of its own would hold whatever it
+    /// last saw in a block, and the writer can only invalidate the
+    /// cache it can reach, so a block freed and written over would read
+    /// back as the thing that used to be in it.
+    #[test]
+    fn a_reader_opened_over_a_writer_shares_the_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = path(&dir, "cache.zu1");
+        drop(Zu1File::create(&file).expect("create"));
+        let handle = FileHandle::attach(&file, false, || Zu1File::open(&file)).expect("attach");
+
+        let mut side = handle.take();
+        let block = |fill: u8| vec![fill; crate::zu1::BLOCK_SIZE as usize];
+        let watched = side.file_mut().allocate_block();
+        let other = side.file_mut().allocate_block();
+        side.file_mut()
+            .write_block(watched, &block(0xA1))
+            .expect("write");
+        side.file_mut()
+            .write_block(other, &block(0xC3))
+            .expect("write");
+        side.file_mut().checkpoint().expect("checkpoint");
+        handle.publish(&side);
+
+        // The side is out, so this is the branch that opens a
+        // descriptor rather than forking the writer's.
+        let mut reader = handle.reader().expect("reader");
+        assert_eq!(reader.read_block(watched).expect("read"), block(0xA1));
+        // The second read is what moves the handle's own memo of the
+        // last block off the one under test, so what answers below is
+        // the shared cache.
+        assert_eq!(reader.read_block(other).expect("read"), block(0xC3));
+
+        side.file_mut()
+            .write_block(watched, &block(0xB2))
+            .expect("write");
+        assert_eq!(
+            reader.read_block(watched).expect("read"),
+            block(0xB2),
+            "the write dropped the frame this reader was reading through"
+        );
+        handle.put(side);
     }
 
     /// The floor a reclaim works to is the oldest epoch anything holds

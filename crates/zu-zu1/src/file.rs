@@ -323,6 +323,15 @@ struct Savepoint {
     began_at: u64,
 }
 
+/// The caches one file's handles hold in common, for a handle that
+/// was opened rather than forked to take up. See [`Zu1File::adopt`].
+#[derive(Clone)]
+pub struct Shared {
+    cache: Arc<BlockCache>,
+    pools: Arc<DecodedPools>,
+    forks: Option<Arc<std::sync::Mutex<Vec<Zu1File>>>>,
+}
+
 /// An open zu1 file: block I/O, the free list, and the header flip.
 #[derive(Debug)]
 pub struct Zu1File {
@@ -640,6 +649,33 @@ impl Zu1File {
             cache: Arc::clone(&self.cache),
             pools: Arc::clone(&self.pools),
         })
+    }
+
+    /// What every handle on one file has to be sharing: the block
+    /// cache, the decoded pools above it, and the pool of retired
+    /// handles.
+    pub fn shared(&self) -> Shared {
+        Shared {
+            cache: Arc::clone(&self.cache),
+            pools: Arc::clone(&self.pools),
+            forks: self.forks.as_ref().map(Arc::clone),
+        }
+    }
+
+    /// Puts this handle on another handle's caches, which a handle
+    /// opened rather than forked has to do before it reads anything.
+    ///
+    /// A cache is invalidated by the handle that writes the block, and
+    /// it can only invalidate its own. So a second cache on one file is
+    /// a cache holding whatever it last saw in a block, and a block the
+    /// writer has since freed and written over reads back as the thing
+    /// that used to be in it. What that looks like from a query is a
+    /// props directory that decodes as somebody else's catalog.
+    pub fn adopt(&mut self, shared: &Shared) {
+        self.cache = Arc::clone(&shared.cache);
+        self.pools = Arc::clone(&shared.pools);
+        self.forks = shared.forks.as_ref().map(Arc::clone);
+        self.pin_memo = None;
     }
 
     /// Retires a fork into its shared pool for the next

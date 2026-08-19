@@ -103,11 +103,32 @@ int main(int argc, char **argv) {
   CHECK(len == 2);
   CHECK(zu2_khop(s, ZU2_OUT, ids[0], 2, &out, &len) == ZU2_OK);
   CHECK(len == 2);
-  CHECK(zu2_reach(s, ZU2_OUT, ids[0], 0, &out, &len) == ZU2_OK);
+  /* Round the ring and back to the start, so the seed is in its own
+   * answer and the count is every vertex. */
+  CHECK(zu2_reach(s, ZU2_OUT, ids[0], 0, 0, &out, &len) == ZU2_OK);
   CHECK(len == N);
-  CHECK(zu2_reach(s, ZU2_OUT, ids[0], 10, &out, &len) == ZU2_OK);
+  CHECK(zu2_reach(s, ZU2_OUT, ids[0], 1, 0, &out, &len) == ZU2_OK);
+  CHECK(len == 2);
+  CHECK(zu2_reach(s, ZU2_OUT, ids[0], 0, 10, &out, &len) == ZU2_OK);
   CHECK(len == 10);
-  CHECK(out[0] == ids[0]);
+  CHECK(out[0] == ids[1]);
+
+  /* The chord is the short way to the far side of the ring, and the
+   * long way round is what the ring itself is. */
+  uint32_t hops = 0;
+  CHECK(zu2_shortest(s, ZU2_OUT, ids[0], ids[500], 0, &hops, &found) == ZU2_OK);
+  CHECK(found == 1 && hops == 1);
+  CHECK(zu2_shortest(s, ZU2_OUT, ids[1], ids[0], 0, &hops, &found) == ZU2_OK);
+  CHECK(found == 1 && hops == N - 1);
+  CHECK(zu2_shortest(s, ZU2_BOTH, ids[1], ids[0], 0, &hops, &found) == ZU2_OK);
+  CHECK(found == 1 && hops == 1);
+  CHECK(zu2_shortest(s, ZU2_OUT, ids[1], ids[0], 3, &hops, &found) == ZU2_OK);
+  CHECK(found == 0 && hops == 0);
+
+  /* Undirected degree is a merge and not a sum: vertex 500 is pointed
+   * at by 499 and by the chord and points at 501. */
+  CHECK(zu2_degree(s, ZU2_BOTH, ids[500], &degree) == ZU2_OK);
+  CHECK(degree == 3);
 
   uint64_t triangles = 0;
   CHECK(zu2_triangles(s, ids[0], &triangles) == ZU2_OK);

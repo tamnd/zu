@@ -110,6 +110,31 @@ fn khop(s: *mut Zu2Session, dir: c_int, seed: u32, k: u32) -> Vec<u32> {
     answer
 }
 
+/// Sorted, because what is being checked is the set that came back and
+/// not the order breadth first happened to reach it in. The one place
+/// the order matters says so itself.
+fn reach(s: *mut Zu2Session, dir: c_int, seed: u32, depth: u32, cap: u64) -> Vec<u32> {
+    let mut out: *const u32 = ptr::null();
+    let mut len = 0usize;
+    let status = unsafe { zu2::zu2_reach(s, dir, seed, depth, cap, &mut out, &mut len) };
+    assert_eq!(status, Zu2Status::Ok);
+    let mut answer = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(out, len) }.to_vec()
+    };
+    answer.sort_unstable();
+    answer
+}
+
+fn shortest(s: *mut Zu2Session, dir: c_int, src: u32, dst: u32, depth: u32) -> Option<u32> {
+    let mut hops = 0u32;
+    let mut found = 0 as c_int;
+    let status = unsafe { zu2::zu2_shortest(s, dir, src, dst, depth, &mut hops, &mut found) };
+    assert_eq!(status, Zu2Status::Ok);
+    (found != 0).then_some(hops)
+}
+
 fn close(db: *mut Zu2Db, sessions: &[*mut Zu2Session]) {
     for &s in sessions {
         unsafe { zu2::zu2_session_close(s) };
@@ -298,28 +323,77 @@ fn reach_walks_the_component_and_stops_where_it_is_told() {
     for pair in ids.windows(2) {
         edge(s, pair[0], pair[1]);
     }
-    let mut out: *const u32 = ptr::null();
-    let mut len = 0usize;
-    assert_eq!(
-        unsafe { zu2::zu2_reach(s, 0, ids[0], 0, &mut out, &mut len) },
-        Zu2Status::Ok
-    );
-    assert_eq!(len, 6);
-    // The bound is a bound on what is collected, not a suggestion.
-    assert_eq!(
-        unsafe { zu2::zu2_reach(s, 0, ids[0], 3, &mut out, &mut len) },
-        Zu2Status::Ok
-    );
-    assert_eq!(len, 3);
-    let visited = unsafe { std::slice::from_raw_parts(out, len) };
-    assert_eq!(visited[0], ids[0]);
+    // Five, not six: the seed is where the walk started and no edge
+    // leads back to it, so it is not something the walk reached.
+    assert_eq!(reach(s, 0, ids[0], 0, 0).len(), 5);
+    // The depth bound is the `*1..k` in a pattern.
+    assert_eq!(reach(s, 0, ids[0], 1, 0), vec![ids[1]]);
+    assert_eq!(reach(s, 0, ids[0], 3, 0), vec![ids[1], ids[2], ids[3]]);
+    // The size bound is a bound on what is collected, not a suggestion.
+    let capped = reach(s, 0, ids[0], 0, 2);
+    assert_eq!(capped, vec![ids[1], ids[2]]);
     // A second walk has to see a clean bitmap, which is the part that
     // breaks when the clear is skipped after an early stop.
-    assert_eq!(
-        unsafe { zu2::zu2_reach(s, 0, ids[0], 0, &mut out, &mut len) },
-        Zu2Status::Ok
-    );
-    assert_eq!(len, 6);
+    assert_eq!(reach(s, 0, ids[0], 0, 0).len(), 5);
+    // Backwards from the far end is the same chain read the other way.
+    assert_eq!(reach(s, 1, ids[5], 0, 0).len(), 5);
+    // Undirected from the middle is both halves and the seed as well,
+    // because an edge with no arrow on it can be walked back along and
+    // two hops of that arrive where they started. That is a walk over
+    // an undirected graph rather than Cypher's rule that one path may
+    // not use one relationship twice, and the header says so.
+    assert_eq!(reach(s, 2, ids[3], 1, 0), vec![ids[2], ids[4]]);
+    assert_eq!(reach(s, 2, ids[3], 2, 0).len(), 5);
+    assert_eq!(reach(s, 2, ids[3], 0, 0).len(), 6);
+    close(db, &[s]);
+}
+
+#[test]
+fn a_cycle_puts_the_seed_back_in_its_own_answer() {
+    let (_dir, db) = open("cycle.zu2");
+    let s = session_on(db);
+    let ids: Vec<u32> = (0..3)
+        .map(|i| vertex(s, format!("v{i}").as_bytes()))
+        .collect();
+    edge(s, ids[0], ids[1]);
+    edge(s, ids[1], ids[2]);
+    edge(s, ids[2], ids[0]);
+    // Three hops round a triangle arrive back where they started, and
+    // that is a vertex reachable in one to three hops.
+    assert_eq!(reach(s, 0, ids[0], 3, 0).len(), 3);
+    assert_eq!(reach(s, 0, ids[0], 2, 0).len(), 2);
+    close(db, &[s]);
+}
+
+#[test]
+fn shortest_counts_hops_and_says_when_there_are_none() {
+    let (_dir, db) = open("shortest.zu2");
+    let s = session_on(db);
+    let ids: Vec<u32> = (0..6)
+        .map(|i| vertex(s, format!("v{i}").as_bytes()))
+        .collect();
+    // A chain 0..4 with a shortcut 0 -> 3, and 5 off on its own.
+    for pair in ids[..5].windows(2) {
+        edge(s, pair[0], pair[1]);
+    }
+    edge(s, ids[0], ids[3]);
+
+    assert_eq!(shortest(s, 0, ids[0], ids[0], 0), Some(0));
+    assert_eq!(shortest(s, 0, ids[0], ids[1], 0), Some(1));
+    // Two, by the shortcut, not three the long way round.
+    assert_eq!(shortest(s, 0, ids[0], ids[4], 0), Some(2));
+    assert_eq!(shortest(s, 0, ids[4], ids[0], 0), None);
+    // The other way round the same edges, which is the undirected
+    // question a `-[:EDGE*]-` pattern asks.
+    assert_eq!(shortest(s, 1, ids[4], ids[0], 0), Some(2));
+    assert_eq!(shortest(s, 2, ids[4], ids[0], 0), Some(2));
+    // No path at all, and no path within the bound, report the same
+    // thing, which is why a caller who cares passes no bound.
+    assert_eq!(shortest(s, 2, ids[0], ids[5], 0), None);
+    assert_eq!(shortest(s, 0, ids[0], ids[4], 1), None);
+    assert_eq!(shortest(s, 0, ids[0], ids[4], 2), Some(2));
+    // The bitmap is clean after a walk that stopped early on arrival.
+    assert_eq!(shortest(s, 0, ids[0], ids[4], 0), Some(2));
     close(db, &[s]);
 }
 

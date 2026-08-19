@@ -269,10 +269,24 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     Some(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-fn direction_of(dir: c_int) -> Option<Direction> {
+/// A direction as a walk takes it. The engine keeps an out list and an
+/// in list and knows nothing of an undirected edge, so `ZU2_BOTH` is not
+/// an engine direction, it is two loads and a merge, and the walks are
+/// written over a slice of directions so that stays one code path.
+///
+/// Undirected is worth having because it is what the reference queries
+/// ask for: a host that writes `(a)-[:EDGE]-(b)` with no arrow gets a
+/// different answer from one that writes an arrow, and an adapter that
+/// quietly answered the directed question would be reporting a number
+/// for a query it did not run.
+fn ways_of(dir: c_int) -> Option<&'static [Direction]> {
+    const OUT: &[Direction] = &[Direction::Out];
+    const IN: &[Direction] = &[Direction::In];
+    const BOTH: &[Direction] = &[Direction::Out, Direction::In];
     match dir {
-        0 => Some(Direction::Out),
-        1 => Some(Direction::In),
+        0 => Some(OUT),
+        1 => Some(IN),
+        2 => Some(BOTH),
         _ => None,
     }
 }
@@ -815,7 +829,12 @@ unsafe fn edge(s: *mut Zu2Session, src: u32, dst: u32, add: bool) -> Zu2Status {
     }
 }
 
-/// The out or in degree.
+/// The out, in or undirected degree.
+///
+/// One direction is a counter the engine already keeps, so it is a load.
+/// `ZU2_BOTH` is the number of distinct neighbours either way round,
+/// which is a merge of the two lists rather than a sum of the two
+/// counts, because an edge that runs both ways is one neighbour.
 ///
 /// # Safety
 /// `s` is live and `degree` is writable.
@@ -832,7 +851,7 @@ pub unsafe extern "C" fn zu2_degree(
     let Some(s) = (unsafe { session(s) }) else {
         return Zu2Status::Misuse;
     };
-    let Some(direction) = direction_of(dir) else {
+    let Some(ways) = ways_of(dir) else {
         return Zu2Status::Misuse;
     };
     if degree.is_null() {
@@ -842,7 +861,15 @@ pub unsafe extern "C" fn zu2_degree(
         return Zu2Status::MisuseConcurrent;
     };
     let state = &mut *call.state;
-    let answer = state.session.degree(direction, vertex);
+    let answer = if let [one] = ways {
+        state.session.degree(*one, vertex)
+    } else {
+        let mut buffer = std::mem::take(&mut state.answer);
+        gather(&mut state.session, ways, vertex, &mut buffer);
+        let count = buffer.len() as u32;
+        state.answer = buffer;
+        count
+    };
     state.error.clear_message();
     unsafe { degree.write(answer) };
     Zu2Status::Ok
@@ -869,7 +896,7 @@ pub unsafe extern "C" fn zu2_neighbours(
     let Some(s) = (unsafe { session(s) }) else {
         return Zu2Status::Misuse;
     };
-    let Some(direction) = direction_of(dir) else {
+    let Some(ways) = ways_of(dir) else {
         return Zu2Status::Misuse;
     };
     if out.is_null() || len.is_null() {
@@ -880,14 +907,33 @@ pub unsafe extern "C" fn zu2_neighbours(
     };
     let state = &mut *call.state;
     let mut answer = std::mem::take(&mut state.answer);
-    state
-        .session
-        .neighbours_into(direction, vertex, &mut answer);
+    gather(&mut state.session, ways, vertex, &mut answer);
     state.answer = answer;
     state.error.clear_message();
     unsafe { out.write(state.answer.as_ptr()) };
     unsafe { len.write(state.answer.len()) };
     Zu2Status::Ok
+}
+
+/// One vertex's neighbours over every direction asked for, in `into`.
+///
+/// A single direction is a copy of a list the engine already holds in
+/// order. Both directions is that twice and then a sort, because the two
+/// lists overlap wherever a pair of vertices point at each other and a
+/// neighbour named twice would be counted twice. The same sort is what
+/// makes the two-list path safe against a load the engine retries, since
+/// a retry can run the closure again and the duplicate falls out.
+fn gather(session: &mut Session<'_>, ways: &[Direction], vertex: u32, into: &mut Vec<u32>) {
+    if let [one] = ways {
+        session.neighbours_into(*one, vertex, into);
+        return;
+    }
+    into.clear();
+    for &direction in ways {
+        session.neighbours(direction, vertex, |slice| into.extend_from_slice(slice));
+    }
+    into.sort_unstable();
+    into.dedup();
 }
 
 /// The distinct vertices exactly `k` hops from `seed`.
@@ -912,7 +958,7 @@ pub unsafe extern "C" fn zu2_khop(
     let Some(s) = (unsafe { session(s) }) else {
         return Zu2Status::Misuse;
     };
-    let Some(direction) = direction_of(dir) else {
+    let Some(ways) = ways_of(dir) else {
         return Zu2Status::Misuse;
     };
     if out.is_null() || len.is_null() {
@@ -922,7 +968,7 @@ pub unsafe extern "C" fn zu2_khop(
         return Zu2Status::MisuseConcurrent;
     };
     let state = &mut *call.state;
-    khop(state, direction, seed, k);
+    khop(state, ways, seed, k);
     state.error.clear_message();
     unsafe { out.write(state.answer.as_ptr()) };
     unsafe { len.write(state.answer.len()) };
@@ -932,7 +978,7 @@ pub unsafe extern "C" fn zu2_khop(
 /// The walk behind [`zu2_khop`], with the buffers taken out of the
 /// state so the borrow checker can see that the closure and the session
 /// are not the same borrow.
-fn khop(state: &mut State, direction: Direction, seed: u32, k: u32) {
+fn khop(state: &mut State, ways: &[Direction], seed: u32, k: u32) {
     let mut current = std::mem::take(&mut state.frontier);
     let mut next = std::mem::take(&mut state.next);
     let mut seen = std::mem::take(&mut state.seen);
@@ -942,16 +988,20 @@ fn khop(state: &mut State, direction: Direction, seed: u32, k: u32) {
     for _ in 0..k {
         next.clear();
         for &vertex in &current {
-            state.session.neighbours(direction, vertex, |slice| {
-                for &far in slice {
-                    // The bitmap makes the level distinct, and it also
-                    // makes the closure safe to run twice: a retry
-                    // meets its own bits and adds nothing.
-                    if mark(&mut seen, far) {
-                        next.push(far);
+            for &direction in ways {
+                state.session.neighbours(direction, vertex, |slice| {
+                    for &far in slice {
+                        // The bitmap makes the level distinct, and it
+                        // also makes the closure safe to run twice: a
+                        // retry meets its own bits and adds nothing. It
+                        // is also what keeps the undirected walk from
+                        // naming a vertex once per direction.
+                        if mark(&mut seen, far) {
+                            next.push(far);
+                        }
                     }
-                }
-            });
+                });
+            }
         }
         // Cleared per level rather than cumulatively, because distinct
         // here means distinct within the level: a vertex the walk
@@ -969,7 +1019,18 @@ fn khop(state: &mut State, direction: Direction, seed: u32, k: u32) {
     state.seen = seen;
 }
 
-/// The vertices reachable from `seed`, breadth first.
+/// The distinct vertices reachable from `seed` in one hop or more, up to
+/// `max_depth` hops, breadth first.
+///
+/// `max_depth` 0 is no bound and walks the whole reachable set, and
+/// `max_visited` 0 is no bound on the size of the answer. A walk that
+/// hits the size bound stops there and reports what it has, which is how
+/// a probe on a graph with one enormous component stays a probe.
+///
+/// The seed is not in the answer unless a path leads back to it. That is
+/// deliberate and it is the difference between this and a component
+/// walk: the question a host asks is the one `-[:EDGE*1..k]->` asks, and
+/// a seed counted as its own neighbour would put every answer one out.
 ///
 /// # Safety
 /// `s` is live and both out-parameters are writable.
@@ -978,6 +1039,7 @@ pub unsafe extern "C" fn zu2_reach(
     s: *mut Zu2Session,
     dir: c_int,
     seed: u32,
+    max_depth: u32,
     max_visited: u64,
     out: *mut *const u32,
     len: *mut usize,
@@ -991,7 +1053,7 @@ pub unsafe extern "C" fn zu2_reach(
     let Some(s) = (unsafe { session(s) }) else {
         return Zu2Status::Misuse;
     };
-    let Some(direction) = direction_of(dir) else {
+    let Some(ways) = ways_of(dir) else {
         return Zu2Status::Misuse;
     };
     if out.is_null() || len.is_null() {
@@ -1001,14 +1063,14 @@ pub unsafe extern "C" fn zu2_reach(
         return Zu2Status::MisuseConcurrent;
     };
     let state = &mut *call.state;
-    reach(state, direction, seed, max_visited);
+    reach(state, ways, seed, max_depth, max_visited);
     state.error.clear_message();
     unsafe { out.write(state.answer.as_ptr()) };
     unsafe { len.write(state.answer.len()) };
     Zu2Status::Ok
 }
 
-fn reach(state: &mut State, direction: Direction, seed: u32, max_visited: u64) {
+fn reach(state: &mut State, ways: &[Direction], seed: u32, max_depth: u32, max_visited: u64) {
     let mut current = std::mem::take(&mut state.frontier);
     let mut next = std::mem::take(&mut state.next);
     let mut seen = std::mem::take(&mut state.seen);
@@ -1019,28 +1081,34 @@ fn reach(state: &mut State, direction: Direction, seed: u32, max_visited: u64) {
     } else {
         max_visited as usize
     };
+    let depth_cap = if max_depth == 0 { u32::MAX } else { max_depth };
     visited.clear();
     current.clear();
-    mark(&mut seen, seed);
-    visited.push(seed);
     current.push(seed);
-    'walk: while !current.is_empty() && visited.len() < cap {
+    let mut depth = 0;
+    // The seed goes into the frontier without going into the bitmap, so
+    // it is somewhere the walk can arrive at rather than somewhere it
+    // has been.
+    'walk: while !current.is_empty() && visited.len() < cap && depth < depth_cap {
+        depth += 1;
         next.clear();
         for &vertex in &current {
-            let full = state.session.neighbours(direction, vertex, |slice| {
-                for &far in slice {
-                    if mark(&mut seen, far) {
-                        visited.push(far);
-                        next.push(far);
-                        if visited.len() >= cap {
-                            return true;
+            for &direction in ways {
+                let full = state.session.neighbours(direction, vertex, |slice| {
+                    for &far in slice {
+                        if mark(&mut seen, far) {
+                            visited.push(far);
+                            next.push(far);
+                            if visited.len() >= cap {
+                                return true;
+                            }
                         }
                     }
+                    false
+                });
+                if full {
+                    break 'walk;
                 }
-                false
-            });
-            if full {
-                break 'walk;
             }
         }
         std::mem::swap(&mut current, &mut next);
@@ -1052,6 +1120,119 @@ fn reach(state: &mut State, direction: Direction, seed: u32, max_visited: u64) {
     state.frontier = current;
     state.next = next;
     state.seen = seen;
+}
+
+/// The number of hops on a shortest path from `src` to `dst`, or not
+/// found if no path of at most `max_depth` hops exists.
+///
+/// `max_depth` 0 is no bound, and that is what a host that wants a true
+/// answer passes: a bounded walk that ends without arriving cannot tell
+/// "no path" from "no short path", and it reports the same not-found for
+/// both. A source that is the destination is nought hops and found.
+///
+/// The walk is one breadth first search from `src` that stops the moment
+/// it arrives. It is not a meet in the middle, and it does not need to
+/// be for `ZU2_BOTH`: undirected here means the edge is followed either
+/// way round, which is the question `(a)-[:EDGE*]-(b)` asks.
+///
+/// # Safety
+/// `s` is live and both out-parameters are writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu2_shortest(
+    s: *mut Zu2Session,
+    dir: c_int,
+    src: u32,
+    dst: u32,
+    max_depth: u32,
+    hops: *mut u32,
+    found: *mut c_int,
+) -> Zu2Status {
+    if !hops.is_null() {
+        unsafe { hops.write(0) };
+    }
+    if !found.is_null() {
+        unsafe { found.write(0) };
+    }
+    let Some(s) = (unsafe { session(s) }) else {
+        return Zu2Status::Misuse;
+    };
+    let Some(ways) = ways_of(dir) else {
+        return Zu2Status::Misuse;
+    };
+    if hops.is_null() || found.is_null() {
+        return Zu2Status::Misuse;
+    }
+    let Some(call) = s.enter() else {
+        return Zu2Status::MisuseConcurrent;
+    };
+    let state = &mut *call.state;
+    let answer = shortest(state, ways, src, dst, max_depth);
+    state.error.clear_message();
+    if let Some(distance) = answer {
+        unsafe { hops.write(distance) };
+        unsafe { found.write(1) };
+    }
+    Zu2Status::Ok
+}
+
+fn shortest(
+    state: &mut State,
+    ways: &[Direction],
+    src: u32,
+    dst: u32,
+    max_depth: u32,
+) -> Option<u32> {
+    if src == dst {
+        return Some(0);
+    }
+    let mut current = std::mem::take(&mut state.frontier);
+    let mut next = std::mem::take(&mut state.next);
+    let mut seen = std::mem::take(&mut state.seen);
+    let mut touched = std::mem::take(&mut state.answer);
+    resize_seen(&mut seen, &state.session);
+    let depth_cap = if max_depth == 0 { u32::MAX } else { max_depth };
+    touched.clear();
+    current.clear();
+    current.push(src);
+    mark(&mut seen, src);
+    touched.push(src);
+    let mut distance = 0;
+    let mut arrived = None;
+    'walk: while !current.is_empty() && distance < depth_cap {
+        distance += 1;
+        next.clear();
+        for &vertex in &current {
+            for &direction in ways {
+                let hit = state.session.neighbours(direction, vertex, |slice| {
+                    for &far in slice {
+                        if mark(&mut seen, far) {
+                            // Every marked vertex is remembered so the
+                            // bitmap can be handed back clean at a cost
+                            // of what was walked rather than what
+                            // exists.
+                            touched.push(far);
+                            next.push(far);
+                            if far == dst {
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                });
+                if hit {
+                    arrived = Some(distance);
+                    break 'walk;
+                }
+            }
+        }
+        std::mem::swap(&mut current, &mut next);
+    }
+    clear(&mut seen, &touched);
+    state.answer = touched;
+    state.frontier = current;
+    state.next = next;
+    state.seen = seen;
+    arrived
 }
 
 /// Closed directed triangles through `seed`.

@@ -100,10 +100,17 @@ typedef enum zu2_durability {
   ZU2_DURABLE = 1
 } zu2_durability;
 
-/* Which way an edge is followed. */
+/* Which way an edge is followed.
+ *
+ * ZU2_BOTH is the undirected reading, and it is two loads rather than
+ * one: the engine keeps an out list and an in list and has no third
+ * list for an edge with no arrow on it. Every call that takes a
+ * direction takes this one, and every one of them counts a vertex
+ * reachable both ways round once. */
 typedef enum zu2_direction {
   ZU2_OUT = 0,
-  ZU2_IN = 1
+  ZU2_IN = 1,
+  ZU2_BOTH = 2
 } zu2_direction;
 
 /* How a database is sized and how durable it is.
@@ -220,7 +227,10 @@ zu2_status zu2_add_edge(zu2_session *s, uint32_t src, uint32_t dst);
  * error. */
 zu2_status zu2_remove_edge(zu2_session *s, uint32_t src, uint32_t dst);
 
-/* The out or in degree. One indexed load, whatever the degree is. */
+/* The degree. One indexed load for ZU2_OUT and ZU2_IN, whatever the
+ * degree is. ZU2_BOTH is the number of distinct neighbours either way
+ * round, so it is two loads and a merge rather than a sum: a pair of
+ * vertices that point at each other are one neighbour, not two. */
 zu2_status zu2_degree(zu2_session *s, zu2_direction dir, uint32_t vertex,
                       uint32_t *degree);
 
@@ -240,12 +250,37 @@ zu2_status zu2_neighbours(zu2_session *s, zu2_direction dir, uint32_t vertex,
 zu2_status zu2_khop(zu2_session *s, zu2_direction dir, uint32_t seed,
                     uint32_t k, const uint32_t **out, size_t *len);
 
-/* The vertices reachable from seed, breadth first, the seed included.
- * Stops once max_visited have been found, which bounds a probe on a
- * graph with a giant component; 0 means no bound. The order is the
- * order they were reached in. */
+/* The distinct vertices reachable from seed in one hop or more and at
+ * most max_depth hops, breadth first, in the order they were reached.
+ *
+ * max_depth 0 is no bound and walks the whole reachable set. max_visited
+ * 0 is no bound on the answer's size; anything else stops the walk once
+ * that many have been found, which bounds a probe on a graph with a
+ * giant component.
+ *
+ * The seed is in the answer only if a path leads back to it, so this is
+ * `MATCH (a)-[:E*1..k]->(c) RETURN count(DISTINCT c)` and not a walk of
+ * the component a seed sits in. Add one for that.
+ *
+ * Under ZU2_BOTH a walk may go back along the edge it arrived on, so a
+ * seed with any neighbour at all is two hops from itself. That is what
+ * reachability over an undirected graph means and it is not what Cypher
+ * means by an undirected variable-length pattern, which forbids a path
+ * from using one relationship twice. */
 zu2_status zu2_reach(zu2_session *s, zu2_direction dir, uint32_t seed,
-                     uint64_t max_visited, const uint32_t **out, size_t *len);
+                     uint32_t max_depth, uint64_t max_visited,
+                     const uint32_t **out, size_t *len);
+
+/* The hop count of a shortest path from src to dst.
+ *
+ * Writes found 0 and leaves hops 0 when there is no such path, which is
+ * an answer and not an error. max_depth bounds the search and 0 means no
+ * bound; a bounded search that ends without arriving reports not found,
+ * so a caller who wants to know whether a path exists at all passes 0.
+ * src == dst is nought hops and found. */
+zu2_status zu2_shortest(zu2_session *s, zu2_direction dir, uint32_t src,
+                        uint32_t dst, uint32_t max_depth, uint32_t *hops,
+                        int *found);
 
 /* Closed directed triangles through seed: pairs (b, c) with seed->b,
  * b->c and seed->c. */

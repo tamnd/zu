@@ -957,3 +957,43 @@ cases:
       - values:
           - type: INT64
             value: "0"
+
+  - name: an-element-pattern-predicate-selects-where-the-node-is-reached
+    doc: A condition inside the parentheses is asked of the one node the pattern is standing on, so it is the same question a WHERE behind the pattern asks of that node and it is asked in the pattern rather than behind it.
+    query: MATCH (n:person WHERE n.age > 35) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: an-element-pattern-predicate-reads-what-the-pattern-bound-before-it
+    doc: The non local predicate of G041, which compares the node the walk has just reached with the node it came from, so only the edges that climb in age are kept.
+    query: MATCH (a:person)-[:knows]->(b:person WHERE b.age > a.age) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: an-element-pattern-predicate-stands-beside-a-property-map
+    doc: Both forms describe the one node, so the map and the condition are both asked of it, in the order they were written.
+    query: MATCH (n:person {age: 40} WHERE n.name = 'bo') RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: an-element-pattern-predicate-inside-an-optional-match-keeps-the-row
+    doc: The condition is part of the pattern, so a node it refuses is a match that did not happen rather than a row to drop, and the left side keeps its row with nulls in it.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person WHERE m.age > 45) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"

@@ -282,12 +282,16 @@ module.exports = grammar({
 
     path_mode: ($) => choice(kw("WALK"), kw("TRAIL"), kw("SIMPLE"), kw("ACYCLIC")),
 
+    // The condition inside the parentheses is the element pattern
+    // predicate of ISO 16.6, asked of the one element the pattern is
+    // standing on and free to read what the pattern bound to its left.
     node: ($) =>
       seq(
         "(",
         optional(field("name", $._name)),
         repeat(seq(":", $.label_expr)),
         optional($.property_map),
+        optional(seq(kw("WHERE"), $._expression)),
         ")",
       ),
 
@@ -332,6 +336,7 @@ module.exports = grammar({
         optional(seq(":", $.label, repeat(seq("|", $.label)))),
         optional(seq("*", optional($.hop_range))),
         optional($.property_map),
+        optional(seq(kw("WHERE"), $._expression)),
         "]",
       ),
 

@@ -897,6 +897,17 @@ pub struct NodePattern {
     /// names no label and therefore matches whatever it reaches.
     pub label: Option<LabelExpr>,
     pub props: Vec<(String, Expr)>,
+    /// The `WHERE` written inside the parentheses, ISO 16.6 and feature
+    /// G041, `None` for a pattern that wrote none.
+    ///
+    /// It is the element pattern predicate, asked of the one node the
+    /// pattern is standing on rather than of the row a whole pattern
+    /// built, so `(a)-[:LINK]->(b WHERE b.step > a.step)` reads the node
+    /// it has just reached and the node it came from. Being part of the
+    /// pattern is what makes it different from the same text behind the
+    /// pattern under an `OPTIONAL MATCH`, where a condition that fails
+    /// leaves the row with nulls rather than dropping it.
+    pub filter: Option<Box<Expr>>,
 }
 
 /// A label expression: names joined by `&` and `|`, negated with `!`,

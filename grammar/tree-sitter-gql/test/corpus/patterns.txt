@@ -479,3 +479,51 @@ MATCH (a)((x)-[:LINK]->(y)){2}(b) RETURN SUM(y.step)
               (variable
                 (identifier))
               (identifier))))))))
+
+================================================================================
+An element pattern predicate on a node and on an edge
+================================================================================
+
+MATCH (a:Step WHERE a.step = 0)-[l:LINK WHERE l.w > 1]->(b:Step) RETURN b
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            name: (identifier)
+            (label_expr
+              (label
+                (identifier)))
+            (binary_expression
+              (property_access
+                (variable
+                  (identifier))
+                property: (identifier))
+              (literal
+                (integer))))
+          (relationship
+            (rel_detail
+              name: (identifier)
+              (label
+                (identifier))
+              (binary_expression
+                (property_access
+                  (variable
+                    (identifier))
+                  property: (identifier))
+                (literal
+                  (integer)))))
+          (node
+            name: (identifier)
+            (label_expr
+              (label
+                (identifier)))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))

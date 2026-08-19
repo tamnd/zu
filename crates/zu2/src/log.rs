@@ -552,23 +552,64 @@ impl Log {
     /// land in, so that `fdatasync` commits data rather than data plus
     /// an inode size change plus an extent allocation.
     ///
+    /// Only the range above `upto` is touched. The bytes below it hold
+    /// records and the flush this is running ahead of is about to put
+    /// them on the device, so the most that could be done for them is
+    /// the allocation they are about to pay for anyway.
+    ///
     /// Called under the flush mutex, which is what makes the watermark
     /// safe to keep as a plain field: the only other thing that moves it
     /// is [`Log::trim_tail`], and that takes the same mutex.
     fn provision(&self, state: &mut Flushing, upto: Address) {
+        // The trigger is the frontier reaching the reservation rather
+        // than the reservation being short of where it would ideally
+        // be, so this runs once per chunk and not once per flush.
         if !state.provisions || state.provisioned >= upto {
             return;
         }
-        let from = state.provisioned;
+        let from = upto.div_ceil(file::BLOCK) * file::BLOCK;
         let want = (upto + self.provision_bytes).div_ceil(file::BLOCK) * file::BLOCK;
-        if file::preallocate(&self.file, from, want - from) {
+        if self.initialise(from, want).is_ok() {
             state.provisioned = want;
         } else {
-            // One refusal is the answer for this filesystem. Asking
-            // again per flush would be a failing syscall on the commit
-            // path forever.
+            // One refusal is the answer for this filesystem, or for a
+            // disk that has run out. Trying again per flush would be a
+            // failing syscall on the commit path forever, and a log
+            // that grows the file the old way is slower and not wrong.
             state.provisions = false;
         }
+    }
+
+    /// Puts real blocks under a range of the file.
+    ///
+    /// Asking for the space is not enough. `fallocate` hands out
+    /// unwritten extents, and the first write to one is still a metadata
+    /// change that the sync has to commit, which is why the fallocated
+    /// shape in the appendcost example sits with the growing file rather
+    /// than with the file that was filled: 104 durable writes a second
+    /// against 1207 on server2. So the range is written, with zeros,
+    /// and synced once. Zeros because that is what page padding already
+    /// is and what a hole already reads as, so recovery treats the
+    /// unused part of a reservation as the end of the log without
+    /// knowing anything about reservations.
+    ///
+    /// The cost is one megabyte written and one extra sync per megabyte
+    /// of log, which is about a quarter of one small durable commit
+    /// spread over the two hundred and fifty six that fit in it.
+    fn initialise(&self, from: u64, want: u64) -> Result<()> {
+        if want <= from {
+            return Ok(());
+        }
+        // Still worth asking: it moves the file's size in one call and
+        // gives the filesystem the whole range to find contiguous
+        // extents for, rather than making it guess from a stream of
+        // writes. A refusal is not an error, the write below is what
+        // actually does the work.
+        file::preallocate(&self.file, from, want - from);
+        let zeros = vec![0u8; (want - from) as usize];
+        file::write_all_at(&self.file, &zeros, from)?;
+        file::sync(&self.file)?;
+        Ok(())
     }
 
     /// Gives back whatever was provisioned above the written frontier.

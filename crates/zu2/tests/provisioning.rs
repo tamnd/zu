@@ -43,6 +43,19 @@ fn file_len(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).expect("metadata").len()
 }
 
+/// What the filesystem has really put under the file, which is not the
+/// same as how long the file says it is.
+#[cfg(unix)]
+fn disk_bytes(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).expect("metadata").blocks() * 512
+}
+
+#[cfg(not(unix))]
+fn disk_bytes(path: &std::path::Path) -> u64 {
+    file_len(path)
+}
+
 #[test]
 fn a_durable_commit_leaves_the_file_provisioned_past_the_tail() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -57,6 +70,29 @@ fn a_durable_commit_leaves_the_file_provisioned_past_the_tail() {
     assert!(
         len >= CHUNK && len > tail,
         "the file is {len} bytes with a tail at {tail}, so nothing was provisioned"
+    );
+}
+
+#[test]
+fn the_reservation_is_written_and_not_merely_asked_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("z.zu2");
+    let db = Db::create(&path, options(Durability::Durable)).expect("create");
+    let mut s = db.session();
+    for i in 0..100u32 {
+        s.upsert(&key(i), &value(i)).expect("upsert");
+    }
+    // The point of the whole exercise. Asking for space with
+    // `fallocate` leaves unwritten extents behind, and the first write
+    // to one is still a metadata change, so the reservation is written
+    // with zeros. A file whose blocks add up to less than its length
+    // has holes in it, which is what merely asking for the space would
+    // have left.
+    let len = file_len(&path);
+    let blocks = disk_bytes(&path);
+    assert!(
+        blocks >= len,
+        "the file is {len} bytes long with {blocks} bytes of blocks under it, so the reservation is a hole"
     );
 }
 

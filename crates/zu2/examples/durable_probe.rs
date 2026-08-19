@@ -91,10 +91,15 @@ fn main() {
         None => tempfile::tempdir(),
     }
     .expect("tempdir");
-    println!("in {}  {rounds} rounds of {ops}", dir.path().display());
+    let chunk: u64 = env("ZU2_PROBE_CHUNK", zu2::PROVISION_CHUNK);
+    println!(
+        "in {}  {rounds} rounds of {ops}  reservation {} KiB",
+        dir.path().display(),
+        chunk / 1024
+    );
 
     let bare = loaded(dir.path(), "bare.zu2", 0);
-    let reserved = loaded(dir.path(), "reserved.zu2", zu2::PROVISION_CHUNK);
+    let reserved = loaded(dir.path(), "reserved.zu2", chunk);
     let value = vec![b'v'; 1000];
 
     let mut async_rates = Vec::new();

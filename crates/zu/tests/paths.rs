@@ -123,6 +123,57 @@ fn a_path_built_from_elements_equals_the_path_that_was_matched() {
     assert!(yes(&mut db, source));
 }
 
+/// GE06 over more than one hop, which is the case a constructor that
+/// only ever joined a single pair would pass every other case here
+/// without: the join has to hold at each step and the elements have to
+/// stay in the order the query wrote them.
+#[test]
+fn a_path_may_be_built_over_several_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    let two = "MATCH p = (a:person)-[e1:knows]->(b:person)-[e2:knows]->(c:person) \
+               WHERE a.id = 0 RETURN";
+    assert!(yes(
+        &mut db,
+        &format!("{two} (PATH [a, e1, b, e2, c] = p) AS v")
+    ));
+    assert_eq!(
+        one(
+            &mut db,
+            &format!("{two} PATH_LENGTH(PATH [a, e1, b, e2, c]) AS v")
+        ),
+        Value::Int(2)
+    );
+
+    // The order is part of the value. Both of these are paths over the
+    // same three elements and they are not the same path, which is what
+    // makes a path a walk rather than a set of what it touched.
+    let source = "MATCH p = (a:person)-[e:knows]->(b:person) WHERE a.id = 0 \
+                  RETURN (PATH [b, e, a] = p) AS v";
+    assert!(!yes(&mut db, source));
+
+    // A walk may go back the way it came, so an element may be written
+    // twice. Nothing here asks for a trail: the modes that do are on the
+    // pattern, and a constructor is not matching anything.
+    let source = "MATCH (a:person)-[e:knows]->(b:person) WHERE a.id = 0 \
+                  RETURN PATH_LENGTH(PATH [a, e, b, e, a]) AS v";
+    assert_eq!(one(&mut db, source), Value::Int(2));
+
+    // A built path is a value like the matched one is, so everything
+    // that takes a path takes this: the elements come back in the order
+    // the walk took them, and a set function gathers the paths
+    // themselves rather than what they are made of.
+    let source = "MATCH (a:person)-[e:knows]->(b:person) WHERE a.id = 0 \
+                  RETURN SIZE(ELEMENTS(PATH [a, e, b])) AS v";
+    assert_eq!(one(&mut db, source), Value::Int(3));
+    let source = "MATCH (a:person)-[e:knows]->(b:person) RETURN COLLECT(PATH [a, e, b]) AS v";
+    let Value::List(built) = one(&mut db, source) else {
+        panic!("{source} did not answer a list");
+    };
+    assert_eq!(built.len(), 3);
+    assert!(built.iter().all(|v| matches!(v, Value::Path(_))));
+}
+
 /// 22G0Z. The elements have to be a walk somebody can take. An edge
 /// between two nodes it does not touch is the interesting case, because
 /// the sequence is the right shape and the right kinds, so nothing but

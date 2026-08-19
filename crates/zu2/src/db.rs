@@ -281,6 +281,19 @@ impl Db {
         self.core.log.make_durable(tail, Durability::Durable)
     }
 
+    /// Device writes since this database was opened, which against the
+    /// commits that asked for one says how far group commit is
+    /// grouping.
+    pub fn syncs(&self) -> u64 {
+        self.core.log.syncs()
+    }
+
+    /// Durable commits since this database was opened. Most of them do
+    /// no device write of their own, or that is the intent.
+    pub fn commits(&self) -> u64 {
+        self.core.log.commits()
+    }
+
     /// What compaction has done since this database was opened.
     pub fn compaction(&self) -> &Compaction {
         &self.core.compaction

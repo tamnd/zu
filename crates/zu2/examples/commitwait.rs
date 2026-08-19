@@ -11,8 +11,16 @@
 //! The reading is the ratio rather than the rate. One writer committing
 //! on its own is the control, the same writer with readers beside it is
 //! the question, and a machine that gets busy halfway through moves both
-//! of them. A ratio near one means a reader is free. The old shape gave
-//! about a fifth of that.
+//! of them. A ratio near one means a reader is free.
+//!
+//! The readers are deliberately few and deliberately cold. Few, because
+//! a probe that runs more threads than the machine has cores measures
+//! the scheduler; the default is a quarter of the cores and one either
+//! way. Cold, because the database is opened with a memory window
+//! smaller than the data, so a read misses and goes to the device
+//! inside its epoch, which is what a reader on a database larger than
+//! memory does all day. That is the case the old shape was worst at: a
+//! commit had to wait out somebody else's `pread`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -33,25 +41,27 @@ fn median(rates: &[f64]) -> f64 {
     sorted[sorted.len() / 2]
 }
 
-fn report(what: &str, rates: &[f64]) {
+fn report(what: &str, rates: &[f64], batches: &[f64]) {
     let each: Vec<String> = rates.iter().map(|r| format!("{r:.0}")).collect();
     println!(
-        "{what:26} {:9.0} op/s median  {:9.1} us/commit  rounds: {}",
+        "{what:26} {:9.0} op/s median  {:9.1} us/commit  {:5.2} commits per sync  rounds: {}",
         median(rates),
         1e6 / median(rates),
+        median(batches),
         each.join(" ")
     );
 }
 
 /// A database loaded with the records the rounds update, so that no
 /// round is measuring an insert.
-fn loaded(dir: &std::path::Path) -> Db {
+fn loaded(dir: &std::path::Path, memory_pages: usize) -> Db {
     let db = Db::create(
         &dir.join("commitwait.zu2"),
         Options {
             durability: Durability::Async,
             index_buckets: 1 << 14,
             max_pages: 1 << 14,
+            memory_pages,
             ..Options::default()
         },
     )
@@ -72,7 +82,16 @@ fn loaded(dir: &std::path::Path) -> Db {
 /// committing `ops` records each, and the rate is the commits over the
 /// time the writers took. The readers are started first and stopped
 /// after, so a commit never runs without them.
-fn round(db: &Db, readers: usize, writers: usize, ops: u64, nth: usize, value: &[u8]) -> f64 {
+fn round(
+    db: &Db,
+    readers: usize,
+    writers: usize,
+    ops: u64,
+    nth: usize,
+    value: &[u8],
+) -> (f64, f64) {
+    let syncs_before = db.syncs();
+    let commits_before = db.commits();
     let stop = AtomicBool::new(false);
     let running = std::sync::atomic::AtomicUsize::new(0);
     let elapsed = std::thread::scope(|scope| {
@@ -113,41 +132,73 @@ fn round(db: &Db, readers: usize, writers: usize, ops: u64, nth: usize, value: &
         stop.store(true, Ordering::Release);
         elapsed
     });
-    (writers as u64 * ops) as f64 / elapsed.as_secs_f64()
+    let commits = (db.commits() - commits_before) as f64;
+    let syncs = (db.syncs() - syncs_before).max(1) as f64;
+    let done = (writers as u64 * ops) as f64;
+    (done / elapsed.as_secs_f64(), commits / syncs)
 }
 
 fn main() {
     let rounds: usize = env("ZU2_PROBE_ROUNDS", 5_usize);
     let ops: u64 = env("ZU2_PROBE_OPS", 400_u64);
-    let readers: usize = env("ZU2_PROBE_READERS", 7_usize);
-    let writers: usize = env("ZU2_PROBE_WRITERS", 8_usize);
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let writers: usize = env("ZU2_PROBE_WRITERS", (cores / 2).max(2));
+    let memory_pages: usize = env("ZU2_PROBE_MEMORY_PAGES", 2_usize);
     let dir = match std::env::args().nth(1) {
         Some(path) => tempfile::tempdir_in(path),
         None => tempfile::tempdir(),
     }
     .expect("tempdir");
     println!(
-        "in {}  {rounds} rounds of {ops} commits",
+        "in {}  {rounds} rounds of {ops} commits  {cores} cores  {memory_pages} pages in memory",
         dir.path().display()
     );
 
-    let db = loaded(dir.path());
+    let db = loaded(dir.path(), memory_pages);
     let value = vec![b'v'; 1000];
 
-    let mut alone = Vec::new();
-    let mut beside_readers = Vec::new();
+    // A sweep rather than one reader count, because what a commit used
+    // to wait for was the slowest session of however many there were,
+    // so one reader hides the effect and eight show it.
+    let counts: Vec<usize> = env::<String>("ZU2_PROBE_READERS", "0 1 2 4 8".to_string())
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let mut rates: Vec<Vec<f64>> = vec![Vec::new(); counts.len()];
+    let mut batches: Vec<Vec<f64>> = vec![Vec::new(); counts.len()];
     let mut many = Vec::new();
+    let mut many_batches = Vec::new();
     for nth in 0..rounds {
-        alone.push(round(&db, 0, 1, ops, nth, &value));
-        beside_readers.push(round(&db, readers, 1, ops, nth, &value));
-        many.push(round(&db, 0, writers, ops, nth, &value));
+        for (i, readers) in counts.iter().enumerate() {
+            let (rate, batch) = round(&db, *readers, 1, ops, nth, &value);
+            rates[i].push(rate);
+            batches[i].push(batch);
+        }
+        let (rate, batch) = round(&db, 0, writers, ops, nth, &value);
+        many.push(rate);
+        many_batches.push(batch);
     }
-    report("one writer alone", &alone);
-    report(&format!("one writer, {readers} readers"), &beside_readers);
-    report(&format!("{writers} writers"), &many);
+    for (i, readers) in counts.iter().enumerate() {
+        report(
+            &format!("one writer, {readers} readers"),
+            &rates[i],
+            &batches[i],
+        );
+    }
+    report(
+        &format!("{writers} writers, no readers"),
+        &many,
+        &many_batches,
+    );
+    let alone = median(&rates[0]);
+    let costs: Vec<String> = counts
+        .iter()
+        .zip(&rates)
+        .map(|(readers, rate)| format!("{readers}: {:.2}x", alone / median(rate)))
+        .collect();
+    println!("readers cost {}", costs.join("  "));
     println!(
-        "readers cost {:.2}x, and {writers} writers are worth {:.2}x one",
-        median(&alone) / median(&beside_readers),
-        median(&many) / median(&alone)
+        "{writers} writers are worth {:.2}x one",
+        median(&many) / alone
     );
 }

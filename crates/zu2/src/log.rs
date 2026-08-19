@@ -153,6 +153,16 @@ pub struct Log {
     /// How far past the write frontier the blocks are reserved. Zero
     /// never reserves.
     provision_bytes: u64,
+    /// Device writes since the log was opened.
+    ///
+    /// Against the commits that asked for one, this is what says whether
+    /// group commit is grouping. A thousand commits and a thousand syncs
+    /// means every thread paid the device on its own and the leader
+    /// arrangement bought nothing.
+    syncs: AtomicU64,
+    /// Durable commits since the log was opened, whether or not they
+    /// ended up doing the device write themselves.
+    commits: AtomicU64,
     pub(crate) epochs: Epochs,
 }
 
@@ -186,12 +196,26 @@ impl Log {
                 stopping: false,
             }),
             provision_bytes,
+            syncs: AtomicU64::new(0),
+            commits: AtomicU64::new(0),
             dirty: Condvar::new(),
             dirty_lock: Mutex::new(false),
             mutable_pages: mutable_pages.max(1),
             memory_pages: memory_pages.max(mutable_pages.max(1) + 1),
             epochs: Epochs::new(sessions),
         }
+    }
+
+    /// Device writes since the log was opened.
+    #[inline]
+    pub fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
+
+    /// Durable commits since the log was opened.
+    #[inline]
+    pub fn commits(&self) -> u64 {
+        self.commits.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -733,6 +757,7 @@ impl Log {
             state.written = page_end;
         }
         file::sync(&self.file)?;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         self.flushed.fetch_max(upto, Ordering::AcqRel);
         Ok(())
     }
@@ -775,7 +800,11 @@ impl Log {
 
     /// Makes everything below `upto` durable according to `mode`.
     pub fn make_durable(&self, upto: Address, mode: Durability) -> Result<()> {
-        if mode == Durability::Async || self.flushed() >= upto {
+        if mode == Durability::Async {
+            return Ok(());
+        }
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        if self.flushed() >= upto {
             return Ok(());
         }
         let mut state = self.flushing.lock().expect("zu2 flush state");

@@ -561,9 +561,12 @@ fn run_set(dir: &Path, rows: u64) -> Cost {
 /// than what to change about it, so it writes every column of the table
 /// and not one of them. Two columns here, one of each kind, so the number
 /// beside the one property run is what the second column and the wider
-/// log record cost. Each write puts back the values it found, as the
-/// other runs do, so the growth column is again what changing nothing
-/// cost the store.
+/// log record cost, and it is the run that says a string is carried the
+/// way a word is: the name goes over the name the row holds and the
+/// blob range is rebuilt around it, where it used to mean rewriting the
+/// column. Each write puts back the values it found, as the other runs
+/// do, so the growth column is again what changing nothing cost the
+/// store. It is what a linkbench update of a node's payload costs.
 fn run_set_record(dir: &Path, rows: u64) -> Cost {
     let path = build(dir, rows);
     let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
@@ -1120,6 +1123,8 @@ fn main() {
         ("set_edge_stmt_growth_b", set_edge.growth),
         ("set_record_stmt_us", set_record.us),
         ("set_record_stmt_kb", set_record.written / 1024.0),
+        ("set_record_stmt_cpu_us", set_record.cpu),
+        ("set_record_stmt_growth_b", set_record.growth),
         ("set_label_stmt_us", set_label.us),
         ("set_label_stmt_kb", set_label.written / 1024.0),
         ("insert_stmt_us", insert.us),

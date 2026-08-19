@@ -567,7 +567,7 @@ impl Log {
         if !state.provisions || state.provisioned >= upto {
             return;
         }
-        // A flush with a chunk's worth of records behind it is a bulk
+        // A commit with a chunk's worth of records behind it is a bulk
         // load, not a commit. Growing the file costs it one inode update
         // for a megabyte of data it was going to write anyway, and
         // writing zeros first would double what it puts on the device.
@@ -642,8 +642,14 @@ impl Log {
 
     /// Writes and syncs everything below `upto`, which the caller has
     /// already established is quiescent.
-    fn write_and_sync(&self, state: &mut Flushing, upto: Address) -> Result<()> {
-        self.provision(state, upto);
+    ///
+    /// `committing` says whether somebody is waiting for this. Only a
+    /// commit provisions, because only a commit is paying the metadata
+    /// cost with a thread that is standing still.
+    fn write_and_sync(&self, state: &mut Flushing, upto: Address, committing: bool) -> Result<()> {
+        if committing {
+            self.provision(state, upto);
+        }
         while state.written < upto {
             let page = page_of(state.written);
             let page_end = page_start(page + 1).min(upto);
@@ -684,7 +690,7 @@ impl Log {
         if upto <= self.flushed() {
             return Ok(());
         }
-        self.write_and_sync(&mut state, upto)
+        self.write_and_sync(&mut state, upto, false)
     }
 
     /// Whether the log has been told to shut down.
@@ -736,7 +742,7 @@ impl Log {
         let target = self.tail().max(upto);
         self.flush_target.fetch_max(target, Ordering::AcqRel);
         self.epochs.wait_for_quiescence();
-        self.write_and_sync(&mut state, target)
+        self.write_and_sync(&mut state, target, true)
     }
 
     /// Stops the flusher after one last pass.

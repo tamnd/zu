@@ -1,0 +1,32 @@
+[package]
+name = "zu-arrow"
+description = "A zu result as Arrow arrays, off the buffers the engine already filled"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zu-common.workspace = true
+zu-query.workspace = true
+arrow.workspace = true
+
+[dev-dependencies]
+zu.workspace = true
+zu-zu1.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+# The C Data Interface, which is how a result reaches pyarrow, DuckDB
+# and anything else in the same process that speaks Arrow.
+ffi = ["arrow/ffi"]
+# The IPC stream format, which is how a result reaches a runtime with no
+# way to read a C struct. JavaScript is the one that needs it.
+ipc = ["arrow/ipc"]
+
+[lints]
+workspace = true

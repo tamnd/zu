@@ -23,6 +23,7 @@ zu-s3 = { path = "crates/zu-s3" }
 zu-query = { path = "crates/zu-query" }
 zu-exec = { path = "crates/zu-exec" }
 zu = { path = "crates/zu" }
+zu-arrow = { path = "crates/zu-arrow" }
 zu-corpus = { path = "crates/zu-corpus" }
 
 thiserror = "2"
@@ -34,6 +35,10 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 arrow-array = "59"
 arrow-schema = "59"
+# The umbrella crate, with nothing turned on by default: zu-arrow adds
+# the ffi and ipc features, and each client turns on the one it exports
+# through.
+arrow = { version = "59", default-features = false }
 tempfile = "3"
 
 [workspace.lints.rust]

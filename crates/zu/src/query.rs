@@ -316,6 +316,40 @@ impl<'a> Zu1Graph<'a> {
         self.patches = Arc::new(Patches::new());
     }
 
+    /// How many edges one element has in one direction of one rel
+    /// table, and the edges themselves.
+    ///
+    /// A `DELETE` asks the first to know whether it may take the
+    /// element away and a `DETACH DELETE` asks the second to know what
+    /// goes with it. They are here rather than in [`crate::delete`] so
+    /// that a write reads through the session's readers: a reader is a
+    /// catalog load and a directory decode, and a statement that opened
+    /// one of its own spent more on finding the edges than on taking
+    /// them away.
+    pub(crate) fn edges_on(&mut self, rel: u32, node: u64, dir: Direction) -> Result<u64> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        readers
+            .get(&rel)
+            .expect("just loaded")
+            .degree_of(db, node, dir)
+    }
+
+    pub(crate) fn ends_of(
+        &mut self,
+        rel: u32,
+        node: u64,
+        dir: Direction,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        self.ensure_reader(rel)?;
+        let Self { db, readers, .. } = self;
+        readers
+            .get(&rel)
+            .expect("just loaded")
+            .neighbors_dir_into(db, node, dir, out)
+    }
+
     fn ensure_reader(&mut self, rel: u32) -> Result<()> {
         if self.readers.contains_key(&rel) {
             return Ok(());

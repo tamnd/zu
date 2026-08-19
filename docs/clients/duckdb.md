@@ -114,7 +114,7 @@ DuckDB's Python connection has 71 public members and its module 181. Ours has 14
 |---|---|---|---|
 | `connect()` with no path, in memory | `connect()`, and `':memory:'` means the same | `connect()`, and `':memory:'` means the same | done |
 | `sql` / `execute` / module-level default connection | `execute`, `sql` | `query`, `exec` | done, minus the module-level default |
-| `fetchall`, `fetchone`, `fetchmany` | `fetchall`, `fetchone` | rows are an array | `fetchmany` owed for DB-API |
+| `fetchall`, `fetchone`, `fetchmany` | `fetchall`, `fetchone`, `fetchmany` | rows are an array | done, and a block is 3.1x a row at a time |
 | `arrow()`, `fetch_arrow_table` | `to_arrow`, off the engine's own buffers | `columnar`, the same buffers as typed arrays | Arrow itself owed for Node, 4.5x for Python |
 | `fetch_record_batch` streaming | `record_batches`, zero-copy slices of a materialized result | `stream`, as batches of rows | owed, real streaming |
 | `df()`, `pl()`, `fetchnumpy()`, `torch()`, `tf()` | `to_pandas`, `to_polars` | none | numpy owed, torch and tf are not our lane |
@@ -143,6 +143,6 @@ In order, largest effect first.
 3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result. Done, all five. Arrow itself over the C Data Interface is what is left of it, and it is item 2's other half.
 4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on. Done in both.
 5. Real streaming, meaning a result read a chunk at a time as the executor produces it rather than a slice of a result that is already whole.
-6. The small ones: an in-memory connection that does not make a file and a second connection made from the first are both done in both clients, and both are the engine's own answer rather than a special case in either one. What is left of this row is `fetchmany`, `fetchnumpy`, and a progress callback in Node.
+6. The small ones: an in-memory connection that does not make a file and a second connection made from the first are both done in both clients, and both are the engine's own answer rather than a special case in either one. What is left of this row is `fetchnumpy` and a progress callback in Node.
 
 Item 1's second half is the only thing left that the live measurement asks for, and it is 22 of the 26 milliseconds. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.

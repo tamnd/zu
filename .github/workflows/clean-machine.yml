@@ -1,0 +1,136 @@
+name: Clean machine
+
+# cargo add zudb, on a machine that has nothing else on it.
+#
+# CI builds inside this workspace, with a lockfile, a warm target
+# directory and a hosted image carrying a decade of development
+# packages. The person who read the README and typed cargo add has a
+# toolchain, a network and a crate of their own, and there is a whole
+# class of failure that only they ever see. A dependency that quietly
+# needs pkg-config and a system library. A build script that shells out
+# to a tool the hosted image happened to have. A feature that resolves
+# one way as a workspace member and another way as somebody's
+# dependency. A revision nobody outside this repository can fetch.
+#
+# So this makes a crate outside the workspace in a container that holds
+# a toolchain and nothing else, points it at this revision, and builds
+# and runs the README's sixty seconds program there. The program it runs
+# is scripts/crate-check.sh, and the program that gets compiled is the
+# snippet file itself, mounted in, which tests/readme.rs already holds
+# to the README character for character. Nothing here retypes the
+# quickstart.
+#
+# This is the third of three. zu-python and zu-node have the same job
+# against a wheel and a platform package; this one is the same question
+# asked of the source, which is what a Rust reader installs.
+#
+# Nightly rather than on every push, because what it catches is drift
+# in things outside this repository: a base image whose glibc moved, a
+# musl that went forward, a transitive dependency that added a build
+# script. None of that is in a diff anybody here writes, and all of it
+# arrives on its own schedule.
+
+on:
+  schedule:
+    # Late enough that the day's merges are in, and not on the hour,
+    # where every scheduled job on the service is queued behind every
+    # other one.
+    - cron: "7 6 * * *"
+  workflow_dispatch:
+  # The workflow and the program it runs are exercised on the pull
+  # request that changes them, since a nightly that broke is a nightly
+  # nobody reads for a week.
+  pull_request:
+    paths:
+      - .github/workflows/clean-machine.yml
+      - scripts/crate-check.sh
+      - crates/zu-snippets/examples/**
+      - README.md
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # docker run rather than a job container, because a job container has
+  # the runner's own tooling mounted into it and half the reason to use
+  # a bare image is that nothing is mounted into it. This way the only
+  # things inside are the image, the shell program and the snippet.
+  clean:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # glibc and musl, which is where a crate that assumed one of
+        # them finds out. Both official images carry a compiler and a
+        # linker, which a toolchain image has to, and neither carries
+        # git, python, make, cmake, pkg-config or node, which is the
+        # part scripts/crate-check.sh asserts rather than believes.
+        variant: [slim, alpine]
+    steps:
+      - uses: actions/checkout@v7
+
+      # One table says what this repository builds against, so the
+      # image tag is read off rust-toolchain.toml rather than written
+      # down a second time and left to drift.
+      - id: pin
+        run: |
+          set -eu
+          rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          test -n "$rust"
+          echo "image=rust:$rust-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+
+      # The revision the crate depends on has to be one cargo can fetch,
+      # which means a commit on a branch of this repository rather than
+      # the merge commit a pull request event hands out: cargo fetches
+      # refs/heads and refs/tags, and refs/pull/N/merge is neither.
+      - id: rev
+        run: echo "sha=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: A crate of somebody's own, on a machine with only the toolchain
+        run: |
+          docker run --rm \
+            -v "$PWD/scripts/crate-check.sh:/crate-check.sh:ro" \
+            -v "$PWD/crates/zu-snippets/examples/sixty-seconds.rs:/sixty-seconds.rs:ro" \
+            -w /tmp \
+            ${{ steps.pin.outputs.image }} \
+            sh /crate-check.sh "${{ github.server_url }}/${{ github.repository }}.git" "${{ steps.rev.outputs.sha }}"
+
+      # The gate is validated the only way a gate can be: the failure it
+      # exists to catch has to fail it. A revision nothing can fetch is
+      # what a branch that was never pushed looks like from in here, and
+      # it is the failure this job is uniquely placed to catch, since
+      # every other job in this repository already has the commit on
+      # disk. It is also the check that the job is running the program
+      # at all, because a bind mount pointing at nothing and a container
+      # whose exit code went nowhere both look exactly like success.
+      - name: The failure the job is meant to catch, caught
+        run: |
+          set +e
+          docker run --rm \
+            -v "$PWD/scripts/crate-check.sh:/crate-check.sh:ro" \
+            -v "$PWD/crates/zu-snippets/examples/sixty-seconds.rs:/sixty-seconds.rs:ro" \
+            -w /tmp \
+            ${{ steps.pin.outputs.image }} \
+            sh /crate-check.sh "${{ github.server_url }}/${{ github.repository }}.git" 0000000000000000000000000000000000000000
+          test $? -ne 0 || { echo "the build passed against a revision that does not exist"; exit 1; }
+
+      # And the other half of the same idea. The emptiness of the image
+      # is what makes the job mean anything, and it is asserted by a
+      # loop that would go on passing if somebody deleted the names out
+      # of it. So the loop is pointed at an image that has one of them,
+      # and has to refuse. A small image with a python in it does the
+      # job and costs a few seconds.
+      - name: The image check, on an image it has to refuse
+        run: |
+          set +e
+          docker run --rm \
+            -v "$PWD/scripts/crate-check.sh:/crate-check.sh:ro" \
+            -v "$PWD/crates/zu-snippets/examples/sixty-seconds.rs:/sixty-seconds.rs:ro" \
+            -w /tmp \
+            python:3.14-alpine sh /crate-check.sh unused unused
+          test $? -ne 0 || { echo "the image check passed on an image with a python on it"; exit 1; }

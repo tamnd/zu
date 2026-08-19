@@ -522,6 +522,45 @@ impl Connection {
         self.read_only
     }
 
+    /// Another connection to the same database, made from this one
+    /// rather than from the path.
+    ///
+    /// This is how a pool is written. [`Database::connect`] opens the
+    /// file and looks up the write side under its path; this forks a
+    /// descriptor off the side this connection already holds, so it
+    /// costs a schema load and no lookup, and it works on a database
+    /// in memory, which has no path to look up.
+    ///
+    /// The two are connections in every sense, not two names for one:
+    /// each has its own plan cache, its own readers, its own interrupt
+    /// and its own transaction. What they share is the write side, so
+    /// they queue behind each other to write and each sees what the
+    /// other has committed, exactly as two connections from the same
+    /// [`Database`] do. The switches and the read-only setting are
+    /// carried across, because a pool that handed out connections
+    /// configured differently from the one it was seeded with would be
+    /// a trap.
+    ///
+    /// ```no_run
+    /// use zu::Database;
+    ///
+    /// let db = Database::memory()?;
+    /// let mut conn = db.connect()?;
+    /// conn.query("INSERT (p:person {id: 1, name: 'ada'})")?;
+    /// let mut other = conn.duplicate()?;
+    /// let rows = other.query("MATCH (p:person) RETURN p.name AS name")?;
+    /// assert_eq!(rows.rows.len(), 1);
+    /// # Ok::<(), zu_common::ZuError>(())
+    /// ```
+    pub fn duplicate(&self) -> Result<Connection> {
+        let mut session = Session::attached(Arc::clone(self.session.handle()))?;
+        session.set_options(self.session.options().clone());
+        Ok(Connection {
+            session,
+            read_only: self.read_only,
+        })
+    }
+
     /// The handle a statement on this connection can be stopped
     /// through, and the count of rows it has read.
     ///
@@ -1140,6 +1179,110 @@ mod tests {
         let (_dir, path) = scratch("durable.zu1");
         let db = Database::open(&path).expect("open");
         assert!(!db.is_memory());
+    }
+
+    /// The pool case: a connection made from another connection reads
+    /// what that one wrote, and what it writes is read back the other
+    /// way. Written on a database in memory because that is the one
+    /// with no path to reopen, so nothing but the shared write side
+    /// could be carrying the rows.
+    #[test]
+    fn a_duplicated_connection_is_on_the_same_database() {
+        let db = Database::memory().expect("memory");
+        let mut first = db.connect().expect("connect");
+        first
+            .query("INSERT (p:person {uid: 1, name: 'ada'})")
+            .expect("ada");
+        let mut second = first.duplicate().expect("duplicate");
+        assert_eq!(
+            second
+                .query("MATCH (p:person) RETURN p.name")
+                .expect("read")
+                .rows
+                .len(),
+            1
+        );
+        second
+            .query("INSERT (p:person {uid: 2, name: 'grace'})")
+            .expect("grace");
+        assert_eq!(
+            first
+                .query("MATCH (p:person) RETURN p.name")
+                .expect("read")
+                .rows
+                .len(),
+            2
+        );
+    }
+
+    /// A duplicate off a file works the same way, and the point worth
+    /// stating is that it did not go back to the path: it is made from
+    /// a connection and there is nowhere else the rows could come from.
+    #[test]
+    fn a_duplicated_connection_on_a_file_reads_what_the_first_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::create(dir.path().join("pooled.zu1")).expect("create");
+        let mut first = db.connect().expect("connect");
+        first
+            .query("INSERT (p:person {uid: 1, name: 'ada'})")
+            .expect("ada");
+        let mut second = first.duplicate().expect("duplicate");
+        assert_eq!(
+            second
+                .query("MATCH (p:person) RETURN p.name")
+                .expect("read")
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    /// A pool that handed out connections configured differently from
+    /// the one it was seeded with would be a trap, so read-only is
+    /// carried across and refuses the same statements.
+    #[test]
+    fn a_duplicate_of_a_read_only_connection_is_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("locked.zu1");
+        Database::create(&path)
+            .expect("create")
+            .connect()
+            .expect("connect")
+            .query("INSERT (p:person {uid: 1, name: 'ada'})")
+            .expect("ada");
+        let db = Database::open_with(&path, Config::new().read_only(true)).expect("open");
+        let first = db.connect().expect("connect");
+        let mut second = first.duplicate().expect("duplicate");
+        assert!(second.is_read_only());
+        assert!(matches!(
+            second.query("INSERT (p:person {uid: 2})"),
+            Err(ZuError::InvalidArgument(_))
+        ));
+    }
+
+    /// The switches ride across too, for the same reason: a pool whose
+    /// connections ran on a different thread count than the one it was
+    /// built from would be a bug nobody would look for.
+    #[test]
+    fn a_duplicate_runs_under_the_same_switches() {
+        let db = Database::memory_with(Config::new().threads(2)).expect("memory");
+        let mut conn = db.connect().expect("connect");
+        let mut second = conn.duplicate().expect("duplicate");
+        assert_eq!(
+            second.session_mut().options().threads,
+            conn.session_mut().options().threads
+        );
+    }
+
+    /// The interrupt does not, and that is the point of it: stopping a
+    /// statement on one connection of a pool must not stop the rest.
+    #[test]
+    fn a_duplicate_has_an_interrupt_of_its_own() {
+        let db = Database::memory().expect("memory");
+        let conn = db.connect().expect("connect");
+        let second = conn.duplicate().expect("duplicate");
+        conn.interrupt().stop();
+        assert!(!second.interrupt().stopped());
     }
 
     #[test]

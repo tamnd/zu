@@ -21,15 +21,15 @@ use zu::{
     zu_appender_flush, zu_appender_free, zu_appender_open, zu_appender_open_z, zu_begin,
     zu_bind_bool, zu_bind_bool_z, zu_bind_i64, zu_bind_i64_z, zu_bind_str_z, zu_bind_temporal,
     zu_bind_temporal_z, zu_commit, zu_config_init, zu_config_set_z, zu_conn_close,
-    zu_conn_in_transaction, zu_conn_interrupt, zu_conn_register, zu_conn_registered_count,
-    zu_conn_registered_name, zu_conn_rows_read, zu_conn_set_progress, zu_conn_unregister_z,
-    zu_connect, zu_create, zu_create_z, zu_database_close, zu_database_create_z,
-    zu_database_is_memory, zu_database_memory, zu_database_open_z, zu_database_path, zu_error_code,
-    zu_error_doc_url, zu_error_excerpt, zu_error_free, zu_error_message, zu_error_offset,
-    zu_error_position, zu_error_retryable, zu_error_severity, zu_error_standard_text,
-    zu_error_status, zu_execute, zu_frame_col_bool, zu_frame_col_float, zu_frame_col_int,
-    zu_frame_col_str, zu_frame_col_view, zu_frame_free, zu_frame_new, zu_frame_new_z,
-    zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
+    zu_conn_duplicate, zu_conn_in_transaction, zu_conn_interrupt, zu_conn_register,
+    zu_conn_registered_count, zu_conn_registered_name, zu_conn_rows_read, zu_conn_set_progress,
+    zu_conn_unregister_z, zu_connect, zu_create, zu_create_z, zu_database_close,
+    zu_database_create_z, zu_database_is_memory, zu_database_memory, zu_database_open_z,
+    zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt, zu_error_free,
+    zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable, zu_error_severity,
+    zu_error_standard_text, zu_error_status, zu_execute, zu_frame_col_bool, zu_frame_col_float,
+    zu_frame_col_int, zu_frame_col_str, zu_frame_col_view, zu_frame_free, zu_frame_new,
+    zu_frame_new_z, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
     zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
     zu_loader_table, zu_loader_table_z, zu_memory, zu_open, zu_open_z, zu_prepare, zu_prepare_z,
     zu_query, zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
@@ -2292,6 +2292,77 @@ fn a_database_is_made_in_memory_and_leaves_nothing_behind() {
         assert_eq!(col_i64(result, 0, 1), [1]);
         zu_result_free(result);
         zu_conn_close(only);
+    }
+}
+
+/// A pool with a connection and no database handle can still make a
+/// second connection, and on a database in memory that is the only way
+/// there is one.
+#[test]
+fn a_connection_duplicates_itself_onto_the_same_database() {
+    unsafe {
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut first: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_memory(&mut first, &mut err), ZuStatus::Ok);
+        let result = query(first, "INSERT (p:person {uid: 1, name: 'ada'})", &mut err);
+        zu_result_free(result);
+
+        let mut second: *mut ZuConn = ptr::null_mut();
+        assert_eq!(
+            zu_conn_duplicate(first, &mut second, &mut err),
+            ZuStatus::Ok
+        );
+        assert!(!second.is_null() && err.is_null());
+        let result = query(second, "MATCH (p:person) RETURN p.uid AS uid", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [1]);
+        zu_result_free(result);
+
+        // Both ways: what the duplicate writes, the original reads.
+        let result = query(
+            second,
+            "INSERT (p:person {uid: 2, name: 'grace'})",
+            &mut err,
+        );
+        zu_result_free(result);
+        let result = query(first, "MATCH (p:person) RETURN p.uid AS uid", &mut err);
+        assert_eq!(col_i64(result, 0, 2), [1, 2]);
+        zu_result_free(result);
+
+        // And it outlives the one it was made from, because it is a
+        // connection and not a view of one.
+        zu_conn_close(first);
+        let result = query(second, "MATCH (p:person) RETURN p.uid AS uid", &mut err);
+        assert_eq!(zu_result_rows(result), 2);
+        zu_result_free(result);
+        zu_conn_close(second);
+    }
+}
+
+/// The misuse cases, which are the ones a binding hits first.
+#[test]
+fn duplicating_nothing_or_into_nothing_is_a_misuse() {
+    unsafe {
+        let mut err: *mut ZuError = ptr::null_mut();
+        let mut out: *mut ZuConn = ptr::null_mut();
+        assert_eq!(
+            zu_conn_duplicate(ptr::null_mut(), &mut out, &mut err),
+            ZuStatus::Misuse
+        );
+        assert!(out.is_null());
+
+        let mut conn: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_memory(&mut conn, &mut err), ZuStatus::Ok);
+        assert_eq!(
+            zu_conn_duplicate(conn, ptr::null_mut(), &mut err),
+            ZuStatus::Misuse
+        );
+        // Nowhere to write the connection to is the one of the two
+        // worth a sentence, because the caller cannot see which
+        // argument was wrong from the status alone.
+        assert!(!err.is_null());
+        zu_error_free(err);
+        assert!(out.is_null());
+        zu_conn_close(conn);
     }
 }
 

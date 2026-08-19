@@ -959,6 +959,18 @@ impl Session {
         Ok(())
     }
 
+    /// The file this session reads through, shared with every other
+    /// session this process has on the same file.
+    ///
+    /// It is handed out so that a caller holding one session can open
+    /// another beside it without going back to the path:
+    /// [`Session::attached`] takes exactly this and forks a descriptor
+    /// off it. What the two share is the write side and the caches
+    /// under it; plans, readers and the interrupt are per session.
+    pub fn handle(&self) -> &Arc<FileHandle> {
+        &self.handle
+    }
+
     /// The execution switches this session runs statements under.
     pub fn options(&self) -> &exec::Options {
         &self.options

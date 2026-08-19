@@ -333,6 +333,14 @@ zu_status zu_create_z(const char *path, zu_conn **out, zu_error **err);
 /* And the same over a database that is nowhere: one scratch graph and
  * one connection on it, which go together when the connection closes. */
 zu_status zu_memory(zu_conn **out, zu_error **err);
+/* A second connection on the database a connection is already on, made
+ * without a path. This is what a pool calls once it has handed the
+ * database handle back, and it is the only way to a second connection
+ * on a database in memory, which has no path to reopen. The switches
+ * and the read-only setting come across; the plan cache, the block
+ * caches, the interrupt and the transaction do not, because those are
+ * what makes it a connection of its own. */
+zu_status zu_conn_duplicate(zu_conn *conn, zu_conn **out, zu_error **err);
 void zu_conn_close(zu_conn *conn);
 void zu_close(zu_conn *conn); /* the old name; goes at the freeze */
 

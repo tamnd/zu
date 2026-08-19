@@ -17,7 +17,11 @@
 //! plus `prepare`, `execute`, `close_stmt`, `explain`,
 //! `explain_analyze`, and `quit`. Any other non-empty line is a bare
 //! statement run with no parameters, with `\n`, `\t`, and `\\`
-//! unfolded so a multi-line statement can travel on one line.
+//! unfolded so a multi-line statement can travel on one line. A
+//! parameter is JSON and takes the value JSON says it is, except for
+//! the two references a statement can be handed: `{"$graph": "/social"}`
+//! is the graph at that path and `{"$table": {"columns": [], "rows": []}}`
+//! is a binding table written out.
 //! Responses are `{"gqlstatus":...,"columns":...,"rows":...}` for
 //! results, `{"text":"..."}` for the two explain frames, and
 //! `{"error":"..."}` for failures, and an error never kills the loop:
@@ -200,9 +204,9 @@ fn respond(session: &mut Session, path: &str, line: &str) -> (String, bool) {
             let Some(id) = frame.get("stmt").and_then(Json::as_u64) else {
                 return (error_line("execute needs an integer stmt"), false);
             };
-            let params = match frame_params(&frame) {
+            let params = match frame_params(session, &frame) {
                 Ok(p) => p,
-                Err(e) => return (error_line(&e), false),
+                Err(fault) => return (fault.line(), false),
             };
             let borrowed: Vec<(&str, Value)> = params
                 .iter()
@@ -260,9 +264,9 @@ fn run_frame(session: &mut Session, frame: &Json, explain: bool) -> String {
     let Some(q) = frame.get("q").and_then(Json::as_str) else {
         return error_line("query needs a string q");
     };
-    let params = match frame_params(frame) {
+    let params = match frame_params(session, frame) {
         Ok(p) => p,
-        Err(e) => return error_line(&e),
+        Err(fault) => return fault.line(),
     };
     let borrowed: Vec<(&str, Value)> = params
         .iter()
@@ -285,19 +289,45 @@ fn run_frame(session: &mut Session, frame: &Json, explain: bool) -> String {
     }
 }
 
+/// What can go wrong while a frame's parameters are being read.
+///
+/// The two are answered differently and that is the whole reason the
+/// enum is here. A `params` that is not an object is a protocol fault,
+/// which has no GQLSTATUS because the standard defines no condition for
+/// a client that sent the wrong shape. A `$graph` naming a graph the
+/// catalog does not hold is a condition the standard does define,
+/// `42002`, and the reply says so the same way it would if the
+/// statement had named the graph in its own text.
+#[derive(Debug)]
+enum Fault {
+    Protocol(String),
+    Engine(zu::ZuError),
+}
+
+impl Fault {
+    /// The one-line reply this fault is answered with.
+    fn line(&self) -> String {
+        match self {
+            Fault::Protocol(message) => error_line(message),
+            Fault::Engine(error) => failure_line(error),
+        }
+    }
+}
+
 /// Pulls the optional `params` object out of a frame and types each
 /// value the way the query engine binds it.
-fn frame_params(frame: &Json) -> Result<Vec<(String, Value)>, String> {
+fn frame_params(session: &mut Session, frame: &Json) -> Result<Vec<(String, Value)>, Fault> {
     let Some(params) = frame.get("params") else {
         return Ok(Vec::new());
     };
     let Json::Obj(fields) = params else {
-        return Err("params must be an object".to_string());
+        return Err(Fault::Protocol("params must be an object".to_string()));
     };
-    Ok(fields
-        .iter()
-        .map(|(name, v)| (name.clone(), param_value(v)))
-        .collect())
+    let mut out = Vec::with_capacity(fields.len());
+    for (name, value) in fields {
+        out.push((name.clone(), param_value(session, value)?));
+    }
+    Ok(out)
 }
 
 /// One parameter, typed the way the engine binds it.
@@ -311,21 +341,125 @@ fn frame_params(frame: &Json) -> Result<Vec<(String, Value)>, String> {
 /// that looks like one is a string: a statement wanting one calls
 /// `date($text)` on a string parameter, which says which calendar type
 /// was meant instead of leaving the wire to guess.
-fn param_value(v: &Json) -> Value {
-    match v {
+///
+/// The two exceptions are the references, GE04 and GE05. A graph and a
+/// binding table are values a statement may be handed, and neither has
+/// a JSON shape of its own, so each is written as an object with one
+/// member whose name begins with a dollar sign: `{"$graph": "/social"}`
+/// and `{"$table": {"columns": [...], "rows": [[...]]}}`. A dollar sign
+/// cannot begin an identifier, so no record a statement could write out
+/// loses its spelling to this, and the word is the same word the
+/// statement writes in front of the parameter.
+fn param_value(session: &mut Session, v: &Json) -> Result<Value, Fault> {
+    Ok(match v {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
         Json::Int(i) => Value::Int(*i),
         Json::Float(f) => Value::Float(*f),
         Json::Str(s) => Value::Str(s.clone()),
-        Json::Arr(items) => Value::List(items.iter().map(param_value).collect()),
-        Json::Obj(fields) => Value::record(
-            fields
-                .iter()
-                .map(|(field, item)| (field.clone(), param_value(item)))
-                .collect(),
-        ),
+        Json::Arr(items) => {
+            let mut list = Vec::with_capacity(items.len());
+            for item in items {
+                list.push(param_value(session, item)?);
+            }
+            Value::List(list)
+        }
+        Json::Obj(fields) => match reference(fields) {
+            Some(("$graph", value)) => graph_param(session, value)?,
+            Some(("$table", value)) => table_param(session, value)?,
+            Some((word, _)) => {
+                return Err(Fault::Protocol(format!(
+                    "{word} is not a reference this wire knows, which is $graph or $table"
+                )));
+            }
+            None => {
+                let mut members = Vec::with_capacity(fields.len());
+                for (field, item) in fields {
+                    members.push((field.clone(), param_value(session, item)?));
+                }
+                Value::record(members)
+            }
+        },
+    })
+}
+
+/// The one member of an object whose name begins with a dollar sign,
+/// and `None` when the object is an ordinary record. An object that
+/// mixes the two is a reference with the rest ignored rather than a
+/// record with a strange field, because a client that wrote `$graph`
+/// meant a graph.
+fn reference(fields: &[(String, Json)]) -> Option<(&str, &Json)> {
+    fields
+        .iter()
+        .find(|(name, _)| name.starts_with('$'))
+        .map(|(name, value)| (name.as_str(), value))
+}
+
+/// `{"$graph": "/social"}`, a graph reference written the way a
+/// statement writes one. That is either the path a graph is at, where
+/// the last segment is the graph and what stands in front of it is the
+/// schema, or one of the words that name a graph without naming it,
+/// which is what a client that does not know the paths of the engine
+/// it is talking to has to write.
+fn graph_param(session: &mut Session, value: &Json) -> Result<Value, Fault> {
+    let Json::Str(path) = value else {
+        return Err(Fault::Protocol(
+            "$graph takes a graph reference, which is a path or one of the graph words".to_string(),
+        ));
+    };
+    if path.eq_ignore_ascii_case("CURRENT_GRAPH")
+        || path.eq_ignore_ascii_case("CURRENT_PROPERTY_GRAPH")
+    {
+        return session.working_graph_ref().map_err(Fault::Engine);
     }
+    if path.eq_ignore_ascii_case("HOME_GRAPH") || path.eq_ignore_ascii_case("HOME_PROPERTY_GRAPH") {
+        return session.home_graph_ref().map_err(Fault::Engine);
+    }
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let (schema, name) = match trimmed.rsplit_once('/') {
+        Some((head, name)) => (format!("/{head}"), name),
+        None => ("/".to_string(), trimmed),
+    };
+    session.graph_ref(&schema, name).map_err(Fault::Engine)
+}
+
+/// `{"$table": {"columns": [...], "rows": [[...]]}}`, a binding table
+/// written out. The rows carry values and not element references,
+/// which is the same limit the wire has everywhere else: a node is an
+/// offset in a snapshot and nothing a client holds can name one.
+fn table_param(session: &mut Session, value: &Json) -> Result<Value, Fault> {
+    let shape = "$table takes an object with a columns array and a rows array of arrays";
+    let (Some(Json::Arr(columns)), Some(Json::Arr(rows))) =
+        (value.get("columns"), value.get("rows"))
+    else {
+        return Err(Fault::Protocol(shape.to_string()));
+    };
+    let mut names = Vec::with_capacity(columns.len());
+    for column in columns {
+        match column {
+            Json::Str(name) => names.push(name.clone()),
+            _ => return Err(Fault::Protocol(shape.to_string())),
+        }
+    }
+    let mut table = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Json::Arr(cells) = row else {
+            return Err(Fault::Protocol(shape.to_string()));
+        };
+        if cells.len() != names.len() {
+            return Err(Fault::Protocol(format!(
+                "a row of {} values in a table of {} columns",
+                cells.len(),
+                names.len()
+            )));
+        }
+        let mut values = Vec::with_capacity(cells.len());
+        for cell in cells {
+            values.push(param_value(session, cell)?);
+        }
+        table.push(values);
+    }
+    Ok(session.binding_table(zu::query::QueryResult::new(names, table)))
 }
 
 /// A failure with no GQLSTATUS: a malformed frame, an unknown op, a
@@ -392,11 +526,19 @@ mod tests {
         assert_eq!(unfold(r"odd\q\"), "odd\\q\\");
     }
 
+    /// A session on nothing, which every parameter test binds against
+    /// because a reference parameter is a value only a session can
+    /// hand out.
+    fn session() -> Session {
+        Session::memory().expect("a session on nothing")
+    }
+
     #[test]
     fn frame_params_keep_their_types() {
+        let mut session = session();
         let frame =
             json::parse(r#"{"params":{"a":1,"b":2.5,"c":"x","d":true,"e":null}}"#).expect("frame");
-        let params = frame_params(&frame).expect("params");
+        let params = frame_params(&mut session, &frame).expect("params");
         assert_eq!(
             params,
             [
@@ -408,13 +550,14 @@ mod tests {
             ]
         );
         let none = json::parse(r#"{"op":"query"}"#).expect("frame");
-        assert_eq!(frame_params(&none).expect("empty"), []);
+        assert_eq!(frame_params(&mut session, &none).expect("empty"), []);
     }
 
     #[test]
     fn a_list_parameter_arrives_as_a_list_and_an_object_as_a_record() {
+        let mut session = session();
         let frame = json::parse(r#"{"params":{"a":[1,[2,"x"]],"b":{"y":2,"x":1}}}"#).expect("f");
-        let params = frame_params(&frame).expect("params");
+        let params = frame_params(&mut session, &frame).expect("params");
         assert_eq!(
             params[0].1,
             Value::List(vec![
@@ -431,5 +574,68 @@ mod tests {
                 ("y".to_string(), Value::Int(2)),
             ])
         );
+    }
+
+    /// GE04 and GE05 over the wire. A graph and a binding table are
+    /// the two values a client can be holding that JSON has no shape
+    /// for, and each is written as an object with one dollar named
+    /// member.
+    #[test]
+    fn the_two_references_have_a_spelling_of_their_own() {
+        let mut session = session();
+        let frame = json::parse(
+            r#"{"params":{"g":{"$graph":"/home"},"c":{"$graph":"CURRENT_PROPERTY_GRAPH"},
+                "t":{"$table":{"columns":["id","name"],"rows":[[1,"a"],[2,"b"]]}}}}"#,
+        )
+        .expect("frame");
+        let params = frame_params(&mut session, &frame).expect("params");
+        let by = |want: &str| {
+            params
+                .iter()
+                .find(|(name, _)| name == want)
+                .map(|(_, value)| value.clone())
+                .expect("a parameter of that name")
+        };
+        // The path and the word name one graph here, because nothing
+        // has moved the session out of the graph it started in.
+        assert_eq!(by("g"), by("c"));
+        assert!(matches!(by("g"), Value::Graph(_)));
+        match by("t") {
+            Value::BindingTable(table) => {
+                assert_eq!(table.columns(), ["id".to_string(), "name".to_string()]);
+                assert_eq!(table.rows().len(), 2);
+                assert_eq!(table.rows()[1][1], Value::Str("b".into()));
+            }
+            other => panic!("a binding table, not {other:?}"),
+        }
+    }
+
+    /// A graph the catalog does not hold is `42002`, the condition the
+    /// statement would raise if it had named the graph itself, and a
+    /// malformed reference is a protocol fault with no condition at
+    /// all.
+    #[test]
+    fn a_reference_that_names_nothing_is_answered_the_way_the_statement_would_be() {
+        let mut session = session();
+        let missing = json::parse(r#"{"params":{"g":{"$graph":"/nowhere"}}}"#).expect("frame");
+        match frame_params(&mut session, &missing) {
+            Err(Fault::Engine(error)) => assert_eq!(
+                error.diagnostic().expect("a condition").status.code(),
+                "42002"
+            ),
+            Err(Fault::Protocol(message)) => panic!("a condition, not {message}"),
+            Ok(_) => panic!("a graph that is not there"),
+        }
+
+        let shapeless = json::parse(r#"{"params":{"t":{"$table":[1,2]}}}"#).expect("frame");
+        assert!(matches!(
+            frame_params(&mut session, &shapeless),
+            Err(Fault::Protocol(_))
+        ));
+        let unknown = json::parse(r#"{"params":{"x":{"$node":1}}}"#).expect("frame");
+        assert!(matches!(
+            frame_params(&mut session, &unknown),
+            Err(Fault::Protocol(_))
+        ));
     }
 }

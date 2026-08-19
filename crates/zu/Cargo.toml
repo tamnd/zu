@@ -131,6 +131,10 @@ name = "write"
 harness = false
 
 [[bench]]
+name = "commit"
+harness = false
+
+[[bench]]
 name = "rows"
 harness = false
 

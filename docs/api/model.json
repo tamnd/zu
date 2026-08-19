@@ -5277,7 +5277,7 @@
       "id": "zu::write::Patches",
       "kind": "struct",
       "name": "Patches",
-      "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nThree shapes, because there are three ways a change can sit above a\ncolumn nobody has rewritten: a new value for a row the column\nalready holds, a whole new row past the end of it, and a new edge,\nwhich is a row of the rel table's property columns and a pair the\nadjacency reader has to merge into two lists."
+      "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nFour shapes, because there are four ways a change can sit above a\ncolumn nobody has rewritten: a new value for a row the column\nalready holds, a whole new row past the end of it, a new edge,\nwhich is a row of the rel table's property columns and a pair the\nadjacency reader has to merge into two lists, and a row taken away,\nwhich is an offset every read of the table filters by."
     },
     {
       "id": "zu::write::Patches::cells",
@@ -5294,6 +5294,14 @@
       "of": "zu::write::Patches",
       "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::graph::EdgePatch>>",
       "doc": "New edges, by rel table."
+    },
+    {
+      "id": "zu::write::Patches::gone",
+      "kind": "field",
+      "name": "gone",
+      "of": "zu::write::Patches",
+      "signature": "std::collections::HashMap<u32, std::sync::Arc<[u64]>>",
+      "doc": "Rows taken away, by table, ascending. A delete moves nothing:\nthe offsets stay where they are and the fold writes them into\nthe table's tombstone chain, so what the patch carries is what\nthe chain would have held."
     },
     {
       "id": "zu::write::Patches::is_empty",
@@ -9505,6 +9513,14 @@
       "of": "zu::zu1::txn::Deferred",
       "signature": "Edge(u32, u64, u64, Vec<(u32, Cell)>)",
       "doc": "An edge added to a rel table: the table, the rows it runs\nbetween, and the cell it holds in each column the table stores,\nby position in the props directory."
+    },
+    {
+      "id": "zu::zu1::txn::Deferred::Gone",
+      "kind": "variant",
+      "name": "Gone",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "Gone(u32, u64)",
+      "doc": "A row taken away: the table and the offset it kept. Nothing of\nthe row moves, here or in a fold, so what a reader is handed is\nthe offset and what makes the row gone is the reader."
     },
     {
       "id": "zu::zu1::txn::Deferred::RelCell",

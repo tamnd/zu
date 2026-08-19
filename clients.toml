@@ -119,7 +119,7 @@ package = "zudb"
 registry = "PyPI"
 maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 1
-holds = ["quickstart", "conditions", "idiom", "misuse", "leaks"]
+holds = ["quickstart", "reference", "idiom", "conditions", "misuse", "leaks", "install", "stability"]
 doc = "PyO3, three wheels per platform. The DB-API layer, the asyncio one and the notebook rendering are submodules a caller asks for by name."
 
 [[client]]
@@ -129,7 +129,7 @@ package = "zudb"
 registry = "npm"
 maintainer = "Tam Nguyen Duc <@tamnd>"
 tier = 1
-holds = ["conditions", "idiom", "misuse", "leaks"]
+holds = ["quickstart", "reference", "idiom", "conditions", "misuse", "leaks", "install", "stability"]
 doc = "napi-rs, platform packages under optionalDependencies, plus the WASM build that is the browser and fallback path. Node, Bun and Deno are all first class."
 
 [[client]]

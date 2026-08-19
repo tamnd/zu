@@ -5271,7 +5271,7 @@
       "id": "zu::write",
       "kind": "module",
       "name": "write",
-      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nMost commits fold, and the ones that do not are worth being plain\nabout. A fold rewrites the columns the transaction touched, and the\noverlay exists precisely so a reader could see a committed row\nwithout one, but [`Zu1Graph`] reads the sealed file and nothing\nelse, so a change that is not folded is a change the next `MATCH`\ncannot see, and a write nobody can read is not a write. So a commit\nfolds unless the read side can be handed what it wrote instead,\nwhich is one shape and only one: a word written onto a column of a\nrow that is already there. Those go into a [`LanePatch`] per table,\nthe readers put them over the words their columns hold, and a fold\nseals them later, at a checkpoint or when the run of them has gone\non long enough. It is worth what it costs to keep narrow, because\nthe fold is not the only thing that goes: it is what moves the\nheader epoch, and moving the epoch is what throws away the session's\nplan cache, its catalog and every decoded chunk it had warm.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
+      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nMost commits fold, and the ones that do not are worth being plain\nabout. A fold rewrites the columns the transaction touched, and the\noverlay exists precisely so a reader could see a committed row\nwithout one, but [`Zu1Graph`] reads the sealed file and nothing\nelse, so a change that is not folded is a change the next `MATCH`\ncannot see, and a write nobody can read is not a write. So a commit\nfolds unless the read side can be handed what it wrote instead,\nwhich is one shape: a word written onto a column of a row that is\nalready there, whether the row is a node or an edge the graph runs\nthrough. Those go into a [`LanePatch`] per table,\nthe readers put them over the words their columns hold, and a fold\nseals them later, at a checkpoint or when the run of them has gone\non long enough. It is worth what it costs to keep narrow, because\nthe fold is not the only thing that goes: it is what moves the\nheader epoch, and moving the epoch is what throws away the session's\nplan cache, its catalog and every decoded chunk it had warm.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
     },
     {
       "id": "zu::write::Patches",
@@ -9484,6 +9484,14 @@
       "doc": "A word written onto a column of a row that is already there."
     },
     {
+      "id": "zu::zu1::txn::Deferred::RelLane",
+      "kind": "variant",
+      "name": "RelLane",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "RelLane(RelLaneWrite)",
+      "doc": "A word written onto a column of an edge the graph already runs\nthrough."
+    },
+    {
       "id": "zu::zu1::txn::IngestPayload",
       "kind": "enum",
       "name": "IngestPayload",
@@ -9739,6 +9747,13 @@
       "of": "zu::zu1::txn::Mvcc",
       "signature": "fn touched_cols(&self, table: u32, epoch: Epoch) -> BTreeSet<u32>",
       "doc": "Which columns of `table` hold an update chain entry visible at\n`epoch`, the columns a fold has to rewrite. The ones outside it\ncome through untouched, and answering the whole set in one pass\nis what keeps that check off the column count."
+    },
+    {
+      "id": "zu::zu1::txn::RelLaneWrite",
+      "kind": "type-alias",
+      "name": "RelLaneWrite",
+      "signature": "(u32, u64, u64, u32, u64)",
+      "doc": "One integer write onto an edge: rel table, the rows the edge runs\nbetween, column position in the props directory, and the word.\n\nThe pair is the only name a statement has for an edge. Which row of\nthe property columns it holds is the ordinal it was loaded at, and\nworking that out takes the adjacency reader, which lives on the\nwrite side rather than in here."
     },
     {
       "id": "zu::zu1::txn::WriteTxn",

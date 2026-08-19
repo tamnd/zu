@@ -356,6 +356,12 @@ The table is held to `repos.toml` in both directions, since that is already wher
 
 `cargo xtask clients` writes the page and then checks the tree, so a page rendered from a table that disagrees with the split cannot be committed, and `--check` does the same without writing, which is what CI runs. The thresholds are behind `--gate` rather than on by default, and that is deliberate: every client is under its threshold until the apparatus of DX3 through DX5 exists, and a check that is red for two milestones is a check somebody turns off. The gate is the release's run and DX6's, which is where the promise has to hold. What the page publishes in the meantime is the standing, with what is missing named rather than counted, because a number nobody can act on is a number nobody reads.
 
-## 16. Documentation deliverables (v1.0 gate)
+## 16. What the clients are measured against
+
+A scorecard says whether a client has the apparatus. It does not say whether the client is good, and the only honest way to answer that is to put it beside the one everybody already uses. `docs/clients/duckdb.md` is that measurement for the Python and TypeScript clients against DuckDB's, run rather than argued, and it is where the performance work on both of them comes from.
+
+Its finding is one sentence long. We are twenty times faster on a point read and eleven times faster registering somebody else's columns, three times faster reading a result as rows, and twenty times slower turning one into Arrow, and all four of those numbers have the same cause: `QueryResult` is `Vec<Vec<Value>>`, so the row path starts where it wants to be and every columnar path has to transpose back out of it. `crates/zu-vector` is already a vector layer of the right shape, down to a `StrView` that is Arrow's `Utf8View` byte for byte, and the executor already works in it. What is missing is a result that keeps the vectors rather than a sink that flattens them, which is the same thing §4 says about the C ABI's chunked reads being a slice of what was already materialized.
+
+## 17. Documentation deliverables (v1.0 gate)
 
 Format spec (`docs/format-zu1.md`, byte-accurate, enough to write an independent reader), grammar EBNF, GQL conformance declaration, ops guide for s3 engine (cost tuning worked examples), migration guides (Neo4j/Kùzu → zu: data model mapping + Cypher dialect diffs).

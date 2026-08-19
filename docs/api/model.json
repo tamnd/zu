@@ -5271,21 +5271,21 @@
       "id": "zu::write",
       "kind": "module",
       "name": "write",
-      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nMost commits fold, and the ones that do not are worth being plain\nabout. A fold rewrites the columns the transaction touched, and the\noverlay exists precisely so a reader could see a committed row\nwithout one, but [`Zu1Graph`] reads the sealed file and nothing\nelse, so a change that is not folded is a change the next `MATCH`\ncannot see, and a write nobody can read is not a write. So a commit\nfolds unless the read side can be handed what it wrote instead,\nwhich is one shape: a word written onto a column of a row that is\nalready there, whether the row is a node or an edge the graph runs\nthrough. Those go into a [`LanePatch`] per table,\nthe readers put them over the words their columns hold, and a fold\nseals them later, at a checkpoint or when the run of them has gone\non long enough. It is worth what it costs to keep narrow, because\nthe fold is not the only thing that goes: it is what moves the\nheader epoch, and moving the epoch is what throws away the session's\nplan cache, its catalog and every decoded chunk it had warm.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
+      "doc": "The write side of an open database: the log beside the file, the\noverlay store above it, and the fold that puts a committed change\nwhere the next read will find it.\n\nM3 built all three of those and crash tested them, and [`crate::append`]\nis the first thing on the query side to open one, but an appender is\nthe bulk shape: whole columns at a time, no expression to evaluate,\nnothing read back. A write statement is the other shape, one\ntransaction of a few rows that has to be visible to the clause after\nit, and it needs the same three pieces held differently. This is\nthat holding. A [`Writer`] owns the WAL and the [`Mvcc`] store for\none open file, recovers whatever the log holds above the file's last\ncheckpoint, and turns a staged transaction into a committed epoch.\n\nMost commits fold, and the ones that do not are worth being plain\nabout. A fold rewrites the columns the transaction touched, and the\noverlay exists precisely so a reader could see a committed row\nwithout one, but [`Zu1Graph`] reads the sealed file and nothing\nelse, so a change that is not folded is a change the next `MATCH`\ncannot see, and a write nobody can read is not a write. So a commit\nfolds unless the read side can be handed what it wrote instead,\nwhich is one shape: a value written onto a column of a row that is\nalready there, whether the row is a node or an edge the graph runs\nthrough. Those go into a [`CellPatch`] per table,\nthe readers put them over the values their columns hold, and a fold\nseals them later, at a checkpoint or when the run of them has gone\non long enough. It is worth what it costs to keep narrow, because\nthe fold is not the only thing that goes: it is what moves the\nheader epoch, and moving the epoch is what throws away the session's\nplan cache, its catalog and every decoded chunk it had warm.\n\nNot every fold publishes, and that is the part worth reading twice.\nA fold moves the roots this handle carries; a checkpoint puts them\non disk, and on a platform where the only barrier is a full sync it\ncosts two of them, against one for the log frame the commit already\nsynced. So a commit folds and stops, and the file is checkpointed\nwhen the folds since the last one have taken\n[`THRESHOLD_BLOCKS`] blocks. Nothing is at risk in between: the\nframe is the durability point, the header on disk still names the\nepoch the last checkpoint folded through, and a crash replays the\nlog from there back to where the folds had got to. What it costs is\nfile growth, because a block freed by an unpublished fold cannot be\nhanded out again, and that is what the threshold bounds.\n\n[`Zu1Graph`]: crate::query::Zu1Graph"
     },
     {
       "id": "zu::write::Patches",
       "kind": "struct",
       "name": "Patches",
-      "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nThree shapes, because there are three ways a change can sit above a\ncolumn nobody has rewritten: a new word for a row the column already\nholds, a whole new row past the end of it, and a new edge, which is\na row of the rel table's property columns and a pair the adjacency\nreader has to merge into two lists."
+      "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nThree shapes, because there are three ways a change can sit above a\ncolumn nobody has rewritten: a new value for a row the column\nalready holds, a whole new row past the end of it, and a new edge,\nwhich is a row of the rel table's property columns and a pair the\nadjacency reader has to merge into two lists."
     },
     {
       "id": "zu::write::Patches::cells",
       "kind": "field",
       "name": "cells",
       "of": "zu::write::Patches",
-      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::LanePatch>>",
-      "doc": "New words, by table."
+      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::CellPatch>>",
+      "doc": "New values, by table."
     },
     {
       "id": "zu::write::Patches::edges",
@@ -8203,6 +8203,42 @@
       "doc": "Node property columns. A node table's entry in the table index\npoints at a props directory chain: variable width columns stored as\nFullZip blob segments, fixed width columns as cascade-encoded u64\nsegments, every column row-aligned with the table's row domain.\n\nA column carries a [`LogicalType`] from the lattice of gql/plan/02,\nwhich is what tells a reader whether the word it pulls out of a\nfixed width lane is a count, a truth value, a float, a day or a\nnanosecond. The lane itself does not care: the cascade encodes 64\nbit words, so a boolean, a float and a date all ride the encoding\nthe integer columns already had, and only the type at the top says\nwhat a word means. This is the whole reason properties can widen\npast strings and integers without a second storage path.\n\nDirectory layout: `version: u16`, `node_count: u64`,\n`column_count: u32`, then per column `name_len: u16` + UTF-8 bytes,\n`type: u8` (a code from [`TYPE_CODES`], or the list code and then\nthe element's code), the column's `SegmentMeta`, and from version 4\na `nullable: u8` flag followed, when it is set, by the segment meta\nof the column's validity words.\n\nA column is dense whether or not it holds a null: every row of the\ntable's domain has a value in the column's segment. What a null adds\nis a second segment saying which of those values a reader may look\nat, one bit per row packed into 64 bit words that ride the same\ninteger cascade the fixed width columns do. A column with no null in\nit has no validity segment, so nothing written before a property\ncould be null costs anything to read now."
     },
     {
+      "id": "zu::zu1::props::CellPatch",
+      "kind": "struct",
+      "name": "CellPatch",
+      "doc": "The cell writes a commit made that no fold has sealed into the\ncolumns of one table yet.\n\nA commit used to fold because a reader read the sealed file and\nnothing else, so a change that was not folded was a change the next\n`MATCH` could not see. Rewriting a column to change one cell of it\nis most of what a point write cost. A reader holding one of these\nreads the column as it stands and puts the newer values over the\nrows the patch names, which is what lets the fold wait for the\ncheckpoint.\n\nA value goes over the value the row already holds, so what is\nrefused is the write that has nowhere to go over: a value taken\naway, which lives in the validity mask, and a label, which lives in\na bitset of its own. Both fold the way they always did."
+    },
+    {
+      "id": "zu::zu1::props::CellPatch::bytes",
+      "kind": "method",
+      "name": "bytes",
+      "of": "zu::zu1::props::CellPatch",
+      "signature": "fn bytes(&self) -> usize",
+      "doc": "How many bytes the strings in it hold between them, the other\nthing that writer bounds: a word is a word, but a string is\nwhatever the statement wrote, and a run of long ones would be\ncarried until the next fold."
+    },
+    {
+      "id": "zu::zu1::props::CellPatch::cells",
+      "kind": "method",
+      "name": "cells",
+      "of": "zu::zu1::props::CellPatch",
+      "signature": "fn cells(&self) -> usize",
+      "doc": "How many cells this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+    },
+    {
+      "id": "zu::zu1::props::CellPatch::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::zu1::props::CellPatch",
+      "signature": "fn is_empty(&self) -> bool"
+    },
+    {
+      "id": "zu::zu1::props::CellPatch::new",
+      "kind": "method",
+      "name": "new",
+      "of": "zu::zu1::props::CellPatch",
+      "signature": "fn new(cols: BTreeMap<usize, Vec<(u64, u64)>>, strs: BTreeMap<usize, Vec<(u64, Vec<u8>)>>) -> Self"
+    },
+    {
       "id": "zu::zu1::props::EdgesWithProps",
       "kind": "type-alias",
       "name": "EdgesWithProps",
@@ -8215,34 +8251,6 @@
       "name": "KeyedEdgesWithProps",
       "signature": "(Vec<(u64, u64)>, Vec<OwnedColumn>)",
       "doc": "The same pair for a rel file that names its endpoints by the ids a\nnode file gave its rows rather than by row offsets, which is what a\ndataset of many node tables is written with. Which row of which table\neach id is takes every node file to answer, so the translation is the\nloader's and not the reader's."
-    },
-    {
-      "id": "zu::zu1::props::LanePatch",
-      "kind": "struct",
-      "name": "LanePatch",
-      "doc": "The cell writes a commit made that no fold has sealed into the\ncolumns yet, for the lane columns of one table.\n\nA commit used to fold because a reader read the sealed file and\nnothing else, so a change that was not folded was a change the next\n`MATCH` could not see. Rewriting a column to change one cell of it\nis most of what a point write cost. A reader holding one of these\nreads the column as it stands and puts the newer words over the\nrows the patch names, which is what lets the fold wait for the\ncheckpoint.\n\nLane columns and no nulls, which is the write whose new value is a\nword that goes straight over the word the column holds. A commit\nthat writes a string or takes a value away folds the way it always\ndid, and that is what keeps the blob side, the validity masks and\nthe label bitset out of here."
-    },
-    {
-      "id": "zu::zu1::props::LanePatch::cells",
-      "kind": "method",
-      "name": "cells",
-      "of": "zu::zu1::props::LanePatch",
-      "signature": "fn cells(&self) -> usize",
-      "doc": "How many cells this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
-    },
-    {
-      "id": "zu::zu1::props::LanePatch::is_empty",
-      "kind": "method",
-      "name": "is_empty",
-      "of": "zu::zu1::props::LanePatch",
-      "signature": "fn is_empty(&self) -> bool"
-    },
-    {
-      "id": "zu::zu1::props::LanePatch::new",
-      "kind": "method",
-      "name": "new",
-      "of": "zu::zu1::props::LanePatch",
-      "signature": "fn new(cols: BTreeMap<usize, Vec<(u64, u64)>>) -> Self"
     },
     {
       "id": "zu::zu1::props::ListElement",
@@ -8716,8 +8724,8 @@
       "kind": "method",
       "name": "set_patch",
       "of": "zu::zu1::props::PropsReader",
-      "signature": "fn set_patch(&mut self, patch: Option<Arc<LanePatch>>)",
-      "doc": "Hands this reader the committed words its columns do not hold\nyet, or takes them away when a fold has sealed them."
+      "signature": "fn set_patch(&mut self, patch: Option<Arc<CellPatch>>)",
+      "doc": "Hands this reader the committed cells its columns do not hold\nyet, or takes them away when a fold has sealed them."
     },
     {
       "id": "zu::zu1::props::PropsReader::zone",
@@ -8731,7 +8739,7 @@
       "id": "zu::zu1::props::RowPatch",
       "kind": "struct",
       "name": "RowPatch",
-      "doc": "The rows a commit added that no fold has put in the columns yet.\n\n[`LanePatch`] carries a new word for a row the columns already hold,\nwhich is an update. This carries whole rows past the end of them,\nwhich is what an edge insert leaves behind once the adjacency reader\nstopped needing the CSR rebuilt to see it: the edge takes the next\nordinal, its property values sit here under that ordinal, and a\ngather asking for it reads them from here rather than off a column\nthat has not been rewritten.\n\nAny value at all, unlike the lane patch, because these rows are not\nstored anywhere yet and there is nothing to lay a word over: a\nstring is the bytes and an absent value is [`Cell::Null`]."
+      "doc": "The rows a commit added that no fold has put in the columns yet.\n\n[`CellPatch`] carries a new value for a row the columns already hold,\nwhich is an update. This carries whole rows past the end of them,\nwhich is what an edge insert leaves behind once the adjacency reader\nstopped needing the CSR rebuilt to see it: the edge takes the next\nordinal, its property values sit here under that ordinal, and a\ngather asking for it reads them from here rather than off a column\nthat has not been rewritten.\n\nAny value at all, unlike the lane patch, because these rows are not\nstored anywhere yet and there is nothing to lay a word over: a\nstring is the bytes and an absent value is [`Cell::Null`]."
     },
     {
       "id": "zu::zu1::props::RowPatch::base",
@@ -8740,6 +8748,14 @@
       "of": "zu::zu1::props::RowPatch",
       "signature": "fn base(&self) -> u64",
       "doc": "The first row this holds, so a caller with a row number can tell\nan unfolded row from a stored one."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::bytes",
+      "kind": "method",
+      "name": "bytes",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn bytes(&self) -> usize",
+      "doc": "How many bytes of string the rows hold between them, which a\nwriter bounds along with the count of them."
     },
     {
       "id": "zu::zu1::props::RowPatch::is_empty",
@@ -9462,10 +9478,25 @@
       "signature": "Str(Vec<u8>)"
     },
     {
+      "id": "zu::zu1::txn::CellWrite",
+      "kind": "type-alias",
+      "name": "CellWrite",
+      "signature": "(u32, u64, u32, Cell)",
+      "doc": "One write onto an existing row: table, row offset, column position\nin the props directory, and the value."
+    },
+    {
       "id": "zu::zu1::txn::Deferred",
       "kind": "enum",
       "name": "Deferred",
       "doc": "One change a reader can be shown before a fold has sealed it."
+    },
+    {
+      "id": "zu::zu1::txn::Deferred::Cell",
+      "kind": "variant",
+      "name": "Cell",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "Cell(CellWrite)",
+      "doc": "A value written onto a column of a row that is already there."
     },
     {
       "id": "zu::zu1::txn::Deferred::Edge",
@@ -9476,20 +9507,12 @@
       "doc": "An edge added to a rel table: the table, the rows it runs\nbetween, and the cell it holds in each column the table stores,\nby position in the props directory."
     },
     {
-      "id": "zu::zu1::txn::Deferred::Lane",
+      "id": "zu::zu1::txn::Deferred::RelCell",
       "kind": "variant",
-      "name": "Lane",
+      "name": "RelCell",
       "of": "zu::zu1::txn::Deferred",
-      "signature": "Lane(LaneWrite)",
-      "doc": "A word written onto a column of a row that is already there."
-    },
-    {
-      "id": "zu::zu1::txn::Deferred::RelLane",
-      "kind": "variant",
-      "name": "RelLane",
-      "of": "zu::zu1::txn::Deferred",
-      "signature": "RelLane(RelLaneWrite)",
-      "doc": "A word written onto a column of an edge the graph already runs\nthrough."
+      "signature": "RelCell(RelCellWrite)",
+      "doc": "A value written onto a column of an edge the graph already runs\nthrough."
     },
     {
       "id": "zu::zu1::txn::IngestPayload",
@@ -9510,13 +9533,6 @@
       "name": "Nodes",
       "of": "zu::zu1::txn::IngestPayload",
       "signature": "Nodes { cols: Vec<zu_zu1::wal::WalColumn>, rows: u64 }"
-    },
-    {
-      "id": "zu::zu1::txn::LaneWrite",
-      "kind": "type-alias",
-      "name": "LaneWrite",
-      "signature": "(u32, u64, u32, u64)",
-      "doc": "One integer write onto an existing row: table, row offset, column\nposition in the props directory, and the word."
     },
     {
       "id": "zu::zu1::txn::Mvcc",
@@ -9749,11 +9765,11 @@
       "doc": "Which columns of `table` hold an update chain entry visible at\n`epoch`, the columns a fold has to rewrite. The ones outside it\ncome through untouched, and answering the whole set in one pass\nis what keeps that check off the column count."
     },
     {
-      "id": "zu::zu1::txn::RelLaneWrite",
+      "id": "zu::zu1::txn::RelCellWrite",
       "kind": "type-alias",
-      "name": "RelLaneWrite",
-      "signature": "(u32, u64, u64, u32, u64)",
-      "doc": "One integer write onto an edge: rel table, the rows the edge runs\nbetween, column position in the props directory, and the word.\n\nThe pair is the only name a statement has for an edge. Which row of\nthe property columns it holds is the ordinal it was loaded at, and\nworking that out takes the adjacency reader, which lives on the\nwrite side rather than in here."
+      "name": "RelCellWrite",
+      "signature": "(u32, u64, u64, u32, Cell)",
+      "doc": "One write onto an edge: rel table, the rows the edge runs between,\ncolumn position in the props directory, and the value.\n\nThe pair is the only name a statement has for an edge. Which row of\nthe property columns it holds is the ordinal it was loaded at, and\nworking that out takes the adjacency reader, which lives on the\nwrite side rather than in here."
     },
     {
       "id": "zu::zu1::txn::WriteTxn",

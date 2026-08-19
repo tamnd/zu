@@ -16,6 +16,10 @@ zu-storage.workspace = true
 zu-vector.workspace = true
 
 [[bench]]
+name = "columnar"
+harness = false
+
+[[bench]]
 name = "kernels"
 harness = false
 

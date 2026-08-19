@@ -13,6 +13,7 @@
 pub mod ast;
 pub mod binder;
 pub mod cast;
+pub mod column;
 pub mod csr;
 pub mod exec;
 pub mod frame;

@@ -619,6 +619,12 @@ fn run_set_record(dir: &Path, rows: u64) -> Cost {
 /// property run is what a column costs that a bit does not. Each write
 /// puts the label on and the next takes it off again, so the table ends
 /// where it started and the growth column is what changing nothing cost.
+///
+/// It no longer folds. A change is a pair of masks, the bits to put on
+/// the row and the bits to take off it, and a reader wants the word, so
+/// the writer reads the word the row was carrying, puts the masks over
+/// it and hands the answer on. The bitset itself is not rewritten and
+/// neither are the columns of the table beside it.
 fn run_set_label(dir: &Path, rows: u64) -> Cost {
     let path = build_labels(dir, rows);
     let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
@@ -1129,6 +1135,8 @@ fn main() {
         ("set_record_stmt_growth_b", set_record.growth),
         ("set_label_stmt_us", set_label.us),
         ("set_label_stmt_kb", set_label.written / 1024.0),
+        ("set_label_stmt_cpu_us", set_label.cpu),
+        ("set_label_stmt_growth_b", set_label.growth),
         ("insert_stmt_us", insert.us),
         ("insert_stmt_kb", insert.written / 1024.0),
         ("insert_stmt_growth_b", insert.growth),

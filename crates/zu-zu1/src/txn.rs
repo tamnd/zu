@@ -114,15 +114,17 @@ pub struct Mvcc {
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
     /// Whether everything published here is a shape a reader can be
-    /// handed without a fold sealing it first. Five are: a value
+    /// handed without a fold sealing it first. Seven are: a value
     /// written onto a column of a row the base file already holds, the
     /// same write onto an edge the graph already runs through, an edge
     /// added to a rel table, which the adjacency reader merges into the
-    /// lists it holds, a row taken away, which is an offset the readers
-    /// filter by, and rows added to a node table, which are served
-    /// whole from past the end of its columns. It starts true on an
-    /// empty store and one commit of any other shape turns it off until
-    /// the next fold empties the store again.
+    /// lists it holds, an edge taken away, which is a pair it drops out
+    /// of them, a row taken away, which is an offset the readers filter
+    /// by, rows added to a node table, which are served whole from past
+    /// the end of its columns, and a label change, which is a word the
+    /// reader answers with in place of the bitset's. It starts true on
+    /// an empty store and one commit of any other shape turns it off
+    /// until the next fold empties the store again.
     soft: bool,
     /// Those writes, for the last commit only. A writer keeps the
     /// running set of them, so what it wants after a commit is what
@@ -169,6 +171,15 @@ pub enum Deferred {
     /// go on the end of the table in the order they are in here, which
     /// is the order a fold would append them in.
     Rows(u32, Vec<Vec<(u32, Cell)>>),
+    /// Labels put on a row and taken off it: the table, the offset, and
+    /// the two masks the change was written as, which are disjoint.
+    Labels(u32, u64, u64, u64),
+    /// The labels a row is left carrying, whole: the table, the offset
+    /// and the word. A change is a pair of masks and a reader wants the
+    /// word, so the writer reads what the row carried, puts the masks
+    /// over it, and hands on the answer. Only the writer makes one of
+    /// these, out of the [`Deferred::Labels`] it was given.
+    Marks(u32, u64, u64),
 }
 
 impl Default for Mvcc {
@@ -870,15 +881,16 @@ impl Mvcc {
         self.deferred.clear();
         for op in ops {
             // What the op is about to put in the store, before the
-            // store has it. Six shapes can be handed to a reader as
+            // store has it. Seven shapes can be handed to a reader as
             // they are, a value onto a row that is already there, the
             // same value onto an edge, an edge added to a rel table, a
-            // row taken away, an edge taken away, and rows added to a
-            // node table; everything else needs a fold to become
-            // readable, and a store that holds one of those needs a
-            // fold whatever else arrives after it. A write of nothing
-            // at all is in the second group: what it changes is the
-            // validity mask, and no patch carries one.
+            // row taken away, an edge taken away, rows added to a node
+            // table, and a label put on a row or taken off it;
+            // everything else needs a fold to become readable, and a
+            // store that holds one of those needs a fold whatever else
+            // arrives after it. A write of nothing at all is in the
+            // second group: what it changes is the validity mask, and
+            // no patch carries one.
             match &op {
                 Op::Update {
                     table,
@@ -917,6 +929,14 @@ impl Mvcc {
                 Op::InsertNodes { table, cols, rows } if self.soft => self
                     .deferred
                     .push(Deferred::Rows(*table, appended(cols, *rows))),
+                Op::UpdateLabels {
+                    table,
+                    row,
+                    add,
+                    remove,
+                } if self.soft => self
+                    .deferred
+                    .push(Deferred::Labels(*table, *row, *add, *remove)),
                 _ => {
                     self.soft = false;
                     self.deferred.clear();

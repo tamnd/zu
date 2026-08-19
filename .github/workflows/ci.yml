@@ -125,6 +125,82 @@ jobs:
       # rather than a walk of everything before them.
       - run: cargo bench -p xtask --bench clients
 
+  # The job above holds the model to the source, so a symbol that
+  # appeared or went away arrives as a diff in docs/api/model.json that
+  # somebody reads. This one answers the other half of the question:
+  # whether what changed was a break. cargo-semver-checks knows two
+  # hundred and fifty ways a Rust API can stop being compatible, and a
+  # diff in a generated file does not, because a reader looking at one
+  # changed line has to remember that widening a return type is fine and
+  # narrowing an argument is not.
+  #
+  # The baseline is a git revision rather than crates.io. Nothing here is
+  # published yet, so the only honest question is what this branch does
+  # to the branch it is going into, and --baseline-rev asks exactly that.
+  #
+  # --release-type patch is not decoration. Given two equal versions the
+  # tool assumes a major bump and skips all 254 lints, which would make
+  # this job green forever and mean nothing; asking it to assume a patch
+  # is what makes it check. The version bump is then the escape hatch,
+  # the same one the Python client's griffe gate and the TypeScript
+  # client's committed api report use: a break is allowed, a break
+  # nobody declared is not.
+  #
+  # Two crates rather than the whole workspace. zu is the Rust API, the
+  # one docs/api/model.json describes and the one a Rust program
+  # depends on; zu-corpus is the only other crate without
+  # `publish = false` on it. zu-capi is left out on purpose, because its
+  # surface is a C ABI rather than a Rust one and zu.h is what holds it.
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      # The tool clones the baseline out of this checkout, so it needs
+      # the branch and not just the one commit under test.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      # A pinned release binary rather than a build from source, which
+      # takes about four minutes, and rather than a third-party action,
+      # for the reasons written on .github/actions/rust.
+      - name: cargo-semver-checks
+        run: |
+          curl -sSfL https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.50.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz \
+            | sudo tar -C /usr/local/bin -xzf -
+          cargo semver-checks --version
+      # The gate is validated the only way a gate can be: a break has to
+      # fail it. Renaming a public method is the cheapest break that is
+      # unambiguously one, and the tree is put back before the real
+      # check reads it.
+      - name: A break the gate is meant to catch, caught
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base="${BASE_REF:+origin/$BASE_REF}"
+          base="${base:-HEAD^}"
+          perl -0pi -e 's/    pub fn epoch\(&self\) -> u64 \{/    pub fn epoch_renamed(&self) -> u64 {/' crates/zu/src/session.rs
+          set +e
+          cargo semver-checks check-release -p zu --baseline-rev "$base" --release-type patch
+          rc=$?
+          set -e
+          git checkout -- crates/zu/src/session.rs
+          test $rc -ne 0 || { echo "the semver gate did not fire on a renamed method"; exit 1; }
+      - name: The Rust surface, against what it was
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base="${BASE_REF:+origin/$BASE_REF}"
+          base="${base:-HEAD^}"
+          was=$(git show "$base:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          now=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$was" != "$now" ]; then
+            echo "version moved from $was to $now, so a break here is one that was declared"
+            cargo semver-checks check-release -p zu -p zu-corpus --baseline-rev "$base" --release-type patch || true
+            exit 0
+          fi
+          cargo semver-checks check-release -p zu -p zu-corpus --baseline-rev "$base" --release-type patch
+
   deny:
     runs-on: ubuntu-latest
     steps:

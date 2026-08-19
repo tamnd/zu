@@ -75,11 +75,28 @@ fn page_layout() -> Layout {
     Layout::from_size_align(PAGE_SIZE, 64).expect("zu2 page layout")
 }
 
+/// How far past the write frontier the file is kept provisioned.
+///
+/// The size is a trade between two syscalls. Provisioning covers a
+/// megabyte at a time, so a workload of small durable commits calls
+/// `fallocate` once per few hundred flushes and the rest of them write
+/// into blocks the file already owns. Larger chunks would call it less
+/// often and reserve more space that a database sitting idle has not
+/// used, and the reservation is given back at rest anyway, so a
+/// megabyte is the point where the syscall has stopped mattering.
+const PROVISION_CHUNK: u64 = 1 << 20;
+
 /// What the flusher and the sync committers share.
 struct Flushing {
     /// The address up to which bytes have been written to the file but
     /// not necessarily synced.
     written: Address,
+    /// The address up to which the file's blocks are allocated, so a
+    /// write below it is a write and not also an allocation.
+    provisioned: u64,
+    /// Cleared when the filesystem refuses to provision, so the log
+    /// stops asking. It is slower and not wrong.
+    provisions: bool,
     /// Set when the log is closing, so the flusher stops after a final
     /// pass.
     stopping: bool,
@@ -157,6 +174,8 @@ impl Log {
             path: path.to_path_buf(),
             flushing: Mutex::new(Flushing {
                 written: FIRST,
+                provisioned: 0,
+                provisions: true,
                 stopping: false,
             }),
             dirty: Condvar::new(),
@@ -295,7 +314,13 @@ impl Log {
         self.flushed.store(address, Ordering::Release);
         self.flush_target.store(address, Ordering::Release);
         self.read_only.store(address, Ordering::Release);
-        self.flushing.lock().expect("zu2 flush state").written = address;
+        let mut state = self.flushing.lock().expect("zu2 flush state");
+        state.written = address;
+        // Whatever the file already has is provisioned, whether it was
+        // reserved by a previous run or written by one. Starting from
+        // zero would have the first flush ask the filesystem to allocate
+        // a range it has already allocated.
+        state.provisioned = self.file_len().unwrap_or(0);
     }
 
     /// The lowest address an update may still rewrite in place: young
@@ -517,9 +542,52 @@ impl Log {
         self.dirty.notify_one();
     }
 
+    /// Makes sure the file owns the blocks the next write is going to
+    /// land in, so that `fdatasync` commits data rather than data plus
+    /// an inode size change plus an extent allocation.
+    ///
+    /// Called under the flush mutex, which is what makes the watermark
+    /// safe to keep as a plain field: the only other thing that moves it
+    /// is [`Log::trim_tail`], and that takes the same mutex.
+    fn provision(&self, state: &mut Flushing, upto: Address) {
+        if !state.provisions || state.provisioned >= upto {
+            return;
+        }
+        let from = state.provisioned;
+        let want = (upto + PROVISION_CHUNK).div_ceil(file::BLOCK) * file::BLOCK;
+        if file::preallocate(&self.file, from, want - from) {
+            state.provisioned = want;
+        } else {
+            // One refusal is the answer for this filesystem. Asking
+            // again per flush would be a failing syscall on the commit
+            // path forever.
+            state.provisions = false;
+        }
+    }
+
+    /// Gives back whatever was provisioned above the written frontier.
+    ///
+    /// The reservation is a write-path optimisation and not part of what
+    /// the database holds, so anything that reports or closes the file
+    /// drops it first. Truncating rather than punching because it is the
+    /// same call everywhere and because a shorter file is also a shorter
+    /// recovery scan.
+    pub fn trim_tail(&self) -> Result<()> {
+        let mut state = self.flushing.lock().expect("zu2 flush state");
+        let frontier = state.written.max(self.tail());
+        let keep = frontier.div_ceil(file::BLOCK) * file::BLOCK;
+        if state.provisioned <= keep {
+            return Ok(());
+        }
+        file::truncate(&self.file, keep)?;
+        state.provisioned = keep;
+        Ok(())
+    }
+
     /// Writes and syncs everything below `upto`, which the caller has
     /// already established is quiescent.
     fn write_and_sync(&self, state: &mut Flushing, upto: Address) -> Result<()> {
+        self.provision(state, upto);
         while state.written < upto {
             let page = page_of(state.written);
             let page_end = page_start(page + 1).min(upto);

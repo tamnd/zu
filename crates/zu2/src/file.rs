@@ -268,6 +268,135 @@ pub fn punch(_file: &File, _offset: u64, _len: u64) -> bool {
     false
 }
 
+/// Gets the blocks behind `[offset, offset + len)` allocated now, so a
+/// later write there changes bytes the file already owns.
+///
+/// This is the other half of the hole punch and it exists for the same
+/// reason: a durable commit is a write followed by a barrier, and what
+/// the barrier costs depends on how much of the filesystem's own
+/// bookkeeping the write dirtied. A write past the end of a file moves
+/// the inode's size, allocates extents and journals both, and `fdatasync`
+/// has to commit all of it before it can return. A write inside a range
+/// that is already allocated commits data. `crates/zu2/examples/appendcost.rs`
+/// measures the difference at 1.9x to 4.6x on the three Linux machines
+/// this is benchmarked on.
+///
+/// `ftruncate` is not this. It moves the size and allocates nothing, so
+/// the first write to a block still does the allocation and the journal
+/// entry, which is why the example measures a sparse shape separately
+/// and finds it no faster than growing.
+///
+/// Returns whether the space was provisioned. A filesystem without the
+/// call is slower and not wrong, so the caller records what it got and
+/// carries on, exactly as it does for [`punch`].
+#[cfg(target_os = "linux")]
+pub fn preallocate(file: &File, offset: u64, len: u64) -> bool {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+    }
+    if len == 0 {
+        return true;
+    }
+    // Mode zero, which allocates and moves the size, rather than
+    // KEEP_SIZE: the size has to move too, or the write that lands in
+    // these blocks moves it and pays for that.
+    //
+    // SAFETY: the descriptor is owned by `file` and open for writing.
+    unsafe { fallocate(file.as_raw_fd(), 0, offset as i64, len as i64) == 0 }
+}
+
+/// Gets the blocks allocated. See the Linux version for what this is
+/// for; macOS spells it as an `fcntl` over a struct and does not move
+/// the file's length, so that is a second call.
+#[cfg(target_os = "macos")]
+pub fn preallocate(file: &File, offset: u64, len: u64) -> bool {
+    use std::os::fd::AsRawFd;
+
+    const F_PREALLOCATE: i32 = 42;
+    /// Allocate contiguously, which is a request rather than a promise.
+    const ALLOCATECONTIG: u32 = 0x00000002;
+    /// Allocate all of it or none of it.
+    const ALLOCATEALL: u32 = 0x00000004;
+    /// Lengths are relative to the physical end of the file.
+    const PEOFPOSMODE: i32 = 3;
+
+    /// `fstore_t` from `sys/fcntl.h`.
+    #[repr(C)]
+    struct Store {
+        flags: u32,
+        posmode: i32,
+        offset: i64,
+        length: i64,
+        allocated: i64,
+    }
+
+    // Variadic for the same ABI reason the punch is.
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    if len == 0 {
+        return true;
+    }
+    let mut request = Store {
+        flags: ALLOCATECONTIG,
+        posmode: PEOFPOSMODE,
+        offset: 0,
+        length: len as i64,
+        allocated: 0,
+    };
+    // SAFETY: the descriptor is owned by `file`, and the struct is the
+    // shape F_PREALLOCATE reads and lives across both calls.
+    let contiguous = unsafe { fcntl(file.as_raw_fd(), F_PREALLOCATE, &raw mut request) == 0 };
+    if !contiguous {
+        // A fragmented volume cannot always answer the contiguous
+        // request, and any allocation is worth more than none.
+        request.flags = ALLOCATEALL;
+        request.allocated = 0;
+        // SAFETY: as above.
+        if unsafe { fcntl(file.as_raw_fd(), F_PREALLOCATE, &raw mut request) != 0 } {
+            return false;
+        }
+    }
+    // The blocks are the file's now but its length still says otherwise,
+    // and a write past the length would move it and journal that.
+    file.set_len(offset + len).is_ok()
+}
+
+/// Moves the file's length so a write below it does not have to.
+///
+/// Windows has no allocation call a normal process can make.
+/// `SetFileValidData` is the closest one and it hands the caller
+/// whatever bytes happened to be on the disk, so it is gated behind
+/// SE_MANAGE_VOLUME_NAME and a database has no business asking for it.
+/// What is left is the size, which is the part of the metadata update
+/// this can avoid, and NTFS allocates the blocks when the write arrives.
+#[cfg(windows)]
+pub fn preallocate(file: &File, offset: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    file.set_len(offset + len).is_ok()
+}
+
+/// Nowhere to ask, so every write pays for its own extent.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn preallocate(_file: &File, _offset: u64, _len: u64) -> bool {
+    false
+}
+
+/// Drops the file's length back to `len`, giving up whatever was
+/// provisioned above it.
+///
+/// The counterpart to [`preallocate`], and the reason the storage
+/// numbers stay honest: what the log reserved to write into next is not
+/// what the database costs, so the reservation goes back before anyone
+/// measures the file and before it is closed.
+pub fn truncate(file: &File, len: u64) -> io::Result<()> {
+    file.set_len(len)
+}
+
 /// Nothing to mark outside Windows.
 #[cfg(not(windows))]
 pub fn make_sparse(_file: &File) -> bool {

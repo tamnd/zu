@@ -35,6 +35,13 @@ pub fn replay(core: &Core) -> Result<()> {
     // same way page padding is, but it would restore every punched page
     // into memory to learn that.
     let mut address = core.log.begin().max(FIRST);
+    // Where the last record the scan accepted ended, which is where the
+    // next append goes. Not the same as where the scan stops: the file
+    // can be longer than the log, either because a page ends in padding
+    // or because the write path had provisioned blocks past the tail
+    // that the run did not live to use, and appending after those would
+    // leave a hole and lose the room.
+    let mut end = address;
     let mut version = 0u64;
     let mut records = 0u64;
     while address < len {
@@ -80,7 +87,10 @@ pub fn replay(core: &Core) -> Result<()> {
             }
         };
         match size {
-            Some(size) => address += size as u64,
+            Some(size) => {
+                address += size as u64;
+                end = address;
+            }
             None => {
                 let next = page_start(page + 1);
                 if next >= len {
@@ -91,7 +101,7 @@ pub fn replay(core: &Core) -> Result<()> {
         }
     }
     let _ = records;
-    core.log.resume_at(address);
+    core.log.resume_at(end);
     core.set_version(version);
     Ok(())
 }

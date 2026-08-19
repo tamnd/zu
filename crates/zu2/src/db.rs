@@ -252,7 +252,14 @@ impl Db {
     /// Bytes the file occupies on the device, holes excluded. This is
     /// the honest storage number: a compacted log keeps its addresses
     /// but not its blocks.
+    ///
+    /// The blocks the write path has provisioned past the tail go back
+    /// first. They are a reservation the log makes so that a durable
+    /// commit does not have to allocate on its way to the device, and
+    /// counting them would report the database as costing up to a
+    /// megabyte more than it holds. The next commit provisions again.
     pub fn disk_bytes(&self) -> Result<u64> {
+        self.core.log.trim_tail()?;
         self.core.log.disk_bytes()
     }
 
@@ -371,6 +378,11 @@ impl Drop for Db {
         if let Some(handle) = self.flusher.take() {
             let _ = handle.join();
         }
+        // After the last flush, so the frontier it trims back to is the
+        // final one. A file that closes carrying its reservation would
+        // report a size nobody wrote and hand the next run a scan over
+        // blocks with nothing in them.
+        let _ = self.core.log.trim_tail();
     }
 }
 

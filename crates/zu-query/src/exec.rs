@@ -6071,6 +6071,34 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         // is, so the row's work is a clone of the handle and nothing
         // else.
         BoundExpr::Graph(handle) => Ok(Value::Graph(handle.clone())),
+        // GE03. Each name is worked out once and put in the overlay
+        // for as long as the body is being read, which is where a
+        // step's edge variable already lives: a slot that is in no
+        // chunk and that `value_of` finds before it looks in one. The
+        // binder made these slots for this expression alone, so there
+        // is nothing under them to shadow and nothing to put back.
+        BoundExpr::Let { values, body } => {
+            let mut failed = None;
+            for (slot, value) in values {
+                match eval(ctx, value) {
+                    Ok(v) => {
+                        ctx.overlay.insert(*slot, v);
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            let answer = match failed {
+                Some(e) => Err(e),
+                None => eval(ctx, body),
+            };
+            for (slot, _) in values {
+                ctx.overlay.remove(slot);
+            }
+            answer
+        }
         BoundExpr::Scalar { ix, .. } => scalar_value(ctx, *ix),
         BoundExpr::Var(slot) => value_of(ctx, *slot),
         BoundExpr::HasLabels { slot, test } => match value_of(ctx, *slot)? {

@@ -266,3 +266,33 @@ cases:
       - values:
           - type: STRING
             value: kept
+
+  - name: a-name-that-lives-for-one-expression
+    doc: ISO 20.7 lets an expression name a value for its own length, which is the LET clause said in a smaller place. The name is worked out once however often the body reads it, and the answer says nothing about that, so what is asked here is the plain reading.
+    query: RETURN LET n = 2 + 3 IN n * n END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "25"
+
+  - name: a-later-name-reads-an-earlier-one
+    doc: The definitions are read in the order they are written and each is in scope for the ones after it, so a pair where the second is about the first means what it looks like.
+    query: RETURN LET a = 4, b = a + 1 IN a * b END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "20"
+
+  - name: let-is-still-a-name
+    doc: The word opens an expression only where a definition follows it, which is a name with an equals sign behind it, so a query may still bind a variable called let and read it back.
+    query: LET let = 'kept' RETURN let AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: kept

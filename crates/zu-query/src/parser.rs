@@ -386,6 +386,7 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         pos: 0,
         depth: 0,
         lists: 0,
+        ends_a_definition: false,
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
@@ -408,6 +409,19 @@ struct Parser<'a> {
     /// the edges a match mode keeps apart are the ones of a single
     /// list, so each list carries a number of its own.
     lists: u32,
+    /// Whether an `IN` ahead closes the definitions of a `LET`
+    /// expression rather than testing membership, GE03.
+    ///
+    /// The two readings collide by the standard's own grammar, since a
+    /// definition holds a whole value expression and `IN` is one of the
+    /// operators a value expression is made of, so `LET n = a IN b IN c
+    /// END` has two parses and neither is more honest than the other.
+    /// This is the resolution: at the top of a definition the word ends
+    /// the definitions, and a membership test written there goes in
+    /// parentheses. It is set for the top of a definition alone, so
+    /// `LET n = (a IN b) IN n END` reads the test, and everywhere a
+    /// nested expression begins it is off again.
+    ends_a_definition: bool,
 }
 
 impl Parser<'_> {
@@ -2593,6 +2607,14 @@ impl Parser<'_> {
     // subexpression goes through this depth guard.
 
     fn parse_expr(&mut self) -> Result<Expr> {
+        self.parse_expr_in(false)
+    }
+
+    /// An expression, and whether an `IN` at the top of it closes a
+    /// `LET` expression's definitions. Every nested expression goes
+    /// through here with that off, which is what keeps the word an
+    /// operator everywhere except the one place it is a separator.
+    fn parse_expr_in(&mut self, ends_a_definition: bool) -> Result<Expr> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
@@ -2601,7 +2623,9 @@ impl Parser<'_> {
                 format!("expression nesting deeper than {MAX_DEPTH}"),
             ));
         }
+        let outer = std::mem::replace(&mut self.ends_a_definition, ends_a_definition);
         let result = self.parse_or();
+        self.ends_a_definition = outer;
         self.depth -= 1;
         result
     }
@@ -2659,7 +2683,7 @@ impl Parser<'_> {
                 Some(TokenKind::Gt) => BinaryOp::Gt,
                 Some(TokenKind::Ge) => BinaryOp::Ge,
                 _ => {
-                    if self.eat_kw("IN") {
+                    if !self.ends_a_definition && self.eat_kw("IN") {
                         let rhs = self.parse_concat()?;
                         lhs = binary(BinaryOp::In, lhs, rhs);
                         continue;
@@ -2939,6 +2963,41 @@ impl Parser<'_> {
         Some(param)
     }
 
+    /// Whether a definition stands here: a name with an equals sign
+    /// behind it, which is what tells `LET` the expression from `let`
+    /// the variable.
+    fn at_definition(&self) -> bool {
+        let name = matches!(
+            self.peek().map(|t| &t.kind),
+            Some(TokenKind::Ident(_) | TokenKind::QuotedIdent(_))
+        );
+        name && self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::Eq)
+    }
+
+    /// `LET n = a + b IN n * n END`, GE03, the word already read.
+    ///
+    /// The definitions are read left to right and the `END` is not
+    /// optional, which is what keeps the body from swallowing whatever
+    /// the expression is written inside: without it `LET n = 1 IN n, 2`
+    /// would be one projection item or two depending on where the
+    /// reader stopped.
+    fn parse_let_expr(&mut self) -> Result<Expr> {
+        let mut definitions = Vec::new();
+        loop {
+            let name = self.expect_name("a name after LET")?;
+            self.expect(&TokenKind::Eq)?;
+            let expr = self.parse_expr_in(true)?;
+            definitions.push(LetItem { name, expr });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect_kw("IN")?;
+        let body = Box::new(self.parse_expr()?);
+        self.expect_kw("END")?;
+        Ok(Expr::Let { definitions, body })
+    }
+
     /// An expression that begins with an identifier, the identifier
     /// already read.
     ///
@@ -2966,6 +3025,16 @@ impl Parser<'_> {
         // somebody names a column `case`.
         if name.eq_ignore_ascii_case("CASE") {
             return self.parse_case();
+        }
+        // GE03, a name that lives for the length of one expression.
+        // `LET` stays an ordinary variable name until a definition
+        // follows it, which is a name with an equals sign behind it,
+        // and nothing an expression may put after a variable read
+        // begins that way: two names against each other are not an
+        // expression at all. So `RETURN let` reads a variable and
+        // `RETURN LET n = 1 IN n END` reads this.
+        if name.eq_ignore_ascii_case("LET") && self.at_definition() {
+            return self.parse_let_expr();
         }
         // A temporal literal is a type name and a string, and it has to
         // be taken before the name becomes a variable, because DATE is

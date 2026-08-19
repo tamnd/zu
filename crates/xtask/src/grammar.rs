@@ -375,6 +375,7 @@ impl Vocabulary {
              (path_constructor name: (identifier) @function.builtin)\n\
              (exists_block name: (identifier) @keyword)\n\
              (value_block name: (identifier) @keyword)\n\
+             (let_expression word: (identifier) @keyword)\n\
              (variable) @variable\n\
              (property_access property: (identifier) @property)\n\
              (property_map key: (identifier) @property)\n\

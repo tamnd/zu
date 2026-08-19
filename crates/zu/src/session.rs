@@ -28,10 +28,11 @@ use zu_query::refs::{BindingTable, GraphHandle};
 use zu_query::row::{Batch, Flow};
 
 use crate::query::{self, NotAQuery, QueryResult, Value, Zu1Graph};
-use crate::shared::{FileHandle, Lease, WriteSide};
+use crate::shared::{FileHandle, Lease, Published, WriteSide};
 use crate::write::Patches;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
+use crate::zu1::wal::Commits;
 
 /// Distinct query texts held before the cache starts over. Workloads
 /// cycle a handful of statements; overflow means every text is unique
@@ -194,6 +195,15 @@ pub struct Session {
     /// it started with and an unregistered frame stays readable until
     /// that statement ends.
     frames: Arc<FrameSet>,
+    /// The state this session's statement made, held back until it is
+    /// durable, with whether the log owed nothing when it was taken.
+    /// See [`Self::durable`].
+    pending: Option<(Published, bool)>,
+    /// The byte the log has to reach the platter through for what this
+    /// session staged to have committed, and what waits for it. Held
+    /// here because the wait happens after the write side has gone
+    /// back and the log with it.
+    owed: Option<(Arc<Commits>, u64)>,
 }
 
 impl Session {
@@ -254,6 +264,8 @@ impl Session {
             dirs: crate::set::Dirs::default(),
             patches,
             frames: Arc::new(FrameSet::new()),
+            pending: None,
+            owed: None,
         })
     }
 
@@ -288,7 +300,10 @@ impl Session {
         self.enter()?;
         let side = self.side.as_mut().expect("entered just above");
         side.fold_writer()?;
-        self.handle.publish(side);
+        // The fold dropped the writer, and a fold that checkpointed
+        // synced the file before it cut the log, so there is nothing
+        // outstanding here and the share always goes through.
+        self.share();
         self.sync()?;
         Ok(self
             .side
@@ -415,6 +430,14 @@ impl Session {
     /// about the change. A closure that raises commits nothing and
     /// publishes no epoch, which is the rollback an implicit
     /// transaction owes.
+    ///
+    /// The frames go to the log here and the wait for the platter does
+    /// not: it happens in [`Self::durable`], after the write side has
+    /// gone back, so the writer queued behind this one stages into the
+    /// same sync rather than after it. What that costs is that the
+    /// state has to be held back too, because a reader shown a commit
+    /// a crash could take away is the one thing the deferral must not
+    /// buy.
     pub fn write<T>(
         &mut self,
         stage: impl FnOnce(&mut crate::zu1::txn::WriteTxn<'_>) -> Result<T>,
@@ -423,22 +446,99 @@ impl Session {
         let staged = {
             let side = self.side.as_mut().expect("entered just above");
             let staged = side.write(stage);
-            // Published even when the closure raised, because a
-            // transaction that staged nothing still folded whatever
-            // opening the writer recovered.
-            self.handle.publish(side);
+            // One debt per session, and this is the later one: the log
+            // only grows, so the wait for this byte is also the wait
+            // for anything this session staged before it. A write that
+            // owes nothing leaves the debt where it was, because what
+            // it means is that this transaction added nothing to the
+            // log rather than that the log has come clean.
+            if let (Ok(written), Some(commits)) = (&staged, side.commits())
+                && let Some(need) = written.owed
+            {
+                self.owed = Some((commits, need));
+            }
             staged
         };
+        // Staged even when the closure raised, because a transaction
+        // that staged nothing still folded whatever opening the writer
+        // recovered.
+        self.stage_side();
         let synced = self.sync();
         // After the sync, so that this session's own lease is on the
-        // epoch it has just published rather than the one before it and
+        // epoch it has just written rather than the one before it and
         // the blocks it freed come back now rather than a statement
         // later, which is what a single connection wants.
         self.reclaim();
         self.leave(entered);
+        // A statement holds a savepoint, so the leave above usually
+        // keeps the side and this waits with it held. That is the
+        // explicit transaction case, where there is nobody to share a
+        // sync with anyway; `settle` is where the statement path waits.
+        let durable = match self.side.is_some() {
+            true => Ok(()),
+            false => self.durable(),
+        };
         let written = staged?;
         synced?;
+        durable?;
         Ok(written.value)
+    }
+
+    /// Waits for the log to reach the platter through what this session
+    /// owes, then installs the state its write made.
+    ///
+    /// Both halves happen with the write side let go of. That is what
+    /// makes a burst of commits cost one sync between them: the writers
+    /// behind this one stage their frames while this sync is in the
+    /// air, and one sync covers all of them. The publish comes after
+    /// the wait rather than before it, so visibility follows durability
+    /// the way it did when the sync was inside the lock.
+    fn durable(&mut self) -> Result<()> {
+        let pending = self.pending.take();
+        let mut waited = false;
+        if let Some((commits, need)) = self.owed.take() {
+            commits.sync_through(need)?;
+            waited = true;
+        }
+        // A state taken while the log owed nothing is durable as it
+        // stands, and one taken while it owed something is durable now
+        // if the wait above covered it. Anything else belongs to a
+        // writer that has not waited yet, and is theirs to show.
+        if let Some((next, settled)) = pending
+            && (waited || settled)
+        {
+            self.handle.publish_staged(next);
+        }
+        Ok(())
+    }
+
+    /// Captures what the write side holds, to be published once the
+    /// log has made it durable.
+    ///
+    /// Whether the log owed anything is read here rather than at the
+    /// publish, with the side still held. That is what makes it an
+    /// answer about this state: a writer that stages after this one
+    /// cannot make what was already on the platter not be.
+    fn stage_side(&mut self) {
+        if let Some(side) = self.side.as_ref() {
+            self.pending = Some((self.handle.stage(side), side.settled()));
+        }
+    }
+
+    /// Publishes what the write side holds, unless the log owes a sync.
+    ///
+    /// This is the share the paths that commit nothing do: a fold from
+    /// recovery, a rollback, a writer being handed over. None of them
+    /// has a byte of its own to wait for, and none of them may show
+    /// somebody else's staged commit early, so they publish when the
+    /// log is clean and leave it to the writer that owes the sync when
+    /// it is not.
+    fn share(&mut self) {
+        if let Some(side) = self.side.as_ref()
+            && side.settled()
+        {
+            self.handle.publish(side);
+        }
     }
 
     /// Hands back the blocks the write just freed, unless a statement
@@ -480,8 +580,8 @@ impl Session {
             self.handle.put(side);
             return Err(err);
         }
-        self.handle.publish(&side);
         self.side = Some(side);
+        self.share();
         self.sync()?;
         // Opening the writer folds, and an appender that had the file
         // between statements checkpointed on it, so there is usually
@@ -503,9 +603,7 @@ impl Session {
     /// Says where the write side has got to, for the readers of every
     /// connection on this file.
     fn publish_side(&mut self) {
-        if let Some(side) = self.side.as_ref() {
-            self.handle.publish(side);
-        }
+        self.share();
     }
 
     /// Gives the write side back to whoever is waiting for it.
@@ -668,14 +766,19 @@ impl Session {
                 Err(failed) => Err(failed),
             },
         };
-        if let Some(side) = self.side.as_ref() {
-            self.handle.publish(side);
-        }
+        // Staged rather than published: this is the state the statement
+        // is about to be answered on, and the log may still owe the
+        // sync that makes it durable. It goes in below, after the wait.
+        self.stage_side();
         let synced = self.sync();
         self.reclaim();
         self.leave(held.entered);
+        // Off the write side, so the statement queued behind this one
+        // is staging its own frames while this sync is in the air.
+        let durable = self.durable();
         let value = out?;
         synced?;
+        durable?;
         Ok(value)
     }
 
@@ -702,7 +805,10 @@ impl Session {
             side.discard_above(floor)?;
         }
         side.file_mut().rollback_savepoint()?;
-        self.handle.publish(side);
+        // The rollback cut the log and synced the cut, and the writer
+        // went with the epochs it held, so nothing here is waiting on
+        // the platter and the share goes through.
+        self.share();
         // The writer went with the epochs it was holding, and the cells
         // its unfolded commits wrote went with it, so what the readers
         // were shown has to go too.
@@ -1633,9 +1739,11 @@ impl Drop for Session {
             .is_some_and(|side| side.file().in_savepoint());
         if self.txn.is_some() && holding {
             let _ = self.undo();
-        } else if let Some(side) = self.side.as_mut() {
-            let _ = side.fold_writer();
-            self.handle.publish(side);
+        } else if self.side.is_some() {
+            if let Some(side) = self.side.as_mut() {
+                let _ = side.fold_writer();
+            }
+            self.share();
         }
         // Whatever happened, the write side goes back: a session that
         // kept it would be a file no other connection could ever write.

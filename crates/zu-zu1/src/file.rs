@@ -1206,6 +1206,20 @@ impl Zu1File {
         self.file.write_all_at(data, ptr * u64::from(BLOCK_SIZE))
     }
 
+    /// Drops whatever the decoded pools hold for the segment keyed on
+    /// `ptr`.
+    ///
+    /// A rewrite that reuses the old segment's first block reuses its
+    /// pool key with it, and the bytes under that key have changed even
+    /// though the block holding them may not have been rewritten. The
+    /// rewrite says so here rather than leaving a reader to serve a
+    /// decoded column that is one commit stale.
+    pub fn forget_segment(&mut self, ptr: BlockPtr) {
+        self.pools.csr_offsets.remove(ptr);
+        self.pools.adjacency.remove(ptr);
+        self.pools.fences.remove(ptr);
+    }
+
     /// Pins the block at `ptr` in the cache. A warm pin is a map probe
     /// and an `Arc` clone, no allocation, no copy, no I/O; a miss reads
     /// the block once into a recycled frame. This is the read primitive

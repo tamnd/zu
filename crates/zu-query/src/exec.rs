@@ -68,7 +68,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
-use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal, unicode};
+use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{
     BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
@@ -280,7 +280,7 @@ fn path_rels(link: &PathLink) -> Value {
 /// Replaces every PMR chain in a value with its settled edge list.
 /// Runs where values leave the pipeline: projections, grouping keys,
 /// sort keys, and aggregate arguments.
-fn settle(v: Value) -> Value {
+pub(crate) fn settle(v: Value) -> Value {
     match v {
         Value::Chain(link) => path_rels(&link),
         Value::List(items) => Value::List(items.into_iter().map(settle).collect()),
@@ -6621,200 +6621,28 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             let is_typed = crate::typed::is_of(&eval(ctx, expr)?, ty);
             Ok(Value::Bool(is_typed != *negated))
         }
+        // The binder settled which kernel this call runs, so the row
+        // spends nothing on deciding what function it is looking at:
+        // the arguments are evaluated in written order and the kernel
+        // is called through the pointer the registry holds. An
+        // aggregate has no kernel, because what answers one is the
+        // accumulator the grouping keeps, and reaching one here is a
+        // projection that was compiled wrong.
         BoundExpr::Call {
             func, star, args, ..
-        } => match func {
-            Func::Id => {
-                if *star || args.len() != 1 {
-                    return Err(invalid("id() takes exactly one argument".into()));
-                }
-                match eval(ctx, &args[0])? {
-                    Value::Node { offset, .. } => Ok(Value::Int(offset as i64)),
-                    Value::Null | Value::Rel { .. } => Ok(Value::Null),
-                    other => Err(invalid(format!("id() expects a node, got {other:?}"))),
-                }
+        } => {
+            let kernel = crate::functions::signature(*func)
+                .and_then(|sig| sig.kernel)
+                .filter(|_| !*star)
+                .ok_or_else(|| {
+                    invalid("aggregate call outside a projection, this is a bug".into())
+                })?;
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(eval(ctx, arg)?);
             }
-            // G100. A string, and one that says which kind of element
-            // it names, so a node and an edge that happen to sit at the
-            // same number are two identifiers and not one. A node is
-            // its table and its offset; an edge is its table, the pair
-            // it runs between and which copy of that pair it is, which
-            // is what tells parallel edges apart. Null in is null out,
-            // as it is for every scalar here.
-            Func::ElementId => {
-                if *star || args.len() != 1 {
-                    return Err(invalid("element_id() takes exactly one argument".into()));
-                }
-                match eval(ctx, &args[0])? {
-                    Value::Node { table, offset } => Ok(Value::Str(format!("n:{table}:{offset}"))),
-                    Value::Rel {
-                        table,
-                        src,
-                        dst,
-                        ord,
-                    } => Ok(Value::Str(format!("e:{table}:{src}:{dst}:{ord}"))),
-                    Value::Null => Ok(Value::Null),
-                    other => Err(invalid(format!(
-                        "element_id() expects a node or an edge, got {other:?}"
-                    ))),
-                }
-            }
-            Func::Size => {
-                if *star || args.len() != 1 {
-                    return Err(invalid("size() takes exactly one argument".into()));
-                }
-                match eval(ctx, &args[0])? {
-                    // The chain stores its length, so size(r) on a
-                    // variable-length rel never materializes the list.
-                    Value::Chain(link) => Ok(Value::Int(link.hops as i64)),
-                    // A path answers with its element count, which is
-                    // the count of the list it used to be, so a query
-                    // written against that still gets the same number.
-                    // PATH_LENGTH is the edge count and the other
-                    // question.
-                    Value::List(items) | Value::Path(items) => Ok(Value::Int(items.len() as i64)),
-                    Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-                    Value::Null => Ok(Value::Null),
-                    other => Err(invalid(format!(
-                        "size() expects a list or string, got {other:?}"
-                    ))),
-                }
-            }
-            // GF12. The same count as size(), over lists only: a
-            // string has a length and not a cardinality, and answering
-            // anyway would let a query that meant CHAR_LENGTH pass.
-            Func::Cardinality => {
-                if *star || args.len() != 1 {
-                    return Err(invalid("cardinality() takes exactly one argument".into()));
-                }
-                match eval(ctx, &args[0])? {
-                    Value::List(items) => Ok(Value::Int(items.len() as i64)),
-                    Value::Null => Ok(Value::Null),
-                    other => Err(invalid(format!(
-                        "cardinality() expects a list, got {other:?}"
-                    ))),
-                }
-            }
-            // GF04. Edges, not elements: a path of two nodes has three
-            // elements and a length of one, and a path of one node has
-            // a length of zero.
-            Func::PathLength => {
-                if *star || args.len() != 1 {
-                    return Err(invalid("path_length() takes exactly one argument".into()));
-                }
-                match eval(ctx, &args[0])? {
-                    Value::Path(elements) => Ok(Value::Int((elements.len() / 2) as i64)),
-                    Value::Null => Ok(Value::Null),
-                    other => Err(invalid(format!(
-                        "path_length() expects a path, got {other:?}"
-                    ))),
-                }
-            }
-            // ISO 20.16. The walk in the order it was taken, node then
-            // edge then node, which is the shape the path already
-            // holds, so the list is the same values under another
-            // type rather than a copy of anything.
-            Func::Elements => {
-                if *star || args.len() != 1 {
-                    return Err(invalid("elements() takes exactly one argument".into()));
-                }
-                match eval(ctx, &args[0])? {
-                    Value::Path(elements) => Ok(Value::List(elements)),
-                    Value::Null => Ok(Value::Null),
-                    other => Err(invalid(format!("elements() expects a path, got {other:?}"))),
-                }
-            }
-            // G113, G114. Element identity, which is the table and the
-            // row for a node and the table, the ends and the ordinal
-            // for an edge, so comparing the values is comparing the
-            // elements. A null argument leaves the answer unknown, the
-            // way it does in the comparison this is a shorthand for,
-            // and a list this short is walked pairwise rather than
-            // sorted.
-            Func::AllDifferent | Func::Same => {
-                let mut elements = Vec::with_capacity(args.len());
-                for arg in args {
-                    match eval(ctx, arg)? {
-                        Value::Null => return Ok(Value::Null),
-                        value @ (Value::Node { .. } | Value::Rel { .. }) => elements.push(value),
-                        other => {
-                            return Err(invalid(format!(
-                                "{} compares nodes and edges, got {other:?}",
-                                if *func == Func::Same {
-                                    "same()"
-                                } else {
-                                    "all_different()"
-                                }
-                            )));
-                        }
-                    }
-                }
-                let same = *func == Func::Same;
-                let held = elements.iter().enumerate().all(|(at, left)| {
-                    elements[at + 1..]
-                        .iter()
-                        .all(|right| (left == right) == same)
-                });
-                Ok(Value::Bool(held))
-            }
-            // ISO 20.22 and 20.24. One string in, one answer out, and a
-            // null in answers null, which is the rule every one of
-            // these shares with the operators around them.
-            Func::CharLength
-            | Func::OctetLength
-            | Func::Upper
-            | Func::Lower
-            | Func::Trim
-            | Func::Normalize(_)
-            | Func::IsNormalized(_) => {
-                if *star || args.len() != 1 {
-                    return Err(invalid(format!(
-                        "{}() takes exactly one argument",
-                        crate::plan::func_name(*func)
-                    )));
-                }
-                let s = match settle(eval(ctx, &args[0])?) {
-                    Value::Str(s) => s,
-                    Value::Null => return Ok(Value::Null),
-                    other => {
-                        return Err(invalid(format!(
-                            "{}() expects a string, got {other:?}",
-                            crate::plan::func_name(*func)
-                        )));
-                    }
-                };
-                Ok(match func {
-                    // Characters, not bytes: what a reader counts is
-                    // the scalar values, and what the store keeps is
-                    // the UTF-8 they encode to. The two agree on ASCII
-                    // and nowhere else.
-                    Func::CharLength => Value::Int(s.chars().count() as i64),
-                    Func::OctetLength => Value::Int(s.len() as i64),
-                    // ASCII is the fold this does, which is the fold
-                    // the standard's default collation asks for and
-                    // the one that needs no table. A character outside
-                    // it is left as it stands rather than folded by a
-                    // rule this engine has not written down yet.
-                    Func::Upper => Value::Str(s.to_ascii_uppercase()),
-                    Func::Lower => Value::Str(s.to_ascii_lowercase()),
-                    // The one argument form trims spaces, which is what
-                    // ISO 20.24 says it trims: the trim character
-                    // defaults to a space and the trim specification to
-                    // BOTH. Naming either is GF06 and a spelling this
-                    // does not read.
-                    Func::Trim => Value::Str(s.trim_matches(' ').to_string()),
-                    // ISO 20.24 and 19.7, both answered by UAX 15 and
-                    // the Unicode Character Database, which is where
-                    // the tables under these two come from.
-                    Func::Normalize(form) => Value::Str(unicode::normalize(&s, *form)),
-                    Func::IsNormalized(form) => Value::Bool(unicode::is_normalized(&s, *form)),
-                    _ => unreachable!("the arm above names every function here"),
-                })
-            }
-            _ => Err(invalid(
-                "aggregate call outside a projection, this is a bug".into(),
-            )),
-        },
+            kernel(*func, &values)
+        }
         // GE09. An aggregate over a group variable, which folds what one
         // row bound rather than what the rows held. The accumulator is
         // the one the grouped aggregates use, so a null element is

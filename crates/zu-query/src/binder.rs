@@ -23,10 +23,22 @@ use crate::ast::{
     NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector,
     SetInto, SetItem, SortKey, UnaryOp,
 };
+use crate::functions;
 use crate::refs::GraphHandle;
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
+}
+
+/// A small count written the way a sentence writes it, since a refusal
+/// is read by a person and a person reading about two arguments does
+/// not want the digit.
+fn spelled(n: usize) -> String {
+    match n {
+        2 => "two".to_owned(),
+        3 => "three".to_owned(),
+        other => other.to_string(),
+    }
 }
 
 /// A statement the surface accepts and this build does not answer yet,
@@ -1725,32 +1737,6 @@ pub enum Func {
 }
 
 impl Func {
-    fn resolve(name: &str) -> Option<Func> {
-        let lower = name.to_ascii_lowercase();
-        Some(match lower.as_str() {
-            "count" => Func::Count,
-            "sum" => Func::Sum,
-            "avg" => Func::Avg,
-            "min" => Func::Min,
-            "max" => Func::Max,
-            "collect" => Func::Collect,
-            "id" => Func::Id,
-            "element_id" => Func::ElementId,
-            "size" => Func::Size,
-            "cardinality" => Func::Cardinality,
-            "path_length" => Func::PathLength,
-            "elements" => Func::Elements,
-            "all_different" => Func::AllDifferent,
-            "same" => Func::Same,
-            "char_length" | "character_length" => Func::CharLength,
-            "octet_length" => Func::OctetLength,
-            "upper" => Func::Upper,
-            "lower" => Func::Lower,
-            "trim" => Func::Trim,
-            _ => return None,
-        })
-    }
-
     pub fn is_aggregate(&self) -> bool {
         matches!(
             self,
@@ -5400,16 +5386,15 @@ impl Binder<'_> {
             Type::List(element) => *element,
             other => other,
         };
-        let out = match func {
-            Func::Count => Type::Int,
-            Func::Avg => Type::Float,
-            Func::Collect => Type::List(Box::new(element)),
-            // A property read answers a value the static lattice does
-            // not know, which is what a group of properties folds to as
-            // well, and the runtime checks what it was handed.
-            Func::Sum | Func::Min | Func::Max => element,
-            _ => unreachable!("only the aggregates reach here"),
-        };
+        // The same rule the vertical aggregate answers by, read against
+        // the element type rather than the column's. A property read
+        // answers a value the static lattice does not know, which is
+        // what a group of properties folds to as well, and the runtime
+        // checks what it was handed.
+        let out = functions::signature(func)
+            .expect("an aggregate has a signature")
+            .ret
+            .of(&element);
         Ok((
             BoundExpr::Fold {
                 func,
@@ -5459,15 +5444,16 @@ impl Binder<'_> {
         args: &[Expr],
         ctx: &mut ExprCtx,
     ) -> Result<(BoundExpr, Type)> {
-        let func = Func::resolve(name)
+        let sig = crate::functions::lookup(name)
             .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
-        if func.is_aggregate()
+        let func = sig.func;
+        if sig.aggregate
             && let [arg] = args
             && self.reads_a_group(arg)
         {
             return self.bind_horizontal(func, distinct, star, arg, ctx);
         }
-        if func.is_aggregate() {
+        if sig.aggregate {
             if !ctx.allow_aggregates {
                 return Err(invalid(format!(
                     "aggregate {name}() is only allowed in WITH and RETURN items"
@@ -5478,22 +5464,34 @@ impl Binder<'_> {
             }
             ctx.saw_aggregate = true;
         }
-        if star && func != Func::Count {
+        if star && !sig.star {
             return Err(invalid(format!("only count(*) takes *, not {name}(*)")));
         }
         // G113 and G114 are the two that take a list of elements rather
-        // than one value, and how many they need is their own rule,
-        // checked below with the types.
-        let variadic = matches!(func, Func::AllDifferent | Func::Same);
-        let want = if func == Func::Count && star { 0 } else { 1 };
-        if !variadic && args.len() != want {
-            return Err(invalid(format!(
-                "{name}() takes {want} argument(s), got {}",
-                args.len()
-            )));
+        // than one value, so their signature says how few will do and
+        // the rest say exactly how many.
+        match sig.arity {
+            functions::Arity::Exactly(want) => {
+                let want = if star { 0 } else { want };
+                if args.len() != want {
+                    return Err(invalid(format!(
+                        "{name}() takes {want} argument(s), got {}",
+                        args.len()
+                    )));
+                }
+            }
+            functions::Arity::AtLeast(least) => {
+                if star || args.len() < least {
+                    return Err(bad_type(format!(
+                        "{}() needs at least {} elements",
+                        sig.name,
+                        spelled(least)
+                    )));
+                }
+            }
         }
         let was_in_aggregate = ctx.in_aggregate;
-        if func.is_aggregate() {
+        if sig.aggregate {
             ctx.in_aggregate = true;
         }
         let mut bound = Vec::new();
@@ -5506,131 +5504,21 @@ impl Binder<'_> {
             bound.push(b);
         }
         ctx.in_aggregate = was_in_aggregate;
-        let out = match func {
-            Func::Count => Type::Int,
-            Func::Sum => {
-                if !arg_ty.is_numeric() {
-                    return Err(bad_type(format!("sum() needs a number, got {arg_ty}")));
-                }
-                arg_ty
+        for ty in &arg_tys {
+            if !sig.arg.accepts(ty) {
+                return Err(bad_type(format!("{}() {}, got {ty}", sig.name, sig.needs)));
             }
-            Func::Avg => {
-                if !arg_ty.is_numeric() {
-                    return Err(bad_type(format!("avg() needs a number, got {arg_ty}")));
-                }
-                Type::Float
-            }
-            Func::Min | Func::Max => arg_ty,
-            Func::Collect => Type::List(Box::new(arg_ty)),
-            Func::Id => {
-                if !matches!(arg_ty, Type::Node | Type::Rel | Type::Any) {
-                    return Err(bad_type(format!("id() needs a node or rel, got {arg_ty}")));
-                }
-                Type::Int
-            }
-            // ISO 20.10 writes the argument as an element variable
-            // reference, so a list or a number is refused here rather
-            // than at the row, and the answer is a string.
-            Func::ElementId => {
-                if !matches!(arg_ty, Type::Node | Type::Rel | Type::Any) {
-                    return Err(bad_type(format!(
-                        "element_id() needs a node or an edge, got {arg_ty}"
-                    )));
-                }
-                Type::Str
-            }
-            Func::Size => {
-                // A path is its alternating node and rel list, so
-                // size() applies to it like any other list.
-                if !matches!(arg_ty, Type::List(_) | Type::Str | Type::Path | Type::Any) {
-                    return Err(bad_type(format!(
-                        "size() needs a list or string, got {arg_ty}"
-                    )));
-                }
-                Type::Int
-            }
-            // ISO defines CARDINALITY over lists and groups and nothing
-            // else, so unlike size() it refuses a string rather than
-            // counting its characters, which is CHAR_LENGTH's question.
-            Func::Cardinality => {
-                if !matches!(arg_ty, Type::List(_) | Type::Any) {
-                    return Err(bad_type(format!(
-                        "cardinality() needs a list, got {arg_ty}"
-                    )));
-                }
-                Type::Int
-            }
-            // A path and nothing else. A list of the same elements is
-            // not a path, so counting one here would answer a question
-            // about a value that is not the one asked about.
-            Func::PathLength => {
-                if !matches!(arg_ty, Type::Path | Type::Any) {
-                    return Err(bad_type(format!(
-                        "path_length() needs a path, got {arg_ty}"
-                    )));
-                }
-                Type::Int
-            }
-            // The elements of a path, and of nothing else: a list is
-            // already the list of its elements and answering it back
-            // would let a query that meant something else pass. The
-            // element type is ANY because the list holds nodes and
-            // edges together, which no narrower type covers.
-            Func::Elements => {
-                if !matches!(arg_ty, Type::Path | Type::Any) {
-                    return Err(bad_type(format!("elements() needs a path, got {arg_ty}")));
-                }
-                Type::List(Box::new(Type::Any))
-            }
-            // G113, G114. Two questions about the same thing, so they
-            // take the same arguments: elements, and at least two of
-            // them, since one element is the same as itself and
-            // different from nothing.
-            Func::AllDifferent | Func::Same => {
-                let name = if func == Func::Same {
-                    "same()"
-                } else {
-                    "all_different()"
-                };
-                if star || arg_tys.len() < 2 {
-                    return Err(bad_type(format!("{name} needs at least two elements")));
-                }
-                for ty in &arg_tys {
-                    if !matches!(ty, Type::Node | Type::Rel | Type::Any) {
-                        return Err(bad_type(format!(
-                            "{name} compares nodes and edges, got {ty}"
-                        )));
-                    }
-                }
-                Type::Bool
-            }
-            // ISO 20.22 and 20.24. Five questions about a string, all
-            // taking one, and a number is refused rather than measured
-            // by its spelling, because GQL casts nothing to a string on
-            // its own and a query that meant the digits says so with a
-            // CAST. What the two lengths differ on is the unit: the
-            // characters a reader counts, and the bytes the store
-            // keeps, which are the same number only for ASCII.
-            Func::CharLength | Func::OctetLength | Func::Upper | Func::Lower | Func::Trim => {
-                if !arg_ty.is_str() {
-                    return Err(bad_type(format!(
-                        "{}() needs a string, got {arg_ty}",
-                        crate::plan::func_name(func)
-                    )));
-                }
-                match func {
-                    Func::CharLength | Func::OctetLength => Type::Int,
-                    _ => Type::Str,
-                }
-            }
-            // The parser reads NORMALIZE and IS NORMALIZED itself,
-            // because both write a normal form where an expression
-            // cannot stand, so neither is resolved by name and neither
-            // arrives here.
-            Func::Normalize(_) | Func::IsNormalized(_) => {
-                unreachable!("a normalization function is not resolved by name")
-            }
-        };
+        }
+        // A deterministic function over what the statement wrote is
+        // answered here, once, rather than on every row it would reach.
+        if let Some(lit) = functions::fold(sig, &bound) {
+            let ty = sig.ret.of(&arg_ty);
+            return Ok((BoundExpr::Literal(lit), ty));
+        }
+        // The answer's type is the signature's rule read against
+        // what arrived: a fixed type for most of these, and for the
+        // ones that hand back what they were given, the argument's.
+        let out = sig.ret.of(&arg_ty);
         Ok((
             BoundExpr::Call {
                 func,

@@ -1299,35 +1299,15 @@ fn item_text(item: &BoundItem, query: &BoundQuery) -> String {
 }
 
 /// What a function is called in a plan listing, which is the name the
-/// query wrote it under.
+/// query wrote it under. The registry holds it, so a plan and a refusal
+/// name a function the same way the statement did.
+///
+/// The two normalization functions carry a form the name does not say,
+/// and a plan listing writes that as a second argument: `func_name` is
+/// also what an error message puts in front of its parentheses, and
+/// `normalize(NFC)()` is not a sentence.
 pub(crate) fn func_name(func: Func) -> &'static str {
-    match func {
-        Func::Count => "count",
-        Func::Sum => "sum",
-        Func::Avg => "avg",
-        Func::Min => "min",
-        Func::Max => "max",
-        Func::Collect => "collect",
-        Func::Id => "id",
-        Func::ElementId => "element_id",
-        Func::Size => "size",
-        Func::Cardinality => "cardinality",
-        Func::PathLength => "path_length",
-        Func::Elements => "elements",
-        Func::AllDifferent => "all_different",
-        Func::Same => "same",
-        Func::CharLength => "char_length",
-        Func::OctetLength => "octet_length",
-        Func::Upper => "upper",
-        Func::Lower => "lower",
-        Func::Trim => "trim",
-        // The form is not in the name, so a plan listing writes it as a
-        // second argument. `func_name` is also what an error message
-        // puts in front of its parentheses, and `normalize(NFC)()` is
-        // not a sentence.
-        Func::Normalize(_) => "normalize",
-        Func::IsNormalized(_) => "is_normalized",
-    }
+    crate::functions::name_of(func)
 }
 
 /// Renders a bound expression back to query-shaped text for EXPLAIN and

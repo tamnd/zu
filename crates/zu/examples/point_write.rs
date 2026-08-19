@@ -80,11 +80,16 @@ fn build(dir: &Path, edges: &[(u32, u32)]) -> std::path::PathBuf {
 fn main() {
     let mut args = std::env::args().skip(1);
     let shape = args.next().unwrap_or_else(|| "delete".into());
-    let writes: u64 = args
-        .next()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(20_000)
-        .min(ROWS - 1);
+    let asked: u64 = args.next().and_then(|n| n.parse().ok()).unwrap_or(20_000);
+    // Every shape but `set1` puts the loop counter in the statement and
+    // wants a row of its own, so it runs out at the table. `set1` sends
+    // the same text every time and can run as long as it is asked to,
+    // which is what a sampler wants.
+    let writes = if shape == "set1" {
+        asked
+    } else {
+        asked.min(ROWS - 1)
+    };
 
     let root = std::env::var_os("ZU_POINT_ROOT")
         .map_or_else(std::env::temp_dir, std::path::PathBuf::from)

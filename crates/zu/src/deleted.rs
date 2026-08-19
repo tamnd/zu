@@ -19,20 +19,20 @@
 //! slower the more the file has deleted, so the two ascending runs are
 //! carried side by side and read that way.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::zu1::catalog::TableIndex;
 use crate::zu1::file::Zu1File;
 use crate::zu1::fold::{TOMBSTONE_KEY, decode_tombstones};
 use crate::zu1::meta;
-use zu_common::Result;
+use zu_common::{IdMap, Result};
 
 /// The rows the commits since the last fold took away, by table, each
 /// list ascending. This is what a delete leaves behind when it is not
 /// folded, and it goes over the chains the same way a cell patch goes
 /// over a column.
-pub(crate) type Tombstones = HashMap<u32, Arc<[u64]>>;
+pub(crate) type Tombstones = IdMap<u32, Arc<[u64]>>;
 
 /// The part of one half's list for `table` that falls in
 /// `base..base + rows`, which is ascending because the list is.
@@ -198,7 +198,7 @@ mod tests {
             &[2, 5, 7],
             "the patch is the whole patch"
         );
-        d.overlay(&Tombstones::new());
+        d.overlay(&Tombstones::default());
         assert_eq!(span(&d, 1, 0, 16), &[2], "a fold takes the patch away");
     }
 

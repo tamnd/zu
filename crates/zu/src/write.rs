@@ -44,11 +44,11 @@
 //!
 //! [`Zu1Graph`]: crate::query::Zu1Graph
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use zu_common::{Epoch, Result, ZuError};
+use zu_common::{Epoch, IdMap, Result, ZuError};
 
 use crate::append::sidecar;
 use crate::deleted::Tombstones;
@@ -115,15 +115,15 @@ const DEFERRED_BYTES: usize = 256 * 1024;
 #[derive(Debug, Default)]
 pub struct Patches {
     /// New values, by table.
-    pub cells: HashMap<u32, Arc<CellPatch>>,
+    pub cells: IdMap<u32, Arc<CellPatch>>,
     /// New rows, by table, node tables and rel tables alike. A rel
     /// table's are the property rows of the edges in `edges`, under
     /// the ordinals those took. A node table's are rows of the table
     /// itself, so they move the count every reader is bounded by, and
     /// everything that reads a bound reads it through this.
-    pub rows: HashMap<u32, Arc<RowPatch>>,
+    pub rows: IdMap<u32, Arc<RowPatch>>,
     /// Edges added and edges taken away, by rel table.
-    pub edges: HashMap<u32, Arc<EdgePatch>>,
+    pub edges: IdMap<u32, Arc<EdgePatch>>,
     /// Rows taken away, by table, ascending. A delete moves nothing:
     /// the offsets stay where they are and the fold writes them into
     /// the table's tombstone chain, so what the patch carries is what
@@ -132,7 +132,7 @@ pub struct Patches {
     /// The labels rows are left carrying, by table. A label is not a
     /// column, so there is no cell to lay a value over: what is kept is
     /// the whole word, composed where the commit was taken.
-    pub marks: HashMap<u32, Arc<LabelPatch>>,
+    pub marks: IdMap<u32, Arc<LabelPatch>>,
 }
 
 impl Patches {
@@ -227,11 +227,11 @@ pub struct Writer {
     /// The words the commits since the last fold wrote, by table and
     /// then by column, which is the running form the patch below is
     /// built from.
-    pending: HashMap<u32, BTreeMap<usize, BTreeMap<u64, u64>>>,
+    pending: IdMap<u32, BTreeMap<usize, BTreeMap<u64, u64>>>,
     /// The strings they wrote, the same way. Apart from the words
     /// because the patch keeps them apart, and the two never name the
     /// same column: a column stores one kind or the other.
-    strings: HashMap<u32, BTreeMap<usize, BTreeMap<u64, Vec<u8>>>>,
+    strings: IdMap<u32, BTreeMap<usize, BTreeMap<u64, Vec<u8>>>>,
     /// The same cells as a reader takes them. Rebuilt whenever a
     /// deferred commit adds to `pending`, and shared from there: a
     /// reader holds the `Arc` and hands copies of it to the workers a
@@ -241,22 +241,22 @@ pub struct Writer {
     deferred: u32,
     /// The rows the deferred commits added, by table, in the running
     /// form the patch above is built from.
-    added: HashMap<u32, RowPatch>,
+    added: IdMap<u32, RowPatch>,
     /// The edges they added, by rel table, the same way.
-    fresh: HashMap<u32, EdgePatch>,
+    fresh: IdMap<u32, EdgePatch>,
     /// The labels they left on rows, by table, again the same way. A
     /// row named twice is in here once, carrying what the later of the
     /// two commits left it with.
-    marks: HashMap<u32, LabelPatch>,
+    marks: IdMap<u32, LabelPatch>,
     /// The rows they took away, by table. A set, because a row can be
     /// deleted twice and the second one takes nothing away, and sorted
     /// because that is the order the readers merge it in.
-    graves: HashMap<u32, BTreeSet<u64>>,
+    graves: IdMap<u32, BTreeSet<u64>>,
     /// Adjacency readers of the rel tables a deferred commit has added
     /// an edge to, which is what says whether the pair is already
     /// there and how many edges the file holds. A fold moves what
     /// these describe, so it empties this.
-    readers: HashMap<u32, GraphReader>,
+    readers: IdMap<u32, GraphReader>,
     /// The catalog those readers were loaded through, for the same
     /// stretch and dropped at the same fold.
     catalog: Option<Catalog>,
@@ -264,7 +264,7 @@ pub struct Writer {
     /// into, which is how a commit is checked against the columns it
     /// names without reading the directory chain per statement. A fold
     /// moves the roots these describe, so it empties this.
-    dirs: HashMap<u32, Option<PropsDirectory>>,
+    dirs: IdMap<u32, Option<PropsDirectory>>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -302,17 +302,17 @@ impl Writer {
             wal,
             mvcc,
             path,
-            pending: HashMap::new(),
-            strings: HashMap::new(),
+            pending: IdMap::default(),
+            strings: IdMap::default(),
             patches: Arc::new(Patches::new()),
             deferred: 0,
-            added: HashMap::new(),
-            fresh: HashMap::new(),
-            marks: HashMap::new(),
-            graves: HashMap::new(),
-            readers: HashMap::new(),
+            added: IdMap::default(),
+            fresh: IdMap::default(),
+            marks: IdMap::default(),
+            graves: IdMap::default(),
+            readers: IdMap::default(),
             catalog: None,
-            dirs: HashMap::new(),
+            dirs: IdMap::default(),
         };
         writer.fold(db)?;
         Ok(writer)
@@ -461,7 +461,7 @@ impl Writer {
             .collect();
         // The words this commit has left on rows so far, by table and
         // offset, for the same reason.
-        let mut staged: HashMap<(u32, u64), u64> = HashMap::new();
+        let mut staged: IdMap<(u32, u64), u64> = IdMap::default();
         let mut taken = Vec::with_capacity(changes.len());
         for change in changes {
             match change {
@@ -864,7 +864,7 @@ impl Writer {
         offset: u64,
         add: u64,
         remove: u64,
-        staged: &HashMap<(u32, u64), u64>,
+        staged: &IdMap<(u32, u64), u64>,
     ) -> Result<Option<u64>> {
         if self.catalog.is_none() {
             self.catalog = Some(Catalog::load(db)?);

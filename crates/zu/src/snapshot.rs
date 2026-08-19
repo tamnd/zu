@@ -11,10 +11,9 @@
 //!
 //! [`Zu1Graph`]: crate::query::Zu1Graph
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use zu_common::{FloatBits, IntBits, LogicalType, Result, ZuError};
+use zu_common::{FloatBits, IdMap, IntBits, LogicalType, Result, ZuError};
 use zu_vector::{MorselArena, PhysType, SelVector, ValueVector, str_vector};
 
 use zu_query::frame::FrameSet;
@@ -92,8 +91,8 @@ impl Drop for Db<'_> {
 pub struct Zu1Snapshot<'a> {
     db: Db<'a>,
     catalog: Catalog,
-    readers: HashMap<u32, GraphReader>,
-    props: HashMap<u32, Option<PropsReader>>,
+    readers: IdMap<u32, GraphReader>,
+    props: IdMap<u32, Option<PropsReader>>,
     /// Decoded-chunk scratch shared by scan and gather, with the
     /// column it currently holds so a predicate column requested in
     /// the output decodes once, not twice.
@@ -132,8 +131,8 @@ pub struct Zu1Snapshot<'a> {
 /// the epoch moves.
 #[derive(Default)]
 pub struct SnapshotCache {
-    pub(crate) readers: HashMap<u32, GraphReader>,
-    pub(crate) props: HashMap<u32, Option<PropsReader>>,
+    pub(crate) readers: IdMap<u32, GraphReader>,
+    pub(crate) props: IdMap<u32, Option<PropsReader>>,
     scratch: Vec<u64>,
     str_bytes: Vec<u8>,
     str_ends: Vec<u64>,
@@ -387,7 +386,7 @@ fn survivors(
 /// The props reader of `table`, which must have properties stored.
 /// A node table and a rel table never share an id, so this reads
 /// either one.
-fn props_of(props: &mut HashMap<u32, Option<PropsReader>>, table: u32) -> Result<&mut PropsReader> {
+fn props_of(props: &mut IdMap<u32, Option<PropsReader>>, table: u32) -> Result<&mut PropsReader> {
     props
         .get_mut(&table)
         .expect("just loaded")
@@ -900,8 +899,8 @@ impl Snapshot for Zu1Snapshot<'_> {
         Some(Box::new(Zu1Snapshot {
             db: Db::Owned(Some(Box::new(db))),
             catalog: self.catalog.clone(),
-            readers: HashMap::new(),
-            props: HashMap::new(),
+            readers: IdMap::default(),
+            props: IdMap::default(),
             scratch: Vec::new(),
             str_bytes: Vec::new(),
             str_ends: Vec::new(),

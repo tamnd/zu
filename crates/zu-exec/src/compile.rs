@@ -14,10 +14,9 @@
 //! The bar for anything compiled here is exact old-engine output:
 //! same rows, same order, same errors on overflow.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use zu_common::Result;
+use zu_common::{IdMap, Result};
 use zu_common::types::LogicalType;
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
@@ -890,17 +889,17 @@ pub(crate) fn compile(
         wcoj: options.wcoj,
         sip: options.sip,
         levels: Vec::new(),
-        slot_level: HashMap::new(),
-        rel_level: HashMap::new(),
+        slot_level: IdMap::default(),
+        rel_level: IdMap::default(),
         sips: Vec::new(),
-        sip_at: HashMap::new(),
+        sip_at: IdMap::default(),
         optional_level: None,
         exists_level: None,
         marked: None,
         unwind_slot: None,
         func_slot: None,
         func: None,
-        marks: HashMap::new(),
+        marks: IdMap::default(),
         consts: Vec::new(),
     };
     c.compile(plan)
@@ -945,13 +944,13 @@ struct Compiler<'a> {
     /// same plan without the filter a join would have published.
     sip: Sip,
     levels: Vec<LevelBuild>,
-    slot_level: HashMap<usize, usize>,
+    slot_level: IdMap<usize, usize>,
     /// Where a rel variable's edges are: the level the walk over that
     /// rel built, and the rel it walked. A property of the variable is
     /// then a column of that level, gathered by ordinal. Only a plain
     /// single hop registers one, so every other shape that names an
     /// edge still declines.
-    rel_level: HashMap<usize, (usize, RelId)>,
+    rel_level: IdMap<usize, (usize, RelId)>,
     /// The joins that placed, each with the scalar its probe reads.
     /// The filter comes off the table at the end, once the plan is
     /// known to be one this pipeline runs at all.
@@ -970,7 +969,7 @@ struct Compiler<'a> {
     /// runs. Levels made inside a bracket are left out on purpose,
     /// since dropping a row of one of those is dropping a match the
     /// bracket has to keep as a miss.
-    sip_at: HashMap<usize, usize>,
+    sip_at: IdMap<usize, usize>,
     /// The level an OPTIONAL MATCH group introduced, once one is open.
     /// It is the level that binds null on a miss, so the sink is held
     /// to what it can answer with a null there, and nothing else
@@ -1003,7 +1002,7 @@ struct Compiler<'a> {
     /// was written on and the chunk vector position of the column that
     /// holds the answer. A predicate naming the slot compiles into a
     /// read of that column.
-    marks: HashMap<usize, (usize, usize)>,
+    marks: IdMap<usize, (usize, usize)>,
     /// The constants the sink writes, in the order they were asked for.
     consts: Vec<Value>,
 }

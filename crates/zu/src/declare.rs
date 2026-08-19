@@ -806,12 +806,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = open(&dir, "existing.zu1");
 
-        let err = session
+        // The read answers a null per row, ISO 20.11, and it answers it
+        // off the table that was already there: nothing here declared a
+        // column for the name, and a statement that reads a property is
+        // not one that writes one.
+        let rows = session
             .run("MATCH (p:person) RETURN p.height AS h", &[])
-            .expect_err("no such column");
+            .expect("a read of a column nobody wrote");
+        assert!(!rows.rows.is_empty(), "the person table has rows in it");
         assert!(
-            err.to_string().contains("unknown property 'height'"),
-            "the binder answered rather than this module: {err}"
+            rows.rows.iter().all(|row| row[0] == Value::Null),
+            "every row reads null: {:?}",
+            rows.rows
         );
     }
 

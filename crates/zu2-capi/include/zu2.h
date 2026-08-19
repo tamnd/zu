@@ -1,0 +1,292 @@
+/* libzu2: the C surface over the zu2 storage engine.
+ *
+ * zu2 is a storage engine and not a database with a query language, so
+ * this is a storage surface: keys and values, vertices and edges, and
+ * the traversals a host would otherwise write as a loop over hops. A
+ * host that wants GQL wants libzu (crates/zu-capi), which is the other
+ * engine and the other header.
+ *
+ * The object model is the Rust one. A zu2_db is an open file and the
+ * structures over it, and it is shareable: every session opened from
+ * one db reads the same log and the same adjacency. A zu2_session is
+ * the state that cannot be shared, which here is a durability setting
+ * and the buffers a call answers out of. A host that traverses from
+ * four threads opens one db and opens four sessions on it.
+ *
+ * A session may move between threads but must not be in two calls at
+ * once. A call that finds one already in use answers
+ * ZU2_MISUSE_CONCURRENT rather than handing back a buffer another
+ * thread is filling. The same rule applies to the fallible db calls
+ * (sync, compact, disk_bytes), because they carry a last-error the same
+ * way; the accessors that cannot fail do not take that guard and may be
+ * called from anywhere.
+ *
+ * Every fallible call returns a zu2_status and writes what it produced
+ * through an out-parameter. The status is the whole control-flow
+ * answer, and the out-parameter is written on every path, zeroed or
+ * NULL when there is nothing to point at, so a caller who ignores the
+ * status is never left holding a pointer from the call before. What a
+ * user reads comes from zu2_db_error or zu2_session_error, on the
+ * handle the failed call was made on, and stays there until the next
+ * call on that handle.
+ *
+ * The status values match libzu's for the four cases both libraries
+ * have, so a host that links both does not need two tables.
+ *
+ * Buffers this API hands out (a value, a neighbour list, a frontier)
+ * belong to the session that produced them and are valid exactly until
+ * the next call on that session. Copy before the next call or do not
+ * keep them.
+ *
+ * Those buffers are copies rather than windows into the storage, and
+ * that is not an oversight. zu2 holds a neighbour list still by
+ * announcing an epoch, and the epoch ends when the call returns, so a
+ * pointer that outlived the call would be a pointer into a block a
+ * writer is free to replace. This is the reason zu2_khop, zu2_reach and
+ * zu2_triangles are here at all: a host that walks a graph one
+ * zu2_neighbours call per vertex pays a copy per hop and measures the
+ * copy, and a host that asks for the k-hop frontier pays one copy for
+ * the answer and walks the interior at Rust speed inside the epoch.
+ *
+ * Strings cross the boundary as a pointer and a length. Most source
+ * languages have counted strings, and a NUL-terminated parameter makes
+ * every one of them measure a string that already knew its own length.
+ * A NULL pointer with a zero length is the empty string, not an error.
+ *
+ * Ownership is the usual C contract: a handle stays valid until the
+ * matching close, and each close is a no-op on NULL.
+ */
+#ifndef ZU2_H
+#define ZU2_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* What a call did. The numbers are libzu's, so the two headers agree
+ * where they overlap and the gaps are libzu's cases that have no
+ * meaning here. */
+typedef enum zu2_status {
+  /* The call did what it was asked and wrote its out-parameter. */
+  ZU2_OK = 0,
+  /* The engine refused the work: a full log, a vertex past the table,
+   * a malformed record, an io error. The handle says which. */
+  ZU2_ERROR = 3,
+  /* The caller broke the contract in this header: a NULL handle, a NULL
+   * out-parameter, a path that is not utf8. Nothing was done and
+   * nothing is wrong with the database. */
+  ZU2_MISUSE = 4,
+  /* Two threads used one session at once. Distinct from ZU2_MISUSE
+   * because it is the mistake a host makes by accident rather than by
+   * typo, and because the fix is a different one: open another session
+   * rather than correct the call. */
+  ZU2_MISUSE_CONCURRENT = 5
+} zu2_status;
+
+/* How far a write waits before it is acknowledged.
+ *
+ * Two settings and not three, and 06-durability-recovery.md section 2
+ * is the argument. ZU2_ASYNC returns once the record is in the log's
+ * memory tail, which a background thread writes out behind the caller;
+ * a crash loses a suffix, never a hole. ZU2_DURABLE returns once the
+ * device has acknowledged it, and it is a group commit, so one device
+ * write serves every commit queued behind it.
+ */
+typedef enum zu2_durability {
+  ZU2_ASYNC = 0,
+  ZU2_DURABLE = 1
+} zu2_durability;
+
+/* Which way an edge is followed. */
+typedef enum zu2_direction {
+  ZU2_OUT = 0,
+  ZU2_IN = 1
+} zu2_direction;
+
+/* How a database is sized and how durable it is.
+ *
+ * Every field zero means the engine's own defaults, so a caller that
+ * memsets the struct and sets nothing gets a working database.
+ * index_buckets and max_vertices are sized once and not grown, so a
+ * caller who knows the shape should say so: past the load factor the
+ * index's collision chains lengthen, which is graceful and is not free.
+ */
+typedef struct zu2_options {
+  /* Default durability for sessions opened from this db. */
+  zu2_durability durability;
+  /* Hash index buckets, rounded up to a power of two. Eight entries to
+   * a bucket and the table wants to stay under half full, so
+   * records / 4 is a reasonable hint. 0 takes the default. */
+  uint64_t index_buckets;
+  /* Slots in the page table, which caps the log at max_pages * 4 MiB.
+   * 0 takes the default. */
+  uint64_t max_pages;
+  /* Vertices the graph plane is sized for. Only one pointer per 16384
+   * vertices per direction is allocated up front, so this is cheap to
+   * set high. 0 takes the default. */
+  uint64_t max_vertices;
+  /* Bytes of log kept per byte of live data, as a percent. 200 settles
+   * the file at about twice the live set. 0 takes the default. */
+  uint32_t space_target_percent;
+  /* Log span below which compaction does not bother, in bytes. A load
+   * that will be measured and thrown away wants compaction off, which
+   * is what UINT64_MAX does. 0 takes the default. */
+  uint64_t compact_below;
+} zu2_options;
+
+typedef struct zu2_db zu2_db;
+typedef struct zu2_session zu2_session;
+
+/* Fills an options struct with the engine's defaults. */
+zu2_status zu2_options_init(zu2_options *opt);
+
+/* Opens the database at path, creating it when it is not there and
+ * replaying its log when it is.
+ *
+ * opt may be NULL for the defaults. On failure *out is NULL, and since
+ * there is no handle to read a message from, the message is written
+ * through err when err is not NULL: a pointer valid until the next
+ * failed zu2_open on the same thread.
+ */
+zu2_status zu2_open(const char *path, size_t path_len, const zu2_options *opt,
+                    zu2_db **out, const char **err, size_t *err_len);
+
+/* Closes a database, stopping its background thread after one last
+ * flush. A no-op on NULL. Sessions hold the engine alive on their own,
+ * so closing a db that still has sessions open is safe; it is just not
+ * usually what the caller meant. */
+void zu2_close(zu2_db *db);
+
+/* What went wrong in the last fallible call on this db, NUL-terminated
+ * and empty when that call succeeded. Valid until the next call on this
+ * db. */
+const char *zu2_db_error(const zu2_db *db, size_t *len);
+
+/* Opens a session. Hold one per thread for the whole run: it owns an
+ * epoch slot and the buffers the read path uses, so an operation on a
+ * warm database allocates nothing. */
+zu2_status zu2_session_open(zu2_db *db, zu2_session **out);
+
+/* Closes a session. A no-op on NULL. */
+void zu2_session_close(zu2_session *s);
+
+/* What went wrong in the last fallible call on this session. */
+const char *zu2_session_error(const zu2_session *s, size_t *len);
+
+/* Changes how far this session waits before acknowledging a write.
+ * Writes already acknowledged keep the guarantee they were given. The
+ * setting belongs to the session and not to the file, which is the same
+ * arrangement as sqlite's synchronous pragma. */
+zu2_status zu2_set_durability(zu2_session *s, zu2_durability d);
+
+/* ---- records ---- */
+
+/* Writes value under key, whether or not it was there. */
+zu2_status zu2_upsert(zu2_session *s, const uint8_t *key, size_t key_len,
+                      const uint8_t *value, size_t value_len);
+
+/* Reads the newest value for key. *found says whether there was one.
+ * The buffer is the session's and is valid until the next call on it. */
+zu2_status zu2_read(zu2_session *s, const uint8_t *key, size_t key_len,
+                    const uint8_t **value, size_t *value_len, int *found);
+
+/* Removes key. *existed says whether it was there. */
+zu2_status zu2_delete(zu2_session *s, const uint8_t *key, size_t key_len,
+                      int *existed);
+
+/* ---- graph ---- */
+
+/* Creates a vertex under an external key and returns its dense id.
+ *
+ * The key to id mapping is an ordinary record, so looking a vertex up
+ * by key is a hash probe and nothing more, and a traversal pays it once
+ * at the seed rather than once per hop, because a frontier is dense
+ * ids. */
+zu2_status zu2_add_vertex(zu2_session *s, const uint8_t *key, size_t key_len,
+                          uint32_t *vertex);
+
+/* The dense id of the vertex with this key. */
+zu2_status zu2_vertex_of(zu2_session *s, const uint8_t *key, size_t key_len,
+                         uint32_t *vertex, int *found);
+
+/* Links src to dst. Repeating an edge is not an error and does not grow
+ * the neighbourhood. */
+zu2_status zu2_add_edge(zu2_session *s, uint32_t src, uint32_t dst);
+
+/* Unlinks src from dst. Removing an edge that is not there is not an
+ * error. */
+zu2_status zu2_remove_edge(zu2_session *s, uint32_t src, uint32_t dst);
+
+/* The out or in degree. One indexed load, whatever the degree is. */
+zu2_status zu2_degree(zu2_session *s, zu2_direction dir, uint32_t vertex,
+                      uint32_t *degree);
+
+/* A vertex's neighbours, ascending, copied into the session's buffer
+ * and valid until the next call on it. */
+zu2_status zu2_neighbours(zu2_session *s, zu2_direction dir, uint32_t vertex,
+                          const uint32_t **out, size_t *len);
+
+/* The distinct vertices exactly k hops from seed.
+ *
+ * k == 0 is the seed itself. Distinct is per level rather than
+ * cumulative, which is what
+ * `MATCH (a)-[:E]->()-[:E]->(c) RETURN count(DISTINCT c)` asks for: a
+ * vertex two paths of length k both reach is counted once, and a vertex
+ * that is also reachable in fewer hops is still counted. The frontier
+ * is the session's buffer and is valid until the next call on it. */
+zu2_status zu2_khop(zu2_session *s, zu2_direction dir, uint32_t seed,
+                    uint32_t k, const uint32_t **out, size_t *len);
+
+/* The vertices reachable from seed, breadth first, the seed included.
+ * Stops once max_visited have been found, which bounds a probe on a
+ * graph with a giant component; 0 means no bound. The order is the
+ * order they were reached in. */
+zu2_status zu2_reach(zu2_session *s, zu2_direction dir, uint32_t seed,
+                     uint64_t max_visited, const uint32_t **out, size_t *len);
+
+/* Closed directed triangles through seed: pairs (b, c) with seed->b,
+ * b->c and seed->c. */
+zu2_status zu2_triangles(zu2_session *s, uint32_t seed, uint64_t *count);
+
+/* How many vertices the graph holds. */
+uint32_t zu2_vertices(const zu2_db *db);
+
+/* ---- administration ---- */
+
+/* Makes everything appended so far durable, whatever the sessions were
+ * set to. This is how a loader running async gets its tail onto the
+ * device before anything measures the file. */
+zu2_status zu2_sync(zu2_db *db);
+
+/* Compacts until another pass would not pay for itself, and reports the
+ * bytes the filesystem took back. The background thread does this on
+ * its own schedule; this is for a caller who wants the space now. */
+zu2_status zu2_compact(zu2_db *db, uint64_t *reclaimed);
+
+/* Bytes the file occupies on the device, which is not its length:
+ * compaction punches holes, and a file with holes reports a length that
+ * still counts them. This is the honest storage number. */
+zu2_status zu2_disk_bytes(zu2_db *db, uint64_t *bytes);
+
+/* Addresses the log has spent, which is what the file would cost had
+ * nothing ever been compacted away. */
+uint64_t zu2_log_bytes(const zu2_db *db);
+
+/* Addresses the log still spans, tail minus begin. */
+uint64_t zu2_log_span(const zu2_db *db);
+
+/* Entries in use in the hash index, for reporting the load factor a run
+ * happened at. */
+uint64_t zu2_index_occupancy(const zu2_db *db);
+
+/* The library version, NUL-terminated and valid forever. */
+const char *zu2_version(size_t *len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ZU2_H */

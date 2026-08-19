@@ -485,6 +485,7 @@ fn build_path(
     }
     plan = label_filter(plan, &path.start, bracket);
     plan = prop_filters(plan, path.start.slot, &path.start.props, bracket);
+    plan = element_predicate(plan, &path.start, bracket);
     let mut from = path.start.slot;
     for (rel, node) in &path.steps {
         let into = bound.contains(&node.slot);
@@ -524,6 +525,7 @@ fn build_path(
         }
         plan = label_filter(plan, node, bracket);
         plan = prop_filters(plan, node.slot, &node.props, bracket);
+        plan = element_predicate(plan, node, bracket);
         from = node.slot;
     }
     Ok(plan)
@@ -547,6 +549,27 @@ fn label_filter(
                 slot: node.slot,
                 test: test.clone(),
             },
+            bracket,
+        },
+    }
+}
+
+/// The `WHERE` written inside an element pattern (G041), planted where
+/// the node it speaks about is reached rather than above the whole
+/// pattern. That is what makes it a pattern predicate: a node the
+/// condition refuses is not reached, so nothing is expanded from it,
+/// and inside an OPTIONAL MATCH it gates the match within the group
+/// instead of dropping the group's null row.
+fn element_predicate(
+    plan: LogicalPlan,
+    node: &crate::binder::BoundNode,
+    bracket: Option<Bracket>,
+) -> LogicalPlan {
+    match &node.filter {
+        None => plan,
+        Some(expr) => LogicalPlan::Filter {
+            input: plan.boxed(),
+            expr: expr.clone(),
             bracket,
         },
     }

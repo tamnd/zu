@@ -6027,7 +6027,7 @@ fn scalar_value(ctx: &mut StageCtx, ix: usize) -> Result<Value> {
     let plan = ctx.scalars.plans[ix]
         .as_ref()
         .expect("a query that captures was planned as one that runs per row");
-    one_value(plan, query, schema, &mut *ctx.graph, &params, options)
+    answer(plan, query, schema, &mut *ctx.graph, &params, options)
 }
 
 fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
@@ -7590,7 +7590,7 @@ impl<'a> Scalars<'a> {
             let built = crate::plan::build(scalar)?;
             let plan = crate::optimizer::optimize(built, scalar, schema)?;
             if scalar.captures.is_empty() {
-                once.push(one_value(&plan, scalar, schema, graph, params, options)?);
+                once.push(answer(&plan, scalar, schema, graph, params, options)?);
                 plans.push(None);
             } else {
                 once.push(Value::Null);
@@ -7623,6 +7623,62 @@ impl<'a> Scalars<'a> {
             options,
         }
     }
+}
+
+/// Runs one query written inside an expression and reads out of it
+/// whatever the word around it asked for.
+///
+/// An `EXISTS` asked whether it answered a row and a `VALUE` asked for
+/// the value in it, and the mark on the query is what says which.
+fn answer(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+) -> Result<Value> {
+    match query.exists {
+        true => any_row(plan, query, schema, graph, params, options),
+        false => one_value(plan, query, schema, graph, params, options),
+    }
+}
+
+/// Runs one existence predicate written around a query (ISO 19.4) and
+/// answers whether it had a row.
+///
+/// The limit is the point. What was asked is whether there is a row
+/// and one row settles that, so the run stops at the first: a query
+/// that would have matched a million times costs the first match and
+/// nothing else. It is never null, unlike the value form, because a
+/// query that answered nothing answers false rather than not knowing.
+fn any_row(
+    plan: &LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    graph: &mut dyn Graph,
+    params: &[Value],
+    options: &Options,
+) -> Result<Value> {
+    let mut found = false;
+    let mut sink = |batch: Batch<'_>| -> Result<Flow> {
+        found |= !batch.is_empty();
+        Ok(Flow::Stop)
+    };
+    let mut stream = Streaming::new(&mut sink, &query.columns, 1);
+    run_stages(
+        plan,
+        query,
+        schema,
+        graph,
+        params,
+        options,
+        Extras {
+            profile: None,
+            stream: Some(&mut stream),
+        },
+    )?;
+    Ok(Value::Bool(found))
 }
 
 /// Runs one value query expression and reads the value out of it.
@@ -7669,10 +7725,14 @@ fn one_value(
 /// of it to get the cost back.
 fn correlated_warning(query: &BoundQuery) -> DiagnosticRecord {
     let read: Vec<&str> = query.captures.iter().map(|c| c.name.as_str()).collect();
+    let word = match query.exists {
+        true => "EXISTS",
+        false => "VALUE",
+    };
     DiagnosticRecord::new(
         codes::C01000,
         format!(
-            "a VALUE query reading {} from the query around it is answered once per row rather than once: lift it out and join it if the row count is large",
+            "a {word} query reading {} from the query around it is answered once per row rather than once: lift it out and join it if the row count is large",
             read.join(", ")
         ),
     )

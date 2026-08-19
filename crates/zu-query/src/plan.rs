@@ -717,6 +717,10 @@ pub struct ScalarPlan {
     /// is run once, and a query reading a name is run per row.
     pub reads: Vec<String>,
     pub plan: QueryPlan,
+    /// True when what was written around it asks only whether it
+    /// answered a row, which is the `EXISTS` form rather than the
+    /// `VALUE` one. It is what the listing titles the plan with.
+    pub exists: bool,
 }
 
 impl QueryPlan {
@@ -736,7 +740,11 @@ impl QueryPlan {
             } else {
                 format!("per row, reading {}", scalar.reads.join(", "))
             };
-            let _ = writeln!(out, "\nVALUE {{{ix}}} ({how}):");
+            let word = match scalar.exists {
+                true => "EXISTS",
+                false => "VALUE",
+            };
+            let _ = writeln!(out, "\n{word} {{{ix}}} ({how}):");
             for line in scalar.plan.render().lines() {
                 let _ = writeln!(out, "  {line}");
             }
@@ -763,6 +771,7 @@ pub fn describe(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Quer
         scalars.push(ScalarPlan {
             reads: scalar.captures.iter().map(|c| c.name.clone()).collect(),
             plan: describe(&opt, scalar, schema),
+            exists: scalar.exists,
         });
     }
     QueryPlan {
@@ -1198,7 +1207,13 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         // operator, and a whole query inside one reads worse than the
         // reference does. [`explain`] prints the plan for it under the
         // plan that reads it.
-        BoundExpr::Scalar { ix, .. } => format!("VALUE {{{ix}}}"),
+        BoundExpr::Scalar { ix, .. } => {
+            let word = match query.scalars.get(*ix).is_some_and(|q| q.exists) {
+                true => "EXISTS",
+                false => "VALUE",
+            };
+            format!("{word} {{{ix}}}")
+        }
         BoundExpr::Var(slot) => slot_name(query, *slot).to_string(),
         BoundExpr::HasLabels { slot, test } => {
             format!("{}:{}", slot_name(query, *slot), test.text(&query.labels))

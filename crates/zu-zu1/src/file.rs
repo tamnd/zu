@@ -778,6 +778,21 @@ impl Zu1File {
         }
     }
 
+    /// Says a commit went to the log and nothing folded it, which is
+    /// where a deferred commit leaves the file.
+    ///
+    /// The roots do not move and the epoch does not either, because
+    /// what the readers are handed is the patch. What does move is the
+    /// log, and the frames are above the floor a rollback cuts back to
+    /// with nothing on the file saying they are to be taken back. That
+    /// is the same position [`Self::stage_fold`] leaves an open
+    /// savepoint in, and it wants the same marker.
+    pub fn stage_deferred(&mut self) {
+        if let Some(saved) = &mut self.savepoint {
+            saved.published = true;
+        }
+    }
+
     /// Where the log stood when the open transaction began, which a
     /// rollback needs because the frames above it are the ones going
     /// away and a fold that did not publish did not cut them.

@@ -24,9 +24,10 @@ use zu_common::gqlstatus::codes;
 use zu_common::{FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
-use crate::deleted::{Deleted, Tombstones};
+use crate::deleted::Deleted;
 use crate::query::Value;
 use crate::split::Insert;
+use crate::write::Patches;
 use crate::zu1::catalog::{Catalog, MAX_PROPERTIES};
 use crate::zu1::file::Zu1File;
 use crate::zu1::props::{PropColumn, load_props, load_rel_props};
@@ -126,7 +127,7 @@ impl<'a> Batch<'a> {
         db: &mut Zu1File,
         write: &'a Insert,
         catalog: Catalog,
-        gone: &Tombstones,
+        patches: &Patches,
     ) -> Result<Self> {
         let mut columns = BTreeMap::new();
         let mut next = BTreeMap::new();
@@ -136,7 +137,10 @@ impl<'a> Batch<'a> {
                 continue;
             }
             columns.insert(node.table, columns_of(db, node.table)?);
-            next.insert(node.table, rows_in(db, node.table)?);
+            next.insert(
+                node.table,
+                rows_in(db, node.table)? + patches.added_rows(node.table),
+            );
         }
         let mut rel_columns = BTreeMap::new();
         for rel in &write.rels {
@@ -151,7 +155,7 @@ impl<'a> Batch<'a> {
         // endpoint questions are asked.
         let gone = match write.rels.is_empty() {
             true => Deleted::default(),
-            false => Deleted::load_with(db, gone)?,
+            false => Deleted::load_with(db, &patches.gone)?,
         };
         Ok(Self {
             write,
@@ -500,7 +504,8 @@ fn rel_columns_of(db: &mut Zu1File, rel: u32) -> Result<Vec<PropColumn>> {
     Ok(load_rel_props(db, rel)?.map_or_else(Vec::new, |dir| dir.columns))
 }
 
-/// How many rows the table holds now, which is where the next one goes.
+/// How many rows the columns of the table hold, which the rows a
+/// commit added and nothing folded yet go on the end of.
 ///
 /// The props directory is the count, because that is what the fold
 /// checks its own arithmetic against, and a table without one is a

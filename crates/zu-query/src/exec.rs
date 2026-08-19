@@ -553,6 +553,19 @@ pub trait Graph {
     fn has_rel_property(&mut self, rel: u32, ord: u64, key: &str) -> Result<bool> {
         Ok(!matches!(self.rel_property(rel, ord, key)?, Value::Null))
     }
+    /// How many rows a table has taken on past the count the schema
+    /// carries for it, read once per query beside the deleted set.
+    ///
+    /// A schema says how many rows a table holds, and a scan of it
+    /// walks that many, so a commit the engine has not yet folded into
+    /// the schema's own source leaves its rows above the count. This is
+    /// how many, and a scan reaches them by walking that much further.
+    /// The default is what an engine whose count is always current
+    /// answers.
+    fn appended(&mut self, table: u32) -> Result<u64> {
+        let _ = table;
+        Ok(0)
+    }
     /// The rows a `DELETE` took away, read once per query. A delete
     /// does not compact, because every edge names its endpoints by row
     /// offset, so a scan still walks the row it took and this is what
@@ -7820,11 +7833,16 @@ fn run_stages(
     // The ones that do are planned here and run per row.
     let scalars = Scalars::prepare(query, schema, graph, params, options)?;
     let stages = build_stages(plan, query, schema, graph, params, options)?;
-    let counts: BTreeMap<u32, u64> = schema
-        .nodes()
-        .iter()
-        .map(|n| (n.id, n.node_count))
-        .collect();
+    // The extent of every table, which is what the schema says plus
+    // whatever the engine has committed and not yet folded back into
+    // it. A schema is built when the store publishes one and a write
+    // that publishes no new schema still adds rows, so the count alone
+    // would stop a scan short of the rows the statement before it
+    // wrote.
+    let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
+    for node in schema.nodes() {
+        counts.insert(node.id, node.node_count + graph.appended(node.id)?);
+    }
     // Read once for the whole query, beside the counts, because the
     // extent and what is missing out of it are the same fact: a table
     // holds `counts` rows and every source below skips the ones here.

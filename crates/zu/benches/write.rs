@@ -1130,6 +1130,8 @@ fn main() {
         ("set_label_stmt_us", set_label.us),
         ("set_label_stmt_kb", set_label.written / 1024.0),
         ("insert_stmt_us", insert.us),
+        ("insert_stmt_kb", insert.written / 1024.0),
+        ("insert_stmt_growth_b", insert.growth),
         ("insert_edge_stmt_us", edge_small.us),
         ("insert_edge_stmt_kb", edge_small.written / 1024.0),
         ("insert_edge_stmt_cpu_us", edge_small.cpu),

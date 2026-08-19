@@ -1438,22 +1438,24 @@ sha256_mibs = 80.0
 # and an `INSERT` of one element, each its own statement and so each its
 # own commit, run against a two column table of 10000 rows.
 #
-# The write path folds after every commit that changed something,
-# because a reader reads the sealed file and nothing else, so a change
-# that is not folded is a change the next MATCH cannot see. That costs
-# four fdatasyncs per statement rather than the one a commit needs (the
-# WAL commit frame, two inside the header flip, and the WAL truncate),
-# and it rewrites every column of the table the statement touched. Both
-# of those are in these numbers and neither is meant to stay.
+# These two are wall clock, and wall clock here is the disk: one
+# statement is one commit is one fdatasync, and on a box whose syncs
+# are several times slower than this one the whole column moves with
+# them. So the ceilings are loose on purpose. What they exist to catch
+# is a regression that adds another sync or another column rewrite,
+# which lands multiples above rather than just over; the processor and
+# bytes columns below are where a write path getting more expensive
+# shows up.
 #
-# Measured on the local M series, where an fdatasync is 3.9 ms: 39 to 50
-# ms and 1556 kB written per SET at 10000 rows, 45 to 54 ms and 2836 kB
-# per INSERT, no growth in the store for a SET that puts back what it
-# found, and 19 to 23 MB of peak resident growth across a 200 statement
-# run. The
-# ceilings are set for a box whose syncs are several times slower, and
-# what they exist to catch is a regression that adds another sync or
-# another rewrite, which lands multiples above rather than just over.
+# The write path used to fold after every commit that changed
+# something, because a reader read the sealed file and nothing else, so
+# a change that was not folded was a change the next MATCH could not
+# see. That cost four fdatasyncs a statement rather than the one a
+# commit needs (the WAL commit frame, two inside the header flip, and
+# the WAL truncate) and rewrote every column of the table the statement
+# touched: 39 to 50 ms and 1556 kB per SET at 10000 rows, 45 to 54 ms
+# and 2836 kB per INSERT. Both shapes now hand the readers a patch and
+# fold nothing, and the same run is 4.7 ms and 16.1 kB for either.
 # Lower these ceilings, never raise them.
 set_stmt_us = 250000.0
 insert_stmt_us = 250000.0
@@ -1484,17 +1486,34 @@ set_stmt_kb = 96.0
 # columns move for different reasons and the latency one cannot see a
 # write path that got twice as expensive.
 #
-# Measured 134 us per SET and 4.1 to 6.2 ms per INSERT at 10000 rows,
-# the spread being what a laptop with other work on it does to a run
-# this short. The SET is the one that reads a table and changes one
-# cell of it, which is the shape the read half of a write statement is
-# measured by; the INSERT has no table to read and is nearly all write
-# path. What these ceilings are here to catch is the read half falling
-# back to the row at a time engine, and the SET one also catches a
-# commit going back to folding per statement, which was 475 us at 10000
-# rows and 767 us at 100000. Lower these ceilings, never raise them.
+# Measured 134 us per SET and 131 us per INSERT at 10000 rows. The SET
+# is the one that reads a table and changes one cell of it, which is
+# the shape the read half of a write statement is measured by; the
+# INSERT has no table to read and is nearly all write path. What these
+# ceilings are here to catch is the read half falling back to the row
+# at a time engine, and they also catch a commit going back to folding
+# per statement, which was 475 us for the SET at 10000 rows and 767 us
+# at 100000.
+#
+# The INSERT ceiling was 30000 while a row added still folded, which
+# cost 1513 us of processor time at 10000 rows against 131 us now that
+# the rows ride to the readers on a patch. It comes down to the SET's,
+# because the two now do the same amount of work: one log frame and
+# nothing else. Lower these ceilings, never raise them.
 set_stmt_cpu_us = 400.0
-insert_stmt_cpu_us = 30000.0
+insert_stmt_cpu_us = 400.0
+
+# Bytes written and file growth per INSERT of one node, measured 16.1
+# kB and no growth at all at 10000 rows, against 293.8 kB and 14418
+# bytes a statement while the row still folded. A row added past the
+# end of a column has nothing under it to be laid over, so the patch
+# carries it whole and the readers serve it from there; nothing is
+# rewritten and the file does not grow. The kB ceiling is the SET's,
+# because it is the same one log frame, and the growth ceiling is a
+# page, loose enough for the log to extend the file and tight enough to
+# catch a fold coming back. Lower these ceilings, never raise them.
+insert_stmt_kb = 96.0
+insert_stmt_growth_b = 4096.0
 
 # The same SET with the sync's own processor cost taken off, one sync a
 # statement, which is what one statement commits. A sync is not only a

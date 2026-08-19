@@ -113,9 +113,11 @@ const DEFERRED_BYTES: usize = 256 * 1024;
 pub struct Patches {
     /// New values, by table.
     pub cells: HashMap<u32, Arc<CellPatch>>,
-    /// New rows, by table. Only rel tables have any so far: a node
-    /// append moves the row count every reader is bounded by, and
-    /// nothing reads through that yet.
+    /// New rows, by table, node tables and rel tables alike. A rel
+    /// table's are the property rows of the edges in `edges`, under
+    /// the ordinals those took. A node table's are rows of the table
+    /// itself, so they move the count every reader is bounded by, and
+    /// everything that reads a bound reads it through this.
     pub rows: HashMap<u32, Arc<RowPatch>>,
     /// New edges, by rel table.
     pub edges: HashMap<u32, Arc<EdgePatch>>,
@@ -145,6 +147,20 @@ impl Patches {
             + self.rows.values().map(|p| p.len()).sum::<usize>()
             + self.edges.values().map(|p| p.len() as usize).sum::<usize>()
             + self.gone.values().map(|rows| rows.len()).sum::<usize>()
+    }
+
+    /// How many rows a commit has added to `table` and not folded,
+    /// which every bound over the table's rows is short by.
+    pub fn added_rows(&self, table: u32) -> u64 {
+        self.rows.get(&table).map_or(0, |p| p.len() as u64)
+    }
+
+    /// The same for the two ends of `rel`, the source first, which is
+    /// what its adjacency reader answers rows past its CSR with.
+    pub fn grown(&self, catalog: &Catalog, rel: u32) -> [u64; 2] {
+        catalog.rel_by_id(rel).map_or([0, 0], |table| {
+            [table.from, table.to].map(|end| self.added_rows(end))
+        })
     }
 
     /// How many bytes of string they hold, the other thing it bounds.
@@ -327,6 +343,10 @@ impl Writer {
             let changes = self.mvcc.take_deferred();
             if let Some(changes) = self.defers(db, changes)? {
                 self.stage_patch(changes);
+                // The frames are in the log and no fold has taken them
+                // anywhere, so an open savepoint owes the file its
+                // marker before the next commit goes on top.
+                db.stage_deferred();
             } else {
                 match db.unpublished_blocks() >= THRESHOLD_BLOCKS {
                     true => self.fold(db)?,
@@ -373,7 +393,7 @@ impl Writer {
     /// This commit as the patch would hold it, or `None` when it has to
     /// be folded.
     ///
-    /// Four shapes need no fold. A value written onto a row that is
+    /// Five shapes need no fold. A value written onto a row that is
     /// already there, because the patch carries exactly that and a
     /// reader reads through it. The same value written onto an edge,
     /// which is the one above once the pair has been turned into the
@@ -383,9 +403,12 @@ impl Writer {
     /// belongs in and its property values sit under the ordinal it was
     /// given. And a row taken away, because a delete moves nothing: the
     /// offset goes in the patch where a fold would have put it in the
-    /// chain, and the readers filter by the two together. Anything
-    /// else, a new node, a label, an edge taken away, folds the way it
-    /// always did. On top of the shape
+    /// chain, and the readers filter by the two together. And rows
+    /// added to a node table, because they go on the end of every
+    /// column of it in the order a fold would have appended them in,
+    /// and the readers take their bound from the patch as well as from
+    /// the file. Anything else, a label, an edge taken away, folds the
+    /// way it always did. On top of the shape
     /// there are four bounds: how many commits may go unfolded, how
     /// many cells they may hold, how many bytes of string among them,
     /// and the block growth the checkpoint threshold already bounds.
@@ -398,7 +421,7 @@ impl Writer {
             return Ok(None);
         }
         if self.deferred >= DEFERRED_COMMITS
-            || self.patches.cells() + changes.len() > DEFERRED_CELLS
+            || self.patches.cells() + written_cells(&changes) > DEFERRED_CELLS
             || self.patches.bytes() + written_bytes(&changes) > DEFERRED_BYTES
             || db.unpublished_blocks() >= THRESHOLD_BLOCKS
         {
@@ -430,6 +453,12 @@ impl Writer {
                 }
                 Deferred::Gone(table, offset) => {
                     if !self.removable(db, table, offset)? {
+                        return Ok(None);
+                    }
+                    taken.push(change);
+                }
+                Deferred::Rows(table, ref rows) => {
+                    if !self.appendable(db, table, rows)? {
                         return Ok(None);
                     }
                     taken.push(change);
@@ -531,6 +560,58 @@ impl Writer {
                 Some((_, cell)) => holds(column, cell),
                 None => false,
             }
+        }))
+    }
+
+    /// Whether readers can be shown these rows on the end of the table
+    /// without a column of it being rewritten.
+    ///
+    /// Every column the table stores has to be given a value of its
+    /// own kind, because the row is served out of the patch and there
+    /// is no column underneath it to fall back on. That is what the
+    /// fold demands of an appended row as well, so a row that skips a
+    /// column is an error either way and this only decides where it is
+    /// raised.
+    ///
+    /// A value that is absent is taken only into a column that already
+    /// keeps a validity segment. The patch carries no mask, so what
+    /// says a row of it holds nothing is the cell itself, and a reader
+    /// only asks that question of a column it has been told can hold a
+    /// null. Into a column that cannot, the same row would read as a
+    /// zero now and as an absence once the fold had given the column a
+    /// mask, and the two have to be the same answer.
+    ///
+    /// The columns have to end where the table does, because the rows
+    /// go on the end of every one of them and a column that stopped
+    /// short would take them at the wrong offsets.
+    fn appendable(
+        &mut self,
+        db: &mut Zu1File,
+        table: u32,
+        rows: &[Vec<(u32, Cell)>],
+    ) -> Result<bool> {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(table) {
+            slot.insert(load_props(db, table)?);
+        }
+        let Some(directory) = self.dirs[&table].as_ref() else {
+            return Ok(false);
+        };
+        if directory.columns.is_empty()
+            || directory
+                .columns
+                .iter()
+                .any(|column| column.meta.value_count != directory.node_count)
+        {
+            return Ok(false);
+        }
+        Ok(rows.iter().all(|row| {
+            directory.columns.iter().enumerate().all(|(at, column)| {
+                match row.iter().find(|(c, _)| *c as usize == at) {
+                    Some((_, Cell::Null)) => column.validity.is_some(),
+                    Some((_, cell)) => holds(column, cell),
+                    None => false,
+                }
+            })
         }))
     }
 
@@ -653,6 +734,7 @@ impl Writer {
         let mut cells: Vec<u32> = Vec::new();
         let mut rels: Vec<u32> = Vec::new();
         let mut graves: Vec<u32> = Vec::new();
+        let mut grown: Vec<u32> = Vec::new();
         for change in changes {
             match change {
                 Deferred::Cell((table, row, col, value)) => {
@@ -694,6 +776,12 @@ impl Writer {
                         graves.push(table);
                     }
                 }
+                Deferred::Rows(table, rows) => {
+                    self.stage_rows(table, rows);
+                    if !grown.contains(&table) {
+                        grown.push(table);
+                    }
+                }
                 // [`Self::defers`] answers with the ordinals a pair
                 // holds, so what reaches here names a row of its own.
                 Deferred::RelCell(..) => unreachable!("resolved where the commit was taken"),
@@ -733,6 +821,11 @@ impl Writer {
                 .gone
                 .insert(table, self.graves[&table].iter().copied().collect());
         }
+        for table in grown {
+            patches
+                .rows
+                .insert(table, Arc::new(self.added[&table].clone()));
+        }
         self.patches = Arc::new(patches);
         self.deferred += 1;
     }
@@ -764,6 +857,36 @@ impl Writer {
             .entry(rel)
             .or_insert_with(|| RowPatch::new(edges))
             .push(row);
+    }
+
+    /// Puts rows a commit added to a node table in that table's running
+    /// patch, one cell per column of it, in the order the fold would
+    /// have appended them in.
+    ///
+    /// The base is the count the columns hold, which is the offset the
+    /// first of them takes, and it is read from the props directory
+    /// rather than the catalog because that is what the fold checks its
+    /// own arithmetic against.
+    fn stage_rows(&mut self, table: u32, rows: Vec<Vec<(u32, Cell)>>) {
+        let Some(directory) = self.dirs.get(&table).and_then(Option::as_ref) else {
+            return;
+        };
+        let (base, width) = (directory.node_count, directory.columns.len());
+        let patch = self
+            .added
+            .entry(table)
+            .or_insert_with(|| RowPatch::new(base));
+        for row in rows {
+            patch.push(
+                (0..width)
+                    .map(|at| {
+                        row.iter()
+                            .find(|(c, _)| *c as usize == at)
+                            .map_or(Cell::Null, |(_, cell)| cell.clone())
+                    })
+                    .collect(),
+            );
+        }
     }
 
     /// Drops the patch a fold has just sealed into the columns.
@@ -828,7 +951,28 @@ fn written_bytes(changes: &[Deferred]) -> usize {
                     _ => 0,
                 })
                 .sum(),
+            Deferred::Rows(_, rows) => rows
+                .iter()
+                .flatten()
+                .map(|(_, cell)| match cell {
+                    Cell::Str(bytes) => bytes.len(),
+                    _ => 0,
+                })
+                .sum(),
             _ => 0,
+        })
+        .sum()
+}
+
+/// How many cells a commit's changes would put in the patch, which is
+/// the other thing the run of them is bounded by. Most shapes are one
+/// cell each; rows added to a node table are as many as there are.
+fn written_cells(changes: &[Deferred]) -> usize {
+    changes
+        .iter()
+        .map(|change| match change {
+            Deferred::Rows(_, rows) => rows.len(),
+            _ => 1,
         })
         .sum()
 }
@@ -1504,6 +1648,191 @@ mod tests {
         session.file_mut().expect("fold");
         assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay"]);
         assert!(session.epoch() > before, "a fold published no epoch");
+    }
+
+    /// A row added to a node table is read out of the patch: by a scan
+    /// of the table, by a filter over a column, by the count the table
+    /// answers, and by a hop that walks past it.
+    #[test]
+    fn a_row_added_needs_no_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("insert-defer.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        session
+            .run("INSERT (p:person {age: 60, name: 'eva'})", &[])
+            .expect("insert eva");
+        assert_eq!(session.epoch(), before, "an insert folded");
+
+        assert_eq!(
+            names(&mut session),
+            ["ada", "amy", "eva", "joe", "kay", "zoe"]
+        );
+        let found = session
+            .run(
+                "MATCH (p:person) WHERE p.age = 60 RETURN p.name AS name",
+                &[],
+            )
+            .expect("read the new row by its age");
+        assert_eq!(found.rows.len(), 1);
+        assert_eq!(string(&found.rows[0], 0), "eva");
+        let counted = session
+            .run("MATCH (p:person) RETURN count(p) AS n", &[])
+            .expect("count");
+        assert_eq!(counted.rows[0][0], Value::Int(6));
+
+        // The row is in no adjacency list, and asking the CSR about a
+        // row it was not built over is what the reader has to answer
+        // rather than refuse.
+        let hops = session
+            .run(
+                "MATCH (p:person)-[:knows]->(q:person) RETURN count(*) AS n",
+                &[],
+            )
+            .expect("walk");
+        assert_eq!(hops.rows[0][0], Value::Int(3));
+
+        // What the patch answered, the columns answer on their own.
+        session.file_mut().expect("fold");
+        assert_eq!(
+            names(&mut session),
+            ["ada", "amy", "eva", "joe", "kay", "zoe"]
+        );
+        assert!(session.epoch() > before, "a fold published no epoch");
+    }
+
+    /// A run of them lands in order and reads back in order, which is
+    /// what says the patch appends where the fold would have.
+    #[test]
+    fn a_run_of_added_rows_keeps_the_order_it_was_written_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("insert-run.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        for (age, name) in [(60, "eva"), (70, "raj"), (80, "ann")] {
+            session
+                .run(
+                    &format!("INSERT (p:person {{age: {age}, name: '{name}'}})"),
+                    &[],
+                )
+                .expect("insert");
+        }
+        assert_eq!(session.epoch(), before, "an insert folded");
+
+        let want = [
+            Value::Int(11),
+            Value::Int(20),
+            Value::Int(30),
+            Value::Int(40),
+            Value::Int(50),
+            Value::Int(60),
+            Value::Int(70),
+            Value::Int(80),
+        ];
+        let ages = |session: &mut Session| {
+            session
+                .run("MATCH (p:person) RETURN p.age AS age ORDER BY age", &[])
+                .expect("read the ages")
+                .rows
+                .iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ages(&mut session), want);
+        session.file_mut().expect("fold");
+        assert_eq!(ages(&mut session), want);
+    }
+
+    /// An edge onto a row the patch is carrying folds. The CSR was
+    /// built over the rows the file held, so a list for the new row is
+    /// one the adjacency reader has nowhere to put.
+    #[test]
+    fn an_edge_onto_a_row_the_patch_is_carrying_folds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("insert-then-link.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("INSERT (p:person {age: 60, name: 'eva'})", &[])
+            .expect("insert eva");
+        let before = session.epoch();
+
+        session
+            .run(
+                "MATCH (a:person), (e:person) WHERE a.name = 'ada' AND e.name = 'eva' \
+                 INSERT (a)-[:knows]->(e)",
+                &[],
+            )
+            .expect("link ada to eva");
+        assert!(session.epoch() > before, "the edge did not fold");
+
+        let hops = session
+            .run(
+                "MATCH (p:person)-[:knows]->(q:person) WHERE q.name = 'eva' \
+                 RETURN p.name AS name",
+                &[],
+            )
+            .expect("walk to eva");
+        assert_eq!(hops.rows.len(), 1);
+        assert_eq!(string(&hops.rows[0], 0), "ada");
+    }
+
+    /// A row holding nothing in a column that cannot hold nothing
+    /// folds. The patch carries a cell per row and no mask, so what
+    /// says the row is empty there is the cell, and a reader only asks
+    /// that of a column it has been told may hold a null. The fold is
+    /// what gives the column the mask, and after it the two answers
+    /// agree.
+    ///
+    /// A statement cannot write this: it is refused a table with a
+    /// nullable column and refused a row that skips one, so the path is
+    /// the write side's own.
+    #[test]
+    fn a_row_holding_nothing_in_a_column_that_cannot_folds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("insert-null.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        let (person, _) = person_and_knows(&session);
+        session
+            .write(|txn| {
+                txn.insert_nodes(
+                    person,
+                    vec![(0, vec![Cell::Null]), (1, vec![Cell::Str(b"eva".to_vec())])],
+                )
+            })
+            .expect("insert eva with no age");
+        assert!(session.epoch() > before, "a row with a hole in it deferred");
+        assert_eq!(
+            names(&mut session),
+            ["ada", "amy", "eva", "joe", "kay", "zoe"]
+        );
+        let ages = session
+            .run(
+                "MATCH (p:person) WHERE p.name = 'eva' RETURN p.age AS age",
+                &[],
+            )
+            .expect("read the age it does not have");
+        assert_eq!(ages.rows[0][0], Value::Null);
     }
 
     /// An element that still has edges folds rather than deferring,

@@ -225,6 +225,21 @@ impl WriteSide {
         }
         Ok(())
     }
+
+    /// Puts what the patch is carrying on the file, keeping the writer.
+    ///
+    /// A statement that reads the tables itself rather than through a
+    /// reader sees only what the file holds, and a deferred commit is
+    /// not on the file. Copying a graph is one, and so is anything else
+    /// that walks the storage under the query plane. The writer stays
+    /// because the statement is still inside a savepoint that will want
+    /// it.
+    pub fn fold_patches(&mut self) -> Result<()> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.fold(&mut self.file)?;
+        }
+        Ok(())
+    }
 }
 
 /// A statement's claim on the epoch it is reading.

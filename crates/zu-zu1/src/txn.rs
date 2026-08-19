@@ -114,14 +114,15 @@ pub struct Mvcc {
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
     /// Whether everything published here is a shape a reader can be
-    /// handed without a fold sealing it first. Four are: a value
+    /// handed without a fold sealing it first. Five are: a value
     /// written onto a column of a row the base file already holds, the
     /// same write onto an edge the graph already runs through, an edge
     /// added to a rel table, which the adjacency reader merges into the
-    /// lists it holds, and a row taken away, which is an offset the
-    /// readers filter by. It starts true on an empty store and
-    /// one commit of any other shape turns it off until the next fold
-    /// empties the store again.
+    /// lists it holds, a row taken away, which is an offset the readers
+    /// filter by, and rows added to a node table, which are served
+    /// whole from past the end of its columns. It starts true on an
+    /// empty store and one commit of any other shape turns it off until
+    /// the next fold empties the store again.
     soft: bool,
     /// Those writes, for the last commit only. A writer keeps the
     /// running set of them, so what it wants after a commit is what
@@ -159,6 +160,11 @@ pub enum Deferred {
     /// the row moves, here or in a fold, so what a reader is handed is
     /// the offset and what makes the row gone is the reader.
     Gone(u32, u64),
+    /// Rows added to a node table: the table, and the cell each new row
+    /// holds in each column, by position in the props directory. They
+    /// go on the end of the table in the order they are in here, which
+    /// is the order a fold would append them in.
+    Rows(u32, Vec<Vec<(u32, Cell)>>),
 }
 
 impl Default for Mvcc {
@@ -273,6 +279,32 @@ fn cell_values(cells: &[Cell]) -> Result<WalValues> {
         ),
         Kind::Null => WalValues::Null(cells.len() as u32),
     })
+}
+
+/// The rows one node append is adding, a cell per column per row.
+///
+/// A staged append holds a column at a time, because that is the shape
+/// the log writes and the fold reads. A patch holds a row at a time,
+/// because a row past the end of the columns has nothing to be laid
+/// over and is served whole. This is the turn between the two.
+fn appended(cols: &[WalColumn], rows: u64) -> Vec<Vec<(u32, Cell)>> {
+    (0..rows as usize)
+        .map(|row| {
+            cols.iter()
+                .map(|col| (col.col, cell_at(col, row)))
+                .collect()
+        })
+        .collect()
+}
+
+/// The cell one logged column holds in one of its rows. A column of
+/// absences carries no values at all, which is the null it stands for.
+fn cell_at(col: &WalColumn, row: usize) -> Cell {
+    match &col.values {
+        WalValues::Int(words) => words.get(row).map_or(Cell::Null, |&w| Cell::Int(w)),
+        WalValues::Str(strs) => strs.get(row).map_or(Cell::Null, |s| Cell::Str(s.clone())),
+        WalValues::Null(_) => Cell::Null,
+    }
 }
 
 impl Mvcc {
@@ -834,14 +866,15 @@ impl Mvcc {
         self.deferred.clear();
         for op in ops {
             // What the op is about to put in the store, before the
-            // store has it. Four shapes can be handed to a reader as
+            // store has it. Five shapes can be handed to a reader as
             // they are, a value onto a row that is already there, the
-            // same value onto an edge, an edge added to a rel table,
-            // and a row taken away; everything else needs a fold to
-            // become readable, and a store that holds one of those
-            // needs a fold whatever else arrives after it. A write of
-            // nothing at all is in the second group: what it changes is
-            // the validity mask, and no patch carries one.
+            // same value onto an edge, an edge added to a rel table, a
+            // row taken away, and rows added to a node table;
+            // everything else needs a fold to become readable, and a
+            // store that holds one of those needs a fold whatever else
+            // arrives after it. A write of nothing at all is in the
+            // second group: what it changes is the validity mask, and
+            // no patch carries one.
             match &op {
                 Op::Update {
                     table,
@@ -874,6 +907,9 @@ impl Mvcc {
                 Op::Delete { table, offset } if self.soft => {
                     self.deferred.push(Deferred::Gone(*table, *offset))
                 }
+                Op::InsertNodes { table, cols, rows } if self.soft => self
+                    .deferred
+                    .push(Deferred::Rows(*table, appended(cols, *rows))),
                 _ => {
                     self.soft = false;
                     self.deferred.clear();

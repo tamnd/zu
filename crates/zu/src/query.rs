@@ -328,6 +328,8 @@ impl<'a> Zu1Graph<'a> {
             .clone();
         let mut reader = GraphReader::load_table(&mut self.db, &name)?;
         reader.set_edges(self.patches.edges.get(&rel).cloned());
+        let [from, to] = self.patches.grown(&self.catalog, rel);
+        reader.set_grown(from, to);
         self.readers.insert(rel, reader);
         Ok(())
     }
@@ -347,6 +349,8 @@ impl<'a> Zu1Graph<'a> {
         }
         for (rel, reader) in &mut self.readers {
             reader.set_edges(patches.edges.get(rel).cloned());
+            let [from, to] = patches.grown(&self.catalog, *rel);
+            reader.set_grown(from, to);
         }
         // The chains the file holds have not moved; what a commit can
         // have added to is the merge above them.
@@ -366,6 +370,32 @@ impl<'a> Zu1Graph<'a> {
         });
         self.props.insert(table, reader);
         Ok(())
+    }
+
+    /// The row a commit added under key `key`, `None` when no unfolded
+    /// row holds it.
+    ///
+    /// A key index is built by a fold, so the rows of a commit that did
+    /// not fold are in none, and the index answering nothing is not the
+    /// whole answer while the patch holds rows. What the fold would
+    /// have put in the index is each appended row's `id`, so that is
+    /// what this reads, and a table with a key index has the column
+    /// because the fold takes the key from it.
+    fn appended_key(&mut self, table: u32, key: u64) -> Result<Option<u64>> {
+        let Some(rows) = self.patches.rows.get(&table).cloned() else {
+            return Ok(None);
+        };
+        self.ensure_props(table)?;
+        let Some(col) = self
+            .props
+            .get(&table)
+            .expect("just loaded")
+            .as_ref()
+            .and_then(|reader| reader.col("id"))
+        else {
+            return Ok(None);
+        };
+        Ok(rows.row_with(col, key))
     }
 
     /// The rows a delete took away, the chains and whatever a commit
@@ -810,19 +840,34 @@ impl Graph for Zu1Graph<'_> {
             return Ok(Some(key));
         };
         self.ensure_reader(rel)?;
-        let Self { db, readers, .. } = self;
-        let reader = readers.get_mut(&rel).expect("just loaded");
-        if reader.directory().keys.is_none() {
-            return Ok(Some(key));
-        }
-        let Some(row) = reader.lookup_key(db, key)? else {
-            return Ok(None);
+        let found = {
+            let Self { db, readers, .. } = self;
+            let reader = readers.get_mut(&rel).expect("just loaded");
+            if reader.directory().keys.is_none() {
+                return Ok(Some(key));
+            }
+            reader.lookup_key(db, key)?
+        };
+        let row = match found {
+            Some(row) => row,
+            None => match self.appended_key(table, key)? {
+                Some(row) => row,
+                None => return Ok(None),
+            },
         };
         // A fold takes the key of a deleted row out of the index as it
         // rebuilds the table, so a key lookup after one answers nothing.
         // An unfolded delete has not rebuilt anything, and the tombstone
         // is what says the row is gone either way.
         Ok((!self.ensure_gone()?.holds(table, row)).then_some(row))
+    }
+
+    fn appended(&mut self, table: u32) -> Result<u64> {
+        // A frame is its own rows and nothing is deferred over one.
+        match self.frames.get(table) {
+            Some(_) => Ok(0),
+            None => Ok(self.patches.added_rows(table)),
+        }
     }
 
     fn deleted(&mut self) -> Result<DeletedRows> {

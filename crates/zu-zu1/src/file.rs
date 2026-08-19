@@ -7,11 +7,10 @@
 //! committed state; new data goes to free blocks and becomes visible only
 //! when the next header flip publishes it.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use zu_common::{Epoch, Result, ZuError};
+use zu_common::{Epoch, IdSet, Result, ZuError};
 
 use crate::cache::{BlockCache, CacheStats, DecodedPool, PinnedBlock};
 use crate::segment::ChunkDirectory;
@@ -298,7 +297,7 @@ struct Savepoint {
     /// which are the only ones it may write into: they are free in the
     /// state a rollback goes back to as well, so whatever the
     /// transaction leaves in them is garbage in a block nothing reads.
-    reusable: HashSet<BlockPtr>,
+    reusable: IdSet<BlockPtr>,
     /// The newest epoch the log held when the transaction began. What
     /// it committed sits above this, and a rollback cuts the log back
     /// here rather than back to what the file had folded.
@@ -1256,7 +1255,7 @@ impl Zu1File {
         // the epoch being superseded reads. They are listed as free
         // like the rest and held back from allocation below.
         let superseded = self.db.epoch;
-        let reached: HashSet<BlockPtr> = self
+        let reached: IdSet<BlockPtr> = self
             .pending_free
             .iter()
             .chain(self.free_chain.iter())

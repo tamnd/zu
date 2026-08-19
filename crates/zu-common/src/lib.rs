@@ -5,6 +5,7 @@
 mod error;
 pub mod gqlstatus;
 mod id;
+pub mod ids;
 mod interrupt;
 mod order;
 pub mod temporal;
@@ -13,6 +14,7 @@ pub mod types;
 pub use error::ZuError;
 pub use gqlstatus::{DiagnosticRecord, GqlStatus, Position, Severity};
 pub use id::{Epoch, GROUP_ROWS, NodeGroupId, NodeId, NodeOffset, RelId, TableId};
+pub use ids::{IdMap, IdSet};
 pub use interrupt::Interrupt;
 pub use order::int_key;
 pub use temporal::Temporal;

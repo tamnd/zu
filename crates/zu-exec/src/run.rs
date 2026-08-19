@@ -15,11 +15,10 @@
 //! quota cut can only come from morsels past the prefix, which the
 //! final truncate drops, so early stop never changes the answer.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use zu_common::{GROUP_ROWS, Interrupt, Result, ZuError};
+use zu_common::{GROUP_ROWS, IdMap, Interrupt, Result, ZuError};
 use zu_query::exec::{Options, QueryResult, Streaming, Value};
 use zu_query::plan::BracketKind;
 use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
@@ -1125,7 +1124,7 @@ struct Worker<'a> {
     arena: MorselArena,
     /// Pinned CSR groups, keyed (rel, backward, group). Pins are Arc
     /// pairs; the cache lives for the query, across morsels.
-    pins: HashMap<(RelId, bool, u32), CsrPin>,
+    pins: IdMap<(RelId, bool, u32), CsrPin>,
     /// Level 0 column ids, resolved once.
     scan_cols: Vec<ColId>,
     /// Row id scratch for degree sums.
@@ -1281,7 +1280,7 @@ impl<'a> Worker<'a> {
             fronts: &sched.fronts,
             snap,
             arena: MorselArena::new(),
-            pins: HashMap::new(),
+            pins: IdMap::default(),
             scan_cols: plan.levels[0]
                 .cols
                 .iter()
@@ -3048,8 +3047,8 @@ impl<'a> Worker<'a> {
     fn hold(&mut self, rel: RelId, dir: Dir, row: u64, wanted: usize) -> Result<Option<CsrPin>> {
         let group = (row / u64::from(GROUP_ROWS)) as u32;
         let key = (rel, matches!(dir, Dir::Bwd), group);
-        if self.pins.contains_key(&key) {
-            return Ok(Some(self.pins[&key].clone()));
+        if let Some(pin) = self.pins.get(&key) {
+            return Ok(Some(pin.clone()));
         }
         // No threshold at all is the snapshot refusing the pin rather
         // than pricing it, which is not the same as a high bar: a scan

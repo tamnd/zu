@@ -3,11 +3,10 @@
 //! frontend. The binder itself is engine-agnostic; this is where zu1
 //! table definitions become labels and relationship types.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use zu_common::gqlstatus::codes;
-use zu_common::{Result, ZuError};
+use zu_common::{IdMap, Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, DeletedRows, Graph};
 use zu_query::frame::FrameSet;
@@ -245,8 +244,8 @@ fn unreadable(ty: &LogicalType, key: &str) -> ZuError {
 pub struct Zu1Graph<'a> {
     db: Db<'a>,
     catalog: Catalog,
-    readers: HashMap<u32, GraphReader>,
-    props: HashMap<u32, Option<PropsReader>>,
+    readers: IdMap<u32, GraphReader>,
+    props: IdMap<u32, Option<PropsReader>>,
     /// The rows a `DELETE` took away, the file's chains with whatever a
     /// commit has taken away since laid over them, read on the first
     /// query that asks and kept for the epoch. `None` is "not read
@@ -268,8 +267,8 @@ impl<'a> Zu1Graph<'a> {
         Zu1Graph {
             db: Db::Borrowed(db),
             catalog,
-            readers: HashMap::new(),
-            props: HashMap::new(),
+            readers: IdMap::default(),
+            props: IdMap::default(),
             gone: None,
             patches: Arc::new(Patches::new()),
             frames: Arc::new(FrameSet::new()),
@@ -285,8 +284,8 @@ impl<'a> Zu1Graph<'a> {
         Zu1Graph {
             db: Db::Owned(Some(Box::new(db))),
             catalog,
-            readers: HashMap::new(),
-            props: HashMap::new(),
+            readers: IdMap::default(),
+            props: IdMap::default(),
             gone: None,
             patches: Arc::new(Patches::new()),
             frames: Arc::new(FrameSet::new()),
@@ -935,8 +934,8 @@ impl Graph for Zu1Graph<'_> {
         Some(Box::new(Zu1Graph {
             db: Db::Owned(Some(Box::new(db))),
             catalog: self.catalog.clone(),
-            readers: HashMap::new(),
-            props: HashMap::new(),
+            readers: IdMap::default(),
+            props: IdMap::default(),
             gone: self.gone.clone(),
             patches: Arc::clone(&self.patches),
             // Somebody else's memory, shared rather than reopened.

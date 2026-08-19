@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use zu_common::gqlstatus::{DiagnosticRecord, codes};
-use zu_common::{Interrupt, Result, ZuError};
+use zu_common::{IdMap, Interrupt, Result, ZuError};
 use zu_query::ast::TxnStmt;
 use zu_query::binder::BoundQuery;
 use zu_query::exec::{self, Streamed};
@@ -134,7 +134,7 @@ pub struct Session {
     working: u32,
     /// One schema per graph a statement has named, built on the first
     /// naming and dropped when the epoch moves.
-    schemas: HashMap<u32, Arc<zu_query::binder::Schema>>,
+    schemas: IdMap<u32, Arc<zu_query::binder::Schema>>,
     epoch: u64,
     /// What the pipeline executor's snapshot read last time. A
     /// snapshot lives for one execution, so without this every query
@@ -152,7 +152,7 @@ pub struct Session {
     /// this call wants. It is a map of its own so that a text naming no
     /// parameter, which is nearly every text, is still one lookup.
     focused: HashMap<String, String>,
-    stmts: HashMap<u64, String>,
+    stmts: IdMap<u64, String>,
     next_stmt: u64,
     /// The execution switches every statement on this session runs
     /// under, read from the environment once at open. Reading them per
@@ -245,12 +245,12 @@ impl Session {
         Ok(Session {
             graph,
             working,
-            schemas: HashMap::from([(working, Arc::new(schema))]),
+            schemas: IdMap::from_iter([(working, Arc::new(schema))]),
             epoch,
             snap,
             plans: HashMap::new(),
             focused: HashMap::new(),
-            stmts: HashMap::new(),
+            stmts: IdMap::default(),
             next_stmt: 1,
             options: exec::Options {
                 interrupt: Interrupt::armed(),

@@ -23,12 +23,11 @@
 //! cache itself and pin storms degrade to today's allocate-per-read
 //! behavior instead of deadlocking.
 
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use zu_common::Result;
+use zu_common::{IdMap, Result};
 
 use crate::BLOCK_SIZE;
 use crate::file::{BlockPtr, NULL_BLOCK};
@@ -71,7 +70,7 @@ struct Slot {
 struct Shard {
     /// Block pointer to slot index; the map is the source of truth,
     /// `Slot::ptr` only names what to unmap on eviction.
-    map: HashMap<BlockPtr, usize>,
+    map: IdMap<BlockPtr, usize>,
     slots: Vec<Slot>,
     hand: usize,
 }
@@ -240,7 +239,7 @@ struct PoolEntry<T> {
 }
 
 struct PoolInner<T> {
-    map: HashMap<BlockPtr, PoolEntry<T>>,
+    map: IdMap<BlockPtr, PoolEntry<T>>,
     bytes: usize,
     tick: u64,
 }
@@ -282,7 +281,7 @@ impl<T> DecodedPool<T> {
     pub fn new(budget: usize) -> Self {
         Self {
             inner: Mutex::new(PoolInner {
-                map: HashMap::new(),
+                map: IdMap::default(),
                 bytes: 0,
                 tick: 0,
             }),

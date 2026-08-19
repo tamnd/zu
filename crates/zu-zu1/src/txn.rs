@@ -17,10 +17,10 @@
 //! crash on either side of the sync leaves the pre-txn or post-txn
 //! state and nothing else.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use zu_common::{Epoch, GROUP_ROWS, Result, ZuError};
+use zu_common::{Epoch, GROUP_ROWS, IdMap, Result, ZuError};
 
 use crate::file::BlockPtr;
 use crate::wal::{Wal, WalColumn, WalRecord, WalValues};
@@ -52,7 +52,7 @@ struct TableOverlay {
     /// Offset of the deleted row, stamped with the deleting epoch.
     tombstones: BTreeMap<u64, Epoch>,
     /// Update chains keyed by cell, newest entry last.
-    updates: HashMap<(u64, u32), Vec<(Epoch, Cell)>>,
+    updates: IdMap<(u64, u32), Vec<(Epoch, Cell)>>,
     /// What a statement put on a row's labels and took off them, keyed
     /// by offset and newest last. A label is not a column, so there is
     /// no cell to overwrite: the entry is the pair of masks the change
@@ -108,8 +108,8 @@ pub enum IngestPayload {
 #[derive(Debug)]
 pub struct Mvcc {
     epoch: Epoch,
-    tables: HashMap<u32, TableOverlay>,
-    rels: HashMap<u32, RelOverlay>,
+    tables: IdMap<u32, TableOverlay>,
+    rels: IdMap<u32, RelOverlay>,
     /// Manifest roots of ingests not yet folded, with their commit
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
@@ -186,8 +186,8 @@ impl Default for Mvcc {
     fn default() -> Self {
         Mvcc {
             epoch: 0,
-            tables: HashMap::new(),
-            rels: HashMap::new(),
+            tables: IdMap::default(),
+            rels: IdMap::default(),
             ingests: Vec::new(),
             soft: true,
             deferred: Vec::new(),

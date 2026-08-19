@@ -210,7 +210,7 @@
       "kind": "struct",
       "name": "Connection",
       "source": "zu::db::Connection",
-      "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of when it connected. It holds\nthe header it opened at, so a write another connection published\nsince is not visible to it, and a reader that wants the latest\ncatalog takes a new connection. Cross-connection visibility without\nreconnecting is the snapshot machinery of docs/08, not a header read\non the statement path."
+      "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of the statement it is running.\nEvery connection to one file shares the write side, and a statement\npicks up what that side has published before it compiles anything,\nso a commit on another connection is visible to the next statement\nhere without reconnecting. Nothing moves under a statement that has\nstarted: what it took at the top is what it reads to the end, which\nis the snapshot isolation of docs/08 §1.\n\nWrites queue. One connection at a time holds the write side of a\nfile, for the length of a write statement or of an explicit\ntransaction, and the rest wait in the order they asked."
     },
     {
       "id": "zu::Connection::appender",
@@ -2592,7 +2592,7 @@
       "id": "zu::db::Connection",
       "kind": "struct",
       "name": "Connection",
-      "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of when it connected. It holds\nthe header it opened at, so a write another connection published\nsince is not visible to it, and a reader that wants the latest\ncatalog takes a new connection. Cross-connection visibility without\nreconnecting is the snapshot machinery of docs/08, not a header read\non the statement path."
+      "doc": "One connection: statements run on it, in order, one at a time.\n\nIt is `Send` and not `Sync`, and every method takes `&mut self`, so\nthe compiler is what stops two threads from using one connection.\nThat is the same rule the C ABI states and has to check at runtime\n(`dx/02` §5), enforced here at no cost.\n\nA connection reads the database as of the statement it is running.\nEvery connection to one file shares the write side, and a statement\npicks up what that side has published before it compiles anything,\nso a commit on another connection is visible to the next statement\nhere without reconnecting. Nothing moves under a statement that has\nstarted: what it took at the top is what it reads to the end, which\nis the snapshot isolation of docs/08 §1.\n\nWrites queue. One connection at a time holds the write side of a\nfile, for the length of a write statement or of an explicit\ntransaction, and the rest wait in the order they asked."
     },
     {
       "id": "zu::db::Connection::appender",
@@ -4336,6 +4336,14 @@
       "name": "Session"
     },
     {
+      "id": "zu::session::Session::attached",
+      "kind": "method",
+      "name": "attached",
+      "of": "zu::session::Session",
+      "signature": "fn attached(handle: Arc<FileHandle>) -> Result<Session>",
+      "doc": "A session on a file this process already holds the write side\nof: its own descriptor for reading, forked off that side so the\nblock cache and the decoded pools are shared, and the roots the\nside has published."
+    },
+    {
       "id": "zu::session::Session::binding_table",
       "kind": "method",
       "name": "binding_table",
@@ -4403,7 +4411,7 @@
       "name": "file_mut",
       "of": "zu::session::Session",
       "signature": "fn file_mut(&mut self) -> Result<&mut Zu1File>",
-      "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs.\n\nThe publish before that is what makes the truncation safe. A\ncommit folds without checkpointing and leaves the frames in the\nlog, so a log cut with the header still behind them would lose\ncommitted statements. Publishing first puts the folds on the\nfile and empties the log itself, and the appender then opens a\nlog that says nothing anyone still needs."
+      "doc": "The file this session reads through.\n\nThe write paths that are not statements need it: the appender\nof [`crate::append`] seals its buffer straight into this handle,\nand it has to be this one rather than a second open of the same\npath, so that the epoch the write publishes is the epoch\n[`Self::refresh`] reads on the next statement.\n\nHanding out the file hands out the log with it. An appender\nopens the same sidecar this session's writer commits to and can\ntruncate it, so the writer goes first and the next write opens\na fresh one. That costs a recovery pass and loses nothing: a\nwriter that has folded holds an empty overlay store, so what it\nwas holding is what recovery reconstructs.\n\nThe publish before that is what makes the truncation safe. A\ncommit folds without checkpointing and leaves the frames in the\nlog, so a log cut with the header still behind them would lose\ncommitted statements. Publishing first puts the folds on the\nfile and empties the log itself, and the appender then opens a\nlog that says nothing anyone still needs.\n\nWhat goes out is the shared write side, so this session holds\nthe writer lock from here until its next statement or its drop.\nNothing else could be true: the file itself is on loan and the\ncaller says when it is done with it by stopping using it, which\nis not something another connection can wait on."
     },
     {
       "id": "zu::session::Session::graph_ref",
@@ -4412,6 +4420,14 @@
       "of": "zu::session::Session",
       "signature": "fn graph_ref(&mut self, schema: &str, name: &str) -> Result<Value>",
       "doc": "A graph reference value naming one graph in the catalog (GV60),\nor `42002` when the catalog has no such graph.\n\nThis is where a graph reference comes from. GQL has no literal\nthat writes one and there is no expression yet that returns one\neither, so the engine hands them out: a caller resolves a name\nonce, holds the handle, and passes it to as many statements as\nit likes."
+    },
+    {
+      "id": "zu::session::Session::idle",
+      "kind": "method",
+      "name": "idle",
+      "of": "zu::session::Session",
+      "signature": "fn idle(&mut self)",
+      "doc": "Lets go of the epoch the statement that just ended was reading.\n\nA connection between statements holds no lease, so a writer is\nfree to reuse everything it has freed. Not calling it is a\ncorrectness-free mistake: the next statement's lease replaces\nthis one, and until then the file grows instead of reusing."
     },
     {
       "id": "zu::session::Session::in_transaction",
@@ -4435,7 +4451,7 @@
       "name": "on",
       "of": "zu::session::Session",
       "signature": "fn on(db: Zu1File) -> Result<Session>",
-      "doc": "A session over a file handle the caller opened, which is how\n[`crate::db::Database`] applies a read-only or memory-limited\nopen without this module growing a constructor per option."
+      "doc": "A session over a file handle the caller opened, which is how\n[`crate::db::Database`] applies a read-only or memory-limited\nopen without this module growing a constructor per option.\n\nThe handle is what the file is registered under if this process\nhas not opened it yet, and dropped if it has: one file is one\nwrite side, and the one already registered is the one every\nother connection is reading through."
     },
     {
       "id": "zu::session::Session::open",
@@ -4539,6 +4555,215 @@
       "of": "zu::session::Session",
       "signature": "fn write<T>(&mut self, stage: impl FnOnce) -> Result<T>",
       "doc": "Runs one write transaction: `stage` describes the change\nagainst an open transaction, and what it returns comes back\nonce the change is committed and visible.\n\nVisible is the part that costs something. The write commits,\nfolds, and the session reloads, so by the time this returns the\nnext statement reads a catalog and a snapshot that both know\nabout the change. A closure that raises commits nothing and\npublishes no epoch, which is the rollback an implicit\ntransaction owes."
+    },
+    {
+      "id": "zu::shared",
+      "kind": "module",
+      "name": "shared",
+      "doc": "The write side of one file, shared by every connection in this\nprocess that has that file open.\n\ndocs/08 §1 is one line: single writer, many snapshot readers. Until\nnow the single was per connection rather than per file. A\n[`Writer`] lived inside the session that opened it, so two\nconnections on one path were two writers, two logs open on one\nsidecar and two handles each flipping the header from its own idea\nof where the roots are, and nothing anywhere said no. It worked\nbecause callers only ever wrote through one of them.\n\nThis is the thing that says no. One [`FileHandle`] per path per\nprocess holds the write side: the file handle that allocates and\nthe writer that logs. A session takes it to write and gives it back\nwhen the statement ends, so writers queue instead of overlapping,\nwhich is the writer lock docs/08 asks for and what a group commit\nhas to have before it can batch anything.\n\nReading stays parallel, which is the point of doing it this way\nround. A session reads through a handle of its own forked from the\nwrite side, so it shares the block cache and the decoded pools with\nevery other connection on the file, and it never takes the lock to\nread. What it takes instead is the header: the write side publishes\nits roots after every commit, and a session picks them up at the\nstart of a statement, which is where a snapshot begins. That is\nalso what makes a commit by one connection visible to the next\nstatement on another, which before this needed a reconnect."
+    },
+    {
+      "id": "zu::shared::FileHandle",
+      "kind": "struct",
+      "name": "FileHandle",
+      "doc": "One process-wide write side per open file.\n\nA session takes the side to write and gives it back afterwards, so\nat most one connection is writing a file at a time and the rest\nqueue in the order they asked. Everything else about a connection,\nthe caches, the plans, the reading handle, stays where it was."
+    },
+    {
+      "id": "zu::shared::FileHandle::attach",
+      "kind": "method",
+      "name": "attach",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn attach(path: &Path, read_only: bool, open: impl FnOnce) -> Result<Arc<FileHandle>>",
+      "doc": "The handle for the file `open` opens, opening it only if this\nprocess does not already hold one.\n\nThe closure is what keeps the common case honest: a second\nconnection to a file that is already open costs a lock and a\nmap lookup rather than an open, a header read and a free list\nwalk."
+    },
+    {
+      "id": "zu::shared::FileHandle::attach_to",
+      "kind": "method",
+      "name": "attach_to",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn attach_to(file: Zu1File) -> Result<Arc<FileHandle>>",
+      "doc": "The handle for a file the caller has already opened.\n\nThe file is dropped when this process holds a handle on it\nalready, because the one already registered is the one every\nother connection is reading through and a second would be a\nsecond writer of the same log."
+    },
+    {
+      "id": "zu::shared::FileHandle::observe",
+      "kind": "method",
+      "name": "observe",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn observe(self: &Arc<Self>) -> (Published, Lease)",
+      "doc": "The published state, and a lease on the epoch it is at.\n\nThe two come together under one lock, and [`Self::reclaim`]\ntakes the same one, which is the whole of why a reader never\nreads a block that has been handed back. Either a statement is\ncounted before the reclaim runs, and the reclaim leaves its\nepoch alone, or it arrives after, and what it is handed is the\nepoch the reclaim published rather than the one it superseded."
+    },
+    {
+      "id": "zu::shared::FileHandle::publish",
+      "kind": "method",
+      "name": "publish",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn publish(&self, side: &WriteSide)",
+      "doc": "Publishes where the write side has got to, for the readers to\npick up at the start of their next statement."
+    },
+    {
+      "id": "zu::shared::FileHandle::published",
+      "kind": "method",
+      "name": "published",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn published(&self) -> Published",
+      "doc": "What the write side last published."
+    },
+    {
+      "id": "zu::shared::FileHandle::put",
+      "kind": "method",
+      "name": "put",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn put(&self, side: WriteSide)",
+      "doc": "Gives the write side back and serves the next ticket."
+    },
+    {
+      "id": "zu::shared::FileHandle::reader",
+      "kind": "method",
+      "name": "reader",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn reader(&self) -> Result<Zu1File>",
+      "doc": "A reading handle on this file: its own descriptor, the roots the\nwrite side is at, and the block cache and decoded pools every\nother handle on the file is sharing."
+    },
+    {
+      "id": "zu::shared::FileHandle::reclaim",
+      "kind": "method",
+      "name": "reclaim",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn reclaim(&self, side: &mut WriteSide)",
+      "doc": "Gives back for allocation the blocks the last checkpoint freed\nthat nothing is reading any more.\n\nCalled by the writer after it has published, so a statement\nstarting from here on reads the epoch that owns those blocks\nrather than the one that let go of them."
+    },
+    {
+      "id": "zu::shared::FileHandle::take",
+      "kind": "method",
+      "name": "take",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn take(&self) -> WriteSide",
+      "doc": "Takes the write side, waiting for whoever has it. The caller\ngives it back with [`Self::put`], and a caller that does not is\na caller nobody else on this file can write past, so the two go\nin the same scope."
+    },
+    {
+      "id": "zu::shared::Lease",
+      "kind": "struct",
+      "name": "Lease",
+      "doc": "A statement's claim on the epoch it is reading.\n\nA checkpoint lists as free the blocks the epoch it supersedes\nreaches, and would hand them straight back to allocation. That is\nright with one connection, which cannot be reading and writing at\nonce, and wrong with several: a statement on another connection is\nreading those blocks, and the next write puts a column of somebody\nelse's rows in the middle of them. The lease says which epoch a\nstatement is on, so the write side knows what it may not reuse yet.\n\nIt lives for the statement rather than for the connection, because\na connection sitting idle on an old epoch would otherwise hold\nevery block the writer frees after it and grow the file by the\nchurn of everyone else."
+    },
+    {
+      "id": "zu::shared::Published",
+      "kind": "struct",
+      "name": "Published",
+      "doc": "What the write side has published for the readers to pick up.\n\nThe header is where the roots are, and a reader that takes it reads\nthe database the writer has reached, staged folds included: data\nblocks are on the file as they are written, so the header is the\nonly thing a reader is missing. The patches are the commits that\nhave not been folded at all, which live in memory and are read\nthrough rather than read."
+    },
+    {
+      "id": "zu::shared::Published::header",
+      "kind": "method",
+      "name": "header",
+      "of": "zu::shared::Published",
+      "signature": "fn header(&self) -> &DatabaseHeader"
+    },
+    {
+      "id": "zu::shared::Published::newer_than",
+      "kind": "method",
+      "name": "newer_than",
+      "of": "zu::shared::Published",
+      "signature": "fn newer_than(&self, seen: u64) -> bool",
+      "doc": "The state a session should be reading, or `None` if it already\nhas this one."
+    },
+    {
+      "id": "zu::shared::Published::patches",
+      "kind": "method",
+      "name": "patches",
+      "of": "zu::shared::Published",
+      "signature": "fn patches(&self) -> &Arc<Patches>"
+    },
+    {
+      "id": "zu::shared::Published::slot",
+      "kind": "method",
+      "name": "slot",
+      "of": "zu::shared::Published",
+      "signature": "fn slot(&self) -> usize"
+    },
+    {
+      "id": "zu::shared::Published::version",
+      "kind": "method",
+      "name": "version",
+      "of": "zu::shared::Published",
+      "signature": "fn version(&self) -> u64"
+    },
+    {
+      "id": "zu::shared::WriteSide",
+      "kind": "struct",
+      "name": "WriteSide",
+      "doc": "The file handle that allocates and the writer that logs, together,\nbecause neither is right without the other: a fold moves roots on\none and empties the overlay of the other."
+    },
+    {
+      "id": "zu::shared::WriteSide::discard_above",
+      "kind": "method",
+      "name": "discard_above",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn discard_above(&mut self, floor: u64) -> Result<()>",
+      "doc": "Takes the log back to `floor` and drops the writer, which is\nwhat a rollback owes: the frames above the floor are the ones\nbeing taken away, and a fresh writer would replay them back on\ntop of the roots going in."
+    },
+    {
+      "id": "zu::shared::WriteSide::epoch",
+      "kind": "method",
+      "name": "epoch",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn epoch(&self) -> u64",
+      "doc": "The epoch the writer has committed through, or the file's own\nwhen there is no writer yet."
+    },
+    {
+      "id": "zu::shared::WriteSide::file",
+      "kind": "method",
+      "name": "file",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn file(&self) -> &Zu1File",
+      "doc": "The file the writer allocates and folds into."
+    },
+    {
+      "id": "zu::shared::WriteSide::file_mut",
+      "kind": "method",
+      "name": "file_mut",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn file_mut(&mut self) -> &mut Zu1File"
+    },
+    {
+      "id": "zu::shared::WriteSide::fold_writer",
+      "kind": "method",
+      "name": "fold_writer",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn fold_writer(&mut self) -> Result<()>",
+      "doc": "Folds what the writer is holding and drops it, which is what a\ncaller wanting the raw file has to do first: an appender opens\nthe same sidecar and can truncate it."
+    },
+    {
+      "id": "zu::shared::WriteSide::has_writer",
+      "kind": "method",
+      "name": "has_writer",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn has_writer(&self) -> bool",
+      "doc": "Whether a writer has been opened on this side yet."
+    },
+    {
+      "id": "zu::shared::WriteSide::open_writer",
+      "kind": "method",
+      "name": "open_writer",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn open_writer(&mut self) -> Result<bool>",
+      "doc": "Opens the writer if it is not open already, and answers whether\nthis call is what opened it. Opening recovers and folds whatever\nthe log holds, which can move the roots, so the caller that\nopened one publishes afterwards."
+    },
+    {
+      "id": "zu::shared::WriteSide::patches",
+      "kind": "method",
+      "name": "patches",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn patches(&self) -> Arc<Patches>",
+      "doc": "The cells committed since the last fold, which a reader reads\nthrough."
+    },
+    {
+      "id": "zu::shared::WriteSide::write",
+      "kind": "method",
+      "name": "write",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn write<T>(&mut self, stage: impl FnOnce) -> Result<Written<T>>",
+      "doc": "Runs one transaction against this file. See [`Writer::write`]."
     },
     {
       "id": "zu::snapshot",
@@ -6750,10 +6975,32 @@
       "doc": "The null block pointer."
     },
     {
+      "id": "zu::zu1::file::Shared",
+      "kind": "struct",
+      "name": "Shared",
+      "doc": "The caches one file's handles hold in common, for a handle that\nwas opened rather than forked to take up. See [`Zu1File::adopt`]."
+    },
+    {
       "id": "zu::zu1::file::Zu1File",
       "kind": "struct",
       "name": "Zu1File",
       "doc": "An open zu1 file: block I/O, the free list, and the header flip."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::active_slot",
+      "kind": "method",
+      "name": "active_slot",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn active_slot(&self) -> usize",
+      "doc": "Which header slot this handle is reading, which a caller passing\nthe header to another handle on the same file passes with it."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::adopt",
+      "kind": "method",
+      "name": "adopt",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn adopt(&mut self, shared: &Shared)",
+      "doc": "Puts this handle on another handle's caches, which a handle\nopened rather than forked has to do before it reads anything.\n\nA cache is invalidated by the handle that writes the block, and\nit can only invalidate its own. So a second cache on one file is\na cache holding whatever it last saw in a block, and a block the\nwriter has since freed and written over reads back as the thing\nthat used to be in it. What that looks like from a query is a\nprops directory that decodes as somebody else's catalog."
     },
     {
       "id": "zu::zu1::file::Zu1File::allocate_block",
@@ -6820,6 +7067,14 @@
       "doc": "Stages root updates for the next checkpoint. Nothing is visible to\nother openers until [`Self::checkpoint`] publishes them."
     },
     {
+      "id": "zu::zu1::file::Zu1File::defer_reclaim",
+      "kind": "method",
+      "name": "defer_reclaim",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn defer_reclaim(&mut self, on: bool)",
+      "doc": "Says that a caller above this handle counts the readers, so a\ncheckpoint holds what it frees until that caller says which\nepoch is the oldest anything is reading. Set on the one handle\nof a file that writes; every other handle only reads."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::file_header",
       "kind": "method",
       "name": "file_header",
@@ -6834,6 +7089,14 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn finish_rollback(&mut self) -> Result<()>",
       "doc": "Publishes the state a transaction the process died inside was\nholding, and says the transaction is over.\n\nNothing is put back in memory, because opening a file with a\ntransaction open on it reads the kept state to begin with. What\nis left is the file: the kept header goes in with an epoch past\nthe one the crash left, so the next open reads it rather than\nthe middle of the transaction, and only then is the kept state\ncleared. A crash anywhere in here leaves the marker down and the\nnext open does the same thing again."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::follow",
+      "kind": "method",
+      "name": "follow",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn follow(&mut self, header: &DatabaseHeader, slot: usize)",
+      "doc": "Takes the roots another handle on this file has reached.\n\n[`Self::reopen`] hands a new handle the roots the writer holds,\nand this is the same move made again later: a reader forked\nbefore a commit reads the blocks that commit wrote, because data\nblocks reach the file as they are staged and only the flip waits\nfor a checkpoint, but it has no way to know where they went. The\nheader is that way, so a reader given the writer's header reads\nthe writer's database.\n\nOnly the header moves. The free lists, the savepoint and the\nunpublished count belong to the handle that allocates, and a\nhandle that follows another one does not: it reads. The pin memo\ngoes because it names a block of the state being left behind."
     },
     {
       "id": "zu::zu1::file::Zu1File::free_block",
@@ -6948,6 +7211,14 @@
       "doc": "Retires a fork into its shared pool for the next\n[`Self::reopen`] to reuse. The handle drops its own reference\nto the pool on the way in, so the pool holding it does not keep\nitself alive. Dropping a fork without recycling is fine, the\nnext reopen just pays the OS open again."
     },
     {
+      "id": "zu::zu1::file::Zu1File::release_retained",
+      "kind": "method",
+      "name": "release_retained",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn release_retained(&mut self, floor: u64) -> usize",
+      "doc": "Gives back for allocation the blocks a checkpoint listed as free\nthat no reader is on any more, and answers how many.\n\n`floor` is the oldest epoch anything is reading, so an entry the\ncheckpoint tagged with an epoch below it is reachable from\nnothing: every reader has moved past it. A caller with no\nreaders passes `u64::MAX` and gets the whole list back, which is\nthe single-connection case and is why one connection allocates\nexactly as it did before this existed."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::release_savepoint",
       "kind": "method",
       "name": "release_savepoint",
@@ -6962,6 +7233,14 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn reopen(&self) -> Result<Self>",
       "doc": "A second read handle on the same file carrying this handle's\ncurrent in-memory state. Data blocks are written to the file as\nthey are staged and only the header flip waits for the\ncheckpoint, so adopting this handle's header lets the new\nhandle read exactly what this one reads, staged roots included.\nThe free lists stay empty because a reopened handle exists to\nread; the morsel workers are the caller. The block cache is\nshared, so a fork starts warm and warms its siblings.\n\nHandles retired through [`Self::recycle`] come back first, with\nthis handle's header and a cleared pin memo, so steady-state\nforking costs a mutex pop instead of an OS open."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::retained_blocks",
+      "kind": "method",
+      "name": "retained_blocks",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn retained_blocks(&self) -> usize",
+      "doc": "How many blocks are waiting on a reader. Nonzero here is a\nconnection reading an epoch the writer has moved past, and the\nfile growing rather than reusing while it does."
     },
     {
       "id": "zu::zu1::file::Zu1File::rollback_savepoint",
@@ -6986,6 +7265,14 @@
       "of": "zu::zu1::file::Zu1File",
       "signature": "fn set_memory_limit(&mut self, memory_limit: usize)",
       "doc": "Rebuilds the caches sized off `memory_limit`: half of it block\nframes per perf/04, 8% CSR offsets, 20% adjacency, 4% fences.\nForks made before the call keep the old caches."
+    },
+    {
+      "id": "zu::zu1::file::Zu1File::shared",
+      "kind": "method",
+      "name": "shared",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn shared(&self) -> Shared",
+      "doc": "What every handle on one file has to be sharing: the block\ncache, the decoded pools above it, and the pool of retired\nhandles."
     },
     {
       "id": "zu::zu1::file::Zu1File::stage_fold",

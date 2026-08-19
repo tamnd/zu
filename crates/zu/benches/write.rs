@@ -672,10 +672,11 @@ fn run_set_label(dir: &Path, rows: u64) -> Cost {
 /// cell is a change to one place in it, whereas an edge column is dense
 /// over the edges in the order the table holds them and an edge has no
 /// offset of its own to name that place by. So the change names the pair
-/// of rows the edge runs between, and the fold rewrites the column
-/// through the edge order it rebuilds. That makes this the write to
-/// watch when the CSR rebuild gets cheaper: it is what a linkbench
-/// update of a link's payload costs.
+/// of rows the edge runs between, and that used to mean a fold, which
+/// rewrote the column through the edge order it rebuilt. The writer now
+/// works the pair into the ordinal it holds and puts the word in the
+/// patch, so what is left in here is the search for the edge and the log
+/// frame. It is what a linkbench update of a link's payload costs.
 ///
 /// Each write puts back the value it found, as the node run does, so the
 /// growth column is what changing nothing cost the store.
@@ -1115,6 +1116,8 @@ fn main() {
         ("insert_stmt_cpu_us", insert.cpu),
         ("set_edge_stmt_us", set_edge.us),
         ("set_edge_stmt_kb", set_edge.written / 1024.0),
+        ("set_edge_stmt_cpu_us", set_edge.cpu),
+        ("set_edge_stmt_growth_b", set_edge.growth),
         ("set_record_stmt_us", set_record.us),
         ("set_record_stmt_kb", set_record.written / 1024.0),
         ("set_label_stmt_us", set_label.us),

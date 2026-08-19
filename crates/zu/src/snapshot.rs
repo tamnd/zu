@@ -100,16 +100,12 @@ pub struct Zu1Snapshot<'a> {
     scratch: Vec<u64>,
     str_bytes: Vec<u8>,
     str_ends: Vec<u64>,
-    /// The rows a `DELETE` took away as the file's chains hold them,
-    /// read on the first scan and kept. `None` is "not read yet" and
-    /// not "nothing is deleted": the read costs a table index decode,
-    /// so a snapshot that never scans a node table never pays it.
+    /// The rows a `DELETE` took away, the file's chains with whatever a
+    /// commit has taken away since laid over them, read on the first
+    /// scan and kept. `None` is "not read yet" and not "nothing is
+    /// deleted": the read costs a table index decode, so a snapshot
+    /// that never scans a node table never pays it.
     gone: Option<Deleted>,
-    /// Those with the rows a commit took away and nobody has folded
-    /// yet merged in, which is what the scans filter by. Kept apart
-    /// from the chains so a commit that adds to the patch costs the
-    /// merge and not the read.
-    merged: Option<Deleted>,
     /// The cells committed since the last fold, by table, which the
     /// props readers read through. A fork carries them, so every worker
     /// of a parallel query reads the same database.
@@ -142,7 +138,6 @@ pub struct SnapshotCache {
     str_bytes: Vec<u8>,
     str_ends: Vec<u64>,
     gone: Option<Deleted>,
-    merged: Option<Deleted>,
     patches: Arc<Patches>,
     frames: Arc<FrameSet>,
 }
@@ -175,9 +170,11 @@ impl SnapshotCache {
             reader.set_grown(from, to);
         }
         // The chains stay: they are the file's and the file has not
-        // moved. What the merge above them said is what a commit can
-        // have added to, so that goes.
-        self.merged = None;
+        // moved. What sits over them is the patch, and this is a new
+        // one.
+        if let Some(gone) = &mut self.gone {
+            gone.overlay(&patches.gone);
+        }
         self.patches = patches;
     }
 }
@@ -198,7 +195,6 @@ impl<'a> Zu1Snapshot<'a> {
             str_bytes: cache.str_bytes,
             str_ends: cache.str_ends,
             gone: cache.gone,
-            merged: cache.merged,
             patches: cache.patches,
             frames: cache.frames,
         }
@@ -213,7 +209,6 @@ impl<'a> Zu1Snapshot<'a> {
             str_bytes: self.str_bytes,
             str_ends: self.str_ends,
             gone: self.gone,
-            merged: self.merged,
             patches: self.patches,
             frames: self.frames,
         }
@@ -302,26 +297,23 @@ impl<'a> Zu1Snapshot<'a> {
     }
 
     /// Reads the deleted set once per snapshot, or per epoch when a
-    /// caller carries the cache from one snapshot to the next, and
-    /// merges whatever a commit has taken away since the last fold.
+    /// caller carries the cache from one snapshot to the next, and lays
+    /// whatever a commit has taken away since the last fold over it.
     ///
     /// A file nothing is deferred against answers with the chains
     /// themselves, which is every read of a database that is only
-    /// written to in bulk. The merge is built once per version of the
-    /// patch and is a walk of two sorted lists per table.
+    /// written to in bulk. The patch is laid over rather than merged
+    /// in, so it costs a reference count per table it names and
+    /// nothing per row, which is what stops a delete getting slower
+    /// the more the file has deleted. [`Self::set_patches`] lays down
+    /// each new one.
     fn ensure_gone(&mut self) -> Result<&Deleted> {
         if self.gone.is_none() {
-            self.gone = Some(Deleted::load(&mut self.db)?);
+            let mut gone = Deleted::load(&mut self.db)?;
+            gone.overlay(&self.patches.gone);
+            self.gone = Some(gone);
         }
-        if self.patches.gone.is_empty() {
-            return Ok(self.gone.as_ref().expect("just loaded"));
-        }
-        if self.merged.is_none() {
-            let mut gone = self.gone.clone().expect("just loaded");
-            gone.merge(&self.patches.gone);
-            self.merged = Some(gone);
-        }
-        Ok(self.merged.as_ref().expect("just merged"))
+        Ok(self.gone.as_ref().expect("just loaded"))
     }
 }
 
@@ -329,39 +321,47 @@ impl<'a> Zu1Snapshot<'a> {
 ///
 /// Both sides are ascending, so this is a merge and not a lookup per
 /// row: the cursor only ever moves forward, whatever the chunk's rows
-/// come out of.
+/// come out of. There are two runs rather than one because the
+/// tombstone set is kept as the chains plus what the commits since the
+/// last fold took away, and a cursor over each is cheaper than putting
+/// the two together for every statement. See [`crate::deleted`].
 struct Tombstones<'a> {
-    dead: &'a [u64],
-    at: usize,
+    dead: [&'a [u64]; 2],
+    at: [usize; 2],
     base: u64,
 }
 
 impl Tombstones<'_> {
     fn gone(&mut self, row: u16) -> bool {
         let offset = self.base + u64::from(row);
-        while self.at < self.dead.len() && self.dead[self.at] < offset {
-            self.at += 1;
+        let mut gone = false;
+        for (run, at) in self.dead.iter().zip(&mut self.at) {
+            while *at < run.len() && run[*at] < offset {
+                *at += 1;
+            }
+            gone |= *at < run.len() && run[*at] == offset;
         }
-        self.at < self.dead.len() && self.dead[self.at] == offset
+        gone
     }
 }
 
 /// The rows of one chunk a delete left behind, as a selection.
 ///
-/// `dead` holds the chunk's deleted rows and `sel` what the scan had
-/// already selected, identity when it has none. An empty answer means
-/// the whole chunk is gone, which a scan reports the way it reports a
-/// chunk the zone map ruled out.
+/// `dead` holds the chunk's deleted rows, one ascending run per half of
+/// the tombstone set, and `sel` what the scan had already selected,
+/// identity when it has none. An empty answer means the whole chunk is
+/// gone, which a scan reports the way it reports a chunk the zone map
+/// ruled out.
 fn survivors(
-    dead: &[u64],
+    dead: (&[u64], &[u64]),
     row_base: u64,
     rows: usize,
     sel: Option<&SelVector>,
     arena: &mut MorselArena,
 ) -> SelVector {
     let mut tombs = Tombstones {
-        dead,
-        at: 0,
+        dead: [dead.0, dead.1],
+        at: [0, 0],
         base: row_base,
     };
     let mut out = SelVector::with_capacity(arena, sel.map_or(rows, SelVector::len));
@@ -534,7 +534,7 @@ impl Snapshot for Zu1Snapshot<'_> {
             let rows = (total - row_base).min(SCAN_ROWS as u64) as u32;
             let dead = self.ensure_gone()?.span(table, row_base, u64::from(rows));
             let mut sel = None;
-            if !dead.is_empty() {
+            if !dead.0.is_empty() || !dead.1.is_empty() {
                 let alive = survivors(dead, row_base, rows as usize, None, arena);
                 if alive.is_empty() {
                     return Ok(None);
@@ -557,12 +557,9 @@ impl Snapshot for Zu1Snapshot<'_> {
             str_bytes,
             str_ends,
             gone,
-            merged,
             ..
         } = self;
-        // The merge when there is one, and the chains alone when
-        // nothing is deferred, which is what the call above just built.
-        let gone = merged.as_ref().or(gone.as_ref()).expect("just loaded");
+        let gone = gone.as_ref().expect("just loaded");
         let reader = props_of(props, table)?;
         let row_base = chunk * SCAN_ROWS as u64;
         if row_base >= reader.rows() {
@@ -626,7 +623,7 @@ impl Snapshot for Zu1Snapshot<'_> {
         // the only place the row can go missing. It is built whatever
         // the density, for the same reason.
         let dead = gone.span(table, row_base, rows as u64);
-        if !dead.is_empty() {
+        if !dead.0.is_empty() || !dead.1.is_empty() {
             let alive = survivors(dead, row_base, rows, sel.as_ref(), arena);
             if alive.is_empty() {
                 return Ok(None);
@@ -913,7 +910,6 @@ impl Snapshot for Zu1Snapshot<'_> {
             // way, so a worker starts with it rather than reading the
             // table index again.
             gone: self.gone.clone(),
-            merged: self.merged.clone(),
             patches: Arc::clone(&self.patches),
             // Frames are the caller's memory and have nothing to do
             // with the file, so a fork shares them rather than

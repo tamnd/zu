@@ -222,16 +222,12 @@ pub struct Zu1Graph<'a> {
     catalog: Catalog,
     readers: HashMap<u32, GraphReader>,
     props: HashMap<u32, Option<PropsReader>>,
-    /// The rows a `DELETE` took away as the file's chains hold them,
-    /// read on the first query that asks and kept for the epoch.
-    /// `None` is "not read yet", so a graph that is only ever written
-    /// through never pays the read.
+    /// The rows a `DELETE` took away, the file's chains with whatever a
+    /// commit has taken away since laid over them, read on the first
+    /// query that asks and kept for the epoch. `None` is "not read
+    /// yet", so a graph that is only ever written through never pays
+    /// the read.
     gone: Option<Deleted>,
-    /// Those with the rows a commit took away and nobody has folded
-    /// yet merged in. Kept apart from the chains for the reason
-    /// [`crate::snapshot`] keeps them apart: a commit that adds to the
-    /// patch owes the merge and not the read.
-    merged: Option<Deleted>,
     /// The cells committed since the last fold, by table. A props
     /// reader reads through these, which is what lets a write be
     /// visible without the column it wrote into being rewritten.
@@ -250,7 +246,6 @@ impl<'a> Zu1Graph<'a> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: None,
-            merged: None,
             patches: Arc::new(Patches::new()),
             frames: Arc::new(FrameSet::new()),
         }
@@ -268,7 +263,6 @@ impl<'a> Zu1Graph<'a> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: None,
-            merged: None,
             patches: Arc::new(Patches::new()),
             frames: Arc::new(FrameSet::new()),
         }
@@ -309,7 +303,6 @@ impl<'a> Zu1Graph<'a> {
         // the deleted set belongs to the epoch as much as the
         // directories do.
         self.gone = None;
-        self.merged = None;
         // Only a fold moves the epoch, and a fold is what seals the
         // cells the patch was carrying, so they are in the columns the
         // next reader loads.
@@ -387,9 +380,11 @@ impl<'a> Zu1Graph<'a> {
             let [from, to] = patches.grown(&self.catalog, *rel);
             reader.set_grown(from, to);
         }
-        // The chains the file holds have not moved; what a commit can
-        // have added to is the merge above them.
-        self.merged = None;
+        // The chains the file holds have not moved; what sits over them
+        // is the patch, and this is a new one.
+        if let Some(gone) = &mut self.gone {
+            gone.overlay(&patches.gone);
+        }
         self.patches = patches;
     }
 
@@ -439,17 +434,11 @@ impl<'a> Zu1Graph<'a> {
     /// [`crate::snapshot::Zu1Snapshot`], which reads them the same way.
     fn ensure_gone(&mut self) -> Result<&Deleted> {
         if self.gone.is_none() {
-            self.gone = Some(Deleted::load(&mut self.db)?);
+            let mut gone = Deleted::load(&mut self.db)?;
+            gone.overlay(&self.patches.gone);
+            self.gone = Some(gone);
         }
-        if self.patches.gone.is_empty() {
-            return Ok(self.gone.as_ref().expect("just loaded"));
-        }
-        if self.merged.is_none() {
-            let mut gone = self.gone.clone().expect("just loaded");
-            gone.merge(&self.patches.gone);
-            self.merged = Some(gone);
-        }
-        Ok(self.merged.as_ref().expect("just merged"))
+        Ok(self.gone.as_ref().expect("just loaded"))
     }
 
     /// The same for a rel table's edge columns, which hang off its
@@ -907,7 +896,7 @@ impl Graph for Zu1Graph<'_> {
     }
 
     fn deleted(&mut self) -> Result<DeletedRows> {
-        Ok(self.ensure_gone()?.tables().clone())
+        Ok(self.ensure_gone()?.rows())
     }
 
     fn fork(&self) -> Option<Box<dyn Graph + Send>> {
@@ -924,7 +913,6 @@ impl Graph for Zu1Graph<'_> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: self.gone.clone(),
-            merged: self.merged.clone(),
             patches: Arc::clone(&self.patches),
             // Somebody else's memory, shared rather than reopened.
             frames: Arc::clone(&self.frames),

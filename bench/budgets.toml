@@ -1577,6 +1577,36 @@ detach_stmt_kb = 96.0
 detach_stmt_cpu_us = 400.0
 detach_stmt_growth_b = 4096.0
 
+# What a burst of writers costs against what one writer costs
+# (crates/zu/benches/commit.rs). The same INSERT of one element run at
+# six widths, one writer up to thirty two, each on its own connection,
+# every level writing the same total.
+#
+# All three are ratios between levels of one run on one machine, so the
+# storage under it cancels: a box whose fdatasync is five times slower
+# than a laptop's moves every level by the same five and leaves these
+# where they were. That is what makes them gateable on a shared runner
+# when the absolute latency in write.rs cannot be.
+#
+# A durable commit has a floor of between one and two sync periods, and
+# the width does not change it. A writer that staged its frames while a
+# sync was already in the air cannot be covered by that sync, because
+# the sync was told how far to reach before those bytes existed, so it
+# waits the one in flight out and then waits for the next one. What the
+# width decides is how many writers ride in that next sync, which is
+# why the throughput is a straight line in the width and the latency is
+# flat.
+#
+# Measured 15.3 times the statements a second of one writer at thirty
+# two writers, with the latency at 2.0 times one writer's and the p99 at
+# 2.5. The floor is set well under the measurement and well over the 1.0
+# that writers syncing one at a time would give, because it is a
+# regression gate and not a claim about the machine. Raise this floor as
+# the commit path shares more, never lower it.
+commit_x = 6.0
+commit_p50_x = 3.0
+commit_p99_x = 6.0
+
 # A SET of one property of one edge, measured 3.6 ms, 398 us of
 # processor time and 15.7 kB at 10000 rows and 10000 edges. It is the
 # same statement as the node SET against a column of a different shape:

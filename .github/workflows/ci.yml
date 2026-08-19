@@ -385,6 +385,21 @@ jobs:
       # whose fdatasync is several times slower than a laptop's.
       - run: ZU_GATE=1 cargo bench -p zu --bench write
 
+  commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      # What a burst of writers costs, which is the P5 shape at c=8: the
+      # same INSERT run at six widths, one writer up to thirty two. All
+      # three keys are ratios between levels of one run on one machine,
+      # so a shared runner moves the columns and not the gate. What they
+      # catch is commits going back to a sync each, which reads as a
+      # throughput that stops rising with the width and a latency that
+      # starts rising with it.
+      - run: ZU_GATE=1 cargo bench -p zu --bench commit
+
   connect:
     runs-on: ubuntu-latest
     steps:

@@ -17,6 +17,7 @@ pub mod column;
 pub mod csr;
 pub mod exec;
 pub mod frame;
+pub mod functions;
 pub mod kernels;
 pub mod lexer;
 pub mod optimizer;

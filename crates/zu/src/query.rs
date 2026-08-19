@@ -1310,6 +1310,7 @@ fn prepare(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<P
             zu_query::binder::BoundClause::Insert { .. }
                 | zu_query::binder::BoundClause::Set { .. }
                 | zu_query::binder::BoundClause::Delete { .. }
+                | zu_query::binder::BoundClause::Merge { .. }
         )
     }) {
         return Err(ZuError::InvalidArgument(
@@ -1351,16 +1352,41 @@ pub fn run(source: &str, db: &mut Zu1File, params: &[(&str, Value)]) -> Result<Q
     }
     let p = prepare(source, db, params)?;
     let options = env_options();
+    // A match written several ways is a plan per way over the rows the
+    // clauses in front of it answered, which is a seam and not an
+    // operator, so a statement that holds one runs as its parts. Only a
+    // read gets this far: a write was refused while it was prepared.
+    if let Some(parts) = crate::split::split(&p.query, &p.schema)? {
+        return crate::split::read_parts(&parts, &p.args, &mut |plan, query, args| {
+            read_one(plan, query, &p.schema, db, &p.catalog, args, &options)
+        });
+    }
+    read_one(
+        &p.plan, &p.query, &p.schema, db, &p.catalog, &p.args, &options,
+    )
+}
+
+/// Runs one plan against an open file, the pipeline executor first and
+/// the row-at-a-time one for the plans it does not cover. This is the
+/// whole of what a one-shot read does, and a statement that runs as
+/// several parts runs each of them through here.
+fn read_one(
+    plan: &plan::LogicalPlan,
+    query: &BoundQuery,
+    schema: &Schema,
+    db: &mut Zu1File,
+    catalog: &Catalog,
+    args: &[Value],
+    options: &exec::Options,
+) -> Result<QueryResult> {
     if exec2_enabled() {
-        let mut snap = crate::snapshot::Zu1Snapshot::new(db, p.catalog.clone());
-        if let Some(r) =
-            zu_exec::try_execute(&p.plan, &p.query, &p.schema, &mut snap, &p.args, &options)?
-        {
+        let mut snap = crate::snapshot::Zu1Snapshot::new(db, catalog.clone());
+        if let Some(r) = zu_exec::try_execute(plan, query, schema, &mut snap, args, options)? {
             return Ok(r);
         }
     }
-    let mut graph = Zu1Graph::new(db, p.catalog);
-    exec::execute(&p.plan, &p.query, &p.schema, &mut graph, &p.args, &options)
+    let mut graph = Zu1Graph::new(db, catalog.clone());
+    exec::execute(plan, query, schema, &mut graph, args, options)
 }
 
 /// Whether plans the pipeline executor covers run there. On by

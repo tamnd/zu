@@ -13,7 +13,7 @@
 //! underlying handle seeks), so a session is Send but queries on it
 //! do not overlap; open one session per thread.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1436,17 +1436,10 @@ impl Session {
         unreachable!("the last part of a split statement writes nothing")
     }
 
-    /// Runs a match written several ways: each way over the rows the
-    /// part in front of it answered, and the rows they answer put end
-    /// to end in written order.
-    ///
-    /// Under `|+|` that is the whole of it, because the alternation is
-    /// of multisets and a path found twice is answered twice. Under `|`
-    /// it is of sets, so a path two ways both found is answered once,
-    /// and what says whether two rows are the same path is the elements
-    /// the way walked, which each way projects behind its row for the
-    /// purpose. Two ways that reached the same pair of nodes over
-    /// different edges walked different paths and stay two rows.
+    /// Runs a match written several ways, which is
+    /// [`crate::split::fork_rows`] reading its parts through the
+    /// session: the same walk a one-shot read does, over a store this
+    /// one may have written to.
     fn run_fork(
         &mut self,
         cached: &CachedPlan,
@@ -1455,24 +1448,9 @@ impl Session {
         args: &[Value],
         options: &exec::Options,
     ) -> Result<Value> {
-        let mut out: Vec<Value> = Vec::new();
-        let mut seen: BTreeSet<Vec<exec::OrdValue>> = BTreeSet::new();
-        for branch in &fork.branches {
-            let mut args = args.to_vec();
-            args.push(seed.clone());
-            let rows = self
-                .read_part(&branch.plan, &branch.query, &cached.schema, &args, options)?
-                .rows;
-            for mut row in rows {
-                if fork.distinct && !seen.insert(row.iter().cloned().map(exec::OrdValue).collect())
-                {
-                    continue;
-                }
-                row.truncate(branch.width);
-                out.push(Value::List(row));
-            }
-        }
-        Ok(Value::List(out))
+        crate::split::fork_rows(fork, seed, args, &mut |plan, query, args| {
+            self.read_part(plan, query, &cached.schema, args, options)
+        })
     }
 
     /// Runs the read half of one part of a write statement.

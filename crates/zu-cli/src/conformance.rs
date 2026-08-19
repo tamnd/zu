@@ -246,13 +246,20 @@ const NOTES: &[&str] = &[
      inside the brackets is refused, the standard writing one in front of a whole pattern",
     "a quantifier behind those brackets repeats the stretch they hold, and a fixed count is \
      written out as that many copies of the steps, so a stretch written `{2}` walks two edges \
-     and keeps its copies apart the way a repeated step does; a variable count is refused \
-     rather than answered for one of its lengths, a stretch of several lengths being a union \
-     of patterns. Every repetition binds the names inside the brackets again, so a name there \
-     stands for one element per repetition rather than for one element: reading it answers the \
-     list of them in the order the walk took them, reading a property of it answers the list of \
-     the properties, and an aggregate written around it folds that row's bindings rather than \
-     the rows, which is one row in and one row out and no grouping under it",
+     and keeps its copies apart the way a repeated step does; a count of several lengths, \
+     written as a range or as the question mark that stands for nought or one, is a pattern \
+     per length rather than one pattern, and the lengths are written out and run over the fork \
+     seam the bar below runs on, so a stretch of nought to two lengths is three walks and the \
+     length nought is the one node the ends of the stretch meet at. A count with no ceiling on \
+     it is refused, since there is no writing out a list with no end to it. Every repetition \
+     binds the names inside the brackets again, so a name there stands for one element per \
+     repetition rather than for one element: reading it answers the list of them in the order \
+     the walk took them, reading a property of it answers the list of the properties, and an \
+     aggregate written around it folds that row's bindings rather than the rows, which is one \
+     row in and one row out and no grouping under it. A name inside a stretch of several \
+     lengths is out of reach behind it, the lengths holding the elements in different places \
+     and the row between the parts holding one column per name, and it is the reading of the \
+     name that is refused rather than the walk",
     "a condition may be written inside an element pattern, and it is asked of the one element \
      that pattern stands on where the pattern reaches it rather than of the row a whole pattern \
      built: a node writes it after its labels and its property map and an edge writes it inside \

@@ -36,6 +36,16 @@ use crate::value_type;
 /// finished with by the time a pattern reaches the binder. A segment
 /// always holds one more node than it holds edge patterns, which is
 /// what makes `finish` total.
+/// The ways a graph pattern was written: the first list, the lists
+/// behind it, and which bar separated them.
+///
+/// The bar is `None` for a pattern that wrote none, which is every
+/// pattern of one way and every pattern whose ways are the lengths of a
+/// quantified stretch rather than alternatives someone wrote a bar
+/// between. What it decides is duplicates, and there are none to decide
+/// about where no bar was written.
+type Ways = (Vec<PathPattern>, Vec<Vec<PathPattern>>, Option<bool>);
+
 #[derive(Default, Clone)]
 struct Segment {
     nodes: Vec<NodePattern>,
@@ -278,6 +288,26 @@ fn forget_names(copy: &mut Segment) {
     }
 }
 
+/// The reason a pattern written several ways is refused where one
+/// shape belongs, which is an `INSERT` or a `MERGE`.
+///
+/// Both spellings say the same thing and they are told apart because a
+/// reader is owed the reason they wrote rather than the reason the
+/// parser reached: a bar is a pattern written two ways on purpose, and
+/// a quantifier of several lengths is one the writer may not have
+/// noticed is several patterns.
+fn one_shape(bar: bool) -> &'static str {
+    if bar {
+        "a bar between two path patterns says either of them may be matched, \
+         and this is a position that describes one shape rather than looking \
+         for one"
+    } else {
+        "a stretch repeated a variable number of times matches paths of several \
+         lengths, which is several shapes, and this is a position that describes \
+         one shape rather than looking for one; write a fixed count"
+    }
+}
+
 /// What to call a conjunction in a message, spelled the way the query
 /// would have written it.
 fn conjunction_name(how: Conjunction) -> &'static str {
@@ -390,6 +420,9 @@ pub fn parse_statement(source: &str) -> Result<Statement> {
         depth: 0,
         lists: 0,
         ends_a_definition: false,
+        lengths: Vec::new(),
+        taken: 0,
+        spans: Vec::new(),
     };
     if parser.at_txn_stmt() {
         let stmt = parser.parse_txn_stmt()?;
@@ -425,6 +458,23 @@ struct Parser<'a> {
     /// `LET n = (a IN b) IN n END` reads the test, and everywhere a
     /// nested expression begins it is off again.
     ends_a_definition: bool,
+    /// The length chosen for each stretch of the path term being read
+    /// that repeats a variable number of times, in the order the
+    /// stretches are written.
+    ///
+    /// A term holding such a stretch is read once per length, because a
+    /// stretch of several lengths is several patterns and not one, so
+    /// the term is parsed as many times as there are lengths to choose
+    /// between and this says which choice the pass in hand is making.
+    /// Empty for the pass that discovers what the choices are, where
+    /// every stretch takes its least length.
+    lengths: Vec<usize>,
+    /// How many of those stretches this pass has read, which indexes
+    /// the choice the next one takes.
+    taken: usize,
+    /// The range each of those stretches was written with, gathered as
+    /// they are read, which is what the choices are made out of.
+    spans: Vec<(usize, usize)>,
 }
 
 impl Parser<'_> {
@@ -1443,8 +1493,12 @@ impl Parser<'_> {
                     (patterns, Vec::new(), false, filter)
                 } else {
                     self.expect_kw("MATCH")?;
-                    let (patterns, alts, distinct) = self.parse_graph_pattern_alts()?;
-                    (patterns, alts, distinct, self.parse_where()?)
+                    let (patterns, alts, bar) = self.parse_graph_pattern_alts()?;
+                    // A bar that was never written leaves nothing to
+                    // say about duplicates: the ways a quantifier
+                    // spelled out are lengths, and two lengths cannot
+                    // be the same path.
+                    (patterns, alts, bar == Some(false), self.parse_where()?)
                 };
                 clauses.push(Clause::Match {
                     optional,
@@ -1920,12 +1974,7 @@ impl Parser<'_> {
         let mut bar = None;
         let mut alts = self.parse_path_alts(&mut bar)?;
         if alts.len() > 1 {
-            return Err(ZuError::gql(
-                codes::C42001,
-                "a bar between two path patterns says either of them may be matched, \
-                 and this is a position that describes one shape rather than looking \
-                 for one",
-            ));
+            return Err(ZuError::gql(codes::C42001, one_shape(bar.is_some())));
         }
         Ok(alts.remove(0))
     }
@@ -1954,7 +2003,7 @@ impl Parser<'_> {
             None
         };
         let (selector, mode) = self.parse_path_prefix()?;
-        let mut alts = vec![self.parse_term(var.clone(), selector, mode)?];
+        let mut alts = self.parse_term(var.clone(), selector, mode)?;
         while self.at(&TokenKind::Pipe) {
             let at = self.peek().expect("peeked").start;
             self.expect(&TokenKind::Pipe)?;
@@ -1978,14 +2027,89 @@ impl Parser<'_> {
                 ));
             }
             *bar = Some(multiset);
-            alts.push(self.parse_term(var.clone(), selector, mode)?);
+            let more = self.parse_term(var.clone(), selector, mode)?;
+            alts.extend(more);
         }
         Ok(alts)
     }
 
-    /// One term of a path pattern: the walk itself, under the variable,
-    /// selector and mode the alternation around it was written with.
+    /// One term of a path pattern, as the walks it stands for (ISO
+    /// 16.11, features G037 and G061).
+    ///
+    /// A term is one walk unless it holds a stretch that repeats a
+    /// variable number of times, and such a stretch is a pattern per
+    /// length rather than one pattern: `((x)-[:LINK]->(y))?` is the
+    /// stretch walked once and the stretch skipped, which are two
+    /// shapes with different numbers of elements in them. So the term
+    /// is read once per length, and once per combination of lengths
+    /// where it holds more than one such stretch, and what comes back
+    /// is a list of walks the way an alternation's is.
+    ///
+    /// The lengths are found by reading the term through: the pass that
+    /// discovers them takes the least length of each stretch and writes
+    /// down the range, and the passes after it are the same tokens read
+    /// again with the choices made. Reading a term twice is safe
+    /// because nothing but the position moves while one is read, and it
+    /// is the shortest way to say this: how many nodes a stretch
+    /// contributes decides where every position behind it lands, so a
+    /// term of several lengths cannot be built once and patched.
     fn parse_term(
+        &mut self,
+        var: Option<String>,
+        selector: Option<Selector>,
+        mode: Option<PathMode>,
+    ) -> Result<Vec<PathPattern>> {
+        let from = self.pos;
+        let held = std::mem::take(&mut self.spans);
+        let chosen = std::mem::take(&mut self.lengths);
+        let taken = std::mem::replace(&mut self.taken, 0);
+        let first = self.one_term(var.clone(), selector, mode);
+        let spans = std::mem::replace(&mut self.spans, held);
+        self.lengths = chosen;
+        self.taken = taken;
+        let first = first?;
+        if spans.is_empty() {
+            return Ok(vec![first]);
+        }
+        let to = self.pos;
+        let mut out = Vec::new();
+        for lengths in Self::choices(&spans) {
+            self.pos = from;
+            let held = std::mem::take(&mut self.spans);
+            let chosen = std::mem::replace(&mut self.lengths, lengths);
+            let taken = std::mem::replace(&mut self.taken, 0);
+            let walk = self.one_term(var.clone(), selector, mode);
+            self.spans = held;
+            self.lengths = chosen;
+            self.taken = taken;
+            out.push(walk?);
+        }
+        self.pos = to;
+        Ok(out)
+    }
+
+    /// Every combination of lengths a term's stretches may take, in
+    /// order, the last stretch counting fastest.
+    fn choices(spans: &[(usize, usize)]) -> Vec<Vec<usize>> {
+        let mut out: Vec<Vec<usize>> = vec![Vec::new()];
+        for &(lo, hi) in spans {
+            out = out
+                .into_iter()
+                .flat_map(|so_far| {
+                    (lo..=hi).map(move |count| {
+                        let mut lengths = so_far.clone();
+                        lengths.push(count);
+                        lengths
+                    })
+                })
+                .collect();
+        }
+        out
+    }
+
+    /// One walk of a term, under the variable, selector and mode the
+    /// alternation around it was written with.
+    fn one_term(
         &mut self,
         var: Option<String>,
         selector: Option<Selector>,
@@ -2091,7 +2215,15 @@ impl Parser<'_> {
         let filter = self.parse_where()?;
         let close = self.peek().map(|t| t.start).unwrap_or(self.source.len());
         self.expect(&TokenKind::RParen)?;
-        let Some(times) = self.parse_edge_quantifier()? else {
+        // A questioned stretch is walked once or skipped, which is the
+        // range the question mark spells (ISO 16.11, feature G037), so
+        // it lands in the same range every other quantifier does.
+        let times = if self.eat(&TokenKind::Question) {
+            Some((Some(0), Some(1)))
+        } else {
+            self.parse_edge_quantifier()?
+        };
+        let Some(times) = times else {
             let to = from + inner.rels.len();
             into.juxtapose(inner);
             into.subpaths.push(Subpath {
@@ -2103,7 +2235,7 @@ impl Parser<'_> {
             into.and(filter);
             return Ok(());
         };
-        let count = self.fixed_count(times, close)?;
+        let count = self.repetitions(times, close)?;
         if var.is_some() {
             return Err(ZuError::gql_in(
                 codes::C42001,
@@ -2142,6 +2274,20 @@ impl Parser<'_> {
         for group in group_names(&inner, count, node_at, step_at, width) {
             into.merge_group(group);
         }
+        if count == 0 {
+            // A stretch walked no times is the one node its ends meet
+            // at: what stood in front of the brackets goes on from
+            // there and what follows them is written against it, which
+            // is what a factor with nothing in it does anyway. The
+            // names inside the brackets bound nothing, and they are
+            // recorded above as groups with no repetition in them so
+            // that this way of matching carries the same names as the
+            // ways that walked the stretch.
+            if into.nodes.is_empty() {
+                into.join(NodePattern::default());
+            }
+            return Ok(());
+        }
         for _ in 0..count {
             let mut copy = inner.clone();
             forget_names(&mut copy);
@@ -2167,39 +2313,56 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// How many times a quantifier on a stretch repeats it.
+    /// How many times a quantifier on a stretch repeats it in the pass
+    /// in hand.
     ///
-    /// A stretch repeated a fixed number of times is a longer pattern of
-    /// the same shape, which is what the parser writes it out as. A
-    /// stretch repeated a variable number of times is not: it matches
-    /// paths of several lengths, so it stands for as many patterns as
-    /// the range holds and the answer is their union. That is the
-    /// alternation work and it is not implemented yet, so a range is
-    /// refused by name rather than answered for one of its lengths.
-    fn fixed_count(&self, times: (Option<u64>, Option<u64>), at: usize) -> Result<usize> {
-        let count = match times {
-            (Some(min), Some(max)) if min == max => min,
+    /// A stretch repeated a fixed number of times is a longer pattern
+    /// of the same shape, which is what the parser writes it out as. A
+    /// stretch repeated a variable number of times is not one pattern
+    /// at all: it matches paths of several lengths, so it stands for as
+    /// many patterns as the range holds and what the query asked for is
+    /// their union. Those are read a length at a time, and this hands
+    /// out the length the pass in hand chose, writing the range down so
+    /// that the term is read again for the lengths still to come.
+    ///
+    /// A count with no ceiling on it is refused. The lengths are
+    /// written out as patterns of their own, and there is no writing
+    /// out a list with no end to it, so `+`, `*` and `{n,}` on a
+    /// stretch are refused by name rather than answered for as many
+    /// lengths as the engine felt like walking.
+    fn repetitions(&mut self, times: (Option<u64>, Option<u64>), at: usize) -> Result<usize> {
+        let (lo, hi) = match times {
+            (Some(min), Some(max)) if min <= max => (min as usize, max as usize),
+            (Some(min), Some(max)) => {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    format!(
+                        "a stretch repeated between {min} and {max} times is asking for \
+                         a count above its own ceiling, which no path has; write the \
+                         smaller number first"
+                    ),
+                ));
+            }
             _ => {
                 return Err(ZuError::gql_in(
                     codes::C42001,
                     self.source,
                     at,
-                    "a stretch repeated a variable number of times matches paths of \
-                     several lengths, which is a union of patterns rather than one \
-                     pattern, and that is not implemented yet; write a fixed count",
+                    "a stretch repeated with no ceiling on the count matches paths of \
+                     every length, and the lengths are walked as patterns of their own, \
+                     so there is no list of them to walk; write a ceiling on the count",
                 ));
             }
         };
-        if count == 0 {
-            return Err(ZuError::gql_in(
-                codes::C42001,
-                self.source,
-                at,
-                "a stretch repeated no times at all leaves nothing where the brackets \
-                 stood; write the pattern without them",
-            ));
+        if lo == hi {
+            return Ok(lo);
         }
-        Ok(count as usize)
+        let at = self.taken;
+        self.taken += 1;
+        self.spans.push((lo, hi));
+        Ok(self.lengths.get(at).copied().unwrap_or(lo))
     }
 
     /// Whether the `(` in hand opens a parenthesized path pattern rather
@@ -2254,14 +2417,9 @@ impl Parser<'_> {
     /// every pattern outside a match: an `INSERT` writes one shape and
     /// a `MERGE` looks for one.
     fn parse_graph_pattern(&mut self) -> Result<Vec<PathPattern>> {
-        let (patterns, alts, _) = self.parse_graph_pattern_alts()?;
+        let (patterns, alts, bar) = self.parse_graph_pattern_alts()?;
         if !alts.is_empty() {
-            return Err(ZuError::gql(
-                codes::C42001,
-                "a bar between two path patterns says either of them may be matched, \
-                 and this is a position that describes one shape rather than looking \
-                 for one",
-            ));
+            return Err(ZuError::gql(codes::C42001, one_shape(bar.is_some())));
         }
         Ok(patterns)
     }
@@ -2282,9 +2440,7 @@ impl Parser<'_> {
     /// however many alternatives matched it and `|+|` answers it once
     /// per alternative, so a list written with both is asking for two
     /// different answers at once.
-    fn parse_graph_pattern_alts(
-        &mut self,
-    ) -> Result<(Vec<PathPattern>, Vec<Vec<PathPattern>>, bool)> {
+    fn parse_graph_pattern_alts(&mut self) -> Result<Ways> {
         let list = PatternList {
             mode: self.parse_match_mode(),
             at: self.lists,
@@ -2316,9 +2472,7 @@ impl Parser<'_> {
             }
         }
         let first = ways.remove(0);
-        // A bar that was never written leaves one way of matching and
-        // nothing to say about duplicates.
-        Ok((first, ways, bar == Some(false)))
+        Ok((first, ways, bar))
     }
 
     /// The ways of matching a whole list, out of the ways each pattern
@@ -4923,10 +5077,7 @@ mod tests {
     #[test]
     fn a_multiset_alternation_is_not_a_union() {
         let q = parsed("MATCH (a)-[:K]->(b) |+| (a)-[:W]->(b) RETURN *");
-        let Clause::Match {
-            alts, distinct, ..
-        } = &q.clauses()[0]
-        else {
+        let Clause::Match { alts, distinct, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
         assert!(!distinct, "|+| keeps a path each way found");
@@ -4952,6 +5103,92 @@ mod tests {
         let list = std::iter::repeat_n(one, 7).collect::<Vec<_>>().join(", ");
         let err = parse_err(&format!("MATCH {list} RETURN *"));
         assert!(err.contains("UNION"), "{err}");
+    }
+
+    /// A questioned stretch is the stretch walked and the stretch
+    /// skipped, which are two shapes with different numbers of steps in
+    /// them, so it reads as the two walks an alternation would have
+    /// been written as. Skipping it leaves the nodes at its ends
+    /// standing on the one node.
+    #[test]
+    fn a_questioned_stretch_reads_as_two_walks() {
+        let q = parsed("MATCH (a) ((x)-[:K]->(y))? (b) RETURN *");
+        let Clause::Match {
+            patterns,
+            alts,
+            distinct,
+            ..
+        } = &q.clauses()[0]
+        else {
+            panic!("MATCH");
+        };
+        assert!(
+            !distinct,
+            "no bar was written, and two lengths cannot be the same path"
+        );
+        assert_eq!(alts.len(), 1, "the length nought and the length one");
+        assert_eq!(patterns[0].steps.len(), 0, "the stretch skipped");
+        assert_eq!(alts[0][0].steps.len(), 1, "the stretch walked");
+        assert_eq!(patterns[0].start.var.as_deref(), Some("a"));
+        assert_eq!(
+            patterns[0].start.aliases,
+            vec!["b".to_string()],
+            "the ends of a skipped stretch meet at one node"
+        );
+    }
+
+    /// A bounded range is a walk per length it holds, in order, and the
+    /// lengths written out are the numbers of steps.
+    #[test]
+    fn a_bounded_range_reads_as_one_walk_per_length() {
+        let q = parsed("MATCH (a) ((x)-[:K]->(y)){1,3} (b) RETURN *");
+        let Clause::Match { patterns, alts, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        let lengths: Vec<usize> = std::iter::once(patterns)
+            .chain(alts)
+            .map(|way| way[0].steps.len())
+            .collect();
+        assert_eq!(lengths, vec![1, 2, 3]);
+    }
+
+    /// Two stretches of several lengths in one term are every pairing
+    /// of their lengths, the last of them counting fastest.
+    #[test]
+    fn two_stretches_of_several_lengths_are_every_pairing() {
+        let q = parsed("MATCH (a) ((x)-[:K]->(y))? (m) ((u)-[:W]->(v)){1,2} (b) RETURN *");
+        let Clause::Match { patterns, alts, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        let lengths: Vec<usize> = std::iter::once(patterns)
+            .chain(alts)
+            .map(|way| way[0].steps.len())
+            .collect();
+        assert_eq!(lengths, vec![1, 2, 2, 3], "0+1, 0+2, 1+1 and 1+2");
+    }
+
+    /// The lengths are walked as patterns of their own, so a count with
+    /// no ceiling on it has no list of patterns to walk.
+    #[test]
+    fn a_stretch_with_no_ceiling_on_its_count_is_refused() {
+        for query in [
+            "MATCH (a) ((x)-[:K]->(y))+ (b) RETURN *",
+            "MATCH (a) ((x)-[:K]->(y))* (b) RETURN *",
+            "MATCH (a) ((x)-[:K]->(y)){2,} (b) RETURN *",
+        ] {
+            let err = parse_err(query);
+            assert!(err.contains("write a ceiling on the count"), "{err}");
+        }
+    }
+
+    /// An INSERT describes one shape to make, and a stretch of several
+    /// lengths describes several, so the reason it is refused for is
+    /// the lengths rather than the bar it never wrote.
+    #[test]
+    fn a_stretch_of_several_lengths_is_refused_where_one_shape_belongs() {
+        let err = parse_err("INSERT (a) ((x)-[:K]->(y))? (b)");
+        assert!(err.contains("several lengths"), "{err}");
+        assert!(!err.contains("bar"), "{err}");
     }
 
     #[test]

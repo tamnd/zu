@@ -14,12 +14,15 @@
 //! that row before the next part reads it back through
 //! [`zu_query::plan::LogicalPlan::Rows`].
 
+use std::collections::BTreeSet;
+
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{
     BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundPath, BoundQuery,
     BoundSetItem, ForkBranch, MatchKind, Schema, Type,
 };
+use zu_query::exec::{OrdValue, QueryResult, Value};
 use zu_query::plan::LogicalPlan;
 use zu_query::{optimizer, plan};
 
@@ -301,6 +304,82 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
         });
         rest = &rest[at + 1..];
     }
+}
+
+/// How a caller runs one part: the plan, the query it belongs to, and
+/// the arguments, in and the rows out. Whoever owns the store passes
+/// one of these in, because a part is read the same way whether it is
+/// read by a session or by a one-shot call.
+pub(crate) type ReadPart<'a> =
+    &'a mut dyn FnMut(&LogicalPlan, &BoundQuery, &[Value]) -> Result<QueryResult>;
+
+/// Runs a statement split at forks and at nothing else, which is what a
+/// statement that only reads is split at. The part in front of a fork
+/// answers the rows its ways walk over, the ways walk them, and the
+/// part with no seam behind it answers the statement's rows.
+pub(crate) fn read_parts(
+    parts: &[Part],
+    args: &[Value],
+    read: ReadPart<'_>,
+) -> Result<QueryResult> {
+    let mut carried: Option<Value> = None;
+    for part in parts {
+        let mut held = args.to_vec();
+        held.extend(carried.take());
+        match &part.seam {
+            Some(Seam::Fork(fork)) => {
+                let rows = read(&part.plan, &part.query, &held)?.rows;
+                let seed = Value::List(rows.into_iter().map(Value::List).collect());
+                carried = Some(fork_rows(fork, seed, args, read)?);
+            }
+            // A write needs the log and the overlay a session owns.
+            // The one-shot entry point says so before it plans
+            // anything, so nothing that got this far holds one.
+            Some(Seam::Write(_)) => {
+                return Err(ZuError::InvalidArgument(
+                    "a statement that writes needs a session, which owns the log a write goes through: open one with zu::db::Database or zu::session::Session".into(),
+                ));
+            }
+            None => return read(&part.plan, &part.query, &held),
+        }
+    }
+    Err(ZuError::InvalidArgument(
+        "a split statement ends in the part that answers its rows".into(),
+    ))
+}
+
+/// Runs the ways of a fork over the rows the part in front of it
+/// answered, and answers the rows they found between them, put end to
+/// end in written order.
+///
+/// Under `|+|` that is the whole of it, because the alternation is of
+/// multisets and a path found twice is answered twice. Under `|` it is
+/// of sets, so a path two ways both found is answered once, and what
+/// says whether two rows are the same path is the elements the way
+/// walked, which each way projects behind its row for the purpose. Two
+/// ways that reached the same pair of nodes over different edges walked
+/// different paths and stay two rows.
+pub(crate) fn fork_rows(
+    fork: &Fork,
+    seed: Value,
+    args: &[Value],
+    read: ReadPart<'_>,
+) -> Result<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: BTreeSet<Vec<OrdValue>> = BTreeSet::new();
+    for branch in &fork.branches {
+        let mut args = args.to_vec();
+        args.push(seed.clone());
+        let rows = read(&branch.plan, &branch.query, &args)?.rows;
+        for mut row in rows {
+            if fork.distinct && !seen.insert(row.iter().cloned().map(OrdValue).collect()) {
+                continue;
+            }
+            row.truncate(branch.width);
+            out.push(Value::List(row));
+        }
+    }
+    Ok(Value::List(out))
 }
 
 /// Whether any part of a split statement changes the graph, which is

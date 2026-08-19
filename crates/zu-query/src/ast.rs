@@ -952,7 +952,7 @@ pub struct PathPattern {
     pub filter: Option<Expr>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct NodePattern {
     pub var: Option<String>,
     /// The other names this node was written under, which is what two

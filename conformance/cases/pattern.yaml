@@ -1167,3 +1167,51 @@ cases:
     doc: A path variable is assembled out of the slots of the walk that bound it, and the alternatives walk differently, so there is no one shape to assemble. It is refused by name rather than answered from whichever alternative happened to run first.
     query: MATCH p = (a:person)-[:knows]->(b:person) | (a:person)-[:knows]->(b:person) RETURN count(*) AS a
     raises: "42001"
+
+  - name: a-questioned-stretch-is-walked-or-skipped
+    doc: A questioned path of ISO 16.11, feature G037. The stretch is walked once or not at all, which is two shapes and not one, so the answer is the rows of each of them. Skipping it leaves the nodes at its ends standing on the one node, which is every person here, and walking it is every edge.
+    query: MATCH (a:person) ((x:person)-[:knows]->(y:person))? (b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "7"
+
+  - name: a-questioned-stretch-answers-both-of-its-lengths
+    doc: The two shapes answer rows of the same columns, so what comes back reads as one result. Written from ann, skipping the stretch is ann itself and walking it is the person ann knows.
+    query: MATCH (a:person WHERE a.name = 'ann') ((x:person)-[:knows]->(y:person))? (b:person) RETURN b.name AS a ORDER BY a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-range-is-walked-at-every-length-it-holds
+    doc: A bounded quantifier of ISO 16.11, feature G060, written over a stretch. Every length the range holds is a shape of its own, so a range of nought to two is three walks: ann itself, the person ann knows, and the person that person knows.
+    query: MATCH (a:person WHERE a.name = 'ann') ((x:person)-[:knows]->(y:person)){0,2} (b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-count-with-no-ceiling-on-it-is-refused
+    doc: The lengths are walked as patterns of their own, and there is no writing out a list with no end to it, so a stretch quantified with a plus is refused with that as the reason rather than answered for as many lengths as the engine felt like.
+    query: MATCH (a:person) ((x:person)-[:knows]->(y:person))+ (b:person) RETURN count(*) AS a
+    raises: "42001"
+
+  - name: a-name-inside-a-stretch-of-several-lengths-is-out-of-reach
+    doc: A name inside a repeated stretch stands for the elements every repetition bound, which are in a different place in each of the lengths, and the row that leaves the fork holds one column per name rather than one per step. Binding it costs nothing, so it is the reading of the name that is refused.
+    query: MATCH (a:person) ((x:person)-[:knows]->(y:person))? (b:person) RETURN x AS a
+    raises: "42002"
+
+  - name: a-stretch-of-several-lengths-is-not-a-shape-to-write
+    doc: An INSERT describes one shape to make, and a stretch of several lengths describes several, so there is no answer to how many elements it asked for. It is refused where it is written.
+    query: INSERT (a:person) ((x:person)-[:knows]->(y:person))? (b:person)
+    raises: "42001"

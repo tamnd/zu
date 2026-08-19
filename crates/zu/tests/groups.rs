@@ -79,6 +79,29 @@ fn a_quantifier_repeats_the_stretch_the_brackets_hold() {
     assert_eq!(count(&mut db, source), 2);
 }
 
+/// A count that holds more than one number is a pattern per length, and
+/// the lengths are walked one after another the way the alternatives of
+/// a bar are. A question mark spells the two lengths nought and one.
+#[test]
+fn a_count_of_several_lengths_walks_each_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph(dir.path());
+    // Nought is the five nodes the chain has, since the stretch walked
+    // no times is the one node its ends meet at, and one is the four
+    // edges.
+    let source = "MATCH (a:person)((x:person)-[:knows]->(y:person))?(b:person) \
+                  RETURN count(*) AS n";
+    assert_eq!(count(&mut db, source), 9);
+    // Four walks of one edge and three of two.
+    let source = "MATCH (a:person)((x:person)-[:knows]->(y:person)){1,2}(b:person) \
+                  RETURN count(*) AS n";
+    assert_eq!(count(&mut db, source), 7);
+    // The node it started at and the one edge out of it.
+    let source = "MATCH (a:person)((x:person)-[:knows]->(y:person))?(b:person) \
+                  WHERE a.id = 0 RETURN count(*) AS n";
+    assert_eq!(count(&mut db, source), 2);
+}
+
 /// A name inside a repeated stretch stands for one element per
 /// repetition, so reading it answers the list of them in the order the
 /// walk took them.
@@ -192,22 +215,35 @@ fn a_repeated_stretch_does_not_take_one_edge_twice() {
     assert_eq!(count(&mut db, source), 2);
 }
 
-/// What a quantified stretch refuses. Two of them are the shapes that
-/// wait on a union of patterns, and the others are the ones where a name
-/// would have to stand for something this engine has no value for.
+/// What a quantified stretch refuses. One is a count with no ceiling on
+/// it, one is a name whose elements sit in a different place in each of
+/// the lengths the stretch was written, and the others are the ones
+/// where a name would have to stand for something this engine has no
+/// value for.
 #[test]
 fn what_a_quantified_stretch_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = graph(dir.path());
-    // A range repeats the stretch a variable number of times, so the
-    // pattern matches paths of several lengths.
+    // A count with no ceiling on it is as many lengths as the graph is
+    // deep, and a length is a walk of its own.
+    for source in [
+        "MATCH (a:person)((x:person)-[:knows]->(y:person))+(b:person) RETURN a.id AS n",
+        "MATCH (a:person)((x:person)-[:knows]->(y:person))*(b:person) RETURN a.id AS n",
+        "MATCH (a:person)((x:person)-[:knows]->(y:person)){2,}(b:person) RETURN a.id AS n",
+    ] {
+        let said = refusal(&mut db, source);
+        assert!(said.contains("write a ceiling on the count"), "got: {said}");
+    }
+    // A name inside a stretch of several lengths stands for the elements
+    // of the walk that bound it, and the walks are of different lengths,
+    // so there is nowhere in one row to put them.
     let source =
-        "MATCH (a:person)((x:person)-[:knows]->(y:person)){1,3}(b:person) RETURN a.id AS n";
+        "MATCH (a:person)((x:person)-[:knows]->(y:person)){1,3}(b:person) RETURN x.id AS n";
     let said = refusal(&mut db, source);
-    assert!(said.contains("union of patterns"), "got: {said}");
-    let source = "MATCH (a:person)((x:person)-[:knows]->(y:person)){0}(b:person) RETURN a.id AS n";
-    let said = refusal(&mut db, source);
-    assert!(said.contains("leaves nothing"), "got: {said}");
+    assert!(
+        said.contains("in a different place in each of them"),
+        "got: {said}"
+    );
     // A name on the repeated stretch itself would be a name for as many
     // paths as the count asks for.
     let source =

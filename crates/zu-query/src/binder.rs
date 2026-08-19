@@ -11,7 +11,7 @@
 //! types as `Any` once the base is a node, rel, or map; the typed
 //! column catalog tightens this later without changing the shape here.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use zu_common::gqlstatus::codes;
@@ -54,6 +54,24 @@ fn guaranteed(schema: &Schema, tables: &[u32]) -> u64 {
 /// mentions something that is not there.
 fn bad_reference(detail: String) -> ZuError {
     ZuError::gql(codes::C42002, detail)
+}
+
+/// A group variable a match written several ways bound, read behind
+/// that match.
+///
+/// The ways walk different numbers of steps, so the elements the name
+/// stands for are in different places in each of them, and the row that
+/// leaves the fork holds one column per name rather than one per step.
+/// Binding it costs nothing and reading it is what has nowhere to come
+/// from, so the refusal is here and not where the pattern was written.
+fn out_of_reach(name: &str) -> ZuError {
+    bad_reference(format!(
+        "'{name}' stands for what a repeated stretch bound, and the stretch is \
+         written a number of lengths rather than one, so the elements it stands \
+         for are in a different place in each of them; write the lengths as \
+         statements of their own, joined with UNION, where each of them reads a \
+         stretch of one length"
+    ))
 }
 
 /// `22G03 data exception, invalid value type`: the expression is well
@@ -2270,6 +2288,7 @@ fn bind_linear(
         outer: outer.to_vec(),
         captures: Vec::new(),
         groups: HashMap::new(),
+        forked: BTreeSet::new(),
     };
     let mut clauses = Vec::new();
     // Where the clause stands in the whole query rather than in the
@@ -2363,6 +2382,17 @@ struct Binder<'a> {
     /// list out of the row the walk already filled. A query that never
     /// reads the name costs nothing for it.
     groups: HashMap<String, GroupVar>,
+    /// The group variables a match written several ways wrote, which
+    /// are out of reach behind it.
+    ///
+    /// A group is the slots of the walk that bound it, and the ways of
+    /// such a match walk differently, so there is no one list of slots
+    /// to hand the clauses behind the fork. The name is written down
+    /// here instead of being kept, and reading it is refused with that
+    /// as the reason. A query that never reads the name is answered,
+    /// because a binding nothing reads is a binding nothing can tell
+    /// apart from any other.
+    forked: BTreeSet<String>,
 }
 
 /// A group variable: what the elements are and where the row holds them.
@@ -2492,6 +2522,7 @@ impl Binder<'_> {
         let base_scope = self.scope.clone();
         let base_vars = self.variables.clone();
         let base_slots = self.carried();
+        let base_groups: Vec<String> = self.groups.keys().cloned().collect();
         let mut branches: Vec<ForkBranch> = Vec::new();
         // The names the first way bound, in the order it bound them,
         // which is the order every way projects them in.
@@ -2511,14 +2542,13 @@ impl Binder<'_> {
             }
             let pending = self.pending.len();
             let (bound, filter) = self.bind_way(false, way, filter)?;
-            // Three things a way may write that the row between the
+            // Two things a way may write that the row between the
             // parts has nowhere to put. A path variable is assembled
             // from the slots of the walk that bound it and the ways
-            // walk differently, a group variable is not a slot at all,
-            // and an existence block is a match of its own that would
-            // be lifted once per way and run that many times. Each is
-            // refused by name, because a reader who wrote one is owed
-            // the reason rather than a wrong count.
+            // walk differently, and an existence block is a match of
+            // its own that would be lifted once per way and run that
+            // many times. Each is refused by name, because a reader who
+            // wrote one is owed the reason rather than a wrong count.
             if bound.iter().any(|path| path.slot.is_some()) {
                 return Err(ZuError::gql(
                     codes::C42001,
@@ -2528,14 +2558,22 @@ impl Binder<'_> {
                      with UNION",
                 ));
             }
-            if !self.groups.is_empty() {
-                return Err(ZuError::gql(
-                    codes::C42001,
-                    "a group variable stands for what a repeated stretch bound rather \
-                     than for one element, and the alternatives of a match repeat \
-                     different stretches; write the alternatives as statements of their \
-                     own, joined with UNION",
-                ));
+            // A group a way wrote is put out of reach rather than
+            // carried. What the name stands for is the slots of the
+            // walk that bound it, the ways walk different numbers of
+            // steps, and the row between the parts holds one column per
+            // name and not one per step. A way that wrote the name is
+            // still a way that matched, so the walk stands and only the
+            // reading of the name is refused.
+            let wrote_groups: Vec<String> = self
+                .groups
+                .keys()
+                .filter(|name| !base_groups.contains(name))
+                .cloned()
+                .collect();
+            for name in wrote_groups {
+                self.groups.remove(&name);
+                self.forked.insert(name);
             }
             if self.pending.len() != pending {
                 return Err(ZuError::gql(
@@ -3249,6 +3287,7 @@ impl Binder<'_> {
         // carried as a list under a name of its own, which is what
         // projecting the group writes.
         self.groups.clear();
+        self.forked.clear();
         // A WITH's WHERE runs over projected rows, and a mark there
         // would be a match under a projection, which is a shape
         // neither executor has. The block refuses rather than being
@@ -3413,6 +3452,7 @@ impl Binder<'_> {
         }
         self.scope = scope;
         self.groups.clear();
+        self.forked.clear();
         Ok(BoundClause::Project {
             distinct: false,
             items: bound,
@@ -4739,6 +4779,9 @@ impl Binder<'_> {
                     let ty = Type::List(Box::new(group.element.clone()));
                     let items = group.slots.iter().map(|&slot| BoundExpr::Var(slot));
                     return Ok((BoundExpr::List(items.collect()), ty));
+                }
+                if self.forked.contains(name) {
+                    return Err(out_of_reach(name));
                 }
                 // A name the query around this one defined, which this
                 // query may read: it makes the value query expression

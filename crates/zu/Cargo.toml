@@ -145,3 +145,7 @@ harness = false
 [[bench]]
 name = "density"
 harness = false
+
+[[bench]]
+name = "fold"
+harness = false

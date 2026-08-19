@@ -341,6 +341,21 @@ jobs:
       # timed together, so a shared runner cannot move it.
       - run: ZU_GATE=1 cargo bench -p zu --bench paths
 
+  fold:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@v2
+      # The GE09 gate: an aggregate written around a group variable
+      # against the same group read as a list, fifty thousand walks of
+      # eight repetitions. What settles it is the allocator, counted in
+      # the bench itself: the fold asks for nothing over the walk and
+      # the list asks for a kilobyte a row, and neither number moves
+      # with the machine or the load. The clock is a loose second gate,
+      # since the walk in front of the fold is most of what it times.
+      - run: ZU_GATE=1 cargo bench -p zu --bench fold
+
   relprops:
     runs-on: ubuntu-latest
     steps:

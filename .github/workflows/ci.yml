@@ -497,7 +497,7 @@ jobs:
       # `-fno-sanitize-recover` because UBSan prints and carries on by
       # default, and a report nothing acts on is a report nobody reads.
       # The decoder above it gets the same treatment over the same
-      # files, which is 1470 values through the temporal parser and the
+      # files, which is 1475 values through the temporal parser and the
       # float printer on every pull request.
       - name: The C reader and decoder over every case
         run: |

@@ -98,6 +98,11 @@ doc = "Words the parser knows and refuses by name, because a statement that writ
 words = ["MERGE", "SESSION"]
 
 [[group]]
+kind = "keyword"
+doc = "The fields an interval qualifier is written with, and the TO that names a range of them. ISO 21.5 gives a duration a second spelling, a string with a qualifier behind it, and the qualifier is the whole of what says how to read the string: '1-2' is a year and two months under YEAR TO MONTH and is no duration at all under DAY. A field word can only stand behind an interval string, so each of these is an ordinary variable name everywhere else, and DAY is the same kind of word DATE is."
+words = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "TO"]
+
+[[group]]
 kind = "literal"
 doc = "The three values that are written as words."
 words = ["NULL", "TRUE", "FALSE"]

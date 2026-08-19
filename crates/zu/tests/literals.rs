@@ -8,6 +8,7 @@
 //! them.
 
 use zu::query::{Value, run};
+use zu_common::{DurationKind, Temporal};
 use zu_zu1::file::Zu1File;
 
 fn db(dir: &std::path::Path) -> Zu1File {
@@ -230,4 +231,105 @@ fn a_string_takes_every_escape_the_standard_writes() {
     // Digits that name no character, and digits that are not digits.
     assert_eq!(code(&mut db, r"RETURN '\UD800AA' AS v"), "42001");
     assert_eq!(code(&mut db, r"RETURN '\uZZZZ' AS v"), "42001");
+}
+
+/// GL12, the SQL spelling of a duration, which is a string and a
+/// qualifier rather than a string on its own.
+///
+/// The qualifier is what says how to read the string, so the same three
+/// characters are a year and two months under one qualifier and are not
+/// a duration at all under another. That is why ISO makes it required
+/// and why the ISO 8601 spelling keeps its own word, `DURATION`.
+#[test]
+fn a_duration_may_be_written_the_way_sql_writes_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = db(dir.path());
+    let year_month = |months| Value::Temporal(Temporal::Duration(DurationKind::YearMonth, months));
+    let day_time = |nanos| Value::Temporal(Temporal::Duration(DurationKind::DayTime, nanos));
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '1-2' YEAR TO MONTH AS v"),
+        year_month(14)
+    );
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '2' MONTH AS v"),
+        year_month(2)
+    );
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '3 04:05:06' DAY TO SECOND AS v"),
+        day_time(((3 * 24 + 4) * 60 * 60 + 5 * 60 + 6) * 1_000_000_000)
+    );
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '1' DAY AS v"),
+        one(&mut db, "RETURN DURATION 'P1D' AS v")
+    );
+
+    // The same string, two qualifiers, two values.
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '1' HOUR AS v"),
+        day_time(3_600_000_000_000)
+    );
+    assert_eq!(code(&mut db, "RETURN INTERVAL '1-2' DAY AS v"), "22G0H");
+
+    // A sign may stand in front of the string and inside it, and both
+    // negate, so writing both is a duration going forward again.
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL -'1' DAY AS v"),
+        day_time(-86_400_000_000_000)
+    );
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '-1' DAY AS v"),
+        day_time(-86_400_000_000_000)
+    );
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL -'-1' DAY AS v"),
+        day_time(86_400_000_000_000)
+    );
+
+    // Only the leading field runs past its own size, since an hour
+    // written after a day has 24 of them and the calendar says so.
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '25' HOUR AS v"),
+        day_time(90_000_000_000_000)
+    );
+    assert_eq!(
+        code(&mut db, "RETURN INTERVAL '1 25:00:00' DAY TO SECOND AS v"),
+        "22G0H"
+    );
+
+    // A written precision bounds the digits it was written about, and
+    // nothing else: zu's duration types carry one precision each and it
+    // is not the one a literal names.
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '100' DAY(3) AS v"),
+        day_time(8_640_000_000_000_000)
+    );
+    assert_eq!(code(&mut db, "RETURN INTERVAL '1000' DAY(3) AS v"), "22G0H");
+    assert_eq!(
+        one(&mut db, "RETURN INTERVAL '1.123' SECOND(2, 3) AS v"),
+        day_time(1_123_000_000)
+    );
+    assert_eq!(
+        code(&mut db, "RETURN INTERVAL '1.1234' SECOND(2, 3) AS v"),
+        "22G0H"
+    );
+
+    // The qualifier names one run of fields, so the second has to be
+    // smaller than the first and of the same kind, and it is required:
+    // the ISO 8601 spelling is `DURATION` and never `INTERVAL`.
+    assert_eq!(
+        code(&mut db, "RETURN INTERVAL '1' MONTH TO DAY AS v"),
+        "42001"
+    );
+    assert_eq!(
+        code(&mut db, "RETURN INTERVAL '1' SECOND TO DAY AS v"),
+        "42001"
+    );
+    assert_eq!(code(&mut db, "RETURN INTERVAL 'P1D' AS v"), "42001");
+
+    // And INTERVAL is a name again wherever a literal does not follow
+    // it, which is what keeps a subtraction a subtraction.
+    assert_eq!(
+        one(&mut db, "LET interval = 3 RETURN interval - 1 AS v"),
+        Value::Int(2)
+    );
 }

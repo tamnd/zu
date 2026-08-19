@@ -186,7 +186,7 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 `DECIMAL`, `BYTES`, `NODE`, `EDGE`, and `PATH` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
 
-The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1470 values counting the ones inside lists, and both print them the same way.
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1475 values counting the ones inside lists, and both print them the same way.
 
 ## What the Rust runner does not check
 

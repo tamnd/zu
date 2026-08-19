@@ -10,7 +10,9 @@
 //! through one depth guard.
 
 use zu_common::gqlstatus::codes;
-use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
+use zu_common::{
+    Field, IntervalField, IntervalQualifier, LogicalType, RecordType, Result, Temporal, ZuError,
+};
 
 use crate::ast::{
     BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd, ElementDefKind,
@@ -3353,6 +3355,12 @@ impl Parser<'_> {
     /// `None` means this was not a temporal literal at all and the
     /// caller should carry on reading a variable or a call.
     fn temporal_literal(&mut self, name: &str) -> Result<Option<Expr>> {
+        // ISO 21.5 writes a duration two ways, `DURATION 'P1D'` and the
+        // SQL spelling, and the SQL one is a grammar of its own rather
+        // than another string to read.
+        if name.eq_ignore_ascii_case("INTERVAL") {
+            return self.sql_interval_literal();
+        }
         let words = match self.peek() {
             Some(Token {
                 kind: TokenKind::Ident(second),
@@ -3402,6 +3410,172 @@ impl Parser<'_> {
         let value = Temporal::parse(&ty, &text)
             .ok_or_else(|| ZuError::gql(code, format!("'{text}' is not a {ty} anyone can read")))?;
         Ok(Some(Expr::Literal(Literal::Temporal(value))))
+    }
+
+    /// `INTERVAL '3 04:05:06' DAY TO SECOND`, the word already read.
+    ///
+    /// The qualifier is required, because it is what says how to read
+    /// the string: `'1-2'` is a year and two months under `YEAR TO
+    /// MONTH` and is not a duration at all under `DAY`. So the ISO
+    /// 8601 spelling is `DURATION 'P1Y2M'` and never `INTERVAL
+    /// 'P1Y2M'`, which is the standard's own division and is worth
+    /// keeping: two spellings of one thing, one of them not GQL, is
+    /// how a client learns a habit that travels nowhere.
+    ///
+    /// A sign may stand in front of the string and inside it, and both
+    /// negate, so `INTERVAL -'-1' DAY` is one day forward.
+    ///
+    /// `None` means this was not an interval literal and `INTERVAL` is
+    /// an ordinary name here.
+    fn sql_interval_literal(&mut self) -> Result<Option<Expr>> {
+        let signed = self.at(&TokenKind::Minus) || self.at(&TokenKind::Plus);
+        let negative = self.at(&TokenKind::Minus);
+        let at = self.pos + usize::from(signed);
+        let Some(Token {
+            kind: TokenKind::Str(text),
+            ..
+        }) = self.tokens.get(at)
+        else {
+            return Ok(None);
+        };
+        // A sign counts as part of the literal only when the whole
+        // literal stands behind it, because `interval - '1'` is a
+        // subtraction and reading its minus sign as this one would
+        // refuse a statement that means something. With no sign there
+        // is nothing to protect: no expression puts a string straight
+        // after a name.
+        if signed
+            && !matches!(
+                self.tokens.get(at + 1),
+                Some(Token { kind: TokenKind::Ident(word), .. })
+                    if IntervalField::spelled(word).is_some()
+            )
+        {
+            return Ok(None);
+        }
+        let text = text.clone();
+        self.pos = at + 1;
+        let qualifier = self.interval_qualifier()?;
+        let value = Temporal::parse_sql_interval(&text, &qualifier).ok_or_else(|| {
+            ZuError::gql(
+                codes::C22G0H,
+                format!("'{text}' is not a {qualifier} interval anyone can read"),
+            )
+        })?;
+        let value = match (negative, value) {
+            (true, Temporal::Duration(kind, count)) => Temporal::Duration(kind, -count),
+            (_, value) => value,
+        };
+        Ok(Some(Expr::Literal(Literal::Temporal(value))))
+    }
+
+    /// The `DAY`, `YEAR TO MONTH` or `SECOND(3)` behind an interval
+    /// string.
+    ///
+    /// The two fields have to be the same kind of duration and the
+    /// second has to be smaller than the first, which is one rule and
+    /// not two: `MONTH TO DAY` fails both and there is no duration it
+    /// could mean, since months and nanoseconds do not mix.
+    fn interval_qualifier(&mut self) -> Result<IntervalQualifier> {
+        let start = self.interval_field()?;
+        let mut leading = None;
+        let mut fraction = None;
+        // The precision after the first field is the digits its own
+        // value may have, and after `SECOND` a second number may
+        // follow, which is the digits after the point.
+        if self.at(&TokenKind::LParen) {
+            let (first, second) = self.interval_precision()?;
+            leading = Some(first);
+            match (start, second) {
+                (IntervalField::Second, second) => fraction = second,
+                (_, Some(_)) => {
+                    return Err(self.error("one precision, since only SECOND takes two"));
+                }
+                (_, None) => {}
+            }
+        }
+        let mut end = start;
+        if self.at_kw("TO") {
+            let to = self.pos;
+            self.pos += 1;
+            end = self.interval_field()?;
+            if self.at(&TokenKind::LParen) {
+                if end != IntervalField::Second {
+                    return Err(self.error("a comma or the end of the qualifier"));
+                }
+                let (first, second) = self.interval_precision()?;
+                if second.is_some() {
+                    return Err(self.error("one precision, since a fraction is one number"));
+                }
+                fraction = Some(first);
+            }
+            if start.kind() != end.kind() || start.rank() >= end.rank() {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    self.tokens[to].start,
+                    format_args!(
+                        "{} is not a field {} runs to, since a qualifier names one run of fields and a year is not a day",
+                        end.word(),
+                        start.word()
+                    ),
+                ));
+            }
+        }
+        Ok(IntervalQualifier {
+            start,
+            end,
+            leading,
+            fraction,
+        })
+    }
+
+    /// One of the six words a qualifier is written with.
+    fn interval_field(&mut self) -> Result<IntervalField> {
+        let field = match self.peek() {
+            Some(Token {
+                kind: TokenKind::Ident(word),
+                ..
+            }) => IntervalField::spelled(word),
+            _ => None,
+        };
+        match field {
+            Some(field) => {
+                self.pos += 1;
+                Ok(field)
+            }
+            None => Err(self.error("YEAR, MONTH, DAY, HOUR, MINUTE or SECOND")),
+        }
+    }
+
+    /// `(3)` or `(3, 6)`, the parenthesis unconsumed.
+    fn interval_precision(&mut self) -> Result<(u32, Option<u32>)> {
+        self.expect(&TokenKind::LParen)?;
+        let first = self.interval_digits(1)?;
+        let second = match self.eat(&TokenKind::Comma) {
+            true => Some(self.interval_digits(0)?),
+            false => None,
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok((first, second))
+    }
+
+    /// A digit count in a precision. The fraction may be none, since
+    /// seconds to no decimal places is a thing to ask for, and the
+    /// leading field may not, since a field of no digits holds no
+    /// value at all.
+    fn interval_digits(&mut self, least: u64) -> Result<u32> {
+        match self.peek() {
+            Some(Token {
+                kind: TokenKind::Int(count),
+                ..
+            }) if (least..=9).contains(count) => {
+                let count = *count as u32;
+                self.pos += 1;
+                Ok(count)
+            }
+            _ => Err(self.error(&format!("a digit count from {least} to 9"))),
+        }
     }
 
     /// A bracketed, comma separated argument list, the opening

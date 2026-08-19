@@ -657,11 +657,19 @@
           "named": true
         },
         {
+          "type": "match_clause",
+          "named": true
+        },
+        {
           "type": "match_mode",
           "named": true
         },
         {
           "type": "pattern",
+          "named": true
+        },
+        {
+          "type": "query",
           "named": true
         },
         {

@@ -935,6 +935,16 @@ pub struct BoundQuery {
     /// from the rows around it answers the same value for all of them
     /// and is worked out once.
     pub captures: Vec<Capture>,
+    /// True when what is written around this query asks only whether it
+    /// answered a row, which is what `EXISTS { ... }` says (ISO 19.4).
+    ///
+    /// It rides here rather than beside the expression that reads it
+    /// because the executor reaches these queries by the index the
+    /// expression holds and has nothing else to tell them apart by.
+    /// What it changes is the answer and the work: the run stops at the
+    /// first row, the columns are never read, and several rows are an
+    /// answer rather than the error a value query would raise.
+    pub exists: bool,
 }
 
 /// One name a value query expression reads from the query around it
@@ -1804,6 +1814,25 @@ fn spread_params(query: &mut BoundQuery, all: &[String]) {
     }
 }
 
+/// The first name this query writes that the query around it already
+/// wrote, if it wrote any.
+///
+/// A query written inside an expression shares no slots with the one
+/// around it, so a name in both is one word standing for two things.
+/// Every operand of a composite is asked, since each writes names of
+/// its own, and the queries written inside this one are not: their
+/// names were checked against this scope when they were bound.
+fn shadowed(query: &BoundQuery, outer: &[String]) -> Option<String> {
+    let mut mine = query.variables.iter().map(|v| &v.name);
+    if let Some(name) = mine.find(|name| outer.iter().any(|o| o == *name)) {
+        return Some(name.clone());
+    }
+    query
+        .conjoined
+        .iter()
+        .find_map(|joined| shadowed(&joined.query, outer))
+}
+
 /// Whether a bound clause changes the graph.
 fn writes(clause: &BoundClause) -> bool {
     matches!(
@@ -2022,6 +2051,7 @@ fn bind_linear(
         conjoined: Vec::new(),
         scalars: binder.scalars,
         captures: binder.captures,
+        exists: false,
     })
 }
 
@@ -4270,6 +4300,7 @@ impl Binder<'_> {
             Expr::Exists { patterns, filter } => {
                 Ok((self.bind_mark(patterns, filter, false)?, Type::Bool))
             }
+            Expr::ExistsQuery(query) => self.bind_exists_query(query),
             Expr::ValueQuery(query) => self.bind_value_query(query),
         }
     }
@@ -4344,24 +4375,7 @@ impl Binder<'_> {
     /// one that read a name is worked out per row of the query it
     /// stands in, and the names it read are its captures.
     fn bind_value_query(&mut self, query: &ast::Query) -> Result<(BoundExpr, Type)> {
-        if query.use_graph.is_some() {
-            return Err(invalid(
-                "a VALUE query runs in the graph the statement runs in, so it may not carry a USE of its own".into(),
-            ));
-        }
-        let mut params = std::mem::take(&mut self.params);
-        let mut outer = self.outer.clone();
-        outer.extend(self.scope.keys().cloned());
-        let mut bound = bind_body(&query.body, self.schema, &mut params, &outer)?;
-        self.params = params;
-        self.settle_captures(&mut bound);
-        let mut wrote = false;
-        bound.walk(&mut |q| wrote |= q.clauses.iter().any(writes));
-        if wrote {
-            return Err(invalid(
-                "a VALUE query stands for a value and is read where one belongs, so it may not write to the graph".into(),
-            ));
-        }
+        let bound = self.bind_nested(query, "VALUE")?;
         if bound.columns.len() != 1 {
             return Err(invalid(format!(
                 "a VALUE query stands for one value, so it has to return one column, and this one returns {}",
@@ -4372,15 +4386,69 @@ impl Binder<'_> {
             Some(BoundClause::Project { items, .. }) if items.len() == 1 => items[0].ty.clone(),
             _ => Type::Any,
         };
+        Ok((self.keep_nested(bound), ty))
+    }
+
+    /// The third shape of the existence predicate (ISO 19.4):
+    /// `EXISTS { ... }` around a whole query rather than a block of
+    /// matches.
+    ///
+    /// It binds the way a value query does, since it is the same thing
+    /// written for a different reason, and differs in what is read off
+    /// the end. Nothing here asks what the query returns or how many
+    /// columns it returns, because the answer is whether it answered a
+    /// row at all, and that is why the query is marked: the executor
+    /// stops it at the first row rather than running it out.
+    fn bind_exists_query(&mut self, query: &ast::Query) -> Result<(BoundExpr, Type)> {
+        let mut bound = self.bind_nested(query, "EXISTS")?;
+        bound.exists = true;
+        Ok((self.keep_nested(bound), Type::Bool))
+    }
+
+    /// Binds the query a `VALUE` or an `EXISTS` was written around,
+    /// with the scope of the query here behind it.
+    fn bind_nested(&mut self, query: &ast::Query, word: &str) -> Result<BoundQuery> {
+        if query.use_graph.is_some() {
+            return Err(invalid(format!(
+                "a query written inside {word} runs in the graph the statement runs in, so it may not carry a USE of its own"
+            )));
+        }
+        let mut params = std::mem::take(&mut self.params);
+        let mut outer = self.outer.clone();
+        outer.extend(self.scope.keys().cloned());
+        let mut bound = bind_body(&query.body, self.schema, &mut params, &outer)?;
+        self.params = params;
+        // A name the query around this one already has is read out of
+        // that row, so a pattern in here that writes the same name
+        // would be two different elements under one word: the read
+        // would be the row's and the pattern would match anything. The
+        // block form is where a pattern and the row share an element,
+        // so that is what the message points at.
+        if let Some(name) = shadowed(&bound, &outer) {
+            return Err(invalid(format!(
+                "'{name}' is a name the query around this {word} already wrote, so a pattern in here writing it again would mean two elements at once: rename it, or write the block form, where the pattern and the row are the same element"
+            )));
+        }
+        self.settle_captures(&mut bound);
+        let mut wrote = false;
+        bound.walk(&mut |q| wrote |= q.clauses.iter().any(writes));
+        if wrote {
+            return Err(invalid(format!(
+                "a query written inside {word} is read where a value belongs, so it may not write to the graph"
+            )));
+        }
+        Ok(bound)
+    }
+
+    /// Files a bound nested query where the executor reaches it and
+    /// answers the expression that reads it by index.
+    fn keep_nested(&mut self, bound: BoundQuery) -> BoundExpr {
         let reads = bound.captures.iter().map(|c| c.slot).collect();
         self.scalars.push(bound);
-        Ok((
-            BoundExpr::Scalar {
-                ix: self.scalars.len() - 1,
-                reads,
-            },
-            ty,
-        ))
+        BoundExpr::Scalar {
+            ix: self.scalars.len() - 1,
+            reads,
+        }
     }
 
     /// Whether an expression reads a group variable, which is what tells
@@ -4811,7 +4879,7 @@ pub fn text(expr: &Expr) -> String {
         // The patterns are not rendered: this text names a column and
         // titles an operator, and a whole match inside one of those
         // reads worse than the word does.
-        Expr::Exists { .. } => "EXISTS { ... }".into(),
+        Expr::Exists { .. } | Expr::ExistsQuery(_) => "EXISTS { ... }".into(),
         Expr::ValueQuery(_) => "VALUE { ... }".into(),
     }
 }

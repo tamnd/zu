@@ -1220,6 +1220,15 @@ impl Parser<'_> {
     /// statement that writes has no result table, and one value is
     /// what this stands for.
     fn parse_nested_query(&mut self) -> Result<Query> {
+        self.parse_nested_query_named("VALUE")
+    }
+
+    /// The same, for the two words that carry one. An `EXISTS` reads
+    /// only whether the query answered a row and a `VALUE` reads the
+    /// value in it, but both hold a query that ends with a RETURN, and
+    /// the word is carried in so the message names the one that was
+    /// written.
+    fn parse_nested_query_named(&mut self, word: &str) -> Result<Query> {
         let at = self.peek().map(|t| t.start).unwrap_or(0);
         self.expect(&TokenKind::LBrace)?;
         let (query, ending) = self.parse_query_body()?;
@@ -1228,7 +1237,7 @@ impl Parser<'_> {
                 codes::C42001,
                 self.source,
                 at,
-                "a VALUE query stands for one value, so it has to end with RETURN",
+                format_args!("a query written inside {word} has to end with RETURN"),
             ));
         }
         self.expect(&TokenKind::RBrace)?;
@@ -1325,7 +1334,7 @@ impl Parser<'_> {
                 // null, which is why the whole block becomes one
                 // bracketed group rather than a group per statement.
                 let (patterns, filter) = if optional && self.at(&TokenKind::LBrace) {
-                    self.parse_match_block()?
+                    self.parse_match_block(&TokenKind::RBrace)?
                 } else {
                     self.expect_kw("MATCH")?;
                     let patterns = self.parse_graph_pattern()?;
@@ -2857,9 +2866,12 @@ impl Parser<'_> {
         }
         // EXISTS carries a match rather than an expression, so it is
         // taken here for the same reason CAST is below: no expression
-        // grammar produces a pattern. A brace has to follow, which
-        // leaves `exists` free to be an ordinary variable name.
-        if name.eq_ignore_ascii_case("EXISTS") && self.at(&TokenKind::LBrace) {
+        // grammar produces a pattern. A brace or a parenthesis has to
+        // follow, which leaves `exists` free to be an ordinary variable
+        // name everywhere else.
+        if name.eq_ignore_ascii_case("EXISTS")
+            && (self.at(&TokenKind::LBrace) || self.at(&TokenKind::LParen))
+        {
             return self.parse_exists();
         }
         // GQ18, and here for the same reason EXISTS is: VALUE carries
@@ -2927,18 +2939,74 @@ impl Parser<'_> {
         Ok(YieldItem { name, alias })
     }
 
+    /// The existence predicate in all three of the shapes ISO 19.4
+    /// writes it in, the opener unconsumed and EXISTS already read.
+    ///
+    /// A graph pattern and a match statement block are the same thing
+    /// to the parser, a block being a pattern with more matches behind
+    /// it, and either may stand in braces or in parentheses. The third
+    /// shape is a whole query, which only braces may hold, and it is
+    /// told from the other two by the RETURN it has to end with: a
+    /// block of matches has no clause that returns anything, so a
+    /// RETURN written at the top level of the block is a query and
+    /// nothing else it could be.
     fn parse_exists(&mut self) -> Result<Expr> {
-        let (patterns, filter) = self.parse_match_block()?;
+        if self.at(&TokenKind::LBrace) && self.block_returns() {
+            let query = self.parse_nested_query_named("EXISTS")?;
+            return Ok(Expr::ExistsQuery(Box::new(query)));
+        }
+        let closer = match self.at(&TokenKind::LParen) {
+            true => TokenKind::RParen,
+            false => TokenKind::RBrace,
+        };
+        let (patterns, filter) = self.parse_match_block(&closer)?;
         Ok(Expr::Exists {
             patterns,
             filter: filter.map(Box::new),
         })
     }
 
-    /// A match statement block, `{ MATCH ... MATCH ... }`, the brace
+    /// Whether the block starting at the brace in hand holds a RETURN
+    /// of its own, which is what tells a nested query from a block of
+    /// matches.
+    ///
+    /// Only the block's own level counts, so a RETURN inside a query
+    /// nested one deeper belongs to that one and is stepped over with
+    /// the depth. A name written after a dot is a property and not the
+    /// clause however it is spelled, which is the one way the word can
+    /// appear here without being the clause.
+    fn block_returns(&self) -> bool {
+        let mut depth = 0usize;
+        let mut after_dot = false;
+        for token in &self.tokens[self.pos..] {
+            match &token.kind {
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                TokenKind::Ident(word)
+                    if depth == 1 && !after_dot && word.eq_ignore_ascii_case("RETURN") =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            after_dot = matches!(token.kind, TokenKind::Dot);
+        }
+        false
+    }
+
+    /// A match statement block, `{ MATCH ... MATCH ... }`, the opener
     /// unconsumed. GQ21 and GQ22 both take one: an `EXISTS` asks
     /// whether it answers a row and an `OPTIONAL` keeps what it
     /// answered, but the block itself is the same thing in both.
+    ///
+    /// The closer says which brackets hold it, since ISO 19.4 lets an
+    /// existence predicate write parentheses where an `OPTIONAL` has
+    /// to write braces. They enclose the same block either way.
     ///
     /// The first MATCH is optional because a block that holds one
     /// statement can hold nothing else, so writing it is a courtesy to
@@ -2950,8 +3018,15 @@ impl Parser<'_> {
     /// exact because nothing inside a block is optional, so no
     /// statement can hand the next one a null that a condition would
     /// have read differently had it run earlier.
-    fn parse_match_block(&mut self) -> Result<(Vec<PathPattern>, Option<Expr>)> {
-        self.expect(&TokenKind::LBrace)?;
+    fn parse_match_block(
+        &mut self,
+        closer: &TokenKind,
+    ) -> Result<(Vec<PathPattern>, Option<Expr>)> {
+        let opener = match closer {
+            TokenKind::RParen => TokenKind::LParen,
+            _ => TokenKind::LBrace,
+        };
+        self.expect(&opener)?;
         self.eat_kw("MATCH");
         let mut patterns = Vec::new();
         let mut filter: Option<Expr> = None;
@@ -2971,7 +3046,7 @@ impl Parser<'_> {
                 break;
             }
         }
-        self.expect(&TokenKind::RBrace)?;
+        self.expect(closer)?;
         Ok((patterns, filter))
     }
 
@@ -4864,8 +4939,8 @@ mod tests {
 
     #[test]
     fn exists_is_still_a_name_without_a_block() {
-        // Only a brace makes it the predicate, so a variable or a
-        // function of that name reads the way it always did.
+        // Only an opening bracket makes it the predicate, so a variable
+        // of that name reads the way it always did.
         let q = parsed("MATCH (exists:Person) RETURN exists.id AS id");
         let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
@@ -4874,10 +4949,43 @@ mod tests {
     }
 
     #[test]
+    fn exists_reads_all_three_of_the_shapes_it_is_written_in() {
+        // A pattern, a block of matches and a whole query, the first
+        // two of them in either brackets and the third in braces
+        // only, which is ISO 19.4 read straight off.
+        for source in [
+            "MATCH (a) WHERE EXISTS { (a)-[:KNOWS]->(b) } RETURN a",
+            "MATCH (a) WHERE EXISTS ( (a)-[:KNOWS]->(b) ) RETURN a",
+            "MATCH (a) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) MATCH (b)-[:KNOWS]->(c) } RETURN a",
+            "MATCH (a) WHERE EXISTS ( MATCH (a)-[:KNOWS]->(b) MATCH (b)-[:KNOWS]->(c) ) RETURN a",
+        ] {
+            let q = parsed(source);
+            let Clause::Match { filter, .. } = &q.clauses()[0] else {
+                panic!("MATCH");
+            };
+            assert!(
+                matches!(filter, Some(Expr::Exists { .. })),
+                "the block form, got {filter:?} from {source}"
+            );
+        }
+        let q = parsed("MATCH (a) WHERE EXISTS { MATCH (b) RETURN b } RETURN a");
+        let Clause::Match { filter, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        assert!(matches!(filter, Some(Expr::ExistsQuery(_))), "{filter:?}");
+    }
+
+    #[test]
     fn exists_refuses_what_a_predicate_cannot_use() {
-        assert!(parse_err("MATCH (a) WHERE EXISTS { RETURN 1 } RETURN a").contains("expected"));
+        // A block is not a query and takes no clause that pages or
+        // orders one, and parentheses hold a block and never a query,
+        // which is the standard's rule and not this parser's.
         assert!(
-            parse_err("MATCH (a) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) RETURN b } RETURN a")
+            parse_err("MATCH (a) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) LIMIT 1 } RETURN a")
+                .contains("expected")
+        );
+        assert!(
+            parse_err("MATCH (a) WHERE EXISTS ( MATCH (b) RETURN b ) RETURN a")
                 .contains("expected")
         );
     }

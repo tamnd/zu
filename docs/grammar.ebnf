@@ -140,8 +140,9 @@ yield_item      = name , [ "AS" , name ] ;
    they write, so an OPTIONAL over a block keeps what the whole block
    answered or nulls every name in it, and an EXISTS over one asks
    whether it answered a row at all. *)
-match_block     = "{" , [ "MATCH" ] , pattern , [ where_clause ] ,
-                  { "MATCH" , pattern , [ where_clause ] } , "}" ;
+match_block     = "{" , match_statements , "}" ;
+match_statements = [ "MATCH" ] , pattern , [ where_clause ] ,
+                  { "MATCH" , pattern , [ where_clause ] } ;
 (* GQ10, GQ11 and GQ24, ISO 14.8. One row per element of a list, with
    an optional counter over the elements: ORDINALITY counts from one
    and OFFSET from zero. The WITH here is read two tokens at a time,
@@ -387,12 +388,19 @@ nullif          = "NULLIF" , "(" , expression , "," , expression , ")" ;
    ALL_DIFFERENT and SAME (G113, G114) are ordinary calls, since their
    arguments are the elements themselves. *)
 property_exists = "PROPERTY_EXISTS" , "(" , expression , "," , name , ")" ;
-(* An existence block is a match written where a predicate goes, so it
-   is grammar here and a clause everywhere else: it may be a whole
-   conjunct of a WHERE, on its own or under one NOT, and nowhere a value
-   is wanted. The brace is what tells it apart from a variable called
-   exists. *)
-exists_block    = "EXISTS" , match_block ;
+(* ISO 19.4. An existence predicate asks whether something matched, and
+   the standard writes three things after the word: a graph pattern, a
+   block of match statements, and a whole query. Braces hold any of the
+   three and parentheses hold the first two, a query in parentheses not
+   being a shape the standard offers. The RETURN is what tells a query
+   from a block, since a block answers the names its patterns wrote and
+   a query answers the columns it returns. What the query returns is
+   never read, only whether it returned a row, so a query answering no
+   row is false where a value query would have been null. The bracket
+   is what tells the whole thing apart from a variable called exists. *)
+exists_block    = "EXISTS" , ( "{" , ( match_statements
+                                     | composite_query ) , "}"
+                             | "(" , match_statements , ")" ) ;
 (* GQ18, ISO 20.6. A whole query written where one value belongs. It is
    a query and not a block: it may chain with NEXT, join with a set
    operator and end with an ORDER BY and a LIMIT, and it has to end with

@@ -211,24 +211,135 @@ MATCH (a) WHERE exists { MATCH (a)-[:KNOWS]->(b) WHERE b.age > 30 } RETURN a
       (where_clause
         (exists_block
           (identifier)
-          (pattern
-            (path
-              (node
-                (identifier))
-              (relationship
-                (rel_detail
-                  (label
+          (query
+            (match_clause
+              (pattern
+                (path
+                  (node
+                    (identifier))
+                  (relationship
+                    (rel_detail
+                      (label
+                        (identifier))))
+                  (node
                     (identifier))))
-              (node
-                (identifier))))
-          (where_clause
-            (binary_expression
-              (property_access
-                (variable
+              (where_clause
+                (binary_expression
+                  (property_access
+                    (variable
+                      (identifier))
+                    (identifier))
+                  (literal
+                    (integer)))))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A pattern written where a predicate goes, in braces and in parentheses
+================================================================================
+
+MATCH (a) WHERE exists { (a)-[:KNOWS]->(b) } AND exists ( (a)-[:LIKES]->(c) ) RETURN a
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))))
+      (where_clause
+        (binary_expression
+          (exists_block
+            (identifier)
+            (pattern
+              (path
+                (node
                   (identifier))
-                (identifier))
-              (literal
-                (integer)))))))
+                (relationship
+                  (rel_detail
+                    (label
+                      (identifier))))
+                (node
+                  (identifier)))))
+          (exists_block
+            (identifier)
+            (pattern
+              (path
+                (node
+                  (identifier))
+                (relationship
+                  (rel_detail
+                    (label
+                      (identifier))))
+                (node
+                  (identifier))))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))
+
+================================================================================
+A block of matches in parentheses, and a whole query in braces
+================================================================================
+
+MATCH (a) WHERE exists ( MATCH (a)-[:KNOWS]->(b) MATCH (b)-[:KNOWS]->(c) ) AND exists { MATCH (d) RETURN d.age } RETURN a
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))))
+      (where_clause
+        (binary_expression
+          (exists_block
+            (identifier)
+            (match_clause
+              (pattern
+                (path
+                  (node
+                    (identifier))
+                  (relationship
+                    (rel_detail
+                      (label
+                        (identifier))))
+                  (node
+                    (identifier)))))
+            (match_clause
+              (pattern
+                (path
+                  (node
+                    (identifier))
+                  (relationship
+                    (rel_detail
+                      (label
+                        (identifier))))
+                  (node
+                    (identifier))))))
+          (exists_block
+            (identifier)
+            (query
+              (match_clause
+                (pattern
+                  (path
+                    (node
+                      (identifier)))))
+              (return_clause
+                (projection
+                  (projection_item
+                    (property_access
+                      (variable
+                        (identifier))
+                      (identifier))))))))))
     (return_clause
       (projection
         (projection_item

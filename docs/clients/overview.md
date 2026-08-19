@@ -49,8 +49,8 @@ The practice score, today, out of what the client's tier asks for. What is missi
 
 | Client | Tier | Practice | Needs | Missing |
 |---|---|---|---|---|
-| [zu-python](https://github.com/tamnd/zu-python) | 1 | 60 | 90 | `reference`, `install`, `stability`, `api-map`, `perf` |
-| [zu-node](https://github.com/tamnd/zu-node) | 1 | 50 | 90 | `quickstart`, `reference`, `install`, `stability`, `api-map`, `perf` |
+| [zu-python](https://github.com/tamnd/zu-python) | 1 | 90 | 90 | `api-map`, `perf` |
+| [zu-node](https://github.com/tamnd/zu-node) | 1 | 90 | 90 | `api-map`, `perf` |
 | [zu-go](https://github.com/tamnd/zu-go) | 1 | 0 | 90 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
 | [zu-java](https://github.com/tamnd/zu-java) | 1 | 0 | 90 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability`, `api-map`, `perf` |
 | [zu-c](https://github.com/tamnd/zu-c) | 1 | 0 | 90 | `quickstart`, `reference`, `idiom`, `conditions`, `misuse`, `leaks`, `install`, `stability` |

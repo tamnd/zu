@@ -253,6 +253,17 @@ const NOTES: &[&str] = &[
      list of them in the order the walk took them, reading a property of it answers the list of \
      the properties, and an aggregate written around it folds that row's bindings rather than \
      the rows, which is one row in and one row out and no grouping under it",
+    "six predicates ask about an element the statement already bound rather than about the rows \
+     a pattern is walking: IS DIRECTED holds of an edge whose table stores a direction and is \
+     refused of a node, which has none to answer with; IS LABELED asks the label expression a \
+     pattern would write after a colon, reading the labels a node's row carries and the name of \
+     the table an edge is in; IS SOURCE OF and IS DESTINATION OF relate a node to an edge, \
+     which is a comparison and not another read of the graph because an edge value carries both \
+     of its ends; ALL_DIFFERENT and SAME compare element identity and are written of at least \
+     two elements, one element being the same as itself and different from nothing; and \
+     PROPERTY_EXISTS asks whether an element carries a property without reading it, so a \
+     property that is there and null is there. All six answer null over an element that is \
+     null, which is the reading an unmatched optional row gets",
     "a path variable binds the walk as a path value rather than as the list of the same \
      elements, so PATH builds one, PATH_LENGTH counts its edges, ELEMENTS answers its nodes \
      and edges as a list in the order they were walked, and two paths over the same elements \

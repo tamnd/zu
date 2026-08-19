@@ -393,7 +393,16 @@ module.exports = grammar({
           $._expression,
           kw("IS"),
           optional(kw("NOT")),
-          choice(kw("NULL"), seq(kw("TYPED"), $.value_type)),
+          // The word behind IS is what tells the five readings
+          // apart: the null test, the type test, and the three
+          // pattern predicates (G110, G111, G112).
+          choice(
+            kw("NULL"),
+            seq(kw("TYPED"), $.value_type),
+            kw("DIRECTED"),
+            seq(kw("LABELED"), $.label_expr),
+            seq(choice(kw("SOURCE"), kw("DESTINATION")), kw("OF"), $._expression),
+          ),
         ),
       ),
 

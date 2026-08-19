@@ -1520,6 +1520,14 @@ pub enum Func {
     /// to read what a path holds, since a path is a value rather than
     /// a list and nothing else indexes into it.
     Elements,
+    /// G113. Whether the elements named are all different elements.
+    /// It is written like a call and reads like one, so it is one,
+    /// which is what keeps the parser free of a predicate that would
+    /// otherwise need a keyword of its own.
+    AllDifferent,
+    /// G114. The other half of the same question: whether the elements
+    /// named are all the same element.
+    Same,
 }
 
 impl Func {
@@ -1537,6 +1545,8 @@ impl Func {
             "cardinality" => Func::Cardinality,
             "path_length" => Func::PathLength,
             "elements" => Func::Elements,
+            "all_different" => Func::AllDifferent,
+            "same" => Func::Same,
             _ => return None,
         })
     }
@@ -1620,6 +1630,49 @@ pub enum BoundExpr {
     HasLabels {
         slot: usize,
         test: LabelTest,
+    },
+    /// G110. `expr IS [NOT] DIRECTED`. Which rel tables hold
+    /// undirected edges is in the schema and the executor has none, so
+    /// the binder writes the tables out here, sorted by id. Almost
+    /// every graph leaves this empty, which is the answer true for
+    /// every edge.
+    IsDirected {
+        expr: Box<BoundExpr>,
+        undirected: Vec<u32>,
+        negated: bool,
+    },
+    /// G111. `expr IS [NOT] LABELED <label expression>`.
+    ///
+    /// A node answers with the word its row carries, the way a pattern
+    /// does. An edge carries no word: its label is the name of the
+    /// table it is in, so the binder asks the expression of each rel
+    /// table's name once and writes down the tables that said yes.
+    IsLabeled {
+        expr: Box<BoundExpr>,
+        node: LabelTest,
+        rels: Vec<u32>,
+        negated: bool,
+    },
+    /// G112. `node IS [NOT] SOURCE OF edge`, and the destination twin.
+    ///
+    /// An edge value already holds the rows of both of its ends, so the
+    /// test is one comparison once the tables agree. Which node table
+    /// each end is in is the schema's answer and is written out here,
+    /// as `(rel table, from table, to table)` sorted by the first.
+    IsEndpoint {
+        node: Box<BoundExpr>,
+        rel: Box<BoundExpr>,
+        end: ast::EdgeEnd,
+        ends: Vec<(u32, u32, u32)>,
+        negated: bool,
+    },
+    /// G115. `PROPERTY_EXISTS(element, name)`: whether the element
+    /// carries a property of this name, which is a question about the
+    /// element's table and not about the value stored there, so a
+    /// property that is present and null answers true.
+    PropertyExists {
+        expr: Box<BoundExpr>,
+        key: String,
     },
     /// GQ18. A value query expression, as an index into
     /// [`BoundQuery::scalars`].
@@ -1783,6 +1836,22 @@ fn agree_on_columns(left: &BoundQuery, right: &BoundQuery, how: ast::Conjunction
     Ok(())
 }
 
+/// Whether a label expression holds of an element whose whole label
+/// set is one name, which is what an edge carries: the name of the
+/// table it is in (G111). The label dictionary is the node tables', so
+/// an edge cannot be asked with a bit test and is asked by name here
+/// instead, once per table at bind time rather than once per row.
+fn label_holds(expr: &ast::LabelExpr, name: &str) -> bool {
+    match expr {
+        ast::LabelExpr::Label(label) => label == name,
+        // Every edge carries the label its table's name is.
+        ast::LabelExpr::Wildcard => true,
+        ast::LabelExpr::Not(inner) => !label_holds(inner, name),
+        ast::LabelExpr::And(lhs, rhs) => label_holds(lhs, name) && label_holds(rhs, name),
+        ast::LabelExpr::Or(lhs, rhs) => label_holds(lhs, name) || label_holds(rhs, name),
+    }
+}
+
 /// Every slot a bound expression reads.
 ///
 /// The set is whatever the caller keeps them in, since the executor
@@ -1827,6 +1896,13 @@ pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
             }
         }
         BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
+        BoundExpr::IsDirected { expr, .. }
+        | BoundExpr::IsLabeled { expr, .. }
+        | BoundExpr::PropertyExists { expr, .. } => expr_slots(expr, out),
+        BoundExpr::IsEndpoint { node, rel, .. } => {
+            expr_slots(node, out);
+            expr_slots(rel, out);
+        }
     }
 }
 
@@ -3869,6 +3945,117 @@ impl Binder<'_> {
                     Type::Bool,
                 ))
             }
+            // G110. Only an edge has a direction, so a node here is a
+            // question with no answer rather than one answered no.
+            Expr::IsDirected { expr, negated } => {
+                let (bound, ty) = self.bind_expr(expr, ctx)?;
+                if !matches!(ty, Type::Rel | Type::Any) {
+                    return Err(bad_type(format!(
+                        "IS DIRECTED asks about an edge, got {ty}"
+                    )));
+                }
+                let undirected = self
+                    .schema
+                    .rels()
+                    .iter()
+                    .filter(|rel| rel.undirected)
+                    .map(|rel| rel.id)
+                    .collect();
+                Ok((
+                    BoundExpr::IsDirected {
+                        expr: Box::new(bound),
+                        undirected,
+                        negated: *negated,
+                    },
+                    Type::Bool,
+                ))
+            }
+            // G111. Nodes and edges both carry labels, so this one is
+            // asked of either and refuses everything else.
+            Expr::IsLabeled {
+                expr,
+                label,
+                negated,
+            } => {
+                let (bound, ty) = self.bind_expr(expr, ctx)?;
+                if !matches!(ty, Type::Node | Type::Rel | Type::Any) {
+                    return Err(bad_type(format!(
+                        "IS LABELED asks about a node or an edge, got {ty}"
+                    )));
+                }
+                let rels = self
+                    .schema
+                    .rels()
+                    .iter()
+                    .filter(|rel| label_holds(label, &rel.name))
+                    .map(|rel| rel.id)
+                    .collect();
+                Ok((
+                    BoundExpr::IsLabeled {
+                        expr: Box::new(bound),
+                        node: self.compile_label(label)?,
+                        rels,
+                        negated: *negated,
+                    },
+                    Type::Bool,
+                ))
+            }
+            // G112. A node and an edge, in that order, whichever end
+            // the query asked about.
+            Expr::IsEndpoint {
+                node,
+                rel,
+                end,
+                negated,
+            } => {
+                let (bound_node, node_ty) = self.bind_expr(node, ctx)?;
+                let (bound_rel, rel_ty) = self.bind_expr(rel, ctx)?;
+                if !matches!(node_ty, Type::Node | Type::Any) {
+                    return Err(bad_type(format!(
+                        "IS {} OF asks about a node, got {node_ty}",
+                        end.text()
+                    )));
+                }
+                if !matches!(rel_ty, Type::Rel | Type::Any) {
+                    return Err(bad_type(format!(
+                        "IS {} OF names an edge, got {rel_ty}",
+                        end.text()
+                    )));
+                }
+                let ends = self
+                    .schema
+                    .rels()
+                    .iter()
+                    .map(|rel| (rel.id, rel.from, rel.to))
+                    .collect();
+                Ok((
+                    BoundExpr::IsEndpoint {
+                        node: Box::new(bound_node),
+                        rel: Box::new(bound_rel),
+                        end: *end,
+                        ends,
+                        negated: *negated,
+                    },
+                    Type::Bool,
+                ))
+            }
+            // G115. The element is a node or an edge for the reason a
+            // property read is: nothing else has properties.
+            Expr::PropertyExists { expr, key } => {
+                let (bound, ty) = self.bind_expr(expr, ctx)?;
+                if !matches!(ty, Type::Node | Type::Rel | Type::Any) {
+                    return Err(bad_type(format!(
+                        "PROPERTY_EXISTS asks about a node or an edge, got {ty}"
+                    )));
+                }
+                Ok((
+                    BoundExpr::PropertyExists {
+                        expr: Box::new(bound),
+                        key: key.clone(),
+                    },
+                    Type::Bool,
+                ))
+            }
             Expr::Call {
                 name,
                 distinct,
@@ -4162,8 +4349,12 @@ impl Binder<'_> {
         if star && func != Func::Count {
             return Err(invalid(format!("only count(*) takes *, not {name}(*)")));
         }
+        // G113 and G114 are the two that take a list of elements rather
+        // than one value, and how many they need is their own rule,
+        // checked below with the types.
+        let variadic = matches!(func, Func::AllDifferent | Func::Same);
         let want = if func == Func::Count && star { 0 } else { 1 };
-        if args.len() != want {
+        if !variadic && args.len() != want {
             return Err(invalid(format!(
                 "{name}() takes {want} argument(s), got {}",
                 args.len()
@@ -4175,9 +4366,11 @@ impl Binder<'_> {
         }
         let mut bound = Vec::new();
         let mut arg_ty = Type::Any;
+        let mut arg_tys = Vec::new();
         for arg in args {
             let (b, t) = self.bind_expr(arg, ctx)?;
-            arg_ty = t;
+            arg_ty = t.clone();
+            arg_tys.push(t);
             bound.push(b);
         }
         ctx.in_aggregate = was_in_aggregate;
@@ -4246,6 +4439,28 @@ impl Binder<'_> {
                 }
                 Type::List(Box::new(Type::Any))
             }
+            // G113, G114. Two questions about the same thing, so they
+            // take the same arguments: elements, and at least two of
+            // them, since one element is the same as itself and
+            // different from nothing.
+            Func::AllDifferent | Func::Same => {
+                let name = if func == Func::Same {
+                    "same()"
+                } else {
+                    "all_different()"
+                };
+                if star || arg_tys.len() < 2 {
+                    return Err(bad_type(format!("{name} needs at least two elements")));
+                }
+                for ty in &arg_tys {
+                    if !matches!(ty, Type::Node | Type::Rel | Type::Any) {
+                        return Err(bad_type(format!(
+                            "{name} compares nodes and edges, got {ty}"
+                        )));
+                    }
+                }
+                Type::Bool
+            }
         };
         Ok((
             BoundExpr::Call {
@@ -4310,6 +4525,18 @@ impl Binder<'_> {
     }
 }
 
+/// A label expression as a query would write it, for the text that
+/// names a column and titles an operator.
+fn label_text(expr: &ast::LabelExpr) -> String {
+    match expr {
+        ast::LabelExpr::Label(name) => name.clone(),
+        ast::LabelExpr::Wildcard => "%".into(),
+        ast::LabelExpr::Not(inner) => format!("!{}", label_text(inner)),
+        ast::LabelExpr::And(lhs, rhs) => format!("({}&{})", label_text(lhs), label_text(rhs)),
+        ast::LabelExpr::Or(lhs, rhs) => format!("({}|{})", label_text(lhs), label_text(rhs)),
+    }
+}
+
 /// Renders an expression compactly: the column name for unaliased
 /// RETURN items and the operator text EXPLAIN will reuse.
 pub fn text(expr: &Expr) -> String {
@@ -4360,6 +4587,30 @@ pub fn text(expr: &Expr) -> String {
         Expr::IsTyped { expr, ty, negated } => {
             let not = if *negated { "NOT " } else { "" };
             format!("{} IS {not}TYPED {ty}", text(expr))
+        }
+        Expr::IsDirected { expr, negated } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}DIRECTED", text(expr))
+        }
+        Expr::IsLabeled {
+            expr,
+            label,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}LABELED {}", text(expr), label_text(label))
+        }
+        Expr::IsEndpoint {
+            node,
+            rel,
+            end,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}{} OF {}", text(node), end.text(), text(rel))
+        }
+        Expr::PropertyExists { expr, key } => {
+            format!("PROPERTY_EXISTS({}, {key})", text(expr))
         }
         Expr::Call {
             name,

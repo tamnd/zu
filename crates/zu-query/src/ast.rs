@@ -1079,6 +1079,37 @@ pub enum Expr {
         ty: LogicalType,
         negated: bool,
     },
+    /// `expr IS [NOT] DIRECTED`, ISO 19.8 and G110. The question is
+    /// asked of an edge and of nothing else, because a node has no
+    /// direction to answer with.
+    IsDirected {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+    /// `expr IS [NOT] LABELED <label expression>`, ISO 19.9 and G111.
+    /// It is the label expression a pattern writes after a colon, asked
+    /// of an element the query already bound rather than of the rows a
+    /// scan is walking.
+    IsLabeled {
+        expr: Box<Expr>,
+        label: LabelExpr,
+        negated: bool,
+    },
+    /// `node IS [NOT] SOURCE OF edge` and its destination twin, ISO
+    /// 19.10 and G112.
+    IsEndpoint {
+        node: Box<Expr>,
+        rel: Box<Expr>,
+        end: EdgeEnd,
+        negated: bool,
+    },
+    /// `PROPERTY_EXISTS(element, name)`, ISO 19.13 and G115. The name
+    /// is written as a name and not as a string, so it is part of the
+    /// query rather than a value the query works out.
+    PropertyExists {
+        expr: Box<Expr>,
+        key: String,
+    },
     /// `count(*)` is `star` with empty `args`.
     Call {
         name: String,
@@ -1114,6 +1145,23 @@ pub enum Expr {
     /// LIMIT, and it has to end with a RETURN of exactly one column,
     /// because what stands here is one value.
     ValueQuery(Box<Query>),
+}
+
+/// Which end of an edge a predicate asks about (G112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeEnd {
+    Source,
+    Destination,
+}
+
+impl EdgeEnd {
+    /// The word a query writes this end with.
+    pub fn text(&self) -> &'static str {
+        match self {
+            EdgeEnd::Source => "SOURCE",
+            EdgeEnd::Destination => "DESTINATION",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

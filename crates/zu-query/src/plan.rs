@@ -1155,6 +1155,8 @@ fn func_name(func: Func) -> &'static str {
         Func::Cardinality => "cardinality",
         Func::PathLength => "path_length",
         Func::Elements => "elements",
+        Func::AllDifferent => "all_different",
+        Func::Same => "same",
     }
 }
 
@@ -1220,6 +1222,41 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::IsTyped { expr, ty, negated } => {
             let not = if *negated { "NOT " } else { "" };
             format!("{} IS {not}TYPED {ty}", expr_text(expr, query))
+        }
+        BoundExpr::IsDirected { expr, negated, .. } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}DIRECTED", expr_text(expr, query))
+        }
+        BoundExpr::IsLabeled {
+            expr,
+            node,
+            negated,
+            ..
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!(
+                "{} IS {not}LABELED {}",
+                expr_text(expr, query),
+                node.text(&query.labels)
+            )
+        }
+        BoundExpr::IsEndpoint {
+            node,
+            rel,
+            end,
+            negated,
+            ..
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!(
+                "{} IS {not}{} OF {}",
+                expr_text(node, query),
+                end.text(),
+                expr_text(rel, query)
+            )
+        }
+        BoundExpr::PropertyExists { expr, key } => {
+            format!("PROPERTY_EXISTS({}, {key})", expr_text(expr, query))
         }
         BoundExpr::Call {
             func,

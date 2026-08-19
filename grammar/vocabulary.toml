@@ -62,8 +62,8 @@ words = ["ALL", "ANY", "SHORTEST", "PATHS", "GROUPS", "KEEP", "WALK", "TRAIL", "
 
 [[group]]
 kind = "keyword"
-doc = "Predicates and the operators spelled as words."
-words = ["AND", "OR", "XOR", "NOT", "IS", "IN", "STARTS", "ENDS", "CONTAINS", "LIKE", "EXISTS", "TYPED", "CAST"]
+doc = "Predicates and the operators spelled as words. DIRECTED, LABELED, SOURCE and DESTINATION are the words behind IS that make the pattern predicates, and OF is a word already in the catalog statements."
+words = ["AND", "OR", "XOR", "NOT", "IS", "IN", "STARTS", "ENDS", "CONTAINS", "LIKE", "EXISTS", "TYPED", "CAST", "DIRECTED", "LABELED", "SOURCE", "DESTINATION"]
 
 [[group]]
 kind = "keyword"
@@ -97,8 +97,8 @@ words = ["NULL", "TRUE", "FALSE"]
 
 [[group]]
 kind = "function"
-doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, PATH_LENGTH and ELEMENTS are the three that read something only the graph knows."
-words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS"]
+doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, PATH_LENGTH and ELEMENTS are the three that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls."
+words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS"]
 
 [[group]]
 kind = "algorithm"

@@ -1234,6 +1234,12 @@ pub(crate) fn func_name(func: Func) -> &'static str {
         Func::Upper => "upper",
         Func::Lower => "lower",
         Func::Trim => "trim",
+        // The form is not in the name, so a plan listing writes it as a
+        // second argument. `func_name` is also what an error message
+        // puts in front of its parentheses, and `normalize(NFC)()` is
+        // not a sentence.
+        Func::Normalize(_) => "normalize",
+        Func::IsNormalized(_) => "is_normalized",
     }
 }
 
@@ -1353,7 +1359,10 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             let inner = if *star {
                 "*".to_string()
             } else {
-                let rendered: Vec<String> = args.iter().map(|a| expr_text(a, query)).collect();
+                let mut rendered: Vec<String> = args.iter().map(|a| expr_text(a, query)).collect();
+                if let Func::Normalize(form) | Func::IsNormalized(form) = func {
+                    rendered.push(form.name().to_string());
+                }
                 rendered.join(", ")
             };
             if *distinct {

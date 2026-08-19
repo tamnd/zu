@@ -337,14 +337,25 @@ comparison      = concat , { comparison_op , concat
                              | "IS" , [ "NOT" ] , "TYPED" , value_type
                              | "IS" , [ "NOT" ] , "DIRECTED"
                              | "IS" , [ "NOT" ] , "LABELED" , label_expr
+                             | "IS" , [ "NOT" ] , "NORMALIZED" ,
+                               [ normal_form ]
                              | "IS" , [ "NOT" ] ,
                                ( "SOURCE" | "DESTINATION" ) , "OF" ,
                                concat } ;
 (* ISO 19.8 to 19.10, features G110, G111 and G112. The three pattern
    predicates written after IS: whether an edge has a direction,
    whether an element carries a label, and whether a node is one end of
-   an edge. The word behind IS is what tells all five readings apart,
+   an edge. The word behind IS is what tells all six readings apart,
    NULL and TYPED included. *)
+(* ISO 19.7 and 20.24, mandatory. The predicate and the function ask
+   the same question of a string, whether it is already in a Unicode
+   normal form and what it looks like in one. The form is a word rather
+   than an expression, so which normalization runs is settled by the
+   statement and not by a row, and it defaults to NFC in both places,
+   which is what the standard defaults it to. *)
+normal_form     = "NFC" | "NFD" | "NFKC" | "NFKD" ;
+normalize       = "NORMALIZE" , "(" , expression ,
+                  [ "," , normal_form ] , ")" ;
 (* ISO 12 and feature GA04. Two values of different types compare
    rather than answer unknown, and the order between the types is
    booleans, numbers, strings, temporals, nodes, edges, lists, records,
@@ -366,7 +377,7 @@ multiplicative  = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
-                | function_call | cast | property_exists
+                | function_call | cast | property_exists | normalize
                 | case_expr | coalesce | nullif
                 | path_constructor | exists_block
                 | value_query | "(" , expression , ")" | list | record ;

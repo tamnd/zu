@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use zu_common::gqlstatus::codes;
+use zu_common::unicode::NormalForm;
 use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
@@ -1632,6 +1633,15 @@ pub enum Func {
     /// is the one form of TRIM every implementation must have; naming
     /// an end or a character to trim is GF06 and a separate spelling.
     Trim,
+    /// ISO 20.24. The string in one of the four Unicode normal forms.
+    /// The form is on the function rather than in the arguments because
+    /// it is a word the statement wrote and not a value a row holds, so
+    /// no row can change which normalization runs.
+    Normalize(NormalForm),
+    /// ISO 19.7. Whether the string is already in that form. It is a
+    /// function here and a predicate in the query text, which is the
+    /// same arrangement `IS TYPED` has: one question, two spellings.
+    IsNormalized(NormalForm),
 }
 
 impl Func {
@@ -4564,6 +4574,31 @@ impl Binder<'_> {
                     Type::Bool,
                 ))
             }
+            // Both spellings of the same question reach the same call.
+            // A negated predicate is a NOT around it rather than a flag
+            // on it, because the function has an answer for every string
+            // and the negation has nothing to say about nulls that the
+            // NOT does not already say.
+            Expr::Normalize { expr, form } => {
+                self.bind_normalize(Func::Normalize(*form), expr, ctx)
+            }
+            Expr::IsNormalized {
+                expr,
+                form,
+                negated,
+            } => {
+                let (bound, ty) = self.bind_normalize(Func::IsNormalized(*form), expr, ctx)?;
+                match negated {
+                    true => Ok((
+                        BoundExpr::Unary {
+                            op: UnaryOp::Not,
+                            expr: Box::new(bound),
+                        },
+                        ty,
+                    )),
+                    false => Ok((bound, ty)),
+                }
+            }
             Expr::IsTyped { expr, ty, negated } => {
                 let (bound, _) = self.bind_expr(expr, ctx)?;
                 Ok((
@@ -5066,6 +5101,37 @@ impl Binder<'_> {
         ))
     }
 
+    /// The one argument the two normalization functions take, bound and
+    /// checked. It is a string or it is nothing: GQL casts nothing to a
+    /// string on its own, and a number has no normal form to be in.
+    fn bind_normalize(
+        &mut self,
+        func: Func,
+        expr: &Expr,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let (bound, ty) = self.bind_expr(expr, ctx)?;
+        if !ty.is_str() {
+            return Err(bad_type(format!(
+                "{}() needs a string, got {ty}",
+                crate::plan::func_name(func)
+            )));
+        }
+        let out = match func {
+            Func::IsNormalized(_) => Type::Bool,
+            _ => Type::Str,
+        };
+        Ok((
+            BoundExpr::Call {
+                func,
+                distinct: false,
+                star: false,
+                args: vec![bound],
+            },
+            out,
+        ))
+    }
+
     fn bind_call(
         &mut self,
         name: &str,
@@ -5227,6 +5293,13 @@ impl Binder<'_> {
                     _ => Type::Str,
                 }
             }
+            // The parser reads NORMALIZE and IS NORMALIZED itself,
+            // because both write a normal form where an expression
+            // cannot stand, so neither is resolved by name and neither
+            // arrives here.
+            Func::Normalize(_) | Func::IsNormalized(_) => {
+                unreachable!("a normalization function is not resolved by name")
+            }
         };
         Ok((
             BoundExpr::Call {
@@ -5362,6 +5435,17 @@ pub fn text(expr: &Expr) -> String {
             } else {
                 format!("{} IS NULL", text(expr))
             }
+        }
+        Expr::Normalize { expr, form } => {
+            format!("NORMALIZE({}, {})", text(expr), form.name())
+        }
+        Expr::IsNormalized {
+            expr,
+            form,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {not}NORMALIZED {}", text(expr), form.name())
         }
         Expr::IsTyped { expr, ty, negated } => {
             let not = if *negated { "NOT " } else { "" };

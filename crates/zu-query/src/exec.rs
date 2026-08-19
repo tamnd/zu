@@ -68,7 +68,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
-use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
+use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal, unicode};
 
 use crate::ast::{
     BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
@@ -6507,7 +6507,13 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             // ISO 20.22 and 20.24. One string in, one answer out, and a
             // null in answers null, which is the rule every one of
             // these shares with the operators around them.
-            Func::CharLength | Func::OctetLength | Func::Upper | Func::Lower | Func::Trim => {
+            Func::CharLength
+            | Func::OctetLength
+            | Func::Upper
+            | Func::Lower
+            | Func::Trim
+            | Func::Normalize(_)
+            | Func::IsNormalized(_) => {
                 if *star || args.len() != 1 {
                     return Err(invalid(format!(
                         "{}() takes exactly one argument",
@@ -6543,7 +6549,13 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     // defaults to a space and the trim specification to
                     // BOTH. Naming either is GF06 and a spelling this
                     // does not read.
-                    _ => Value::Str(s.trim_matches(' ').to_string()),
+                    Func::Trim => Value::Str(s.trim_matches(' ').to_string()),
+                    // ISO 20.24 and 19.7, both answered by UAX 15 and
+                    // the Unicode Character Database, which is where
+                    // the tables under these two come from.
+                    Func::Normalize(form) => Value::Str(unicode::normalize(&s, *form)),
+                    Func::IsNormalized(form) => Value::Bool(unicode::is_normalized(&s, *form)),
+                    _ => unreachable!("the arm above names every function here"),
                 })
             }
             _ => Err(invalid(
@@ -6704,7 +6716,9 @@ impl AggState {
             | Func::OctetLength
             | Func::Upper
             | Func::Lower
-            | Func::Trim => {
+            | Func::Trim
+            | Func::Normalize(_)
+            | Func::IsNormalized(_) => {
                 unreachable!("scalar function as an aggregate")
             }
         };

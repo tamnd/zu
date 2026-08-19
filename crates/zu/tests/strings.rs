@@ -166,3 +166,92 @@ fn a_number_written_where_a_string_belongs_is_refused_by_name() {
         assert!(err.contains("needs a string"), "{source}: {err}");
     }
 }
+
+/// The four normal forms of ISO 20.24, over literals and over a stored
+/// value. What is checkable here is that the word the statement wrote
+/// picks the form, that the default is NFC, and that a decomposed
+/// string and a composed one meet in the middle: the algorithm itself
+/// is checked against the Unicode Consortium's own conformance file in
+/// `zu-common`.
+#[test]
+fn a_string_normalizes_to_the_form_the_statement_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(dir.path());
+    // U+00E9 is e with an acute, and 'e' followed by U+0301 is the same
+    // letter written apart. NFC brings them together and NFD takes them
+    // apart, so each spelling answers the other under one of the forms.
+    assert_eq!(
+        str_of(&db, "RETURN NORMALIZE('e\u{301}', NFC) AS v"),
+        "\u{e9}"
+    );
+    assert_eq!(
+        str_of(&db, "RETURN NORMALIZE('\u{e9}', NFD) AS v"),
+        "e\u{301}"
+    );
+    // The form defaults to NFC, which is what the standard defaults it
+    // to and not what an implementation picked.
+    assert_eq!(str_of(&db, "RETURN NORMALIZE('e\u{301}') AS v"), "\u{e9}");
+    // The compatibility forms are the ones that lose the formatting.
+    // U+FB01 is the fi ligature, which has no canonical decomposition
+    // because it is not the same character as the two letters.
+    assert_eq!(
+        str_of(&db, "RETURN NORMALIZE('\u{fb01}', NFC) AS v"),
+        "\u{fb01}"
+    );
+    assert_eq!(str_of(&db, "RETURN NORMALIZE('\u{fb01}', NFKC) AS v"), "fi");
+    assert_eq!(str_of(&db, "RETURN NORMALIZE('\u{fb01}', NFKD) AS v"), "fi");
+    // And it reads a stored value the same way it reads a literal.
+    assert_eq!(
+        str_of(
+            &db,
+            "MATCH (p:person) WHERE p.tag = 'wide' RETURN NORMALIZE(p.name, NFKC) AS v"
+        ),
+        "日本"
+    );
+}
+
+#[test]
+fn the_predicate_asks_whether_the_string_is_already_in_the_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(dir.path());
+    assert_eq!(
+        one(&db, "RETURN 'ab' IS NORMALIZED AS v"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&db, "RETURN '\u{e9}' IS NORMALIZED NFC AS v"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&db, "RETURN '\u{e9}' IS NORMALIZED NFD AS v"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        one(&db, "RETURN '\u{e9}' IS NOT NORMALIZED NFD AS v"),
+        Value::Bool(true)
+    );
+    // A word that is not a form is read as the word after the
+    // predicate, so the predicate ends at NORMALIZED and the AND is an
+    // AND.
+    assert_eq!(
+        one(&db, "RETURN 'ab' IS NORMALIZED AND 1 = 1 AS v"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn normalization_answers_null_for_null_and_refuses_a_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(dir.path());
+    assert_eq!(one(&db, "RETURN NORMALIZE(NULL, NFC) AS v"), Value::Null);
+    assert_eq!(one(&db, "RETURN NULL IS NORMALIZED AS v"), Value::Null);
+    for source in [
+        "RETURN NORMALIZE(1, NFC) AS v",
+        "RETURN 1 IS NORMALIZED AS v",
+    ] {
+        let err = refused(&db, source);
+        assert!(err.contains("needs a string"), "{source}: {err}");
+    }
+    let err = refused(&db, "RETURN NORMALIZE('ab', NFX) AS v");
+    assert!(err.contains("NFC, NFD, NFKC or NFKD"), "{err}");
+}

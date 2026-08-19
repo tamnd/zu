@@ -5,6 +5,7 @@
 //! what a label means) belong to the binder, so the AST stays a plain
 //! description of the text.
 
+use zu_common::unicode::NormalForm;
 use zu_common::{LogicalType, Temporal};
 
 /// One statement: a query that reads, a catalog statement that changes
@@ -1122,6 +1123,23 @@ pub enum Expr {
     },
     IsNull {
         expr: Box<Expr>,
+        negated: bool,
+    },
+    /// `NORMALIZE(s, NFC)`, ISO 20.24. Written like a call and not one,
+    /// for the reason CAST is not one: the second argument names a
+    /// normal form, and reading it as an expression would bind a
+    /// variable called NFC. The form defaults to NFC, which is what the
+    /// standard defaults it to.
+    Normalize {
+        expr: Box<Expr>,
+        form: NormalForm,
+    },
+    /// `expr IS [NOT] NORMALIZED [NFC]`, ISO 19.7. The same question the
+    /// function answers, asked as a predicate, and the form defaults the
+    /// same way.
+    IsNormalized {
+        expr: Box<Expr>,
+        form: NormalForm,
         negated: bool,
     },
     /// `expr IS TYPED type`, ISO's GA06. The answer is a boolean and

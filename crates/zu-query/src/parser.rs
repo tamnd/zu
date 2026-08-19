@@ -10,6 +10,7 @@
 //! through one depth guard.
 
 use zu_common::gqlstatus::codes;
+use zu_common::unicode::NormalForm;
 use zu_common::{
     Field, IntervalField, IntervalQualifier, LogicalType, RecordType, Result, Temporal, ZuError,
 };
@@ -2819,6 +2820,20 @@ impl Parser<'_> {
                 negated,
             });
         }
+        // ISO 19.7. The form is optional and defaults to NFC, and the
+        // word after NORMALIZED is only read as one when it is one of
+        // the four, so `s IS NORMALIZED AND t IS NULL` still reads.
+        if self.eat_kw("NORMALIZED") {
+            let form = match self.at_normal_form() {
+                true => self.parse_normal_form()?,
+                false => NormalForm::Nfc,
+            };
+            return Ok(Expr::IsNormalized {
+                expr: Box::new(lhs),
+                form,
+                negated,
+            });
+        }
         if let Some(end) = self.eat_endpoint() {
             self.expect_kw("OF")?;
             return Ok(Expr::IsEndpoint {
@@ -3206,6 +3221,12 @@ impl Parser<'_> {
                 value: Box::new(value),
                 compared: Box::new(compared),
             })
+        } else if name.eq_ignore_ascii_case("NORMALIZE") {
+            // ISO 20.24, and here for the reason CAST is: the second
+            // argument names one of the four normal forms, which is a
+            // word and not a value, and a function would have received
+            // a variable called NFC.
+            self.parse_normalize()
         } else if name.eq_ignore_ascii_case("PROPERTY_EXISTS") {
             // G115, and here for the reason CAST is: the second
             // argument is a property name rather than an expression,
@@ -3911,6 +3932,45 @@ impl Parser<'_> {
         let key = self.expect_name("a property name")?;
         self.expect(&TokenKind::RParen)?;
         Ok(Expr::PropertyExists { expr, key })
+    }
+
+    /// `NORMALIZE(s)` or `NORMALIZE(s, NFKC)`, the parenthesis
+    /// unconsumed and NORMALIZE already read.
+    fn parse_normalize(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let expr = Box::new(self.parse_expr()?);
+        let form = match self.eat(&TokenKind::Comma) {
+            true => self.parse_normal_form()?,
+            false => NormalForm::Nfc,
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::Normalize { expr, form })
+    }
+
+    /// One of the four words ISO 19.7 names a normal form with. They are
+    /// reserved words, so nothing else can be standing here, and a word
+    /// that is not one of the four is named in the error rather than
+    /// read as a variable.
+    fn parse_normal_form(&mut self) -> Result<NormalForm> {
+        // The error is raised before the word is taken, so it points at
+        // the word that is wrong rather than at whatever follows it.
+        let expected = "a normal form: NFC, NFD, NFKC or NFKD";
+        if !self.at_normal_form() {
+            return Err(self.error(expected));
+        }
+        let word = self.expect_name(expected)?;
+        NormalForm::from_name(&word).ok_or_else(|| self.error(expected))
+    }
+
+    /// Whether a normal form is written next. Only the four words are,
+    /// so `x IS NORMALIZED AND y` reads the AND as the AND it is.
+    fn at_normal_form(&self) -> bool {
+        self.peek()
+            .and_then(|t| match &t.kind {
+                TokenKind::Ident(word) => NormalForm::from_name(word),
+                _ => None,
+            })
+            .is_some()
     }
 
     fn parse_call(&mut self, name: String) -> Result<Expr> {

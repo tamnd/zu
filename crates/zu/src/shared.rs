@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
 use zu_common::Result;
@@ -35,6 +36,7 @@ use zu_common::Result;
 use crate::write::{Patches, Writer, Written};
 use crate::zu1::file::{DatabaseHeader, Shared, Zu1File};
 use crate::zu1::txn::WriteTxn;
+use crate::zu1::wal::Commits;
 
 /// Replays a sidecar WAL that a previous writer left behind.
 ///
@@ -83,6 +85,14 @@ pub struct Published {
     /// Bumped whenever either of the two above moves, so a session
     /// asking whether it is behind compares one word.
     version: u64,
+    /// Where this state falls in the order the writers staged them.
+    ///
+    /// A commit stages its state before it waits for the platter and
+    /// installs it after, so two of them can be in the air at once and
+    /// they can land out of order. This is what says which is which,
+    /// and it is not `version`, which counts installs rather than
+    /// stages and so cannot tell a stale state from a fresh one.
+    staged: u64,
 }
 
 impl Published {
@@ -154,6 +164,26 @@ impl WriteSide {
         self.open_writer()?;
         let writer = self.writer.as_mut().expect("opened just above");
         writer.write(&mut self.file, stage)
+    }
+
+    /// What makes this side's commits durable, held past the side
+    /// itself going back so the wait happens off the queue. `None`
+    /// before a writer has been opened, which is a side with nothing to
+    /// make durable.
+    pub fn commits(&self) -> Option<Arc<Commits>> {
+        self.writer.as_ref().map(Writer::commits)
+    }
+
+    /// Whether the log owes nothing, so what this side holds is durable
+    /// and may be shown to the readers.
+    ///
+    /// A writer that has staged its frames and not yet waited for the
+    /// platter is in this side, and publishing it would let a reader
+    /// act on a commit a crash could take back. Whoever owes that sync
+    /// publishes it themselves once it lands, so what this says to skip
+    /// is never lost, only left to the writer it belongs to.
+    pub fn settled(&self) -> bool {
+        self.writer.as_ref().is_none_or(Writer::settled)
     }
 
     /// The epoch the writer has committed through, or the file's own
@@ -249,6 +279,10 @@ pub struct FileHandle {
     /// so a reader that has to open its own descriptor takes them up
     /// rather than starting a second cache nothing invalidates.
     shared: Shared,
+    /// Hands out the order writers staged their published states in,
+    /// so a state that lands after a newer one can be recognized as
+    /// stale and dropped. See [`FileHandle::stage`].
+    staged: AtomicU64,
 }
 
 /// The queue in front of the write side.
@@ -332,6 +366,7 @@ impl FileHandle {
             slot: file.active_slot(),
             patches: Arc::new(Patches::new()),
             version: 1,
+            staged: 0,
         };
         let shared = file.shared();
         let handle = Arc::new(FileHandle {
@@ -345,6 +380,7 @@ impl FileHandle {
             freed: Condvar::new(),
             published: RwLock::new(published),
             readers: Mutex::new(BTreeMap::new()),
+            staged: AtomicU64::new(0),
         });
         open_files.insert(key, Arc::downgrade(&handle));
         Ok(handle)
@@ -448,6 +484,43 @@ impl FileHandle {
         published.slot = side.file.active_slot();
         published.patches = side.patches();
         published.version += 1;
+        published.staged = self.staged.load(Ordering::Relaxed);
+    }
+
+    /// What [`Self::publish`] would install, without installing it,
+    /// stamped with where it falls in the order writers staged.
+    ///
+    /// This is the first half of a group commit. The state is taken
+    /// while the write side is still held, which is the only moment it
+    /// can be read consistently, and put in with [`Self::publish_staged`]
+    /// once the log behind it is on the platter. Between the two the
+    /// write side is back with the next writer, which is the whole
+    /// point: their frames are staged while this one's sync is in the
+    /// air, so one sync covers them both.
+    pub fn stage(&self, side: &WriteSide) -> Published {
+        Published {
+            header: side.file.db_header().clone(),
+            slot: side.file.active_slot(),
+            patches: side.patches(),
+            version: 0,
+            staged: self.staged.fetch_add(1, Ordering::Relaxed) + 1,
+        }
+    }
+
+    /// Installs a state whose log is now durable.
+    ///
+    /// A writer behind this one may have staged, synced and published
+    /// while this one was waiting, and then this state is stale: what
+    /// it describes the newer one describes too, because they are
+    /// cumulative. So the older one is dropped rather than put in,
+    /// which would take the readers backwards.
+    pub fn publish_staged(&self, next: Published) {
+        let mut published = self.published.write().expect("published");
+        if next.staged <= published.staged {
+            return;
+        }
+        let version = published.version + 1;
+        *published = Published { version, ..next };
     }
 }
 

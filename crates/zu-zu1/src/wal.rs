@@ -21,6 +21,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 
 use zu_common::{Epoch, Result, ZuError};
 
@@ -530,8 +531,148 @@ impl<'a> Reader<'a> {
 /// after a checkpoint and the rollback of a transaction the process
 /// died inside, writes zeros over what it took rather than leaving
 /// bytes that once parsed.
+/// The sync a commit waits on, shared by every writer on one log.
+///
+/// A commit is durable once the log is on the platter through the byte
+/// its commit frame ends at. The log is append only, so that is a
+/// prefix property: one sync makes durable everything staged before it,
+/// whoever staged it. Which is what lets commits share one.
+///
+/// A writer that finds nobody syncing becomes the leader, and syncs the
+/// log as far as it has been staged rather than only as far as its own
+/// frames go, so the writers that staged behind it while it waited for
+/// the write side come along for free. A writer that finds a sync
+/// already running waits for it, and either it covered them or they
+/// lead the next one. So a burst of n commits costs two syncs rather
+/// than n: the one already in flight when the burst arrived, and the
+/// one that covers the rest.
+///
+/// The sync runs on a second handle on the log, because by then the
+/// writer that staged the frames has given the write side back and the
+/// log belongs to somebody else.
+#[derive(Debug)]
+pub struct Commits {
+    /// The handle the sync is issued on. Only the leader takes this,
+    /// and `Marks::running` is what stops there being two.
+    file: Mutex<Box<dyn VfsFile>>,
+    marks: Mutex<Marks>,
+    /// Woken by every sync that finishes, leader or not.
+    done: Condvar,
+}
+
+/// How far the log is written and how far it is durable.
+#[derive(Debug, Default)]
+struct Marks {
+    /// Bytes handed to the file, whether or not they are on the platter.
+    staged: u64,
+    /// Bytes that are on the platter. Never above `staged`.
+    durable: u64,
+    /// A sync is running and will make this many bytes durable when it
+    /// lands. `None` when nobody is syncing.
+    running: Option<u64>,
+    /// Set when a sync failed, so the writers waiting on it are told
+    /// rather than left believing a sync happened. Cleared by the next
+    /// sync that succeeds.
+    failed: bool,
+}
+
+impl Commits {
+    fn new(file: Box<dyn VfsFile>, len: u64) -> Self {
+        Self {
+            file: Mutex::new(file),
+            marks: Mutex::new(Marks {
+                staged: len,
+                // Whatever was in the log before this process opened it
+                // is the last process's problem and already on disk.
+                durable: len,
+                running: None,
+                failed: false,
+            }),
+            done: Condvar::new(),
+        }
+    }
+
+    /// Says the log has been written out to `len` bytes.
+    fn staged(&self, len: u64) {
+        let mut marks = self.marks.lock().expect("wal marks");
+        marks.staged = marks.staged.max(len);
+    }
+
+    /// Says the log is `len` bytes long, and whether the cut that made
+    /// it that length is on the platter, which is where a rollback and
+    /// a post checkpoint truncate respectively leave it.
+    fn reset(&self, len: u64, synced: bool) {
+        let mut marks = self.marks.lock().expect("wal marks");
+        marks.staged = len;
+        marks.durable = if synced { len } else { 0 };
+        if synced {
+            marks.failed = false;
+        }
+    }
+
+    /// Whether the log owes nothing: every byte staged is on the
+    /// platter, so what the write side holds can be shown to a reader.
+    pub fn settled(&self) -> bool {
+        let marks = self.marks.lock().expect("wal marks");
+        !marks.failed && marks.durable >= marks.staged
+    }
+
+    /// Returns once the log is durable through `need` bytes, syncing it
+    /// here if nobody else is already doing it.
+    ///
+    /// This is the commit point. It runs with the write side let go of,
+    /// so the writers behind this one are staging their own frames
+    /// while this sync is in the air, and the sync that covers them is
+    /// the next one rather than one each.
+    pub fn sync_through(&self, need: u64) -> Result<()> {
+        let mut marks = self.marks.lock().expect("wal marks");
+        loop {
+            // A log shorter than the byte asked for no longer holds the
+            // frames this was waiting on, and the only two ways that
+            // happens both leave nothing to wait for: a checkpoint that
+            // sealed them into the base file and synced it before
+            // cutting, or a rollback that took them away.
+            if !marks.failed && (marks.durable >= need || marks.staged < need) {
+                return Ok(());
+            }
+            if marks.running.is_some() {
+                // Somebody is syncing. Whether they reach far enough or
+                // not, waiting is right: if they do this is over, and
+                // if they do not the next turn of this loop leads.
+                marks = self.done.wait(marks).expect("wal marks");
+                continue;
+            }
+            // Lead. Sync as far as the log has been staged, not only as
+            // far as this commit needs, because the bytes are already
+            // there and covering them costs the same syscall. Never
+            // past that: a mark above what the file holds would have
+            // the next commit believe a sync it never got.
+            let target = marks.staged;
+            marks.running = Some(target);
+            drop(marks);
+
+            let synced = self.file.lock().expect("wal sync handle").sync_data();
+
+            marks = self.marks.lock().expect("wal marks");
+            marks.running = None;
+            match &synced {
+                Ok(()) => {
+                    marks.durable = marks.durable.max(target);
+                    marks.failed = false;
+                }
+                Err(_) => marks.failed = true,
+            }
+            self.done.notify_all();
+            return synced;
+        }
+    }
+}
+
 pub struct Wal {
     file: Box<dyn VfsFile>,
+    /// What makes a commit durable, shared with every other writer on
+    /// this log so that their syncs are one sync.
+    commits: Arc<Commits>,
     path: PathBuf,
     len: u64,
     /// Bytes the file has been given and zeroed, which is where a
@@ -581,8 +722,10 @@ impl Wal {
             let _ = body;
             end = next;
         }
+        let commits = Arc::new(Commits::new(file.dup()?, end));
         let mut wal = Wal {
             file,
+            commits,
             path: path.to_path_buf(),
             len: end,
             reserved,
@@ -683,6 +826,9 @@ impl Wal {
         self.file.write_all_at(&self.buf, self.len)?;
         self.len += self.buf.len() as u64;
         self.buf.clear();
+        // A sync that starts now covers these bytes, so the leader is
+        // told about them before it picks how far to go.
+        self.commits.staged(self.len);
         Ok(())
     }
 
@@ -691,11 +837,35 @@ impl Wal {
     /// disk is the commit point: replay delivers a txn exactly when
     /// that frame verifies, and it is last in the buffer, so a write
     /// the disk tears anywhere leaves a txn replay refuses.
+    ///
+    /// This is the whole commit, sync included, for the caller with
+    /// nobody to share the sync with. A caller that wants to let the
+    /// write side go before it waits for the platter wants
+    /// [`Wal::stage_commit`] and then [`Commits::sync_through`], which
+    /// is the same two steps with the lock let go of in between.
     pub fn commit(&mut self, epoch: Epoch) -> Result<()> {
+        let need = self.stage_commit(epoch)?;
+        self.commits.sync_through(need)
+    }
+
+    /// Writes the txn's frames and its `TxnCommit` out to the log
+    /// without waiting for the platter, and returns the byte the log
+    /// has to be durable through for this txn to have committed.
+    ///
+    /// Nothing is committed when this returns. What it buys is that the
+    /// write side can go back to the next writer now, so their frames
+    /// are staged while this one's sync is in the air and one sync
+    /// covers them both.
+    pub fn stage_commit(&mut self, epoch: Epoch) -> Result<u64> {
         self.append(epoch, &WalRecord::TxnCommit)?;
         self.flush()?;
-        self.file.sync_data()?;
-        Ok(())
+        Ok(self.len)
+    }
+
+    /// What makes this log's commits durable, to be held past the write
+    /// side going back.
+    pub fn commits(&self) -> &Arc<Commits> {
+        &self.commits
     }
 
     /// Drops the frames of a transaction the process died inside, which
@@ -727,6 +897,10 @@ impl Wal {
         self.erase(end, self.len)?;
         self.file.sync_data()?;
         self.len = end;
+        // The log just got shorter and the cut is on the platter, so
+        // the marks go back to it. Leaving them where they were would
+        // have the next commit's offset look like one already synced.
+        self.commits.reset(end, true);
         Ok(())
     }
 
@@ -749,6 +923,12 @@ impl Wal {
         // the end of it. Zeros are what say the log is empty.
         self.erase(0, self.len)?;
         self.len = 0;
+        // The zeros are not synced, and deliberately: the header the
+        // checkpoint published is what makes them unnecessary. So the
+        // log is back to empty and none of it is claimed durable, and
+        // the next commit's sync is what puts the cut on the platter
+        // along with its own frames.
+        self.commits.reset(0, false);
         Ok(())
     }
 
@@ -838,7 +1018,136 @@ fn next_frame(bytes: &[u8], at: u64) -> Option<(&[u8], u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+    use crate::vfs::RealFile;
+
+    /// A log file that counts the syncs issued on it, on any of its
+    /// handles, which is what a claim about group commit is about.
+    #[derive(Debug)]
+    struct CountingFile {
+        inner: Box<dyn VfsFile>,
+        syncs: Arc<AtomicU64>,
+    }
+
+    impl CountingFile {
+        fn open(path: &Path) -> (Box<dyn VfsFile>, Arc<AtomicU64>) {
+            let syncs = Arc::new(AtomicU64::new(0));
+            let file = CountingFile {
+                inner: Box::new(RealFile::open_or_create(path).unwrap()),
+                syncs: Arc::clone(&syncs),
+            };
+            (Box::new(file), syncs)
+        }
+    }
+
+    impl VfsFile for CountingFile {
+        fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+
+        fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+
+        fn set_len(&mut self, len: u64) -> Result<()> {
+            self.inner.set_len(len)
+        }
+
+        fn sync_all(&mut self) -> Result<()> {
+            self.syncs.fetch_add(1, Ordering::Relaxed);
+            self.inner.sync_all()
+        }
+
+        fn sync_data(&mut self) -> Result<()> {
+            self.syncs.fetch_add(1, Ordering::Relaxed);
+            self.inner.sync_data()
+        }
+
+        fn len(&self) -> Result<u64> {
+            self.inner.len()
+        }
+
+        fn dup(&self) -> Result<Box<dyn VfsFile>> {
+            Ok(Box::new(CountingFile {
+                inner: self.inner.dup()?,
+                syncs: Arc::clone(&self.syncs),
+            }))
+        }
+    }
+
+    fn staged(wal: &mut Wal, epoch: Epoch) -> u64 {
+        wal.append(
+            epoch,
+            &WalRecord::Delete {
+                table: 1,
+                ids: vec![epoch],
+            },
+        )
+        .unwrap();
+        wal.stage_commit(epoch).unwrap()
+    }
+
+    /// Three transactions staged and one sync, because the log is
+    /// append only: the sync that puts the last one on the platter puts
+    /// the two before it there too. This is the whole of group commit,
+    /// and what the writers do around it is only let go of the write
+    /// side so their frames land in the same batch.
+    #[test]
+    fn one_sync_commits_everything_staged_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.wal");
+        let (file, syncs) = CountingFile::open(&path);
+        let mut wal = Wal::open_on(file, &path).unwrap();
+        let commits = Arc::clone(wal.commits());
+
+        let first = staged(&mut wal, 1);
+        let second = staged(&mut wal, 2);
+        let third = staged(&mut wal, 3);
+        // The room the log took at the first write is synced once a
+        // reservation and has nothing to do with a commit, so the
+        // count that matters is the one from here.
+        let reserving = syncs.load(Ordering::Relaxed);
+
+        // The writer of the first one leads, and syncs as far as the
+        // log has been staged rather than as far as its own frames go.
+        commits.sync_through(first).unwrap();
+        assert_eq!(syncs.load(Ordering::Relaxed) - reserving, 1);
+
+        commits.sync_through(second).unwrap();
+        commits.sync_through(third).unwrap();
+        assert_eq!(
+            syncs.load(Ordering::Relaxed) - reserving,
+            1,
+            "the two behind it were already covered"
+        );
+    }
+
+    /// A commit waiting on a byte the log no longer reaches is over:
+    /// the only ways the log gets shorter are a checkpoint that sealed
+    /// those frames into the base file and synced it first, and a
+    /// rollback that took them away. Waiting for a sync that will never
+    /// name that byte again would hang the writer forever.
+    #[test]
+    fn a_commit_the_checkpoint_swallowed_stops_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut.wal");
+        let (file, syncs) = CountingFile::open(&path);
+        let mut wal = Wal::open_on(file, &path).unwrap();
+        let commits = Arc::clone(wal.commits());
+
+        let need = staged(&mut wal, 1);
+        wal.truncate().unwrap();
+        let before = syncs.load(Ordering::Relaxed);
+
+        commits.sync_through(need).unwrap();
+        assert_eq!(
+            syncs.load(Ordering::Relaxed),
+            before,
+            "the header the checkpoint published is what makes it durable"
+        );
+    }
 
     fn sample_records() -> Vec<WalRecord> {
         vec![

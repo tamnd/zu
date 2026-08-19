@@ -22,7 +22,7 @@ use zu_zu1::wal::Wal;
 /// touches.
 #[derive(Debug)]
 struct CountingFile {
-    inner: RealFile,
+    inner: Box<dyn VfsFile>,
     read: Arc<Mutex<u64>>,
 }
 
@@ -50,6 +50,15 @@ impl VfsFile for CountingFile {
 
     fn len(&self) -> zu_common::Result<u64> {
         self.inner.len()
+    }
+
+    /// The copy counts onto the same total, so a read issued through it
+    /// is still a read this test sees.
+    fn dup(&self) -> zu_common::Result<Box<dyn VfsFile>> {
+        Ok(Box::new(CountingFile {
+            inner: self.inner.dup()?,
+            read: Arc::clone(&self.read),
+        }))
     }
 }
 
@@ -148,7 +157,7 @@ fn recovery_reads_headers_and_meta_not_data_blocks() {
     let read = Arc::new(Mutex::new(0u64));
     let mut db = Zu1File::open_on(
         Box::new(CountingFile {
-            inner: RealFile::open_rw(&db_path).unwrap(),
+            inner: Box::new(RealFile::open_rw(&db_path).unwrap()),
             read: read.clone(),
         }),
         &db_path,

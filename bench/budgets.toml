@@ -1512,16 +1512,28 @@ insert_stmt_cpu_us = 30000.0
 # write path gets cheaper, never raise it.
 set_stmt_cpu_nosync_us = 300.0
 
-# A DELETE at the same shape, measured 15 ms and 1044 kB at 10000 rows.
-# It is the cheapest of the three because a delete does not compact: the
-# row keeps its offset, so the fold merges one offset into the table's
-# tombstone chain instead of rewriting the property columns the way a
-# SET does. The ceilings are the same as the other two, because what
-# they are here to catch is the same thing, a path that starts rewriting
-# the table or adds another sync. Lower these ceilings, never raise
-# them.
+# A DELETE at the same shape, measured 3.7 ms, 76 us of processor time,
+# 16.0 kB written and no growth at all at 10000 rows. It is the cheapest
+# of the three because a delete moves nothing: the row keeps its offset,
+# so all the commit has to hand a reader is the offset, and the readers
+# merge that list over the table's tombstone chain the way a cell patch
+# goes over a column. Nothing folds, so nothing is rewritten and the
+# file does not grow.
+#
+# Before the commit was deferred this was 321 us with the sync taken
+# out against 78 us for the SET in the same run, and it is now 42 us
+# against 33 us, so about three times less processor time once the
+# machine is normalised away, with 41.6 kB down to 16.0 and 6554 bytes
+# of growth a statement down to none. The bytes are the part that does
+# not move between machines, and they are what the fold cost. The kB
+# ceiling is the SET's, because it is now the same one log frame, and
+# the growth ceiling is a page, which is loose enough for the log to
+# extend the file and tight enough to catch a fold coming back. Lower
+# these ceilings, never raise them.
 delete_stmt_us = 250000.0
-delete_stmt_kb = 4096.0
+delete_stmt_kb = 96.0
+delete_stmt_cpu_us = 400.0
+delete_stmt_growth_b = 4096.0
 
 # A DETACH DELETE of an element that still has edges on it, measured 29
 # to 56 ms and 2324 kB at 10000 rows and 10000 edges. It costs about what a

@@ -11,7 +11,7 @@
 //! says whether any table has one, and a table with no chain has an
 //! empty set that every caller checks before it looks a row up.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::zu1::catalog::TableIndex;
@@ -19,6 +19,12 @@ use crate::zu1::file::Zu1File;
 use crate::zu1::fold::{TOMBSTONE_KEY, decode_tombstones};
 use crate::zu1::meta;
 use zu_common::Result;
+
+/// The rows the commits since the last fold took away, by table, each
+/// list ascending. This is what a delete leaves behind when it is not
+/// folded, and it goes over the chains the same way a cell patch goes
+/// over a column.
+pub(crate) type Tombstones = HashMap<u32, Arc<[u64]>>;
 
 /// Every table's deleted rows, sorted, read out of the sealed file.
 #[derive(Debug, Clone, Default)]
@@ -44,6 +50,46 @@ impl Deleted {
             tables.insert(id & !TOMBSTONE_KEY, offsets.into());
         }
         Ok(Deleted { tables })
+    }
+
+    /// The same read with the rows a commit took away and nobody has
+    /// folded yet put over it, which is what every reader wants: a row
+    /// a delete removed is gone whether or not the tombstone has
+    /// reached the chain it will end up in.
+    pub(crate) fn load_with(db: &mut Zu1File, patch: &Tombstones) -> Result<Self> {
+        let mut gone = Deleted::load(db)?;
+        if !patch.is_empty() {
+            gone.merge(patch);
+        }
+        Ok(gone)
+    }
+
+    /// Puts the unfolded offsets of each table into its list.
+    ///
+    /// Both sides are ascending, so a table is one merge and not a sort,
+    /// and a row that is in both, which is what a second delete of the
+    /// same row leaves, goes in once.
+    pub(crate) fn merge(&mut self, patch: &Tombstones) {
+        for (&table, rows) in patch {
+            let Some(held) = self.tables.get(&table) else {
+                self.tables.insert(table, Arc::clone(rows));
+                continue;
+            };
+            let mut all = Vec::with_capacity(held.len() + rows.len());
+            let (mut at, mut on) = (0, 0);
+            loop {
+                let next = match (held.get(at), rows.get(on)) {
+                    (Some(&held), Some(&new)) => held.min(new),
+                    (Some(&held), None) => held,
+                    (None, Some(&new)) => new,
+                    (None, None) => break,
+                };
+                at += usize::from(held.get(at) == Some(&next));
+                on += usize::from(rows.get(on) == Some(&next));
+                all.push(next);
+            }
+            self.tables.insert(table, all.into());
+        }
     }
 
     /// Whether any table in the file has lost a row. False is the
@@ -108,6 +154,23 @@ mod tests {
         assert!(d.holds(3, 4));
         assert!(!d.holds(3, 5));
         assert!(!d.holds(4, 4), "another table keeps its rows");
+    }
+
+    #[test]
+    fn an_unfolded_delete_joins_the_chain_it_will_end_up_in() {
+        let mut d = deleted(&[(1, &[2, 6]), (2, &[0])]);
+        let patch: Tombstones = [
+            (1u32, [1u64, 2, 9].as_slice().into()),
+            (3, [4u64].as_slice().into()),
+        ]
+        .into_iter()
+        .collect();
+        d.merge(&patch);
+        assert_eq!(d.rows(1), &[1, 2, 6, 9], "merged, and the pair kept once");
+        assert_eq!(d.rows(2), &[0], "a table the patch says nothing about");
+        assert_eq!(d.rows(3), &[4], "a table only the patch knows of");
+        assert!(d.holds(1, 9));
+        assert_eq!(d.span(1, 0, 3), &[1, 2]);
     }
 
     #[test]

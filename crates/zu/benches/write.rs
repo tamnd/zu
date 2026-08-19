@@ -917,11 +917,13 @@ fn run_insert_edge_txn(dir: &Path, rows: u64, strings: bool) -> Cost {
 ///
 /// A delete does not compact, because every edge in the file names its
 /// endpoints by row offset, so what a delete writes is a tombstone: the
-/// row keeps its place and the fold merges the offset into the table's
-/// tombstone chain, which every scan after that filters by. That makes
-/// this the one write of the three whose cost has two halves, and both
-/// are in the number: the statement itself, and the chain growing by
-/// one offset a statement so every read pays a little more.
+/// row keeps its place and the offset joins the table's tombstone
+/// chain, which every scan after that filters by. That makes this the
+/// one write of the three whose cost has two halves, and both are in
+/// the number: the statement itself, and the chain growing by one
+/// offset a statement so every read pays a little more. The offset is
+/// carried in the patch until a fold takes it, so what the statement
+/// pays is the log frame and the readers merge the two lists.
 ///
 /// The count is read back afterwards, so a path that timed well by not
 /// taking the row away fails instead of scoring.
@@ -1139,6 +1141,8 @@ fn main() {
         ("insert_edge_write_str_us", txn_str.cpu),
         ("insert_edge_write_x", write_edge_x),
         ("delete_stmt_us", delete.us),
+        ("delete_stmt_cpu_us", delete.cpu),
+        ("delete_stmt_growth_b", delete.growth),
         ("detach_stmt_us", detach.us),
         ("set_stmt_kb", set_small.written / 1024.0),
         ("delete_stmt_kb", delete.written / 1024.0),

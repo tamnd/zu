@@ -19,6 +19,7 @@
 //! what [`crate::deleted`] reads back and every scan filters by.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
@@ -26,6 +27,7 @@ use zu_common::{Result, ZuError};
 use crate::insert::describe;
 use crate::query::Value;
 use crate::split::Delete;
+use crate::write::Patches;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::graph::{Direction, GraphReader};
@@ -59,6 +61,11 @@ pub(crate) struct Removals<'a> {
     /// turn up in, and a slot the write names is bound by a match that
     /// can leave several tables open.
     readers: HashMap<u32, GraphReader>,
+    /// The edges the commits since the last fold added, which the
+    /// readers above read through. An edge that has not been folded is
+    /// an edge all the same, so the element it is on cannot go without
+    /// a `DETACH` any more than one the file holds can.
+    patches: Arc<Patches>,
     rows: BTreeSet<Row>,
     /// The edges a `DETACH` is taking away, as the rel table and the two
     /// rows each one runs between. A set for the same reason the rows
@@ -68,11 +75,12 @@ pub(crate) struct Removals<'a> {
 }
 
 impl<'a> Removals<'a> {
-    pub(crate) fn open(write: &'a Delete, catalog: Catalog) -> Self {
+    pub(crate) fn open(write: &'a Delete, catalog: Catalog, patches: Arc<Patches>) -> Self {
         Self {
             write,
             catalog,
             readers: HashMap::new(),
+            patches,
             rows: BTreeSet::new(),
             edges: BTreeSet::new(),
         }
@@ -203,8 +211,9 @@ impl<'a> Removals<'a> {
             .ok_or_else(|| ZuError::InvalidArgument(format!("unknown rel table {rel}")))?
             .name
             .clone();
-        self.readers
-            .insert(rel, GraphReader::load_table(db, &name)?);
+        let mut reader = GraphReader::load_table(db, &name)?;
+        reader.set_edges(self.patches.edges.get(&rel).cloned());
+        self.readers.insert(rel, reader);
         Ok(())
     }
 

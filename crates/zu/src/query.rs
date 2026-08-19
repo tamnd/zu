@@ -214,10 +214,16 @@ pub struct Zu1Graph<'a> {
     catalog: Catalog,
     readers: HashMap<u32, GraphReader>,
     props: HashMap<u32, Option<PropsReader>>,
-    /// The rows a `DELETE` took away, read on the first query that
-    /// asks and kept for the epoch. `None` is "not read yet", so a
-    /// graph that is only ever written through never pays the read.
+    /// The rows a `DELETE` took away as the file's chains hold them,
+    /// read on the first query that asks and kept for the epoch.
+    /// `None` is "not read yet", so a graph that is only ever written
+    /// through never pays the read.
     gone: Option<Deleted>,
+    /// Those with the rows a commit took away and nobody has folded
+    /// yet merged in. Kept apart from the chains for the reason
+    /// [`crate::snapshot`] keeps them apart: a commit that adds to the
+    /// patch owes the merge and not the read.
+    merged: Option<Deleted>,
     /// The cells committed since the last fold, by table. A props
     /// reader reads through these, which is what lets a write be
     /// visible without the column it wrote into being rewritten.
@@ -236,6 +242,7 @@ impl<'a> Zu1Graph<'a> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: None,
+            merged: None,
             patches: Arc::new(Patches::new()),
             frames: Arc::new(FrameSet::new()),
         }
@@ -253,6 +260,7 @@ impl<'a> Zu1Graph<'a> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: None,
+            merged: None,
             patches: Arc::new(Patches::new()),
             frames: Arc::new(FrameSet::new()),
         }
@@ -293,6 +301,7 @@ impl<'a> Zu1Graph<'a> {
         // the deleted set belongs to the epoch as much as the
         // directories do.
         self.gone = None;
+        self.merged = None;
         // Only a fold moves the epoch, and a fold is what seals the
         // cells the patch was carrying, so they are in the columns the
         // next reader loads.
@@ -331,6 +340,9 @@ impl<'a> Zu1Graph<'a> {
         for (rel, reader) in &mut self.readers {
             reader.set_edges(patches.edges.get(rel).cloned());
         }
+        // The chains the file holds have not moved; what a commit can
+        // have added to is the merge above them.
+        self.merged = None;
         self.patches = patches;
     }
 
@@ -346,6 +358,24 @@ impl<'a> Zu1Graph<'a> {
         });
         self.props.insert(table, reader);
         Ok(())
+    }
+
+    /// The rows a delete took away, the chains and whatever a commit
+    /// has taken away since the last fold together. See
+    /// [`crate::snapshot::Zu1Snapshot`], which reads them the same way.
+    fn ensure_gone(&mut self) -> Result<&Deleted> {
+        if self.gone.is_none() {
+            self.gone = Some(Deleted::load(&mut self.db)?);
+        }
+        if self.patches.gone.is_empty() {
+            return Ok(self.gone.as_ref().expect("just loaded"));
+        }
+        if self.merged.is_none() {
+            let mut gone = self.gone.clone().expect("just loaded");
+            gone.merge(&self.patches.gone);
+            self.merged = Some(gone);
+        }
+        Ok(self.merged.as_ref().expect("just merged"))
     }
 
     /// The same for a rel table's edge columns, which hang off its
@@ -777,14 +807,18 @@ impl Graph for Zu1Graph<'_> {
         if reader.directory().keys.is_none() {
             return Ok(Some(key));
         }
-        reader.lookup_key(db, key)
+        let Some(row) = reader.lookup_key(db, key)? else {
+            return Ok(None);
+        };
+        // A fold takes the key of a deleted row out of the index as it
+        // rebuilds the table, so a key lookup after one answers nothing.
+        // An unfolded delete has not rebuilt anything, and the tombstone
+        // is what says the row is gone either way.
+        Ok((!self.ensure_gone()?.holds(table, row)).then_some(row))
     }
 
     fn deleted(&mut self) -> Result<DeletedRows> {
-        if self.gone.is_none() {
-            self.gone = Some(Deleted::load(&mut self.db)?);
-        }
-        Ok(self.gone.as_ref().expect("just loaded").tables().clone())
+        Ok(self.ensure_gone()?.tables().clone())
     }
 
     fn fork(&self) -> Option<Box<dyn Graph + Send>> {
@@ -801,6 +835,7 @@ impl Graph for Zu1Graph<'_> {
             readers: HashMap::new(),
             props: HashMap::new(),
             gone: self.gone.clone(),
+            merged: self.merged.clone(),
             patches: Arc::clone(&self.patches),
             // Somebody else's memory, shared rather than reopened.
             frames: Arc::clone(&self.frames),

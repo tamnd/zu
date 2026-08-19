@@ -114,11 +114,12 @@ pub struct Mvcc {
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
     /// Whether everything published here is a shape a reader can be
-    /// handed without a fold sealing it first. Three are: a value
+    /// handed without a fold sealing it first. Four are: a value
     /// written onto a column of a row the base file already holds, the
-    /// same write onto an edge the graph already runs through, and an
-    /// edge added to a rel table, which the adjacency reader merges
-    /// into the lists it holds. It starts true on an empty store and
+    /// same write onto an edge the graph already runs through, an edge
+    /// added to a rel table, which the adjacency reader merges into the
+    /// lists it holds, and a row taken away, which is an offset the
+    /// readers filter by. It starts true on an empty store and
     /// one commit of any other shape turns it off until the next fold
     /// empties the store again.
     soft: bool,
@@ -154,6 +155,10 @@ pub enum Deferred {
     /// between, and the cell it holds in each column the table stores,
     /// by position in the props directory.
     Edge(u32, u64, u64, Vec<(u32, Cell)>),
+    /// A row taken away: the table and the offset it kept. Nothing of
+    /// the row moves, here or in a fold, so what a reader is handed is
+    /// the offset and what makes the row gone is the reader.
+    Gone(u32, u64),
 }
 
 impl Default for Mvcc {
@@ -829,14 +834,14 @@ impl Mvcc {
         self.deferred.clear();
         for op in ops {
             // What the op is about to put in the store, before the
-            // store has it. Three shapes can be handed to a reader as
+            // store has it. Four shapes can be handed to a reader as
             // they are, a value onto a row that is already there, the
-            // same value onto an edge, and an edge added to a rel
-            // table; everything else needs a fold to become readable,
-            // and a store that holds one of those needs a fold whatever
-            // else arrives after it. A write of nothing at all is in
-            // the second group: what it changes is the validity mask,
-            // and no patch carries one.
+            // same value onto an edge, an edge added to a rel table,
+            // and a row taken away; everything else needs a fold to
+            // become readable, and a store that holds one of those
+            // needs a fold whatever else arrives after it. A write of
+            // nothing at all is in the second group: what it changes is
+            // the validity mask, and no patch carries one.
             match &op {
                 Op::Update {
                     table,
@@ -865,6 +870,9 @@ impl Mvcc {
                 } if self.soft => {
                     self.deferred
                         .push(Deferred::Edge(*rel, *src, *dst, cols.clone()))
+                }
+                Op::Delete { table, offset } if self.soft => {
+                    self.deferred.push(Deferred::Gone(*table, *offset))
                 }
                 _ => {
                     self.soft = false;

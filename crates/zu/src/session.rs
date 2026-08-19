@@ -28,39 +28,10 @@ use zu_query::refs::{BindingTable, GraphHandle};
 use zu_query::row::{Batch, Flow};
 
 use crate::query::{self, NotAQuery, QueryResult, Value, Zu1Graph};
-use crate::write::{Patches, Writer};
+use crate::shared::{FileHandle, Lease, WriteSide};
+use crate::write::Patches;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
-
-/// Replays a sidecar WAL that a previous writer left behind.
-///
-/// A bulk load commits by writing its segments and appending one frame
-/// naming them, and folds those segments into the base afterwards. The
-/// commit is durable at the frame and the base is what a query reads,
-/// so a crash between the two leaves rows that are on disk and that no
-/// statement can see. Folding them here is what closes that window:
-/// every writable open pays one existence check, and one that finds a
-/// log with something in it puts the rows where a reader looks before
-/// the first statement runs.
-///
-/// A read-only open cannot fold, and does not pretend to. It reads the
-/// base as it stands, which is the state the last fold left, and the
-/// next writable open recovers the rest.
-fn replay_sidecar(db: &mut Zu1File) -> Result<()> {
-    if !db.is_writable() {
-        return Ok(());
-    }
-    let path = crate::append::sidecar(db.path());
-    if !path.try_exists().unwrap_or(false) {
-        return Ok(());
-    }
-    let mut wal = crate::zu1::wal::Wal::open(&path)?;
-    if wal.is_empty() {
-        return Ok(());
-    }
-    let mut mvcc = crate::zu1::fold::recover(db, &mut wal)?;
-    crate::zu1::fold::checkpoint_fold(db, &mut mvcc, &mut wal)
-}
 
 /// Distinct query texts held before the cache starts over. Workloads
 /// cycle a handful of statements; overflow means every text is unique
@@ -138,6 +109,22 @@ struct Explicit {
     read_only: bool,
 }
 
+/// What a statement that writes took on the way in and owes on the way
+/// out: the file's savepoint, the write side, or both.
+///
+/// They come apart because a statement inside an explicit transaction
+/// takes neither, the transaction is holding both already, and one
+/// that raises inside a transaction must not give back what the
+/// statements after it still need.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    /// Whether this statement is the one that will let go of the state
+    /// the file is keeping.
+    savepoint: bool,
+    /// Whether this statement is the one that took the write side.
+    entered: bool,
+}
+
 pub struct Session {
     graph: Zu1Graph<'static>,
     /// The graph a statement is against when it does not say, which is
@@ -172,10 +159,24 @@ pub struct Session {
     /// other part of the process last put in the environment, and
     /// [`crate::db::Config`] is the way a caller sets them on purpose.
     options: exec::Options,
-    /// The write side, opened on the first write and dropped whenever
-    /// the file goes out on loan. Opening it costs a log open and a
-    /// recovery pass, which a session that only reads should not pay.
-    writer: Option<Writer>,
+    /// The one write side of this file in this process, shared with
+    /// every other connection that has it open.
+    handle: Arc<FileHandle>,
+    /// The write side itself, while this session is the one writing.
+    /// Taken by the statement that writes and given back when it ends,
+    /// or held across an explicit transaction, which is the writer
+    /// lock of docs/08 §1.
+    side: Option<WriteSide>,
+    /// The version of the published state this session has taken. A
+    /// statement compares it and picks up what a commit on another
+    /// connection left, which costs one read lock and one word when
+    /// nothing has moved.
+    seen: u64,
+    /// The claim this session has on the epoch it is reading, taken at
+    /// the top of a statement and let go of at the end of it. While it
+    /// is held, a writer on another connection lists the blocks this
+    /// epoch reads as free but does not allocate into them.
+    lease: Option<Lease>,
     /// The explicit transaction running here, if a statement opened one.
     txn: Option<Explicit>,
     /// The props directories of the tables writes have touched, held
@@ -197,23 +198,46 @@ pub struct Session {
 
 impl Session {
     pub fn open(path: &Path) -> Result<Session> {
-        Session::on(Zu1File::open(path)?)
+        Session::attached(FileHandle::attach(path, false, || Zu1File::open(path))?)
     }
 
     /// A session over a file handle the caller opened, which is how
     /// [`crate::db::Database`] applies a read-only or memory-limited
     /// open without this module growing a constructor per option.
-    pub fn on(mut db: Zu1File) -> Result<Session> {
-        replay_sidecar(&mut db)?;
+    ///
+    /// The handle is what the file is registered under if this process
+    /// has not opened it yet, and dropped if it has: one file is one
+    /// write side, and the one already registered is the one every
+    /// other connection is reading through.
+    pub fn on(db: Zu1File) -> Result<Session> {
+        Session::attached(FileHandle::attach_to(db)?)
+    }
+
+    /// A session on a file this process already holds the write side
+    /// of: its own descriptor for reading, forked off that side so the
+    /// block cache and the decoded pools are shared, and the roots the
+    /// side has published.
+    pub fn attached(handle: Arc<FileHandle>) -> Result<Session> {
+        // Leased for the length of the open, because loading the schema
+        // is a read like any other and a writer on another connection
+        // is free to be folding underneath it.
+        let (published, lease) = FileHandle::observe(&handle);
+        let mut db = handle.reader()?;
+        db.follow(published.header(), published.slot());
         let (catalog, schema) = query::load_schema(&mut db)?;
         let epoch = db.db_header().epoch;
         let working = catalog.home_graph_id();
+        let patches = Arc::clone(published.patches());
+        let mut graph = Zu1Graph::owned(db, catalog);
+        graph.set_patches(Arc::clone(&patches));
+        let mut snap = crate::snapshot::SnapshotCache::default();
+        snap.set_patches(Arc::clone(&patches));
         Ok(Session {
-            graph: Zu1Graph::owned(db, catalog),
+            graph,
             working,
             schemas: HashMap::from([(working, Arc::new(schema))]),
             epoch,
-            snap: crate::snapshot::SnapshotCache::default(),
+            snap,
             plans: HashMap::new(),
             focused: HashMap::new(),
             stmts: HashMap::new(),
@@ -222,10 +246,13 @@ impl Session {
                 interrupt: Interrupt::armed(),
                 ..query::env_options()
             },
-            writer: None,
+            seen: published.version(),
+            lease: Some(lease),
+            handle,
+            side: None,
             txn: None,
             dirs: crate::set::Dirs::default(),
-            patches: Arc::new(Patches::new()),
+            patches,
             frames: Arc::new(FrameSet::new()),
         })
     }
@@ -251,12 +278,23 @@ impl Session {
     /// committed statements. Publishing first puts the folds on the
     /// file and empties the log itself, and the appender then opens a
     /// log that says nothing anyone still needs.
+    ///
+    /// What goes out is the shared write side, so this session holds
+    /// the writer lock from here until its next statement or its drop.
+    /// Nothing else could be true: the file itself is on loan and the
+    /// caller says when it is done with it by stopping using it, which
+    /// is not something another connection can wait on.
     pub fn file_mut(&mut self) -> Result<&mut Zu1File> {
-        if let Some(mut writer) = self.writer.take() {
-            writer.fold(self.graph.file_mut())?;
-        }
-        self.sync_patches();
-        Ok(self.graph.file_mut())
+        self.enter()?;
+        let side = self.side.as_mut().expect("entered just above");
+        side.fold_writer()?;
+        self.handle.publish(side);
+        self.sync()?;
+        Ok(self
+            .side
+            .as_mut()
+            .expect("held from the enter above")
+            .file_mut())
     }
 
     /// The catalog this session last loaded, which is how a caller
@@ -381,29 +419,115 @@ impl Session {
         &mut self,
         stage: impl FnOnce(&mut crate::zu1::txn::WriteTxn<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.refresh()?;
-        self.open_writer()?;
-        let mut writer = self.writer.take().expect("opened just above");
-        let written = writer.write(self.graph.file_mut(), stage);
-        self.writer = Some(writer);
-        let written = written?;
-        self.refresh()?;
-        self.sync_patches();
+        let entered = self.enter()?;
+        let staged = {
+            let side = self.side.as_mut().expect("entered just above");
+            let staged = side.write(stage);
+            // Published even when the closure raised, because a
+            // transaction that staged nothing still folded whatever
+            // opening the writer recovered.
+            self.handle.publish(side);
+            staged
+        };
+        let synced = self.sync();
+        // After the sync, so that this session's own lease is on the
+        // epoch it has just published rather than the one before it and
+        // the blocks it freed come back now rather than a statement
+        // later, which is what a single connection wants.
+        self.reclaim();
+        self.leave(entered);
+        let written = staged?;
+        synced?;
         Ok(written.value)
     }
 
-    /// Opens the writer if it is not open already.
-    ///
-    /// Opening it recovers and folds whatever the log holds, which can
-    /// move the epoch, so the reload comes with it rather than only
-    /// after the next write.
-    fn open_writer(&mut self) -> Result<()> {
-        if self.writer.is_none() {
-            self.writer = Some(Writer::open(self.graph.file_mut())?);
-            self.refresh()?;
-            self.sync_patches();
+    /// Hands back the blocks the write just freed, unless a statement
+    /// on another connection is still reading the epoch that held them.
+    fn reclaim(&mut self) {
+        if let Some(side) = self.side.as_mut() {
+            self.handle.reclaim(side);
         }
-        Ok(())
+    }
+
+    /// Lets go of the epoch the statement that just ended was reading.
+    ///
+    /// A connection between statements holds no lease, so a writer is
+    /// free to reuse everything it has freed. Not calling it is a
+    /// correctness-free mistake: the next statement's lease replaces
+    /// this one, and until then the file grows instead of reusing.
+    pub fn idle(&mut self) {
+        self.lease = None;
+    }
+
+    /// Takes the write side of this file, unless this session is
+    /// already holding it, and answers whether this call is what took
+    /// it. Waiting here is a connection waiting for another
+    /// connection's write statement, in the order they asked.
+    ///
+    /// Taking it picks up whatever the last writer left, which is the
+    /// roots it folded to and the cells it committed without folding,
+    /// and opening the writer for the first time recovers and folds
+    /// whatever the log holds on top of that.
+    fn enter(&mut self) -> Result<bool> {
+        if self.side.is_some() {
+            return Ok(false);
+        }
+        let mut side = self.handle.take();
+        let opened = side.open_writer();
+        // The side goes back before the failure does, or a log this
+        // process cannot open is a file nothing else can write either.
+        if let Err(err) = opened {
+            self.handle.put(side);
+            return Err(err);
+        }
+        self.handle.publish(&side);
+        self.side = Some(side);
+        self.sync()?;
+        // Opening the writer folds, and an appender that had the file
+        // between statements checkpointed on it, so there is usually
+        // something waiting here even before this statement writes.
+        self.reclaim();
+        Ok(true)
+    }
+
+    /// The file a statement that writes writes through, which is the
+    /// shared write side it took at the top of the statement rather
+    /// than the handle it reads with.
+    fn writing(&mut self) -> &mut Zu1File {
+        self.side
+            .as_mut()
+            .expect("a statement that writes holds the write side")
+            .file_mut()
+    }
+
+    /// Says where the write side has got to, for the readers of every
+    /// connection on this file.
+    fn publish_side(&mut self) {
+        if let Some(side) = self.side.as_ref() {
+            self.handle.publish(side);
+        }
+    }
+
+    /// Gives the write side back to whoever is waiting for it.
+    ///
+    /// A savepoint keeps it here. The state a rollback goes back to
+    /// lives on that handle, so an explicit transaction holds the
+    /// writer lock from its first write to the word that ends it,
+    /// which is what `BEGIN WRITE` means in docs/08 §1.
+    fn leave(&mut self, entered: bool) {
+        if !entered {
+            return;
+        }
+        if self
+            .side
+            .as_ref()
+            .is_some_and(|side| side.file().in_savepoint())
+        {
+            return;
+        }
+        if let Some(side) = self.side.take() {
+            self.handle.put(side);
+        }
     }
 
     /// Whether an explicit transaction is running on this session.
@@ -447,13 +571,25 @@ impl Session {
                 }
                 // A transaction that only read, or that wrote nothing
                 // yet, never had the file keep anything, so both words
-                // end it the same way and neither costs an epoch.
-                if self.graph.file().in_savepoint() {
+                // end it the same way, neither costs an epoch, and the
+                // write side was never taken to give back.
+                if self
+                    .side
+                    .as_ref()
+                    .is_some_and(|side| side.file().in_savepoint())
+                {
                     if matches!(stmt, TxnStmt::Commit) {
-                        self.graph.file_mut().release_savepoint()?;
+                        self.side
+                            .as_mut()
+                            .expect("held just above")
+                            .file_mut()
+                            .release_savepoint()?;
                     } else {
                         self.undo()?;
                     }
+                    // The savepoint is what was keeping the write side
+                    // here, so this is where the next writer gets it.
+                    self.leave(true);
                 }
             }
         }
@@ -483,10 +619,10 @@ impl Session {
     /// when its earlier parts had already committed. Inside one, the
     /// first statement to write takes it and the transaction owns it,
     /// because the unit that can be taken back is then the transaction.
-    fn hold(&mut self) -> Result<bool> {
-        if self.graph.file().in_savepoint() {
-            return Ok(false);
-        }
+    fn hold(&mut self) -> Result<Held> {
+        // Asked of the reading handle, which was opened the way the
+        // connection was, so a read-only connection is turned away
+        // before it queues for a write side it may not use.
         crate::write::writable(self.graph.file())?;
         // A transaction starts from a folded file. Opening the writer
         // is what folds it, and the savepoint keeps where the log
@@ -494,34 +630,53 @@ impl Session {
         // transaction wrote and leaves alone the ones that were in the
         // log before it, which somebody else committed and this
         // transaction has no say over.
-        self.open_writer()?;
-        let floor = self.writer.as_ref().expect("opened just above").epoch();
-        self.graph
-            .file_mut()
-            .begin_savepoint(self.txn.is_some(), floor)?;
-        Ok(self.txn.is_none())
+        let entered = self.enter()?;
+        let side = self.side.as_mut().expect("entered just above");
+        if side.file().in_savepoint() {
+            return Ok(Held {
+                savepoint: false,
+                entered,
+            });
+        }
+        let floor = side.epoch();
+        let inside = self.txn.is_some();
+        side.file_mut().begin_savepoint(inside, floor)?;
+        Ok(Held {
+            savepoint: !inside,
+            entered,
+        })
     }
 
     /// Ends what [`Self::hold`] took: a statement that answered keeps
     /// what it wrote, one that raised has it undone.
-    fn settle<T>(&mut self, out: Result<T>, held: bool) -> Result<T> {
-        if !held {
-            return out;
-        }
-        match out {
-            Ok(value) => {
-                self.graph.file_mut().release_savepoint()?;
-                Ok(value)
-            }
+    fn settle<T>(&mut self, out: Result<T>, held: Held) -> Result<T> {
+        let out = match (held.savepoint, out) {
+            (false, out) => out,
+            (true, Ok(value)) => self
+                .side
+                .as_mut()
+                .expect("a savepoint is held on the write side")
+                .file_mut()
+                .release_savepoint()
+                .map(|()| value),
             // The rollback is reported over the error that caused it
             // when it fails, because a statement that raised and was
             // undone leaves a database a caller can carry on with, and
             // one that raised and could not be undone does not.
-            Err(err) => {
-                self.undo()?;
-                Err(err)
-            }
+            (true, Err(err)) => match self.undo() {
+                Ok(()) => Err(err),
+                Err(failed) => Err(failed),
+            },
+        };
+        if let Some(side) = self.side.as_ref() {
+            self.handle.publish(side);
         }
+        let synced = self.sync();
+        self.reclaim();
+        self.leave(held.entered);
+        let value = out?;
+        synced?;
+        Ok(value)
     }
 
     /// Publishes the state the file was keeping, and drops everything
@@ -540,18 +695,18 @@ impl Session {
     /// is where the log stood when the transaction began, so frames
     /// somebody else committed before it are left alone.
     fn undo(&mut self) -> Result<()> {
-        let floor = self.graph.file().savepoint_floor();
-        if let (Some(writer), Some(floor)) = (self.writer.as_mut(), floor) {
-            writer.discard_above(floor)?;
+        self.enter()?;
+        let side = self.side.as_mut().expect("entered just above");
+        let floor = side.file().savepoint_floor();
+        if let Some(floor) = floor {
+            side.discard_above(floor)?;
         }
-        self.writer = None;
-        self.graph.file_mut().rollback_savepoint()?;
-        self.refresh()?;
+        side.file_mut().rollback_savepoint()?;
+        self.handle.publish(side);
         // The writer went with the epochs it was holding, and the cells
         // its unfolded commits wrote went with it, so what the readers
         // were shown has to go too.
-        self.sync_patches();
-        Ok(())
+        self.sync()
     }
 
     /// A graph reference value naming one graph in the catalog (GV60),
@@ -563,7 +718,7 @@ impl Session {
     /// once, holds the handle, and passes it to as many statements as
     /// it likes.
     pub fn graph_ref(&mut self, schema: &str, name: &str) -> Result<Value> {
-        self.refresh()?;
+        self.sync()?;
         let graph = self.graph.catalog().graph(schema, name).ok_or_else(|| {
             ZuError::gql(codes::C42002, format!("no graph '{name}' in '{schema}'"))
         })?;
@@ -576,7 +731,7 @@ impl Session {
     /// which is what `CURRENT_PROPERTY_GRAPH` will hand back once a
     /// graph expression can be written (GE01, G6).
     pub fn working_graph_ref(&mut self) -> Result<Value> {
-        self.refresh()?;
+        self.sync()?;
         let graph = self
             .graph
             .catalog()
@@ -710,7 +865,7 @@ impl Session {
         batch_rows: usize,
         sink: &mut dyn FnMut(Batch<'_>) -> Result<Flow>,
     ) -> Result<Streamed> {
-        self.refresh()?;
+        self.sync()?;
         self.check_refs(params)?;
         if query::not_a_query(source)?.is_some() {
             let result = self.run(source, params)?;
@@ -764,7 +919,7 @@ impl Session {
     /// Runs one query, compiling it on the first sighting of this text
     /// and reusing the cached plan afterwards.
     pub fn run(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
-        self.refresh()?;
+        self.sync()?;
         self.check_refs(params)?;
         match query::not_a_query(source)? {
             Some(NotAQuery::Transaction(stmt)) => return self.transaction(stmt),
@@ -775,9 +930,8 @@ impl Session {
             Some(NotAQuery::Catalog(stmt)) => {
                 self.refuse_a_write()?;
                 let held = self.hold()?;
-                let out = crate::catalog_stmt::apply(self.graph.file_mut(), &stmt, params);
+                let out = crate::catalog_stmt::apply(self.writing(), &stmt, params);
                 self.settle(out, held)?;
-                self.refresh()?;
                 return Ok(QueryResult::new(Vec::new(), Vec::new()));
             }
             None => {}
@@ -954,7 +1108,9 @@ impl Session {
                     // statement holds a savepoint, so a change that
                     // fails after this takes the declaration with it.
                     if let Some(catalog) = widened {
-                        catalog.store(self.graph.file_mut())?;
+                        catalog.store(self.writing())?;
+                        self.publish_side();
+                        self.sync()?;
                     }
                     self.write(|txn| crate::set::stage(txn, &updates))?;
                     next
@@ -1051,7 +1207,7 @@ impl Session {
     /// id and the parameter names the statement wants, in binder
     /// order.
     pub fn prepare(&mut self, source: &str) -> Result<(u64, Vec<String>)> {
-        self.refresh()?;
+        self.sync()?;
         let cached = self.plan_for(source, &[])?;
         let params = cached.query.params.clone();
         let id = self.next_stmt;
@@ -1067,7 +1223,7 @@ impl Session {
     /// query text and starting execution: the epoch check and the
     /// cache lookup.
     pub fn warm(&mut self, source: &str) -> Result<bool> {
-        self.refresh()?;
+        self.sync()?;
         // A text that is held as a refusal is not warm: it has nothing
         // to run, and the call below hands the caller the condition it
         // was refused with rather than reporting a cache hit.
@@ -1120,7 +1276,7 @@ impl Session {
     /// [`zu_query::plan::QueryPlan::render`] of this, so what a caller
     /// reads and what a caller prints cannot disagree.
     pub fn explain_plan(&mut self, source: &str) -> Result<QueryPlan> {
-        self.refresh()?;
+        self.sync()?;
         let cached = self.plan_for(source, &[])?;
         let mut described = zu_query::plan::describe(&cached.plan, &cached.query, &cached.schema);
         described.notes = cached.notes.clone();
@@ -1176,7 +1332,7 @@ impl Session {
     /// rendering, for callers that want the numbers. `zu bench
     /// cardinality` reads q-error off this.
     pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<exec::Profile> {
-        self.refresh()?;
+        self.sync()?;
         let cached = self.plan_for(source, params)?;
         if cached.parts.is_some() {
             return Err(ZuError::Unsupported {
@@ -1239,10 +1395,11 @@ impl Session {
         graph: u32,
         wanted: &crate::declare::Wanted,
     ) -> Result<QueryResult> {
-        crate::declare::create(self.graph.file_mut(), graph, wanted)?;
+        crate::declare::create(self.writing(), graph, wanted)?;
         // The tables are published now, and the schemas this session
         // holds describe the catalog from before them.
-        self.refresh()?;
+        self.publish_side();
+        self.sync()?;
         let cached = self.plan_for(source, params)?;
         let args = query::bind_args(&cached.query.params, params)?;
         let parts = cached.parts.as_ref().ok_or_else(|| {
@@ -1365,18 +1522,59 @@ impl Session {
     /// columns have not moved, so the plan cache, the catalog and the
     /// decoded chunks all stay, and the statement pays the log sync and
     /// nothing else.
-    fn sync_patches(&mut self) {
-        let patches = match &self.writer {
-            Some(writer) => Arc::clone(writer.patches()),
-            None if self.patches.is_empty() => return,
-            None => Arc::new(Patches::new()),
-        };
+    fn hand_patches(&mut self, patches: Arc<Patches>) {
         if Arc::ptr_eq(&patches, &self.patches) {
+            return;
+        }
+        if patches.is_empty() && self.patches.is_empty() {
             return;
         }
         self.graph.set_patches(Arc::clone(&patches));
         self.snap.set_patches(Arc::clone(&patches));
         self.patches = patches;
+    }
+
+    /// Puts this session on the state the write side has reached.
+    ///
+    /// This is where a snapshot begins. A session holding the side
+    /// reads it straight, because it is the one moving it; a session
+    /// that is not compares the published version with what it last
+    /// took, which is one read lock and one word on a statement that
+    /// only reads and nothing has happened under. Either way what
+    /// comes over is the roots and the unfolded cells, which together
+    /// are the database as the last commit left it.
+    fn sync(&mut self) -> Result<()> {
+        let (published, lease) = FileHandle::observe(&self.handle);
+        // Taking the new lease before letting go of the old one is what
+        // keeps a statement from being briefly on no epoch at all,
+        // which a writer between the two would read as nobody looking.
+        self.lease = Some(lease);
+        let ahead = match &self.side {
+            Some(side) => Some((
+                side.file().db_header().clone(),
+                side.file().active_slot(),
+                side.patches(),
+            )),
+            None if published.newer_than(self.seen) => Some((
+                published.header().clone(),
+                published.slot(),
+                Arc::clone(published.patches()),
+            )),
+            None => None,
+        };
+        let Some((header, slot, patches)) = ahead else {
+            // Nothing has been published since the last statement, so
+            // the roots are the ones already in hand. The epoch check
+            // still runs, because it is a word and because it is what
+            // catches a handle moved by anything that went round the
+            // published state.
+            return self.refresh();
+        };
+        self.seen = published.version();
+        self.graph.file_mut().follow(&header, slot);
+        self.refresh()?;
+        self.hand_patches(patches);
+        Ok(())
     }
 
     fn refresh(&mut self) -> Result<()> {
@@ -1429,12 +1627,20 @@ impl Session {
 /// log as long as its life.
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.txn.is_some() && self.graph.file().in_savepoint() {
+        let holding = self
+            .side
+            .as_ref()
+            .is_some_and(|side| side.file().in_savepoint());
+        if self.txn.is_some() && holding {
             let _ = self.undo();
-            return;
+        } else if let Some(side) = self.side.as_mut() {
+            let _ = side.fold_writer();
+            self.handle.publish(side);
         }
-        if let Some(mut writer) = self.writer.take() {
-            let _ = writer.fold(self.graph.file_mut());
+        // Whatever happened, the write side goes back: a session that
+        // kept it would be a file no other connection could ever write.
+        if let Some(side) = self.side.take() {
+            self.handle.put(side);
         }
     }
 }
@@ -1535,6 +1741,7 @@ mod tests {
             .expect("second");
         assert_eq!(count(&mut session, PEOPLE), 4);
         std::mem::forget(session);
+        crate::shared::forget(&path);
 
         let mut reopened = Session::open(&path).expect("reopen");
         assert_eq!(
@@ -1570,6 +1777,7 @@ mod tests {
             .expect("second");
         session.run("COMMIT", &[]).expect("commit");
         std::mem::forget(session);
+        crate::shared::forget(&path);
 
         let mut reopened = Session::open(&path).expect("reopen");
         assert_eq!(count(&mut reopened, PEOPLE), 4);

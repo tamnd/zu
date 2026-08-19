@@ -1642,6 +1642,19 @@ pub enum BoundExpr {
     /// while the statement is bound, because which graph the words name
     /// is a question the catalog answers once and not once per row.
     Graph(GraphHandle),
+    /// GE03, a name that stands for a value inside one expression.
+    ///
+    /// The values are worked out in the order they are written, each
+    /// into the slot beside it, and the body reads them the way it
+    /// reads anything else the row holds. The slots are the binder's
+    /// own and are in no chunk, which is why [`expr_slots`] takes them
+    /// back out of what this expression asks the row for: the row owes
+    /// this expression what it reads from outside and nothing it made
+    /// itself.
+    Let {
+        values: Vec<(usize, BoundExpr)>,
+        body: Box<BoundExpr>,
+    },
     /// Index into `BoundQuery::params`.
     Param(usize),
     Var(usize),
@@ -2013,6 +2026,20 @@ pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
             for element in elements {
                 expr_slots(element, out);
             }
+        }
+        // GE03. The row supplies what the parts read less the names
+        // this expression made, since those are written and read
+        // inside it and no operator under it has ever heard of them.
+        BoundExpr::Let { values, body } => {
+            let mut read = Vec::new();
+            for (_, value) in values {
+                expr_slots(value, &mut read);
+            }
+            expr_slots(body, &mut read);
+            out.extend(
+                read.into_iter()
+                    .filter(|slot| !values.iter().any(|(made, _)| made == slot)),
+            );
         }
         BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
         BoundExpr::Case {
@@ -4015,6 +4042,50 @@ impl Binder<'_> {
         self.groups.get(name).cloned()
     }
 
+    /// Binds a `LET` written inside an expression, GE03.
+    ///
+    /// The names go into the ordinary scope and come back out at the
+    /// `END`, so the body reads one of them the way it reads a variable
+    /// the match wrote, and everything that already works on a variable
+    /// works on these. What they get is a slot of their own rather than
+    /// a copy of the expression in each place they are read, which is
+    /// the whole point of writing one: `LET n = f(x) IN n + n END` calls
+    /// `f` once, and a substitution would call it twice.
+    ///
+    /// A name already in scope is refused rather than shadowed, which is
+    /// `declare`'s rule and the standard's. It also keeps the slot
+    /// numbering honest for the projection: a slot only ever goes up,
+    /// an item's own slot is made after its expression is bound, so a
+    /// projection item and a name written inside it can share a name
+    /// without the sink confusing the two.
+    fn bind_let_expr(
+        &mut self,
+        definitions: &[ast::LetItem],
+        body: &Expr,
+        ctx: &mut ExprCtx,
+    ) -> Result<(BoundExpr, Type)> {
+        let mut values = Vec::with_capacity(definitions.len());
+        for item in definitions {
+            // Each definition is in scope for the ones after it, the
+            // same as in the clause, so a pair where the second is
+            // about the first reads the way it is written.
+            let (expr, ty) = self.bind_expr(&item.expr, ctx)?;
+            values.push((self.declare(&item.name, ty)?, expr));
+        }
+        let bound = self.bind_expr(body, ctx);
+        for item in definitions {
+            self.scope.remove(&item.name);
+        }
+        let (body, ty) = bound?;
+        Ok((
+            BoundExpr::Let {
+                values,
+                body: Box::new(body),
+            },
+            ty,
+        ))
+    }
+
     /// The handle a graph reference expression names, out of the
     /// graphs the schema was told about.
     ///
@@ -4395,6 +4466,7 @@ impl Binder<'_> {
                 let handle = self.resolve_graph_ref(reference)?;
                 Ok((BoundExpr::Graph(handle), Type::Graph))
             }
+            Expr::Let { definitions, body } => self.bind_let_expr(definitions, body, ctx),
             // GE01. A searched branch has to be a truth and a simple
             // branch has to be something the subject can be compared
             // with, and the answer is one type for the whole
@@ -5072,6 +5144,13 @@ pub fn text(expr: &Expr) -> String {
             },
             GraphRef::Param(name) => format!("GRAPH ${name}"),
         },
+        Expr::Let { definitions, body } => {
+            let rendered: Vec<String> = definitions
+                .iter()
+                .map(|item| format!("{} = {}", item.name, text(&item.expr)))
+                .collect();
+            format!("LET {} IN {} END", rendered.join(", "), text(body))
+        }
         Expr::Cast { expr, ty } => format!("CAST({} AS {ty})", text(expr)),
         Expr::Case {
             subject,

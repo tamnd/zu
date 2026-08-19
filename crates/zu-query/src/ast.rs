@@ -1169,6 +1169,17 @@ pub enum Expr {
     /// worth the same wherever they are written. What it answers is a
     /// reference and not the graph, which is what GV60 is.
     GraphRef(GraphRef),
+    /// `LET n = a + b IN n * n END`, ISO 20.7 and GE03: a name that
+    /// stands for a value for the length of one expression.
+    ///
+    /// The same [`LetItem`] the clause is made of, because it is the
+    /// same thing said in a smaller place: a name for something worked
+    /// out once. What the clause adds to a row, this adds to nothing,
+    /// and the name is gone at the `END`.
+    Let {
+        definitions: Vec<LetItem>,
+        body: Box<Expr>,
+    },
     /// `CAST(expr AS type)`, ISO's GA05.
     Cast {
         expr: Box<Expr>,

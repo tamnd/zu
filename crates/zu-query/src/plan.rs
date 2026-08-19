@@ -1354,6 +1354,19 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             let rendered: Vec<String> = elements.iter().map(|e| expr_text(e, query)).collect();
             format!("PATH [{}]", rendered.join(", "))
         }
+        BoundExpr::Let { values, body } => {
+            let rendered: Vec<String> = values
+                .iter()
+                .map(|(slot, value)| {
+                    format!("{} = {}", slot_name(query, *slot), expr_text(value, query))
+                })
+                .collect();
+            format!(
+                "LET {} IN {} END",
+                rendered.join(", "),
+                expr_text(body, query)
+            )
+        }
         BoundExpr::Cast { expr, ty } => format!("CAST({} AS {ty})", expr_text(expr, query)),
         BoundExpr::Case {
             subject,

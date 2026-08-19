@@ -24,7 +24,7 @@ use zu_common::gqlstatus::codes;
 use zu_common::{FloatBits, GqlStatus, LogicalType, Result, Temporal, ZuError};
 use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
-use crate::deleted::Deleted;
+use crate::deleted::{Deleted, Tombstones};
 use crate::query::Value;
 use crate::split::Insert;
 use crate::zu1::catalog::{Catalog, MAX_PROPERTIES};
@@ -100,10 +100,12 @@ pub(crate) struct Batch<'a> {
     /// between. Owned for the reason [`crate::delete::Removals`] owns
     /// one: the file it came out of is handed in a row at a time.
     catalog: Catalog,
-    /// The rows the file has lost, which is what says an endpoint an
-    /// earlier clause found is one a `DELETE` has since taken away. A
-    /// statement's own delete is in here because a write folds as it is
-    /// staged, so the part after it reads a file the tombstone is in.
+    /// The rows the database has lost, which is what says an endpoint
+    /// an earlier clause found is one a `DELETE` has since taken away.
+    /// A statement's own delete is in here whichever way it was
+    /// written: a fold puts the tombstone in the chain the part after
+    /// it reads, and a delete that was not folded is in the patch this
+    /// was merged with.
     gone: Deleted,
     /// The property columns of each node table being written to, read
     /// once.
@@ -120,7 +122,12 @@ pub(crate) struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn open(db: &mut Zu1File, write: &'a Insert, catalog: Catalog) -> Result<Self> {
+    pub(crate) fn open(
+        db: &mut Zu1File,
+        write: &'a Insert,
+        catalog: Catalog,
+        gone: &Tombstones,
+    ) -> Result<Self> {
         let mut columns = BTreeMap::new();
         let mut next = BTreeMap::new();
         for node in &write.nodes {
@@ -144,7 +151,7 @@ impl<'a> Batch<'a> {
         // endpoint questions are asked.
         let gone = match write.rels.is_empty() {
             true => Deleted::default(),
-            false => Deleted::load(db)?,
+            false => Deleted::load_with(db, gone)?,
         };
         Ok(Self {
             write,

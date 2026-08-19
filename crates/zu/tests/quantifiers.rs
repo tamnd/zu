@@ -103,5 +103,5 @@ fn a_step_of_no_hops_is_refused_and_not_rounded_up() {
 #[test]
 fn the_abbreviated_edge_pattern_takes_one() {
     let mut fx = Fixture::open("quantifier-abbreviated.zu1");
-    assert_eq!(fx.reached("-->{2}"), fx.reached("-[:knows]->{2}"));
+    assert_eq!(fx.reached("->{2}"), fx.reached("-[:knows]->{2}"));
 }

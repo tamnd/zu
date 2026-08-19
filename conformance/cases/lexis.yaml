@@ -1,0 +1,149 @@
+schema: 3
+suite: lexis
+doc: How a statement is written rather than what it means. Every case here answers a value another suite already covers, and what is being asked is whether the engine reads the spelling ISO 21.3 gives it: the separator between digits, the two comment introducers, the doubled quote, the escapes, and the delimited name. A engine that refuses one of these refuses a statement that is legal GQL, and a client that generates GQL has to know which spellings travel.
+
+cases:
+  - name: digit-separator
+    doc: An underscore between digits is mandatory lexis, not an optional feature, and it changes nothing about the value. A client that strips it before sending, or an engine that reads the number as far as the underscore and then finds a name, both answer something other than a million.
+    query: RETURN 1_000_000 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1000000"
+
+  - name: digit-separator-in-a-radix
+    doc: The same separator in the three other radixes, where ISO also allows one in front of the first digit, since the prefix has already said the number began.
+    query: RETURN 0xF_F AS n, 0o1_7 AS o, 0b1_0 AS b
+    columns:
+      - n
+      - o
+      - b
+    rows:
+      - values:
+          - type: INT64
+            value: "255"
+          - type: INT64
+            value: "15"
+          - type: INT64
+            value: "2"
+
+  - name: digit-separator-in-a-fraction
+    doc: A fraction is two runs of digits and a point between them, so the separator reads in both runs and in the exponent.
+    query: RETURN 1_0.5_0 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "10.5"
+
+  - name: solidus-comment
+    doc: GB03. Two solidi open a comment that runs to the end of the line, and a statement is what is left when the comments are gone.
+    query: RETURN 1 AS n // the rest of this line is not the statement
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: minus-comment
+    doc: GB02. Two minus signs open the same comment the two solidi do, which is the spelling every SQL dialect has and which costs the Cypher way of writing an undirected edge, since those are the same two characters.
+    query: RETURN 1 AS n -- the rest of this line is not the statement
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: bracketed-comment
+    doc: The mandatory bracketed form, which is the one that may stand in the middle of a statement rather than only at the end of a line.
+    query: RETURN /* a note where a space would do */ 1 AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: doubled-quote
+    doc: A quote written twice is one quote in the value, which is SQL's rule and is not only the no-escape form's. An engine that reads the pair as the end of one string and the start of another answers two strings where the statement wrote one.
+    query: RETURN 'it''s' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: it's
+
+  - name: doubled-double-quote
+    doc: The same rule inside the other quote, so neither quote character is the one that has to be escaped.
+    query: RETURN "say ""hi""" AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: say "hi"
+
+  - name: escape-set
+    doc: The escapes of ISO 21.3 that are not the newline and the tab everybody has: a backspace, a form feed, and the accent that a delimited name is written with. Three characters no keyboard puts in a string any other way.
+    query: RETURN 'a\bb' AS b, 'a\fb' AS f, 'a\`b' AS a
+    columns:
+      - b
+      - f
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: "a\bb"
+          - type: STRING
+            value: "a\fb"
+          - type: STRING
+            value: "a`b"
+
+  - name: unicode-escape
+    doc: A character named by the digits of its code point, in the four digit form and the six digit form. The six digit form is the one that reaches past the basic plane, which is where a client holding text as UTF-16 has two units for one character.
+    query: RETURN 'é' AS four, '\U01F600' AS six
+    columns:
+      - four
+      - six
+    rows:
+      - values:
+          - type: STRING
+            value: é
+          - type: STRING
+            value: 😀
+
+  - name: delimited-name
+    doc: A column name that no identifier could spell, which is the whole point of the delimited form: the accent may be doubled to mean itself, so there is no name a catalog can hold and a statement cannot write.
+    query: RETURN 1 AS `odd``name`
+    columns:
+      - odd`name
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: delimited-name-with-an-escape
+    doc: The escapes of a string are the escapes of a name, so a tab in a column name is written the way a tab in a value is.
+    query: RETURN 1 AS `a\tb`
+    columns:
+      - "a\tb"
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: no-escape-name
+    doc: GL11 for a name rather than a string. The `@` turns the escapes off in front of either quote and in front of the accent, and a backslash is then a backslash.
+    query: RETURN 1 AS @`raw\name`
+    columns:
+      - raw\name
+    rows:
+      - values:
+          - type: INT64
+            value: "1"

@@ -439,6 +439,8 @@ fn unescape(body: &str, line: usize) -> Result<String, String> {
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
             Some('0') => out.push('\0'),
             Some(other) => return Err(format!("line {line}: \\{other} is not an escape")),
             None => return Err(format!("line {line}: a scalar ending in a backslash")),

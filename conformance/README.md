@@ -186,7 +186,7 @@ The rule that carries the whole encoding is which types are written in quotes.
 
 `DECIMAL`, `BYTES`, `NODE`, `EDGE`, and `PATH` are reserved: the names are refused today rather than silently accepted as unknown, so that the first case to need one is a decision somebody makes rather than a spelling that happened to parse.
 
-The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1367 values counting the ones inside lists, and both print them the same way.
+The encoding has two implementations for the same reason the YAML subset does. `crates/zu-corpus/src/value.rs` is the reference and `conformance/c/value.c` is the same encoding in C, down to the temporal parser, the shortest float text, and which spellings are refused. Both walk every value in the corpus in their own test suite, which is 1470 values counting the ones inside lists, and both print them the same way.
 
 ## What the Rust runner does not check
 
@@ -198,10 +198,10 @@ Notices are the other gap. A statement can succeed and raise a warning, as a set
 
 ## The YAML the reader accepts
 
-A strict block-only subset, not general YAML: two-space indent, no tabs, `- ` with exactly one space after it, one-line plain or single-quoted or double-quoted scalars, and `#` comments. No flow collections, block scalars, anchors, aliases, tags, or document markers. Anything outside the subset is an error with a line number rather than something reinterpreted.
+A strict block-only subset, not general YAML: two-space indent, no tabs, `- ` with exactly one space after it, one-line plain or single-quoted or double-quoted scalars, whose escapes are the six of YAML that name a character a case needs and no more (`\\"`, `\\\\`, `\\n`, `\\r`, `\\t`, `\\b`, `\\f`, `\\0`), and `#` comments. No flow collections, block scalars, anchors, aliases, tags, or document markers. Anything outside the subset is an error with a line number rather than something reinterpreted.
 
 The reason is the reason the TOML reader gives: a construct silently reinterpreted is a case that says one thing to a reviewer and another to the runner, and a corpus whose whole job is to settle disagreements cannot afford to be one of them. Block scalars are refused in particular so that a `doc:` is one unwrapped line, which is the same rule the repository's markdown follows.
 
 Comments are found by the one rule that matters to a case writer: a `#` starts a comment only with whitespace before it, and a quote hides a `#` only if it opens after whitespace and closes on the same line. That last clause is what lets a `query:` hold `cast('  42  ' AS INT64)`, whose closing quote has a space before it and so looks like an opening one. A quote that opens nothing that closes was not a run.
 
-There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 18 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.
+There are two readers of that subset. `crates/zu-corpus/src/yaml.rs` is the reference, and `conformance/c/yaml.c` is the same subset in C, because a runner in C cannot take a Rust dependency. They are held together by the refusal table, which is written out in both test suites case for case, and by the 20 case files themselves, which both have to read the same way. Where they disagree the Rust one is right by definition, for the same reason its runner is. Two implementations are also the cheapest evidence that the subset is small enough to implement, which is a claim this directory makes to eight repositories that will each have to.

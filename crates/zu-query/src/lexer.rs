@@ -7,6 +7,15 @@
 //! token set small and the keyword list in one place. `<-` and `->` are
 //! deliberately not tokens: `a < -1` must lex as less-than then minus,
 //! so the parser assembles pattern arrows from the single characters.
+//!
+//! Two minus signs are a comment to the end of the line (GB02), which
+//! costs the two spellings Cypher writes an edge with and GQL does not,
+//! `(a)--(b)` and `(a)-->(b)`. GQL abbreviates those `(a)-(b)` and
+//! `(a)->(b)`, the standard says a double minus opens a comment
+//! wherever it is written, and a lexer cannot have it both ways: the
+//! two readings are the same characters. A statement that writes the
+//! Cypher spelling loses the rest of its line to the comment and fails
+//! to parse, which is the loud way for this to go wrong.
 
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
@@ -134,7 +143,15 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
             ix += 1;
             continue;
         }
-        if b == b'/' && bytes.get(ix + 1) == Some(&b'/') {
+        // GB02 and GB03: a comment to the end of the line opens with
+        // either two solidi or two minus signs, and ISO gives them one
+        // rule between them. Two minus signs are also two operators,
+        // and `1 - -2` keeps its spaces for that reason: a subtraction
+        // of a negative number written with nothing between the signs
+        // is a comment in every SQL there has ever been.
+        if (b == b'/' && bytes.get(ix + 1) == Some(&b'/'))
+            || (b == b'-' && bytes.get(ix + 1) == Some(&b'-'))
+        {
             while ix < bytes.len() && bytes[ix] != b'\n' {
                 ix += 1;
             }
@@ -235,43 +252,29 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
                 }
                 continue;
             }
-            b'\'' | b'"' => {
-                let (text, end) = lex_string(source, ix)?;
-                tokens.push(Token {
-                    kind: TokenKind::Str(text),
-                    start,
-                    end,
-                });
+            // A grave accent opens a delimited identifier and the other
+            // two quotes open a string, and all three are read the same
+            // way. `@` in front of any of them is GL11, the form that
+            // hands back the characters as written, so a lone `@` is
+            // still nothing at all.
+            b'\'' | b'"' | b'`' | b'@'
+                if matches!(
+                    bytes.get(if b == b'@' { ix + 1 } else { ix }),
+                    Some(b'\'' | b'"' | b'`')
+                ) =>
+            {
+                let open = if b == b'@' { ix + 1 } else { ix };
+                let (text, end) = lex_quoted(source, open, b != b'@', start)?;
+                let kind = if bytes[open] == b'`' {
+                    if text.is_empty() {
+                        return Err(err(source, start, "empty backtick identifier"));
+                    }
+                    TokenKind::QuotedIdent(text)
+                } else {
+                    TokenKind::Str(text)
+                };
+                tokens.push(Token { kind, start, end });
                 ix = end;
-                continue;
-            }
-            // GL11. `@` before a quote asks for the text as written, so
-            // a lone `@` is still nothing at all.
-            b'@' if matches!(bytes.get(ix + 1), Some(b'\'' | b'"')) => {
-                let (text, end) = lex_raw_string(source, ix + 1)?;
-                tokens.push(Token {
-                    kind: TokenKind::Str(text),
-                    start,
-                    end,
-                });
-                ix = end;
-                continue;
-            }
-            b'`' => {
-                let close = bytes[ix + 1..]
-                    .iter()
-                    .position(|&c| c == b'`')
-                    .ok_or_else(|| err(source, ix, "unterminated backtick identifier"))?;
-                let name = &source[ix + 1..ix + 1 + close];
-                if name.is_empty() {
-                    return Err(err(source, ix, "empty backtick identifier"));
-                }
-                tokens.push(Token {
-                    kind: TokenKind::QuotedIdent(name.to_string()),
-                    start,
-                    end: ix + close + 2,
-                });
-                ix += close + 2;
                 continue;
             }
             b'$' => {
@@ -323,48 +326,70 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
-/// Lexes a quoted string starting at `open`, handling the escape set
-/// `\\ \' \" \n \r \t` and rejecting everything else by position.
-fn lex_string(source: &str, open: usize) -> Result<(String, usize)> {
+/// One escape of ISO 21.3, the reverse solidus at `at` unread, pushing
+/// what it stands for onto `text` and answering the index after it.
+///
+/// The four quote escapes are here rather than in the caller because
+/// the set does not depend on which quote the sequence was opened with:
+/// `'\`'` is a legal way to write a grave accent inside a string, and
+/// the reader of a statement should not have to remember which of the
+/// three characters the escape list changes with.
+fn escape(source: &str, at: usize, text: &mut String) -> Result<usize> {
     let bytes = source.as_bytes();
-    let quote = bytes[open];
-    let mut text = String::new();
-    let mut ix = open + 1;
-    while ix < bytes.len() {
-        match bytes[ix] {
-            b'\\' => {
-                let escaped = bytes
-                    .get(ix + 1)
-                    .ok_or_else(|| err(source, open, "unterminated string"))?;
-                let ch = match escaped {
-                    b'\\' => '\\',
-                    b'\'' => '\'',
-                    b'"' => '"',
-                    b'n' => '\n',
-                    b'r' => '\r',
-                    b't' => '\t',
-                    _ => {
-                        return Err(err(source, ix, "unknown escape in string"));
-                    }
-                };
-                text.push(ch);
-                ix += 2;
-            }
-            c if c == quote => return Ok((text, ix + 1)),
-            _ => {
-                let ch = source[ix..].chars().next().expect("in-bounds char");
-                text.push(ch);
-                ix += ch.len_utf8();
-            }
-        }
+    let escaped = bytes
+        .get(at + 1)
+        .ok_or_else(|| err(source, at, "unterminated escape"))?;
+    // The two unicode escapes name a code point by its hexadecimal
+    // digits, four of them or six, and the digits have to make a
+    // character: a surrogate half is a number that no text contains.
+    if matches!(escaped, b'u' | b'U') {
+        let width = if *escaped == b'u' { 4 } else { 6 };
+        let end = at + 2 + width;
+        let digits = source
+            .get(at + 2..end)
+            .filter(|d| d.chars().all(|c| c.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                err(
+                    source,
+                    at,
+                    &format!(
+                        "expected {width} hexadecimal digits after '\\{}'",
+                        *escaped as char
+                    ),
+                )
+            })?;
+        let point = u32::from_str_radix(digits, 16).expect("hexadecimal digits");
+        let ch =
+            char::from_u32(point).ok_or_else(|| err(source, at, "escape names no character"))?;
+        text.push(ch);
+        return Ok(end);
     }
-    Err(err(source, open, "unterminated string"))
+    let ch = match escaped {
+        b'\\' => '\\',
+        b'\'' => '\'',
+        b'"' => '"',
+        b'`' => '`',
+        b'n' => '\n',
+        b'r' => '\r',
+        b't' => '\t',
+        b'b' => '\u{8}',
+        b'f' => '\u{c}',
+        _ => return Err(err(source, at, "unknown escape in string")),
+    };
+    text.push(ch);
+    Ok(at + 2)
 }
 
-/// Lexes an `@'...'` string, ISO's no-escape form (GL11, 21.3). A
-/// backslash is a backslash, which is the point of the form, so the
-/// only way a quote gets in is by writing it twice.
-fn lex_raw_string(source: &str, open: usize) -> Result<(String, usize)> {
+/// Lexes a quoted sequence starting at `open`, which is a string when
+/// the quote is `'` or `"` and an identifier when it is a grave accent.
+/// All three are the same shape in ISO 21.3, so they are one function:
+/// the quote may be written twice to mean itself, and `escapes` is off
+/// for the `@` form of GL11, where a backslash is a backslash and
+/// doubling the quote is the only way one gets in.
+///
+/// `report` is where a failure points, which is the `@` rather than the
+/// quote when there is one, since that is where the literal began.
+fn lex_quoted(source: &str, open: usize, escapes: bool, report: usize) -> Result<(String, usize)> {
     let bytes = source.as_bytes();
     let quote = bytes[open];
     let mut text = String::new();
@@ -378,11 +403,20 @@ fn lex_raw_string(source: &str, open: usize) -> Result<(String, usize)> {
             }
             return Ok((text, ix + 1));
         }
+        if escapes && bytes[ix] == b'\\' {
+            ix = escape(source, ix, &mut text)?;
+            continue;
+        }
         let ch = source[ix..].chars().next().expect("in-bounds char");
         text.push(ch);
         ix += ch.len_utf8();
     }
-    Err(err(source, open - 1, "unterminated string"))
+    let noun = if quote == b'`' {
+        "identifier"
+    } else {
+        "string"
+    };
+    Err(err(source, report, &format!("unterminated {noun}")))
 }
 
 /// The radix a `0x`, `0o` or `0b` prefix asks for, and the word for it
@@ -407,8 +441,20 @@ fn lex_radix_integer(
     let bytes = source.as_bytes();
     let first = start + 2;
     let mut ix = first;
-    while ix < bytes.len() && (bytes[ix] as char).is_digit(radix) {
-        ix += 1;
+    // ISO 21.3 writes the digits of a radix integer as `{ [_] digit }`,
+    // so a separator may stand in front of the first digit here where a
+    // decimal integer has to begin with one. Two in a row is still two
+    // separators with no digit between them.
+    while ix < bytes.len() {
+        if bytes[ix] == b'_' && (bytes.get(ix + 1)).is_some_and(|&c| (c as char).is_digit(radix)) {
+            ix += 2;
+            continue;
+        }
+        if (bytes[ix] as char).is_digit(radix) {
+            ix += 1;
+            continue;
+        }
+        break;
     }
     let trailing = bytes
         .get(ix)
@@ -421,9 +467,32 @@ fn lex_radix_integer(
             &format!("expected {name} digits after '{prefix}'"),
         ));
     }
-    let value = u64::from_str_radix(&source[first..ix], radix)
+    let digits: String = source[first..ix].chars().filter(|&c| c != '_').collect();
+    let value = u64::from_str_radix(&digits, radix)
         .map_err(|_| err(source, start, "integer literal out of range"))?;
     Ok((TokenKind::Int(value), ix))
+}
+
+/// Runs of decimal digits from `from`, which is a digit, answering the
+/// index after the last of them. A separator is allowed between two
+/// digits and nowhere else, which is what makes `1_000` a thousand and
+/// `1_` the number one followed by a name: ISO 21.3 writes the run as
+/// `digit { [_] digit }`, so the underscore never ends the number and
+/// never doubles.
+fn digits(bytes: &[u8], from: usize) -> usize {
+    let mut ix = from;
+    while ix < bytes.len() {
+        if bytes[ix].is_ascii_digit() {
+            ix += 1;
+            continue;
+        }
+        if bytes[ix] == b'_' && bytes.get(ix + 1).is_some_and(u8::is_ascii_digit) {
+            ix += 2;
+            continue;
+        }
+        break;
+    }
+    ix
 }
 
 /// Lexes an integer or float. `1..3` stays an integer before a range,
@@ -438,20 +507,14 @@ fn lex_number(source: &str, start: usize) -> Result<(TokenKind, usize)> {
     {
         return lex_radix_integer(source, start, radix);
     }
-    let mut ix = start;
-    while ix < bytes.len() && bytes[ix].is_ascii_digit() {
-        ix += 1;
-    }
+    let mut ix = digits(bytes, start);
     let mut is_float = false;
     if ix < bytes.len() && bytes[ix] == b'.' && bytes.get(ix + 1) != Some(&b'.') {
         if !bytes.get(ix + 1).is_some_and(u8::is_ascii_digit) {
             return Err(err(source, ix, "expected digits after the decimal point"));
         }
         is_float = true;
-        ix += 1;
-        while ix < bytes.len() && bytes[ix].is_ascii_digit() {
-            ix += 1;
-        }
+        ix = digits(bytes, ix + 1);
     }
     if ix < bytes.len() && (bytes[ix] == b'e' || bytes[ix] == b'E') {
         let mut ex = ix + 1;
@@ -460,13 +523,17 @@ fn lex_number(source: &str, start: usize) -> Result<(TokenKind, usize)> {
         }
         if bytes.get(ex).is_some_and(u8::is_ascii_digit) {
             is_float = true;
-            ix = ex;
-            while ix < bytes.len() && bytes[ix].is_ascii_digit() {
-                ix += 1;
-            }
+            ix = digits(bytes, ex);
         }
     }
-    let text = &source[start..ix];
+    let written = &source[start..ix];
+    let stripped: String;
+    let text = if written.contains('_') {
+        stripped = written.chars().filter(|&c| c != '_').collect();
+        stripped.as_str()
+    } else {
+        written
+    };
     // GL05 to GL10. A number may say which kind it is: `M` for an exact
     // number, `F` and `D` for an approximate one. The suffix is one
     // letter and nothing may follow it, or `1Fx` would be the number one
@@ -643,12 +710,105 @@ mod tests {
         );
     }
 
+    /// The separator ISO 21.3 puts between digits, which is mandatory
+    /// and reads in every radix.
+    #[test]
+    fn digits_may_be_grouped() {
+        assert_eq!(
+            kinds("1_000_000 1_0.5_0 1_0e1_0 0xF_F 0b1_0 0o1_7 0x_FF 1_000M"),
+            vec![
+                TokenKind::Int(1_000_000),
+                TokenKind::Float(10.50),
+                TokenKind::Float(1.0e11),
+                TokenKind::Int(255),
+                TokenKind::Int(2),
+                TokenKind::Int(15),
+                TokenKind::Int(255),
+                TokenKind::Int(1000),
+            ]
+        );
+        // A separator lives between two digits, so one with a name
+        // behind it ends the number and begins the name.
+        assert_eq!(
+            kinds("1_x 1_"),
+            vec![
+                TokenKind::Int(1),
+                TokenKind::Ident("_x".into()),
+                TokenKind::Int(1),
+                TokenKind::Ident("_".into()),
+            ]
+        );
+        for bad in ["0x__F", "0b_", "0o_9"] {
+            let e = lex(bad).expect_err(bad);
+            assert!(e.to_string().contains("digits after"), "{bad}: {e}");
+        }
+    }
+
+    /// GB02 and GB03, and the bracketed form that is mandatory. Two
+    /// minus signs are a comment wherever they are written, which is
+    /// why a subtraction of a negative number needs its spaces.
     #[test]
     fn comments_vanish() {
         assert_eq!(
-            kinds("1 // line\n/* block\n */ 2"),
-            vec![TokenKind::Int(1), TokenKind::Int(2)]
+            kinds("1 // line\n/* block\n */ 2 -- dash\n3"),
+            vec![TokenKind::Int(1), TokenKind::Int(2), TokenKind::Int(3)]
         );
+        assert_eq!(
+            kinds("1 - -2"),
+            vec![
+                TokenKind::Int(1),
+                TokenKind::Minus,
+                TokenKind::Minus,
+                TokenKind::Int(2)
+            ]
+        );
+        assert_eq!(kinds("1--2"), vec![TokenKind::Int(1)]);
+    }
+
+    /// A delimited identifier is a quoted sequence like a string is,
+    /// down to the doubling and the escapes (ISO 21.3), and the `@`
+    /// form turns the escapes off for either of them.
+    #[test]
+    fn identifiers_quote_like_strings_do() {
+        assert_eq!(
+            kinds(r#"`odd``name` `a\tb` @`raw\name` `it's`"#),
+            vec![
+                TokenKind::QuotedIdent("odd`name".into()),
+                TokenKind::QuotedIdent("a\tb".into()),
+                TokenKind::QuotedIdent(r"raw\name".into()),
+                TokenKind::QuotedIdent("it's".into()),
+            ]
+        );
+        let e = lex("RETURN ``").expect_err("empty");
+        assert!(e.to_string().contains("empty backtick"), "{e}");
+        let e = lex("RETURN `open").expect_err("unterminated");
+        assert!(e.to_string().contains("unterminated identifier"), "{e}");
+    }
+
+    /// The rest of ISO's escape set, and the two ways to name a
+    /// character by its code point.
+    #[test]
+    fn strings_take_the_whole_escape_set() {
+        assert_eq!(
+            kinds(r#"'a\bb' 'a\fb' 'a\`b' 'it''s' "say ""hi""" 'A\U01F600'"#),
+            vec![
+                TokenKind::Str("a\u{8}b".into()),
+                TokenKind::Str("a\u{c}b".into()),
+                TokenKind::Str("a`b".into()),
+                TokenKind::Str("it's".into()),
+                TokenKind::Str("say \"hi\"".into()),
+                TokenKind::Str("A\u{1F600}".into()),
+            ]
+        );
+        for (bad, want) in [
+            (r"'\uZZZZ'", "hexadecimal digits"),
+            (r"'\u00'", "hexadecimal digits"),
+            (r"'\UD800AA'", "no character"),
+            (r"'\q'", "unknown escape"),
+        ] {
+            let e = lex(bad).expect_err(bad);
+            assert!(e.to_string().contains(want), "{bad}: {e}");
+        }
     }
 
     #[test]

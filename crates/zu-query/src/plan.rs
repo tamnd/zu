@@ -1637,7 +1637,7 @@ mod tests {
             text.contains("Expand (a)-[#1:KNOWS*.. any shortest]->(b)"),
             "got:\n{text}"
         );
-        let text = explained("MATCH (a:Person)--(b:Person) RETURN a");
+        let text = explained("MATCH (a:Person)-(b:Person) RETURN a");
         assert!(
             text.contains("]-(b)") && !text.contains("]->(b)"),
             "got:\n{text}"

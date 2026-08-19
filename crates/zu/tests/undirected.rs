@@ -122,7 +122,7 @@ fn a_directed_edge_refuses_the_tilde() {
 fn the_abbreviated_spellings_are_the_same_patterns() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = pair(dir.path());
-    for pattern in ["~", "<~", "~>", "-", "--"] {
+    for pattern in ["~", "<~", "~>", "-"] {
         let source = format!("MATCH (a:peer){pattern}(b:peer) WHERE a.id = 0 RETURN b.id AS id");
         assert_eq!(ids(&mut db, &source), [1], "{pattern}");
     }

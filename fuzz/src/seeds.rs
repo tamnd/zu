@@ -206,7 +206,7 @@ fn main() {
         (
             "paths",
             "MATCH q = (a)<-[r:LIKES|FOLLOWS {since: 2020}]-(b), (b)-[*..4]-(c:`odd label`) \
-             OPTIONAL MATCH (c)--(d) RETURN *",
+             OPTIONAL MATCH (c)-(d) RETURN *",
         ),
     ];
     for (name, text) in queries {

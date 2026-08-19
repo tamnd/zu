@@ -26,9 +26,8 @@ pub(crate) enum Kind {
     /// A quoted string, single, double or backtick.
     Text,
     Number,
-    /// A `//` line comment or a `/* */` block, which are the two the
-    /// language has. `--` is a pair of minus signs and is coloured as
-    /// what it is.
+    /// A line comment, which opens with `//` or with `--`, and a
+    /// `/* */` block.
     Comment,
     /// `$name`, which is the one thing in a statement a shell user is
     /// most likely to misspell, since nothing checks it until the
@@ -150,7 +149,7 @@ pub(crate) fn scan(text: &str) -> Vec<(&str, Kind)> {
                 runs.push((&rest[..end], Kind::Text));
                 end
             }
-            b'/' if rest.starts_with("//") => {
+            b'/' | b'-' if rest.starts_with("//") || rest.starts_with("--") => {
                 let end = rest.find('\n').unwrap_or(rest.len());
                 runs.push((&rest[..end], Kind::Comment));
                 end
@@ -277,6 +276,9 @@ fn number_len(text: &str) -> usize {
     while end < bytes.len() {
         match bytes[end] {
             b'0'..=b'9' => end += 1,
+            // The separator a long number may be written with, which
+            // stands between two digits and nowhere else.
+            b'_' if bytes.get(end + 1).is_some_and(u8::is_ascii_digit) => end += 2,
             b'.' if !seen_dot && bytes.get(end + 1).is_some_and(u8::is_ascii_digit) => {
                 seen_dot = true;
                 end += 1;
@@ -542,11 +544,12 @@ mod tests {
         assert!(kinds.contains(&("$p", Kind::Param)));
         assert!(kinds.contains(&("'x'", Kind::Text)));
         assert!(kinds.contains(&("// why", Kind::Comment)));
-        // Two minus signs are two minus signs: the language's line
-        // comment is the other one, and a shell that dimmed the rest of
-        // the line would be dimming a statement that still runs.
+        // Two minus signs open a comment as surely as two solidi do
+        // (GB02), so the rest of the line is dim and a subtraction of a
+        // negative number is written with its spaces.
+        assert!(scan("RETURN 1 -- 2").contains(&("-- 2", Kind::Comment)));
         assert!(
-            scan("RETURN 1 -- 2")
+            scan("RETURN 1 - -2")
                 .iter()
                 .all(|(_, k)| *k != Kind::Comment)
         );
@@ -560,6 +563,9 @@ mod tests {
         assert_eq!(number_len("1e"), 1);
         // A property access, not a decimal point.
         assert_eq!(number_len("1.name"), 1);
+        assert_eq!(number_len("1_000_000"), 9);
+        // A separator with a name behind it is where the number ends.
+        assert_eq!(number_len("1_x"), 1);
     }
 
     #[test]

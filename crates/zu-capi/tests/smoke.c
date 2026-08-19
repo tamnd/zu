@@ -743,7 +743,7 @@ int main(int argc, char **argv) {
   err = NULL;
   result = NULL;
   status = zu_query_z(first,
-                      "MATCH (a) OPTIONAL MATCH (a)-->(b) WHERE b.id > 2 RETURN avg(b.id) AS x",
+                      "MATCH (a) OPTIONAL MATCH (a)->(b) WHERE b.id > 2 RETURN avg(b.id) AS x",
                       &result, &err);
   if (status != ZU_OK) {
     zu_conn_close(first);

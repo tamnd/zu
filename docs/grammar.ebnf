@@ -473,27 +473,38 @@ type_name       = identifier , [ identifier ] ;
 
 (* Lexical shapes. *)
 
-name            = identifier | "`" , { character - "`" } , "`" ;
+(* A delimited name is quoted the way a string is, down to the doubling
+   and the escapes, so `odd``name` is one name with an accent in it. *)
+name            = identifier | [ "@" ] , "`" , { character } , "`" ;
 identifier      = ( letter | "_" ) , { letter | digit | "_" } ;
 parameter       = "$" , ( letter | digit | "_" ) , { letter | digit | "_" } ;
 (* A number may be written in another radix, and it may say which kind
    of number it means: M for an exact one, F and D for an approximate
    one. An exact number with no fraction is an integer; zu has no
-   decimal type, so an exact fraction is widened to a double. *)
-integer         = digit , { digit } , [ "M" ]
-                | ( "0x" | "0o" | "0b" ) , radix_digit , { radix_digit } ;
-float           = digit , { digit } , "." , digit , { digit } , [ exponent ] , [ suffix ]
-                | digit , { digit } , exponent , [ suffix ]
-                | digit , { digit } , ( "F" | "D" ) ;
+   decimal type, so an exact fraction is widened to a double. The digits
+   of a long number may be grouped with an underscore, which stands
+   between two digits and, in a radix other than ten, in front of the
+   first one as well. *)
+integer         = digits , [ "M" ]
+                | ( "0x" | "0o" | "0b" ) , radix_digits ;
+digits          = digit , { [ "_" ] , digit } ;
+radix_digits    = { [ "_" ] , radix_digit } - "" ;
+float           = digits , "." , digits , [ exponent ] , [ suffix ]
+                | digits , exponent , [ suffix ]
+                | digits , ( "F" | "D" ) ;
 suffix          = "M" | "F" | "D" ;
-exponent        = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
+exponent        = ( "e" | "E" ) , [ "+" | "-" ] , digits ;
 radix_digit     = digit | "a" | "b" | "c" | "d" | "e" | "f" ;
 string          = [ "@" ] , "'" , { character } , "'"
                 | [ "@" ] , '"' , { character } , '"' ;
-(* String escapes: \\ \' \" \n \r \t. An @ before the quote turns escape
-   processing off, and a doubled quote is then the only way to write one.
-   Comments are // to end of line and /* ... */; both are whitespace to
-   the parser. *)
+(* String escapes: \\ \' \" \` \n \r \t \b \f, and \uXXXX and
+   \UXXXXXX for a character named by its code point. An @ before the
+   quote turns escape processing off, and a doubled quote is then the
+   only way to write one. Comments run to the end of the line after //
+   or after --, or from /* to */; all three are whitespace to the
+   parser, which costs the Cypher spellings (a)--(b) and (a)-->(b),
+   since GQL writes those (a)-(b) and (a)->(b) and reads a double minus
+   as a comment wherever it stands. *)
 
 (* Reserved but not yet parsed; the parser rejects them by name:
    CREATE, SESSION. CREATE is a statement only where GRAPH follows it,

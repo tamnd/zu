@@ -275,6 +275,12 @@ const NOTES: &[&str] = &[
      PROPERTY_EXISTS asks whether an element carries a property without reading it, so a \
      property that is there and null is there. All six answer null over an element that is \
      null, which is the reading an unmatched optional row gets",
+    "a property reference to a property the element does not have is null and not an error, ISO \
+     20.11, which is the same answer an element that carries the property and holds nothing in \
+     it gives, so a query cannot tell a property nobody wrote from a property nobody stored and \
+     PROPERTY_EXISTS is how the two are told apart. A graph where half the people have a \
+     nickname is one column half the rows are null in, and a graph where none of them do is the \
+     same question asked of no column",
     "a case is written in both of the standard's forms, one asking a condition per branch and \
      one naming a value and comparing each branch with it, and a value before the first WHEN is \
      what tells them apart; the branches are asked in the order they were written, a branch \

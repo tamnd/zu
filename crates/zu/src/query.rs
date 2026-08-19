@@ -487,20 +487,22 @@ fn column_value(
 }
 
 /// What a batch of rows reads for a property no column holds: the id,
-/// which without a stored `id` column is the offset, and an error for
+/// which without a stored `id` column is the offset, and a null for
 /// anything else. The single row read says the same thing.
-fn every_row_is_its_own_offset(
-    rows: &[u64],
-    key: &str,
-    table: u32,
-    out: &mut Vec<Value>,
-) -> Result<()> {
-    if key != "id" {
-        return Err(ZuError::InvalidArgument(format!(
-            "unknown property '{key}' on table {table}"
-        )));
+///
+/// ISO 20.11. A property reference to a property the element does not
+/// have is null and not an error, which is what an element that has the
+/// property and holds nothing in it already answers, so a query cannot
+/// tell a property nobody wrote from a property nobody stored. That is
+/// the whole of the rule: a graph where half the people have a nickname
+/// is one table with a column half the rows are null in, and a graph
+/// where none of them do is the same question asked of no column.
+fn every_row_reads_its_offset_or_null(rows: &[u64], key: &str, out: &mut Vec<Value>) -> Result<()> {
+    if key == "id" {
+        out.extend(rows.iter().map(|&row| Value::Int(row as i64)));
+    } else {
+        out.resize(rows.len(), Value::Null);
     }
-    out.extend(rows.iter().map(|&row| Value::Int(row as i64)));
     Ok(())
 }
 
@@ -576,12 +578,10 @@ impl Graph for Zu1Graph<'_> {
                 Some(col) => Ok(frame.value(col, offset)),
                 // A frame has no stored id either, so the row is it,
                 // which is the same answer a table without the column
-                // gives.
+                // gives, and a column the frame does not carry is the
+                // null a column the table does not carry answers.
                 None if key == "id" => Ok(Value::Int(offset as i64)),
-                None => Err(ZuError::InvalidArgument(format!(
-                    "unknown property '{key}' on frame '{}'",
-                    frame.name()
-                ))),
+                None => Ok(Value::Null),
             };
         }
         self.ensure_props(table)?;
@@ -592,12 +592,12 @@ impl Graph for Zu1Graph<'_> {
             return column_value(db, reader, col, offset, key);
         }
         // Without a stored `id` column the id is the offset, the dense
-        // contract every load without REORDER keeps.
+        // contract every load without REORDER keeps, and a property no
+        // column holds is the null of ISO 20.11, which is what an edge
+        // property already answered.
         match key {
             "id" => Ok(Value::Int(offset as i64)),
-            other => Err(ZuError::InvalidArgument(format!(
-                "unknown property '{other}' on table {table}"
-            ))),
+            _ => Ok(Value::Null),
         }
     }
 
@@ -612,7 +612,7 @@ impl Graph for Zu1Graph<'_> {
         out.reserve(rows.len());
         if let Some(frame) = self.frames.get(table) {
             let Some(col) = frame.column(key) else {
-                return every_row_is_its_own_offset(rows, key, table, out);
+                return every_row_reads_its_offset_or_null(rows, key, out);
             };
             out.extend(rows.iter().map(|&row| frame.value(col, row)));
             return Ok(());
@@ -620,10 +620,10 @@ impl Graph for Zu1Graph<'_> {
         self.ensure_props(table)?;
         let Self { db, props, .. } = self;
         let Some(reader) = props.get_mut(&table).expect("just loaded") else {
-            return every_row_is_its_own_offset(rows, key, table, out);
+            return every_row_reads_its_offset_or_null(rows, key, out);
         };
         let Some(col) = reader.col(key) else {
-            return every_row_is_its_own_offset(rows, key, table, out);
+            return every_row_reads_its_offset_or_null(rows, key, out);
         };
         // A fixed width column with nothing missing from it is the one
         // this is for: the rows gather through one decode of each chunk
@@ -2501,9 +2501,13 @@ mod tests {
                     .collect();
                 assert_eq!(batch, one, "{key}");
             }
-            // A property no column holds is refused either way.
-            assert!(graph.properties(table, &rows, "nope", &mut batch).is_err());
-            assert!(graph.property(table, 0, "nope").is_err());
+            // ISO 20.11. A property no column holds is a null either
+            // way, and the batch answers one per row rather than one.
+            graph
+                .properties(table, &rows, "nope", &mut batch)
+                .expect("nope");
+            assert_eq!(batch, vec![Value::Null; rows.len()]);
+            assert_eq!(graph.property(table, 0, "nope").expect("nope"), Value::Null);
         }
 
         // The same read behind a filter, which is what the batch is
@@ -2644,8 +2648,11 @@ mod tests {
         .expect("filter");
         assert_eq!(r.rows, [[Value::Int(4025)], [Value::Int(9000)]]);
 
-        let err = run("MATCH (a:person) RETURN a.nope AS x", &mut db, &[]).expect_err("unknown");
-        assert!(err.to_string().contains("unknown property"), "got: {err}");
+        // A property no column holds reads null for every row rather
+        // than refusing the statement, which is ISO 20.11 and what an
+        // element holding a stored null already answered.
+        let r = run("MATCH (a:person) RETURN a.nope AS x LIMIT 2", &mut db, &[]).expect("nope");
+        assert_eq!(r.rows, [[Value::Null], [Value::Null]]);
 
         // A table function source in key space: 9000 is row 0, and the
         // undirected hop distances come back under stored ids.

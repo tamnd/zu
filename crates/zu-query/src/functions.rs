@@ -9,18 +9,21 @@
 //! the binder, another in the printer and a third in the evaluator.
 //!
 //! A scalar function carries its kernel too, which is the code that
-//! answers it. The binder settles which kernel a call runs while it
-//! binds, and the evaluator calls through that pointer, so no row is
-//! spent deciding which function it is looking at. A call whose
+//! answers it. The binder settles which row answers a call while it
+//! binds and writes that row's number onto the call, so the evaluator
+//! reads the kernel at a number and calls through the pointer rather
+//! than spending a row deciding which function it is looking at or
+//! walking the table to find out. A call whose
 //! arguments are all literals does not reach a row at all: a
 //! deterministic kernel answers the same thing every time, so the
 //! binder runs it once and keeps the answer.
 
+use zu_common::gqlstatus::codes;
 use zu_common::unicode::NormalForm;
 use zu_common::{Result, ZuError, unicode};
 
 use crate::ast::Literal;
-use crate::binder::{BoundExpr, Func, Type};
+use crate::binder::{BoundExpr, Func, Math, Type};
 use crate::exec::{Value, settle};
 
 /// The code behind a scalar function: the arguments already evaluated,
@@ -77,6 +80,20 @@ pub enum Arity {
     /// This many or more, which is what the element predicates take
     /// since they compare a list of elements against each other.
     AtLeast(usize),
+    /// This many at the fewest and that many at the most, which is what
+    /// `ROUND` takes: the digits to round to are a second argument and
+    /// nought when none is written.
+    Between(usize, usize),
+}
+
+impl Arity {
+    /// The fewest arguments a call may write, which is the count the
+    /// tests hand a kernel when they ask what it does with a null.
+    pub fn least(self) -> usize {
+        match self {
+            Arity::Exactly(n) | Arity::AtLeast(n) | Arity::Between(n, _) => n,
+        }
+    }
 }
 
 /// What the answer's type is. It is written as a rule rather than as a
@@ -96,19 +113,35 @@ pub enum Ret {
     Same,
     /// A list of the type of the first argument.
     ListOf,
+    /// The wider of the arguments: an integer where every argument is
+    /// one and a float where any of them is, which is the rule the
+    /// arithmetic operators follow and so is the rule `MOD` follows.
+    Wider,
 }
 
 impl Ret {
-    /// The answer's type, given the type of the first argument.
-    pub fn of(self, arg: &Type) -> Type {
+    /// The answer's type, given the types of the arguments. Most of
+    /// these answer one type whatever arrived; the rest read the first
+    /// argument, or all of them.
+    pub fn of(self, args: &[Type]) -> Type {
+        let first = || args.first().cloned().unwrap_or(Type::Any);
         match self {
             Ret::Int => Type::Int,
             Ret::Float => Type::Float,
             Ret::Str => Type::Str,
             Ret::Bool => Type::Bool,
             Ret::ListOfAny => Type::List(Box::new(Type::Any)),
-            Ret::Same => arg.clone(),
-            Ret::ListOf => Type::List(Box::new(arg.clone())),
+            Ret::Same => first(),
+            Ret::ListOf => Type::List(Box::new(first())),
+            Ret::Wider => {
+                if args.iter().any(|ty| matches!(ty, Type::Any)) {
+                    Type::Any
+                } else if args.iter().any(|ty| matches!(ty, Type::Float)) {
+                    Type::Float
+                } else {
+                    Type::Int
+                }
+            }
         }
     }
 }
@@ -452,29 +485,350 @@ pub static REGISTRY: &[Signature] = &[
         by_name: false,
         kernel: Some(string_kernel),
     },
+    Signature {
+        name: "abs",
+        aliases: &[],
+        func: Func::Math(Math::Abs),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Same,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(exact_kernel),
+    },
+    Signature {
+        name: "ceil",
+        aliases: &["ceiling"],
+        func: Func::Math(Math::Ceil),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Same,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(exact_kernel),
+    },
+    Signature {
+        name: "floor",
+        aliases: &[],
+        func: Func::Math(Math::Floor),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Same,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(exact_kernel),
+    },
+    Signature {
+        name: "round",
+        aliases: &[],
+        func: Func::Math(Math::Round),
+        arity: Arity::Between(1, 2),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Same,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(exact_kernel),
+    },
+    Signature {
+        name: "sign",
+        aliases: &[],
+        func: Func::Math(Math::Sign),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Int,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(exact_kernel),
+    },
+    Signature {
+        name: "mod",
+        aliases: &[],
+        func: Func::Math(Math::Mod),
+        arity: Arity::Exactly(2),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Wider,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(pair_kernel),
+    },
+    Signature {
+        name: "sqrt",
+        aliases: &[],
+        func: Func::Math(Math::Sqrt),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "power",
+        aliases: &[],
+        func: Func::Math(Math::Power),
+        arity: Arity::Exactly(2),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(pair_kernel),
+    },
+    Signature {
+        name: "exp",
+        aliases: &[],
+        func: Func::Math(Math::Exp),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "ln",
+        aliases: &[],
+        func: Func::Math(Math::Ln),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "log",
+        aliases: &[],
+        func: Func::Math(Math::Log),
+        arity: Arity::Exactly(2),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(pair_kernel),
+    },
+    Signature {
+        name: "log10",
+        aliases: &[],
+        func: Func::Math(Math::Log10),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "sin",
+        aliases: &[],
+        func: Func::Math(Math::Sin),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "cos",
+        aliases: &[],
+        func: Func::Math(Math::Cos),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "tan",
+        aliases: &[],
+        func: Func::Math(Math::Tan),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "cot",
+        aliases: &[],
+        func: Func::Math(Math::Cot),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "asin",
+        aliases: &[],
+        func: Func::Math(Math::Asin),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "acos",
+        aliases: &[],
+        func: Func::Math(Math::Acos),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "atan",
+        aliases: &[],
+        func: Func::Math(Math::Atan),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "degrees",
+        aliases: &[],
+        func: Func::Math(Math::Degrees),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
+    Signature {
+        name: "radians",
+        aliases: &[],
+        func: Func::Math(Math::Radians),
+        arity: Arity::Exactly(1),
+        arg: Kind::Number,
+        needs: "needs a number",
+        ret: Ret::Float,
+        deterministic: true,
+        aggregate: false,
+        star: false,
+        by_name: true,
+        kernel: Some(real_kernel),
+    },
 ];
 
-/// The signature a written name resolves to, or nothing when no builtin
-/// has that name. The comparison ignores case, since GQL folds the
-/// names of its functions and a statement may shout them.
-pub fn lookup(name: &str) -> Option<&'static Signature> {
-    REGISTRY.iter().find(|sig| {
+/// The row number a written name resolves to, or nothing when no
+/// builtin has that name. The comparison ignores case, since GQL folds
+/// the names of its functions and a statement may shout them.
+pub fn lookup(name: &str) -> Option<u16> {
+    let at = REGISTRY.iter().position(|sig| {
         sig.by_name
             && (sig.name.eq_ignore_ascii_case(name)
                 || sig
                     .aliases
                     .iter()
                     .any(|alias| alias.eq_ignore_ascii_case(name)))
-    })
+    })?;
+    Some(at as u16)
 }
 
-/// The signature of a function the engine already holds. The two
+/// The row at that number. The number comes from [`lookup`] or from
+/// [`row_of`], both of which read this same table, so a number that is
+/// past its end is a bug rather than something a statement can write.
+pub fn row(at: u16) -> Option<&'static Signature> {
+    REGISTRY.get(at as usize)
+}
+
+/// Which row answers a function the engine already holds. The two
 /// normalization functions carry a form, and the form is not part of
-/// which function it is, so the arms are compared and not the values.
+/// which function it is, so what is compared is the function with the
+/// form set aside.
+pub fn row_of(func: Func) -> Option<u16> {
+    let key = keyed(func);
+    let at = REGISTRY.iter().position(|sig| keyed(sig.func) == key)?;
+    Some(at as u16)
+}
+
+/// A function with the part that is not its identity taken off, which
+/// is the normal form the two normalization functions carry.
+fn keyed(func: Func) -> Func {
+    match func {
+        Func::Normalize(_) => Func::Normalize(NormalForm::Nfc),
+        Func::IsNormalized(_) => Func::IsNormalized(NormalForm::Nfc),
+        other => other,
+    }
+}
+
+/// The signature of a function the engine already holds, for the places
+/// that have a function and no row number: the printer and the binder's
+/// horizontal aggregates. A call that is evaluated per row reads its
+/// row number instead and never walks the table.
 pub fn signature(func: Func) -> Option<&'static Signature> {
-    REGISTRY
-        .iter()
-        .find(|sig| std::mem::discriminant(&sig.func) == std::mem::discriminant(&func))
+    row_of(func).and_then(row)
 }
 
 /// The name a function is printed with. Every function has a row, so
@@ -692,6 +1046,344 @@ fn string_kernel(func: Func, args: &[Value]) -> Result<Value> {
     })
 }
 
+/// A GQL condition raised by a kernel. These are conditions the
+/// standard names, unlike the failures above, so they carry the code a
+/// client checks rather than a message it would have to read.
+fn gql(status: zu_common::GqlStatus, detail: String) -> ZuError {
+    ZuError::gql(status, detail)
+}
+
+/// `22003 numeric value out of range`, for an answer that is a number
+/// the type cannot hold: an absolute value one past the top of the
+/// integers, an exponential that ran off the end of the doubles.
+fn out_of_range(func: Func, detail: String) -> ZuError {
+    gql(codes::C22003, format!("{}() {detail}", name_of(func)))
+}
+
+/// Which numeric function this is, for the three kernels the numeric
+/// library shares. A function that is not one of them cannot reach
+/// them, since the row that carries the kernel carries the function.
+fn math_of(func: Func) -> Result<Math> {
+    match func {
+        Func::Math(math) => Ok(math),
+        other => Err(invalid(format!(
+            "{}() is not a numeric function",
+            name_of(other)
+        ))),
+    }
+}
+
+/// The number an argument holds, as a float. Every kernel here that
+/// answers an approximate number reads its arguments through this, so
+/// an integer argument is widened once and in one place.
+fn real(func: Func, value: &Value) -> Result<f64> {
+    match value {
+        Value::Int(i) => Ok(*i as f64),
+        Value::Float(f) => Ok(*f),
+        other => Err(invalid(format!(
+            "{}() expects a number, got {other:?}",
+            name_of(func)
+        ))),
+    }
+}
+
+/// The answer of a kernel over the reals, refused when it left the
+/// range the doubles hold. An argument that was already infinite is
+/// let through, because an engine that raises there is answering a
+/// question about IEEE arithmetic with a condition the statement did
+/// not cause (GA01).
+fn finite(func: Func, arg: f64, answer: f64) -> Result<Value> {
+    if answer.is_finite() || !arg.is_finite() {
+        Ok(Value::Float(answer))
+    } else {
+        Err(out_of_range(
+            func,
+            format!("of {arg} is outside the range of a float"),
+        ))
+    }
+}
+
+/// GF01, the numeric functions that keep an exact argument exact: ABS,
+/// CEIL, FLOOR, ROUND and SIGN.
+///
+/// An integer in gives an integer out, because the answer of every one
+/// of these over a whole number is a whole number, and widening it to a
+/// float would lose a digit above two to the fifty third for no reason
+/// the statement asked for. ROUND takes the digits to round to as a
+/// second argument: a positive count rounds inside the fraction, a
+/// negative one rounds tens, hundreds and upwards, and halves go away
+/// from nought either way, which is the rule SQL rounds by and the one
+/// a reader expects when they write it out by hand.
+fn exact_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let math = math_of(func)?;
+    let (value, digits) = match args {
+        [value] => (settle(value.clone()), Value::Int(0)),
+        [value, digits] if math == Math::Round => (settle(value.clone()), settle(digits.clone())),
+        _ => {
+            return Err(invalid(format!(
+                "{}() was given {} arguments",
+                name_of(func),
+                args.len()
+            )));
+        }
+    };
+    if matches!(value, Value::Null) || matches!(digits, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let digits = match digits {
+        Value::Int(n) => n,
+        other => {
+            return Err(gql(
+                codes::C22G03,
+                format!("round() rounds to a whole number of digits, got {other:?}"),
+            ));
+        }
+    };
+    match (math, &value) {
+        (Math::Abs, Value::Int(i)) => i
+            .checked_abs()
+            .map(Value::Int)
+            .ok_or_else(|| out_of_range(func, format!("of {i} is one past the top of an integer"))),
+        (Math::Abs, Value::Float(f)) => Ok(Value::Float(f.abs())),
+        (Math::Sign, Value::Int(i)) => Ok(Value::Int(i.signum())),
+        (Math::Sign, Value::Float(f)) => Ok(Value::Int(if *f > 0.0 {
+            1
+        } else if *f < 0.0 {
+            -1
+        } else {
+            0
+        })),
+        // A whole number is already at its own ceiling and its own
+        // floor, so these two answer what they were handed rather than
+        // going through a float that could not hold it.
+        (Math::Ceil | Math::Floor | Math::Round, Value::Int(i)) if digits >= 0 => {
+            Ok(Value::Int(*i))
+        }
+        (Math::Round, Value::Int(i)) => rounded_int(*i, digits)
+            .map(Value::Int)
+            .ok_or_else(|| out_of_range(func, format!("of {i} to {digits} digits does not fit"))),
+        (Math::Ceil, Value::Float(f)) => Ok(Value::Float(f.ceil())),
+        (Math::Floor, Value::Float(f)) => Ok(Value::Float(f.floor())),
+        (Math::Round, Value::Float(f)) => {
+            let scale = 10f64.powi(digits.clamp(-308, 308) as i32);
+            let answer = if digits == 0 {
+                f.round()
+            } else {
+                (f * scale).round() / scale
+            };
+            finite(func, *f, answer)
+        }
+        (_, other) => Err(invalid(format!(
+            "{}() expects a number, got {other:?}",
+            name_of(func)
+        ))),
+    }
+}
+
+/// An integer rounded to a place left of the decimal point, kept in the
+/// integers the whole way: a hundred and fifty rounded to minus one
+/// digit is two hundred, and nothing here goes through a float, so a
+/// number wider than a double holds is rounded exactly.
+fn rounded_int(value: i64, digits: i64) -> Option<i64> {
+    let places = u32::try_from(-digits).ok()?;
+    // Past nineteen digits every integer rounds to nought, and the
+    // power below would overflow rather than say so.
+    if places > 19 {
+        return Some(0);
+    }
+    let factor = 10i128.checked_pow(places)?;
+    let value = value as i128;
+    let half = factor / 2;
+    let carried = if value >= 0 {
+        (value + half) / factor
+    } else {
+        (value - half) / factor
+    };
+    i64::try_from(carried.checked_mul(factor)?).ok()
+}
+
+/// GF02 and GF03, the functions over one number whose answer is
+/// approximate: the roots, the exponential, the logarithms and the
+/// trigonometric set.
+///
+/// Every one of these answers a float, because the answer of all but a
+/// handful of arguments is irrational and a type that changed with the
+/// value would be a type nothing could be planned against. Where the
+/// function has no answer at all the kernel raises the condition the
+/// standard names for it and never hands back a NaN: a NaN travels
+/// through every comparison below it as false and a statement that got
+/// one has been told nothing about what went wrong.
+fn real_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let math = math_of(func)?;
+    let value = settle(one(func, args)?.clone());
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let x = real(func, &value)?;
+    let answer = match math {
+        // ISO 20.20 defines the square root as the power of one half,
+        // so a negative argument is the power function's condition
+        // rather than a condition of its own.
+        Math::Sqrt => {
+            if x < 0.0 {
+                return Err(gql(
+                    codes::C2201F,
+                    format!("sqrt() has no answer for {x}, which is below nought"),
+                ));
+            }
+            x.sqrt()
+        }
+        Math::Exp => x.exp(),
+        Math::Ln => {
+            if x <= 0.0 {
+                return Err(gql(
+                    codes::C2201E,
+                    format!("ln() has no answer for {x}, which is not above nought"),
+                ));
+            }
+            x.ln()
+        }
+        Math::Log10 => {
+            if x <= 0.0 {
+                return Err(gql(
+                    codes::C2201E,
+                    format!("log10() has no answer for {x}, which is not above nought"),
+                ));
+            }
+            x.log10()
+        }
+        Math::Sin => x.sin(),
+        Math::Cos => x.cos(),
+        Math::Tan => x.tan(),
+        // The cotangent is the cosine over the sine, so where the sine
+        // is nought it is a division by nought and is raised as one.
+        Math::Cot => {
+            let sin = x.sin();
+            if sin == 0.0 {
+                return Err(gql(
+                    codes::C22012,
+                    format!("cot() has no answer for {x}, where the sine is nought"),
+                ));
+            }
+            x.cos() / sin
+        }
+        Math::Asin | Math::Acos => {
+            if !(-1.0..=1.0).contains(&x) && x.is_finite() {
+                return Err(out_of_range(
+                    func,
+                    format!("has no answer for {x}, which is outside minus one to one"),
+                ));
+            }
+            if math == Math::Asin {
+                x.asin()
+            } else {
+                x.acos()
+            }
+        }
+        Math::Atan => x.atan(),
+        Math::Degrees => x.to_degrees(),
+        Math::Radians => x.to_radians(),
+        _ => {
+            return Err(invalid(format!(
+                "{}() takes more than one number",
+                name_of(func)
+            )));
+        }
+    };
+    finite(func, x, answer)
+}
+
+/// The numeric functions over two numbers: MOD, POWER and LOG.
+///
+/// MOD is the operator under another name, so it keeps the operator's
+/// arithmetic: an integer remainder where both sides are integers, the
+/// sign of the dividend, and `22012` for a nought divisor rather than
+/// the infinity the hardware would answer. POWER and LOG answer floats
+/// for the reason the kernel above does, and each raises where it has
+/// no answer: nought to a negative power and a negative number to a
+/// fractional power are `2201F`, and a logarithm of a number that is
+/// not above nought, or in a base that is not above nought or is one,
+/// is `2201E`.
+fn pair_kernel(func: Func, args: &[Value]) -> Result<Value> {
+    let math = math_of(func)?;
+    let [left, right] = args else {
+        return Err(invalid(format!(
+            "{}() takes two arguments, got {}",
+            name_of(func),
+            args.len()
+        )));
+    };
+    let (left, right) = (settle(left.clone()), settle(right.clone()));
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let (Math::Mod, Value::Int(x), Value::Int(y)) = (math, &left, &right) {
+        if *y == 0 {
+            return Err(gql(codes::C22012, "division by zero".into()));
+        }
+        return x
+            .checked_rem(*y)
+            .map(Value::Int)
+            .ok_or_else(|| out_of_range(func, format!("of {x} and {y} does not fit an integer")));
+    }
+    let x = real(func, &left)?;
+    let y = real(func, &right)?;
+    let answer = match math {
+        Math::Mod => {
+            if y == 0.0 {
+                return Err(gql(codes::C22012, "division by zero".into()));
+            }
+            x % y
+        }
+        Math::Power => {
+            if x == 0.0 && y < 0.0 {
+                return Err(gql(
+                    codes::C2201F,
+                    "power() has no answer for nought raised to a negative power".into(),
+                ));
+            }
+            if x < 0.0 && y.fract() != 0.0 && y.is_finite() {
+                return Err(gql(
+                    codes::C2201F,
+                    format!("power() has no answer for {x} raised to {y}, which is not whole"),
+                ));
+            }
+            x.powf(y)
+        }
+        // LOG takes the base first and the number second, which is the
+        // order ISO 20.21 writes it in.
+        Math::Log => {
+            if x <= 0.0 || x == 1.0 {
+                return Err(gql(
+                    codes::C2201E,
+                    format!("log() has no answer in base {x}"),
+                ));
+            }
+            if y <= 0.0 {
+                return Err(gql(
+                    codes::C2201E,
+                    format!("log() has no answer for {y}, which is not above nought"),
+                ));
+            }
+            y.log(x)
+        }
+        _ => {
+            return Err(invalid(format!(
+                "{}() takes one number and not two",
+                name_of(func)
+            )));
+        }
+    };
+    if answer.is_finite() || !x.is_finite() || !y.is_finite() {
+        Ok(Value::Float(answer))
+    } else {
+        Err(out_of_range(
+            func,
+            format!("of {x} and {y} is outside the range of a float"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,19 +1394,17 @@ mod tests {
     /// that would print the wrong name.
     #[test]
     fn a_row_is_reached_from_both_sides() {
+        let named = |name: &str| lookup(name).and_then(row).map(|sig| sig.name);
         for sig in REGISTRY {
             assert_eq!(signature(sig.func).map(|s| s.name), Some(sig.name));
             if sig.by_name {
-                assert_eq!(lookup(sig.name).map(|s| s.name), Some(sig.name));
-                assert_eq!(
-                    lookup(&sig.name.to_uppercase()).map(|s| s.name),
-                    Some(sig.name)
-                );
+                assert_eq!(named(sig.name), Some(sig.name));
+                assert_eq!(named(&sig.name.to_uppercase()), Some(sig.name));
                 for alias in sig.aliases {
-                    assert_eq!(lookup(alias).map(|s| s.name), Some(sig.name));
+                    assert_eq!(named(alias), Some(sig.name));
                 }
             } else {
-                assert_eq!(lookup(sig.name).map(|s| s.name), None);
+                assert_eq!(named(sig.name), None);
             }
         }
     }
@@ -756,10 +1446,7 @@ mod tests {
         for sig in REGISTRY {
             let Some(kernel) = sig.kernel else { continue };
             let args = vec![Value::Null; 2];
-            let at = match sig.arity {
-                Arity::Exactly(n) => n,
-                Arity::AtLeast(n) => n,
-            };
+            let at = sig.arity.least();
             assert_eq!(
                 kernel(sig.func, &args[..at]).unwrap(),
                 Value::Null,
@@ -767,5 +1454,91 @@ mod tests {
                 sig.name
             );
         }
+    }
+
+    /// The answer of a call, for the tests below, by the name a
+    /// statement would write.
+    fn call(name: &str, args: &[Value]) -> Result<Value> {
+        let sig = lookup(name).and_then(row).expect("a builtin of that name");
+        sig.kernel.expect("a scalar")(sig.func, args)
+    }
+
+    /// GF01. An exact argument keeps its type through the exact half of
+    /// the numeric library, because the whole number a rounding answers
+    /// is a whole number and a float would lose the digits above two to
+    /// the fifty third that an integer holds.
+    #[test]
+    fn a_whole_number_stays_whole() {
+        for (name, arg, want) in [
+            ("abs", -7, 7),
+            ("ceil", 7, 7),
+            ("floor", 7, 7),
+            ("round", 7, 7),
+            ("sign", -7, -1),
+        ] {
+            assert_eq!(call(name, &[Value::Int(arg)]).unwrap(), Value::Int(want));
+        }
+        assert_eq!(
+            call("mod", &[Value::Int(7), Value::Int(3)]).unwrap(),
+            Value::Int(1)
+        );
+        // Rounding to a place left of the point stays in the integers
+        // too, and rounds a half away from nought.
+        assert_eq!(
+            call("round", &[Value::Int(155), Value::Int(-1)]).unwrap(),
+            Value::Int(160)
+        );
+        assert_eq!(
+            call("round", &[Value::Int(-155), Value::Int(-1)]).unwrap(),
+            Value::Int(-160)
+        );
+        // And the approximate half answers a float from an integer, so
+        // a plan is typed against one answer rather than two.
+        assert_eq!(call("sqrt", &[Value::Int(16)]).unwrap(), Value::Float(4.0));
+        assert_eq!(
+            call("power", &[Value::Int(2), Value::Int(3)]).unwrap(),
+            Value::Float(8.0)
+        );
+    }
+
+    /// GF02 and GF03. Where a function has no answer it raises the
+    /// condition the standard names for it. A NaN would travel through
+    /// every comparison below as false, so a statement that got one
+    /// would have been told nothing about what went wrong.
+    #[test]
+    fn a_domain_error_is_a_condition_and_not_a_nan() {
+        for (name, args, want) in [
+            ("ln", vec![Value::Int(0)], codes::C2201E),
+            ("log10", vec![Value::Float(-1.0)], codes::C2201E),
+            ("log", vec![Value::Int(1), Value::Int(8)], codes::C2201E),
+            ("sqrt", vec![Value::Float(-1.0)], codes::C2201F),
+            ("power", vec![Value::Int(0), Value::Int(-1)], codes::C2201F),
+            (
+                "power",
+                vec![Value::Float(-2.0), Value::Float(0.5)],
+                codes::C2201F,
+            ),
+            ("mod", vec![Value::Int(1), Value::Int(0)], codes::C22012),
+            ("mod", vec![Value::Float(1.0), Value::Int(0)], codes::C22012),
+            ("cot", vec![Value::Int(0)], codes::C22012),
+            ("asin", vec![Value::Int(2)], codes::C22003),
+            ("acos", vec![Value::Float(-1.5)], codes::C22003),
+            ("exp", vec![Value::Int(1000)], codes::C22003),
+        ] {
+            let err = call(name, &args).expect_err("a condition");
+            assert_eq!(err.gqlstatus(), Some(want), "{name} raised {err}");
+        }
+    }
+
+    /// An argument that is already infinite is IEEE 754's business and
+    /// not the standard's, so it travels rather than raising: what the
+    /// conditions above are about is a statement that asked for a
+    /// number nobody has, and this one has already been answered.
+    #[test]
+    fn an_infinite_argument_is_left_to_ieee() {
+        assert_eq!(
+            call("exp", &[Value::Float(f64::INFINITY)]).unwrap(),
+            Value::Float(f64::INFINITY)
+        );
     }
 }

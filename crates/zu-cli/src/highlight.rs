@@ -319,6 +319,12 @@ pub(crate) fn is_keyword(word: &str) -> bool {
 /// Sorted by length first because that is the comparison
 /// [`is_keyword`] can make without upper-casing the word into a string
 /// of its own, and a keystroke is not a place to allocate.
+///
+/// A word here is upper case, since that is what the lookup compares
+/// against, and LOG10 shows that a digit may stand in one. The sort
+/// puts the digit where its byte falls, which is before every letter,
+/// and the scanner reads a digit as part of a word already, so LOG10 is
+/// one word and not LOG with a number behind it.
 pub(crate) const KEYWORDS: &[&str] = &[
     "AS",
     "BY",
@@ -326,31 +332,44 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "IF",
     "IN",
     "IS",
+    "LN",
     "NO",
     "OF",
     "OR",
     "TO",
+    "ABS",
     "ALL",
     "AND",
     "ANY",
     "ASC",
     "AVG",
+    "COS",
+    "COT",
     "DAY",
     "END",
+    "EXP",
     "FOR",
     "LET",
+    "LOG",
     "MAX",
     "MIN",
+    "MOD",
     "NFC",
     "NFD",
     "NOT",
     "SET",
+    "SIN",
     "SUM",
+    "TAN",
     "USE",
     "XOR",
+    "ACOS",
+    "ASIN",
+    "ATAN",
     "CALL",
     "CASE",
     "CAST",
+    "CEIL",
     "COPY",
     "DESC",
     "DROP",
@@ -368,8 +387,10 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "NODE",
     "NULL",
     "SAME",
+    "SIGN",
     "SIZE",
     "SKIP",
+    "SQRT",
     "THEN",
     "TRIM",
     "TRUE",
@@ -383,9 +404,11 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "EDGES",
     "FALSE",
     "FIRST",
+    "FLOOR",
     "GRAPH",
     "GROUP",
     "LIMIT",
+    "LOG10",
     "LOWER",
     "MATCH",
     "MERGE",
@@ -393,6 +416,8 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "NULLS",
     "ORDER",
     "PATHS",
+    "POWER",
+    "ROUND",
     "START",
     "TRAIL",
     "TYPED",
@@ -424,9 +449,12 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "STARTS",
     "UNWIND",
     "ACYCLIC",
+    "CEILING",
     "COLLECT",
+    "DEGREES",
     "ELEMENT",
     "LABELED",
+    "RADIANS",
     "REPLACE",
     "SESSION",
     "BINDINGS",
@@ -479,7 +507,8 @@ mod tests {
                 "{a} and {b} are out of order, and the search is a binary one"
             );
             assert!(
-                a.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                a.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
                 "{a} is not upper case, and the lookup upper-cases the word it is given"
             );
         }

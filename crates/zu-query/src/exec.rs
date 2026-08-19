@@ -2912,6 +2912,7 @@ fn build_stages(
                             distinct,
                             star,
                             args,
+                            ..
                         } = &item.expr
                         else {
                             return Err(invalid(format!(
@@ -6629,9 +6630,13 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
         // accumulator the grouping keeps, and reaching one here is a
         // projection that was compiled wrong.
         BoundExpr::Call {
-            func, star, args, ..
+            func,
+            sig,
+            star,
+            args,
+            ..
         } => {
-            let kernel = crate::functions::signature(*func)
+            let kernel = crate::functions::row(*sig)
                 .and_then(|sig| sig.kernel)
                 .filter(|_| !*star)
                 .ok_or_else(|| {
@@ -6800,7 +6805,8 @@ impl AggState {
             | Func::Lower
             | Func::Trim
             | Func::Normalize(_)
-            | Func::IsNormalized(_) => {
+            | Func::IsNormalized(_)
+            | Func::Math(_) => {
                 unreachable!("scalar function as an aggregate")
             }
         };

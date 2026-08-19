@@ -1,6 +1,6 @@
 schema = 1
 doc = "The words of zuQL, grouped by what they are, for the three things that colour them."
-audited = "2026-08-19"
+audited = "2026-08-20"
 
 # One list of words, three consumers. The shell scans a statement as it
 # is typed and colours the words it recognises, the tree-sitter grammar
@@ -111,6 +111,11 @@ words = ["NULL", "TRUE", "FALSE"]
 kind = "function"
 doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, ELEMENT_ID, PATH_LENGTH and ELEMENTS are the four that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls. ELEMENT_ID is ISO 20.10 and ID is zu's own, older function: one answers a string that names any element, the other a node's offset as a number, and both keep the name they are asked for. The last seven are the character string functions of ISO 20.22 and 20.24, CHAR_LENGTH and CHARACTER_LENGTH being two spellings the standard gives one function and OCTET_LENGTH being the other question, since the characters a reader counts and the bytes the store keeps are the same number only for ASCII. NORMALIZE is written like a call and is not one, because its second argument is a normal form and not a value, which is the arrangement CAST has."
 words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "ELEMENT_ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS", "CHAR_LENGTH", "CHARACTER_LENGTH", "OCTET_LENGTH", "UPPER", "LOWER", "TRIM", "NORMALIZE"]
+
+[[group]]
+kind = "function"
+doc = "The numeric library of ISO 20.16, 20.17 and 20.18. The first six are the exact ones, which answer the type they were given, and CEILING is the long spelling of CEIL; ROUND is the one of the six that takes a second argument, the number of digits to keep, and a negative count of digits rounds to tens and hundreds. MOD and POWER take two arguments and the rest take one. The other fifteen are approximate and answer a float whatever they were handed, because a square root, a logarithm and a sine are not exact numbers and a function that answered an integer for SQRT(4) and a float for SQRT(2) would be two functions wearing one name. LOG takes the base first and the value second, which is the order ISO 20.18 gives it and the opposite of the order a school book writes."
+words = ["ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "SIGN", "MOD", "POWER", "SQRT", "EXP", "LN", "LOG", "LOG10", "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "DEGREES", "RADIANS"]
 
 [[group]]
 kind = "keyword"

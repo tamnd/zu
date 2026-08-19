@@ -2860,6 +2860,7 @@ impl Compiler<'_> {
             distinct: false,
             star,
             args,
+            ..
         } = expr
         else {
             return Ok(None);
@@ -3793,6 +3794,7 @@ impl Compiler<'_> {
             distinct: true,
             star: false,
             args,
+            ..
         } = expr
         else {
             return Ok(None);
@@ -3838,6 +3840,7 @@ impl Compiler<'_> {
             distinct: false,
             star,
             args,
+            ..
         } = expr
         else {
             return Ok(None);

@@ -1734,6 +1734,70 @@ pub enum Func {
     /// function here and a predicate in the query text, which is the
     /// same arrangement `IS TYPED` has: one question, two spellings.
     IsNormalized(NormalForm),
+    /// GF01, GF02 and GF03: the numeric library, under one arm rather
+    /// than twenty one of them, so that a match over `Func` stays a
+    /// match a reader can hold and the exhaustiveness check keeps its
+    /// value. Which of the twenty one it is is a question for the
+    /// registry and for the kernel behind it, and for nobody else.
+    Math(Math),
+}
+
+/// ISO 20.19 to 20.21, the functions over one or two numbers: the
+/// arithmetic set, the trigonometric set and the logarithms.
+///
+/// They are together because they are one family to everything outside
+/// the registry: none of them reads the store, all of them answer the
+/// same thing every time they are asked, and the whole of what tells
+/// them apart is which arm of which kernel they take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Math {
+    /// GF01. The distance from nought, exact for an exact argument.
+    Abs,
+    /// GF01. The nearest whole number at or above the argument.
+    Ceil,
+    /// GF01. The nearest whole number at or below the argument.
+    Floor,
+    /// GF01. The nearest whole number, halves away from nought, and to
+    /// a written number of digits when a second argument says so.
+    Round,
+    /// GF01. Minus one, nought or one, which is exact whatever arrived.
+    Sign,
+    /// GF01. The square root, which is the power of one half and
+    /// refuses a negative argument for that reason.
+    Sqrt,
+    /// GF01. One number raised to another.
+    Power,
+    /// GF01. The remainder of a division, which is the function spelling
+    /// of the operator and raises on a nought divisor the same way.
+    Mod,
+    /// GF03. The exponential, e raised to the argument.
+    Exp,
+    /// GF03. The natural logarithm.
+    Ln,
+    /// GF03. The logarithm of the second argument in the base the first
+    /// one gives.
+    Log,
+    /// GF03. The logarithm in base ten.
+    Log10,
+    /// GF02. The sine of an angle in radians.
+    Sin,
+    /// GF02. The cosine of an angle in radians.
+    Cos,
+    /// GF02. The tangent of an angle in radians.
+    Tan,
+    /// GF02. The cotangent, which is the cosine over the sine and has
+    /// no answer where the sine is nought.
+    Cot,
+    /// GF02. The angle whose sine is the argument.
+    Asin,
+    /// GF02. The angle whose cosine is the argument.
+    Acos,
+    /// GF02. The angle whose tangent is the argument.
+    Atan,
+    /// GF02. Radians read as degrees.
+    Degrees,
+    /// GF02. Degrees read as radians.
+    Radians,
 }
 
 impl Func {
@@ -1795,6 +1859,12 @@ pub enum BoundExpr {
     },
     Call {
         func: Func,
+        /// Which row of the function registry answers this call, found
+        /// while the statement is bound. The evaluator reads the row at
+        /// this number rather than looking the function up again, so a
+        /// call costs a jump and not a walk of the table however many
+        /// rows the table grows to.
+        sig: u16,
         distinct: bool,
         star: bool,
         args: Vec<BoundExpr>,
@@ -5394,7 +5464,7 @@ impl Binder<'_> {
         let out = functions::signature(func)
             .expect("an aggregate has a signature")
             .ret
-            .of(&element);
+            .of(std::slice::from_ref(&element));
         Ok((
             BoundExpr::Fold {
                 func,
@@ -5428,6 +5498,7 @@ impl Binder<'_> {
         Ok((
             BoundExpr::Call {
                 func,
+                sig: functions::row_of(func).expect("a normalization function has a row"),
                 distinct: false,
                 star: false,
                 args: vec![bound],
@@ -5444,8 +5515,9 @@ impl Binder<'_> {
         args: &[Expr],
         ctx: &mut ExprCtx,
     ) -> Result<(BoundExpr, Type)> {
-        let sig = crate::functions::lookup(name)
+        let at = crate::functions::lookup(name)
             .ok_or_else(|| bad_reference(format!("unknown function '{name}'")))?;
+        let sig = functions::row(at).expect("a row number came from the table");
         let func = sig.func;
         if sig.aggregate
             && let [arg] = args
@@ -5489,17 +5561,23 @@ impl Binder<'_> {
                     )));
                 }
             }
+            functions::Arity::Between(least, most) => {
+                if star || args.len() < least || args.len() > most {
+                    return Err(invalid(format!(
+                        "{name}() takes {least} or {most} argument(s), got {}",
+                        args.len()
+                    )));
+                }
+            }
         }
         let was_in_aggregate = ctx.in_aggregate;
         if sig.aggregate {
             ctx.in_aggregate = true;
         }
         let mut bound = Vec::new();
-        let mut arg_ty = Type::Any;
         let mut arg_tys = Vec::new();
         for arg in args {
             let (b, t) = self.bind_expr(arg, ctx)?;
-            arg_ty = t.clone();
             arg_tys.push(t);
             bound.push(b);
         }
@@ -5512,16 +5590,17 @@ impl Binder<'_> {
         // A deterministic function over what the statement wrote is
         // answered here, once, rather than on every row it would reach.
         if let Some(lit) = functions::fold(sig, &bound) {
-            let ty = sig.ret.of(&arg_ty);
+            let ty = sig.ret.of(&arg_tys);
             return Ok((BoundExpr::Literal(lit), ty));
         }
         // The answer's type is the signature's rule read against
         // what arrived: a fixed type for most of these, and for the
-        // ones that hand back what they were given, the argument's.
-        let out = sig.ret.of(&arg_ty);
+        // ones that hand back what they were given, the arguments'.
+        let out = sig.ret.of(&arg_tys);
         Ok((
             BoundExpr::Call {
                 func,
+                sig: at,
                 distinct,
                 star,
                 args: bound,

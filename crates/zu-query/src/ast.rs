@@ -410,6 +410,13 @@ pub enum Clause {
     /// AS x`, which is the Cypher spelling of the same thing and the
     /// one this engine accepted first.
     ///
+    /// The source may also be a binding table (GQ23), where the rows
+    /// of the table are what the statement runs over and each of them
+    /// arrives as a record over the table's columns. It is the same
+    /// statement either way: a table is a sequence of rows the way a
+    /// list is a sequence of elements, so nothing about the counter or
+    /// the binding changes with it.
+    ///
     /// `ordinal` is the counter GQL lets the statement number its own
     /// rows with, `WITH ORDINALITY i` from one (GQ11) and `WITH OFFSET
     /// i` from zero (GQ24). It counts the elements of the list rather

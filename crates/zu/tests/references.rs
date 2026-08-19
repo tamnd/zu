@@ -400,3 +400,48 @@ fn references_compare_by_what_they_name() {
     );
     no(&mut session, "$a = $b", &[("a", first), ("b", second)]);
 }
+
+/// GQ23. A `FOR` runs over the rows of a binding table the way it runs
+/// over the elements of a list, and a row arrives as a record over the
+/// table's columns, so a field read is what gets at the value in it.
+/// The counter of `WITH ORDINALITY` numbers the rows, because a table
+/// is a sequence of rows the way a list is a sequence of elements and
+/// nothing else about the statement changes.
+#[test]
+fn a_for_statement_runs_over_the_rows_of_a_binding_table() {
+    let (_dir, mut session) = opened("for-over-a-table.zu1");
+    let rows = session_run(&mut session, "MATCH (p:person) RETURN p.id AS id");
+    let table = session.binding_table(rows);
+
+    let out = session
+        .run("FOR r IN $t RETURN r.id AS v", &[("t", table.clone())])
+        .expect("a row for each row of the table");
+    let mut got: Vec<Value> = out.rows.into_iter().map(|row| row[0].clone()).collect();
+    got.sort_by_key(|v| match v {
+        Value::Int(n) => *n,
+        other => panic!("an integer, got {other:?}"),
+    });
+    assert_eq!(got, vec![Value::Int(0), Value::Int(1)]);
+
+    let out = session
+        .run(
+            "FOR r IN $t WITH ORDINALITY i RETURN i AS n ORDER BY n",
+            &[("t", table)],
+        )
+        .expect("the rows numbered from one");
+    assert_eq!(out.rows[0], vec![Value::Int(1)]);
+    assert_eq!(out.rows[1], vec![Value::Int(2)]);
+}
+
+/// What a `FOR` refuses is everything that is neither a list nor a
+/// table, and it says both in the message, because a reader who wrote
+/// one of the two meant the statement to work.
+#[test]
+fn a_for_statement_over_a_number_is_refused() {
+    let (_dir, mut session) = opened("for-over-a-number.zu1");
+    let err = session
+        .run("FOR x IN 1 RETURN x AS v", &[])
+        .expect_err("a number is not a sequence");
+    let message = err.to_string();
+    assert!(message.contains("list"), "{message}");
+}

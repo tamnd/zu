@@ -147,7 +147,7 @@ fn a_close_counts_parallel_edges_one_at_a_time() {
 }
 
 /// The graph the nested close is checked on: a random background so the
-/// planner is looking at a real degree distribution, and eight nodes
+/// optimizer is looking at a real degree distribution, and eight nodes
 /// wired by hand under it.
 ///
 /// The hand wired part is built so that the two closes stand for

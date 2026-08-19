@@ -38,6 +38,7 @@ mod deleted;
 mod exec2_tests;
 mod insert;
 pub mod list_text;
+mod merge;
 pub mod query;
 pub mod session;
 mod set;

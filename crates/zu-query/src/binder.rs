@@ -1105,6 +1105,39 @@ pub enum BoundClause {
         /// carries across the write.
         carry: Vec<usize>,
     },
+    /// `MERGE`, the statement that finds a pattern or writes it.
+    ///
+    /// The pattern is here twice, once as the walk that looks for it
+    /// and once as the elements written when the walk finds nothing,
+    /// and both are over the same slots. That is what makes the run
+    /// simple: the probe is an optional match, so a row where the
+    /// pattern's own slots came back null is a row the write runs for
+    /// and every other row is one it found.
+    Merge {
+        /// The walk that looks for the pattern.
+        probe: BoundPath,
+        /// What the walk asks past the pattern itself, which is the
+        /// edge distinctness the pattern's own steps imply.
+        filter: Option<BoundExpr>,
+        /// The elements written when the walk finds nothing, over the
+        /// probe's own slots. `ON CREATE SET` is in here as well, as
+        /// properties of the element it writes, because that is what
+        /// it is: the element is being made, so a property it takes on
+        /// creation is one of the properties it is made with.
+        nodes: Vec<BoundInsertNode>,
+        rels: Vec<BoundInsertRel>,
+        /// `ON MATCH SET`, run over the rows the walk found.
+        on_match: Vec<BoundSetItem>,
+        /// The slots in scope where the write runs, the same thing
+        /// [`BoundClause::Insert::carry`] holds, and then the slots the
+        /// pattern writes in the order `nodes` and `rels` name them.
+        /// The second run is the one that says whether the row was
+        /// found, so it is carried whether or not anything reads it.
+        carry: Vec<usize>,
+        /// Where that second run starts, which is how many slots were
+        /// in scope before the clause.
+        at: usize,
+    },
     /// `SET`, the assignments the statement makes to elements earlier
     /// clauses found.
     Set {
@@ -1984,6 +2017,61 @@ fn label_holds(expr: &ast::LabelExpr, name: &str) -> bool {
     }
 }
 
+/// One end of a merged pattern, as the slot holding it, adding the
+/// element to `nodes` when it is one the statement writes.
+///
+/// An end is one of three things. A name an earlier clause bound is one
+/// the pattern is pointing at, and a name this pattern already used is
+/// the same element again; neither is written, and neither may carry a
+/// label or a property, because that would be describing an element
+/// that has already been described. Everything else is an element the
+/// pattern describes, which is one to write when the walk finds nothing.
+///
+/// This is a free function rather than a method because it holds a
+/// borrow of the list it is adding to for as long as it runs.
+fn merge_end(
+    binder: &Binder<'_>,
+    pat: &NodePattern,
+    bound: &BoundNode,
+    carry: &[usize],
+    nodes: &mut Vec<BoundInsertNode>,
+) -> Result<usize> {
+    let again = carry.contains(&bound.slot) || nodes.iter().any(|node| node.slot == bound.slot);
+    if again {
+        if pat.label.is_some() || !pat.props.is_empty() {
+            return Err(invalid(format!(
+                "'{}' already stands for an element here, so writing a label or a property on it would be describing an element that is already described",
+                pat.var.as_deref().unwrap_or("")
+            )));
+        }
+        return Ok(bound.slot);
+    }
+    let table = binder.insert_table(pat, "MERGE")?;
+    nodes.push(BoundInsertNode {
+        slot: bound.slot,
+        table,
+        props: bound.props.clone(),
+    });
+    Ok(bound.slot)
+}
+
+/// The properties of whichever written element a slot names. The slot
+/// has been checked against the list of what the clause writes, so one
+/// of the two holds it.
+fn merge_props<'a>(
+    nodes: &'a mut [BoundInsertNode],
+    rels: &'a mut [BoundInsertRel],
+    slot: usize,
+) -> &'a mut Vec<(String, BoundExpr)> {
+    if let Some(node) = nodes.iter_mut().find(|node| node.slot == slot) {
+        return &mut node.props;
+    }
+    rels.iter_mut()
+        .find(|rel| rel.slot == slot)
+        .map(|rel| &mut rel.props)
+        .expect("the slot was checked against what the clause writes")
+}
+
 /// Every slot a bound expression reads.
 ///
 /// The set is whatever the caller keeps them in, since the executor
@@ -2323,6 +2411,11 @@ impl Binder<'_> {
                 }
                 Ok(BoundClause::Insert { nodes, rels, carry })
             }
+            Clause::Merge {
+                pattern,
+                on_create,
+                on_match,
+            } => self.bind_merge(pattern, on_create, on_match),
             Clause::Set { items } => {
                 let carry = self.carried();
                 let mut bound = Vec::with_capacity(items.len());
@@ -3355,6 +3448,177 @@ impl Binder<'_> {
         Ok(slot)
     }
 
+    /// Binds `MERGE`, the statement that finds a pattern or writes it.
+    ///
+    /// The pattern is bound once, as a walk to look for, and the
+    /// elements to write are read off what that bound. The other way
+    /// round does not work: binding the write first declares the
+    /// variables, and the walk would then be a pattern over names that
+    /// already stand for something, which is a different pattern and
+    /// one the binder refuses anyway.
+    ///
+    /// So what comes out is an optional match and an insert over the
+    /// same slots, and the row on the other side is what tells them
+    /// apart: a walk that found nothing leaves nulls where the pattern
+    /// is, and those are the rows the insert runs for.
+    fn bind_merge(
+        &mut self,
+        pattern: &ast::PathPattern,
+        on_create: &[SetItem],
+        on_match: &[SetItem],
+    ) -> Result<BoundClause> {
+        // Read before the clause writes anything into scope, for the
+        // reason `INSERT` reads it there.
+        let carry = self.carried();
+        let at = carry.len();
+        self.refuse_unmergeable(pattern)?;
+        let mut probe = self.bind_path(pattern)?;
+        self.narrow_path(&probe)?;
+        self.settle_labels(&mut probe);
+        // A pattern whose steps could walk one edge twice is a pattern
+        // that finds a walk the store does not hold, and then the write
+        // would run for a row that was there. The test is the one every
+        // match asks.
+        let filter = and_all(
+            None,
+            self.edge_distinctness(std::slice::from_ref(pattern), std::slice::from_ref(&probe)),
+        );
+        let mut nodes = Vec::new();
+        let mut rels = Vec::new();
+        let mut left = merge_end(self, &pattern.start, &probe.start, &carry, &mut nodes)?;
+        for ((step, node), (rel, bound)) in pattern.steps.iter().zip(&probe.steps) {
+            let right = merge_end(self, node, bound, &carry, &mut nodes)?;
+            let (table, src, dst) = self.insert_rel_ends(step, left, right, &nodes, "MERGE")?;
+            rels.push(BoundInsertRel {
+                slot: rel.slot,
+                table,
+                src,
+                dst,
+                props: rel.props.clone(),
+            });
+            left = right;
+        }
+        if nodes.is_empty() && rels.is_empty() {
+            return Err(invalid(
+                "this MERGE names only elements earlier clauses already found, so there is nothing for it to look for and nothing for it to write".into(),
+            ));
+        }
+        let created: Vec<usize> = nodes
+            .iter()
+            .map(|node| node.slot)
+            .chain(rels.iter().map(|rel| rel.slot))
+            .collect();
+        for item in on_create {
+            self.merge_on_create(item, &created, &mut nodes, &mut rels)?;
+        }
+        let mut matched = Vec::with_capacity(on_match.len());
+        for item in on_match {
+            matched.push(self.bind_set_item(item)?);
+        }
+        once_each("ON MATCH SET", &matched)?;
+        let mut carry = carry;
+        carry.extend(created);
+        Ok(BoundClause::Merge {
+            probe,
+            filter,
+            nodes,
+            rels,
+            on_match: matched,
+            carry,
+            at,
+        })
+    }
+
+    /// Turns away the pattern shapes a `MERGE` cannot mean, before any
+    /// of it is bound.
+    ///
+    /// The pattern is read and written by the same brackets, so
+    /// anything in it that only makes sense on one side of that is
+    /// turned away rather than read one way and written another. A
+    /// selector and a path mode pick between the walks that are there,
+    /// and this clause writes one when there are none. A condition
+    /// inside a bracket says which elements match, and this clause
+    /// makes an element when none does, which is not something a
+    /// condition describes.
+    fn refuse_unmergeable(&self, pattern: &ast::PathPattern) -> Result<()> {
+        if pattern.var.is_some() {
+            return Err(not_yet(
+                "MERGE binding the path it found, which is a walk over rows some of which may be being made,",
+            ));
+        }
+        if pattern.selector.is_some() || pattern.mode.is_some() {
+            return Err(invalid(
+                "a selector or a path mode says which of the walks that are there to pick, and MERGE writes the walk when there is none".into(),
+            ));
+        }
+        if !pattern.subpaths.is_empty() || !pattern.groups.is_empty() {
+            return Err(invalid(
+                "brackets around part of a pattern name a stretch of a walk, and MERGE is one pattern that is either all found or all written".into(),
+            ));
+        }
+        let inside = pattern.filter.is_some()
+            || pattern.start.filter.is_some()
+            || pattern
+                .steps
+                .iter()
+                .any(|(rel, node)| rel.filter.is_some() || node.filter.is_some());
+        if inside {
+            return Err(invalid(
+                "a condition inside a pattern picks which elements match it, and MERGE writes the elements when none does, which is not something a condition describes".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Folds one `ON CREATE SET` item into the element it writes.
+    ///
+    /// A property an element takes at creation is one of the properties
+    /// it is created with, so this is not a write after the write: the
+    /// item joins the properties the pattern already named and the
+    /// element is made holding both. That is also why the value cannot
+    /// read the element: it is worked out before there is one.
+    fn merge_on_create(
+        &mut self,
+        item: &SetItem,
+        created: &[usize],
+        nodes: &mut [BoundInsertNode],
+        rels: &mut [BoundInsertRel],
+    ) -> Result<()> {
+        let target = self.write_target("ON CREATE SET", &item.target)?;
+        if !created.contains(&target) {
+            return Err(invalid(format!(
+                "ON CREATE SET writes the elements the pattern wrote, and '{}' is one MERGE was given rather than one it makes",
+                item.target
+            )));
+        }
+        let SetInto::Property(key) = &item.into else {
+            return Err(not_yet(
+                "ON CREATE SET writing an element's whole record or its labels, which is a write to an element that is still being made,",
+            ));
+        };
+        let mut ctx = ExprCtx::new(false);
+        let (value, _) = self.bind_expr(&item.value, &mut ctx)?;
+        let mut reads: Vec<usize> = Vec::new();
+        expr_slots(&value, &mut reads);
+        if let Some(&slot) = reads.iter().find(|slot| created.contains(slot)) {
+            return Err(not_yet(&format!(
+                "ON CREATE SET reading {}, which the statement is making and which holds nothing until it has,",
+                self.var_text(slot)
+            )));
+        }
+        let props = merge_props(nodes, rels, target);
+        if props.iter().any(|(written, _)| written == key) {
+            return Err(ZuError::gql(
+                codes::C22G0M,
+                format!(
+                    "this MERGE writes property '{key}' of one element twice, and an element holds one value per property"
+                ),
+            ));
+        }
+        props.push((key.clone(), value));
+        Ok(())
+    }
+
     /// The slots a write carries across itself, which is everything in
     /// scope where it sits.
     ///
@@ -3490,16 +3754,44 @@ impl Binder<'_> {
         right: usize,
         nodes: &[BoundInsertNode],
     ) -> Result<BoundInsertRel> {
+        let (table, src, dst) = self.insert_rel_ends(pat, left, right, nodes, "INSERT")?;
+        let slot = match &pat.var {
+            Some(name) => self.declare(name, Type::Rel)?,
+            None => self.anon_slot(Type::Rel),
+        };
+        self.variables[slot].rel_tables = vec![table];
+        let props = self.bind_props(&pat.props)?;
+        Ok(BoundInsertRel {
+            slot,
+            table,
+            src,
+            dst,
+            props,
+        })
+    }
+
+    /// Which rel table a written edge pattern goes in and which way
+    /// round it runs, as the table and the two slots. This is the part
+    /// of writing an edge that only reads: `INSERT` declares the slot
+    /// after it and `MERGE` already has one.
+    fn insert_rel_ends(
+        &self,
+        pat: &RelPattern,
+        left: usize,
+        right: usize,
+        nodes: &[BoundInsertNode],
+        verb: &str,
+    ) -> Result<(u32, usize, usize)> {
         if pat.range.is_some() {
-            return Err(invalid(
-                "a hop range asks for a walk of some length, and INSERT writes one edge".into(),
-            ));
+            return Err(invalid(format!(
+                "a hop range asks for a walk of some length, and {verb} writes one edge"
+            )));
         }
         let [name] = pat.types.as_slice() else {
             return Err(match pat.types.is_empty() {
-                true => invalid(
-                    "INSERT needs an edge type saying which table the edge goes in, and this one names none".into(),
-                ),
+                true => invalid(format!(
+                    "{verb} needs an edge type saying which table the edge goes in, and this one names none"
+                )),
                 false => invalid(format!(
                     "an edge goes in one table, and '{}' names {}",
                     pat.types.join("|"),
@@ -3562,19 +3854,7 @@ impl Binder<'_> {
                 )));
             }
         }
-        let slot = match &pat.var {
-            Some(name) => self.declare(name, Type::Rel)?,
-            None => self.anon_slot(Type::Rel),
-        };
-        self.variables[slot].rel_tables = vec![rel.id];
-        let props = self.bind_props(&pat.props)?;
-        Ok(BoundInsertRel {
-            slot,
-            table: rel.id,
-            src,
-            dst,
-            props,
-        })
+        Ok((rel.id, src, dst))
     }
 
     /// How to write a slot in a message: the name the statement gave
@@ -3614,16 +3894,32 @@ impl Binder<'_> {
                     .into(),
             ));
         }
+        let table = self.insert_table(pat, "INSERT")?;
+        let props = self.bind_props(&pat.props)?;
+        let slot = match &pat.var {
+            Some(name) => self.declare(name, Type::Node)?,
+            None => self.anon_slot(Type::Node),
+        };
+        self.variables[slot].node_tables = vec![table];
+        Ok(BoundInsertNode { slot, table, props })
+    }
+
+    /// The node table a written element pattern goes in, which is the
+    /// table whose own name is the label the pattern carries. `verb` is
+    /// the statement asking, since `INSERT` and `MERGE` both write an
+    /// element out of a pattern and a reader wants to be told which of
+    /// their clauses is the one that cannot run.
+    fn insert_table(&self, pat: &NodePattern, verb: &str) -> Result<u32> {
         let Some(label) = &pat.label else {
             return Err(invalid(format!(
-                "INSERT needs a label saying which table the element goes in, and '({})' names none",
+                "{verb} needs a label saying which table the element goes in, and '({})' names none",
                 pat.var.as_deref().unwrap_or("")
             )));
         };
         let LabelExpr::Label(name) = label else {
-            return Err(not_yet(
-                "INSERT of an element whose labels are written as anything but one name,",
-            ));
+            return Err(not_yet(&format!(
+                "{verb} of an element whose labels are written as anything but one name,"
+            )));
         };
         // A row lands in a table, and the label a table gives every row
         // it holds is its own name, so that is the one that says where
@@ -3631,7 +3927,7 @@ impl Binder<'_> {
         // rather than somewhere it lives, and adding one to an element
         // being created is a key label set change, which is its own
         // line on the milestone.
-        let table = self
+        Ok(self
             .schema
             .nodes
             .iter()
@@ -3641,14 +3937,7 @@ impl Binder<'_> {
                     "no node table is named '{name}', and an element is created in the table whose own name is the label"
                 ))
             })?
-            .id;
-        let props = self.bind_props(&pat.props)?;
-        let slot = match &pat.var {
-            Some(name) => self.declare(name, Type::Node)?,
-            None => self.anon_slot(Type::Node),
-        };
-        self.variables[slot].node_tables = vec![table];
-        Ok(BoundInsertNode { slot, table, props })
+            .id)
     }
 
     fn bind_node(&mut self, pat: &NodePattern) -> Result<BoundNode> {

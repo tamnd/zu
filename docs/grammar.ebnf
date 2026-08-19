@@ -496,7 +496,7 @@ string          = [ "@" ] , "'" , { character } , "'"
    the parser. *)
 
 (* Reserved but not yet parsed; the parser rejects them by name:
-   CREATE, SET, DELETE, DETACH, MERGE, CALL, FILTER, LET.
-   CREATE is a statement only where GRAPH follows it, with OR REPLACE
-   and PROPERTY allowed in between; anywhere else it is still the write
-   nobody has implemented. *)
+   CREATE, SESSION. CREATE is a statement only where GRAPH follows it,
+   with OR REPLACE and PROPERTY allowed in between; anywhere else it is
+   still the write nobody has implemented. The rest of the write words,
+   INSERT, SET, REMOVE, DELETE, DETACH DELETE and MERGE, are parsed. *)

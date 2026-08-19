@@ -21,8 +21,8 @@
 //! vocabulary knows, because a word the grammar parses and nothing
 //! colours is a word that comes out plain in an editor. The reverse is
 //! not required, and deliberately: the vocabulary holds the words the
-//! parser refuses by name, `MERGE`, `FILTER`, `LET` and the rest, and
-//! those are coloured everywhere and parsed nowhere.
+//! parser refuses by name, `CREATE` where no GRAPH follows it and
+//! `SESSION`, and those are coloured everywhere and parsed nowhere.
 //!
 //! Two of the three live here and the tree-sitter grammar does not: it
 //! is [`REPOSITORY`], and a checkout of it is something this may or may

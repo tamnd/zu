@@ -37,8 +37,8 @@ cases:
     raises: "42001"
 
   - name: a-clause-that-is-reserved-and-not-here-yet
-    doc: MERGE is GQL and this engine does not run it, and a statement that names it is still a syntax condition rather than a feature flag, because the answer does not depend on the data.
-    query: MERGE (n:person)
+    doc: SESSION opens the session statements and this engine does not run them, and a statement that names one is still a syntax condition rather than a feature flag, because the answer does not depend on the data.
+    query: SESSION SET VALUE $x = 1
     raises: "42001"
 
   - name: a-write-clause-that-is-reserved

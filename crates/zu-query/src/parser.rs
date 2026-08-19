@@ -343,7 +343,7 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// told the parser expected MATCH has been sent looking for a typo
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
-const UNIMPLEMENTED: &[&str] = &["CREATE", "MERGE", "SESSION"];
+const UNIMPLEMENTED: &[&str] = &["CREATE", "SESSION"];
 
 /// How a simple query statement ended, which is what the parser needs
 /// to say when something follows that may not.
@@ -1101,6 +1101,7 @@ impl Parser<'_> {
             matches!(
                 c,
                 Clause::Insert { .. }
+                    | Clause::Merge { .. }
                     | Clause::Set { .. }
                     | Clause::Remove { .. }
                     | Clause::Delete { .. }
@@ -1125,6 +1126,67 @@ impl Parser<'_> {
         Ok(RemoveItem {
             target,
             what: Removed::Property(key),
+        })
+    }
+
+    /// `MERGE (p:person {id: 7}) ON CREATE SET p.seen = 1 ON MATCH SET
+    /// p.seen = p.seen + 1`, read after the word itself.
+    ///
+    /// One pattern and no comma. A comma here would be two patterns,
+    /// and a statement that found the first and wrote the second is not
+    /// a statement anyone means; Cypher spells that as two `MERGE`s and
+    /// so does this.
+    ///
+    /// The two `ON` blocks may be written in either order and either
+    /// may be left out. Writing one of them twice is refused rather
+    /// than folded together, because the two spellings would run their
+    /// items in different orders and the reader who wrote it that way
+    /// meant one of them.
+    fn parse_merge(&mut self) -> Result<Clause> {
+        let pattern = self.parse_path()?;
+        if self.at(&TokenKind::Comma) {
+            return Err(self.error(
+                "MERGE takes one pattern: it finds what it describes or writes it, and two \
+                 patterns would leave which of the two it did unsaid",
+            ));
+        }
+        let mut on_create = Vec::new();
+        let mut on_match = Vec::new();
+        let mut seen_create = false;
+        let mut seen_match = false;
+        while self.at_kw("ON") {
+            let at = self.pos;
+            self.eat_kw("ON");
+            let create = if self.eat_kw("CREATE") {
+                true
+            } else if self.eat_kw("MATCH") {
+                false
+            } else {
+                self.pos = at;
+                break;
+            };
+            self.expect_kw("SET")?;
+            let mut items = vec![self.parse_set_item()?];
+            while self.eat(&TokenKind::Comma) {
+                items.push(self.parse_set_item()?);
+            }
+            let (seen, into) = match create {
+                true => (&mut seen_create, &mut on_create),
+                false => (&mut seen_match, &mut on_match),
+            };
+            if *seen {
+                return Err(self.error(match create {
+                    true => "ON CREATE SET is written once: two of them would run in an order the statement does not say",
+                    false => "ON MATCH SET is written once: two of them would run in an order the statement does not say",
+                }));
+            }
+            *seen = true;
+            *into = items;
+        }
+        Ok(Clause::Merge {
+            pattern,
+            on_create,
+            on_match,
         })
     }
 
@@ -1402,6 +1464,8 @@ impl Parser<'_> {
                     patterns.push(self.parse_path()?);
                 }
                 clauses.push(Clause::Insert { patterns });
+            } else if self.eat_kw("MERGE") {
+                clauses.push(self.parse_merge()?);
             } else if self.eat_kw("SET") {
                 let mut items = vec![self.parse_set_item()?];
                 while self.eat(&TokenKind::Comma) {
@@ -4143,15 +4207,67 @@ mod tests {
     /// which is the wrong place to look and the wrong thing to fix.
     #[test]
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
+        let err = parse_err("SESSION SET VALUE $x = 1");
+        assert!(
+            err.contains("SESSION is not implemented yet"),
+            "refused with {err:?}, which does not name SESSION"
+        );
+    }
+
+    /// `MERGE` reads one pattern and then whichever of the two `ON`
+    /// blocks were written, in either order.
+    #[test]
+    fn merge_reads_one_pattern_and_two_blocks() {
+        let q = parse("MERGE (p:person {id: 7}) ON MATCH SET p.seen = 1 ON CREATE SET p.made = 2")
+            .expect("parse");
+        let Clause::Merge {
+            pattern,
+            on_create,
+            on_match,
+        } = &q.clauses()[0]
+        else {
+            panic!("parsed as {:?}", q.clauses()[0]);
+        };
+        assert!(pattern.steps.is_empty(), "one element and no steps");
+        assert_eq!(on_create.len(), 1);
+        assert_eq!(on_create[0].target, "p");
+        assert_eq!(on_match.len(), 1);
+        assert_eq!(on_match[0].target, "p");
+        let plain = parse("MERGE (p:person)").expect("parse");
+        let Clause::Merge {
+            on_create,
+            on_match,
+            ..
+        } = &plain.clauses()[0]
+        else {
+            panic!("parsed as {:?}", plain.clauses()[0]);
+        };
+        assert!(on_create.is_empty() && on_match.is_empty(), "neither block");
+    }
+
+    /// The shapes the word does not take: two patterns, which would
+    /// leave unsaid which of them was found and which written, and
+    /// either block written twice, which would leave unsaid what order
+    /// the items run in.
+    #[test]
+    fn merge_takes_one_pattern_and_each_block_once() {
+        assert!(
+            parse_err("MERGE (a:person), (b:person)").contains("MERGE takes one pattern"),
+            "{}",
+            parse_err("MERGE (a:person), (b:person)")
+        );
         for (source, kw) in [
-            ("SESSION SET VALUE $x = 1", "SESSION"),
-            ("MERGE (p:Person) RETURN p", "MERGE"),
+            (
+                "MERGE (p:person) ON CREATE SET p.a = 1 ON CREATE SET p.b = 2",
+                "ON CREATE SET is written once",
+            ),
+            (
+                "MERGE (p:person) ON MATCH SET p.a = 1 ON MATCH SET p.b = 2",
+                "ON MATCH SET is written once",
+            ),
         ] {
             let err = parse_err(source);
-            assert!(
-                err.contains(&format!("{kw} is not implemented yet")),
-                "{source:?} was refused with {err:?}, which does not name {kw}"
-            );
+            assert!(err.contains(kw), "{source:?} was refused with {err:?}");
         }
     }
 

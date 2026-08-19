@@ -407,6 +407,20 @@ impl Session {
                     _ => None,
                 })
             }
+            // A `MERGE` names its tables both ways, so it is asked both
+            // ways: the elements it writes are in the clause and the
+            // ones it found are in the row.
+            crate::split::Write::Merge(merge) => merge
+                .insert
+                .nodes
+                .iter()
+                .find_map(|node| self.frames.get(node.table))
+                .or_else(|| {
+                    rows.iter().flatten().find_map(|value| match value {
+                        Value::Node { table, .. } => self.frames.get(*table),
+                        _ => None,
+                    })
+                }),
         };
         match named {
             Some(frame) => Err(ZuError::gql(
@@ -1223,6 +1237,83 @@ impl Session {
                     }
                     let (rows, edges) = removals.staged();
                     self.write(|txn| crate::delete::stage(txn, &rows, &edges))?;
+                    next
+                }
+                crate::split::Write::Merge(merge) => {
+                    // The walk ran with the read half of this part, so
+                    // the row already says which of the two halves it
+                    // is for: null where the pattern is means the walk
+                    // found nothing, and that is what the insert runs
+                    // for.
+                    let catalog = self.graph.catalog().clone();
+                    let patches = Arc::clone(&self.patches);
+                    let mut batch = crate::insert::Batch::open(
+                        self.graph.file_mut(),
+                        &merge.insert,
+                        catalog,
+                        &patches,
+                        &mut self.dirs,
+                    )?;
+                    let mut merged = crate::merge::Merged::default();
+                    let mut next = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let (carried, values) = row.split_at(carry);
+                        if carried[merge.at] != Value::Null {
+                            next.push(Value::List(carried.to_vec()));
+                            continue;
+                        }
+                        let props = &values[..merge.props];
+                        let given: Vec<Value> =
+                            merge.ends.iter().map(|at| carried[*at].clone()).collect();
+                        let made = merged.made(&given, props, || batch.row(carried, props))?;
+                        next.push(Value::List(
+                            carried[..merge.at].iter().cloned().chain(made).collect(),
+                        ));
+                    }
+                    let propful = batch.propful();
+                    let created = batch.created_rows();
+                    let (new, edges) = batch.staged();
+                    if !new.is_empty() || !edges.is_empty() {
+                        let catalog = self.graph.catalog().clone();
+                        crate::insert::refuse_duplicate_pairs(
+                            &mut self.graph,
+                            &catalog,
+                            &edges,
+                            &propful,
+                            &created,
+                        )?;
+                        self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
+                        crate::insert::settle(&mut self.graph, &mut next)?;
+                    }
+                    // What the walk did find, changed. The elements are
+                    // in the store already, so this is an ordinary
+                    // `SET` and it goes in behind the insert rather
+                    // than with it.
+                    if !merge.matched.items.is_empty() {
+                        let catalog = self.graph.catalog().clone();
+                        let mut changes = crate::set::Changes::open(&merge.matched, catalog);
+                        for row in &rows {
+                            let (carried, values) = row.split_at(carry);
+                            if carried[merge.at] == Value::Null {
+                                continue;
+                            }
+                            changes.row(
+                                self.graph.file_mut(),
+                                &mut self.dirs,
+                                carried,
+                                &values[merge.props..],
+                            )?;
+                        }
+                        let (updates, widened) = changes.staged();
+                        if let Some(catalog) = widened {
+                            catalog.store(self.writing())?;
+                            self.publish_side();
+                            self.sync()?;
+                        }
+                        if !updates.is_empty() {
+                            self.write(|txn| crate::set::stage(txn, &updates))?;
+                        }
+                    }
                     next
                 }
                 crate::split::Write::Set(set) => {

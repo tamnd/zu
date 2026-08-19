@@ -18,7 +18,7 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{
     BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetItem,
-    Schema, Type,
+    MatchKind, Schema, Type,
 };
 use zu_query::plan::LogicalPlan;
 use zu_query::{optimizer, plan};
@@ -41,6 +41,9 @@ pub(crate) enum Write {
     Insert(Insert),
     Set(Set),
     Delete(Delete),
+    /// Boxed, because a merge carries the walk it runs as well as the
+    /// write, and every other arm would be as big as that one.
+    Merge(Box<Merge>),
 }
 
 impl Write {
@@ -52,6 +55,20 @@ impl Write {
             Write::Insert(insert) => &insert.carry,
             Write::Set(set) => &set.carry,
             Write::Delete(delete) => &delete.carry,
+            Write::Merge(merge) => &merge.insert.carry,
+        }
+    }
+
+    /// The clauses the write puts at the end of the part before it.
+    ///
+    /// A `MERGE` is the one write that reads something of its own: the
+    /// walk that decides whether it writes anything is part of the read
+    /// half rather than of the write, so it goes in here and the rows
+    /// arrive with the answer already in them.
+    fn before(&self) -> Option<BoundClause> {
+        match self {
+            Write::Merge(merge) => Some(merge.probe.clone()),
+            _ => None,
         }
     }
 
@@ -64,6 +81,17 @@ impl Write {
             // A delete names the elements it takes away and computes
             // nothing, so there is nothing behind the row.
             Write::Delete(_) => Vec::new(),
+            // The properties the written elements take, and then what
+            // `ON MATCH SET` assigns. A row gets one or the other used
+            // and both worked out, because which of the two a row is
+            // for is not known until the walk has run and the walk is
+            // what produced the row.
+            Write::Merge(merge) => {
+                crate::insert::value_exprs(&merge.insert.nodes, &merge.insert.rels)
+                    .into_iter()
+                    .chain(merge.matched.items.iter().map(|item| item.value.clone()))
+                    .collect()
+            }
         }
     }
 
@@ -73,7 +101,10 @@ impl Write {
     fn created(&self) -> &[usize] {
         match self {
             Write::Insert(insert) => &insert.created,
-            Write::Set(_) | Write::Delete(_) => &[],
+            // A merge binds the pattern's slots, and the walk in front
+            // of it already put them in the row, so they are in the
+            // carry rather than behind it.
+            Write::Set(_) | Write::Delete(_) | Write::Merge(_) => &[],
         }
     }
 }
@@ -119,6 +150,35 @@ pub(crate) struct Delete {
     pub(crate) detach: bool,
 }
 
+/// A `MERGE`: the walk that looks for the pattern, the elements written
+/// when it finds none, and the assignments made when it finds one.
+///
+/// The insert is over the pattern's own slots, and those slots are in
+/// the carry rather than behind it, because the walk in front of the
+/// write already put them in the row. That is also what says which of
+/// the two halves a row is for.
+pub(crate) struct Merge {
+    /// The walk, as an optional match, run at the end of the part
+    /// before the write.
+    pub(crate) probe: BoundClause,
+    pub(crate) insert: Insert,
+    /// `ON MATCH SET`, over the same carry. Its values follow the
+    /// insert's in the row.
+    pub(crate) matched: Set,
+    /// Where the pattern's own slots start in the row. The walk is
+    /// optional, so null there is a row it found nothing for, and that
+    /// is the row the insert runs for.
+    pub(crate) at: usize,
+    /// The positions in the row of the endpoints the pattern was given
+    /// rather than wrote. Two rows that agree on these and on the
+    /// properties are merging one thing, which is what stops a
+    /// statement writing it twice.
+    pub(crate) ends: Vec<usize>,
+    /// How many of the values behind the row are the insert's. The rest
+    /// are what `ON MATCH SET` assigns.
+    pub(crate) props: usize,
+}
+
 /// A query nested inside a statement, compiled the way the statement
 /// around it was and run on its own. `DELETE VALUE { ... }` is the one
 /// place a statement holds one.
@@ -151,6 +211,7 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
         };
         let write = write_of(&rest[at], schema)?;
         let mut clauses = rest[..at].to_vec();
+        clauses.extend(write.before());
         let exprs = write
             .carry()
             .iter()
@@ -188,7 +249,10 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
 fn is_write(clause: &BoundClause) -> bool {
     matches!(
         clause,
-        BoundClause::Insert { .. } | BoundClause::Set { .. } | BoundClause::Delete { .. }
+        BoundClause::Insert { .. }
+            | BoundClause::Set { .. }
+            | BoundClause::Delete { .. }
+            | BoundClause::Merge { .. }
     )
 }
 
@@ -223,6 +287,56 @@ fn write_of(clause: &BoundClause, schema: &Schema) -> Result<Write> {
             carry: carry.clone(),
             detach: *detach,
         }),
+        BoundClause::Merge {
+            probe,
+            filter,
+            nodes,
+            rels,
+            on_match,
+            carry,
+            at,
+        } => {
+            let written: Vec<usize> = nodes
+                .iter()
+                .map(|node| node.slot)
+                .chain(rels.iter().map(|rel| rel.slot))
+                .collect();
+            // An end the pattern did not write is one it was given, and
+            // where it sits in the row is where its slot sits in the
+            // carry.
+            let mut ends: Vec<usize> = rels
+                .iter()
+                .flat_map(|rel| [rel.src, rel.dst])
+                .filter(|slot| !written.contains(slot))
+                .filter_map(|slot| carry.iter().position(|held| *held == slot))
+                .collect();
+            ends.sort_unstable();
+            ends.dedup();
+            Write::Merge(Box::new(Merge {
+                probe: BoundClause::Match {
+                    kind: MatchKind::Optional,
+                    patterns: vec![probe.clone()],
+                    filter: filter.clone(),
+                },
+                insert: Insert {
+                    nodes: nodes.clone(),
+                    rels: rels.clone(),
+                    carry: carry.clone(),
+                    created: written,
+                },
+                matched: Set {
+                    items: on_match.clone(),
+                    carry: carry.clone(),
+                },
+                at: *at,
+                ends,
+                props: nodes
+                    .iter()
+                    .map(|node| node.props.len())
+                    .chain(rels.iter().map(|rel| rel.props.len()))
+                    .sum(),
+            }))
+        }
         _ => unreachable!("the position that matched"),
     })
 }

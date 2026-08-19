@@ -1577,6 +1577,32 @@ detach_stmt_kb = 96.0
 detach_stmt_cpu_us = 400.0
 detach_stmt_growth_b = 4096.0
 
+# A MERGE over two rows, one the walk finds and one it does not,
+# measured 4.2 ms, 650 us of processor time, 16.1 kB written and no
+# growth at all at 10000 rows.
+#
+# This is the one statement shape that writes twice, because the row the
+# walk missed is an insert and the row it found is a SET. Until they
+# shared a transaction it cost 11.5 ms, 61.0 kB written and 10486 bytes
+# of growth a statement, so about three times the clock and four times
+# the bytes. The bytes are where the mechanism shows: two commits a
+# statement fill the log twice as fast, the log tripping its threshold
+# is what makes a fold checkpoint, and a checkpoint syncs the base file
+# and cuts the log. One commit a statement leaves the growth at nothing,
+# the same as every other write here.
+#
+# The processor ceiling is the loose one of the set, because most of
+# what it covers is the walk and not the write: the pattern is
+# correlated with the row the UNWIND handed it, so the walk runs per row
+# rather than once, and that read is an order of magnitude more than the
+# commit underneath it. The kB and growth ceilings are the ones every
+# other write on this list carries, and they are the two that do not
+# move between machines. Lower these ceilings, never raise them.
+merge_stmt_us = 250000.0
+merge_stmt_kb = 96.0
+merge_stmt_cpu_us = 2400.0
+merge_stmt_growth_b = 4096.0
+
 # What a burst of writers costs against what one writer costs
 # (crates/zu/benches/commit.rs). The same INSERT of one element run at
 # six widths, one writer up to thirty two, each on its own connection,
@@ -1597,12 +1623,18 @@ detach_stmt_growth_b = 4096.0
 # why the throughput is a straight line in the width and the latency is
 # flat.
 #
-# Measured 15.3 times the statements a second of one writer at thirty
-# two writers, with the latency at 2.0 times one writer's and the p99 at
-# 2.5. The floor is set well under the measurement and well over the 1.0
+# Measured 17.1 times the statements a second of one writer at thirty
+# two writers, with the latency at 1.6 times one writer's and the p99 at
+# 1.8. The floor is set well under the measurement and well over the 1.0
 # that writers syncing one at a time would give, because it is a
 # regression gate and not a claim about the machine. Raise this floor as
 # the commit path shares more, never lower it.
+#
+# The p99 is read against the one writer level's own p99 and not against
+# its median. It was the median at first, and on a machine somebody else
+# was also using that read 9.6 and failed a gate nothing in the engine
+# had moved: the load is in the tail at every width and only tail over
+# tail cancels it.
 commit_x = 6.0
 commit_p50_x = 3.0
 commit_p99_x = 6.0

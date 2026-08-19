@@ -1294,7 +1294,8 @@ impl Session {
                     let propful = batch.propful();
                     let created = batch.created_rows();
                     let (new, edges) = batch.staged();
-                    if !new.is_empty() || !edges.is_empty() {
+                    let inserting = !new.is_empty() || !edges.is_empty();
+                    if inserting {
                         let catalog = self.graph.catalog().clone();
                         crate::insert::refuse_duplicate_pairs(
                             &mut self.graph,
@@ -1303,13 +1304,14 @@ impl Session {
                             &propful,
                             &created,
                         )?;
-                        self.write(|txn| crate::insert::stage(txn, &new, &edges))?;
-                        crate::insert::settle(&mut self.graph, &mut next)?;
                     }
                     // What the walk did find, changed. The elements are
                     // in the store already, so this is an ordinary
-                    // `SET` and it goes in behind the insert rather
-                    // than with it.
+                    // `SET`, and it is worked out here rather than
+                    // after the insert because the rows it reads are
+                    // the ones the walk matched and the insert does not
+                    // touch them.
+                    let mut updates = Vec::new();
                     if !merge.matched.items.is_empty() {
                         let catalog = self.graph.catalog().clone();
                         let mut changes = crate::set::Changes::open(&merge.matched, catalog);
@@ -1325,15 +1327,32 @@ impl Session {
                                 &values[merge.props..],
                             )?;
                         }
-                        let (updates, widened) = changes.staged();
+                        let (staged, widened) = changes.staged();
+                        // A label the matched half declares goes in
+                        // ahead of the frames, the same way it does for
+                        // a plain `SET`, because the fold reads the
+                        // catalog in the file to decide whether a label
+                        // change is allowed on the table.
                         if let Some(catalog) = widened {
                             catalog.store(self.writing())?;
                             self.publish_side();
                             self.sync()?;
                         }
-                        if !updates.is_empty() {
-                            self.write(|txn| crate::set::stage(txn, &updates))?;
-                        }
+                        updates = staged;
+                    }
+                    // Both halves of the merge in one transaction. A
+                    // row the walk missed and a row it found are
+                    // different rows, so nothing in the insert is what
+                    // the update reads, and one commit is the whole
+                    // statement rather than one commit per half.
+                    if inserting || !updates.is_empty() {
+                        self.write(|txn| {
+                            crate::insert::stage(txn, &new, &edges)?;
+                            crate::set::stage(txn, &updates)
+                        })?;
+                    }
+                    if inserting {
+                        crate::insert::settle(&mut self.graph, &mut next)?;
                     }
                     next
                 }
@@ -1932,6 +1951,55 @@ mod tests {
     }
 
     const PEOPLE: &str = "MATCH (p:person) RETURN count(p) AS n";
+
+    /// The epoch the writer has committed through, which counts up by
+    /// one per commit and is therefore how many commits a statement
+    /// costs. Readable while a transaction is open, because that is
+    /// what keeps the write side on the session between statements.
+    fn commits(session: &Session) -> u64 {
+        session
+            .side
+            .as_ref()
+            .expect("a transaction holds the write side")
+            .epoch()
+    }
+
+    /// A merge over a mix of rows is one commit, not one per half.
+    ///
+    /// The rows the walk missed are an insert and the rows it found are
+    /// a `SET`, and they used to go in as two transactions. They are
+    /// different rows by definition, so neither half reads what the
+    /// other wrote and there is nothing to order them by, which is what
+    /// lets one transaction carry both. What it saves is a commit
+    /// frame, an epoch and a fold on every merge that does both.
+    #[test]
+    fn a_merge_that_writes_both_halves_commits_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("merge-commit.zu1");
+        people(&path);
+        let mut session = Session::open(&path).expect("open");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        // Opens the writer, so the epoch below is the writer's own
+        // rather than the one the file header still holds.
+        session
+            .run("INSERT (p:person {name: 'zoe'})", &[])
+            .expect("seed");
+        let before = commits(&session);
+        session
+            .run(
+                "UNWIND ['ada', 'eve'] AS n MERGE (p:person {name: n}) \
+                 ON MATCH SET p.name = 'ada'",
+                &[],
+            )
+            .expect("merge");
+        assert_eq!(commits(&session) - before, 1, "one statement, one commit");
+        // Both halves are in the store, so the one commit carried them
+        // rather than one of them having been dropped on the way.
+        assert_eq!(count(&mut session, PEOPLE), 4);
+        session.run("COMMIT", &[]).expect("commit");
+        assert_eq!(count(&mut session, PEOPLE), 4);
+    }
 
     /// The statement the milestone is about: two statements are one
     /// transaction, and the word at the end unmakes both of them even

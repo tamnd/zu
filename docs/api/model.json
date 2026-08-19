@@ -5266,6 +5266,14 @@
       "signature": "fn file_mut(&mut self) -> &mut Zu1File"
     },
     {
+      "id": "zu::shared::WriteSide::fold_patches",
+      "kind": "method",
+      "name": "fold_patches",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn fold_patches(&mut self) -> Result<()>",
+      "doc": "Puts what the patch is carrying on the file, keeping the writer.\n\nA statement that reads the tables itself rather than through a\nreader sees only what the file holds, and a deferred commit is\nnot on the file. Copying a graph is one, and so is anything else\nthat walks the storage under the query plane. The writer stays\nbecause the statement is still inside a savepoint that will want\nit."
+    },
+    {
       "id": "zu::shared::WriteSide::fold_writer",
       "kind": "method",
       "name": "fold_writer",
@@ -5658,7 +5666,7 @@
       "kind": "method",
       "name": "set_patches",
       "of": "zu::snapshot::SnapshotCache",
-      "signature": "fn set_patches(&mut self, patches: Arc<Patches>)",
+      "signature": "fn set_patches(&mut self, patches: Arc<Patches>, catalog: &Catalog)",
       "doc": "Hands the cached readers the cells a commit has left in the\noverlay, and keeps them for the readers a later snapshot loads.\n\nThe readers are kept rather than dropped, which is the point: a\ncommit that does not fold does not move the columns they\ndescribe, so the only thing that has changed about them is what\nthey read on top."
     },
     {
@@ -5788,6 +5796,14 @@
       "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nFour shapes, because there are four ways a change can sit above a\ncolumn nobody has rewritten: a new value for a row the column\nalready holds, a whole new row past the end of it, a new edge,\nwhich is a row of the rel table's property columns and a pair the\nadjacency reader has to merge into two lists, and a row taken away,\nwhich is an offset every read of the table filters by."
     },
     {
+      "id": "zu::write::Patches::added_rows",
+      "kind": "method",
+      "name": "added_rows",
+      "of": "zu::write::Patches",
+      "signature": "fn added_rows(&self, table: u32) -> u64",
+      "doc": "How many rows a commit has added to `table` and not folded,\nwhich every bound over the table's rows is short by."
+    },
+    {
       "id": "zu::write::Patches::cells",
       "kind": "field",
       "name": "cells",
@@ -5812,6 +5828,14 @@
       "doc": "Rows taken away, by table, ascending. A delete moves nothing:\nthe offsets stay where they are and the fold writes them into\nthe table's tombstone chain, so what the patch carries is what\nthe chain would have held."
     },
     {
+      "id": "zu::write::Patches::grown",
+      "kind": "method",
+      "name": "grown",
+      "of": "zu::write::Patches",
+      "signature": "fn grown(&self, catalog: &Catalog, rel: u32) -> [u64; 2]",
+      "doc": "The same for the two ends of `rel`, the source first, which is\nwhat its adjacency reader answers rows past its CSR with."
+    },
+    {
       "id": "zu::write::Patches::is_empty",
       "kind": "method",
       "name": "is_empty",
@@ -5831,7 +5855,7 @@
       "name": "rows",
       "of": "zu::write::Patches",
       "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::RowPatch>>",
-      "doc": "New rows, by table. Only rel tables have any so far: a node\nappend moves the row count every reader is bounded by, and\nnothing reads through that yet."
+      "doc": "New rows, by table, node tables and rel tables alike. A rel\ntable's are the property rows of the edges in `edges`, under\nthe ordinals those took. A node table's are rows of the table\nitself, so they move the count every reader is bounded by, and\neverything that reads a bound reads it through this."
     },
     {
       "id": "zu::write::Writer",
@@ -7855,6 +7879,14 @@
       "doc": "What every handle on one file has to be sharing: the block\ncache, the decoded pools above it, and the pool of retired\nhandles."
     },
     {
+      "id": "zu::zu1::file::Zu1File::stage_deferred",
+      "kind": "method",
+      "name": "stage_deferred",
+      "of": "zu::zu1::file::Zu1File",
+      "signature": "fn stage_deferred(&mut self)",
+      "doc": "Says a commit went to the log and nothing folded it, which is\nwhere a deferred commit leaves the file.\n\nThe roots do not move and the epoch does not either, because\nwhat the readers are handed is the patch. What does move is the\nlog, and the frames are above the floor a rollback cuts back to\nwith nothing on the file saying they are to be taken back. That\nis the same position [`Self::stage_fold`] leaves an open\nsavepoint in, and it wants the same marker."
+    },
+    {
       "id": "zu::zu1::file::Zu1File::stage_fold",
       "kind": "method",
       "name": "stage_fold",
@@ -8404,7 +8436,7 @@
       "name": "pinnable",
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn pinnable(&self, group: usize, dir: Direction) -> bool",
-      "doc": "Chunks the neighbor array of `group` in `dir` is stored in,\ndirectory only, no decode. This is what says whether pinning a\ngroup is worth it: the pin decodes every one of these chunks,\nand reading one node's list as a range decodes about one of\nthem, so a caller wanting fewer lists than there are chunks is\nbetter off reading each one. It is the same rule\n[`Self::degrees_into`] uses on the offset array.\nWhether pinning `group` in `dir` is still the cheap read. A\ngroup the patch reaches into is built on every pin, so while a\npatch is up the caller is better off taking one list at a time\nhowever many it wants."
+      "doc": "Chunks the neighbor array of `group` in `dir` is stored in,\ndirectory only, no decode. This is what says whether pinning a\ngroup is worth it: the pin decodes every one of these chunks,\nand reading one node's list as a range decodes about one of\nthem, so a caller wanting fewer lists than there are chunks is\nbetter off reading each one. It is the same rule\n[`Self::degrees_into`] uses on the offset array.\nWhether pinning `group` in `dir` is still the cheap read. A\ngroup the patch reaches into is built on every pin, so while a\npatch is up the caller is better off taking one list at a time\nhowever many it wants.\n\nA group holding a row appended since the CSR was built is not\npinnable either, and for a harder reason: the offset array of\nthe group stops at the rows the file held, so there is nothing\nto hand a caller for the rows past that and no place to put\nthem. Those rows are read one list at a time like any other."
     },
     {
       "id": "zu::zu1::graph::GraphReader::set_edges",
@@ -8413,6 +8445,14 @@
       "of": "zu::zu1::graph::GraphReader",
       "signature": "fn set_edges(&mut self, edges: Option<Arc<EdgePatch>>)",
       "doc": "Hands this reader the edges committed since the last fold, or\ntakes them back away with `None`. Every read below merges them\ninto what the file holds, so a caller that sets this reads a\ngraph the CSR does not hold yet."
+    },
+    {
+      "id": "zu::zu1::graph::GraphReader::set_grown",
+      "kind": "method",
+      "name": "set_grown",
+      "of": "zu::zu1::graph::GraphReader",
+      "signature": "fn set_grown(&mut self, from: u64, to: u64)",
+      "doc": "Hands this reader the rows the node tables at its two ends have\ntaken on since the last fold, source end first, or takes them\nback away with a pair of zeroes."
     },
     {
       "id": "zu::zu1::graph::GroupMeta",
@@ -9209,7 +9249,7 @@
       "name": "rows",
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn rows(&self) -> u64",
-      "doc": "Rows in the table's domain; every column is row-aligned to it."
+      "doc": "Rows in the table's domain; every column is row-aligned to it.\n\nThe rows a commit appended are in here as well, because they are\nrows of the table and a scan that stopped short of them would\nanswer a query without them. What tells the two apart is\n[`Self::stored`], which is where the columns end."
     },
     {
       "id": "zu::zu1::props::PropsReader::scan_int_chunk",
@@ -9303,6 +9343,14 @@
       "of": "zu::zu1::props::RowPatch",
       "signature": "fn push(&mut self, cells: Vec<Cell>) -> u64",
       "doc": "Takes one row, a cell per column, and answers with the row\nnumber it was given."
+    },
+    {
+      "id": "zu::zu1::props::RowPatch::row_with",
+      "kind": "method",
+      "name": "row_with",
+      "of": "zu::zu1::props::RowPatch",
+      "signature": "fn row_with(&self, col: usize, word: u64) -> Option<u64>",
+      "doc": "The row whose `col` holds `word`, `None` when none of them\ndoes.\n\nThis is the key index for the rows nothing has folded yet. A\nkey index is built by a fold and a deferred commit runs none,\nso the rows in here are in no index, and what the fold would\nhave put in one is the value each of them holds in the table's\n`id` column. The walk is over the rows a handful of commits\nadded rather than over the table, and it is bounded by what the\nwriter lets the patch grow to."
     },
     {
       "id": "zu::zu1::props::list_elements",
@@ -10037,6 +10085,14 @@
       "of": "zu::zu1::txn::Deferred",
       "signature": "RelCell(RelCellWrite)",
       "doc": "A value written onto a column of an edge the graph already runs\nthrough."
+    },
+    {
+      "id": "zu::zu1::txn::Deferred::Rows",
+      "kind": "variant",
+      "name": "Rows",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "Rows(u32, Vec<Vec<(u32, Cell)>>)",
+      "doc": "Rows added to a node table: the table, and the cell each new row\nholds in each column, by position in the props directory. They\ngo on the end of the table in the order they are in here, which\nis the order a fold would append them in."
     },
     {
       "id": "zu::zu1::txn::IngestPayload",

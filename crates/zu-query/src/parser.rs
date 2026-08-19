@@ -2568,6 +2568,27 @@ impl Parser<'_> {
         Ok(props)
     }
 
+    /// The `[a, b, c]` of a list constructor and of a path
+    /// constructor, brackets and all.
+    ///
+    /// ISO calls the inside of it an element list and lets it be
+    /// empty, which is how `[]` is the empty list rather than a
+    /// syntax error.
+    fn parse_bracketed_items(&mut self) -> Result<Vec<Expr>> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut items = Vec::new();
+        if !self.at(&TokenKind::RBracket) {
+            loop {
+                items.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RBracket)?;
+        Ok(items)
+    }
+
     // Expressions, precedence low to high. Every recursion into a
     // subexpression goes through this depth guard.
 
@@ -2855,20 +2876,7 @@ impl Parser<'_> {
                 self.expect(&TokenKind::RParen)?;
                 Ok(expr)
             }
-            TokenKind::LBracket => {
-                self.pos += 1;
-                let mut items = Vec::new();
-                if !self.at(&TokenKind::RBracket) {
-                    loop {
-                        items.push(self.parse_expr()?);
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                }
-                self.expect(&TokenKind::RBracket)?;
-                Ok(Expr::List(items))
-            }
+            TokenKind::LBracket => Ok(Expr::List(self.parse_bracketed_items()?)),
             TokenKind::LBrace => {
                 let props = self.parse_property_map()?;
                 Ok(Expr::Map(props))
@@ -2927,18 +2935,26 @@ impl Parser<'_> {
         // follows it. Nothing else in the expression grammar puts a
         // bracket after a name, so the two readings never overlap.
         if name.eq_ignore_ascii_case("path") && self.at(&TokenKind::LBracket) {
-            self.pos += 1;
-            let mut elements = Vec::new();
-            if !self.at(&TokenKind::RBracket) {
-                loop {
-                    elements.push(self.parse_expr()?);
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
-            }
-            self.expect(&TokenKind::RBracket)?;
-            return Ok(Expr::Path(elements));
+            return Ok(Expr::Path(self.parse_bracketed_items()?));
+        }
+        // The list value constructor of ISO 20.17, which names the
+        // type it is building before it lists what goes in it. LIST
+        // and ARRAY are the same word twice, as they are in the type
+        // grammar, and the name is what the standard calls optional:
+        // `LIST [1, 2]` and `[1, 2]` are the same list. It is here
+        // with PATH because a bracket after a name is the only thing
+        // that tells either of them from a variable read.
+        if (name.eq_ignore_ascii_case("list") || name.eq_ignore_ascii_case("array"))
+            && self.at(&TokenKind::LBracket)
+        {
+            return Ok(Expr::List(self.parse_bracketed_items()?));
+        }
+        // The record constructor of ISO 20.19, whose name is optional
+        // in the same way: `RECORD {a: 1}` and `{a: 1}` are the same
+        // record. A brace after a name begins nothing else, so
+        // `record` stays free to be a variable everywhere else.
+        if name.eq_ignore_ascii_case("record") && self.at(&TokenKind::LBrace) {
+            return Ok(Expr::Map(self.parse_property_map()?));
         }
         // EXISTS carries a match rather than an expression, so it is
         // taken here for the same reason CAST is below: no expression
@@ -4814,6 +4830,41 @@ mod tests {
             panic!("multiply");
         };
         assert_eq!(**rhs, Expr::Literal(Literal::Int(-1)));
+    }
+
+    /// The constructor may name the type it is building, ISO 20.17 and
+    /// 20.19, and the name is worth nothing beyond saying what the
+    /// reader is looking at: the three spellings are one tree.
+    #[test]
+    fn a_constructor_may_name_its_type() {
+        let want = Expr::List(vec![
+            Expr::Literal(Literal::Int(1)),
+            Expr::Literal(Literal::Int(2)),
+        ]);
+        for source in ["RETURN [1, 2]", "RETURN LIST [1, 2]", "RETURN ARRAY [1, 2]"] {
+            let q = parsed(source);
+            assert_eq!(q.result().expect("RETURN").items[0].expr, want, "{source}");
+        }
+        let want = Expr::Map(vec![("a".to_string(), Expr::Literal(Literal::Int(1)))]);
+        for source in ["RETURN {a: 1}", "RETURN RECORD {a: 1}"] {
+            let q = parsed(source);
+            assert_eq!(q.result().expect("RETURN").items[0].expr, want, "{source}");
+        }
+    }
+
+    /// Only the bracket or the brace makes the word a constructor, so
+    /// a query that binds a variable of that name still reads it back
+    /// as a variable.
+    #[test]
+    fn a_type_name_is_still_a_name() {
+        for name in ["list", "array", "record"] {
+            let q = parsed(&format!("LET {name} = 1 RETURN {name}"));
+            assert_eq!(
+                q.result().expect("RETURN").items[0].expr,
+                Expr::Variable(name.to_string()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

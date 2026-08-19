@@ -1421,6 +1421,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             distinct,
             star,
             args,
+            ..
         } => {
             let name = func_name(*func);
             let inner = if *star {

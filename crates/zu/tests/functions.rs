@@ -16,9 +16,11 @@ fn opened(dir: &std::path::Path) -> Database {
     let db = Database::create(dir.join("functions.zu1")).expect("create");
     {
         let mut conn = db.connect().expect("connect");
-        for name in ["ana", "bo"] {
-            conn.execute(&format!("INSERT (p:person {{name: '{name}'}})"))
-                .expect("a person");
+        for (name, height) in [("ana", -2.5), ("bo", 6.25)] {
+            conn.execute(&format!(
+                "INSERT (p:person {{name: '{name}', height: {height}}})"
+            ))
+            .expect("a person");
         }
     }
     db
@@ -95,6 +97,51 @@ fn a_call_over_what_the_statement_wrote_is_answered_once() {
     assert!(plan.contains("upper("), "{plan}");
 }
 
+/// GF01 to GF03, the numeric library over a column: what the kernels
+/// answer per row, that an exact argument stays exact through the
+/// roundings, and that a function with no answer for the value one row
+/// holds raises the condition the standard names rather than handing
+/// back a NaN that every comparison below would read as false.
+#[test]
+fn the_numeric_library_answers_over_a_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = opened(dir.path());
+    let mut conn = db.connect().expect("connect");
+
+    let source = "MATCH (p:person) RETURN ABS(p.height) AS a, FLOOR(p.height) AS f, SQRT(ABS(p.height)) AS s ORDER BY a";
+    let rows = conn
+        .query(source)
+        .unwrap_or_else(|e| panic!("{source}: {e}"));
+    let read = |rows: &zu::query::QueryResult, name: &str| -> Vec<f64> {
+        rows.iter()
+            .map(|row| row.get_by_name::<f64>(name).expect(name))
+            .collect()
+    };
+    assert_eq!(read(&rows, "a"), [2.5, 6.25]);
+    assert_eq!(read(&rows, "f"), [-3.0, 6.0]);
+    assert_eq!(read(&rows, "s"), [2.5_f64.sqrt(), 2.5]);
+
+    // The call over a column stays in the plan, one literal argument
+    // and all is answered while binding, and the two agree.
+    let plan = conn
+        .explain("MATCH (p:person) RETURN ABS(p.height) AS a")
+        .expect("explain");
+    assert!(plan.contains("abs("), "{plan}");
+    let plan = conn.explain("RETURN ABS(-3) AS a").expect("explain");
+    assert!(!plan.contains("abs("), "{plan}");
+    assert_eq!(one(&db, "RETURN ABS(-3) AS a"), Value::Int(3));
+    assert_eq!(one(&db, "RETURN MOD(7, 3) AS m"), Value::Int(1));
+    assert_eq!(one(&db, "RETURN POWER(2, 3) AS p"), Value::Float(8.0));
+
+    // A condition the values raise is raised where the values are, so
+    // the same statement over a column that held no negative height
+    // would have answered.
+    let says = refused(&db, "MATCH (p:person) RETURN LN(p.height) AS l");
+    assert!(says.contains("ln()"), "{says}");
+    let says = refused(&db, "RETURN MOD(1, 0) AS m");
+    assert!(says.contains("division by zero"), "{says}");
+}
+
 /// What a signature refuses, and in its own words: a name no builtin
 /// has, a count of arguments the signature does not allow, and a type
 /// the function has nothing to say about.
@@ -120,4 +167,10 @@ fn what_the_registry_refuses() {
 
     let says = refused(&db, "MATCH (p:person) RETURN UPPER(*) AS v");
     assert!(says.contains("only count(*) takes *"), "{says}");
+
+    let says = refused(&db, "RETURN ABS('a') AS v");
+    assert!(says.contains("abs() needs a number"), "{says}");
+
+    let says = refused(&db, "RETURN ROUND(1.5, 2, 3) AS v");
+    assert!(says.contains("takes 1 or 2 argument(s), got 3"), "{says}");
 }

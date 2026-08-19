@@ -265,3 +265,258 @@ cases:
       - values:
           - type: STRING
             value: ab
+
+  - name: abs-of-a-negative-integer
+    doc: The distance from nought of an integer is an integer, and a client widening it to a float here gives back a value that no longer compares equal to the integer beside it.
+    query: RETURN ABS(-7) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "7"
+
+  - name: abs-of-a-negative-float
+    doc: The same function over an approximate number keeps the fraction, so this is the case that separates a client dispatching on the value from one dispatching on the type.
+    query: RETURN ABS(-2.5) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.5"
+
+  - name: floor-and-ceiling
+    doc: The whole number below and the whole number above, which disagree for every argument that is not already whole and are the pair a client most often has only one of.
+    query: RETURN FLOOR(2.5) AS lo, CEIL(2.5) AS hi
+    columns:
+      - lo
+      - hi
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+          - type: FLOAT64
+            value: "3.0"
+
+  - name: ceiling-is-ceil
+    doc: CEILING is the long spelling of CEIL and is the same function, so a client resolving names by exact match rather than against a signature table answers one of these and refuses the other.
+    query: RETURN CEILING(2.1) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "3.0"
+
+  - name: floor-of-an-integer-stays-an-integer
+    doc: A whole number is already at its own floor, so the answer is the argument and not a float of the same value, which is the type a client that always answers a double gets wrong.
+    query: RETURN FLOOR(7) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "7"
+
+  - name: round-halves-away-from-zero
+    doc: A half rounds away from nought and not to the nearest even, so a client using a banker's rounding gives two and minus two here rather than three and minus three.
+    query: RETURN ROUND(2.5) AS up, ROUND(-2.5) AS down
+    columns:
+      - up
+      - down
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "3.0"
+          - type: FLOAT64
+            value: "-3.0"
+
+  - name: round-to-a-number-of-digits
+    doc: A second argument says how many digits to keep, which is the form a client that only implements the one argument version refuses.
+    query: RETURN ROUND(2.345, 2) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.35"
+
+  - name: round-to-tens
+    doc: A negative number of digits rounds to the left of the point, and the answer of an integer rounded that way is an integer, so nothing here goes through a float.
+    query: RETURN ROUND(155, -1) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "160"
+
+  - name: sign
+    doc: Minus one, nought or one, and an integer whatever arrived, which is the one function in this family whose answer type does not follow its argument.
+    query: RETURN SIGN(-3) AS neg, SIGN(0) AS zero, SIGN(2.5) AS pos
+    columns:
+      - neg
+      - zero
+      - pos
+    rows:
+      - values:
+          - type: INT64
+            value: "-1"
+          - type: INT64
+            value: "0"
+          - type: INT64
+            value: "1"
+
+  - name: mod-of-two-integers
+    doc: The remainder is the function spelling of the operator and keeps the operator's arithmetic, so a client that implements one of the two and not the other disagrees with itself.
+    query: RETURN MOD(7, 3) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: mod-takes-the-sign-of-the-dividend
+    doc: A negative dividend gives a negative remainder. Python answers two here and a client written by somebody thinking in Python fails this case and passes the one above.
+    query: RETURN MOD(-7, 3) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "-1"
+
+  - name: mod-by-zero
+    doc: A remainder by nought is a division by nought and raises the same condition, rather than answering the NaN the hardware would.
+    query: RETURN MOD(1, 0) AS n
+    raises: "22012"
+
+  - name: power
+    doc: One number raised to another, whose answer is approximate even where both arguments are exact, because a power of two exact numbers is exact only for some of them and a type that changed with the value would be no type at all.
+    query: RETURN POWER(2, 3) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "8.0"
+
+  - name: power-of-zero-to-a-negative
+    doc: Nought raised to a negative power is a division by nought under another spelling and has the power function's own condition for it.
+    query: RETURN POWER(0, -1) AS n
+    raises: "2201F"
+
+  - name: power-of-a-negative-to-a-fraction
+    doc: A negative number raised to a fraction has no real answer, so it raises rather than giving the NaN an unguarded call to the host language's own power function returns.
+    query: RETURN POWER(-2, 0.5) AS n
+    raises: "2201F"
+
+  - name: square-root
+    doc: The square root of a perfect square, which is exact in binary and so is the one root every client agrees on to the last digit.
+    query: RETURN SQRT(16) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "4.0"
+
+  - name: square-root-of-a-negative
+    doc: The square root is the power of one half, so a negative argument raises the power function's condition and not one of its own.
+    query: RETURN SQRT(-1) AS n
+    raises: "2201F"
+
+  - name: exponential-and-natural-logarithm
+    doc: The two halves of the same relation at the arguments where both are exact, which is where a client can compare them without arguing about the last digit.
+    query: RETURN EXP(0) AS one, LN(1) AS zero
+    columns:
+      - one
+      - zero
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "1.0"
+          - type: FLOAT64
+            value: "0.0"
+
+  - name: natural-logarithm-of-zero
+    doc: The logarithm of nought is minus infinity in IEEE arithmetic and a condition in GQL, which is the disagreement a client passing the argument straight to its host language cannot see.
+    query: RETURN LN(0) AS n
+    raises: "2201E"
+
+  - name: logarithm-in-a-base
+    doc: The base comes first and the number second, which is the order the standard writes and the opposite of the order several host libraries take.
+    query: RETURN LOG(2, 8) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "3.0"
+
+  - name: logarithm-base-ten
+    doc: The common logarithm of a power of ten, which is exact, and is here because a client computing it as a ratio of natural logarithms answers 1.9999999999999998 instead.
+    query: RETURN LOG10(100) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "2.0"
+
+  - name: trigonometry-at-zero
+    doc: The three ratios at the one argument where all three are exact, so a client whose angles are in degrees rather than radians fails the cosine here.
+    query: RETURN SIN(0) AS s, COS(0) AS c, TAN(0) AS t
+    columns:
+      - s
+      - c
+      - t
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.0"
+          - type: FLOAT64
+            value: "1.0"
+          - type: FLOAT64
+            value: "0.0"
+
+  - name: cotangent-at-zero
+    doc: The cotangent is the cosine over the sine, so where the sine is nought it is a division by nought and raises as one rather than answering an infinity.
+    query: RETURN COT(0) AS n
+    raises: "22012"
+
+  - name: inverse-trigonometry
+    doc: The three inverse functions at their exact arguments, which is where a client that has them in degrees disagrees by a factor of about fifty seven.
+    query: RETURN ASIN(0) AS a, ACOS(1) AS b, ATAN(0) AS c
+    columns:
+      - a
+      - b
+      - c
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "0.0"
+          - type: FLOAT64
+            value: "0.0"
+          - type: FLOAT64
+            value: "0.0"
+
+  - name: arc-sine-outside-its-domain
+    doc: There is no angle whose sine is two, so this raises rather than answering the NaN the host language's own arc sine gives back.
+    query: RETURN ASIN(2) AS n
+    raises: "22003"
+
+  - name: degrees-and-radians
+    doc: The two conversions, at the argument that makes the factor visible: half a turn is a hundred and eighty degrees, and a client that has swapped the two answers about 0.0548.
+    query: RETURN DEGREES(3.141592653589793) AS d, RADIANS(180) AS r
+    columns:
+      - d
+      - r
+    rows:
+      - values:
+          - type: FLOAT64
+            value: "180.0"
+          - type: FLOAT64
+            value: "3.141592653589793"

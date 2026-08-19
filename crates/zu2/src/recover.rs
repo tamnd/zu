@@ -60,16 +60,30 @@ pub fn replay(core: &Core) -> Result<()> {
         if base.is_null() {
             break;
         }
-        // SAFETY: the page is resident and the address is 8 byte
-        // aligned, so the header words are readable. The lengths are
-        // checked against the page before anything past the header is
-        // touched.
+        let room = PAGE_SIZE - (address - page_start(page)) as usize;
+        if room < record::HEADER {
+            // The gap the allocator leaves when the last record of a
+            // page does not fit in what is left of it. There is no
+            // header here to look at, and looking anyway reads past the
+            // end of the page: a heap that happened to hold something
+            // other than zeros next to it made the scan stop and lose
+            // every record above this page (#438).
+            let next = page_start(page + 1);
+            if next >= len {
+                break;
+            }
+            address = next;
+            continue;
+        }
+        // SAFETY: the page is resident, the address is 8 byte aligned,
+        // and a whole header fits in what is left of the page. The
+        // lengths are checked against the page before anything past the
+        // header is touched.
         let size = unsafe {
             let header = RecordRef::new(base);
             let key_len = header.key_len();
             let value_len = header.value_len();
             let size = record::size_of(key_len, value_len);
-            let room = PAGE_SIZE - (address - page_start(page)) as usize;
             if key_len == 0 && value_len == 0 {
                 // Either page padding or the end of the log.
                 None
@@ -195,9 +209,68 @@ fn chain_version(core: &Core, mut address: Address, key: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use crate::addr::NULL;
+    use crate::addr::{NULL, PAGE_SIZE, offset_of};
     use crate::db::{Db, Options};
-    use crate::record::KIND_VALUE;
+    use crate::record::{HEADER, KIND_VALUE};
+
+    /// A page whose last record leaves less room than a header, which is
+    /// the gap the tail allocator makes when the next record does not
+    /// fit and it moves on. The scan used to read a header out of that
+    /// gap, past the end of the page, and stop the moment the heap next
+    /// door held something other than zeros, losing every record above
+    /// that page (#438).
+    ///
+    /// The gap is built rather than hoped for, and the test says so: it
+    /// asserts the page really does end eight bytes short before it
+    /// closes the database.
+    #[test]
+    fn a_page_that_ends_short_of_a_header_is_not_the_end_of_the_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("g.zu2");
+        let options = Options {
+            durability: crate::log::Durability::Async,
+            ..Options::default()
+        };
+        let below = |i: u32| format!("fill{i:09}").into_bytes();
+        let above = |i: u32| format!("over{i:09}").into_bytes();
+        let over = 200u32;
+        {
+            let db = Db::create(&path, options).expect("create");
+            let mut s = db.session();
+            let mut i = 0u32;
+            // Up to the last few kilobytes of the first page, in
+            // ordinary thousand byte records.
+            while PAGE_SIZE - offset_of(db.core().log.tail()) as usize >= 4096 {
+                s.upsert(&below(i), &vec![b'x'; 1000]).expect("fill");
+                i += 1;
+            }
+            // One record sized to land eight bytes short of the end,
+            // which is a quarter of a header.
+            let room = PAGE_SIZE - offset_of(db.core().log.tail()) as usize;
+            let value = vec![b'x'; room - 8 - HEADER - below(i).len()];
+            s.upsert(&below(i), &value).expect("short");
+            assert_eq!(
+                PAGE_SIZE - offset_of(db.core().log.tail()) as usize,
+                8,
+                "the page did not end short of a header, so this proves nothing"
+            );
+            // And the records the old scan would have thrown away.
+            for i in 0..over {
+                s.upsert(&above(i), &vec![b'y'; 1000]).expect("over");
+            }
+            db.sync().expect("sync");
+        }
+
+        let db = Db::open(&path, options).expect("reopen");
+        let mut s = db.session();
+        let mut out = Vec::new();
+        for i in 0..over {
+            assert!(
+                s.read(&above(i), &mut out).expect("read"),
+                "the scan stopped in the gap and lost over{i:09}"
+            );
+        }
+    }
 
     /// The shape a compaction pass leaves on the log when one of its
     /// copies loses its race: an older version of a key sitting above

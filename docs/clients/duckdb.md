@@ -2,9 +2,13 @@
 
 DuckDB is the only embedded analytical database whose clients are used more than its engine is talked about, and its Python client is the most used embedded analytics client there is. That makes it the bar for `zu-python` and `zu-node`, and it makes the interesting question a narrow one. Not what DuckDB has that we do not, which is a long list and most of it is SQL. What a user would feel.
 
-This page is the answer, measured rather than asserted. Everything below was run on one machine on 2026-08-19: an Apple M-series laptop, DuckDB 1.5.5 for Python and `@duckdb/node-api` 1.5.5 for TypeScript, `zudb` built from the tree at 9ed70a8, Python 3.14.6 and Node 24.18. A million rows of three columns, `INT64`, `DOUBLE` and a `VARCHAR` of about five bytes, in a stored table on both sides. Each figure is the fastest of five runs, because what is being compared is the code path and not the scheduler.
+This page is the answer, measured rather than asserted. Everything below was run on one machine on 2026-08-19: an Apple M-series laptop, DuckDB 1.5.5 for Python and `@duckdb/node-api` 1.5.5 for TypeScript, Python 3.14.6 and Node 24.18. A million rows of three columns, `INT64`, `DOUBLE` and a `VARCHAR` of about five bytes, in a stored table on both sides.
 
-One row of each table below is not a comparison and is marked as such. DuckDB's `execute` and `run` hand back a result nobody has read yet, so the milliseconds they take are the cost of planning and of nothing else; ours has the whole answer in memory by the time it returns. The pair is printed because the difference between them is the subject of this page, not because 0.3 against 50.6 is a ratio anybody should quote.
+The Python half is `tools/versus_duckdb.py` in `zu-python`, which is committed so that anybody can rerun it rather than take this page's word. It alternates the two calls, ours then theirs then ours again, nine of each, and keeps each one's fastest; timing all of one and then all of the other hands whichever went second whatever the machine was doing by then, and that is worth two times on a laptop. Read the ratios rather than the milliseconds: the ratios hold across runs to within a tenth, and the absolute figures move with whatever else is on the machine.
+
+One row of each table below is not a comparison and is marked as such. DuckDB's `execute` and `run` hand back a result nobody has read yet, so the milliseconds they take are the cost of planning and of nothing else; ours has the whole answer in memory by the time it returns. The pair is printed because the difference between them is the subject of this page, not because 0.5 against 66 is a ratio anybody should quote.
+
+The same trap sits one row down. DuckDB's `arrow()` gives back a `RecordBatchReader` that has read nothing, so it times at a fraction of a millisecond and is not the same call; `to_arrow_table` is, and that is what is compared here. Every row that claims to have read a million rows checks that it read a million rows.
 
 ## 1. What the numbers say
 
@@ -12,17 +16,18 @@ Python, one million rows out:
 
 | call | zu | DuckDB | ratio |
 |---|---|---|---|
-| execute, nothing read | 50.6 ms | 0.3 ms | not a comparison |
-| execute and `fetchall` | 450 ms | 1365 ms | 3.0x faster |
-| execute and Arrow table | 454 ms | 22 ms | 20.6x slower |
-| execute and pandas | 372 ms | 111 ms | 3.4x slower |
+| execute, nothing read | 66 ms | 0.5 ms | not a comparison |
+| execute and `fetchall` | 246 ms | 279 ms | 1.1x faster |
+| execute and Arrow table | 98 ms | 22 ms | 4.5x slower |
+| execute and pandas | 98 ms | 72 ms | 1.4x slower |
 
 Python, one row out, and one registration of a million-row Arrow table:
 
 | call | zu | DuckDB | ratio |
 |---|---|---|---|
-| point read, whole call | 11.1 us | 221.7 us | 20.0x faster |
-| `register` and `unregister` | 15.9 us | 177.1 us | 11.1x faster |
+| point read, whole call | 14.6 us | 237.5 us | 16.3x faster |
+| `register` and `unregister`, numbers | 14.0 us | 124.0 us | 8.8x faster |
+| `register` and `unregister`, with strings | 511.0 us | 137.9 us | 3.7x slower |
 
 TypeScript, one million rows out:
 
@@ -37,23 +42,36 @@ Three things fall out of that, and they are the whole page.
 
 ## 2. We win latency, by a lot, and it is not an accident
 
-A point read is twenty times faster in Python and twice as fast in TypeScript, and a registration of somebody else's Arrow table is eleven times faster. Neither number is about the query engine. They are about what a call costs before and after the query, which is the cost that dominates every workload made of small questions, and small questions are what an embedded database is for.
+A point read is sixteen times faster in Python and twice as fast in TypeScript, and a registration of somebody else's Arrow table is nine times faster. Neither number is about the query engine. They are about what a call costs before and after the query, which is the cost that dominates every workload made of small questions, and small questions are what an embedded database is for.
 
 The registration figure is the clearer of the two because there is no query in it at all. DuckDB's replacement scan copies the frame's description and builds a table function around it; ours takes the pointers, the widths and the meanings and hands them to the engine, and a statement that names the frame reads the caller's own arrays where they lie. `docs/10-api-and-tooling.md` section 4 has the mechanism. The measurement here is that the mechanism is worth what it was supposed to be worth.
 
-Nothing in this page proposes giving that up.
+The third row of that table is the exception, and it is printed rather than averaged away. A frame with a string column in it costs about half a millisecond where the same frame of numbers costs fourteen microseconds, and the whole difference is one pass over the bytes: `arrow-rs` validates a string buffer as UTF-8 when it imports it across the C Data Interface, and nine megabytes at memory speed is what that is worth. Nothing else in the path grew. It is a real cost a caller pays, it is on the way in rather than on the way out, and whether the validation can be skipped for a producer that has already done it is an open question rather than a decision.
 
-## 3. We lose bulk export, by about twenty, and it is one cause
+Nothing in this page proposes giving up the numeric case.
 
-`to_arrow` on a million rows takes 454 ms against DuckDB's 22 ms. The Arrow table on both sides is the same shape and the same bytes. What differs is what each engine had to start from.
+## 3. We lose bulk export, and the cause is one decision
+
+The Arrow table on both sides is the same shape and the same bytes. What differs is what each engine had to start from.
 
 DuckDB never has rows. A result is a sequence of data chunks and a chunk is a set of column vectors, so exporting to Arrow is a per-column handoff of a buffer and a validity bitmap, and for flat numerics it copies nothing at all.
 
-We have rows. `QueryResult` in `crates/zu-query/src/exec.rs` is `rows: Vec<Vec<Value>>`, and the sink in `crates/zu-exec/src/sink.rs` fills it a row at a time out of the vectors the executor was working in. Every columnar consumer then transposes it back: `zu-python`'s `columns.rs` walks the whole result once per column to infer a kind, walks it again to gather a `Vec<&Value>` per batch, and builds Arrow arrays out of that. Three million boxed values are built and then read twice, and the 20x is the cost of doing that.
+We have rows. `QueryResult` in `crates/zu-query/src/exec.rs` is `rows: Vec<Vec<Value>>`, and the sink in `crates/zu-exec/src/sink.rs` fills it a row at a time out of the vectors the executor was working in. Everything columnar then has to put that back the way it was.
 
-`record_batches` is the same code and is worse rather than better, which is worth saying because its name promises the opposite. It builds every batch into a `Vec<RecordBatch>` before it hands back a reader, so a caller who asked for batches because the result would not fit in memory gets the whole Arrow table built first and the original rows still alive beside it.
+The first version of this page measured that at twenty times DuckDB, and most of the twenty was the client rather than the engine: `zu-python`'s `columns.rs` walked the whole result once per column to settle a type, walked it again per column per batch to gather a `Vec<&Value>`, and built Arrow arrays by collecting iterators of `Option`s. Three passes over three million boxed values, strided every time, and a copy at the end of them.
 
-The same trade explains the row path going the other way. `fetchall` is three times faster than DuckDB's, and for exactly the reason Arrow is twenty times slower: our rows are already rows.
+That part is fixed. `zu::query::column` does the transpose once, in the engine, in two passes over the rows in row order, and hands back one owned buffer per column in the layout Arrow already uses. The client moves those buffers into Arrow arrays and copies nothing. Before and after, with the same script in one sitting on a quieter machine than section 1's, which is why the absolute figures are lower there than in that table and only the pair below should be compared:
+
+| call | was | is |
+|---|---|---|
+| execute and Arrow table | 148 ms | 73 ms |
+| execute and pandas | 148 ms | 79 ms |
+
+The statement itself is 45 ms of each of those, so the export went from 103 ms to 26 ms. Of the 26 that are left, 22 are the transpose, which `cargo bench -p zu-query --bench columnar` times on its own. The Arrow half is about four milliseconds and there is not much left in it.
+
+So the remaining gap is no longer a client problem. It is the sink, and it is one number: 22 ms to read a result whose rows the executor built out of vectors it then threw away. `record_batches` is fixed alongside it, having been worse rather than better than its name promised: it built every batch into a `Vec<RecordBatch>` before handing back a reader, and a batch is a slice of a finished column now.
+
+The same trade explains the row path going the other way. `fetchall` is faster than DuckDB's, and for exactly the reason Arrow is slower: our rows are already rows. The first pass of this page put that at three times, on a measurement that did not alternate the two sides; alternated, it is a tenth, and a tenth is what should be believed.
 
 So this is not a bug and it is not a missing optimisation. It is one decision, visible from both ends, and it is the decision this audit says to revisit.
 
@@ -97,8 +115,8 @@ DuckDB's Python connection has 71 public members and its module 181. Ours has 14
 | `connect()` with no path, in memory | needs a path, and `':memory:'` makes a file called that | needs a path | owed, and the `':memory:'` behaviour is a bug |
 | `sql` / `execute` / module-level default connection | `execute`, `sql` | `query`, `exec` | done, minus the module-level default |
 | `fetchall`, `fetchone`, `fetchmany` | `fetchall`, `fetchone` | rows are an array | `fetchmany` owed for DB-API |
-| `arrow()`, `fetch_arrow_table` | `to_arrow` | none | owed for Node, 20x for Python |
-| `fetch_record_batch` streaming | `record_batches`, over a materialized result | none | owed, real streaming |
+| `arrow()`, `fetch_arrow_table` | `to_arrow`, off the engine's own buffers | none | owed for Node, 4.5x for Python |
+| `fetch_record_batch` streaming | `record_batches`, zero-copy slices of a materialized result | none | owed, real streaming |
 | `df()`, `pl()`, `fetchnumpy()`, `torch()`, `tf()` | `to_pandas`, `to_polars` | none | numpy owed, torch and tf are not our lane |
 | `register` / `unregister` | `register` / `unregister`, faster | none | owed for Node |
 | `append(table, df)` | `appender()` | none | owed for Node |
@@ -121,10 +139,10 @@ The relational API is the one row worth arguing about, and the answer is no. It 
 In order, largest effect first.
 
 1. A columnar result, in two halves. The first is a result read down its columns at all, in the engine rather than in each client, which is `zu::query::column` and is done: one buffer per column in Arrow's own layout, filled in two passes over the rows instead of two per column, so the transpose happens once and correctly. The second is the executor keeping the vectors it already computes in, so that `Vec<Vec<Value>>` becomes something the row path gathers rather than something every other path unpicks and the transpose stops happening at all. The first half is what a client can use today; the second is the one that touches the engine, and it changes no client, because the type it fills is already the one they read.
-2. Arrow export as a handoff. Once the vectors survive, `to_arrow`, `__arrow_c_stream__` and `record_batches` become a description of buffers and a release callback, with no copy for the six physical types whose layout is already Arrow's.
+2. Arrow export as a handoff, which is done for Python. `to_arrow`, `__arrow_c_stream__` and `record_batches` are a description of the buffers `zu::query::column` filled and a release callback, with no copy for the physical types whose layout is already Arrow's, and a batch is a slice cut when the reader asks for it. The export alone went from 103 ms to 26 ms on a million rows, and 22 of the 26 are the transpose that item 1's second half removes. The same handoff is owed for Node, where it is item 3.
 3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result.
 4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on.
 5. Real streaming, meaning a result read a chunk at a time as the executor produces it rather than a slice of a result that is already whole.
 6. The small ones: an in-memory connection that does not make a file, `cursor()`, `fetchmany`, `fetchnumpy`, and a progress callback in Node.
 
-Items 1 and 2 are what the live measurement asks for. Items 3 and 4 are what the scorecard is blocked on. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.
+Item 1's second half is the only thing left that the live measurement asks for, and it is 22 of the 26 milliseconds. Items 3 and 4 are what the scorecard is blocked on. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.

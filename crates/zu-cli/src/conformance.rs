@@ -275,6 +275,16 @@ const NOTES: &[&str] = &[
      PROPERTY_EXISTS asks whether an element carries a property without reading it, so a \
      property that is there and null is there. All six answer null over an element that is \
      null, which is the reading an unmatched optional row gets",
+    "a case is written in both of the standard's forms, one asking a condition per branch and \
+     one naming a value and comparing each branch with it, and a value before the first WHEN is \
+     what tells them apart; the branches are asked in the order they were written, a branch \
+     whose condition is null is a branch that did not hold, a null subject of the simple form \
+     equals no branch at all, and a case that holds no branch and wrote no ELSE is null. Only \
+     the branch that holds is evaluated, so the expression the other rows cannot answer may be \
+     written in a branch they never reach. COALESCE and NULLIF are the two abbreviations, read \
+     as forms rather than as functions for the same reason: COALESCE stops at the first \
+     argument that is not null, which is a decision a function would have made after all of \
+     them had been evaluated",
     "a path variable binds the walk as a path value rather than as the list of the same \
      elements, so PATH builds one, PATH_LENGTH counts its edges, ELEMENTS answers its nodes \
      and edges as a list in the order they were walked, and two paths over the same elements \

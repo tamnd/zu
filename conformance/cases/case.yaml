@@ -1,0 +1,141 @@
+schema: 3
+suite: case
+doc: The case expression and its two abbreviations, ISO 19.4 and mandatory feature GE01. Two things are being asked here and only one of them is arithmetic. The first is which branch answers, which a client gets wrong by testing a null branch as false rather than as a branch that did not hold, and by comparing rather than testing in the simple form. The second is which branches are evaluated at all, which a client gets wrong by evaluating every branch and picking one afterwards, since the branch nobody reached is exactly where a query puts the expression the other rows cannot answer.
+
+cases:
+  - name: searched-form
+    doc: A condition per branch, the plainest reading, here so that a client failing the rest fails on something simple first.
+    query: RETURN CASE WHEN 1 < 2 THEN 'yes' ELSE 'no' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: yes
+
+  - name: searched-form-answers-the-first-branch-that-holds
+    doc: Two branches hold and the answer is the one written first, so the branches are asked in order rather than gathered and chosen between.
+    query: RETURN CASE WHEN true THEN 1 WHEN true THEN 2 END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: searched-form-else
+    doc: The ELSE is the branch that holds when no other one did, which is the shape most queries write.
+    query: RETURN CASE WHEN false THEN 1 ELSE 2 END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: no-branch-holds-and-no-else-is-null
+    doc: A case that answers nothing is null rather than an error or a zero, which is what makes the ELSE optional.
+    query: RETURN CASE WHEN false THEN 1 END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: a-null-condition-is-a-branch-that-did-not-hold
+    doc: A branch whose condition is unknown is not taken, the way a WHERE that answers unknown keeps no row. A client testing a null as false gets this right and a client testing it as true does not, which is why the ELSE below is the answer and not the THEN.
+    query: RETURN CASE WHEN null THEN 'taken' ELSE 'not taken' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: not taken
+
+  - name: simple-form
+    doc: The value is named once and each branch is compared with it, which is the searched form with the equality written for the reader.
+    query: RETURN CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: two
+
+  - name: simple-form-compares-and-does-not-test
+    doc: A branch of the simple form holds a value to compare and not a condition, so a branch written as a true is compared with the subject and is not taken because it is true.
+    query: RETURN CASE 1 WHEN true THEN 'tested' ELSE 'compared' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: compared
+
+  - name: simple-form-with-a-null-subject-matches-nothing
+    doc: The comparison is the ordinary one, so a null subject equals no branch, not even a branch written as null, and the answer comes from the ELSE.
+    query: RETURN CASE null WHEN null THEN 'matched' ELSE 'unmatched' END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: unmatched
+
+  - name: only-the-branch-that-holds-is-evaluated
+    doc: The division in the branch nobody reached is never done, which is the property that lets a case guard an expression the other rows cannot answer. A client evaluating every branch and choosing afterwards raises here instead of answering.
+    query: RETURN CASE WHEN false THEN 1 / 0 ELSE 7 END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "7"
+
+  - name: nested
+    doc: A case is an expression, so it stands where the value of a branch stands, and nothing about the inner one changes for being inside the outer one.
+    query: RETURN CASE WHEN false THEN 'no' ELSE CASE WHEN true THEN 'yes' END END AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: yes
+
+  - name: coalesce
+    doc: The first argument that is not null, which is the abbreviation of a case whose branches all ask the same question.
+    query: RETURN COALESCE(null, 2, 3) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: coalesce-of-nulls-is-null
+    doc: With nothing to answer with the answer is null, and a client returning the last argument regardless gets this one right by accident and the one above wrong.
+    query: RETURN COALESCE(null, null) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: nullif-equal
+    doc: Null where the two are equal, which is the abbreviation that turns a placeholder into a null.
+    query: RETURN NULLIF(1, 1) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: nullif-different
+    doc: The first argument where they are not, and the first argument is what comes back rather than the second, which is where a client with the two the wrong way round answers 2.
+    query: RETURN NULLIF(1, 2) AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "1"

@@ -420,6 +420,8 @@ module.exports = grammar({
         $.parameter,
         $.function_call,
         $.cast,
+        $.case_expression,
+        $.case_abbreviation,
         $.path_constructor,
         $.exists_block,
         $.parenthesized_expression,
@@ -469,6 +471,28 @@ module.exports = grammar({
       ),
 
     cast: ($) => seq(kw("CAST"), "(", $._expression, kw("AS"), $.value_type, ")"),
+
+    // GE01. The value before the first WHEN is what tells the simple
+    // form from the searched one, and there is nothing to choose
+    // between them here: one expression stands where the other does
+    // not.
+    case_expression: ($) =>
+      seq(
+        kw("CASE"),
+        optional($._expression),
+        repeat1(seq(kw("WHEN"), $._expression, kw("THEN"), $._expression)),
+        optional(seq(kw("ELSE"), $._expression)),
+        kw("END"),
+      ),
+
+    // The two case abbreviations. They are written exactly as a call is
+    // written and have a rule here for the reason CAST does, which is
+    // that the engine reads them as forms rather than as functions. It
+    // is also what keeps NULLIF one word: the lexer prefers a keyword
+    // to an identifier of the same length, so without the spelling the
+    // NULL nobody wrote would be read out of the front of it.
+    case_abbreviation: ($) =>
+      seq(choice(kw("COALESCE"), kw("NULLIF")), "(", commaSep1($._expression), ")"),
 
     list: ($) => seq("[", optional(commaSep1($._expression)), "]"),
 

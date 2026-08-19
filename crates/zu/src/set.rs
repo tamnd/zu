@@ -1379,6 +1379,7 @@ mod tests {
         // The process stops here, with the transaction open and both
         // statements published.
         std::mem::forget(session);
+        crate::shared::forget(&path);
 
         let mut reopened = Session::open(&path).expect("reopen");
         assert!(

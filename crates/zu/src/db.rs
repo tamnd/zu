@@ -220,12 +220,17 @@ impl Database {
 /// That is the same rule the C ABI states and has to check at runtime
 /// (`dx/02` §5), enforced here at no cost.
 ///
-/// A connection reads the database as of when it connected. It holds
-/// the header it opened at, so a write another connection published
-/// since is not visible to it, and a reader that wants the latest
-/// catalog takes a new connection. Cross-connection visibility without
-/// reconnecting is the snapshot machinery of docs/08, not a header read
-/// on the statement path.
+/// A connection reads the database as of the statement it is running.
+/// Every connection to one file shares the write side, and a statement
+/// picks up what that side has published before it compiles anything,
+/// so a commit on another connection is visible to the next statement
+/// here without reconnecting. Nothing moves under a statement that has
+/// started: what it took at the top is what it reads to the end, which
+/// is the snapshot isolation of docs/08 §1.
+///
+/// Writes queue. One connection at a time holds the write side of a
+/// file, for the length of a write statement or of an explicit
+/// transaction, and the rest wait in the order they asked.
 pub struct Connection {
     session: Session,
     read_only: bool,
@@ -241,7 +246,11 @@ impl Connection {
     /// leading `$`.
     pub fn query_with(&mut self, source: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.refuse_if_read_only(source)?;
-        self.session.run(source, params)
+        let out = self.session.run(source, params);
+        // The statement is over, so the epoch it was reading is one the
+        // next writer may reuse the blocks of.
+        self.session.idle();
+        out
     }
 
     /// Runs one statement and hands its rows to `sink` in batches as
@@ -289,8 +298,11 @@ impl Connection {
         mut sink: impl FnMut(Batch<'_>) -> Result<Flow>,
     ) -> Result<Streamed> {
         self.refuse_if_read_only(source)?;
-        self.session
-            .run_streaming(source, params, batch_rows, &mut sink)
+        let out = self
+            .session
+            .run_streaming(source, params, batch_rows, &mut sink);
+        self.session.idle();
+        out
     }
 
     /// Runs a statement for its effect and returns the number of rows
@@ -305,12 +317,16 @@ impl Connection {
     /// with it, in the order the binder assigned them.
     pub fn prepare(&mut self, source: &str) -> Result<(u64, Vec<String>)> {
         self.refuse_if_read_only(source)?;
-        self.session.prepare(source)
+        let out = self.session.prepare(source);
+        self.session.idle();
+        out
     }
 
     /// Runs a prepared statement with a set of bindings.
     pub fn execute_prepared(&mut self, stmt: u64, params: &[(&str, Value)]) -> Result<QueryResult> {
-        self.session.execute(stmt, params)
+        let out = self.session.execute(stmt, params);
+        self.session.idle();
+        out
     }
 
     /// Releases a prepared statement, reporting whether the id was one.
@@ -321,7 +337,9 @@ impl Connection {
     /// The plan this connection would run for `source`, rendered,
     /// without running it.
     pub fn explain(&mut self, source: &str) -> Result<String> {
-        self.session.explain(source)
+        let out = self.session.explain(source);
+        self.session.idle();
+        out
     }
 
     /// The same plan as operators rather than as text: the tree, the
@@ -347,7 +365,9 @@ impl Connection {
     /// # Ok::<(), zu::ZuError>(())
     /// ```
     pub fn explain_plan(&mut self, source: &str) -> Result<QueryPlan> {
-        self.session.explain_plan(source)
+        let out = self.session.explain_plan(source);
+        self.session.idle();
+        out
     }
 
     /// Runs `source` with the counters on and hands back what it
@@ -365,7 +385,9 @@ impl Connection {
     /// profile describes, and profiling it would apply the write.
     pub fn profile(&mut self, source: &str, params: &[(&str, Value)]) -> Result<Profile> {
         self.refuse_if_read_only(source)?;
-        self.session.profile(source, params)
+        let out = self.session.profile(source, params);
+        self.session.idle();
+        out
     }
 
     /// Opens an appender on `table`, the bulk-load path of dx/04 §6.
@@ -710,39 +732,40 @@ mod tests {
         assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }
 
-    /// What a connection sees is the database as of when it connected.
+    /// What a connection sees is the database as of the statement it is
+    /// running, including what another connection committed a moment
+    /// ago.
     ///
-    /// A handle reads the header at open and keeps it, so a write
-    /// another connection published afterwards is not visible to it:
-    /// the epoch check that drops stale plans compares the header this
-    /// handle holds, and that one moves when this handle writes. Making
-    /// it move otherwise means re-reading two header slots per
-    /// statement, which is the whole cost of a warm query, and the
-    /// right answer to it is the snapshot machinery of docs/08 rather
-    /// than a read on the hot path. Until that lands, a reader that
-    /// wants the latest catalog takes a new connection, which is cheap
-    /// and is what this test says.
+    /// The write side publishes where it got to at every commit and a
+    /// statement picks that up before it compiles anything, so the
+    /// graph a connection could not name before the other one made it
+    /// is a graph it can name now. That costs a read lock and a word
+    /// on a statement nothing has happened under, which is what makes
+    /// it affordable on the warm path: the header itself is only read
+    /// again when the version says it moved.
     #[test]
-    fn a_connection_reads_the_database_as_of_when_it_connected() {
+    fn a_connection_sees_what_another_one_committed() {
         let (_dir, path) = scratch("epoch.zu1");
         let db = Database::open(&path).expect("open");
         let mut writer = db.connect().expect("connect");
         let mut reader = db.connect().expect("connect");
+
+        let missing = reader
+            .query("USE second MATCH (p) RETURN p")
+            .expect_err("no such graph yet");
+        assert!(missing.to_string().contains("is no graph"), "{missing}");
+
         writer
             .execute("CREATE PROPERTY GRAPH second ANY")
             .expect("create");
 
-        let stale = reader
-            .query("USE second MATCH (p) RETURN p")
-            .expect_err("connected before the write");
-        assert!(stale.to_string().contains("is no graph"), "{stale}");
-
-        // The new graph is empty, so a fresh connection gets past the
-        // name and finds nothing in it, which is what says the write is
-        // on disk and being read: the stale connection above could not
+        // The new graph is empty, so a statement against it gets past
+        // the name and finds nothing, which is what says the write
+        // reached this connection: a moment ago the same text could not
         // resolve the name at all.
-        let mut fresh = db.connect().expect("connect");
-        let seen = fresh.query("USE second MATCH (p) RETURN p").expect("query");
+        let seen = reader
+            .query("USE second MATCH (p) RETURN p")
+            .expect("the graph the other connection made");
         assert!(seen.rows.is_empty(), "the new graph holds no elements");
     }
 
@@ -772,6 +795,163 @@ mod tests {
             .query("MATCH (p:person) WHERE p.name = 'zoe' RETURN p.name AS name")
             .expect("read");
         assert_eq!(out.rows.len(), 1, "the row that was written is there");
+    }
+
+    /// Gives the seeded table a column a new row can grow into, since
+    /// the bulk load stores no properties.
+    fn named(path: &Path) {
+        let mut file = Zu1File::open(path).expect("open");
+        let names: Vec<&[u8]> = vec![b"ada", b"bo", b"cy", b"di", b"ed", b"fi", b"gil", b"hal"];
+        crate::zu1::props::store_props(
+            &mut file,
+            "person",
+            &[("name", crate::zu1::props::PropValues::Str(&names))],
+        )
+        .expect("props");
+    }
+
+    fn people(conn: &mut Connection) -> usize {
+        conn.query("MATCH (p:person) RETURN p.name AS name")
+            .expect("count")
+            .rows
+            .len()
+    }
+
+    /// Two connections in one process write one file. Before the write
+    /// side was shared they were two writers of one log, each folding
+    /// from its own idea of where the roots were, and what came of that
+    /// depended on which of them checkpointed last.
+    #[test]
+    fn two_connections_write_one_file() {
+        let (_dir, path) = scratch("shared.zu1");
+        named(&path);
+        let db = Database::open(&path).expect("open");
+        let mut first = db.connect().expect("connect");
+        let mut second = db.connect().expect("connect");
+
+        first.query("INSERT (p:person {name: 'zoe'})").expect("zoe");
+        second
+            .query("INSERT (p:person {name: 'raj'})")
+            .expect("raj");
+
+        assert_eq!(people(&mut first), 10, "both writes are on the file");
+        assert_eq!(people(&mut second), 10);
+
+        // And the file says so to somebody who was not here for either.
+        let mut third = db.connect().expect("connect");
+        assert_eq!(people(&mut third), 10);
+    }
+
+    /// The same thing from several threads at once, which is what the
+    /// writer lock is for: they queue, and every row each of them wrote
+    /// is on the file at the end.
+    #[test]
+    fn writers_on_several_threads_all_land() {
+        let (_dir, path) = scratch("threads.zu1");
+        named(&path);
+        let db = Database::open(&path).expect("open");
+
+        let writers: Vec<_> = (0..4)
+            .map(|worker| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let mut conn = db.connect().expect("connect");
+                    for row in 0..4 {
+                        conn.query_with(
+                            "INSERT (p:person {name: $name})",
+                            &[("name", Value::Str(format!("w{worker}r{row}")))],
+                        )
+                        .expect("insert");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("join");
+        }
+
+        let mut conn = db.connect().expect("connect");
+        assert_eq!(people(&mut conn), 8 + 16, "every write of every thread");
+    }
+
+    /// Readers reading while writers write, which is what the epoch
+    /// leases are for. A checkpoint lists as free the blocks the epoch
+    /// it supersedes reads, and without a lease the next write puts a
+    /// column of new rows in the middle of the segment somebody else's
+    /// statement is halfway through reading. What that looks like from
+    /// here is a `Corrupt` out of a plain `MATCH`.
+    #[test]
+    fn readers_read_while_writers_write() {
+        let (_dir, path) = scratch("mixed.zu1");
+        named(&path);
+        let db = Database::open(&path).expect("open");
+
+        let mut hands = Vec::new();
+        for worker in 0..2 {
+            let db = db.clone();
+            hands.push(std::thread::spawn(move || {
+                let mut conn = db.connect().expect("connect");
+                for row in 0..24 {
+                    conn.query_with(
+                        "INSERT (p:person {name: $name})",
+                        &[("name", Value::Str(format!("w{worker}r{row}")))],
+                    )
+                    .expect("insert");
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let db = db.clone();
+            hands.push(std::thread::spawn(move || {
+                let mut conn = db.connect().expect("connect");
+                let mut last = 0;
+                for _ in 0..64 {
+                    let seen = people(&mut conn);
+                    // A statement reads a database somebody is writing,
+                    // so the count grows; it never goes backwards and
+                    // never counts a row twice.
+                    assert!(seen >= last, "{seen} rows after {last}");
+                    assert!(seen <= 8 + 48, "{seen} rows is more than were written");
+                    last = seen;
+                }
+            }));
+        }
+        for hand in hands {
+            hand.join().expect("join");
+        }
+
+        let mut conn = db.connect().expect("connect");
+        assert_eq!(people(&mut conn), 8 + 48);
+    }
+
+    /// An explicit transaction holds the write side from its first
+    /// write to the word that ends it, so a second connection writing
+    /// meanwhile waits rather than interleaving with it.
+    #[test]
+    fn a_transaction_holds_the_write_side_until_it_ends() {
+        let (_dir, path) = scratch("txn.zu1");
+        named(&path);
+        let db = Database::open(&path).expect("open");
+        let mut holder = db.connect().expect("connect");
+        holder.query("START TRANSACTION").expect("start");
+        holder
+            .query("INSERT (p:person {name: 'zoe'})")
+            .expect("zoe");
+
+        let waiting = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mut conn = db.connect().expect("connect");
+                conn.query("INSERT (p:person {name: 'raj'})").expect("raj");
+            })
+        };
+        // Long enough that the other thread is queued rather than slow.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiting.is_finished(), "the transaction holds the lock");
+
+        holder.query("COMMIT").expect("commit");
+        waiting.join().expect("join");
+        assert_eq!(people(&mut holder), 10, "both rows, one after the other");
     }
 
     #[test]

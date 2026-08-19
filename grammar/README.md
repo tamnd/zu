@@ -61,9 +61,10 @@ across turns the grammar's build red rather than this one, which is
 where the work of carrying it across is.
 
 The reverse direction is not required anywhere. The list holds the
-words the parser refuses by name, `MERGE`, `FILTER`, `LET` and the
-rest, and those are coloured everywhere and parsed nowhere: an error is
-easier to believe when the word looked like a word.
+words the parser refuses by name, `MERGE`, `SESSION` and the `CREATE`
+that is not a catalog statement, and those are coloured everywhere and
+parsed nowhere: an error is easier to believe when the word looked like
+a word.
 
 ## What holds the grammar to the engine
 

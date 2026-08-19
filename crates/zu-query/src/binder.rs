@@ -2359,6 +2359,8 @@ impl Binder<'_> {
             Clause::With { projection, filter } => {
                 self.bind_projection(projection, Projected::Onward, filter)
             }
+            Clause::Order { keys, skip, limit } => self.bind_order(keys, skip, limit),
+            Clause::Finish => self.bind_finish(),
         }
     }
 
@@ -2981,6 +2983,63 @@ impl Binder<'_> {
             limit: None,
             filter: None,
         })
+    }
+
+    /// Binds `FINISH`, the primitive result statement of ISO 14.10.
+    ///
+    /// What it answers is a table with no columns and no rows, and
+    /// that is what it binds to: a projection that keeps no column of
+    /// what the clauses found, with a page of no rows behind it. The
+    /// two halves are both needed and neither is a trick. A projection
+    /// of nothing is what makes the columns none, and a result with no
+    /// columns is not the same thing as a result with no rows, since a
+    /// statement that carries rows between two others has slots and no
+    /// column names. The page of nothing is what makes the rows none,
+    /// and it is what lets the executor stop early, since a statement
+    /// that says it wants nothing back should not pay for the rows it
+    /// is about to throw away.
+    ///
+    /// It is always the answer, the parser having refused anything
+    /// that would read from it.
+    fn bind_finish(&mut self) -> Result<BoundClause> {
+        let projection = Projection {
+            distinct: false,
+            star: false,
+            items: Vec::new(),
+            group_by: Vec::new(),
+            order_by: Vec::new(),
+            skip: None,
+            limit: Some(Expr::Literal(Literal::Int(0))),
+        };
+        self.bind_projection(&projection, Projected::Answer, &None)
+    }
+
+    /// Binds the order by and page statement of ISO 14.9, the one that
+    /// stands where a statement stands rather than behind a `RETURN`.
+    ///
+    /// It says which rows come first and which of them come out at all,
+    /// and it says nothing about the columns: everything in hand stays
+    /// in hand. That is what a `WITH *` carrying the same tail already
+    /// means, so that is what this binds to, rather than to a clause of
+    /// its own that would have to answer the same questions about
+    /// groups and paths a second time and could answer one of them
+    /// differently.
+    fn bind_order(
+        &mut self,
+        keys: &[SortKey<Expr>],
+        skip: &Option<Expr>,
+        limit: &Option<Expr>,
+    ) -> Result<BoundClause> {
+        let projection = Projection {
+            distinct: false,
+            star: true,
+            items: Vec::new(),
+            group_by: Vec::new(),
+            order_by: keys.to_vec(),
+            skip: skip.clone(),
+            limit: limit.clone(),
+        };
+        self.bind_projection(&projection, Projected::Onward, &None)
     }
 
     fn bind_count_limit(&mut self, expr: &Option<Expr>, what: &str) -> Result<Option<BoundExpr>> {

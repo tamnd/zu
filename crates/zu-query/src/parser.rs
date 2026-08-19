@@ -343,7 +343,7 @@ fn endpoint(def: ElementTypeDef) -> Endpoint {
 /// told the parser expected MATCH has been sent looking for a typo
 /// instead of a milestone. CREATE is in the list for the opposite
 /// reason, being the Cypher spelling of a statement GQL does not have.
-const UNIMPLEMENTED: &[&str] = &["CREATE", "MERGE", "SESSION", "FINISH"];
+const UNIMPLEMENTED: &[&str] = &["CREATE", "MERGE", "SESSION"];
 
 /// How a simple query statement ended, which is what the parser needs
 /// to say when something follows that may not.
@@ -353,6 +353,12 @@ enum Ending {
     Result,
     /// A write that projected nothing.
     Write,
+    /// `FINISH`, which is a result statement that says there is no
+    /// result. Nothing may follow it and nothing may read from it,
+    /// which is what separates it from the write above: a write that
+    /// projected nothing ended because it had said everything it had
+    /// to say, and this ended because the reader said so.
+    Finish,
 }
 
 /// Parses one zuQL query.
@@ -1209,6 +1215,7 @@ impl Parser<'_> {
             let what = match ending {
                 Ending::Result => "RETURN",
                 Ending::Write => "the end of a statement",
+                Ending::Finish => "FINISH",
             };
             return Err(ZuError::gql_in(
                 codes::C42001,
@@ -1295,6 +1302,16 @@ impl Parser<'_> {
         loop {
             let (simple, ending) = self.parse_simple()?;
             statements.push(simple);
+            if self.at_kw("NEXT") && ending == Ending::Finish {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    self.peek().expect("peeked").start,
+                    format_args!(
+                        "NEXT reads what the statement in front of it returned, and FINISH is how a statement says it returns nothing"
+                    ),
+                ));
+            }
             if !self.eat_kw("NEXT") {
                 return Ok((Linear { statements }, ending));
             }
@@ -1462,6 +1479,30 @@ impl Parser<'_> {
                 let projection = self.parse_projection()?;
                 let filter = self.parse_where()?;
                 clauses.push(Clause::With { projection, filter });
+            } else if self.at_kw("ORDER")
+                || self.at_kw("OFFSET")
+                || self.at_kw("SKIP")
+                || self.at_kw("LIMIT")
+            {
+                // ISO 14.9 standing on its own. The same words after a
+                // RETURN or a WITH were eaten by that projection, so
+                // reaching here means there is nothing in front of them
+                // but the rows themselves.
+                let (keys, skip, limit) = self.parse_order_and_page()?;
+                clauses.push(Clause::Order { keys, skip, limit });
+            } else if self.eat_kw("FINISH") {
+                // ISO 14.10. A query that ends here answers no rows and
+                // no columns, which is not the same as answering
+                // nothing: the clauses in front of it ran, and a write
+                // in one of them wrote.
+                clauses.push(Clause::Finish);
+                return Ok((
+                    Simple {
+                        clauses,
+                        result: None,
+                    },
+                    Ending::Finish,
+                ));
             } else if self.eat_kw("RETURN") {
                 let projection = self.parse_projection()?;
                 return Ok((
@@ -1693,6 +1734,28 @@ impl Parser<'_> {
                 }
             }
         }
+        let (order_by, skip, limit) = self.parse_order_and_page()?;
+        Ok(Projection {
+            distinct,
+            star,
+            items,
+            group_by,
+            order_by,
+            skip,
+            limit,
+        })
+    }
+
+    /// The order by and page of ISO 14.9: the sort keys, the offset and
+    /// the limit, each optional and in that order.
+    ///
+    /// One reader of this is the tail of a projection and the other is
+    /// the statement that is nothing but this, so the three parts are
+    /// read in one place. Nothing here decides whether writing none of
+    /// them is allowed, because after a `RETURN` it is and on its own
+    /// it is not.
+    #[allow(clippy::type_complexity)]
+    fn parse_order_and_page(&mut self) -> Result<(Vec<SortKey<Expr>>, Option<Expr>, Option<Expr>)> {
         let mut order_by = Vec::new();
         if self.eat_kw("ORDER") {
             self.expect_kw("BY")?;
@@ -1753,15 +1816,7 @@ impl Parser<'_> {
         } else {
             None
         };
-        Ok(Projection {
-            distinct,
-            star,
-            items,
-            group_by,
-            order_by,
-            skip,
-            limit,
-        })
+        Ok((order_by, skip, limit))
     }
 
     fn parse_projection_item(&mut self) -> Result<ProjectionItem> {
@@ -3937,7 +3992,6 @@ mod tests {
     fn a_statement_we_do_not_parse_yet_is_refused_by_name() {
         for (source, kw) in [
             ("SESSION SET VALUE $x = 1", "SESSION"),
-            ("MATCH (p) FINISH", "FINISH"),
             ("MERGE (p:Person) RETURN p", "MERGE"),
         ] {
             let err = parse_err(source);
@@ -3946,6 +4000,95 @@ mod tests {
                 "{source:?} was refused with {err:?}, which does not name {kw}"
             );
         }
+    }
+
+    /// `FINISH` is a result statement and the clause list ends with
+    /// it, since what it does is end the statement rather than say
+    /// what the answer looks like.
+    #[test]
+    fn finish_ends_a_statement_with_no_result() {
+        let query = parsed("MATCH (p:Person) FINISH");
+        let linear = linear_body(&query);
+        assert_eq!(linear.statements.len(), 1);
+        let simple = &linear.statements[0];
+        assert!(simple.result.is_none(), "there is no projection");
+        assert!(
+            matches!(simple.clauses.last(), Some(Clause::Finish)),
+            "the last clause is the FINISH, got {:?}",
+            simple.clauses.last()
+        );
+    }
+
+    /// Nothing may follow it and nothing may read from it, which is
+    /// the difference between a statement that answers nothing and a
+    /// statement that has not answered yet.
+    #[test]
+    fn nothing_follows_a_finish() {
+        assert!(
+            parse_err("MATCH (p) FINISH RETURN 1 AS one").contains("nothing may follow FINISH")
+        );
+        assert!(
+            parse_err("MATCH (p) FINISH NEXT RETURN 1 AS one")
+                .contains("FINISH is how a statement says it returns nothing")
+        );
+        assert!(
+            parse_err("MATCH (p) FINISH UNION RETURN 1 AS one").contains("has to end with RETURN"),
+            "a conjunction joins two result tables"
+        );
+    }
+
+    /// ISO 14.9 makes the order by and page a statement of its own, so
+    /// each of its three parts stands where a statement stands.
+    #[test]
+    fn the_order_by_and_page_is_a_statement() {
+        for (source, keys, skip, limit) in [
+            (
+                "MATCH (p) ORDER BY p.age RETURN p.name AS name",
+                1,
+                false,
+                false,
+            ),
+            (
+                "MATCH (p) ORDER BY p.age, p.name RETURN p.name AS name",
+                2,
+                false,
+                false,
+            ),
+            ("MATCH (p) OFFSET 1 RETURN p.name AS name", 0, true, false),
+            (
+                "MATCH (p) SKIP 1 LIMIT 2 RETURN p.name AS name",
+                0,
+                true,
+                true,
+            ),
+            ("MATCH (p) LIMIT 2 RETURN p.name AS name", 0, false, true),
+        ] {
+            let query = parsed(source);
+            let simple = &linear_body(&query).statements[0];
+            let Some(Clause::Order {
+                keys: k,
+                skip: s,
+                limit: l,
+            }) = simple.clauses.get(1)
+            else {
+                panic!("{source:?} parsed as {:?}", simple.clauses);
+            };
+            assert_eq!(k.len(), keys, "{source:?}");
+            assert_eq!(s.is_some(), skip, "{source:?}");
+            assert_eq!(l.is_some(), limit, "{source:?}");
+        }
+    }
+
+    /// The same words behind a `RETURN` belong to that projection, so
+    /// a statement of them is only ever what is left over.
+    #[test]
+    fn the_page_behind_a_return_is_still_the_projections() {
+        let query = parsed("MATCH (p) RETURN p.name AS name ORDER BY name LIMIT 2");
+        let simple = &linear_body(&query).statements[0];
+        assert_eq!(simple.clauses.len(), 1, "the MATCH, and no page clause");
+        let projection = simple.result.as_ref().expect("a projection");
+        assert_eq!(projection.order_by.len(), 1);
+        assert!(projection.limit.is_some());
     }
 
     #[test]

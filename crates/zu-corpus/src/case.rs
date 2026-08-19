@@ -207,8 +207,13 @@ fn case(node: &Node) -> Result<Case, String> {
             Expect::Raises(code.to_string())
         }
         (None, Some(columns)) => Expect::Rows {
+            // A `columns:` with nothing under it is a result with no
+            // columns, which is what `FINISH` answers and what a write
+            // answers. A list somebody left unfinished reads as that
+            // too and fails the case, since a statement that does
+            // answer columns is not one that answers none.
             columns: columns
-                .seq()
+                .seq_or_empty()
                 .ok_or(at("`columns:` is a sequence of names".to_string()))?
                 .iter()
                 .map(|c| {

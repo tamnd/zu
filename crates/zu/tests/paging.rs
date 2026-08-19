@@ -103,3 +103,40 @@ fn a_page_is_taken_where_it_is_written() {
     );
     assert_eq!(ids, [3, 4], "the filter reads the window, not the table");
 }
+
+/// The order by and page statement standing where a statement stands,
+/// which is what ISO 14.9 says it is: the words are a statement of
+/// their own and not a tail on the RETURN in front of them.
+#[test]
+fn the_page_stands_on_its_own() {
+    let mut fx = Fixture::open("standalone.zu1");
+    assert_eq!(
+        fx.ids("MATCH (p:person) ORDER BY p.id DESC LIMIT 3 RETURN p.id AS id"),
+        [7, 6, 5],
+        "the rows were ordered and paged before the projection saw them"
+    );
+    assert_eq!(
+        fx.ids("MATCH (p:person) ORDER BY p.id OFFSET 6 RETURN p.id AS id"),
+        [6, 7]
+    );
+    assert_eq!(
+        fx.ids("MATCH (p:person) LIMIT 2 RETURN p.id AS id").len(),
+        2,
+        "a LIMIT alone is a whole statement"
+    );
+}
+
+/// The standalone statement orders the rows the walk bound rather than
+/// the columns a projection made, so it sorts by things no column
+/// holds.
+#[test]
+fn the_standalone_page_reads_what_is_bound() {
+    let mut fx = Fixture::open("standalone-scope.zu1");
+    assert_eq!(
+        fx.ids(
+            "MATCH (p:person)-[:knows]->(q:person) ORDER BY q.id DESC LIMIT 2 RETURN p.id AS id"
+        ),
+        [6, 5],
+        "the key is a variable the projection does not carry"
+    );
+}

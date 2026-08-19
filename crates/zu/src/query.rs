@@ -11,6 +11,7 @@ use zu_common::{Result, ZuError};
 use zu_query::binder::{self, BoundQuery, NodeDef, RelDef, Schema};
 use zu_query::exec::{self, DeletedRows, Graph};
 use zu_query::frame::FrameSet;
+use zu_query::refs::GraphHandle;
 use zu_query::{optimizer, parser, plan};
 
 use crate::deleted::Deleted;
@@ -40,14 +41,21 @@ pub use zu_query::row::{Batch, Flow, FromRow, FromValue, Row, RowIter};
 
 /// Builds the binder schema for the home graph, which is the graph a
 /// statement is against when nothing said otherwise.
-pub fn schema_of(catalog: &Catalog) -> Result<Schema> {
-    schema_of_graph(catalog, catalog.home_graph_id())
+pub fn schema_of(catalog: &Catalog, epoch: u64) -> Result<Schema> {
+    schema_of_graph(catalog, catalog.home_graph_id(), epoch)
 }
 
 /// Builds the binder schema from one graph of a zu1 catalog. A query
 /// sees the tables of the graph it runs against and no others, which
 /// is what lets two graphs in one file both hold a `person`.
-pub fn schema_of_graph(catalog: &Catalog, graph: u32) -> Result<Schema> {
+///
+/// The epoch is the one the catalog was read at, and it is here for
+/// the graph references a statement may write (GE01): a reference
+/// records when it was taken, and the answer to `CURRENT_PROPERTY_GRAPH`
+/// was taken when the schema was built. A schema outlives no epoch,
+/// since the session throws every one of them away when the epoch
+/// moves, so the stamp stays true for as long as the schema is around.
+pub fn schema_of_graph(catalog: &Catalog, graph: u32, epoch: u64) -> Result<Schema> {
     let nodes = catalog
         .node_tables()
         .iter()
@@ -73,6 +81,19 @@ pub fn schema_of_graph(catalog: &Catalog, graph: u32) -> Result<Schema> {
         })
         .collect();
     let mut schema = Schema::with_labels(nodes, rels, catalog.labels().to_vec())?;
+    // GE01. Every graph in the catalog and not only the one being
+    // bound against, because `GRAPH other` names a graph this
+    // statement is not running against and answering it is the point:
+    // a reference says which graph, it does not read one.
+    schema.set_graphs(
+        catalog
+            .graphs()
+            .iter()
+            .map(|g| GraphHandle::new(g.id, g.schema.clone(), g.name.clone(), epoch))
+            .collect(),
+        graph,
+        catalog.home_graph_id(),
+    );
     // perf/12 §2.4 wants the dual run threshold tunable. Default is
     // 100x; lower it to reach for the robust join order sooner on data
     // whose estimates cannot be trusted.
@@ -107,10 +128,14 @@ pub fn merge_frames(schema: &mut Schema, frames: &FrameSet) -> Result<Vec<u16>> 
 }
 
 /// Parses and binds one query against a zu1 catalog.
+///
+/// The epoch the schema is stamped with is zero, and it can be: a
+/// catalog on its own is not a snapshot, and nothing here runs, so no
+/// graph reference this binds ever reaches a caller.
 pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
     let parsed = parser::parse(source)?;
     let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
-    binder::bind(&parsed, &schema_of_graph(catalog, graph)?)
+    binder::bind(&parsed, &schema_of_graph(catalog, graph, 0)?)
 }
 
 /// Parses, binds, plans, and optimizes one query, returning the
@@ -118,7 +143,7 @@ pub fn bind(source: &str, catalog: &Catalog) -> Result<BoundQuery> {
 pub fn explain(source: &str, catalog: &Catalog) -> Result<String> {
     let parsed = parser::parse(source)?;
     let graph = graph_of(catalog, catalog.home_graph_id(), &parsed, &[])?;
-    let schema = schema_of_graph(catalog, graph)?;
+    let schema = schema_of_graph(catalog, graph, 0)?;
     let query = binder::bind(&parsed, &schema)?;
     let built = plan::build(&query)?;
     let (optimized, notes) = optimizer::optimize_noted(built, &query, &schema)?;
@@ -1030,7 +1055,7 @@ pub(crate) fn load_schema(db: &mut Zu1File) -> Result<(Catalog, Schema)> {
 /// by table id and a graph's tables are a subset of the file's, so the
 /// ones this schema has no table for are simply never asked for.
 pub(crate) fn schema_with_stats(db: &mut Zu1File, catalog: &Catalog, graph: u32) -> Result<Schema> {
-    let mut schema = schema_of_graph(catalog, graph)?;
+    let mut schema = schema_of_graph(catalog, graph, db.db_header().epoch)?;
     // The stats chain feeds the optimizer's degree histograms; a file
     // written before stats existed simply attaches nothing and every
     // estimate falls back to the count ratios.

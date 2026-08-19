@@ -1216,9 +1216,12 @@ pub fn value_order(a: &Value, b: &Value) -> Ordering {
             a.len().cmp(&b.len())
         }
         // Two graph references order by what identifies them, which is
-        // the catalog id and the epoch it was taken at; the names ride
-        // along and are the same whenever the id is.
-        (Value::Graph(a), Value::Graph(b)) => (a.id, a.epoch).cmp(&(b.id, b.epoch)),
+        // the catalog id; the names ride along and are the same
+        // whenever the id is, and the epoch is when the reference was
+        // taken rather than which graph it names, so ordering on it
+        // would put two references to one graph in two places and
+        // disagree with the equality above.
+        (Value::Graph(a), Value::Graph(b)) => a.id.cmp(&b.id),
         // Two binding table references order by handle number, which
         // is creation order. Ordering them by their rows would say two
         // tables holding the same rows are one, and they are two.
@@ -5536,6 +5539,16 @@ fn cmp_eq(a: &Value, b: &Value) -> Result<Option<bool>> {
             }
             Some(true)
         }
+        // GV60. Two graph references are equal when they name the same
+        // graph. The epoch each was taken at says when it was asked
+        // for and not what it names, so it is no part of this, which
+        // is what lets a handle a caller has held since yesterday
+        // equal one a statement wrote this morning.
+        (Value::Graph(x), Value::Graph(y)) => Some(x.id == y.id),
+        // GV61, the other way round. A binding table reference is an
+        // identity and not its rows, so two tables over the same rows
+        // are two tables and comparing the rows would say otherwise.
+        (Value::BindingTable(x), Value::BindingTable(y)) => Some(x.id() == y.id()),
         _ => Some(false),
     })
 }
@@ -6054,6 +6067,10 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Literal::Temporal(t) => Value::Temporal(*t),
         }),
         BoundExpr::Param(ix) => Ok(ctx.params[*ix].clone()),
+        // GE01. The binder already asked the catalog which graph this
+        // is, so the row's work is a clone of the handle and nothing
+        // else.
+        BoundExpr::Graph(handle) => Ok(Value::Graph(handle.clone())),
         BoundExpr::Scalar { ix, .. } => scalar_value(ctx, *ix),
         BoundExpr::Var(slot) => value_of(ctx, *slot),
         BoundExpr::HasLabels { slot, test } => match value_of(ctx, *slot)? {

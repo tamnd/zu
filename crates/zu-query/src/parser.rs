@@ -2881,6 +2881,18 @@ impl Parser<'_> {
                 let props = self.parse_property_map()?;
                 Ok(Expr::Map(props))
             }
+            // GE01. A path where a value goes names a graph, and a
+            // slash can begin nothing else here: division wants a
+            // value in front of it and an expression starts with none.
+            //
+            // The path is the whole of how a graph is named here. A
+            // `USE` also takes the name on its own and takes `GRAPH`
+            // in front of it, and neither of those can be read in an
+            // expression: a bare name is a variable, and a word with a
+            // path behind it is a division as often as it is a graph,
+            // since `graph / n` is one and `graph /n` is the other and
+            // no reader can see the difference.
+            TokenKind::Slash => Ok(Expr::GraphRef(GraphRef::Named(self.parse_graph_name()?))),
             TokenKind::Ident(ref name) => {
                 let name = name.clone();
                 self.pos += 1;
@@ -2893,6 +2905,38 @@ impl Parser<'_> {
             }
             _ => Err(self.error("an expression")),
         }
+    }
+
+    /// The parameter behind `GRAPH`, `PROPERTY GRAPH`, `TABLE` or
+    /// `BINDING TABLE`, the word already read, and `None` when what
+    /// stands there is not one of those words with a parameter behind
+    /// it.
+    ///
+    /// The word is read and thrown away on purpose. It says which of
+    /// the two reference types the caller means to have passed, the
+    /// value says the same thing, and where they disagree the value is
+    /// the one that is true, so keeping the word would only be a
+    /// second place for the answer to come from.
+    fn reference_parameter(&mut self, name: &str) -> Option<String> {
+        // How many words of the spelling are still ahead of the
+        // parameter: none for the short ones, one for each long one.
+        let long = (name.eq_ignore_ascii_case("PROPERTY") && self.at_kw("GRAPH"))
+            || (name.eq_ignore_ascii_case("BINDING") && self.at_kw("TABLE"));
+        let short = name.eq_ignore_ascii_case("GRAPH") || name.eq_ignore_ascii_case("TABLE");
+        if !long && !short {
+            return None;
+        }
+        let words = usize::from(long);
+        let Some(Token {
+            kind: TokenKind::Param(param),
+            ..
+        }) = self.tokens.get(self.pos + words)
+        else {
+            return None;
+        };
+        let param = param.clone();
+        self.pos += words + 1;
+        Some(param)
     }
 
     /// An expression that begins with an identifier, the identifier
@@ -2936,6 +2980,30 @@ impl Parser<'_> {
         // bracket after a name, so the two readings never overlap.
         if name.eq_ignore_ascii_case("path") && self.at(&TokenKind::LBracket) {
             return Ok(Expr::Path(self.parse_bracketed_items()?));
+        }
+        // GE01, a graph named where a value goes. Each of these four
+        // words is a whole graph reference on its own, so there is
+        // nothing to read behind them and nothing they could be
+        // mistaken for: a variable of one of these names is the one
+        // thing ISO does reserve here.
+        if name.eq_ignore_ascii_case("CURRENT_GRAPH")
+            || name.eq_ignore_ascii_case("CURRENT_PROPERTY_GRAPH")
+        {
+            return Ok(Expr::GraphRef(GraphRef::Current));
+        }
+        if name.eq_ignore_ascii_case("HOME_GRAPH")
+            || name.eq_ignore_ascii_case("HOME_PROPERTY_GRAPH")
+        {
+            return Ok(Expr::GraphRef(GraphRef::Home));
+        }
+        // GE01 and GE02, the reference a caller passed in. `GRAPH $g`
+        // and `BINDING TABLE $t` say what the parameter holds and
+        // nothing else, which is what `USE GRAPH $g` beside `USE $g`
+        // already says: the word is a reader's note, and the value is
+        // the parameter's either way. The `$` behind the word is what
+        // makes these readable, so `graph` and `table` stay names.
+        if let Some(param) = self.reference_parameter(&name) {
+            return Ok(Expr::Param(param));
         }
         // The list value constructor of ISO 20.17, which names the
         // type it is building before it lists what goes in it. LIST

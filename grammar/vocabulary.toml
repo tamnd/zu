@@ -74,7 +74,7 @@ words = ["CASE", "WHEN", "THEN", "ELSE", "END", "COALESCE", "NULLIF"]
 
 [[group]]
 kind = "keyword"
-doc = "The catalog statements and what they name."
+doc = "The catalog statements and what they name. The last four are the graph references that name a graph without naming one, and they are not only a USE clause's words: ISO 19.6 lets a graph stand where a value stands, so each of them is a whole expression too. A graph named rather than referred to is written as the path it is at when it stands in an expression, GRAPH and PROPERTY GRAPH being spellings a USE takes and an expression cannot, since a word with a path behind it is a division as often as it is a graph. Both words do stand in front of a parameter, where the dollar sign settles it."
 words = ["CREATE", "DROP", "SCHEMA", "GRAPH", "PROPERTY", "TYPE", "IF", "REPLACE", "COPY", "OF", "NODE", "EDGE", "RELATIONSHIP", "PROPERTIES", "NO", "CURRENT_GRAPH", "CURRENT_PROPERTY_GRAPH", "HOME_GRAPH", "HOME_PROPERTY_GRAPH"]
 
 [[group]]

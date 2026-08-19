@@ -374,7 +374,7 @@ impl Session {
     /// against a schema that did not hold these frames.
     fn publish_frames(&mut self, mut set: FrameSet) -> Result<()> {
         let catalog = self.graph.catalog().clone();
-        let mut schema = query::schema_of_graph(&catalog, self.working)?;
+        let mut schema = query::schema_of_graph(&catalog, self.working, self.epoch)?;
         set.set_labels(&query::merge_frames(&mut schema, &set)?);
         let set = Arc::new(set);
         self.graph.set_frames(Arc::clone(&set));

@@ -18,10 +18,11 @@ use zu_common::gqlstatus::codes;
 use zu_common::{LogicalType, Result, ZuError};
 
 use crate::ast::{
-    self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, LabelExpr, Literal, NodePattern,
-    PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector, SetInto,
-    SetItem, SortKey, UnaryOp,
+    self, BinaryOp, Clause, Conjunction, DeleteTarget, Expr, GraphRef, LabelExpr, Literal,
+    NodePattern, PathMode, Projection, RelDirection, RelPattern, RemoveItem, Removed, Selector,
+    SetInto, SetItem, SortKey, UnaryOp,
 };
+use crate::refs::GraphHandle;
 
 fn invalid(detail: String) -> ZuError {
     ZuError::InvalidArgument(detail)
@@ -601,6 +602,15 @@ pub struct Schema {
     /// from a catalog carries that catalog's order rather than one of
     /// its own.
     labels: Vec<String>,
+    /// GV60 and GE01. The graphs a graph reference expression may
+    /// name, which is every graph in the catalog the statement was
+    /// bound against, with the working one and the home one called out
+    /// by id. Empty for a schema built without a catalog behind it,
+    /// and a graph reference in a statement bound against one of those
+    /// is refused rather than answered wrongly.
+    graphs: Vec<GraphHandle>,
+    working_graph: Option<u32>,
+    home_graph: Option<u32>,
     /// How far the summed ceilings may run past the summed estimates
     /// before the join order DP reruns minimizing the ceiling instead
     /// (perf/12 §2.4). Higher trusts the estimates further, lower
@@ -641,6 +651,9 @@ impl Schema {
             color_summaries: BTreeMap::new(),
             col_stats: BTreeMap::new(),
             labels,
+            graphs: Vec::new(),
+            working_graph: None,
+            home_graph: None,
             bound_disagreement: DEFAULT_BOUND_DISAGREEMENT,
         };
         if schema.labels.len() > MAX_LABELS {
@@ -788,6 +801,25 @@ impl Schema {
         }
     }
 
+    /// Tells the schema which graphs a graph reference may name, and
+    /// which of them the statement is running against.
+    ///
+    /// The whole catalog rather than the working graph alone, because
+    /// `GRAPH other` names a graph the statement is not running
+    /// against, and answering it is the point: a reference is a value
+    /// that says which graph, not a promise to read one.
+    pub fn set_graphs(&mut self, graphs: Vec<GraphHandle>, working: u32, home: u32) {
+        self.graphs = graphs;
+        self.working_graph = Some(working);
+        self.home_graph = Some(home);
+    }
+
+    /// The handle on the graph with this id, or `None` for an id no
+    /// catalog behind this schema holds.
+    fn graph_by_id(&self, id: u32) -> Option<&GraphHandle> {
+        self.graphs.iter().find(|g| g.id == id)
+    }
+
     /// How far the ceilings may run past the estimates before the join
     /// order DP reruns on the ceilings.
     pub fn bound_disagreement(&self) -> f64 {
@@ -846,6 +878,11 @@ pub enum Type {
     Path,
     List(Box<Type>),
     Record,
+    /// GV60, the type of a graph reference. A value of it says which
+    /// graph, and that is all it says: the graph's own contents are
+    /// read by the clauses that read graphs, never by holding one of
+    /// these.
+    Graph,
 }
 
 impl Type {
@@ -875,6 +912,7 @@ impl fmt::Display for Type {
             Type::Path => write!(f, "PATH"),
             Type::List(t) => write!(f, "LIST<{t}>"),
             Type::Record => write!(f, "RECORD"),
+            Type::Graph => write!(f, "GRAPH"),
         }
     }
 }
@@ -1600,6 +1638,10 @@ impl Func {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     Literal(Literal),
+    /// GE01, a graph named where a value goes. The handle is settled
+    /// while the statement is bound, because which graph the words name
+    /// is a question the catalog answers once and not once per row.
+    Graph(GraphHandle),
     /// Index into `BoundQuery::params`.
     Param(usize),
     Var(usize),
@@ -1938,7 +1980,7 @@ fn label_holds(expr: &ast::LabelExpr, name: &str) -> bool {
 /// two places to forget when a variant is added.
 pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::Param(_) => {}
+        BoundExpr::Literal(_) | BoundExpr::Param(_) | BoundExpr::Graph(_) => {}
         // A value query expression reads the slots the query inside it
         // captured, and nothing at all when it captured none, which is
         // what makes that one a single value for the whole run.
@@ -3973,6 +4015,56 @@ impl Binder<'_> {
         self.groups.get(name).cloned()
     }
 
+    /// The handle a graph reference expression names, out of the
+    /// graphs the schema was told about.
+    ///
+    /// A parameter is refused rather than resolved, and the reason is
+    /// worth writing down: `USE $g` is settled when the statement runs
+    /// because the clause is read before anything is bound, while an
+    /// expression is bound once and read many times, so a parameter in
+    /// this position would have to be a handle carried to the executor
+    /// instead of a handle settled here. That is GE04's work and not
+    /// this one's.
+    fn resolve_graph_ref(&self, reference: &GraphRef) -> Result<GraphHandle> {
+        if self.schema.graphs.is_empty() {
+            return Err(ZuError::gql(
+                codes::C42002,
+                "a graph reference names a graph in the catalog, and this statement was compiled without one behind it".to_string(),
+            ));
+        }
+        let by_id = |id: Option<u32>, which: &str| -> Result<GraphHandle> {
+            id.and_then(|id| self.schema.graph_by_id(id))
+                .cloned()
+                .ok_or_else(|| {
+                    ZuError::gql(
+                        codes::C42002,
+                        format!("{which} is no graph this statement can name"),
+                    )
+                })
+        };
+        match reference {
+            GraphRef::Current => by_id(self.schema.working_graph, "the working graph"),
+            GraphRef::Home => by_id(self.schema.home_graph, "the home graph"),
+            GraphRef::Named(name) => {
+                let schema = name.schema.as_deref().unwrap_or("/");
+                self.schema
+                    .graphs
+                    .iter()
+                    .find(|g| g.schema == schema && g.name == name.name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ZuError::gql(
+                            codes::C42002,
+                            format!("'{}' is no graph in '{schema}'", name.name),
+                        )
+                    })
+            }
+            GraphRef::Param(name) => Err(not_yet(
+                format!("a graph parameter in an expression, ${name}").as_str(),
+            )),
+        }
+    }
+
     fn bind_expr(&mut self, expr: &Expr, ctx: &mut ExprCtx) -> Result<(BoundExpr, Type)> {
         match expr {
             Expr::Literal(lit) => {
@@ -4294,6 +4386,14 @@ impl Binder<'_> {
                     bound.push(b);
                 }
                 Ok((BoundExpr::Path(bound), Type::Path))
+            }
+            // GE01. Which graph the words name is settled here and
+            // never again, because the catalog does not move under a
+            // statement and a reference that is the same for every row
+            // has no business being worked out per row.
+            Expr::GraphRef(reference) => {
+                let handle = self.resolve_graph_ref(reference)?;
+                Ok((BoundExpr::Graph(handle), Type::Graph))
             }
             // GE01. A searched branch has to be a truth and a simple
             // branch has to be something the subject can be compared
@@ -4963,6 +5063,15 @@ pub fn text(expr: &Expr) -> String {
             let rendered: Vec<String> = elements.iter().map(text).collect();
             format!("PATH [{}]", rendered.join(", "))
         }
+        Expr::GraphRef(reference) => match reference {
+            GraphRef::Current => "CURRENT_PROPERTY_GRAPH".into(),
+            GraphRef::Home => "HOME_PROPERTY_GRAPH".into(),
+            GraphRef::Named(name) => match &name.schema {
+                Some(schema) => format!("GRAPH {schema}/{}", name.name),
+                None => format!("GRAPH {}", name.name),
+            },
+            GraphRef::Param(name) => format!("GRAPH ${name}"),
+        },
         Expr::Cast { expr, ty } => format!("CAST({} AS {ty})", text(expr)),
         Expr::Case {
             subject,

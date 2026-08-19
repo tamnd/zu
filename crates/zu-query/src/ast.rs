@@ -1161,6 +1161,14 @@ pub enum Expr {
     /// `PATH [a, e, b]`, ISO's GE06: a path built out of the elements
     /// the query names rather than out of a pattern it matched.
     Path(Vec<Expr>),
+    /// A graph named where a value goes, ISO 19.6 and GE01.
+    ///
+    /// It is the same `GraphRef` a `USE` names, in the one other place
+    /// the standard lets one stand, and that is the point of the
+    /// feature: a graph is a value, so the words that name one are
+    /// worth the same wherever they are written. What it answers is a
+    /// reference and not the graph, which is what GV60 is.
+    GraphRef(GraphRef),
     /// `CAST(expr AS type)`, ISO's GA05.
     Cast {
         expr: Box<Expr>,

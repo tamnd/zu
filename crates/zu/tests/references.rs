@@ -205,3 +205,160 @@ fn the_epoch_check_reaches_a_nested_element() {
     assert!(!numbers.holds_elements());
     assert!(nested.holds_elements());
 }
+
+/// GE01, the half of a graph reference that is not a parameter. The
+/// four words that name a graph without naming it answer handles, and
+/// the handles are the ones the session hands out, which is the whole
+/// claim: a reference written in a statement and a reference taken
+/// through the API are the same value.
+#[test]
+fn the_words_that_name_a_graph_answer_the_handle_the_session_hands_out() {
+    let (_dir, mut session) = opened("graph-expr.zu1");
+    let home = session.graph_ref("/", "home").expect("the home graph");
+
+    for source in [
+        "RETURN CURRENT_GRAPH AS g",
+        "RETURN CURRENT_PROPERTY_GRAPH AS g",
+        "RETURN HOME_GRAPH AS g",
+        "RETURN HOME_PROPERTY_GRAPH AS g",
+        "RETURN /home AS g",
+    ] {
+        let out = session
+            .run(source, &[])
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(out.rows[0], vec![home.clone()], "{source}");
+    }
+}
+
+/// A graph reference is a value of `GRAPH` wherever it was written,
+/// and the type predicate is how a statement says so without the API
+/// having handed anything in.
+#[test]
+fn a_graph_reference_written_in_a_statement_is_typed_a_graph() {
+    let (_dir, mut session) = opened("graph-expr-typed.zu1");
+    yes(&mut session, "CURRENT_PROPERTY_GRAPH IS TYPED GRAPH", &[]);
+    yes(&mut session, "/home IS TYPED ANY GRAPH", &[]);
+    no(&mut session, "CURRENT_GRAPH IS TYPED BINDING TABLE", &[]);
+    yes(
+        &mut session,
+        "CURRENT_PROPERTY_GRAPH = HOME_PROPERTY_GRAPH",
+        &[],
+    );
+}
+
+/// The path is the whole of how a graph is named in an expression,
+/// and this is why: a bare name is a variable, and a word with a path
+/// behind it is a division as often as it is a graph. Both readings
+/// are kept here, because both are what somebody wrote.
+#[test]
+fn graph_is_still_a_name_and_a_slash_after_one_is_still_a_division() {
+    let (_dir, mut session) = opened("graph-is-a-name.zu1");
+    let out = session
+        .run("LET graph = 12 RETURN graph AS n", &[])
+        .expect("a variable of that name");
+    assert_eq!(out.rows[0], vec![Value::Int(12)]);
+
+    let out = session
+        .run("LET graph = 12, home = 4 RETURN graph / home AS n", &[])
+        .expect("a division of two variables");
+    assert_eq!(out.rows[0], vec![Value::Int(3)]);
+}
+
+/// A name the catalog does not hold is `42002`, the same condition a
+/// `USE` of it raises and for the same reason: the reference resolves
+/// to nothing.
+#[test]
+fn a_graph_reference_to_a_name_that_is_not_there_is_refused() {
+    let (_dir, mut session) = opened("graph-expr-missing.zu1");
+    let err = session
+        .run("RETURN /nowhere AS g", &[])
+        .expect_err("no such graph");
+    let record = err.diagnostic().expect("a condition");
+    assert_eq!(record.status.code(), "42002");
+}
+
+/// GE01 and GE02, the reference a caller passed in. The word in front
+/// of the parameter says which of the two types the caller means to
+/// have passed and the value is the same value either way, which is
+/// what `USE GRAPH $g` beside `USE $g` already says.
+#[test]
+fn the_word_in_front_of_a_reference_parameter_says_nothing_the_value_does_not() {
+    let (_dir, mut session) = opened("reference-params.zu1");
+    let home = session.graph_ref("/", "home").expect("the home graph");
+    let graph = [("g", home.clone())];
+    for source in [
+        "RETURN $g AS g",
+        "RETURN GRAPH $g AS g",
+        "RETURN PROPERTY GRAPH $g AS g",
+    ] {
+        let out = session
+            .run(source, &graph)
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(out.rows[0], vec![home.clone()], "{source}");
+    }
+
+    let rows = session_run(&mut session, "MATCH (p:person) RETURN p.id AS id");
+    let table = session.binding_table(rows);
+    let params = [("t", table.clone())];
+    for source in [
+        "RETURN $t AS t",
+        "RETURN TABLE $t AS t",
+        "RETURN BINDING TABLE $t AS t",
+    ] {
+        let out = session
+            .run(source, &params)
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(out.rows[0], vec![table.clone()], "{source}");
+    }
+}
+
+/// `graph` and `table` are names right up until a parameter or a path
+/// follows them, which is the rule `PATH` and `DATE` are read under.
+#[test]
+fn table_is_still_a_name() {
+    let (_dir, mut session) = opened("table-is-a-name.zu1");
+    let out = session
+        .run(
+            "LET table = 7, binding = 8 RETURN table + binding AS n",
+            &[],
+        )
+        .expect("variables of those names");
+    assert_eq!(out.rows[0], vec![Value::Int(15)]);
+}
+
+/// Two references are equal when they name the same thing, and that is
+/// the identity and not the contents: two graph handles taken at
+/// different epochs name one graph, and two tables over the same rows
+/// are two tables.
+#[test]
+fn references_compare_by_what_they_name() {
+    let (_dir, mut session) = opened("reference-equality.zu1");
+    let home = session.graph_ref("/", "home").expect("the home graph");
+    let Value::Graph(handle) = home.clone() else {
+        panic!("a graph handle, got {home:?}");
+    };
+    let older = Value::Graph(GraphHandle::new(
+        handle.id,
+        handle.schema.clone(),
+        handle.name.clone(),
+        handle.epoch.wrapping_sub(1),
+    ));
+    yes(
+        &mut session,
+        "$g = CURRENT_PROPERTY_GRAPH",
+        &[("g", older.clone())],
+    );
+    yes(&mut session, "$g = $h", &[("g", older), ("h", home)]);
+
+    let source = "MATCH (p:person) RETURN p.id AS id";
+    let rows = session_run(&mut session, source);
+    let first = session.binding_table(rows);
+    let rows = session_run(&mut session, source);
+    let second = session.binding_table(rows);
+    yes(
+        &mut session,
+        "$a = $b",
+        &[("a", first.clone()), ("b", first.clone())],
+    );
+    no(&mut session, "$a = $b", &[("a", first), ("b", second)]);
+}

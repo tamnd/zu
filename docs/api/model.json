@@ -4289,7 +4289,7 @@
       "kind": "function",
       "name": "bind",
       "signature": "fn bind(source: &str, catalog: &zu::zu1::catalog::Catalog) -> zu_common::Result<zu_query::binder::BoundQuery>",
-      "doc": "Parses and binds one query against a zu1 catalog."
+      "doc": "Parses and binds one query against a zu1 catalog.\n\nThe epoch the schema is stamped with is zero, and it can be: a\ncatalog on its own is not a snapshot, and nothing here runs, so no\ngraph reference this binds ever reaches a caller."
     },
     {
       "id": "zu::query::column",
@@ -4830,15 +4830,15 @@
       "id": "zu::query::schema_of",
       "kind": "function",
       "name": "schema_of",
-      "signature": "fn schema_of(catalog: &zu::zu1::catalog::Catalog) -> zu_common::Result<zu_query::binder::Schema>",
+      "signature": "fn schema_of(catalog: &zu::zu1::catalog::Catalog, epoch: u64) -> zu_common::Result<zu_query::binder::Schema>",
       "doc": "Builds the binder schema for the home graph, which is the graph a\nstatement is against when nothing said otherwise."
     },
     {
       "id": "zu::query::schema_of_graph",
       "kind": "function",
       "name": "schema_of_graph",
-      "signature": "fn schema_of_graph(catalog: &zu::zu1::catalog::Catalog, graph: u32) -> zu_common::Result<zu_query::binder::Schema>",
-      "doc": "Builds the binder schema from one graph of a zu1 catalog. A query\nsees the tables of the graph it runs against and no others, which\nis what lets two graphs in one file both hold a `person`."
+      "signature": "fn schema_of_graph(catalog: &zu::zu1::catalog::Catalog, graph: u32, epoch: u64) -> zu_common::Result<zu_query::binder::Schema>",
+      "doc": "Builds the binder schema from one graph of a zu1 catalog. A query\nsees the tables of the graph it runs against and no others, which\nis what lets two graphs in one file both hold a `person`.\n\nThe epoch is the one the catalog was read at, and it is here for\nthe graph references a statement may write (GE01): a reference\nrecords when it was taken, and the answer to `CURRENT_PROPERTY_GRAPH`\nwas taken when the schema was built. A schema outlives no epoch,\nsince the session throws every one of them away when the epoch\nmoves, so the stamp stays true for as long as the schema is around."
     },
     {
       "id": "zu::session",
@@ -5793,7 +5793,7 @@
       "id": "zu::write::Patches",
       "kind": "struct",
       "name": "Patches",
-      "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nFour shapes, because there are four ways a change can sit above a\ncolumn nobody has rewritten: a new value for a row the column\nalready holds, a whole new row past the end of it, a new edge,\nwhich is a row of the rel table's property columns and a pair the\nadjacency reader has to merge into two lists, and a row taken away,\nwhich is an offset every read of the table filters by."
+      "doc": "Everything the commits since the last fold left for the readers to\nread through, which is what makes a deferred commit visible.\n\nFive shapes, because there are five ways a change can sit above a\ncolumn nobody has rewritten: a new value for a row the column\nalready holds, a whole new row past the end of it, an edge added or\ntaken away, which is a pair the adjacency reader merges into or out\nof two lists and, where it was added, a row of the rel table's\nproperty columns, a row taken away, which is an offset every read of\nthe table filters by, and a label change, which is a word the reader\nanswers with in place of the bitset's."
     },
     {
       "id": "zu::write::Patches::added_rows",
@@ -5817,7 +5817,7 @@
       "name": "edges",
       "of": "zu::write::Patches",
       "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::graph::EdgePatch>>",
-      "doc": "New edges, by rel table."
+      "doc": "Edges added and edges taken away, by rel table."
     },
     {
       "id": "zu::write::Patches::gone",
@@ -5841,6 +5841,14 @@
       "name": "is_empty",
       "of": "zu::write::Patches",
       "signature": "fn is_empty(&self) -> bool"
+    },
+    {
+      "id": "zu::write::Patches::marks",
+      "kind": "field",
+      "name": "marks",
+      "of": "zu::write::Patches",
+      "signature": "std::collections::HashMap<u32, std::sync::Arc<zu::zu1::props::LabelPatch>>",
+      "doc": "The labels rows are left carrying, by table. A label is not a\ncolumn, so there is no cell to lay a value over: what is kept is\nthe whole word, composed where the commit was taken."
     },
     {
       "id": "zu::write::Patches::new",
@@ -8182,7 +8190,7 @@
       "id": "zu::zu1::graph::EdgePatch",
       "kind": "struct",
       "name": "EdgePatch",
-      "doc": "Read access to a bulk-loaded graph, caching the most recently decoded\ngroup per direction so sequential scans decode each group once. The\ntwo directions cache independently because a plan often walks both\non the same rel row by row, an expand backward feeding a count\nforward, and a shared slot would decode a full group per row.\nThe edges committed since the last fold, held the way a reader\nwants them rather than the way the log wrote them.\n\nAn edge added to a rel table does not have to wait for a fold to be\nreadable: the file holds a sorted list per node per direction, and\na handful of extra edges merge into one of those as it is read. So\na commit that only adds edges leaves them here, the reader merges,\nand the CSR is rebuilt once for the run of them rather than once\neach.\n\nAn edge's ordinal is its row in the rel table's property columns.\nThe base holds `base` of them, in the order the forward CSR lays\nthem out, and an edge in here takes the next one after those, so\nthe two spaces do not overlap and an unfolded edge names its own\nvalues. Both directions carry the ordinal, which is what makes the\nsame edge read forward and read backward carry the same row."
+      "doc": "Read access to a bulk-loaded graph, caching the most recently decoded\ngroup per direction so sequential scans decode each group once. The\ntwo directions cache independently because a plan often walks both\non the same rel row by row, an expand backward feeding a count\nforward, and a shared slot would decode a full group per row.\nThe edges committed since the last fold, held the way a reader\nwants them rather than the way the log wrote them.\n\nAn edge added to a rel table does not have to wait for a fold to be\nreadable: the file holds a sorted list per node per direction, and\na handful of extra edges merge into one of those as it is read. So\na commit that only adds edges leaves them here, the reader merges,\nand the CSR is rebuilt once for the run of them rather than once\neach.\n\nAn edge taken away is the same trade the other way round. It cannot\nbe tombstoned the way a row is, because a row is named by an offset\nthe reader already has in hand and an edge is named by the pair it\nruns between; so what is kept is the pair, and the merge drops it\nout of both lists on the way past. A `DETACH DELETE` is where they\ncome from, and it is the reason the row it took away can go without\nthe CSR being rebuilt around it.\n\nAn edge's ordinal is its row in the rel table's property columns.\nThe base holds `base` of them, in the order the forward CSR lays\nthem out, and an edge in here takes the next one after those, so\nthe two spaces do not overlap and an unfolded edge names its own\nvalues. Both directions carry the ordinal, which is what makes the\nsame edge read forward and read backward carry the same row."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::add",
@@ -8193,12 +8201,28 @@
       "doc": "Takes one edge and answers with the ordinal it was given."
     },
     {
+      "id": "zu::zu1::graph::EdgePatch::adds",
+      "kind": "method",
+      "name": "adds",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn adds(&self) -> u64",
+      "doc": "How many edges this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+    },
+    {
       "id": "zu::zu1::graph::EdgePatch::base",
       "kind": "method",
       "name": "base",
       "of": "zu::zu1::graph::EdgePatch",
       "signature": "fn base(&self) -> u64",
       "doc": "The first ordinal this patch handed out, so a caller holding one\ncan tell an edge in here from an edge in the file."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::drops",
+      "kind": "method",
+      "name": "drops",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn drops(&self, node: u64, other: u64, dir: Direction) -> bool",
+      "doc": "Whether this has taken away the edges between `node` and `other`,\n`node` being the end the list is keyed by."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::holds",
@@ -8213,15 +8237,8 @@
       "kind": "method",
       "name": "is_empty",
       "of": "zu::zu1::graph::EdgePatch",
-      "signature": "fn is_empty(&self) -> bool"
-    },
-    {
-      "id": "zu::zu1::graph::EdgePatch::len",
-      "kind": "method",
-      "name": "len",
-      "of": "zu::zu1::graph::EdgePatch",
-      "signature": "fn len(&self) -> u64",
-      "doc": "How many edges this holds, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether it has neither added nor taken anything away."
     },
     {
       "id": "zu::zu1::graph::EdgePatch::new",
@@ -8230,6 +8247,22 @@
       "of": "zu::zu1::graph::EdgePatch",
       "signature": "fn new(base: u64) -> Self",
       "doc": "An empty patch over a base holding `base` edges."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::remove",
+      "kind": "method",
+      "name": "remove",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn remove(&mut self, src: u64, dst: u64)",
+      "doc": "Takes one edge away, by the pair it runs between, which is every\ncopy of it the file holds."
+    },
+    {
+      "id": "zu::zu1::graph::EdgePatch::removed",
+      "kind": "method",
+      "name": "removed",
+      "of": "zu::zu1::graph::EdgePatch",
+      "signature": "fn removed(&self) -> u64",
+      "doc": "How many pairs it has taken away, the other half of the same\nbound."
     },
     {
       "id": "zu::zu1::graph::Ends",
@@ -8762,7 +8795,7 @@
       "id": "zu::zu1::props::CellPatch",
       "kind": "struct",
       "name": "CellPatch",
-      "doc": "The cell writes a commit made that no fold has sealed into the\ncolumns of one table yet.\n\nA commit used to fold because a reader read the sealed file and\nnothing else, so a change that was not folded was a change the next\n`MATCH` could not see. Rewriting a column to change one cell of it\nis most of what a point write cost. A reader holding one of these\nreads the column as it stands and puts the newer values over the\nrows the patch names, which is what lets the fold wait for the\ncheckpoint.\n\nA value goes over the value the row already holds, so what is\nrefused is the write that has nowhere to go over: a value taken\naway, which lives in the validity mask, and a label, which lives in\na bitset of its own. Both fold the way they always did."
+      "doc": "The cell writes a commit made that no fold has sealed into the\ncolumns of one table yet.\n\nA commit used to fold because a reader read the sealed file and\nnothing else, so a change that was not folded was a change the next\n`MATCH` could not see. Rewriting a column to change one cell of it\nis most of what a point write cost. A reader holding one of these\nreads the column as it stands and puts the newer values over the\nrows the patch names, which is what lets the fold wait for the\ncheckpoint.\n\nA value goes over the value the row already holds, so what is\nrefused is the write that has nowhere to go over: a value taken\naway, which lives in the validity mask. It folds the way it always\ndid. A label has a bitset of its own and [`LabelPatch`] carries it."
     },
     {
       "id": "zu::zu1::props::CellPatch::bytes",
@@ -8807,6 +8840,43 @@
       "name": "KeyedEdgesWithProps",
       "signature": "(Vec<(u64, u64)>, Vec<OwnedColumn>)",
       "doc": "The same pair for a rel file that names its endpoints by the ids a\nnode file gave its rows rather than by row offsets, which is what a\ndataset of many node tables is written with. Which row of which table\neach id is takes every node file to answer, so the translation is the\nloader's and not the reader's."
+    },
+    {
+      "id": "zu::zu1::props::LabelPatch",
+      "kind": "struct",
+      "name": "LabelPatch",
+      "doc": "The labels a commit put on rows that no fold has written into the\nbitset yet.\n\nA label change is written as a pair of masks, the bits to put on a\nrow and the bits to take off it, because two statements can name two\nlabels of one row and both have to land. What a reader wants is the\nword, so the composing is done once, on the way in: the writer reads\nthe word the row carried, puts the masks over it, and what is kept\nhere is the answer. That also puts the rules a change has to keep,\nwhich is the fold's business, where the row it lands on is known."
+    },
+    {
+      "id": "zu::zu1::props::LabelPatch::get",
+      "kind": "method",
+      "name": "get",
+      "of": "zu::zu1::props::LabelPatch",
+      "signature": "fn get(&self, row: u64) -> Option<u64>",
+      "doc": "The word `row` carries, `None` when no commit has named it and\nthe bitset underneath is the whole answer."
+    },
+    {
+      "id": "zu::zu1::props::LabelPatch::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::zu1::props::LabelPatch",
+      "signature": "fn is_empty(&self) -> bool"
+    },
+    {
+      "id": "zu::zu1::props::LabelPatch::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::zu1::props::LabelPatch",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many rows this names, which is what a writer bounds when it\ndecides whether to keep deferring the fold."
+    },
+    {
+      "id": "zu::zu1::props::LabelPatch::set",
+      "kind": "method",
+      "name": "set",
+      "of": "zu::zu1::props::LabelPatch",
+      "signature": "fn set(&mut self, row: u64, word: u64)",
+      "doc": "Puts `word` on `row`, which is what the row carries from here\nuntil a fold seals it."
     },
     {
       "id": "zu::zu1::props::ListElement",
@@ -9180,7 +9250,7 @@
       "name": "has_labels",
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn has_labels(&self) -> bool",
-      "doc": "Whether the table stores a label bitset at all, which is what\nsays whether a scan has a word to read per row."
+      "doc": "Whether the table has a label bitset at all, which is what says\nwhether a scan has a word to read per row. A commit that has not\nfolded counts: its words are labels the rows carry, and the\nfirst of them on a table that stored none is the reason the\nbitset is about to exist."
     },
     {
       "id": "zu::zu1::props::PropsReader::is_nullable",
@@ -9274,6 +9344,14 @@
       "of": "zu::zu1::props::PropsReader",
       "signature": "fn set_added(&mut self, added: Option<Arc<RowPatch>>)",
       "doc": "The same for the committed rows past the end of them."
+    },
+    {
+      "id": "zu::zu1::props::PropsReader::set_marks",
+      "kind": "method",
+      "name": "set_marks",
+      "of": "zu::zu1::props::PropsReader",
+      "signature": "fn set_marks(&mut self, marks: Option<Arc<LabelPatch>>)",
+      "doc": "And for the labels the bitset does not carry yet."
     },
     {
       "id": "zu::zu1::props::PropsReader::set_patch",
@@ -9442,6 +9520,13 @@
       "name": "store_rel_props_owned",
       "signature": "fn store_rel_props_owned(db: &mut zu_zu1::file::Zu1File, rel_table: &str, columns: &[OwnedColumn]) -> zu_common::Result<PropsDirectory>",
       "doc": "The same store, for columns a caller holds whole rather than as\nborrowed slices, which is what a parquet edge list produces.\n\nThe string arm is the only reason this exists: `PropValues::Str`\nwants a slice of slices and an owned column has a vector of\nvectors, so the pointers have to live somewhere for the length of\nthe call."
+    },
+    {
+      "id": "zu::zu1::props::stored_label_word",
+      "kind": "function",
+      "name": "stored_label_word",
+      "signature": "fn stored_label_word(db: &mut zu_zu1::file::Zu1File, directory: &PropsDirectory, row: u64) -> zu_common::Result<Option<u64>>",
+      "doc": "The label word row `row` carries in a stored bitset, `None` when the\ntable stores none or the row is past the end of it, which is a row\ncarrying its table's own label and nothing else.\n\nThis is [`PropsReader::label_word`] for a caller holding a directory\nrather than a reader, which is the write side: it asks once per\nstatement, to put a change's masks over the word the row had, so\nthere is nothing for a cache to save."
     },
     {
       "id": "zu::zu1::reorder",
@@ -10063,6 +10148,14 @@
       "doc": "A value written onto a column of a row that is already there."
     },
     {
+      "id": "zu::zu1::txn::Deferred::DeadRel",
+      "kind": "variant",
+      "name": "DeadRel",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "DeadRel(u32, u64, u64)",
+      "doc": "An edge taken away: the rel table and the pair it ran between.\nA pair is the whole name of an edge, so this takes every copy of\nit, which is what the fold does with the same pair."
+    },
+    {
       "id": "zu::zu1::txn::Deferred::Edge",
       "kind": "variant",
       "name": "Edge",
@@ -10077,6 +10170,22 @@
       "of": "zu::zu1::txn::Deferred",
       "signature": "Gone(u32, u64)",
       "doc": "A row taken away: the table and the offset it kept. Nothing of\nthe row moves, here or in a fold, so what a reader is handed is\nthe offset and what makes the row gone is the reader."
+    },
+    {
+      "id": "zu::zu1::txn::Deferred::Labels",
+      "kind": "variant",
+      "name": "Labels",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "Labels(u32, u64, u64, u64)",
+      "doc": "Labels put on a row and taken off it: the table, the offset, and\nthe two masks the change was written as, which are disjoint."
+    },
+    {
+      "id": "zu::zu1::txn::Deferred::Marks",
+      "kind": "variant",
+      "name": "Marks",
+      "of": "zu::zu1::txn::Deferred",
+      "signature": "Marks(u32, u64, u64)",
+      "doc": "The labels a row is left carrying, whole: the table, the offset\nand the word. A change is a pair of masks and a reader wants the\nword, so the writer reads what the row carried, puts the masks\nover it, and hands on the answer. Only the writer makes one of\nthese, out of the [`Deferred::Labels`] it was given."
     },
     {
       "id": "zu::zu1::txn::Deferred::RelCell",

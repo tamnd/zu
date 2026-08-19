@@ -1208,6 +1208,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
         BoundExpr::Literal(Literal::Str(s)) => format!("'{s}'"),
         BoundExpr::Literal(Literal::Temporal(t)) => t.to_string(),
         BoundExpr::Param(ix) => format!("${}", query.params[*ix]),
+        BoundExpr::Graph(handle) => handle.label(),
         // The query itself is not written out here: this text titles an
         // operator, and a whole query inside one reads worse than the
         // reference does. [`explain`] prints the plan for it under the

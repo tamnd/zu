@@ -226,3 +226,43 @@ cases:
       - values:
           - type: STRING
             value: kept
+
+  - name: the-working-graph-is-a-value
+    doc: ISO 19.6 lets a graph stand where a value stands, and CURRENT_PROPERTY_GRAPH is the graph the statement is already running against. The answer is a reference and not the graph, so what is asked here is the type of it, which is the one thing about a reference every engine can agree on.
+    query: RETURN CURRENT_PROPERTY_GRAPH IS TYPED GRAPH AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-short-and-long-spellings-name-one-graph
+    doc: CURRENT_GRAPH and CURRENT_PROPERTY_GRAPH are the same words twice, as they are in the USE clause, so the two references are references to one graph and compare equal. Two references are equal when they name the same graph, which is what makes a reference a value rather than a moment.
+    query: RETURN CURRENT_GRAPH = CURRENT_PROPERTY_GRAPH AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: a-session-that-has-not-moved-is-in-its-home-graph
+    doc: The home graph is the one a session started in and the working graph is the one it is in now, and nothing here has moved it, so the two name one graph. A client that answers false has either moved the session or is comparing when the references were taken rather than what they name.
+    query: RETURN HOME_PROPERTY_GRAPH = CURRENT_PROPERTY_GRAPH AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: graph-is-still-a-name
+    doc: The words that name a graph are whole references on their own, and graph is not one of them, so a query may still bind a variable called graph and read it back.
+    query: LET graph = 'kept' RETURN graph AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: kept

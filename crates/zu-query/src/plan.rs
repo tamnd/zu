@@ -358,6 +358,46 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                     rels: rels.clone(),
                 };
             }
+            BoundClause::Merge {
+                probe,
+                filter,
+                nodes,
+                rels,
+                on_match,
+                ..
+            } => {
+                // What the statement does, as one plan: look for the
+                // pattern, write what was not there, change what was.
+                // The session runs it from the clause rather than from
+                // this, because the write in the middle decides which
+                // rows each side runs for and one plan has nowhere to
+                // say that. This is what an EXPLAIN of the statement
+                // reads, so it says the same thing in the same order.
+                groups += 1;
+                let group = Some(Bracket {
+                    id: groups - 1,
+                    kind: BracketKind::Optional,
+                });
+                plan = build_path(plan, probe, &mut bound, group)?;
+                if let Some(expr) = filter {
+                    plan = LogicalPlan::Filter {
+                        input: plan.boxed(),
+                        expr: expr.clone(),
+                        bracket: group,
+                    };
+                }
+                plan = LogicalPlan::Insert {
+                    input: plan.boxed(),
+                    nodes: nodes.clone(),
+                    rels: rels.clone(),
+                };
+                if !on_match.is_empty() {
+                    plan = LogicalPlan::Set {
+                        input: plan.boxed(),
+                        items: on_match.clone(),
+                    };
+                }
+            }
             BoundClause::Set { items, .. } => {
                 plan = LogicalPlan::Set {
                     input: plan.boxed(),

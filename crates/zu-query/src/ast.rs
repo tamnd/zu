@@ -366,6 +366,20 @@ pub enum Clause {
     /// here is a description of an element to create rather than one to
     /// look for.
     Insert { patterns: Vec<PathPattern> },
+    /// `MERGE (p:person {id: 7})`, the statement that finds a pattern
+    /// or writes it (Cypher; GQL has no word for it). Exactly one
+    /// pattern, because what the statement does with two of them, find
+    /// one and write the other, is not a thing it could mean.
+    ///
+    /// `ON CREATE SET` runs on the rows the pattern was written for and
+    /// `ON MATCH SET` on the rows it was found for, so between them
+    /// every row the statement ran for is covered once. Either may be
+    /// left out and neither may be written twice.
+    Merge {
+        pattern: PathPattern,
+        on_create: Vec<SetItem>,
+        on_match: Vec<SetItem>,
+    },
     /// `SET p.age = 37`, the statement that changes what an element
     /// already there holds (ISO 13.3). The element is named by a
     /// variable an earlier clause bound, because a statement changes

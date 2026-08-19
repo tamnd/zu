@@ -88,8 +88,15 @@ fn page_layout() -> Layout {
 /// megabyte is the point where the syscall has stopped mattering.
 pub const PROVISION_CHUNK: u64 = 1 << 20;
 
-/// What the flusher and the sync committers share.
-struct Flushing {
+/// What the thread doing the device write owns while it does it.
+///
+/// Only the leader of a group ever holds this, and leadership is decided
+/// under [`Flushing`], so the lock is uncontended by construction. It is
+/// a separate lock rather than a field of `Flushing` for one reason: the
+/// device write happens with `Flushing` released, so that the threads
+/// arriving during it can queue up and be served by the write instead of
+/// waiting to start one of their own.
+struct Device {
     /// The address up to which bytes have been written to the file but
     /// not necessarily synced.
     written: Address,
@@ -99,6 +106,18 @@ struct Flushing {
     /// Cleared when the filesystem refuses to provision, so the log
     /// stops asking. It is slower and not wrong.
     provisions: bool,
+}
+
+/// Who is allowed to write to the device, and whether the log is closing.
+///
+/// Short critical sections only. A committer holds this to find out
+/// whether somebody is already writing, and either becomes the leader or
+/// waits on `synced` for the leader to publish, which is what makes one
+/// device write serve a whole group.
+struct Flushing {
+    /// Set while a thread is between claiming the device and publishing
+    /// what it wrote.
+    syncing: bool,
     /// Set when the log is closing, so the flusher stops after a final
     /// pass.
     stopping: bool,
@@ -143,6 +162,18 @@ pub struct Log {
     file: File,
     path: PathBuf,
     flushing: Mutex<Flushing>,
+    /// Woken when a group's device write has landed and been published.
+    ///
+    /// A committer that finds a sync in progress waits here rather than
+    /// on the lock. Waking every waiter at once is the point: a leader's
+    /// write covers everything appended before it started, so most of
+    /// the threads it wakes find themselves already durable and go
+    /// straight back to work. Waiting on the lock instead meant they
+    /// found that out one at a time, in whatever order the platform
+    /// handed the lock out, and a writer that never lost the lock
+    /// starved the rest for as long as it kept committing.
+    synced: Condvar,
+    device: Mutex<Device>,
     /// Woken when there is something to flush.
     dirty: Condvar,
     dirty_lock: Mutex<bool>,
@@ -190,10 +221,14 @@ impl Log {
             file,
             path: path.to_path_buf(),
             flushing: Mutex::new(Flushing {
+                syncing: false,
+                stopping: false,
+            }),
+            synced: Condvar::new(),
+            device: Mutex::new(Device {
                 written: FIRST,
                 provisioned: 0,
                 provisions: provision_bytes > 0,
-                stopping: false,
             }),
             provision_bytes,
             syncs: AtomicU64::new(0),
@@ -346,7 +381,7 @@ impl Log {
         self.flushed.store(address, Ordering::Release);
         self.flush_target.store(address, Ordering::Release);
         self.read_only.store(address, Ordering::Release);
-        let mut state = self.flushing.lock().expect("zu2 flush state");
+        let mut state = self.device.lock().expect("zu2 device state");
         state.written = address;
         // Whatever the file already has is provisioned, whether it was
         // reserved by a previous run or written by one. Starting from
@@ -643,7 +678,7 @@ impl Log {
     /// Called under the flush mutex, which is what makes the watermark
     /// safe to keep as a plain field: the only other thing that moves it
     /// is [`Log::trim_tail`], and that takes the same mutex.
-    fn provision(&self, state: &mut Flushing, upto: Address) {
+    fn provision(&self, state: &mut Device, upto: Address) {
         // The trigger is the frontier reaching the reservation rather
         // than the reservation being short of where it would ideally
         // be, so this runs once per chunk and not once per flush.
@@ -712,7 +747,7 @@ impl Log {
     /// same call everywhere and because a shorter file is also a shorter
     /// recovery scan.
     pub fn trim_tail(&self) -> Result<()> {
-        let mut state = self.flushing.lock().expect("zu2 flush state");
+        let mut state = self.device.lock().expect("zu2 device state");
         let frontier = state.written.max(self.tail());
         let keep = frontier.div_ceil(file::BLOCK) * file::BLOCK;
         if state.provisioned <= keep {
@@ -729,7 +764,7 @@ impl Log {
     /// `committing` says whether somebody is waiting for this. Only a
     /// commit provisions, because only a commit is paying the metadata
     /// cost with a thread that is standing still.
-    fn write_and_sync(&self, state: &mut Flushing, upto: Address, committing: bool) -> Result<()> {
+    fn write_and_sync(&self, state: &mut Device, upto: Address, committing: bool) -> Result<()> {
         if committing {
             self.provision(state, upto);
         }
@@ -762,20 +797,55 @@ impl Log {
         Ok(())
     }
 
-    /// One pass of the flusher: snapshot, wait for the writers below
-    /// the snapshot to finish, write, sync, publish.
+    /// One pass of the flusher: claim the device, snapshot, wait for the
+    /// writers below the snapshot to finish, write, sync, publish.
+    ///
+    /// A pass that finds a commit already at the device gives up rather
+    /// than queueing behind it. The commit is taking the same range and
+    /// the flusher has nothing to add, and a flusher standing in the
+    /// group's way would only make the next pass later.
     pub fn flush_once(&self) -> Result<()> {
         let upto = self.tail();
         if upto <= self.flushed() {
             return Ok(());
         }
-        self.flush_target.fetch_max(upto, Ordering::SeqCst);
-        self.wait_for_writers(upto);
-        let mut state = self.flushing.lock().expect("zu2 flush state");
-        if upto <= self.flushed() {
-            return Ok(());
+        {
+            let mut state = self.flushing.lock().expect("zu2 flush state");
+            if state.syncing || upto <= self.flushed() {
+                return Ok(());
+            }
+            state.syncing = true;
         }
-        self.write_and_sync(&mut state, upto, false)
+        let outcome = self.sync_range(upto, false);
+        self.release_device();
+        outcome
+    }
+
+    /// The device write itself, done by whichever thread holds the
+    /// claim. Everything below `target` goes to the file and the file
+    /// goes to the device, and `flushed` moves last.
+    ///
+    /// The target is published before the wait so that a session
+    /// starting later refuses to update anything below it in place, and
+    /// the wait then covers the sessions that were already running. Both
+    /// halves are needed: without the target a later writer could edit
+    /// bytes this thread is about to read, and without the wait an
+    /// earlier one could still be mid-record.
+    fn sync_range(&self, target: Address, committing: bool) -> Result<()> {
+        self.flush_target.fetch_max(target, Ordering::SeqCst);
+        self.wait_for_writers(target);
+        let mut device = self.device.lock().expect("zu2 device state");
+        self.write_and_sync(&mut device, target, committing)
+    }
+
+    /// Hands the device back and tells everyone waiting on it, whether
+    /// the write worked or not. A leader that failed still has to wake
+    /// its followers, or they wait for a group that is never coming.
+    fn release_device(&self) {
+        let mut state = self.flushing.lock().expect("zu2 flush state");
+        state.syncing = false;
+        drop(state);
+        self.synced.notify_all();
     }
 
     /// Whether the log has been told to shut down.
@@ -799,6 +869,14 @@ impl Log {
     }
 
     /// Makes everything below `upto` durable according to `mode`.
+    ///
+    /// One device write per group, not per commit. A thread that finds
+    /// its record already durable is done, a thread that finds nobody at
+    /// the device claims it, and a thread that finds somebody there
+    /// waits for them to publish and then asks again. The leader takes
+    /// everything appended so far and not just its own record, so the
+    /// threads that were waiting behind it usually wake up durable and
+    /// return without touching the device at all.
     pub fn make_durable(&self, upto: Address, mode: Durability) -> Result<()> {
         if mode == Durability::Async {
             return Ok(());
@@ -808,30 +886,30 @@ impl Log {
             return Ok(());
         }
         let mut state = self.flushing.lock().expect("zu2 flush state");
-        if self.flushed() >= upto {
-            // A leader flushed past this record while this thread was
-            // waiting for the mutex, which is the arrangement working:
-            // one device write served both commits.
-            return Ok(());
+        loop {
+            if self.flushed() >= upto || state.stopping {
+                // Either a leader took this record to the device while
+                // this thread was getting here, which is the whole
+                // arrangement working, or the log is closing and the
+                // last pass will take it.
+                return Ok(());
+            }
+            if !state.syncing {
+                break;
+            }
+            state = self.synced.wait(state).expect("zu2 sync wait");
         }
-        if state.stopping {
-            return Ok(());
-        }
+        state.syncing = true;
+        drop(state);
         // Everything appended so far rather than just this record. The
-        // device write costs the same either way and the threads queued
-        // behind this one are already inside the range, so they will
-        // find themselves durable when they get the mutex.
-        //
-        // The target is published before the wait so that a session
-        // starting later refuses to update anything below it in place,
-        // and the wait then covers the sessions that were already
-        // running. Both halves are needed: without the target a later
-        // writer could edit bytes this thread is about to read, and
-        // without the wait an earlier one could still be mid-record.
+        // device write costs the same either way, and the threads that
+        // queued while the last group was at the device are already
+        // inside this range, so they will find themselves durable when
+        // this one publishes.
         let target = self.tail().max(upto);
-        self.flush_target.fetch_max(target, Ordering::SeqCst);
-        self.wait_for_writers(target);
-        self.write_and_sync(&mut state, target, true)
+        let outcome = self.sync_range(target, true);
+        self.release_device();
+        outcome
     }
 
     /// Stops the flusher after one last pass.

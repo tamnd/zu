@@ -1174,7 +1174,7 @@ fn item_text(item: &BoundItem, query: &BoundQuery) -> String {
 
 /// What a function is called in a plan listing, which is the name the
 /// query wrote it under.
-fn func_name(func: Func) -> &'static str {
+pub(crate) fn func_name(func: Func) -> &'static str {
     match func {
         Func::Count => "count",
         Func::Sum => "sum",
@@ -1189,6 +1189,11 @@ fn func_name(func: Func) -> &'static str {
         Func::Elements => "elements",
         Func::AllDifferent => "all_different",
         Func::Same => "same",
+        Func::CharLength => "char_length",
+        Func::OctetLength => "octet_length",
+        Func::Upper => "upper",
+        Func::Lower => "lower",
+        Func::Trim => "trim",
     }
 }
 
@@ -1243,6 +1248,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
                 BinaryOp::StartsWith => "STARTS WITH",
                 BinaryOp::EndsWith => "ENDS WITH",
                 BinaryOp::Contains => "CONTAINS",
+                BinaryOp::Concat => "||",
             };
             format!(
                 "{} {symbol} {}",

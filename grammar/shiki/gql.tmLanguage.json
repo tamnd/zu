@@ -113,7 +113,7 @@
     },
     "function": {
       "name": "support.function.gql",
-      "match": "(?i)\\b(COUNT|SUM|AVG|MIN|MAX|COLLECT|ID|SIZE|CARDINALITY|PATH_LENGTH|ELEMENTS|ALL_DIFFERENT|SAME|PROPERTY_EXISTS)\\b(?=\\s*\\()"
+      "match": "(?i)\\b(COUNT|SUM|AVG|MIN|MAX|COLLECT|ID|SIZE|CARDINALITY|PATH_LENGTH|ELEMENTS|ALL_DIFFERENT|SAME|PROPERTY_EXISTS|CHAR_LENGTH|CHARACTER_LENGTH|OCTET_LENGTH|UPPER|LOWER|TRIM)\\b(?=\\s*\\()"
     },
     "algorithm": {
       "name": "support.function.graph.gql",

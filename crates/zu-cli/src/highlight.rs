@@ -446,6 +446,7 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "NORMALIZE",
     "OTHERWISE",
     "DESCENDING",
+    "ELEMENT_ID",
     "HOME_GRAPH",
     "NORMALIZED",
     "ORDINALITY",

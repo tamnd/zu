@@ -1594,6 +1594,22 @@ pub enum Func {
     Max,
     Collect,
     Id,
+    /// G100, ISO 20.10. An identifier for an element, node or edge.
+    ///
+    /// What the identifier is, the standard leaves to the engine, and
+    /// it lists the choice in both its implementation-defined and its
+    /// implementation-dependent tables. zu answers a string rather than
+    /// a number, because the one thing an identifier has to do is name
+    /// one element, and a number that is the node's offset would be the
+    /// same number as some edge's, so a query holding two of these
+    /// could not tell whether it was holding one element twice. The
+    /// spelling is written down in the conformance declaration, since a
+    /// client that stores one of these is relying on it.
+    ///
+    /// This is not `ID`. `ID` answers a node's offset as an integer and
+    /// null for an edge, which is zu's own function and older than the
+    /// standard's; both stay, under the names they are asked for.
+    ElementId,
     Size,
     /// GF12. The element count of a list, which is `SIZE` asked for by
     /// its other name and refused on anything that is not a list.
@@ -1655,6 +1671,7 @@ impl Func {
             "max" => Func::Max,
             "collect" => Func::Collect,
             "id" => Func::Id,
+            "element_id" => Func::ElementId,
             "size" => Func::Size,
             "cardinality" => Func::Cardinality,
             "path_length" => Func::PathLength,
@@ -5208,6 +5225,17 @@ impl Binder<'_> {
                     return Err(bad_type(format!("id() needs a node or rel, got {arg_ty}")));
                 }
                 Type::Int
+            }
+            // ISO 20.10 writes the argument as an element variable
+            // reference, so a list or a number is refused here rather
+            // than at the row, and the answer is a string.
+            Func::ElementId => {
+                if !matches!(arg_ty, Type::Node | Type::Rel | Type::Any) {
+                    return Err(bad_type(format!(
+                        "element_id() needs a node or an edge, got {arg_ty}"
+                    )));
+                }
+                Type::Str
             }
             Func::Size => {
                 // A path is its alternating node and rel list, so

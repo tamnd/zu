@@ -87,24 +87,24 @@ That sentence is the work this page is asking for. A result that keeps the vecto
 
 The row path keeps working because a row is a gather across vectors at a known offset, which is what `fetchall` would do instead of what it does now. Whether it stays as fast is the thing to measure rather than assume, and it is the reason this is staged behind a benchmark rather than declared.
 
-## 5. TypeScript is a milestone behind, not a factor behind
+## 5. TypeScript was a milestone behind, and is most of the way back
 
-The Python client is a fast client with one slow path. The TypeScript client is a smaller client.
+The Python client is a fast client with one slow path. The TypeScript client was a smaller client, and the list below is what it was missing when this page was first written.
 
-What it has: `query`, `exec`, `cursor`, `stream` with async iteration and Web Streams, `AbortSignal` wired to the interrupt, `await using`, the four temporal value classes with `toTemporal()`, `bigint` by default with a documented opt out, and the full error model with codes, positions and doc URLs. That is a good client and the parts of it that exist are idiomatic.
+What it had: `query`, `exec`, `cursor`, `stream` with async iteration and Web Streams, `AbortSignal` wired to the interrupt, `await using`, the four temporal value classes with `toTemporal()`, `bigint` by default with a documented opt out, and the full error model with codes, positions and doc URLs. That was a good client and the parts of it that existed were idiomatic.
 
-What it has not, all of which `zu-python` has:
+What it had not, all of which `zu-python` had:
 
-- no transactions, so a program cannot make several statements one
-- no appender, so there is no fast way to add rows to a table that exists
-- no `register`, so the zero-copy frame path, the fastest thing this engine does across a boundary, is not reachable from Node at all
-- no bulk load, so a program cannot build a database from Node
-- no Arrow, no columnar read of any kind
-- no `rowsRead` and no progress callback
+- no transactions, so a program could not make several statements one, which `transaction()` now does
+- no appender, so there was no fast way to add rows to a table that exists, which `appender()` now does
+- no `register`, so the zero-copy frame path, the fastest thing this engine does across a boundary, was not reachable from Node at all, which `register` now is
+- no bulk load, so a program could not build a database from Node, which `load` now does
+- no Arrow, no columnar read of any kind, of which `columnar` is the second half: the same buffers `zu::query::column` fills, handed over as typed arrays, with Arrow itself still owed
+- no `rowsRead` and no progress callback, which is the one row of the list still open
 
-The last one is the one to look at first alongside the numbers. `duck runAndReadAll getColumns` is 333 ms where the same rows as objects are 615 ms, and our own object path is 3198 ms. A columnar read is the single largest thing missing, and it is also the one that a columnar result would make cheap to add.
+The columnar read was the one to look at first alongside the numbers. `duck runAndReadAll getColumns` is 333 ms where the same rows as objects are 615 ms, and our own object path is 3198 ms. It was the single largest thing missing, and it was also the one that a columnar result made cheap to add.
 
-And a program cannot build a database from Node at all. `connect` creates the file, `CREATE NODE TABLE` answers `42001 not implemented`, and there is no loader and no appender on the surface, so the only way in is an `INSERT` per row. That is a first-run experience of an empty file and no way to fill it, and it is why the client scorecard's `api-map` item cannot pass for either client today: the ledger puts `explain`, `profile`, `prepare` and prepared statements at tier 1, and neither client names any of them.
+A program could not build a database from Node at all. `connect` created the file, `CREATE NODE TABLE` answers `42001 not implemented`, and there was no loader and no appender on the surface, so the only way in was an `INSERT` per row: a first-run experience of an empty file and no way to fill it. `load` and `appender()` are the answer to that, and `prepare`, `explain` and `profile` are the answer to the client scorecard's `api-map` item, which the ledger puts at tier 1 and which neither client named when this was written.
 
 ## 6. The surface, item by item
 
@@ -112,19 +112,19 @@ DuckDB's Python connection has 71 public members and its module 181. Ours has 14
 
 | DuckDB | zu-python | zu-node | verdict |
 |---|---|---|---|
-| `connect()` with no path, in memory | needs a path, and `':memory:'` makes a file called that | needs a path | owed, and the `':memory:'` behaviour is a bug |
+| `connect()` with no path, in memory | `connect()`, and `':memory:'` means the same | `connect()`, and `':memory:'` means the same | done |
 | `sql` / `execute` / module-level default connection | `execute`, `sql` | `query`, `exec` | done, minus the module-level default |
 | `fetchall`, `fetchone`, `fetchmany` | `fetchall`, `fetchone` | rows are an array | `fetchmany` owed for DB-API |
-| `arrow()`, `fetch_arrow_table` | `to_arrow`, off the engine's own buffers | none | owed for Node, 4.5x for Python |
-| `fetch_record_batch` streaming | `record_batches`, zero-copy slices of a materialized result | none | owed, real streaming |
+| `arrow()`, `fetch_arrow_table` | `to_arrow`, off the engine's own buffers | `columnar`, the same buffers as typed arrays | Arrow itself owed for Node, 4.5x for Python |
+| `fetch_record_batch` streaming | `record_batches`, zero-copy slices of a materialized result | `stream`, as batches of rows | owed, real streaming |
 | `df()`, `pl()`, `fetchnumpy()`, `torch()`, `tf()` | `to_pandas`, `to_polars` | none | numpy owed, torch and tf are not our lane |
-| `register` / `unregister` | `register` / `unregister`, faster | none | owed for Node |
-| `append(table, df)` | `appender()` | none | owed for Node |
-| `begin` / `commit` / `rollback` | `transaction()` | none | owed for Node |
+| `register` / `unregister` | `register` / `unregister`, faster | `register` / `unregister` | done |
+| `append(table, df)` | `appender()` | `appender()`, and `load` for a whole database | done |
+| `begin` / `commit` / `rollback` | `transaction()` | `transaction()` | done |
 | `interrupt()`, `query_progress()` | `interrupt()`, `rows_read` | `AbortSignal` only | progress owed for Node |
 | `cursor()` / `duplicate()` | none | none | owed, it is how a pool is written |
-| prepared statements | none | none | owed, tier 1 in the ledger |
-| `explain`, profiling | none | none | owed, tier 1 in the ledger |
+| prepared statements | `prepare()` | `prepare()` | done |
+| `explain`, profiling | `explain()`, `profile()` | `explain()`, `profile()` | done |
 | `create_function` UDFs, Arrow-vectorised | none | none | not this milestone |
 | relational API, 111 members | none | none | deliberately not |
 | Spark API | none | none | deliberately not |
@@ -140,9 +140,9 @@ In order, largest effect first.
 
 1. A columnar result, in two halves. The first is a result read down its columns at all, in the engine rather than in each client, which is `zu::query::column` and is done: one buffer per column in Arrow's own layout, filled in two passes over the rows instead of two per column, so the transpose happens once and correctly. The second is the executor keeping the vectors it already computes in, so that `Vec<Vec<Value>>` becomes something the row path gathers rather than something every other path unpicks and the transpose stops happening at all. The first half is what a client can use today; the second is the one that touches the engine, and it changes no client, because the type it fills is already the one they read.
 2. Arrow export as a handoff, which is done for Python. `to_arrow`, `__arrow_c_stream__` and `record_batches` are a description of the buffers `zu::query::column` filled and a release callback, with no copy for the physical types whose layout is already Arrow's, and a batch is a slice cut when the reader asks for it. The export alone went from 103 ms to 26 ms on a million rows, and 22 of the 26 are the transpose that item 1's second half removes. The same handoff is owed for Node, where it is item 3.
-3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result.
-4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on.
+3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result. Done, all five. Arrow itself over the C Data Interface is what is left of it, and it is item 2's other half.
+4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on. Done in both.
 5. Real streaming, meaning a result read a chunk at a time as the executor produces it rather than a slice of a result that is already whole.
-6. The small ones: an in-memory connection that does not make a file, `cursor()`, `fetchmany`, `fetchnumpy`, and a progress callback in Node.
+6. The small ones: an in-memory connection that does not make a file, which is done in both and is the engine's own answer rather than a special case in either client, and then `cursor()`, `fetchmany`, `fetchnumpy`, and a progress callback in Node.
 
-Item 1's second half is the only thing left that the live measurement asks for, and it is 22 of the 26 milliseconds. Items 3 and 4 are what the scorecard is blocked on. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.
+Item 1's second half is the only thing left that the live measurement asks for, and it is 22 of the 26 milliseconds. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.

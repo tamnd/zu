@@ -161,7 +161,7 @@ impl SnapshotCache {
     /// commit that does not fold does not move the columns they
     /// describe, so the only thing that has changed about them is what
     /// they read on top.
-    pub fn set_patches(&mut self, patches: Arc<Patches>) {
+    pub fn set_patches(&mut self, patches: Arc<Patches>, catalog: &Catalog) {
         for (table, reader) in &mut self.props {
             if let Some(reader) = reader {
                 reader.set_patch(patches.cells.get(table).cloned());
@@ -170,6 +170,8 @@ impl SnapshotCache {
         }
         for (rel, reader) in &mut self.readers {
             reader.set_edges(patches.edges.get(rel).cloned());
+            let [from, to] = patches.grown(catalog, *rel);
+            reader.set_grown(from, to);
         }
         // The chains stay: they are the file's and the file has not
         // moved. What the merge above them said is what a commit can
@@ -234,6 +236,8 @@ impl<'a> Zu1Snapshot<'a> {
             .clone();
         let mut reader = GraphReader::load_table(&mut self.db, &name)?;
         reader.set_edges(self.patches.edges.get(&rel).cloned());
+        let [from, to] = self.patches.grown(&self.catalog, rel);
+        reader.set_grown(from, to);
         self.readers.insert(rel, reader);
         Ok(())
     }
@@ -272,6 +276,26 @@ impl<'a> Zu1Snapshot<'a> {
         });
         self.props.insert(rel, reader);
         Ok(())
+    }
+
+    /// The row a commit added under key `key`, `None` when no unfolded
+    /// row holds it. See [`crate::query::Zu1Graph`], which answers a
+    /// key the same way.
+    fn appended_key(&mut self, table: u32, key: u64) -> Result<Option<u64>> {
+        let Some(rows) = self.patches.rows.get(&table).cloned() else {
+            return Ok(None);
+        };
+        self.ensure_props(table)?;
+        let Some(col) = self
+            .props
+            .get(&table)
+            .expect("just loaded")
+            .as_ref()
+            .and_then(|reader| reader.col("id"))
+        else {
+            return Ok(None);
+        };
+        Ok(rows.row_with(col, key))
     }
 
     /// Reads the deleted set once per snapshot, or per epoch when a
@@ -452,11 +476,14 @@ impl Snapshot for Zu1Snapshot<'_> {
         if let Some(frame) = self.frames.get(table) {
             return Ok(frame.rows());
         }
+        // The catalog is the file's and a commit that did not fold
+        // wrote no catalog, so the rows it added are on top of it.
         Ok(self
             .catalog
             .node_by_id(table)
             .ok_or_else(|| ZuError::InvalidArgument(format!("unknown node table {table}")))?
-            .node_count)
+            .node_count
+            + self.patches.added_rows(table))
     }
 
     fn resolve_col(&mut self, table: TableId, name: &str) -> Result<Option<(ColId, ColType)>> {
@@ -782,12 +809,20 @@ impl Snapshot for Zu1Snapshot<'_> {
         {
             Some(rel) => {
                 self.ensure_reader(rel)?;
-                let Self { db, readers, .. } = self;
-                let reader = readers.get_mut(&rel).expect("just loaded");
-                if reader.directory().keys.is_none() {
-                    Some(key)
-                } else {
-                    reader.lookup_key(db, key)?
+                let found = {
+                    let Self { db, readers, .. } = self;
+                    let reader = readers.get_mut(&rel).expect("just loaded");
+                    match reader.directory().keys.is_none() {
+                        true => Some(key),
+                        false => reader.lookup_key(db, key)?,
+                    }
+                };
+                match found {
+                    Some(row) => Some(row),
+                    // The index is the file's and a deferred commit
+                    // rewrites nothing, so a row it added is in no
+                    // index and the patch is where its key is.
+                    None => self.appended_key(table, key)?,
                 }
             }
             None => Some(key),

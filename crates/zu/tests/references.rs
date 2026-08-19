@@ -151,8 +151,14 @@ fn session_run(session: &mut Session, source: &str) -> zu::query::QueryResult {
 /// so once a write has moved the session on, the values in such a
 /// table name rows that may now belong to something else, and the
 /// statement is refused rather than told a plausible wrong answer.
+///
+/// Not every write moves it. An appended row is handed to the readers
+/// on a patch and the rows that were already there stay where they
+/// were, so a table taken before one still names what it named. A
+/// label set rewrites the column it is on and folds, and that is the
+/// write this checks.
 #[test]
-fn a_table_holding_elements_does_not_survive_a_write() {
+fn a_table_holding_elements_does_not_survive_a_fold() {
     let (_dir, mut session) = opened("table-epoch.zu1");
     let rows = session_run(&mut session, "MATCH (p:person) RETURN p.id AS id");
     let scalars = session.binding_table(rows);
@@ -161,6 +167,12 @@ fn a_table_holding_elements_does_not_survive_a_write() {
 
     session
         .run("INSERT (p:person {name: 'zoe'})", &[])
+        .expect("a write the readers are handed on a patch");
+    let params = [("t", elements.clone())];
+    yes(&mut session, "$t IS TYPED BINDING TABLE", &params);
+
+    session
+        .run("MATCH (p:person) WHERE p.id = 0 SET p:bot", &[])
         .expect("a write, which moves the epoch on");
 
     yes(&mut session, "$t IS TYPED BINDING TABLE", &[("t", scalars)]);

@@ -1595,6 +1595,12 @@ pub struct GraphReader {
     /// file nothing is being written to, which is every read path but
     /// the session's own.
     edges: Option<Arc<EdgePatch>>,
+    /// Rows the two node tables have taken on since the last fold, the
+    /// source end first. The CSR is built over the rows the file held
+    /// when it was written, so a row appended after that has no slot in
+    /// it, and every read below answers for one without going near the
+    /// group it would have been in.
+    grown: [u64; 2],
     /// Where a merged list is built, so a caller asking for a slice
     /// gets one without an allocation per call.
     merged: Vec<(u64, u64)>,
@@ -1650,6 +1656,7 @@ impl GraphReader {
             cached_offsets: [None, None],
             key_reader: None,
             edges: None,
+            grown: [0, 0],
             merged: Vec::new(),
             flat: Vec::new(),
         })
@@ -1680,17 +1687,45 @@ impl GraphReader {
     /// forward and of the TO table when backward, and the two tables
     /// need not be the same size, so which end is asking decides what
     /// the id is allowed to be.
-    fn locate(&self, node: u64, dir: Direction) -> Result<(usize, usize)> {
+    ///
+    /// `None` is a row appended since the CSR was built, which is a
+    /// real row of a real table with nowhere in the CSR to be. It has
+    /// no edges, because an edge onto it is a fold, so every caller
+    /// answers it with the empty list its own return shape spells.
+    fn locate(&self, node: u64, dir: Direction) -> Result<Option<(usize, usize)>> {
         let rows = self.directory.rows(dir);
         if node >= rows {
+            if node < rows + self.grown[dir as usize] {
+                return Ok(None);
+            }
             return Err(ZuError::InvalidArgument(format!(
                 "node {node} out of range 0..{rows}"
             )));
         }
-        Ok((
+        Ok(Some((
             (node / GROUP_ROWS as u64) as usize,
             (node % GROUP_ROWS as u64) as usize,
-        ))
+        )))
+    }
+
+    /// Hands this reader the rows the node tables at its two ends have
+    /// taken on since the last fold, source end first, or takes them
+    /// back away with a pair of zeroes.
+    pub fn set_grown(&mut self, from: u64, to: u64) {
+        self.grown = [from, to];
+    }
+
+    /// Whether `group` in `dir` holds a row the CSR was not built over,
+    /// which is what says a pin of it would be reading past the end of
+    /// its offset array.
+    fn grows(&self, group: usize, dir: Direction) -> bool {
+        let grown = self.grown[dir as usize];
+        if grown == 0 {
+            return false;
+        }
+        let rows = self.directory.rows(dir);
+        let base = group as u64 * GROUP_ROWS as u64;
+        rows < base + GROUP_ROWS as u64 && base < rows + grown
     }
 
     /// Hands this reader the edges committed since the last fold, or
@@ -1734,7 +1769,9 @@ impl GraphReader {
     /// This is what the merge reads to build the answer above, so it is
     /// the one adjacency read that must not consult the patch.
     fn base_neighbors(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
-        let (g, row) = self.locate(node, dir)?;
+        let Some((g, row)) = self.locate(node, dir)? else {
+            return Ok(&[]);
+        };
         let idx = dir as usize;
         if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
             let (offsets, nbrs) = self.base_csr_group(db, g, dir)?;
@@ -1835,7 +1872,9 @@ impl GraphReader {
     /// not a range and cannot be reported this way; the merge reads
     /// this and puts the rest on itself.
     fn base_out_from(&mut self, db: &mut Zu1File, node: u64) -> Result<(&[u64], u64)> {
-        let (g, row) = self.locate(node, Direction::Fwd)?;
+        let Some((g, row)) = self.locate(node, Direction::Fwd)? else {
+            return Ok((&[], self.directory.edge_count));
+        };
         let base = self.directory.groups[g].edge_base;
         let idx = Direction::Fwd as usize;
         if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {
@@ -1859,8 +1898,14 @@ impl GraphReader {
     /// group the patch reaches into is built on every pin, so while a
     /// patch is up the caller is better off taking one list at a time
     /// however many it wants.
+    ///
+    /// A group holding a row appended since the CSR was built is not
+    /// pinnable either, and for a harder reason: the offset array of
+    /// the group stops at the rows the file held, so there is nothing
+    /// to hand a caller for the rows past that and no place to put
+    /// them. Those rows are read one list at a time like any other.
     pub fn pinnable(&self, group: usize, dir: Direction) -> bool {
-        !self.edges.as_ref().is_some_and(|p| p.touches(group, dir))
+        !self.edges.as_ref().is_some_and(|p| p.touches(group, dir)) && !self.grows(group, dir)
     }
 
     pub fn list_chunks(&self, group: usize, dir: Direction) -> usize {
@@ -1937,7 +1982,9 @@ impl GraphReader {
     /// Degree of `node` in `dir` from the pooled offset array alone;
     /// the neighbor values never decode for a count.
     pub fn degree_of(&self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<u64> {
-        let (g, row) = self.locate(node, dir)?;
+        let Some((g, row)) = self.locate(node, dir)? else {
+            return Ok(0);
+        };
         let meta = self.directory.groups[g].dir(dir);
         let pools = db.pools();
         let offs = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
@@ -2007,9 +2054,20 @@ impl GraphReader {
     ) -> Result<()> {
         let mut at = 0;
         while at < nodes.len() {
-            let (group, _) = self.locate(nodes[at], dir)?;
+            let Some((group, _)) = self.locate(nodes[at], dir)? else {
+                // A row appended since the CSR was built is in no
+                // group, so it is a run of one and its degree is
+                // whatever the patch put on it, which is nothing.
+                sink(at, self.added(nodes[at], dir) as u64);
+                at += 1;
+                continue;
+            };
             let mut end = at + 1;
-            while end < nodes.len() && self.locate(nodes[end], dir)?.0 == group {
+            while end < nodes.len()
+                && self
+                    .locate(nodes[end], dir)?
+                    .is_some_and(|(g, _)| g == group)
+            {
                 end += 1;
             }
             let chunks = self.directory.groups[group]
@@ -2020,14 +2078,14 @@ impl GraphReader {
             if end - at >= chunks {
                 let offs = Arc::clone(self.offsets(db, group, dir)?);
                 for (i, &node) in (at..end).zip(&nodes[at..end]) {
-                    let (_, row) = self.locate(node, dir)?;
+                    let (_, row) = self.locate(node, dir)?.expect("the run is one group");
                     sink(i, offs[row + 1] - offs[row] + self.added(node, dir) as u64);
                 }
             } else {
                 let meta = &self.directory.groups[group].dir(dir).offsets;
                 let mut pair = Vec::with_capacity(2);
                 for (i, &node) in (at..end).zip(&nodes[at..end]) {
-                    let (_, row) = self.locate(node, dir)?;
+                    let (_, row) = self.locate(node, dir)?.expect("the run is one group");
                     pair.clear();
                     read_range(db, meta, row as u64, row as u64 + 2, &mut pair)?;
                     sink(i, pair[1] - pair[0] + self.added(node, dir) as u64);
@@ -2050,7 +2108,9 @@ impl GraphReader {
         dir: Direction,
         out: &mut Vec<u64>,
     ) -> Result<()> {
-        let (g, row) = self.locate(node, dir)?;
+        let Some((g, row)) = self.locate(node, dir)? else {
+            return Ok(());
+        };
         let meta = self.directory.groups[g].dir(dir);
         let mut offs = Vec::with_capacity(2);
         read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
@@ -2093,7 +2153,9 @@ impl GraphReader {
                 return Ok(true);
             }
         }
-        let (g, row) = self.locate(node, dir)?;
+        let Some((g, row)) = self.locate(node, dir)? else {
+            return Ok(false);
+        };
         let meta = self.directory.groups[g].dir(dir);
         let mut offs = Vec::with_capacity(2);
         read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
@@ -2168,7 +2230,9 @@ impl GraphReader {
         src: u64,
         dst: u64,
     ) -> Result<Option<(u64, u64)>> {
-        let (g, row) = self.locate(src, Direction::Fwd)?;
+        let Some((g, row)) = self.locate(src, Direction::Fwd)? else {
+            return Ok(None);
+        };
         let base = self.directory.groups[g].edge_base;
         let idx = Direction::Fwd as usize;
         if self.cached_groups[idx].as_ref().map(|(i, _, _)| *i) != Some(g) {

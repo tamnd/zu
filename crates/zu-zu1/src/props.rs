@@ -1587,6 +1587,48 @@ impl RowPatch {
             None => None,
         }
     }
+
+    /// The row whose `col` holds `word`, `None` when none of them
+    /// does.
+    ///
+    /// This is the key index for the rows nothing has folded yet. A
+    /// key index is built by a fold and a deferred commit runs none,
+    /// so the rows in here are in no index, and what the fold would
+    /// have put in one is the value each of them holds in the table's
+    /// `id` column. The walk is over the rows a handful of commits
+    /// added rather than over the table, and it is bounded by what the
+    /// writer lets the patch grow to.
+    pub fn row_with(&self, col: usize, word: u64) -> Option<u64> {
+        self.rows
+            .iter()
+            .position(|cells| matches!(cells.get(col), Some(Cell::Int(held)) if *held == word))
+            .map(|at| self.base + at as u64)
+    }
+
+    /// The rows of this patch that fall in `lo..hi`, which is what a
+    /// read of that range of the column has to put on the end of what
+    /// it read.
+    fn span(&self, lo: u64, hi: u64) -> std::ops::Range<u64> {
+        let start = lo.max(self.base);
+        let end = hi.min(self.base + self.rows.len() as u64);
+        start..end.max(start)
+    }
+
+    /// `bounds` widened to take in what the rows of `lo..hi` hold in
+    /// `col`. A zone says a scan may skip a chunk, and a row the column
+    /// does not hold yet is still a row of the table, so a value of it
+    /// outside the stored bounds has to move them.
+    fn widen(&self, col: usize, lo: u64, hi: u64, bounds: (u64, u64)) -> (u64, u64) {
+        let (mut min, mut max) = bounds;
+        for row in self.span(lo, hi) {
+            let Some(word) = self.word(col, row) else {
+                continue;
+            };
+            min = min.min(word);
+            max = max.max(word);
+        }
+        (min, max)
+    }
 }
 
 /// Point reads over one table's property columns, keeping decoded
@@ -1671,6 +1713,13 @@ impl PropsReader {
         let Some(meta) = self.directory.labels.clone() else {
             return Ok(None);
         };
+        // A row the bitset does not reach carries its table's own label
+        // and nothing else, which is what the caller answers when there
+        // is no word here. A statement that puts another label on a row
+        // writes one the patch does not carry, and folds.
+        if row >= self.stored() {
+            return Ok(None);
+        }
         if self.label_state.is_none() {
             let pools = db.pools();
             let dir = load_chunk_directory_pooled(db, &pools.fences, &meta)?;
@@ -1697,7 +1746,18 @@ impl PropsReader {
     }
 
     /// Rows in the table's domain; every column is row-aligned to it.
+    ///
+    /// The rows a commit appended are in here as well, because they are
+    /// rows of the table and a scan that stopped short of them would
+    /// answer a query without them. What tells the two apart is
+    /// [`Self::stored`], which is where the columns end.
     pub fn rows(&self) -> u64 {
+        self.stored() + self.added.as_ref().map_or(0, |p| p.len() as u64)
+    }
+
+    /// Rows the columns themselves hold, which is where a read stops
+    /// going to the file and starts reading the patch.
+    fn stored(&self) -> u64 {
         self.directory.node_count
     }
 
@@ -1722,14 +1782,18 @@ impl PropsReader {
     ) -> Result<Option<(u64, u64)>> {
         let dir = self.int_dir(db, col)?;
         let meta = &self.directory.columns[col].meta;
-        let Some(bounds) = chunk_zone(meta, &dir, chunk) else {
+        let Some(mut bounds) = chunk_zone(meta, &dir, chunk) else {
             return Ok(None);
         };
-        let Some(patch) = &self.patch else {
-            return Ok(Some(bounds));
-        };
         let lo = (chunk * CHUNK_ROWS) as u64;
-        Ok(Some(patch.widen(col, lo, lo + CHUNK_ROWS as u64, bounds)))
+        let hi = lo + CHUNK_ROWS as u64;
+        if let Some(patch) = &self.patch {
+            bounds = patch.widen(col, lo, hi, bounds);
+        }
+        if let Some(added) = &self.added {
+            bounds = added.widen(col, lo, hi, bounds);
+        }
+        Ok(Some(bounds))
     }
 
     /// The value bounds of the whole of `col`, which is what says
@@ -1744,11 +1808,14 @@ impl PropsReader {
         if meta.value_count == 0 {
             return None;
         }
-        let bounds = (meta.min, meta.max);
-        Some(match &self.patch {
-            Some(patch) => patch.widen(col, 0, u64::MAX, bounds),
-            None => bounds,
-        })
+        let mut bounds = (meta.min, meta.max);
+        if let Some(patch) = &self.patch {
+            bounds = patch.widen(col, 0, u64::MAX, bounds);
+        }
+        if let Some(added) = &self.added {
+            bounds = added.widen(col, 0, u64::MAX, bounds);
+        }
+        Some(bounds)
     }
 
     /// The chunk directory of an integer column, loaded through the
@@ -1778,13 +1845,30 @@ impl PropsReader {
         if !column.is_lane() {
             return Err(not_lane(column));
         }
-        let dir = self.int_dir(db, col)?;
-        let meta = &self.directory.columns[col].meta;
-        decode_chunk(db, meta, &dir, chunk, out)?;
+        let base = (chunk * CHUNK_ROWS) as u64;
+        let stored = self.stored();
+        // The chunk as the column holds it, cut to the rows it really
+        // has: a decode hands back a full chunk whatever the last one
+        // is filled to, and the appended rows go where the filling
+        // stops. A chunk past the end of the column has none of it and
+        // is all appended rows.
+        match base < stored {
+            true => {
+                let dir = self.int_dir(db, col)?;
+                let meta = &self.directory.columns[col].meta;
+                decode_chunk(db, meta, &dir, chunk, out)?;
+                out.resize(((stored - base).min(CHUNK_ROWS as u64)) as usize, 0);
+            }
+            false => out.clear(),
+        }
         if let Some(patch) = &self.patch {
-            let base = (chunk * CHUNK_ROWS) as u64;
             for &(row, value) in patch.span(col, base, base + out.len() as u64) {
                 out[(row - base) as usize] = value;
+            }
+        }
+        if let Some(added) = &self.added {
+            for row in added.span(base, base + CHUNK_ROWS as u64) {
+                out.push(added.word(col, row).unwrap_or(0));
             }
         }
         Ok(())
@@ -1847,8 +1931,20 @@ impl PropsReader {
         }
         bytes.clear();
         ends.clear();
-        read_blob_range(db, &column.meta, start, end, bytes, ends)?;
+        let stored = self.stored();
+        if start < end.min(stored) {
+            read_blob_range(db, &column.meta, start, end.min(stored), bytes, ends)?;
+        }
         self.overwrite(col, start, bytes, ends);
+        // The appended rows come after the stored ones, which is the
+        // order their offsets are in, so they go on the end of the
+        // buffer the same way.
+        if let Some(added) = &self.added {
+            for row in added.span(start, end) {
+                bytes.extend_from_slice(added.bytes_of(col, row).unwrap_or(&[]));
+                ends.push(bytes.len() as u64);
+            }
+        }
         Ok(())
     }
 

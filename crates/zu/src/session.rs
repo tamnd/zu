@@ -241,7 +241,7 @@ impl Session {
         let mut graph = Zu1Graph::owned(db, catalog);
         graph.set_patches(Arc::clone(&patches));
         let mut snap = crate::snapshot::SnapshotCache::default();
-        snap.set_patches(Arc::clone(&patches));
+        snap.set_patches(Arc::clone(&patches), graph.catalog());
         Ok(Session {
             graph,
             working,
@@ -600,6 +600,15 @@ impl Session {
             .file_mut()
     }
 
+    /// Puts what the writer is deferring on the file, for a statement
+    /// that reads it directly. See [`WriteSide::fold_patches`].
+    fn fold_patches(&mut self) -> Result<()> {
+        self.side
+            .as_mut()
+            .expect("a statement that writes holds the write side")
+            .fold_patches()
+    }
+
     /// Says where the write side has got to, for the readers of every
     /// connection on this file.
     fn publish_side(&mut self) {
@@ -801,10 +810,20 @@ impl Session {
         self.enter()?;
         let side = self.side.as_mut().expect("entered just above");
         let floor = side.file().savepoint_floor();
+        let had_writer = side.has_writer();
         if let Some(floor) = floor {
             side.discard_above(floor)?;
         }
         side.file_mut().rollback_savepoint()?;
+        // The writer went with the epochs the rollback took, and what it
+        // was deferring went with it. Those commits are in the log below
+        // the floor and not on the file, so with no writer nothing
+        // answers for them. Opening one again replays them and folds
+        // them down, which is where they would have been all along had
+        // this transaction never run.
+        if had_writer {
+            side.open_writer()?;
+        }
         // The rollback cut the log and synced the cut, and the writer
         // went with the epochs it held, so nothing here is waiting on
         // the platter and the share goes through.
@@ -1036,7 +1055,12 @@ impl Session {
             Some(NotAQuery::Catalog(stmt)) => {
                 self.refuse_a_write()?;
                 let held = self.hold()?;
-                let out = crate::catalog_stmt::apply(self.writing(), &stmt, params);
+                // It reads the tables off the file rather than through
+                // a reader, so what a commit deferred has to be on the
+                // file before it looks.
+                let out = self
+                    .fold_patches()
+                    .and_then(|()| crate::catalog_stmt::apply(self.writing(), &stmt, params));
                 self.settle(out, held)?;
                 return Ok(QueryResult::new(Vec::new(), Vec::new()));
             }
@@ -1141,7 +1165,7 @@ impl Session {
                         self.graph.file_mut(),
                         insert,
                         catalog,
-                        &patches.gone,
+                        &patches,
                     )?;
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
@@ -1642,7 +1666,8 @@ impl Session {
             return;
         }
         self.graph.set_patches(Arc::clone(&patches));
-        self.snap.set_patches(Arc::clone(&patches));
+        self.snap
+            .set_patches(Arc::clone(&patches), self.graph.catalog());
         self.patches = patches;
     }
 

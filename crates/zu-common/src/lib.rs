@@ -10,6 +10,7 @@ mod interrupt;
 mod order;
 pub mod temporal;
 pub mod types;
+pub mod unicode;
 
 pub use error::ZuError;
 pub use gqlstatus::{DiagnosticRecord, GqlStatus, Position, Severity};

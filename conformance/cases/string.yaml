@@ -734,3 +734,54 @@ cases:
           - type: NULL
           - type: NULL
           - type: NULL
+
+  - name: normalize-composes-and-decomposes
+    doc: The same letter written two ways, one character with an accent on it and the letter followed by a combining accent, meet under the two canonical forms. A client whose normalization is a no-op passes the first of these and fails the second.
+    query: RETURN NORMALIZE('é', NFC) AS a, NORMALIZE('é', NFD) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: "é"
+          - type: STRING
+            value: "é"
+
+  - name: normalize-defaults-to-nfc
+    doc: The form is optional and defaults to NFC, which is what ISO 20.24 defaults it to. A client that defaults it to no normalization at all answers the argument unchanged.
+    query: RETURN NORMALIZE('é') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: "é"
+
+  - name: the-compatibility-forms-lose-the-formatting
+    doc: The fi ligature has no canonical decomposition, because it is not the same character as the two letters it draws, and it has a compatibility one, because it reads as them. That is the whole difference between the K forms and the other two.
+    query: RETURN NORMALIZE('ﬁ', NFC) AS a, NORMALIZE('ﬁ', NFKC) AS b
+    columns:
+      - a
+      - b
+    rows:
+      - values:
+          - type: STRING
+            value: "ﬁ"
+          - type: STRING
+            value: fi
+
+  - name: is-normalized-asks-the-same-question
+    doc: The predicate of ISO 19.7 over a string that is in one form and not the other, and over a null, which answers null the way every other predicate over a null does.
+    query: RETURN 'é' IS NORMALIZED NFC AS a, 'é' IS NORMALIZED NFD AS b, NULL IS NORMALIZED AS c
+    columns:
+      - a
+      - b
+      - c
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+          - type: BOOL
+            value: false
+          - type: NULL

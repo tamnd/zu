@@ -109,8 +109,13 @@ words = ["NULL", "TRUE", "FALSE"]
 
 [[group]]
 kind = "function"
-doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, PATH_LENGTH and ELEMENTS are the three that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls. The last six are the character string functions of ISO 20.22 and 20.24, CHAR_LENGTH and CHARACTER_LENGTH being two spellings the standard gives one function and OCTET_LENGTH being the other question, since the characters a reader counts and the bytes the store keeps are the same number only for ASCII."
-words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS", "CHAR_LENGTH", "CHARACTER_LENGTH", "OCTET_LENGTH", "UPPER", "LOWER", "TRIM"]
+doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, PATH_LENGTH and ELEMENTS are the three that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls. The last seven are the character string functions of ISO 20.22 and 20.24, CHAR_LENGTH and CHARACTER_LENGTH being two spellings the standard gives one function and OCTET_LENGTH being the other question, since the characters a reader counts and the bytes the store keeps are the same number only for ASCII. NORMALIZE is written like a call and is not one, because its second argument is a normal form and not a value, which is the arrangement CAST has."
+words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS", "CHAR_LENGTH", "CHARACTER_LENGTH", "OCTET_LENGTH", "UPPER", "LOWER", "TRIM", "NORMALIZE"]
+
+[[group]]
+kind = "keyword"
+doc = "The predicate of ISO 19.7 and the four normal forms it and NORMALIZE are written with. A normal form is a word rather than a string because which normalization runs is settled by the statement and not by a row, and the four are reserved words, so nothing else can be standing where one is expected."
+words = ["NORMALIZED", "NFC", "NFD", "NFKC", "NFKD"]
 
 [[group]]
 kind = "algorithm"

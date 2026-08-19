@@ -2181,7 +2181,10 @@ impl<'a> Worker<'a> {
         // The fused close asks the same question the standalone one
         // does, once per neighbor of every source row under this
         // vector, so it takes the same bitmap.
-        let close_bits = match close_lists.is_empty() {
+        // A probe side holding a neighbor twice closes twice, and a
+        // bitmap that set the same bit twice cannot say so, so that
+        // shape takes the counting walk below instead.
+        let close_bits = match close_lists.is_empty() || probe_repeats(&close_lists) {
             true => None,
             false => self.build_mask(&close_lists),
         };
@@ -2379,7 +2382,11 @@ impl<'a> Worker<'a> {
                             cur.fill(0);
                             let mut prev = 0;
                             for (i, &v) in list.iter().enumerate() {
-                                if member(&close_lists, cur, &mut prev, v) {
+                                // Once per closing edge, not once per
+                                // neighbor: the pattern matched through
+                                // each of the edges between the two ends
+                                // and the row repeats for each of them.
+                                for _ in 0..member_count(&close_lists, cur, &mut prev, v) {
                                     masked.push(v);
                                     if wants_ords {
                                         masked_ords.push(ords[i]);
@@ -2837,7 +2844,12 @@ impl<'a> Worker<'a> {
             self.recycle(pheld);
             return Ok(());
         }
-        let bits = self.build_mask(std::slice::from_ref(&plist));
+        // The bitmap records that a probe neighbor exists, not how many
+        // edges reach it, so a probe side with repeats leapfrogs instead.
+        let bits = match probe_repeats(std::slice::from_ref(&plist)) {
+            true => None,
+            false => self.build_mask(std::slice::from_ref(&plist)),
+        };
         // Copy the active rows out first: pinning mutates the chunk the
         // selection and values are read from.
         let mut idxs = self.idx_pool.pop().unwrap_or_default();
@@ -2986,7 +2998,12 @@ impl<'a> Worker<'a> {
             self.decisions.empty_close += 1;
             return Ok(());
         }
-        let bits = self.build_mask(&lists);
+        // The bitmap says an edge exists and a close that has to count
+        // needs to know how many, so a probe side with repeats galloped.
+        let bits = match probe_repeats(&lists) {
+            true => None,
+            false => self.build_mask(&lists),
+        };
         let last = set.chunks.len() - 1;
         let mut keep = std::mem::take(&mut self.keep);
         keep.clear();
@@ -2997,20 +3014,23 @@ impl<'a> Worker<'a> {
             let mut prev = 0;
             let cur = &mut cur[..lists.len()];
             let mut ask = |v: u64| match bits {
-                Some(bits) => in_mask(&self.mask, bits, v),
-                None => member(&lists, cur, &mut prev, v),
+                Some(bits) => usize::from(in_mask(&self.mask, bits, v)),
+                None => member_count(&lists, cur, &mut prev, v),
             };
+            // A row stays once per edge back to the pinned end, so a
+            // pair holding two of them is two rows and the position
+            // repeats in the selection.
             match &chunk.sel {
                 Some(s) => {
                     for &i in s.as_slice() {
-                        if ask(vals[i as usize]) {
+                        for _ in 0..ask(vals[i as usize]) {
                             keep.push(i);
                         }
                     }
                 }
                 None => {
                     for i in 0..chunk.count {
-                        if ask(vals[i as usize]) {
+                        for _ in 0..ask(vals[i as usize]) {
                             keep.push(i as u16);
                         }
                     }
@@ -3021,13 +3041,20 @@ impl<'a> Worker<'a> {
         drop(lists);
         self.recycle(held);
         let mut result = Ok(());
-        if !keep.is_empty() {
-            let mut sel = SelVector::with_capacity(&mut self.arena, keep.len());
-            for &i in &keep {
+        // One selection per vector's worth. Without repeats that is the
+        // single pass this has always run, the kept rows being a subset
+        // of one chunk; with them the rows still go down in order and no
+        // selection is asked to hold more than a vector.
+        for part in keep.chunks(zu_vector::VECTOR_SIZE) {
+            let mut sel = SelVector::with_capacity(&mut self.arena, part.len());
+            for &i in part {
                 sel.push(i);
             }
             set.chunks[last].sel = Some(sel);
             result = self.run_ops(rest, set);
+            if result.is_err() {
+                break;
+            }
         }
         self.keep = keep;
         result
@@ -3982,10 +4009,11 @@ fn mask_hits(mask: &[u64], bits: Bits, seed: &[u64], out: &mut Vec<u64>) {
 }
 
 /// Intersects two sorted neighbor lists, galloping past the runs
-/// neither side can match. A repeat in the seed list is a real
-/// multi-edge row and emits again; a repeat in the probe list is only
-/// the existence check answering twice, so it adds nothing. That is
-/// the old engine's rule and the counts depend on it.
+/// neither side can match. Every copy on the seed side pairs with every
+/// copy on the probe side: the two lists are two rel steps of the
+/// pattern and each of them matched that many times, so the pair repeats
+/// as many times as the product. That is the old engine's rule and the
+/// counts depend on it.
 fn leapfrog(seed: &[u64], probe: &[u64], out: &mut Vec<u64>) {
     let (mut si, mut pi) = (0, 0);
     while si < seed.len() && pi < probe.len() {
@@ -3995,53 +4023,85 @@ fn leapfrog(seed: &[u64], probe: &[u64], out: &mut Vec<u64>) {
         } else if pv < sv {
             pi = gallop(probe, sv, pi);
         } else {
-            while si < seed.len() && seed[si] == sv {
-                out.push(sv);
-                si += 1;
+            let se = si + seed[si..].partition_point(|&v| v == sv);
+            let pe = pi + probe[pi..].partition_point(|&v| v == sv);
+            for _ in si..se {
+                for _ in pi..pe {
+                    out.push(sv);
+                }
             }
-            pi += 1;
+            si = se;
+            pi = pe;
         }
     }
 }
 
-/// Unions two sorted neighbor lists into `out`, ascending and without
-/// repeats. The probe side of an intersection only answers whether an
-/// edge exists, so a node the two sides share is one entry here.
+/// Merges two sorted neighbor lists into `out`, ascending and keeping
+/// every copy. A node the two sides share is joined through the forward
+/// edge and the backward one, and those are two edges rather than two
+/// readings of one, so both entries stay.
 fn merge_sorted(a: &[u64], b: &[u64], out: &mut Vec<u64>) {
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        let v = a[i].min(b[j]);
-        out.push(v);
-        while i < a.len() && a[i] == v {
+        if a[i] <= b[j] {
+            out.push(a[i]);
             i += 1;
-        }
-        while j < b.len() && b[j] == v {
+        } else {
+            out.push(b[j]);
             j += 1;
         }
     }
-    for &v in a[i..].iter().chain(&b[j..]) {
-        if out.last() != Some(&v) {
-            out.push(v);
-        }
-    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
 }
 
-/// Whether `v` sits in any of the pinned lists, carrying each list's
+/// Whether any value appears more than once across the probe lists,
+/// which is what decides whether a close has to count instead of only
+/// answering yes. Every list is sorted, so a repeat inside one is a pair
+/// of neighbors and a repeat across two is a value both of them hold.
+///
+/// The bitmap paths record existence and cannot say how many, so a probe
+/// side this answers true for takes the counting walk instead. Graphs
+/// with neither parallel edges nor a pair joined both ways never reach
+/// it, which is what keeps the bitmap on the common shape.
+fn probe_repeats(lists: &[&[u64]]) -> bool {
+    if lists.iter().any(|l| l.windows(2).any(|w| w[0] == w[1])) {
+        return true;
+    }
+    let [a, b] = lists else {
+        return false;
+    };
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+/// How many entries of the pinned lists equal `v`, carrying each list's
 /// cursor forward. Rows arrive in list order out of an expand, so the
 /// cursor usually starts within a step or two of the answer; a row that
 /// goes backwards rewinds it, which is what keeps a filtered or scanned
 /// level correct here too.
-fn member(lists: &[&[u64]], cur: &mut [usize], prev: &mut u64, v: u64) -> bool {
+///
+/// The count rather than the answer, because a pattern with both of its
+/// ends bound matches once per edge between them and a pair can hold
+/// several.
+fn member_count(lists: &[&[u64]], cur: &mut [usize], prev: &mut u64, v: u64) -> usize {
     if v < *prev {
         cur.fill(0);
     }
     *prev = v;
-    let mut hit = false;
+    let mut n = 0;
     for (list, c) in lists.iter().zip(cur.iter_mut()) {
         *c = gallop(list, v, *c);
-        hit |= list.get(*c) == Some(&v);
+        n += list[*c..].partition_point(|&x| x == v);
     }
-    hit
+    n
 }
 
 /// First position at or after `from` whose value is at least `target`,
@@ -4440,20 +4500,46 @@ mod tests {
     }
 
     #[test]
-    fn leapfrog_emits_one_hit_per_seed_occurrence() {
+    fn leapfrog_pairs_every_seed_copy_with_every_probe_copy() {
         let mut hits = Vec::new();
         leapfrog(&[2, 2, 3, 7, 9, 12], &[1, 2, 7, 7, 8, 12], &mut hits);
-        assert_eq!(hits, [2, 2, 7, 12]);
+        assert_eq!(hits, [2, 2, 7, 7, 12]);
         hits.clear();
         leapfrog(&[5], &[], &mut hits);
         leapfrog(&[], &[5], &mut hits);
         assert_eq!(hits, []);
     }
 
+    /// Both sides of an undirected end are two edges wherever they name
+    /// the same neighbor, so the merged probe list holds it twice and
+    /// the close matches through each of them.
+    #[test]
+    fn the_merged_probe_side_keeps_every_copy() {
+        let mut out = Vec::new();
+        merge_sorted(&[1, 2, 4], &[2, 3, 3], &mut out);
+        assert_eq!(out, [1, 2, 2, 3, 3, 4]);
+        assert!(probe_repeats(&[&[1, 2, 4], &[2, 3, 3]]));
+        assert!(probe_repeats(&[&[1, 2, 2]]));
+        assert!(!probe_repeats(&[&[1, 2, 4], &[3, 5]]));
+        assert!(!probe_repeats(&[&[1, 2, 4]]));
+    }
+
+    #[test]
+    fn member_count_answers_how_many_edges_close() {
+        let lists: [&[u64]; 2] = [&[2, 5, 5, 9], &[5, 7]];
+        let mut cur = [0usize; 2];
+        let mut prev = 0;
+        for (v, want) in [(2, 1), (5, 3), (7, 1), (8, 0), (9, 1)] {
+            assert_eq!(member_count(&lists, &mut cur, &mut prev, v), want, "{v}");
+        }
+    }
+
     /// The bitmap answers the close the same way the gallop does, or
     /// the count comes out different depending on which of the two the
     /// vector happened to pick, which is the one thing the switch is
-    /// not allowed to do.
+    /// not allowed to do. A probe side holding a neighbor twice cannot
+    /// be put in a bitmap at all, which is what `probe_repeats` keeps
+    /// off this path, so the agreement is claimed for the rest.
     #[test]
     fn the_probe_bitmap_and_the_gallop_agree() {
         let probes: [&[u64]; 4] = [
@@ -4470,6 +4556,9 @@ mod tests {
             &[999],
         ];
         for probe in probes {
+            if probe_repeats(std::slice::from_ref(&probe)) {
+                continue;
+            }
             let base = probe[0];
             let top = probe[probe.len() - 1];
             let mut mask = vec![0u64; ((top - base) as usize / 64) + 1];

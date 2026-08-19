@@ -4165,21 +4165,25 @@ fn link(prev: Arc<PathLink>, rel: Value, node: (u32, u64)) -> Arc<PathLink> {
     })
 }
 
-/// One probe against the accumulated edge sets of an ASP join,
-/// mirroring the direction and endpoint table checks of the storage
-/// probe in `ExpandInto`.
-/// The hit is the whole run the pair names, table and endpoints and
+/// Every probe against the accumulated edge sets of an ASP join that
+/// answers, mirroring the direction and endpoint table checks of the
+/// storage probe in `ExpandInto`.
+/// A hit is the whole run the pair names, table and endpoints and
 /// `(row, count)`, because a pattern with both endpoints bound matches
 /// once per edge and a pair can hold several.
-fn asp_hit(
+/// There can be more than one hit for one bound pair: a step naming no
+/// direction may join through the forward edge and the backward one
+/// both, and an alternation of rel types may join through any of them.
+/// Each of those is a different edge, so each is emitted, which is the
+/// count the expand this join replaces produces.
+fn asp_hits(
     sets: &[EdgeSet],
     rels: &[RelStep],
     direction: RelDirection,
-    ft: u32,
-    fo: u64,
-    tt: u32,
-    to_off: u64,
-) -> Option<(u32, u64, u64, (u64, u64))> {
+    (ft, fo): (u32, u64),
+    (tt, to_off): (u32, u64),
+    mut emit: impl FnMut(u32, u64, u64, (u64, u64)),
+) {
     for (step, set) in rels.iter().zip(sets) {
         let Some(direction) = direction.resolve(step.undirected) else {
             continue;
@@ -4189,30 +4193,33 @@ fn asp_hit(
             && tt == step.to_table
             && let Some(&run) = set.get(&(fo, to_off))
         {
-            return Some((step.id, fo, to_off, run));
+            emit(step.id, fo, to_off, run);
         }
         if direction.walks_in()
             && ft == step.to_table
             && tt == step.from_table
             && let Some(&run) = set.get(&(to_off, fo))
         {
-            return Some((step.id, to_off, fo, run));
+            emit(step.id, to_off, fo, run);
         }
     }
-    None
 }
 
-/// The rel values of one run, in load order: `count` copies of the same
-/// pair, each carrying its own property row.
-fn run_values(table: u32, src: u64, dst: u64, (base, count): (u64, u64)) -> Vec<Value> {
-    (0..count)
-        .map(|k| Value::Rel {
-            table,
-            src,
-            dst,
-            ord: base + k,
-        })
-        .collect()
+/// Appends the rel values of one run, in load order: `count` copies of
+/// the same pair, each carrying its own property row.
+fn push_run_values(
+    table: u32,
+    src: u64,
+    dst: u64,
+    (base, count): (u64, u64),
+    out: &mut Vec<Value>,
+) {
+    out.extend((0..count).map(|k| Value::Rel {
+        table,
+        src,
+        dst,
+        ord: base + k,
+    }));
 }
 
 /// Whether one end of the intersection has stored lists to gallop for
@@ -4284,54 +4291,42 @@ impl ProbeSide {
     /// `ords` and `fwd` are filled only when `with_rows` is set, which
     /// is when something reads the rel.
     ///
-    /// A neighbor both lists hold is a pair joined in both directions,
-    /// and the undirected close reports the forward one, which is what
-    /// the pair-at-a-time probe in `ExpandInto` reports for the same
-    /// pattern: it asks storage the forward way first and only asks the
-    /// backward way when there is no forward edge. So a value the
-    /// forward list holds contributes its forward copies and nothing
-    /// else, and the backward list only speaks for the neighbors the
-    /// forward one does not have.
-    ///
-    /// Copies inside one list are a different thing and all of them
-    /// stay: those are parallel edges, as many matches as there are
-    /// edges.
+    /// Every copy of both lists stays. A neighbor both lists hold is a
+    /// pair joined in both directions, and those are two edges rather
+    /// than two readings of one, so an undirected end matches through
+    /// each of them. Copies inside one list are parallel edges and stay
+    /// for the same reason. That is exactly what the expand this close
+    /// replaces produces, which walks the out list and then the back one
+    /// and keeps whatever each of them holds, so a fused close and an
+    /// unfused one still count the same rows.
     fn merge(&mut self, with_rows: bool) {
         self.all.clear();
         self.all.reserve(self.out.len() + self.back.len());
         self.ords.clear();
         self.fwd.clear();
         let (mut i, mut j) = (0, 0);
-        while i < self.out.len() || j < self.back.len() {
-            let (fwd, at) = match (self.out.get(i), self.back.get(j)) {
-                (Some(a), Some(b)) => (a <= b, *a.min(b)),
-                (Some(a), None) => (true, *a),
-                (None, Some(b)) => (false, *b),
+        loop {
+            let fwd = match (self.out.get(i), self.back.get(j)) {
+                (Some(a), Some(b)) => a <= b,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
                 (None, None) => break,
             };
-            let (list, ords) = if fwd {
-                (&self.out, &self.out_ords)
+            let (at, ord) = if fwd {
+                let at = self.out[i];
+                let ord = if with_rows { self.out_ords[i] } else { 0 };
+                i += 1;
+                (at, ord)
             } else {
-                (&self.back, &self.back_ords)
+                let at = self.back[j];
+                let ord = if with_rows { self.back_ords[j] } else { 0 };
+                j += 1;
+                (at, ord)
             };
-            let from = if fwd { i } else { j };
-            let run = list[from..].partition_point(|&v| v == at);
+            self.all.push(at);
             if with_rows {
-                for &ord in &ords[from..from + run] {
-                    self.all.push(at);
-                    self.ords.push(ord);
-                    self.fwd.push(fwd);
-                }
-            } else {
-                self.all.resize(self.all.len() + run, at);
-            }
-            if fwd {
-                i += run;
-                // The backward list has nothing to add about a
-                // neighbor the forward one already spoke for.
-                j += self.back[j..].partition_point(|&v| v == at);
-            } else {
-                j += run;
+                self.ords.push(ord);
+                self.fwd.push(fwd);
             }
         }
     }
@@ -5044,7 +5039,13 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                 }
                 let (ft, fo) = node_value(fv, "expand into")?;
                 let (tt, to_off) = node_value(tv, "expand into")?;
-                let mut hit = None;
+                // Every run the bound pair joins through, not the first
+                // one: a step naming no direction may hold a forward
+                // edge and a backward one, and those are two edges, so
+                // the pattern matches through each of them. An
+                // alternation of rel types is the same story a step at a
+                // time.
+                let mut vals = Vec::new();
                 for step in rels {
                     let Some(direction) = direction.resolve(step.undirected) else {
                         continue;
@@ -5058,22 +5059,19 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         && tt == step.to_table
                         && let Some(run) = ctx.graph.edge_run(step.id, fo, to_off)?
                     {
-                        hit = Some((step.id, fo, to_off, run));
-                        break;
+                        push_run_values(step.id, fo, to_off, run, &mut vals);
                     }
                     if direction.walks_in()
                         && ft == step.to_table
                         && tt == step.from_table
                         && let Some(run) = ctx.graph.edge_run(step.id, to_off, fo)?
                     {
-                        hit = Some((step.id, to_off, fo, run));
-                        break;
+                        push_run_values(step.id, to_off, fo, run, &mut vals);
                     }
                 }
-                let Some((table, src, dst, run)) = hit else {
+                if vals.is_empty() {
                     continue;
-                };
-                let vals = run_values(table, src, dst, run);
+                }
                 let c = &mut ctx.chunks[c];
                 c.size = vals.len();
                 c.cols[0] = vals;
@@ -5146,12 +5144,20 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         let (ft, fo) = node_value(fv, "asp join")?;
                         let (tt, to_off) = node_value(tv, "asp join")?;
                         let sets = ctx.edge_sets.get(&i).expect("accumulated above");
-                        let Some((table, src, dst, run)) =
-                            asp_hit(sets, rels, *direction, ft, fo, tt, to_off)
-                        else {
+                        let mut vals = Vec::new();
+                        asp_hits(
+                            sets,
+                            rels,
+                            *direction,
+                            (ft, fo),
+                            (tt, to_off),
+                            |table, src, dst, run| {
+                                push_run_values(table, src, dst, run, &mut vals);
+                            },
+                        );
+                        if vals.is_empty() {
                             continue;
-                        };
-                        let vals = run_values(table, src, dst, run);
+                        }
                         let c = &mut ctx.chunks[c];
                         c.size = vals.len();
                         c.cols[0] = vals;
@@ -5187,8 +5193,16 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                         times.push(match &source.cols[col][pos] {
                             Value::Null => 0,
                             &Value::Node { table, offset } => {
-                                asp_hit(sets, rels, *direction, ft, fo, table, offset)
-                                    .map_or(0, |(_, _, _, (_, count))| count as usize)
+                                let mut n = 0;
+                                asp_hits(
+                                    sets,
+                                    rels,
+                                    *direction,
+                                    (ft, fo),
+                                    (table, offset),
+                                    |_, _, _, (_, count)| n += count as usize,
+                                );
+                                n
                             }
                             other => {
                                 return Err(invalid(format!(
@@ -5328,10 +5342,10 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
                                 dst: sd,
                                 ord: seed_ords[s],
                             });
-                            // The binary probe an undirected close
-                            // replaces reports the forward edge when
-                            // there is one, so the merged list says
-                            // which stored list each entry came from.
+                            // Each entry of the merged list is one
+                            // stored edge and the list says which of the
+                            // two stored lists it came from, so the rel
+                            // is oriented the way storage holds it.
                             let (ps, pd) = if cache.fwd[p] { (po, v) } else { (v, po) };
                             probe_rels.push(Value::Rel {
                                 table: probe_step.id,

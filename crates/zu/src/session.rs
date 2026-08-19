@@ -899,6 +899,24 @@ impl Session {
         )))
     }
 
+    /// A graph reference on the graph this session started in, which
+    /// is what `HOME_PROPERTY_GRAPH` hands back. It is the working
+    /// graph until something moves the working graph, and the two are
+    /// separate calls for the same reason the two words are separate
+    /// words: a caller that wants to go back has to be able to say so.
+    pub fn home_graph_ref(&mut self) -> Result<Value> {
+        self.sync()?;
+        let id = self.graph.catalog().home_graph_id();
+        let graph = self.graph.catalog().graph_by_id(id).ok_or_else(|| {
+            ZuError::gql(
+                codes::C42002,
+                "the graph this session started in is gone".to_string(),
+            )
+        })?;
+        let (schema, name) = (graph.schema.clone(), graph.name.clone());
+        Ok(Value::Graph(GraphHandle::new(id, schema, name, self.epoch)))
+    }
+
     /// A binding table reference over the rows of a result (GV61).
     ///
     /// The rows are taken as they are: a binding table value is a

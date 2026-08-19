@@ -278,17 +278,27 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
                 continue;
             }
             b'$' => {
-                let mut end = ix + 1;
+                // ISO 21.10 writes a parameter two ways. One dollar
+                // sign is a general parameter, which holds a value,
+                // and two is a substituted parameter, which holds a
+                // reference: a graph, a binding table, a graph type or
+                // a procedure. The two spellings name the same
+                // parameter here, because what a parameter holds is
+                // settled by the value that arrives and not by the
+                // characters in front of the name, which is the rule
+                // `GRAPH $g` beside `$g` is already read under.
+                let name = ix + 1 + usize::from(bytes.get(ix + 1) == Some(&b'$'));
+                let mut end = name;
                 while end < bytes.len()
                     && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
                 {
                     end += 1;
                 }
-                if end == ix + 1 {
+                if end == name {
                     return Err(err(source, ix, "expected a parameter name after '$'"));
                 }
                 tokens.push(Token {
-                    kind: TokenKind::Param(source[ix + 1..end].to_string()),
+                    kind: TokenKind::Param(source[name..end].to_string()),
                     start,
                     end,
                 });
@@ -831,5 +841,23 @@ mod tests {
                 TokenKind::QuotedIdent("odd name".into()),
             ]
         );
+    }
+
+    /// ISO 21.10's two parameter spellings, the general one and the
+    /// substituted one a reference is written with. They name the same
+    /// parameter, so the name is what comes out either way, and a
+    /// dollar sign with nothing behind it is still an error.
+    #[test]
+    fn a_substituted_parameter_names_the_parameter_the_general_one_names() {
+        assert_eq!(
+            kinds("$g $$g $$long_name"),
+            vec![
+                TokenKind::Param("g".into()),
+                TokenKind::Param("g".into()),
+                TokenKind::Param("long_name".into()),
+            ]
+        );
+        let e = lex("RETURN $$ AS n").expect_err("no name");
+        assert!(e.to_string().contains("parameter name"), "got: {e}");
     }
 }

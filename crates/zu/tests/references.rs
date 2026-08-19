@@ -312,6 +312,44 @@ fn the_word_in_front_of_a_reference_parameter_says_nothing_the_value_does_not() 
     }
 }
 
+/// GE08. The standard writes a reference parameter with two dollar
+/// signs, `<substituted parameter reference>` in ISO 21.10, and a
+/// value parameter with one. Both name the same parameter here,
+/// because what a parameter holds is settled by the value that
+/// arrives, which is the rule the word in front of it is read under
+/// too.
+#[test]
+fn a_reference_parameter_may_be_written_the_way_the_standard_writes_one() {
+    let (_dir, mut session) = opened("substituted-params.zu1");
+    let home = session.graph_ref("/", "home").expect("the home graph");
+    let graph = [("g", home.clone())];
+    for source in [
+        "RETURN $$g AS g",
+        "RETURN GRAPH $$g AS g",
+        "RETURN PROPERTY GRAPH $$g AS g",
+    ] {
+        let out = session
+            .run(source, &graph)
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(out.rows[0], vec![home.clone()], "{source}");
+    }
+
+    let out = session
+        .run(
+            "USE GRAPH $$g MATCH (p:person) RETURN count(p) AS n",
+            &graph,
+        )
+        .expect("a graph parameter says which graph to run against");
+    assert_eq!(out.columns, vec!["n".to_string()]);
+
+    // One dollar sign in front of a value is the other spelling and
+    // is untouched by any of this.
+    let out = session
+        .run("RETURN $n + 1 AS n", &[("n", Value::Int(1))])
+        .expect("a value parameter");
+    assert_eq!(out.rows[0], vec![Value::Int(2)]);
+}
+
 /// `graph` and `table` are names right up until a parameter or a path
 /// follows them, which is the rule `PATH` and `DATE` are read under.
 #[test]

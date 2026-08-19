@@ -64,6 +64,17 @@ A malformed frame, an unknown op and a `params` that is not an object are faults
 
 A temporal has no spelling here, because JSON has no date and a string that looks like one is a string. A statement that wants one takes a string parameter and calls the constructor for the type it means, `date($when)` or `duration($span)`, which says which calendar type was meant instead of leaving the wire to guess it from the characters.
 
+The two references do have a spelling, because a graph and a binding table are values a statement can be handed and neither has a JSON shape of its own. Each is an object with one member whose name begins with a dollar sign, which no field of a record can, so nothing a client could otherwise write loses its meaning to this.
+
+`{"$graph": "/social"}` is a graph reference, written the way a statement writes one. That is the path the graph is at, where the last segment names the graph and what stands in front of it names the schema, or one of the four words that name a graph without naming it, `CURRENT_GRAPH`, `CURRENT_PROPERTY_GRAPH`, `HOME_GRAPH` and `HOME_PROPERTY_GRAPH`. The words are what a client that does not know the paths of the engine it is talking to can write, and they mean here what they mean in a statement. A path that names no graph is `42002`, the same condition a `USE` of it raises, and it arrives as a failure with a code rather than a fault of the protocol, because naming a graph that is not there is a question the standard has an answer for.
+
+`{"$table": {"columns": ["id", "name"], "rows": [[1, "a"]]}}` is a binding table, written out. Every row is as long as the column list and every cell is a parameter value in its own right, so a table may hold lists and records. What it cannot hold is an element: a node is an offset in a snapshot, and nothing a client is holding names one.
+
+```
+{"op":"query","q":"USE GRAPH $g MATCH (n) RETURN count(n) AS n","params":{"g":{"$graph":"CURRENT_PROPERTY_GRAPH"}}}
+{"op":"query","q":"RETURN BINDING TABLE $t IS TYPED BINDING TABLE AS t","params":{"t":{"$table":{"columns":["id"],"rows":[[1],[2]]}}}}
+```
+
 ## A session
 
 ```

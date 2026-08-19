@@ -437,6 +437,71 @@ cases:
           - type: STRING
             value: di
 
+  - name: a-pattern-that-exists-written-in-parentheses
+    doc: The standard writes the existence predicate in parentheses as well as in braces, and the pattern inside is the same pattern, so this answers what the braced spelling answers.
+    query: MATCH (a:person) WHERE EXISTS ( (a)-[:knows]->(:person) ) RETURN a.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-block-of-matches-that-exists
+    doc: Several match statements under one predicate, which is one conjunction over the names they share, so this asks for two hops rather than one.
+    query: MATCH (a:person) WHERE EXISTS ( MATCH (a)-[:knows]->(b:person) MATCH (b)-[:knows]->(c:person) ) RETURN a.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: di
+
+  - name: a-query-that-exists
+    doc: A whole query under the predicate rather than a block, which the RETURN is what tells apart, and it reads the row around it, so the answer is that row's.
+    query: MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age = a.age + 10 RETURN b.name } RETURN a.name AS x ORDER BY x
+    columns:
+      - x
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+      - values:
+          - type: STRING
+            value: di
+
+  - name: what-the-query-under-a-predicate-returns-is-never-read
+    doc: Only whether the query answered a row is asked, so it may return as many columns as it likes, which a query written where one value belongs may not.
+    query: MATCH (a:person) WHERE EXISTS { MATCH (b:person) WHERE b.age = a.age RETURN b.name, b.age } RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-query-that-answers-nothing-is-false-and-not-null
+    doc: The difference between asking whether something is there and asking what it is, since a query answering no row where one value belongs is null and here it is false.
+    query: MATCH (a:person) WHERE NOT EXISTS { MATCH (b:person) WHERE b.age > 99 RETURN b.name } RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
   - name: two-patterns-with-nothing-joining-them
     doc: A cross product of the table with itself, which is sixteen rows and is the count a client that quietly joins on the variable name would not produce.
     query: MATCH (a:person), (b:person) RETURN count(*) AS a

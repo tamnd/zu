@@ -56,6 +56,14 @@ module.exports = grammar({
 
   extras: ($) => [/[\s\uFEFF]/, $.comment],
 
+  // A name with a parenthesis behind it is a call, and it is also how
+  // the existence predicate writes a pattern, so the two are the same
+  // text until what is inside the bracket tells them apart. Nothing a
+  // fixed lookahead can see settles that, so both are carried until it
+  // is settled, and the dynamic precedence on the predicate decides the
+  // text that stays ambiguous to the end in favour of the call.
+  conflicts: ($) => [[$.exists_block, $._name]],
+
   rules: {
     source_file: ($) =>
       optional(seq(commaSepSemi($), optional(";"))),
@@ -441,21 +449,44 @@ module.exports = grammar({
     path_constructor: ($) =>
       prec(2, seq(field("name", $.identifier), "[", optional(commaSep1($._expression)), "]")),
 
-    // A match written where a predicate goes. The brace is what tells
-    // it apart from a variable called exists.
+    // A match written where a predicate goes. The bracket is what
+    // tells it apart from a variable called exists.
+    //
+    // ISO 19.4 writes three things here: a pattern, a block of match
+    // statements, and a whole query. Braces hold any of the three and
+    // parentheses hold the first two, a query written in parentheses
+    // not being one of the shapes the standard offers. A pattern with
+    // no MATCH in front of it is what keeps the first apart from the
+    // third, since a query is clauses and a clause begins with a word.
+    // The parenthesized form reads like a call for as long as a call
+    // and a pattern read alike, which is why it is the one conflict
+    // this grammar declares and why it carries a dynamic precedence
+    // below the call's: what follows the bracket settles it, and where
+    // both still stand at the end the call wins, since a name with a
+    // parenthesis behind it is a call almost every time it is written.
     exists_block: ($) =>
-      prec(
-        2,
-        seq(
-          field("name", $.identifier),
-          "{",
-          optional(kw("MATCH")),
-          optional($.match_mode),
-          $.pattern,
-          optional($.keep_clause),
-          optional($.where_clause),
-          "}",
+      choice(
+        prec(
+          2,
+          seq(field("name", $.identifier), "{", choice($.query, $._exists_pattern), "}"),
         ),
+        prec.dynamic(
+          -1,
+          seq(
+            field("name", $.identifier),
+            "(",
+            choice(repeat1($.match_clause), $._exists_pattern),
+            ")",
+          ),
+        ),
+      ),
+
+    _exists_pattern: ($) =>
+      seq(
+        optional($.match_mode),
+        $.pattern,
+        optional($.keep_clause),
+        optional($.where_clause),
       ),
 
     function_call: ($) =>

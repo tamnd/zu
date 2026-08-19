@@ -289,8 +289,10 @@ fn compile(
         // [`BoundExpr::Scalar`] indexes them by position.
         scalars: query.scalars.clone(),
         // A part is a slice of a statement and not a query written
-        // inside one, so it reads nothing from a query around it.
+        // inside one, so it reads nothing from a query around it and
+        // nothing around it asks whether it answered a row.
         captures: Vec::new(),
+        exists: false,
     };
     let leaf = match base {
         // The rows the part before this one carried arrive as one

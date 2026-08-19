@@ -1847,6 +1847,14 @@
       "doc": "One value query expression as a plan, and how often it runs."
     },
     {
+      "id": "zu::ScalarPlan::exists",
+      "kind": "field",
+      "name": "exists",
+      "of": "zu::ScalarPlan",
+      "signature": "bool",
+      "doc": "True when what was written around it asks only whether it\nanswered a row, which is the `EXISTS` form rather than the\n`VALUE` one. It is what the listing titles the plan with."
+    },
+    {
       "id": "zu::ScalarPlan::plan",
       "kind": "field",
       "name": "plan",

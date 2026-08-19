@@ -1176,6 +1176,17 @@ pub enum Expr {
         patterns: Vec<PathPattern>,
         filter: Option<Box<Expr>>,
     },
+    /// `EXISTS { MATCH (p:Person) RETURN p.name }`, the third shape the
+    /// existence predicate is written in (ISO 19.4): a whole query
+    /// rather than a block of matches, asked whether it answered a row.
+    ///
+    /// The query inside answers a binding table and this asks only
+    /// whether that table has a row in it, so what the query returns is
+    /// never read. It is a separate variant from [`Expr::Exists`]
+    /// because a block of matches folds into the match around it and a
+    /// query cannot: it has clauses of its own, ends with a RETURN, and
+    /// runs as a query in its own right.
+    ExistsQuery(Box<Query>),
     /// `VALUE { MATCH (p:Person) RETURN COUNT(*) }`, the value query
     /// expression (ISO 20.6, GQ18): a whole query written where one
     /// value belongs.

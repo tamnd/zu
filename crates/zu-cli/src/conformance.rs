@@ -307,6 +307,16 @@ const NOTES: &[&str] = &[
      one conjunction and the same thing the commas of a single statement are; under an OPTIONAL \
      it is also one operand, so a block that matches half of itself matches none of it and \
      every name it writes reads null",
+    "the existence predicate is written in the three shapes the standard gives it, a graph \
+     pattern, a block of match statements and a whole query, and the first two stand in \
+     parentheses as well as in braces; the RETURN is what tells a query from a block. What the \
+     query returns is never read, only whether it returned a row, so it may return any number \
+     of columns and a query answering no row is false rather than the null a query written \
+     where a value belongs would stand for; the run stops at the first row, so a predicate \
+     over a query that would match a million times costs the first match. A query has a scope \
+     of its own, so it reads the row around it through its expressions rather than through its \
+     patterns, and a pattern in it writing a name the row already carries is refused by name \
+     rather than quietly meaning a second element",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",

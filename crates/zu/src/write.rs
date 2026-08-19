@@ -44,17 +44,18 @@
 //!
 //! [`Zu1Graph`]: crate::query::Zu1Graph
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use zu_common::{Epoch, Result, ZuError};
 
 use crate::append::sidecar;
+use crate::deleted::Tombstones;
 use crate::zu1::catalog::Catalog;
 use crate::zu1::file::Zu1File;
 use crate::zu1::fold::{checkpoint_fold, recover, staged_fold};
-use crate::zu1::graph::{EdgePatch, GraphReader};
+use crate::zu1::graph::{Direction, EdgePatch, GraphReader};
 use crate::zu1::props::{
     CellPatch, PropColumn, PropsDirectory, RowPatch, load_props, load_rel_props,
 };
@@ -102,11 +103,12 @@ const DEFERRED_BYTES: usize = 256 * 1024;
 /// Everything the commits since the last fold left for the readers to
 /// read through, which is what makes a deferred commit visible.
 ///
-/// Three shapes, because there are three ways a change can sit above a
+/// Four shapes, because there are four ways a change can sit above a
 /// column nobody has rewritten: a new value for a row the column
-/// already holds, a whole new row past the end of it, and a new edge,
+/// already holds, a whole new row past the end of it, a new edge,
 /// which is a row of the rel table's property columns and a pair the
-/// adjacency reader has to merge into two lists.
+/// adjacency reader has to merge into two lists, and a row taken away,
+/// which is an offset every read of the table filters by.
 #[derive(Debug, Default)]
 pub struct Patches {
     /// New values, by table.
@@ -117,6 +119,11 @@ pub struct Patches {
     pub rows: HashMap<u32, Arc<RowPatch>>,
     /// New edges, by rel table.
     pub edges: HashMap<u32, Arc<EdgePatch>>,
+    /// Rows taken away, by table, ascending. A delete moves nothing:
+    /// the offsets stay where they are and the fold writes them into
+    /// the table's tombstone chain, so what the patch carries is what
+    /// the chain would have held.
+    pub gone: Tombstones,
 }
 
 impl Patches {
@@ -125,7 +132,10 @@ impl Patches {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.rows.is_empty() && self.edges.is_empty()
+        self.cells.is_empty()
+            && self.rows.is_empty()
+            && self.edges.is_empty()
+            && self.gone.is_empty()
     }
 
     /// How many cells everything in here holds between them, which is
@@ -134,6 +144,7 @@ impl Patches {
         self.cells.values().map(|p| p.cells()).sum::<usize>()
             + self.rows.values().map(|p| p.len()).sum::<usize>()
             + self.edges.values().map(|p| p.len() as usize).sum::<usize>()
+            + self.gone.values().map(|rows| rows.len()).sum::<usize>()
     }
 
     /// How many bytes of string they hold, the other thing it bounds.
@@ -204,6 +215,10 @@ pub struct Writer {
     added: HashMap<u32, RowPatch>,
     /// The edges they added, by rel table, the same way.
     fresh: HashMap<u32, EdgePatch>,
+    /// The rows they took away, by table. A set, because a row can be
+    /// deleted twice and the second one takes nothing away, and sorted
+    /// because that is the order the readers merge it in.
+    graves: HashMap<u32, BTreeSet<u64>>,
     /// Adjacency readers of the rel tables a deferred commit has added
     /// an edge to, which is what says whether the pair is already
     /// there and how many edges the file holds. A fold moves what
@@ -260,6 +275,7 @@ impl Writer {
             deferred: 0,
             added: HashMap::new(),
             fresh: HashMap::new(),
+            graves: HashMap::new(),
             readers: HashMap::new(),
             catalog: None,
             dirs: HashMap::new(),
@@ -357,7 +373,7 @@ impl Writer {
     /// This commit as the patch would hold it, or `None` when it has to
     /// be folded.
     ///
-    /// Three shapes need no fold. A value written onto a row that is
+    /// Four shapes need no fold. A value written onto a row that is
     /// already there, because the patch carries exactly that and a
     /// reader reads through it. The same value written onto an edge,
     /// which is the one above once the pair has been turned into the
@@ -365,8 +381,11 @@ impl Writer {
     /// changes rather than about them. An edge added to a rel table,
     /// because the adjacency reader merges it into the two lists it
     /// belongs in and its property values sit under the ordinal it was
-    /// given. Anything else, a new node, a deleted row, a label, an edge
-    /// taken away, folds the way it always did. On top of the shape
+    /// given. And a row taken away, because a delete moves nothing: the
+    /// offset goes in the patch where a fold would have put it in the
+    /// chain, and the readers filter by the two together. Anything
+    /// else, a new node, a label, an edge taken away, folds the way it
+    /// always did. On top of the shape
     /// there are four bounds: how many commits may go unfolded, how
     /// many cells they may hold, how many bytes of string among them,
     /// and the block growth the checkpoint threshold already bounds.
@@ -405,6 +424,12 @@ impl Writer {
                 }
                 Deferred::Edge(rel, src, dst, ref cols) => {
                     if !self.edge_patchable(db, rel, src, dst, cols)? {
+                        return Ok(None);
+                    }
+                    taken.push(change);
+                }
+                Deferred::Gone(table, offset) => {
+                    if !self.removable(db, table, offset)? {
                         return Ok(None);
                     }
                     taken.push(change);
@@ -562,6 +587,63 @@ impl Writer {
         Ok(holds(column, value) && column.validity.is_none() && row < column.meta.value_count)
     }
 
+    /// Whether a reader can be shown this row as gone without the file
+    /// being rewritten around it.
+    ///
+    /// The row has to be one the table has, and it has to have no edges
+    /// on it. Every edge in the file names its endpoints by offset, so
+    /// a row that still has one and is gone all the same is an edge
+    /// that runs to nothing, which is the state a fold is careful never
+    /// to leave: it prunes the edges of a tombstoned row as it rebuilds
+    /// the rel table. Nothing here rebuilds anything, so what a fold
+    /// would have pruned is what this refuses. A `DELETE` says the same
+    /// thing one layer up and raises G1001 rather than folding, and
+    /// this is what keeps a caller that staged the op itself honest.
+    ///
+    /// An edge this run of deferred commits added counts, and it is
+    /// counted by turning the whole table away: the readers here are
+    /// the file's and the patch is the writer's, and a delete on a
+    /// table something has just been linked into is rare enough to
+    /// fold.
+    fn removable(&mut self, db: &mut Zu1File, table: u32, offset: u64) -> Result<bool> {
+        if self.catalog.is_none() {
+            self.catalog = Some(Catalog::load(db)?);
+        }
+        let catalog = self.catalog.as_ref().expect("just loaded");
+        let Some(node) = catalog.node_by_id(table) else {
+            return Ok(false);
+        };
+        if offset >= node.node_count {
+            return Ok(false);
+        }
+        let rels: Vec<(u32, bool, bool)> = catalog
+            .rel_tables()
+            .iter()
+            .filter(|rel| rel.from == table || rel.to == table)
+            .map(|rel| (rel.id, rel.from == table, rel.to == table))
+            .collect();
+        for (rel, out, back) in rels {
+            if self.fresh.contains_key(&rel) {
+                return Ok(false);
+            }
+            self.load_reader(db, rel)?;
+            let Some(reader) = self.readers.get(&rel) else {
+                return Ok(false);
+            };
+            let mut edges = 0;
+            if out {
+                edges += reader.degree_of(db, offset, Direction::Fwd)?;
+            }
+            if back {
+                edges += reader.degree_of(db, offset, Direction::Bwd)?;
+            }
+            if edges > 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Adds a deferred commit's cells to the patch and republishes it.
     ///
     /// Only the tables this commit wrote into are rebuilt. The others
@@ -570,6 +652,7 @@ impl Writer {
     fn stage_patch(&mut self, changes: Vec<Deferred>) {
         let mut cells: Vec<u32> = Vec::new();
         let mut rels: Vec<u32> = Vec::new();
+        let mut graves: Vec<u32> = Vec::new();
         for change in changes {
             match change {
                 Deferred::Cell((table, row, col, value)) => {
@@ -605,6 +688,12 @@ impl Writer {
                         rels.push(rel);
                     }
                 }
+                Deferred::Gone(table, offset) => {
+                    self.graves.entry(table).or_default().insert(offset);
+                    if !graves.contains(&table) {
+                        graves.push(table);
+                    }
+                }
                 // [`Self::defers`] answers with the ordinals a pair
                 // holds, so what reaches here names a row of its own.
                 Deferred::RelCell(..) => unreachable!("resolved where the commit was taken"),
@@ -614,6 +703,7 @@ impl Writer {
             cells: self.patches.cells.clone(),
             rows: self.patches.rows.clone(),
             edges: self.patches.edges.clone(),
+            gone: self.patches.gone.clone(),
         };
         for table in cells {
             let words = self.pending.get(&table).map_or_else(BTreeMap::new, |cols| {
@@ -637,6 +727,11 @@ impl Writer {
             if let Some(rows) = self.added.get(&rel) {
                 patches.rows.insert(rel, Arc::new(rows.clone()));
             }
+        }
+        for table in graves {
+            patches
+                .gone
+                .insert(table, self.graves[&table].iter().copied().collect());
         }
         self.patches = Arc::new(patches);
         self.deferred += 1;
@@ -682,6 +777,7 @@ impl Writer {
             self.strings.clear();
             self.added.clear();
             self.fresh.clear();
+            self.graves.clear();
             self.patches = Arc::new(Patches::new());
         }
     }
@@ -809,6 +905,24 @@ mod tests {
             ],
         )
         .expect("edge props");
+    }
+
+    /// Four people linked in a line and a fifth with nobody, because a
+    /// plain `DELETE` takes away an element that has no edges on it and
+    /// refuses one that has.
+    fn seeded_loner(path: &Path) {
+        let mut db = Zu1File::create(path).expect("create");
+        bulk_load_as(&mut db, "person", "knows", 5, &[(0, 1), (1, 2), (2, 3)]).expect("load");
+        let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe", b"amy", b"zoe"];
+        store_props(
+            &mut db,
+            "person",
+            &[
+                ("age", PropValues::Int(&[10, 20, 30, 40, 50])),
+                ("name", PropValues::Str(&names)),
+            ],
+        )
+        .expect("props");
     }
 
     fn string(row: &[Value], at: usize) -> String {
@@ -1324,6 +1438,112 @@ mod tests {
             )
             .expect("read it back");
         assert_eq!(string(&out.rows[0], 0), long);
+    }
+
+    /// A row taken away is gone to every read without the file being
+    /// rewritten around it.
+    ///
+    /// A delete moves nothing: the offsets stay where they are, the
+    /// fold writes them into the table's tombstone chain, and every
+    /// read filters by that chain. So the patch carries what the chain
+    /// would have held and the readers merge the two, which is the same
+    /// answer for the cost of a walk of two sorted lists.
+    #[test]
+    fn a_row_taken_away_needs_no_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("delete-defer.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        // The first write opens the writer, which recovers and folds,
+        // so the epoch to hold against is the one after it.
+        session
+            .run("MATCH (p:person) WHERE p.age = 10 SET p.age = 11", &[])
+            .expect("first write");
+        let before = session.epoch();
+
+        session
+            .run("MATCH (p:person) WHERE p.age = 50 DELETE p", &[])
+            .expect("take zoe away");
+        assert_eq!(session.epoch(), before, "a delete folded");
+
+        // Out of a scan of the table, out of a filter over the column
+        // the row was found by, and out of the count the table answers.
+        assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay"]);
+        let out = session
+            .run(
+                "MATCH (p:person) WHERE p.age = 50 RETURN p.name AS name",
+                &[],
+            )
+            .expect("read the row that went");
+        assert!(out.rows.is_empty(), "a deleted row came back");
+        let counted = session
+            .run("MATCH (p:person) RETURN count(p) AS n", &[])
+            .expect("count");
+        assert_eq!(counted.rows[0][0], Value::Int(4));
+
+        // And the rows around it kept their offsets, which is what says
+        // nothing was compacted underneath.
+        let ages = session
+            .run("MATCH (p:person) RETURN p.age AS age ORDER BY age", &[])
+            .expect("read the ages");
+        assert_eq!(
+            ages.rows
+                .iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>(),
+            [
+                Value::Int(11),
+                Value::Int(20),
+                Value::Int(30),
+                Value::Int(40)
+            ]
+        );
+
+        // What the patch answered, the chain answers on its own.
+        session.file_mut().expect("fold");
+        assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay"]);
+        assert!(session.epoch() > before, "a fold published no epoch");
+    }
+
+    /// An element that still has edges folds rather than deferring,
+    /// because it does not get as far as the write side: an edge names
+    /// its endpoints by offset, so a row that is gone with an edge on it
+    /// is an edge that runs to nothing, and a plain `DELETE` refuses it.
+    #[test]
+    fn a_row_with_an_edge_on_it_is_refused_rather_than_carried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("delete-attached.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let err = session
+            .run("MATCH (p:person) WHERE p.age = 20 DELETE p", &[])
+            .expect_err("kay is in the middle of the line");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("G1001"));
+        assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay", "zoe"]);
+    }
+
+    /// The part of a statement after a delete reads the row as gone,
+    /// whether the delete folded or is still in the patch. An edge onto
+    /// it is refused rather than written into the lists, because an edge
+    /// to a row nobody can read is one no reader can resolve.
+    #[test]
+    fn an_edge_onto_a_row_the_same_statement_took_away_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("delete-then-link.zu1");
+        seeded_loner(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let err = session
+            .run(
+                "MATCH (a:person), (z:person) WHERE a.name = 'ada' AND z.name = 'zoe' \
+                 DELETE z INSERT (a)-[:knows]->(z)",
+                &[],
+            )
+            .expect_err("the far end is gone");
+        assert_eq!(err.gqlstatus().map(|s| s.code()), Some("G1002"));
+        assert!(err.to_string().contains("taken away"), "got: {err}");
     }
 
     /// A write onto an edge this same unfolded run added folds instead.

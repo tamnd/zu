@@ -1136,8 +1136,13 @@ impl Session {
             let next = match write {
                 crate::split::Write::Insert(insert) => {
                     let catalog = self.graph.catalog().clone();
-                    let mut batch =
-                        crate::insert::Batch::open(self.graph.file_mut(), insert, catalog)?;
+                    let patches = Arc::clone(&self.patches);
+                    let mut batch = crate::insert::Batch::open(
+                        self.graph.file_mut(),
+                        insert,
+                        catalog,
+                        &patches.gone,
+                    )?;
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
                         let (carried, props) = row.split_at(carry);
@@ -1182,7 +1187,8 @@ impl Session {
                         }
                     }
                     let catalog = self.graph.catalog().clone();
-                    let mut removals = crate::delete::Removals::open(delete, catalog);
+                    let mut removals =
+                        crate::delete::Removals::open(delete, catalog, Arc::clone(&self.patches));
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
                         let (carried, _) = row.split_at(carry);

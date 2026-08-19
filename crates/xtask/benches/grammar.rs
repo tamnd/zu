@@ -15,10 +15,10 @@
 //! Run: cargo bench -p xtask --bench grammar
 
 use std::hint::black_box;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use xtask::grammar::{self, Kind, Vocabulary};
+use xtask::grammar::{self, Kind, TreeSitter, Vocabulary};
 
 fn main() {
     println!(
@@ -32,6 +32,10 @@ fn main() {
         let words = vocabulary.all().len();
         let js = grammar_js(&vocabulary);
         let rust = highlight_rs(&vocabulary);
+        let tree_sitter = TreeSitter {
+            dir: PathBuf::from("."),
+            js: js.clone(),
+        };
         let mut bytes = 0;
         let ms = best(|| {
             let vocabulary = Vocabulary::parse(black_box(&text)).expect("parses");
@@ -40,7 +44,7 @@ fn main() {
             assert_eq!(table.len(), vocabulary.shell_table().len());
             assert_eq!(spelled.len(), words);
             bytes = vocabulary
-                .generated(&js)
+                .generated(Path::new("."), Some(&tree_sitter))
                 .iter()
                 .map(|file| black_box(file.text.len()))
                 .sum();
@@ -64,15 +68,27 @@ fn main() {
     // all read off the disk.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let vocabulary = Vocabulary::load(&root.join(grammar::PATH)).expect("the word list loads");
+    // The grammar is another repository, so on a machine without a
+    // checkout of it this measures the two halves that are here. The
+    // keywords it spells are counted as none rather than left out of
+    // the line, so that a run against fewer files says so.
+    let tree_sitter = TreeSitter::find(&root).expect("the grammar checkout resolves");
+    let tree_sitter = tree_sitter.as_ref();
     let ms = best(|| {
-        black_box(vocabulary.check(black_box(&root)).expect("the check runs"));
+        black_box(
+            vocabulary
+                .check(black_box(&root), tree_sitter)
+                .expect("the check runs"),
+        );
     });
-    let notes = vocabulary.check(&root).expect("the check runs");
+    let notes = vocabulary
+        .check(&root, tree_sitter)
+        .expect("the check runs");
     println!(
         "\ncommitted tree: {} words, {} keywords the grammar spells, {} in the shell's table, \
          {ms:.2} ms, {} to fix",
         vocabulary.all().len(),
-        grammar::spelled(&read(&root.join(grammar::GRAMMAR))).len(),
+        tree_sitter.map_or(0, |ts| grammar::spelled(&ts.js).len()),
         vocabulary.shell_table().len(),
         notes.len(),
     );
@@ -122,10 +138,6 @@ fn highlight_rs(vocabulary: &Vocabulary) -> String {
     }
     text.push_str("];\n\nfn colour() {}\n");
     text
-}
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 /// The best of seven, in milliseconds. The best rather than the mean

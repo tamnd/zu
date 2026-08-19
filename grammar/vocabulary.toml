@@ -12,11 +12,13 @@ audited = "2026-08-19"
 # editor.
 #
 # So the lists live here and `cargo xtask grammar` puts them where each
-# consumer needs them: `grammar/tree-sitter-gql/queries/highlights.scm`
-# and `grammar/shiki/gql.tmLanguage.json` are written from this file, and
-# `crates/zu-cli/src/highlight.rs` is checked against it, because the
-# shell's table is sorted for a binary search and is read by a scanner
-# on the keystroke path rather than by a generator.
+# consumer needs them: `grammar/shiki/gql.tmLanguage.json` is written
+# from this file, `crates/zu-cli/src/highlight.rs` is checked against it,
+# because the shell's table is sorted for a binary search and is read by
+# a scanner on the keystroke path rather than by a generator, and
+# `queries/highlights.scm` is written into a checkout of
+# https://github.com/tamnd/tree-sitter-gql, which is where the editor's
+# grammar lives and which puts this file to itself in its own CI.
 #
 # What a `kind` means:
 #   keyword   a word the parser gives meaning to by position

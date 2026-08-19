@@ -1074,18 +1074,35 @@ fn grammar_command(args: &[String]) -> Result<ExitCode, String> {
         counted(grammar::Kind::Type),
     );
 
+    // The tree-sitter grammar is a repository of its own, so its half
+    // of this runs when there is a checkout of it to run against.
+    let tree_sitter = grammar::TreeSitter::find(&root)?;
+    let tree_sitter = tree_sitter.as_ref();
+
     let notes = if check {
-        vocabulary.check(&root)?
+        vocabulary.check(&root, tree_sitter)?
     } else {
         // Writing first, so that the drift a write fixes is not
         // reported as something to fix by hand.
-        for path in vocabulary.write(&root)? {
-            println!("{path}");
+        for path in vocabulary.write(&root, tree_sitter)? {
+            println!("{}", path.display());
         }
-        vocabulary.consistency(&root)?
+        vocabulary.consistency(&root, tree_sitter)?
     };
     if notes.is_empty() {
         println!("{summary}");
+        // Said every time rather than only when something is wrong,
+        // because a check that quietly did half of what it is named
+        // after reads exactly like one that did all of it.
+        match tree_sitter {
+            Some(ts) => println!("and the tree-sitter grammar in {}", ts.dir.display()),
+            None => println!(
+                "the tree-sitter grammar was not checked: it is {}, and no checkout of it is \
+                 beside this one or named by ${}",
+                grammar::REPOSITORY,
+                grammar::CHECKOUT
+            ),
+        }
         return Ok(ExitCode::SUCCESS);
     }
     for note in &notes {

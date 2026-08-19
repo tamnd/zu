@@ -27,8 +27,11 @@ fmt:
 	cargo fmt --all
 
 # The word list against the three things that colour a statement, and
-# the two grammars against the conformance corpus. The second half wants
-# node, which is why it is a target of its own rather than part of lint.
+# the website's grammar against the conformance corpus. The second half
+# wants node, which is why it is a target of its own rather than part of
+# lint. The editor's grammar is tamnd/tree-sitter-gql, and the first
+# half covers it when a checkout of it is beside this one or named by
+# $ZU_TREE_SITTER.
 grammar:
 	cargo run -p xtask -- grammar --check
 	cd grammar && npm ci && npm test

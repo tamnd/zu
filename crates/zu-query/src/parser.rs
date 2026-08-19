@@ -13,7 +13,7 @@ use zu_common::gqlstatus::codes;
 use zu_common::{Field, LogicalType, RecordType, Result, Temporal, ZuError};
 
 use crate::ast::{
-    BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, ElementDefKind,
+    BinaryOp, CatalogStmt, Clause, Composite, Conjunction, DeleteTarget, EdgeEnd, ElementDefKind,
     ElementTypeDef, Endpoint, Expr, GraphName, GraphRef, GraphTypeRef, GraphTypeSource, Group,
     GroupKind, LabelExpr, LetItem, Linear, Literal, MatchMode, NodePattern, NullOrder, Ordinal,
     PathMode, PathPattern, PatternList, Projection, ProjectionItem, PropertyDef, Query,
@@ -2569,24 +2569,7 @@ impl Parser<'_> {
                     }
                     if self.at_kw("IS") {
                         self.pos += 1;
-                        let negated = self.eat_kw("NOT");
-                        // GA06. `IS NULL` and `IS TYPED` share their
-                        // first two words, and NULL is also the name of
-                        // a type, so the null test is the one written
-                        // without TYPED and nothing else has to change.
-                        if self.eat_kw("TYPED") {
-                            lhs = Expr::IsTyped {
-                                expr: Box::new(lhs),
-                                ty: self.parse_value_type()?,
-                                negated,
-                            };
-                            continue;
-                        }
-                        self.expect_kw("NULL")?;
-                        lhs = Expr::IsNull {
-                            expr: Box::new(lhs),
-                            negated,
-                        };
+                        lhs = self.parse_is_tail(lhs)?;
                         continue;
                     }
                     break;
@@ -2597,6 +2580,53 @@ impl Parser<'_> {
             lhs = binary(op, lhs, rhs);
         }
         Ok(lhs)
+    }
+
+    /// Everything a query may write behind `IS`, parsed off the line the
+    /// comparison is on rather than inside it, since `parse_comparison`
+    /// is on the recursion path a nested expression pays for and these
+    /// five readings are not.
+    fn parse_is_tail(&mut self, lhs: Expr) -> Result<Expr> {
+        let negated = self.eat_kw("NOT");
+        // GA06. `IS NULL` and `IS TYPED` share their first two words,
+        // and NULL is also the name of a type, so the null test is the
+        // one written without TYPED and nothing else has to change.
+        if self.eat_kw("TYPED") {
+            return Ok(Expr::IsTyped {
+                expr: Box::new(lhs),
+                ty: self.parse_value_type()?,
+                negated,
+            });
+        }
+        // G110, G111, G112. The pattern predicates are written after IS
+        // as well, and each is settled by the word behind it.
+        if self.eat_kw("DIRECTED") {
+            return Ok(Expr::IsDirected {
+                expr: Box::new(lhs),
+                negated,
+            });
+        }
+        if self.eat_kw("LABELED") {
+            return Ok(Expr::IsLabeled {
+                expr: Box::new(lhs),
+                label: self.parse_label_expr()?,
+                negated,
+            });
+        }
+        if let Some(end) = self.eat_endpoint() {
+            self.expect_kw("OF")?;
+            return Ok(Expr::IsEndpoint {
+                node: Box::new(lhs),
+                rel: Box::new(self.parse_additive()?),
+                end,
+                negated,
+            });
+        }
+        self.expect_kw("NULL")?;
+        Ok(Expr::IsNull {
+            expr: Box::new(lhs),
+            negated,
+        })
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
@@ -2816,6 +2846,12 @@ impl Parser<'_> {
         // receive a variable named INT8.
         if name.eq_ignore_ascii_case("CAST") {
             self.parse_cast()
+        } else if name.eq_ignore_ascii_case("PROPERTY_EXISTS") {
+            // G115, and here for the reason CAST is: the second
+            // argument is a property name rather than an expression,
+            // and reading it as one would bind a variable that the
+            // query never wrote.
+            self.parse_property_exists()
         } else {
             self.parse_call(name)
         }
@@ -3206,6 +3242,27 @@ impl Parser<'_> {
         };
         self.pos += 1;
         u32::try_from(value).map_err(|_| self.error("a count that fits in 32 bits"))
+    }
+
+    /// The end of an edge a source or destination predicate names,
+    /// consumed when one of the two words stands here (G112).
+    fn eat_endpoint(&mut self) -> Option<EdgeEnd> {
+        if self.eat_kw("SOURCE") {
+            return Some(EdgeEnd::Source);
+        }
+        self.eat_kw("DESTINATION").then_some(EdgeEnd::Destination)
+    }
+
+    /// `PROPERTY_EXISTS(element, name)`, the parenthesis unconsumed and
+    /// the name already read. A quoted name is taken as well, because a
+    /// property whose name needs quoting is still a property.
+    fn parse_property_exists(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let expr = Box::new(self.parse_expr()?);
+        self.expect(&TokenKind::Comma)?;
+        let key = self.expect_name("a property name")?;
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::PropertyExists { expr, key })
     }
 
     fn parse_call(&mut self, name: String) -> Result<Expr> {

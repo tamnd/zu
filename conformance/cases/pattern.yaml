@@ -877,3 +877,83 @@ cases:
       - values:
           - type: INT64
             value: "90"
+
+  - name: a-directed-predicate-asks-whether-an-edge-has-a-direction
+    doc: Every edge of a table has a direction or none of them does, so the question is about the table the edge came from and every edge here answers yes. A node has no direction to answer with, so the predicate is written of an edge and refused of anything else.
+    query: MATCH (a:person)-[k:knows]->(b:person) WHERE k IS DIRECTED RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-labeled-predicate-tests-a-label-expression-on-a-bound-element
+    doc: The label expression a pattern writes after a colon, asked of an element the query already bound rather than of the rows a scan is walking, so it reads the labels the row carries and nothing else.
+    query: MATCH (n) WHERE n IS LABELED person RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-labeled-predicate-answers-no-for-a-label-nothing-carries
+    doc: A name the graph has never held is a question with the answer no rather than a mistake, which is the reading a pattern naming one gets.
+    query: MATCH (n) WHERE n IS NOT LABELED nothing RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-source-predicate-relates-a-node-to-the-edge-it-leaves
+    doc: An edge value carries both of its ends, so the predicate is a comparison rather than another read of the graph. Every edge of a directed pattern leaves the node written first and arrives at the node written second, so both halves hold on every row.
+    query: MATCH (a:person)-[k:knows]->(b:person) WHERE a IS SOURCE OF k AND b IS DESTINATION OF k RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: an-all-different-predicate-is-true-when-the-elements-are-distinct
+    doc: Element identity, which is the table and the row for a node, so the two ends of the edge from a node to itself are one element and the two ends of the others are two.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE all_different(a, b) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-same-predicate-is-true-when-the-elements-are-one-element
+    doc: The other half of the same question, which the edge from a node to itself is the one row to answer yes for.
+    query: MATCH (a:person)-[:knows]->(b:person) WHERE same(a, b) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: a-property-exists-predicate-asks-the-element-and-not-the-value
+    doc: Whether the element carries a property, which is a question about the element and not about what is stored in it, so it is answered without reading the value.
+    query: MATCH (n:person) WHERE property_exists(n, name) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-property-exists-predicate-answers-no-for-a-name-the-table-lacks
+    doc: A property the table does not have is absent from every one of its elements, which is the answer no rather than a null and rather than a condition.
+    query: MATCH (n:person) WHERE property_exists(n, nickname) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"

@@ -1138,6 +1138,35 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: LogicalType,
     },
+    /// `CASE`, ISO 19.4 and mandatory feature GE01, in both of the forms
+    /// the standard writes it in.
+    ///
+    /// The searched form asks a condition per branch,
+    /// `CASE WHEN n.age < 18 THEN 'child' ELSE 'adult' END`; the simple
+    /// form names a value once and compares it with each branch's,
+    /// `CASE n.kind WHEN 'a' THEN 1 WHEN 'b' THEN 2 END`, which is the
+    /// same expression with the equality written for the reader. A
+    /// `CASE` that answers no branch and wrote no `ELSE` is null, which
+    /// is what makes the `ELSE` optional.
+    Case {
+        /// The value the simple form compares each branch with, `None`
+        /// for the searched form.
+        subject: Option<Box<Expr>>,
+        /// The branches, in the order they were written, which is the
+        /// order they are asked in.
+        branches: Vec<(Expr, Expr)>,
+        otherwise: Option<Box<Expr>>,
+    },
+    /// `COALESCE(a, b, c)`, the first of its arguments that is not null.
+    /// ISO calls it a case abbreviation, being `CASE WHEN a IS NOT NULL
+    /// THEN a ELSE COALESCE(b, c) END` written short.
+    Coalesce(Vec<Expr>),
+    /// `NULLIF(a, b)`, which is null where the two are equal and `a`
+    /// otherwise, the other case abbreviation.
+    NullIf {
+        value: Box<Expr>,
+        compared: Box<Expr>,
+    },
     /// `EXISTS { MATCH (a)-[:knows]->(b) WHERE b.id > 10 }`, the pattern
     /// existence predicate. The block is a match of its own that binds
     /// nothing outside itself: variables written in it live for the

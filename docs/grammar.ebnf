@@ -357,10 +357,30 @@ unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
                 | function_call | cast | property_exists
+                | case_expr | coalesce | nullif
                 | path_constructor | exists_block
                 | value_query | "(" , expression , ")" | list | record ;
 
 cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
+(* ISO 19.4 and mandatory feature GE01. Two forms: the searched one
+   asks a condition per branch, and the simple one names a value and
+   compares each branch with it. Whether a value stands before the
+   first WHEN is what tells them apart. The branches are asked in the
+   order they were written and only the branch that holds is
+   evaluated, so a CASE may guard an expression the other rows cannot
+   answer. A CASE that holds no branch and wrote no ELSE is null.
+   CASE is the one word of the expression grammar with nothing behind
+   it to tell it from a variable read, so it is a word wherever an
+   expression begins. *)
+case_expr       = "CASE" , [ expression ] , when_branch , { when_branch } ,
+                  [ "ELSE" , expression ] , "END" ;
+when_branch     = "WHEN" , expression , "THEN" , expression ;
+(* The case abbreviations of the same clause, written like calls and
+   read like forms: COALESCE stops at the first argument that is not
+   null, so what a function would have evaluated before it was entered
+   is what these two decide not to evaluate at all. *)
+coalesce        = "COALESCE" , "(" , expression , { "," , expression } , ")" ;
+nullif          = "NULLIF" , "(" , expression , "," , expression , ")" ;
 (* ISO 19.13 and feature G115. Written like a call and not one: the
    second argument is a property name rather than an expression, so
    reading it as one would bind a variable the query never wrote.

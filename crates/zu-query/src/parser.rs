@@ -2821,6 +2821,15 @@ impl Parser<'_> {
         if name.eq_ignore_ascii_case("false") {
             return Ok(Expr::Literal(Literal::Bool(false)));
         }
+        // GE01. CASE is the one word in the expression grammar that
+        // opens something with nothing behind it to tell it from a
+        // variable read, so it is the case expression wherever an
+        // expression begins and is not free to be a name. ISO reserves
+        // it, and the alternative is a query that means one thing until
+        // somebody names a column `case`.
+        if name.eq_ignore_ascii_case("CASE") {
+            return self.parse_case();
+        }
         // A temporal literal is a type name and a string, and it has to
         // be taken before the name becomes a variable, because DATE is
         // a perfectly good variable name right up until a string
@@ -2869,6 +2878,27 @@ impl Parser<'_> {
         // receive a variable named INT8.
         if name.eq_ignore_ascii_case("CAST") {
             self.parse_cast()
+        } else if name.eq_ignore_ascii_case("COALESCE") {
+            // GE01's two case abbreviations. They are written like
+            // calls and are read here rather than left to a function
+            // because the binder resolves a function by name and gives
+            // every one of them a fixed arity, and because both are
+            // short circuiting: COALESCE stops at the first argument
+            // that is not null and a function would have had all of
+            // them evaluated before it was entered.
+            let args = self.parse_arguments()?;
+            if args.is_empty() {
+                return Err(self.error("at least one argument to COALESCE"));
+            }
+            Ok(Expr::Coalesce(args))
+        } else if name.eq_ignore_ascii_case("NULLIF") {
+            let args = self.parse_arguments()?;
+            let [value, compared] = <[Expr; 2]>::try_from(args)
+                .map_err(|_| self.error("exactly two arguments to NULLIF"))?;
+            Ok(Expr::NullIf {
+                value: Box::new(value),
+                compared: Box::new(compared),
+            })
         } else if name.eq_ignore_ascii_case("PROPERTY_EXISTS") {
             // G115, and here for the reason CAST is: the second
             // argument is a property name rather than an expression,
@@ -3004,6 +3034,59 @@ impl Parser<'_> {
         let value = Temporal::parse(&ty, &text)
             .ok_or_else(|| ZuError::gql(code, format!("'{text}' is not a {ty} anyone can read")))?;
         Ok(Some(Expr::Literal(Literal::Temporal(value))))
+    }
+
+    /// A bracketed, comma separated argument list, the opening
+    /// parenthesis unconsumed. The special forms written like calls
+    /// share it, since what tells them apart is what they do with the
+    /// arguments rather than how the arguments are written.
+    fn parse_arguments(&mut self) -> Result<Vec<Expr>> {
+        self.expect(&TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if !self.at(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(args)
+    }
+
+    /// `CASE`, ISO 19.4 and GE01, the word already read.
+    ///
+    /// Both forms are read here, and which one this is is settled by
+    /// what follows `CASE`: a `WHEN` means the searched form, and
+    /// anything else is the value the simple form compares each branch
+    /// with. Nothing is rewritten on the way in, so the simple form
+    /// keeps its one subject rather than becoming an equality repeated
+    /// once per branch.
+    fn parse_case(&mut self) -> Result<Expr> {
+        let subject = match self.at_kw("WHEN") {
+            true => None,
+            false => Some(Box::new(self.parse_expr()?)),
+        };
+        let mut branches = Vec::new();
+        while self.eat_kw("WHEN") {
+            let when = self.parse_expr()?;
+            self.expect_kw("THEN")?;
+            branches.push((when, self.parse_expr()?));
+        }
+        if branches.is_empty() {
+            return Err(self.error("WHEN after CASE"));
+        }
+        let otherwise = match self.eat_kw("ELSE") {
+            true => Some(Box::new(self.parse_expr()?)),
+            false => None,
+        };
+        self.expect_kw("END")?;
+        Ok(Expr::Case {
+            subject,
+            branches,
+            otherwise,
+        })
     }
 
     /// `CAST(expr AS type)`, the opening parenthesis unconsumed.
@@ -4355,6 +4438,51 @@ mod tests {
                 .contains("once per repetition"),
             "a predicate inside a repeated stretch"
         );
+    }
+
+    /// GE01. The word after CASE is what settles which form this is,
+    /// and the two abbreviations are read where a call would be read
+    /// without becoming calls.
+    #[test]
+    fn case_reads_both_forms_and_the_two_abbreviations() {
+        let searched = parsed("RETURN CASE WHEN a > 1 THEN 'many' ELSE 'one' END AS n");
+        let Expr::Case {
+            subject,
+            branches,
+            otherwise,
+        } = &searched.result().expect("RETURN").items[0].expr
+        else {
+            panic!("the searched form");
+        };
+        assert!(subject.is_none(), "no value before the first WHEN");
+        assert_eq!(branches.len(), 1);
+        assert!(otherwise.is_some());
+
+        let simple = parsed("RETURN CASE a.kind WHEN 'x' THEN 1 WHEN 'y' THEN 2 END AS n");
+        let Expr::Case {
+            subject,
+            branches,
+            otherwise,
+        } = &simple.result().expect("RETURN").items[0].expr
+        else {
+            panic!("the simple form");
+        };
+        assert!(subject.is_some(), "the value each branch is compared with");
+        assert_eq!(branches.len(), 2);
+        assert!(otherwise.is_none(), "an ELSE nobody wrote");
+
+        let abbreviated = parsed("RETURN COALESCE(a, b, 0) AS n, NULLIF(a, b) AS m");
+        let items = &abbreviated.result().expect("RETURN").items;
+        let Expr::Coalesce(args) = &items[0].expr else {
+            panic!("COALESCE");
+        };
+        assert_eq!(args.len(), 3);
+        assert!(matches!(items[1].expr, Expr::NullIf { .. }));
+
+        // A CASE with no branch answers nothing, and NULLIF asks about
+        // two values however many the query wrote.
+        assert!(parse_err("RETURN CASE ELSE 1 END AS n").contains("WHEN"));
+        assert!(parse_err("RETURN NULLIF(a) AS n").contains("two arguments"));
     }
 
     #[test]

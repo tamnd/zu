@@ -722,3 +722,39 @@ cases:
             value:
               - type: INT64
                 value: "1"
+
+  - name: named-by-its-type
+    doc: The list value constructor of ISO 20.17 may name what it is building before it lists what goes in it, and the name changes nothing about the list. A client that only reads the bracket form fails here on a query the standard writes both ways.
+    query: RETURN LIST [1, 2, 3] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: LIST
+            value:
+              - type: INT64
+                value: "1"
+              - type: INT64
+                value: "2"
+              - type: INT64
+                value: "3"
+
+  - name: array-is-the-same-word-twice
+    doc: ARRAY and LIST are one type name spelled two ways, in the constructor as in the type grammar, so the two constructors build the same value and compare equal.
+    query: RETURN ARRAY [1, 2] = LIST [1, 2] AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-name-does-not-take-the-word
+    doc: The type name is only a constructor when a bracket follows it, so a query may still bind a variable called list and read it back.
+    query: LET list = 7 RETURN list AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "7"

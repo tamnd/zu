@@ -196,3 +196,33 @@ cases:
     columns:
       - n
     rows:
+
+  - name: a-record-named-by-its-type
+    doc: The record constructor of ISO 20.19 may name what it is building the way the list constructor does, and the name changes nothing about the record. The field is read back here rather than the record itself, because the wire encoding of this corpus has no record value and a client is not asked to invent one.
+    query: RETURN (RECORD {a: 1, b: 2}).b AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-record-with-and-without-its-name
+    doc: The name is optional, so the two ways of writing one record build the same record and compare equal.
+    query: RETURN RECORD {a: 1} = {a: 1} AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: record-is-still-a-name
+    doc: The word is a constructor only when a brace follows it, so a query may still bind a variable called record and read it back.
+    query: LET record = 'kept' RETURN record AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: kept

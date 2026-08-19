@@ -79,7 +79,7 @@ words = ["CREATE", "DROP", "SCHEMA", "GRAPH", "PROPERTY", "TYPE", "IF", "REPLACE
 
 [[group]]
 kind = "keyword"
-doc = "Value type words that are grammar rather than type names: the list types and the open types."
+doc = "Value type words that are grammar rather than type names: the list types and the open types. The three type names are also the constructors that build a value of the type, ISO 20.17 and 20.19, where the name is optional and only a bracket or a brace behind it tells the constructor from a variable read."
 words = ["LIST", "ARRAY", "RECORD", "VALUE"]
 
 [[group]]

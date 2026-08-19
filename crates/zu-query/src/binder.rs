@@ -1092,6 +1092,39 @@ pub enum BoundClause {
         patterns: Vec<BoundPath>,
         filter: Option<BoundExpr>,
     },
+    /// A match written several ways, ISO 16.7 and features G030 and
+    /// G032: the walks, and what is done with the rows they answer.
+    ///
+    /// Each branch is a match of its own over slots of its own, and
+    /// that is the point of the shape. Two branches describe the same
+    /// names and not the same walk, so the tables a name may be found
+    /// in are the tables one branch says or the tables the other says,
+    /// and a single slot narrowed by both would be narrowed to what
+    /// they agree on, which is the wrong answer and quietly so. So each
+    /// branch binds its own slots, the row it answers is projected into
+    /// the slots named here, and the clauses after the fork read those.
+    ///
+    /// The session runs this the way it runs a write, as parts with the
+    /// rows carried between them, and for the same reason: what the
+    /// clauses after it read is rows that several walks answered, and
+    /// there is no operator in one pipeline that is several walks.
+    Fork {
+        branches: Vec<ForkBranch>,
+        /// Whether a row two branches both answered is answered once,
+        /// which is the path pattern union of feature G032, or twice,
+        /// which is the multiset alternation of G030.
+        distinct: bool,
+        /// The slots in scope where the fork runs, which is what the
+        /// branches read back and what they carry across. The names the
+        /// fork itself binds follow them, in the order the branches
+        /// project them.
+        carry: Vec<usize>,
+        /// How many of `carry` were in scope before the fork. The rest
+        /// are the names the branches bound, and the split projects the
+        /// first `base` of them into the branches and reads all of
+        /// `carry` back out.
+        base: usize,
+    },
     /// `INSERT`, the elements the statement creates: the nodes first,
     /// then the edges between them, which is the order the write runs
     /// in because an edge is written between two rows that have to
@@ -1296,6 +1329,19 @@ pub struct BoundPath {
     pub slot: Option<usize>,
     pub start: BoundNode,
     pub steps: Vec<(BoundRel, BoundNode)>,
+}
+
+/// One way of matching, under [`BoundClause::Fork`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForkBranch {
+    pub patterns: Vec<BoundPath>,
+    pub filter: Option<BoundExpr>,
+    /// The slots this branch's row holds, in the order
+    /// [`BoundClause::Fork::carry`] names them. The first of them are
+    /// the slots the fork was given, which every branch shares, and the
+    /// rest are this branch's own: the same name has a slot per branch,
+    /// so the row is what makes the branches line up.
+    pub slots: Vec<usize>,
 }
 
 /// One element of a path variable's shape: how the executor
@@ -1929,6 +1975,15 @@ fn bind_body(
                     "a statement that writes may not be an operand of a composite query, write it on its own".into(),
                 ));
             }
+            // A match written several ways is run in parts for the
+            // same reason a write is, so it runs into the same wall.
+            // The alternatives are already a union, so writing them as
+            // operands of this one is what the reader wanted anyway.
+            if operand.clauses.iter().any(forks) {
+                return Err(invalid(
+                    "a match written several ways may not be an operand of a composite query, write each alternative as an operand of its own".into(),
+                ));
+            }
         }
         agree_on_columns(&bound, &right, how)?;
         bound.conjoined.push(Conjoined {
@@ -1977,6 +2032,11 @@ fn writes(clause: &BoundClause) -> bool {
         clause,
         BoundClause::Insert { .. } | BoundClause::Set { .. } | BoundClause::Delete { .. }
     )
+}
+
+/// Whether a bound clause is a match written several ways.
+pub fn forks(clause: &BoundClause) -> bool {
+    matches!(clause, BoundClause::Fork { .. })
 }
 
 /// The operands of a composite in written order, each beside the
@@ -2360,41 +2420,230 @@ impl Binder<'_> {
         Ok(slot)
     }
 
+    /// Binds one way of matching: the patterns of a list, and the
+    /// conditions that decide the match.
+    fn bind_way(
+        &mut self,
+        optional: bool,
+        patterns: &[ast::PathPattern],
+        filter: &Option<Expr>,
+    ) -> Result<(Vec<BoundPath>, Option<BoundExpr>)> {
+        let mut bound = Vec::new();
+        for path in patterns {
+            bound.push(self.bind_path(path)?);
+        }
+        for path in &bound {
+            self.narrow_path(path)?;
+        }
+        for path in &mut bound {
+            self.settle_labels(path);
+        }
+        // A mark is a match of its own that has to run before the
+        // predicate reading it, and an OPTIONAL MATCH is one bracket
+        // already: its WHERE decides the match rather than filtering
+        // behind it, so a mark there would have to run inside that
+        // bracket and refuses instead.
+        let mut filter = self.bind_where(filter, !optional)?;
+        // A condition written inside a pattern's brackets decides the
+        // match the way the clause's own WHERE does, so the two fold
+        // together rather than one running behind the other. It is
+        // bound after every pattern of the list, because a condition
+        // inside one bracket may read a name another pattern wrote.
+        for path in patterns {
+            let inner = self.bind_where(&path.filter, !optional)?;
+            filter = and_all(filter, inner.into_iter().collect());
+        }
+        let filter = and_all(filter, self.edge_distinctness(patterns, &bound));
+        Ok((bound, filter))
+    }
+
+    /// Binds a match written several ways (ISO 16.7, features G030 and
+    /// G032).
+    ///
+    /// Each way binds against the scope the fork started in, so a name
+    /// two ways both write has a slot in each of them and neither way
+    /// narrows the other's. What the ways share is the names, and the
+    /// standard asks for that: a variable one alternative binds and the
+    /// other does not would be a variable the clauses after the fork
+    /// could only sometimes read, so a fork whose ways disagree about
+    /// what they bind is refused here rather than answered with nulls.
+    ///
+    /// The names the fork binds are given slots of their own, one per
+    /// name however many ways there are, and what a slot may hold is
+    /// what any way could put in it: the candidate tables are the union
+    /// across the ways, because a row from either of them arrives in
+    /// the same place.
+    fn bind_fork(
+        &mut self,
+        optional: bool,
+        patterns: &[ast::PathPattern],
+        alts: &[Vec<ast::PathPattern>],
+        distinct: bool,
+        filter: &Option<Expr>,
+    ) -> Result<BoundClause> {
+        if optional {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "an OPTIONAL MATCH answers a row of nulls where it found nothing, and a \
+                 match written several ways would have one such row per way; write the \
+                 alternatives as separate statements joined with UNION",
+            ));
+        }
+        let base_scope = self.scope.clone();
+        let base_vars = self.variables.clone();
+        let base_slots = self.carried();
+        let mut branches: Vec<ForkBranch> = Vec::new();
+        // The names the first way bound, in the order it bound them,
+        // which is the order every way projects them in.
+        let mut names: Vec<String> = Vec::new();
+        for (at, way) in std::iter::once(patterns)
+            .chain(alts.iter().map(Vec::as_slice))
+            .enumerate()
+        {
+            if at > 0 {
+                self.scope = base_scope.clone();
+                // A slot the fork's own ways narrowed is narrowed to
+                // what that way needs, and the next way is a different
+                // walk over the same graph. Only the slots that were
+                // there before the fork are put back: the ones a way
+                // made are its own and stay as it left them.
+                self.variables[..base_vars.len()].clone_from_slice(&base_vars);
+            }
+            let pending = self.pending.len();
+            let (bound, filter) = self.bind_way(false, way, filter)?;
+            // Three things a way may write that the row between the
+            // parts has nowhere to put. A path variable is assembled
+            // from the slots of the walk that bound it and the ways
+            // walk differently, a group variable is not a slot at all,
+            // and an existence block is a match of its own that would
+            // be lifted once per way and run that many times. Each is
+            // refused by name, because a reader who wrote one is owed
+            // the reason rather than a wrong count.
+            if bound.iter().any(|path| path.slot.is_some()) {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "a path variable is put together out of the slots of the walk that \
+                     bound it, and the alternatives of a match walk differently; name \
+                     the path in each alternative as a statement of its own, joined \
+                     with UNION",
+                ));
+            }
+            if !self.groups.is_empty() {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "a group variable stands for what a repeated stretch bound rather \
+                     than for one element, and the alternatives of a match repeat \
+                     different stretches; write the alternatives as statements of their \
+                     own, joined with UNION",
+                ));
+            }
+            if self.pending.len() != pending {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "an existence block under a match written several ways is a match of \
+                     its own that would run once per alternative; write the alternatives \
+                     as statements of their own, joined with UNION",
+                ));
+            }
+            let mut wrote: Vec<(String, usize)> = self
+                .scope
+                .iter()
+                .filter(|(name, _)| !base_scope.contains_key(*name))
+                .map(|(name, slot)| (name.clone(), *slot))
+                .collect();
+            wrote.sort_by_key(|(_, slot)| *slot);
+            if at == 0 {
+                names = wrote.iter().map(|(name, _)| name.clone()).collect();
+            }
+            let mut slots = base_slots.clone();
+            for name in &names {
+                let Some((_, slot)) = wrote.iter().find(|(wrote, _)| wrote == name) else {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        format!(
+                            "one way of matching binds '{name}' and another does not, so \
+                             the clauses after them could only sometimes read it; every \
+                             alternative binds the same names"
+                        ),
+                    ));
+                };
+                slots.push(*slot);
+            }
+            if slots.len() != base_slots.len() + wrote.len() {
+                let extra = wrote
+                    .iter()
+                    .map(|(name, _)| name)
+                    .find(|name| !names.contains(name))
+                    .expect("a way that bound more names than the first bound one of them");
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    format!(
+                        "one way of matching binds '{extra}' and another does not, so the \
+                         clauses after them could only sometimes read it; every \
+                         alternative binds the same names"
+                    ),
+                ));
+            }
+            branches.push(ForkBranch {
+                patterns: bound,
+                filter,
+                slots,
+            });
+        }
+        // The slots the fork answers in. A name's slot is new, because
+        // what it holds is a row from any of the ways, and what it may
+        // hold is what any of them could have put there.
+        self.scope = base_scope;
+        self.variables[..base_vars.len()].clone_from_slice(&base_vars);
+        let mut carry = base_slots.clone();
+        for (at, name) in names.iter().enumerate() {
+            let mut def = self.variables[branches[0].slots[base_slots.len() + at]].clone();
+            def.name = name.clone();
+            for branch in &branches[1..] {
+                let other = &self.variables[branch.slots[base_slots.len() + at]];
+                if other.ty != def.ty {
+                    return Err(ZuError::gql(
+                        codes::C42001,
+                        format!(
+                            "one way of matching binds '{name}' as {} and another as {}, \
+                             and a name stands for one kind of thing",
+                            def.ty, other.ty
+                        ),
+                    ));
+                }
+                def.node_tables.extend(other.node_tables.iter().copied());
+                def.rel_tables.extend(other.rel_tables.iter().copied());
+            }
+            def.node_tables.sort_unstable();
+            def.node_tables.dedup();
+            def.rel_tables.sort_unstable();
+            def.rel_tables.dedup();
+            let slot = self.variables.len();
+            self.variables.push(def);
+            self.scope.insert(name.clone(), slot);
+            carry.push(slot);
+        }
+        Ok(BoundClause::Fork {
+            branches,
+            distinct,
+            carry,
+            base: base_slots.len(),
+        })
+    }
+
     fn bind_clause(&mut self, clause: &Clause) -> Result<BoundClause> {
         match clause {
             Clause::Match {
                 optional,
                 patterns,
+                alts,
+                distinct,
                 filter,
             } => {
-                let mut bound = Vec::new();
-                for path in patterns {
-                    bound.push(self.bind_path(path)?);
+                if !alts.is_empty() {
+                    return self.bind_fork(*optional, patterns, alts, *distinct, filter);
                 }
-                for path in &bound {
-                    self.narrow_path(path)?;
-                }
-                for path in &mut bound {
-                    self.settle_labels(path);
-                }
-                // A mark is a match of its own that has to run before
-                // the predicate reading it, and an OPTIONAL MATCH is
-                // one bracket already: its WHERE decides the match
-                // rather than filtering behind it, so a mark there
-                // would have to run inside that bracket and refuses
-                // instead.
-                let mut filter = self.bind_where(filter, !optional)?;
-                // A condition written inside a pattern's brackets
-                // decides the match the way the clause's own WHERE
-                // does, so the two fold together rather than one
-                // running behind the other. It is bound after every
-                // pattern of the list, because a condition inside one
-                // bracket may read a name another pattern wrote.
-                for path in patterns {
-                    let inner = self.bind_where(&path.filter, !optional)?;
-                    filter = and_all(filter, inner.into_iter().collect());
-                }
-                let filter = and_all(filter, self.edge_distinctness(patterns, &bound));
+                let (bound, filter) = self.bind_way(*optional, patterns, filter)?;
                 Ok(BoundClause::Match {
                     kind: match optional {
                         true => MatchKind::Optional,
@@ -5032,6 +5281,16 @@ impl Binder<'_> {
                 "a query written inside {word} is read where a value belongs, so it may not write to the graph"
             )));
         }
+        // A match written several ways runs as parts of the statement,
+        // and a query written where a value belongs is run whole where
+        // the value is read, so there is nowhere to put the parts.
+        let mut forked = false;
+        bound.walk(&mut |q| forked |= q.clauses.iter().any(forks));
+        if forked {
+            return Err(invalid(format!(
+                "a match written several ways inside {word} is a walk per alternative, and a query read where a value belongs runs as one walk; write the alternatives as operands of a composite query"
+            )));
+        }
         Ok(bound)
     }
 
@@ -5893,6 +6152,39 @@ mod tests {
         };
         assert_eq!(patterns[0].start.props[0].0, "id");
         assert_eq!(patterns[0].start.props[0].1, BoundExpr::Param(0));
+    }
+
+    /// The point of giving each way its own slots. The two ways here
+    /// reach different tables under the one name, so the name may hold
+    /// either, and a single slot narrowed by both would have been
+    /// narrowed to nothing.
+    #[test]
+    fn each_way_of_a_fork_binds_its_own_slots() {
+        let q = bound(
+            "MATCH (a:Person)-[:IS_LOCATED_IN]->(b) | (a:Person)-[:KNOWS]->(b) \
+             RETURN count(*) AS n",
+        );
+        let BoundClause::Fork {
+            branches,
+            distinct,
+            carry,
+            base,
+        } = &q.clauses[0]
+        else {
+            panic!("a match written two ways binds to a fork");
+        };
+        assert!(distinct, "one bar is the union");
+        assert_eq!(*base, 0, "nothing was in scope in front of it");
+        assert_eq!(branches.len(), 2);
+        let held: Vec<usize> = branches.iter().map(|branch| branch.slots[1]).collect();
+        assert_ne!(held[0], held[1], "the two ways bind 'b' apart");
+        assert_eq!(q.variables[held[0]].node_tables, [1], "a place");
+        assert_eq!(q.variables[held[1]].node_tables, [0], "a person");
+        assert_eq!(
+            q.variables[carry[1]].node_tables,
+            [0, 1],
+            "and the name the clauses after the fork read may hold either"
+        );
     }
 
     #[test]

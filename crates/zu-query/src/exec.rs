@@ -1885,8 +1885,12 @@ fn input_of(plan: &LogicalPlan) -> Option<&LogicalPlan> {
         // it is not a link in a chain and the linearizer stops at it.
         // It never reaches here in a run: [`execute`] takes the
         // composite apart above the pipeline and runs each operand as
-        // a query of its own.
-        LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. } => None,
+        // a query of its own. A fork is the same shape of thing, one
+        // plan per way, and the session runs each of them as a part.
+        LogicalPlan::Empty
+        | LogicalPlan::Rows { .. }
+        | LogicalPlan::Conjoin { .. }
+        | LogicalPlan::Fork { .. } => None,
         LogicalPlan::ScanNodes { input, .. }
         | LogicalPlan::Expand { input, .. }
         | LogicalPlan::Filter { input, .. }
@@ -2816,7 +2820,10 @@ fn build_stages(
             continue;
         }
         match linear[i] {
-            LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. } => {
+            LogicalPlan::Empty
+            | LogicalPlan::Rows { .. }
+            | LogicalPlan::Conjoin { .. }
+            | LogicalPlan::Fork { .. } => {
                 unreachable!("a leaf never appears in the linearized ops")
             }
             LogicalPlan::ScanNodes { .. }

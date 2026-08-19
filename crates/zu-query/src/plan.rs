@@ -183,6 +183,32 @@ pub enum LogicalPlan {
         nodes: Vec<BoundInsertNode>,
         rels: Vec<BoundInsertRel>,
     },
+    /// The ways a match was written, ISO 16.7 and features G030 and
+    /// G032: each branch is a plan of its own over the rows this one
+    /// hands it, and the rows they answer between them are the rows the
+    /// operators above read.
+    ///
+    /// This is the shape of the statement rather than something the
+    /// executor runs, the way [`LogicalPlan::Insert`] is. The session
+    /// splits the statement here: the operators under this one answer
+    /// the rows the branches run for, each branch runs over those rows,
+    /// and the operators above run over what the branches answered
+    /// between them. That is a seam and not a design, and it is here
+    /// because one pipeline is one walk: a branch that ran as an
+    /// operator would have to hand the row it was given back to the
+    /// branch beside it, which is a shape the pull through a stage does
+    /// not have.
+    Fork {
+        input: Box<LogicalPlan>,
+        /// One plan per way of matching, each over the slots the branch
+        /// itself bound.
+        branches: Vec<LogicalPlan>,
+        /// Whether a row two branches both answered is answered once,
+        /// which is `|`, or twice, which is `|+|`.
+        distinct: bool,
+        /// The slots the rows hold on the other side of the fork.
+        carry: Vec<usize>,
+    },
     /// Changes what the elements a row already holds hold, one row at a
     /// time, and hands the row on unchanged.
     ///
@@ -344,6 +370,40 @@ pub fn build_over(query: &BoundQuery, base: LogicalPlan) -> Result<LogicalPlan> 
                         bracket: group,
                     };
                 }
+            }
+            BoundClause::Fork {
+                branches,
+                distinct,
+                carry,
+                base,
+            } => {
+                // Each branch introduces its own slots, so each one is
+                // built over the rows the fork was given rather than
+                // over the plan so far, and what the fork answers is
+                // the slots the branches project into.
+                let mut built = Vec::with_capacity(branches.len());
+                for branch in branches {
+                    let mut seen: HashSet<usize> = branch.slots[..*base].iter().copied().collect();
+                    let mut inner = LogicalPlan::Empty;
+                    for path in &branch.patterns {
+                        inner = build_path(inner, path, &mut seen, None)?;
+                    }
+                    if let Some(expr) = &branch.filter {
+                        inner = LogicalPlan::Filter {
+                            input: inner.boxed(),
+                            expr: expr.clone(),
+                            bracket: None,
+                        };
+                    }
+                    built.push(inner);
+                }
+                bound.extend(carry.iter().copied());
+                plan = LogicalPlan::Fork {
+                    input: plan.boxed(),
+                    branches: built,
+                    distinct: *distinct,
+                    carry: carry.clone(),
+                };
             }
             BoundClause::Insert { nodes, rels, .. } => {
                 for node in nodes {
@@ -1027,6 +1087,32 @@ fn node(plan: &LogicalPlan, query: &BoundQuery, schema: &Schema) -> Option<PlanN
             PlanNode {
                 binds,
                 ..plain("Unwind", detail, under(input))
+            }
+        }
+        LogicalPlan::Fork {
+            input,
+            branches,
+            distinct,
+            carry,
+        } => {
+            // The branches print under the fork in written order, each
+            // one a tree of its own, and the rows they answer are the
+            // rows the operators above this read.
+            let mut children = under(input);
+            children.extend(branches.iter().filter_map(|b| node(b, query, schema)));
+            let names: Vec<String> = carry.iter().map(|slot| named(*slot)).collect();
+            PlanNode {
+                binds: names.clone(),
+                detail: format!(
+                    "{} ways, {}: {}",
+                    branches.len(),
+                    match distinct {
+                        true => "each row once",
+                        false => "each row once per way",
+                    },
+                    names.join(", ")
+                ),
+                ..plain("Fork", String::new(), children)
             }
         }
         LogicalPlan::Insert { input, nodes, rels } => {

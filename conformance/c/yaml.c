@@ -512,6 +512,8 @@ static int scalar(zy_parser *p, const char *text, size_t len, size_t line, zy_no
             case 'n': dst[n++] = '\n'; break;
             case 'r': dst[n++] = '\r'; break;
             case 't': dst[n++] = '\t'; break;
+            case 'b': dst[n++] = '\b'; break;
+            case 'f': dst[n++] = '\f'; break;
             case '0': dst[n++] = '\0'; break;
             default:
                 return fail(p, "line %lu: \\%c is not an escape", (unsigned long)line, body[i]);

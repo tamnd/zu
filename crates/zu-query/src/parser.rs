@@ -4386,7 +4386,7 @@ mod tests {
     #[test]
     fn directions_and_hop_ranges() {
         let q =
-            parsed("MATCH (a)-[:KNOWS*1..2]->(b), (a)<-[r:LIKES|FOLLOWS]-(c), (b)--(c) RETURN *");
+            parsed("MATCH (a)-[:KNOWS*1..2]->(b), (a)<-[r:LIKES|FOLLOWS]-(c), (b)-(c) RETURN *");
         let Clause::Match { patterns, .. } = &q.clauses()[0] else {
             panic!("MATCH");
         };
@@ -4425,7 +4425,6 @@ mod tests {
             ("(a)<~(b)", RelDirection::InOrUndirected),
             ("(a)~>(b)", RelDirection::OutOrUndirected),
             ("(a)-(b)", RelDirection::Any),
-            ("(a)--(b)", RelDirection::Any),
         ];
         for (pattern, want) in full.into_iter().chain(short) {
             let q = parsed(&format!("MATCH {pattern} RETURN a"));
@@ -4434,6 +4433,14 @@ mod tests {
             };
             let (rel, _) = &patterns[0].steps[0];
             assert_eq!(rel.direction, want, "{pattern}");
+        }
+        // Cypher writes two of these with a second minus sign and GQL
+        // does not, because in GQL a double minus opens a comment
+        // (GB02). So the rest of the line goes with it and the
+        // statement is short of a RETURN.
+        for pattern in ["(a)--(b)", "(a)-->(b)"] {
+            let e = parse_err(&format!("MATCH {pattern} RETURN a"));
+            assert!(e.contains("42001"), "{pattern}: {e}");
         }
     }
 
@@ -4695,7 +4702,7 @@ mod tests {
             ("-[:KNOWS]->{2,4}", (Some(2), Some(4))),
             // The abbreviated edge pattern takes one too, and so does
             // an edge pointing the other way.
-            ("-->+", (Some(1), None)),
+            ("->+", (Some(1), None)),
             ("<-[:KNOWS]-{2,4}", (Some(2), Some(4))),
         ] {
             let q = parsed(&format!("MATCH (a){text}(b) RETURN a"));
@@ -5205,7 +5212,9 @@ mod tests {
         // Deep NOT and minus chains stay iterative, so they parse.
         let nots = "NOT ".repeat(5000);
         parse(&format!("MATCH (n) WHERE {nots}true RETURN n")).expect("NOT chain parses");
-        let minuses = "-".repeat(5000);
+        // Spaced, because two minus signs against each other are a
+        // comment (GB02) and the whole line would go with them.
+        let minuses = "- ".repeat(5000);
         parse(&format!("RETURN {minuses}1")).expect("minus chain parses");
     }
 

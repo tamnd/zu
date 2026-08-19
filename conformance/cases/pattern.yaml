@@ -251,7 +251,7 @@ cases:
 
   - name: an-anonymous-edge
     doc: An arrow with no bracket, which selects every edge between the two nodes whatever its table is called.
-    query: MATCH (a:person)-->(b:person) RETURN count(*) AS a
+    query: MATCH (a:person)->(b:person) RETURN count(*) AS a
     columns:
       - a
     rows:

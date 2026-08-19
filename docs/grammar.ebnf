@@ -220,7 +220,8 @@ keep_clause     = "KEEP" , path_prefix ;
    one that named the same kind the KEEP names is refused rather than
    settled by a rule of precedence. *)
 path            = [ name , "=" ] , [ path_prefix ] , path_body ;
-path_body       = factor , { ( relationship , factor ) | factor } ;
+path_body       = factor , { ( ( relationship | simplified ) , factor )
+                            | factor } ;
 factor          = node | subpath , [ quantifier ] ;
 subpath         = "(" , [ name , "=" ] , [ path_mode ] , path_body ,
                   [ where_clause ] , ")" ;
@@ -241,9 +242,12 @@ subpath         = "(" , [ name , "=" ] , [ path_mode ] , path_body ,
 
    A quantifier behind the brackets repeats the stretch they hold (ISO
    16.11, feature G035). A fixed count is a longer pattern of the same
-   shape, which is what the parser writes it out as; a range is a pattern
-   matching several lengths, which is a union of patterns and is refused
-   until there is a union to write it as. Every repetition binds the
+   shape, which is what the parser writes it out as; a range, and the
+   question mark that stands for nought or one, is a pattern per length
+   rather than one pattern, and the lengths are written out and run over
+   the fork seam the bar between two paths runs on. A count with no
+   ceiling on it is refused, there being no writing out a list with no
+   end to it. Every repetition binds the
    names inside the brackets again, so such a name stands for one element
    per repetition rather than for one element, which is the group
    variable of feature GQ17: reading it answers the list, reading a
@@ -322,6 +326,33 @@ quantifier      = "+" | "*" | "{" , [ integer ] , [ "," , [ integer ] ] , "}" ;
    allowed to be left out. A step carries one of the two forms and not
    both. A step of no hops is not walked yet, so `*` and a lower bound
    of 0 are refused rather than read as `+`. *)
+
+simplified      = [ "<" ] , bar , "/" , simple_contents , "/" , bar ,
+                  [ ">" ] ;
+simple_contents = simple_term , { "|" , simple_term } ;
+simple_term     = simple_factor , { simple_factor } ;
+simple_factor   = [ "<" | "~" ] , simple_primary , [ ">" ] ,
+                  [ "?" | quantifier ] ;
+simple_primary  = name | "(" , simple_contents , ")" ;
+(* ISO 16.12, features G039 and G080 to G082. A stretch of edges
+   written between one pair of slashes, with the nodes between them
+   left unwritten: `-/ A B /->` is `-[:A]->()-[:B]->`, and the parser
+   reads it as that pattern, so nothing below the parser knows the
+   short form was written. The arrow around the slashes is the same
+   seven directions an ordinary arrow writes and it defaults every
+   step of the stretch; a step overrides it by writing `<` in front of
+   its label or `>` behind it, which is what features G081 and G082
+   are. Inside the slashes a label is a step, two written against each
+   other are two steps, a bar is either label on the one step, and a
+   quantifier repeats what stands in front of it: a count with a floor
+   of one or more over a single step is the hop range the arrow
+   already writes, and every other count is written out the way a
+   quantifier behind brackets is. What the standard writes here for
+   label expressions this engine has no store for is refused by name:
+   an edge is kept under exactly one type, so `!`, `%` and `&` have no
+   reading, and a bar separating stretches of more than one step is an
+   alternation of paths rather than of labels, which the bar between
+   whole patterns already says. *)
 
 property_map    = "{" , [ name , ":" , expression ,
                   { "," , name , ":" , expression } ] , "}" ;

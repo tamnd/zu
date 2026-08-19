@@ -1176,12 +1176,24 @@ struct Worker<'a> {
     neigh: Vec<u64>,
     /// Intersection scratch for the WCOJ close.
     hits: Vec<u64>,
-    /// The probe side of a WCOJ close as a bitmap, one bit per id from
-    /// the lowest the list holds. Zero everywhere between closes: the
-    /// build sets bits out of the probe list and the teardown zeroes the
-    /// words it touched, so the buffer is never scanned end to end and
-    /// its length is only ever the widest probe list the query met.
+    /// The probe sides of the closes now running, as bitmaps, one bit
+    /// per id from the lowest the list holds. Zero everywhere between
+    /// closes: the build sets bits out of the probe list and the
+    /// teardown zeroes the words it touched, so the buffer is never
+    /// scanned end to end.
+    ///
+    /// A stack rather than one buffer, because a close holds its bitmap
+    /// while the pipeline under it runs and that pipeline closes too. A
+    /// cycle over three patterns is three of them live at once, and two
+    /// closes sharing a buffer read each other's bits: the ranges they
+    /// stand for start at different ids, so a bit one of them set is a
+    /// neighbor the other one never had.
     mask: Vec<u64>,
+    /// Words of `mask` the closes above the one being built have taken.
+    /// The next build starts here and hands the words back on the way
+    /// out, so the buffer grows to the deepest nest the query reaches
+    /// and every close reads only its own.
+    mask_used: usize,
     /// Survivor scratch for the binary close.
     keep: Vec<u16>,
     /// Per-row degree and running product scratch for hub counts.
@@ -1357,6 +1369,7 @@ impl<'a> Worker<'a> {
             neigh: Vec::new(),
             hits: Vec::new(),
             mask: Vec::new(),
+            mask_used: 0,
             keep: Vec::new(),
             deg: Vec::new(),
             prod: Vec::new(),
@@ -3074,45 +3087,19 @@ impl<'a> Worker<'a> {
     /// undirected end, and the bitmap is their union, which is what
     /// membership in either of them means anyway.
     fn build_mask(&mut self, lists: &[&[u64]]) -> Option<Bits> {
-        let (mut base, mut top) = (u64::MAX, 0);
-        for l in lists {
-            if let (Some(&first), Some(&last)) = (l.first(), l.last()) {
-                base = base.min(first);
-                top = top.max(last);
-            }
-        }
-        if base > top {
-            return None;
-        }
-        let words = ((top - base) as usize / 64) + 1;
-        if words > MASK_WORDS {
-            return None;
-        }
-        if self.mask.len() < words {
-            self.mask.resize(words, 0);
-        }
-        for l in lists {
-            for &v in *l {
-                let at = (v - base) as usize;
-                self.mask[at >> 6] |= 1 << (at & 63);
-            }
-        }
-        Some(Bits { base, top })
+        push_mask(&mut self.mask, &mut self.mask_used, lists)
     }
 
-    /// Back to all zero for the next close. Only the words the build
-    /// wrote into can hold a bit, so zeroing those is zeroing the
-    /// buffer, and the cost is the probe lists again rather than the
-    /// span they cover.
+    /// Back to all zero for the next close, and the words handed back
+    /// to the stack. Only the words the build wrote into can hold a
+    /// bit, so zeroing those is zeroing the region, and the cost is the
+    /// probe lists again rather than the span they cover.
+    ///
+    /// Closes tear down in the order they were built, innermost first,
+    /// because a close holds its bitmap across the pipeline under it,
+    /// so the region handed back is always the top of the stack.
     fn drop_mask(&mut self, lists: &[&[u64]], bits: Option<Bits>) {
-        let Some(bits) = bits else {
-            return;
-        };
-        for l in lists {
-            for &v in *l {
-                self.mask[(v - bits.base) as usize >> 6] = 0;
-            }
-        }
+        pop_mask(&mut self.mask, &mut self.mask_used, lists, bits);
     }
 
     /// How many lists of one group the walk is about to want, given the
@@ -3978,11 +3965,66 @@ const MASK_RUN: usize = 8;
 
 /// Which ids the probe bitmap stands for: the lowest one it holds a bit
 /// for, and the highest, since everything outside that range is a miss
-/// without a test.
+/// without a test. `word` is where the close's own region of the mask
+/// stack begins, which is what keeps a close nested under another one
+/// off the bits that other one is still reading.
 #[derive(Clone, Copy)]
 struct Bits {
     base: u64,
     top: u64,
+    word: usize,
+}
+
+/// Takes the next region of the mask stack for one close's probe side,
+/// or answers `None` where its ids are spread too wide for the bitmap
+/// to stay in cache and the walk has to close on the gallop instead.
+///
+/// The region starts where the closes already running left off, so a
+/// close nested under another one writes past the bits that one is
+/// still reading rather than into them.
+fn push_mask(mask: &mut Vec<u64>, used: &mut usize, lists: &[&[u64]]) -> Option<Bits> {
+    let (mut base, mut top) = (u64::MAX, 0);
+    for l in lists {
+        if let (Some(&first), Some(&last)) = (l.first(), l.last()) {
+            base = base.min(first);
+            top = top.max(last);
+        }
+    }
+    if base > top {
+        return None;
+    }
+    let words = ((top - base) as usize / 64) + 1;
+    if words > MASK_WORDS {
+        return None;
+    }
+    let word = *used;
+    if mask.len() < word + words {
+        mask.resize(word + words, 0);
+    }
+    *used += words;
+    for l in lists {
+        for &v in *l {
+            let at = (v - base) as usize;
+            mask[word + (at >> 6)] |= 1 << (at & 63);
+        }
+    }
+    Some(Bits { base, top, word })
+}
+
+/// Zeroes one close's region and hands it back. Only the words the
+/// build wrote into can hold a bit, so zeroing those is zeroing the
+/// region, and the cost is the probe lists again rather than the span
+/// they cover.
+fn pop_mask(mask: &mut [u64], used: &mut usize, lists: &[&[u64]], bits: Option<Bits>) {
+    let Some(bits) = bits else {
+        return;
+    };
+    for l in lists {
+        for &v in *l {
+            mask[bits.word + ((v - bits.base) as usize >> 6)] = 0;
+        }
+    }
+    *used = bits.word;
 }
 
 /// Whether the probe side holds `v`, at one test of a bitmap the whole
@@ -3992,7 +4034,7 @@ fn in_mask(mask: &[u64], bits: Bits, v: u64) -> bool {
         return false;
     }
     let at = (v - bits.base) as usize;
-    mask[at >> 6] >> (at & 63) & 1 == 1
+    mask[bits.word + (at >> 6)] >> (at & 63) & 1 == 1
 }
 
 /// Keeps the seed neighbors the probe bitmap holds a bit for. Nothing
@@ -4559,20 +4601,62 @@ mod tests {
             if probe_repeats(std::slice::from_ref(&probe)) {
                 continue;
             }
-            let base = probe[0];
-            let top = probe[probe.len() - 1];
-            let mut mask = vec![0u64; ((top - base) as usize / 64) + 1];
-            for &v in probe {
-                let at = (v - base) as usize;
-                mask[at >> 6] |= 1 << (at & 63);
-            }
+            let mut mask = Vec::new();
+            let mut used = 0;
+            let bits = push_mask(&mut mask, &mut used, std::slice::from_ref(&probe))
+                .expect("every probe here fits the bitmap");
             for seed in seeds {
                 let (mut want, mut got) = (Vec::new(), Vec::new());
                 leapfrog(seed, probe, &mut want);
-                mask_hits(&mask, Bits { base, top }, seed, &mut got);
+                mask_hits(&mask, bits, seed, &mut got);
                 assert_eq!(got, want, "seed {seed:?} against probe {probe:?}");
             }
+            pop_mask(
+                &mut mask,
+                &mut used,
+                std::slice::from_ref(&probe),
+                Some(bits),
+            );
         }
+    }
+
+    /// A close holds its bitmap while the pipeline under it runs, and
+    /// that pipeline closes too, so two of them are live at once and
+    /// each has to read its own bits. They stand for different ranges
+    /// of ids, so one buffer between them means the inner close's bits
+    /// land where the outer one is reading and the outer one starts
+    /// answering yes for neighbors it never had. That is the cycle
+    /// joined to two more patterns coming in high (tamnd/zu#304).
+    #[test]
+    fn a_close_nested_under_another_reads_its_own_bits() {
+        let outer: &[u64] = &[10, 20, 30];
+        let inner: &[u64] = &[500, 501];
+        let mut mask = Vec::new();
+        let mut used = 0;
+
+        let ob = push_mask(&mut mask, &mut used, std::slice::from_ref(&outer)).unwrap();
+        let ib = push_mask(&mut mask, &mut used, std::slice::from_ref(&inner)).unwrap();
+        // The inner close's own answers, and the outer one's unchanged
+        // by them: 510 and 511 are what the inner bits would read as
+        // through the outer's range if the two shared a region.
+        for v in [500, 501] {
+            assert!(in_mask(&mask, ib, v), "the inner close holds {v}");
+        }
+        for v in [10, 20, 30] {
+            assert!(in_mask(&mask, ob, v), "the outer close holds {v}");
+        }
+        for v in [11, 21, 29, 510, 511] {
+            assert!(!in_mask(&mask, ob, v), "the outer close never had {v}");
+        }
+
+        pop_mask(&mut mask, &mut used, std::slice::from_ref(&inner), Some(ib));
+        assert_eq!(used, ob.word + 1, "the inner region is handed back");
+        for v in [10, 20, 30] {
+            assert!(in_mask(&mask, ob, v), "the outer close still holds {v}");
+        }
+        pop_mask(&mut mask, &mut used, std::slice::from_ref(&outer), Some(ob));
+        assert_eq!(used, 0);
+        assert!(mask.iter().all(|&w| w == 0), "the buffer goes back to zero");
     }
 
     use zu_query::snapshot::{ColId, GroupId, ScanChunk, TableId, ZonePred};

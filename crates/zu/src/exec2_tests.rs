@@ -397,6 +397,19 @@ fn covered_queries() -> &'static [&'static str] {
          RETURN count(c) AS n",
         "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c) \
          RETURN b.id AS b, c.id AS c ORDER BY b, c LIMIT 20",
+        // A cycle joined to further patterns that close as well, so a
+        // close is running under a close: the pipeline the first one
+        // holds its probe bitmap across is the pipeline the second one
+        // builds a bitmap in. Once counted and once with the rows read,
+        // and once with a third close under the second (tamnd/zu#304).
+        "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c), \
+         (b)-[:knows]-(d), (c)-[:knows]-(d) RETURN count(*) AS n",
+        "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c), \
+         (b)-[:knows]-(d), (c)-[:knows]-(d) RETURN b.id AS b, c.id AS c, d.id AS d \
+         ORDER BY b, c, d LIMIT 20",
+        "MATCH (a:person {id: 1})-[:knows]-(b)-[:knows]-(c), (a)-[:knows]-(c), \
+         (b)-[:knows]-(d), (c)-[:knows]-(d), (a)-[:knows]-(e), (d)-[:knows]-(e) \
+         RETURN count(*) AS n",
         // Correlated filters, the predicate that names a level and one
         // below it. The lower end is pinned while the filter runs, so
         // it joins the chunk as a constant column and the compare is

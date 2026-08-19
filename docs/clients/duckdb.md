@@ -122,7 +122,7 @@ DuckDB's Python connection has 71 public members and its module 181. Ours has 14
 | `append(table, df)` | `appender()` | `appender()`, and `load` for a whole database | done |
 | `begin` / `commit` / `rollback` | `transaction()` | `transaction()` | done |
 | `interrupt()`, `query_progress()` | `interrupt()`, `rows_read` | `AbortSignal` only | progress owed for Node |
-| `cursor()` / `duplicate()` | none | none | owed, it is how a pool is written |
+| `cursor()` / `duplicate()` | `cursor()`, and `duplicate()` under the name that says what it does | `duplicate()`, since `cursor()` is a cursor over rows here | done |
 | prepared statements | `prepare()` | `prepare()` | done |
 | `explain`, profiling | `explain()`, `profile()` | `explain()`, `profile()` | done |
 | `create_function` UDFs, Arrow-vectorised | none | none | not this milestone |
@@ -143,6 +143,6 @@ In order, largest effect first.
 3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result. Done, all five. Arrow itself over the C Data Interface is what is left of it, and it is item 2's other half.
 4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on. Done in both.
 5. Real streaming, meaning a result read a chunk at a time as the executor produces it rather than a slice of a result that is already whole.
-6. The small ones: an in-memory connection that does not make a file, which is done in both and is the engine's own answer rather than a special case in either client, and then `cursor()`, `fetchmany`, `fetchnumpy`, and a progress callback in Node.
+6. The small ones: an in-memory connection that does not make a file and a second connection made from the first are both done in both clients, and both are the engine's own answer rather than a special case in either one. What is left of this row is `fetchmany`, `fetchnumpy`, and a progress callback in Node.
 
 Item 1's second half is the only thing left that the live measurement asks for, and it is 22 of the 26 milliseconds. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.

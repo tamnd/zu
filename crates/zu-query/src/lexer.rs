@@ -56,6 +56,12 @@ pub enum TokenKind {
     Gt,
     Ge,
     Pipe,
+    /// `||`, the concatenation operator of ISO 20.23. It is two of the
+    /// character a label expression writes one of, so it is lexed here
+    /// rather than in the parser: a label alternation never writes two
+    /// bars against each other, and reading them as one token is what
+    /// keeps a concatenation out of the pattern grammar.
+    Concat,
     /// `&`, the label expression conjunction.
     Amp,
     /// `!`, the label expression negation.
@@ -98,6 +104,7 @@ impl TokenKind {
             TokenKind::Gt => "'>'".into(),
             TokenKind::Ge => "'>='".into(),
             TokenKind::Pipe => "'|'".into(),
+            TokenKind::Concat => "'||'".into(),
             TokenKind::Amp => "'&'".into(),
             TokenKind::Bang => "'!'".into(),
             TokenKind::Tilde => "'~'".into(),
@@ -172,7 +179,19 @@ pub fn lex(source: &str) -> Result<Vec<Token>> {
             b'%' => tokens.push(single(TokenKind::Percent)),
             b'^' => tokens.push(single(TokenKind::Caret)),
             b'=' => tokens.push(single(TokenKind::Eq)),
-            b'|' => tokens.push(single(TokenKind::Pipe)),
+            b'|' => {
+                let (kind, len) = match bytes.get(ix + 1) {
+                    Some(b'|') => (TokenKind::Concat, 2),
+                    _ => (TokenKind::Pipe, 1),
+                };
+                tokens.push(Token {
+                    kind,
+                    start,
+                    end: start + len,
+                });
+                ix += len;
+                continue;
+            }
             b'&' => tokens.push(single(TokenKind::Amp)),
             b'!' => tokens.push(single(TokenKind::Bang)),
             b'<' => {

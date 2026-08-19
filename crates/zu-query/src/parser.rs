@@ -304,7 +304,15 @@ fn is_temporal(ty: &LogicalType) -> bool {
 
 /// Hard cap on expression nesting; hostile input past it errors instead
 /// of overflowing the parser's stack.
-const MAX_DEPTH: usize = 128;
+///
+/// What the number has to be is small enough that the deepest expression
+/// the cap admits still fits in the smallest stack a caller is likely to
+/// run the parser on, and a level of nesting is one frame per precedence
+/// level rather than one frame, so the number moves when the table does.
+/// 64 leaves room for the eleven levels the table has now at the frame
+/// sizes an unoptimized build gives them, which is the build the cost is
+/// worst on. No query a person writes comes near it.
+const MAX_DEPTH: usize = 64;
 
 /// How many labels a written key label set may name, impdef IL003.
 ///
@@ -2565,7 +2573,7 @@ impl Parser<'_> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr> {
-        let mut lhs = self.parse_additive()?;
+        let mut lhs = self.parse_concat()?;
         loop {
             let op = match self.peek().map(|t| &t.kind) {
                 Some(TokenKind::Eq) => BinaryOp::Eq,
@@ -2576,26 +2584,26 @@ impl Parser<'_> {
                 Some(TokenKind::Ge) => BinaryOp::Ge,
                 _ => {
                     if self.eat_kw("IN") {
-                        let rhs = self.parse_additive()?;
+                        let rhs = self.parse_concat()?;
                         lhs = binary(BinaryOp::In, lhs, rhs);
                         continue;
                     }
                     if self.at_kw("STARTS") {
                         self.pos += 1;
                         self.expect_kw("WITH")?;
-                        let rhs = self.parse_additive()?;
+                        let rhs = self.parse_concat()?;
                         lhs = binary(BinaryOp::StartsWith, lhs, rhs);
                         continue;
                     }
                     if self.at_kw("ENDS") {
                         self.pos += 1;
                         self.expect_kw("WITH")?;
-                        let rhs = self.parse_additive()?;
+                        let rhs = self.parse_concat()?;
                         lhs = binary(BinaryOp::EndsWith, lhs, rhs);
                         continue;
                     }
                     if self.eat_kw("CONTAINS") {
-                        let rhs = self.parse_additive()?;
+                        let rhs = self.parse_concat()?;
                         lhs = binary(BinaryOp::Contains, lhs, rhs);
                         continue;
                     }
@@ -2608,7 +2616,7 @@ impl Parser<'_> {
                 }
             };
             self.pos += 1;
-            let rhs = self.parse_additive()?;
+            let rhs = self.parse_concat()?;
             lhs = binary(op, lhs, rhs);
         }
         Ok(lhs)
@@ -2659,6 +2667,19 @@ impl Parser<'_> {
             expr: Box::new(lhs),
             negated,
         })
+    }
+
+    /// ISO 20.23. Concatenation sits between the comparisons and the
+    /// additions, which is where the standard puts it: `a || b = c`
+    /// asks about the joined string, and `'n=' || 1 + 2` joins the sum
+    /// rather than joining the one and adding the two.
+    fn parse_concat(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_additive()?;
+        while self.eat(&TokenKind::Concat) {
+            let rhs = self.parse_additive()?;
+            lhs = binary(BinaryOp::Concat, lhs, rhs);
+        }
+        Ok(lhs)
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
@@ -4727,6 +4748,65 @@ mod tests {
             panic!("AND on the right");
         };
         assert!(matches!(&**null_side, Expr::IsNull { negated: true, .. }));
+    }
+
+    #[test]
+    fn concatenation_sits_between_the_comparisons_and_the_additions() {
+        // ISO 20.23. The join is under the equals and the sum is under
+        // the join, so the query asks whether the joined string equals
+        // the one on the right, and the right hand operand of the join
+        // is the sum rather than the one.
+        let q = parsed("MATCH (n) WHERE n.a || 1 + 2 = n.b RETURN n");
+        let Clause::Match {
+            filter: Some(filter),
+            ..
+        } = &q.clauses()[0]
+        else {
+            panic!("WHERE");
+        };
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            ..
+        } = filter
+        else {
+            panic!("= at the top, got {filter:?}");
+        };
+        let Expr::Binary {
+            op: BinaryOp::Concat,
+            rhs: sum,
+            ..
+        } = &**lhs
+        else {
+            panic!("|| under the =, got {lhs:?}");
+        };
+        assert!(matches!(
+            &**sum,
+            Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+
+        // And it folds to the left the way the other binary operators
+        // do, so three strings joined are two joins and not a list.
+        let q = parsed("RETURN 'a' || 'b' || 'c' AS v");
+        let projection = q.result().expect("RETURN");
+        let Expr::Binary {
+            op: BinaryOp::Concat,
+            lhs,
+            ..
+        } = &projection.items[0].expr
+        else {
+            panic!("|| at the top");
+        };
+        assert!(matches!(
+            &**lhs,
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                ..
+            }
+        ));
     }
 
     #[test]

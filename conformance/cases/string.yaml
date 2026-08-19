@@ -624,3 +624,113 @@ cases:
       - values:
           - type: STRING
             value: "a"
+
+  - name: two-strings-joined
+    doc: The concatenation operator of ISO 20.23, which is the one operator a string has that a number does not, and is written apart from the plus so that a query says which of the two it meant.
+    query: RETURN 'ab' || 'cd' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: abcd
+
+  - name: a-join-of-three-strings-folds-to-the-left
+    doc: Three operands and one answer, so an engine that read the operator as anything but left associative still answers the same string and an engine that read it as a label alternation does not.
+    query: RETURN 'a' || 'b' || 'c' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: abc
+
+  - name: a-join-with-a-null-in-it-is-null
+    doc: The rule every operator here shares, which is what keeps a joined string from quietly gaining the four letters of the word null.
+    query: RETURN 'ab' || NULL AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: NULL
+
+  - name: a-join-binds-tighter-than-a-comparison
+    doc: The precedence ISO gives the operator, so this asks whether the joined string is the one written rather than joining a string to a boolean.
+    query: RETURN 'ab' || 'cd' = 'abcd' AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: the-characters-of-a-string-counted
+    doc: CHAR_LENGTH of ISO 20.22, which counts characters and not bytes, so a client that measured the encoding answers differently here than the engine does.
+    query: RETURN CHAR_LENGTH('abcd') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: the-characters-and-the-bytes-of-one-string
+    doc: The same string under both lengths. The character is one character and three bytes of UTF-8, which is the whole difference between the two questions.
+    query: RETURN CHAR_LENGTH('日') AS c, OCTET_LENGTH('日') AS o
+    columns:
+      - c
+      - o
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+          - type: INT64
+            value: "3"
+
+  - name: character-length-is-the-same-word-written-out
+    doc: ISO gives the function two spellings and neither is preferred, so an engine reading only the short one leaves half of the standard's text unparseable.
+    query: RETURN CHARACTER_LENGTH('abcd') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-string-folded-up-and-down
+    doc: The fold of ISO 20.24 in both directions, which is where a client's locale used to decide the answer and where the standard says the collation does.
+    query: RETURN UPPER('aB') AS u, LOWER('aB') AS l
+    columns:
+      - u
+      - l
+    rows:
+      - values:
+          - type: STRING
+            value: AB
+          - type: STRING
+            value: ab
+
+  - name: the-spaces-taken-off-both-ends-of-a-string
+    doc: TRIM with only a source, which is the one form of it every implementation must have, and it takes spaces off both ends and nothing out of the middle.
+    query: RETURN TRIM('  a b  ') AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: STRING
+            value: a b
+
+  - name: a-string-function-over-a-null-is-null
+    doc: Four functions asked about nothing, which is the row an OPTIONAL MATCH leaves behind, and each answers null rather than the empty string.
+    query: RETURN CHAR_LENGTH(NULL) AS a, UPPER(NULL) AS b, LOWER(NULL) AS c, TRIM(NULL) AS d
+    columns:
+      - a
+      - b
+      - c
+      - d
+    rows:
+      - values:
+          - type: NULL
+          - type: NULL
+          - type: NULL
+          - type: NULL

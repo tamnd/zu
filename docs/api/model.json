@@ -4562,7 +4562,7 @@
       "name": "write",
       "of": "zu::session::Session",
       "signature": "fn write<T>(&mut self, stage: impl FnOnce) -> Result<T>",
-      "doc": "Runs one write transaction: `stage` describes the change\nagainst an open transaction, and what it returns comes back\nonce the change is committed and visible.\n\nVisible is the part that costs something. The write commits,\nfolds, and the session reloads, so by the time this returns the\nnext statement reads a catalog and a snapshot that both know\nabout the change. A closure that raises commits nothing and\npublishes no epoch, which is the rollback an implicit\ntransaction owes."
+      "doc": "Runs one write transaction: `stage` describes the change\nagainst an open transaction, and what it returns comes back\nonce the change is committed and visible.\n\nVisible is the part that costs something. The write commits,\nfolds, and the session reloads, so by the time this returns the\nnext statement reads a catalog and a snapshot that both know\nabout the change. A closure that raises commits nothing and\npublishes no epoch, which is the rollback an implicit\ntransaction owes.\n\nThe frames go to the log here and the wait for the platter does\nnot: it happens in [`Self::durable`], after the write side has\ngone back, so the writer queued behind this one stages into the\nsame sync rather than after it. What that costs is that the\nstate has to be held back too, because a reader shown a commit\na crash could take away is the one thing the deferral must not\nbuy."
     },
     {
       "id": "zu::shared",
@@ -4609,6 +4609,14 @@
       "doc": "Publishes where the write side has got to, for the readers to\npick up at the start of their next statement."
     },
     {
+      "id": "zu::shared::FileHandle::publish_staged",
+      "kind": "method",
+      "name": "publish_staged",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn publish_staged(&self, next: Published)",
+      "doc": "Installs a state whose log is now durable.\n\nA writer behind this one may have staged, synced and published\nwhile this one was waiting, and then this state is stale: what\nit describes the newer one describes too, because they are\ncumulative. So the older one is dropped rather than put in,\nwhich would take the readers backwards."
+    },
+    {
       "id": "zu::shared::FileHandle::published",
       "kind": "method",
       "name": "published",
@@ -4639,6 +4647,14 @@
       "of": "zu::shared::FileHandle",
       "signature": "fn reclaim(&self, side: &mut WriteSide)",
       "doc": "Gives back for allocation the blocks the last checkpoint freed\nthat nothing is reading any more.\n\nCalled by the writer after it has published, so a statement\nstarting from here on reads the epoch that owns those blocks\nrather than the one that let go of them."
+    },
+    {
+      "id": "zu::shared::FileHandle::stage",
+      "kind": "method",
+      "name": "stage",
+      "of": "zu::shared::FileHandle",
+      "signature": "fn stage(&self, side: &WriteSide) -> Published",
+      "doc": "What [`Self::publish`] would install, without installing it,\nstamped with where it falls in the order writers staged.\n\nThis is the first half of a group commit. The state is taken\nwhile the write side is still held, which is the only moment it\ncan be read consistently, and put in with [`Self::publish_staged`]\nonce the log behind it is on the platter. Between the two the\nwrite side is back with the next writer, which is the whole\npoint: their frames are staged while this one's sync is in the\nair, so one sync covers them both."
     },
     {
       "id": "zu::shared::FileHandle::take",
@@ -4703,6 +4719,14 @@
       "doc": "The file handle that allocates and the writer that logs, together,\nbecause neither is right without the other: a fold moves roots on\none and empties the overlay of the other."
     },
     {
+      "id": "zu::shared::WriteSide::commits",
+      "kind": "method",
+      "name": "commits",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn commits(&self) -> Option<Arc<Commits>>",
+      "doc": "What makes this side's commits durable, held past the side\nitself going back so the wait happens off the queue. `None`\nbefore a writer has been opened, which is a side with nothing to\nmake durable."
+    },
+    {
       "id": "zu::shared::WriteSide::discard_above",
       "kind": "method",
       "name": "discard_above",
@@ -4764,6 +4788,14 @@
       "of": "zu::shared::WriteSide",
       "signature": "fn patches(&self) -> Arc<Patches>",
       "doc": "The cells committed since the last fold, which a reader reads\nthrough."
+    },
+    {
+      "id": "zu::shared::WriteSide::settled",
+      "kind": "method",
+      "name": "settled",
+      "of": "zu::shared::WriteSide",
+      "signature": "fn settled(&self) -> bool",
+      "doc": "Whether the log owes nothing, so what this side holds is durable\nand may be shown to the readers.\n\nA writer that has staged its frames and not yet waited for the\nplatter is in this side, and publishing it would let a reader\nact on a commit a crash could take back. Whoever owes that sync\npublishes it themselves once it lands, so what this says to skip\nis never lost, only left to the writer it belongs to."
     },
     {
       "id": "zu::shared::WriteSide::write",
@@ -5292,6 +5324,14 @@
       "doc": "The write side of one open database.\n\nOne of these is the single writer: it holds the only handle on its\noverlay store, and [`Mvcc::begin`] hands out that store's only\nmutable borrow, so a second transaction cannot exist while one is\nopen. Two writers over one file would be two overlay stores and one\nlog between them, and neither would be right, so there is exactly\none place a [`Writer`] lives, which is inside the session that owns\nthe file handle. An appender is the other writer of the same log,\nand it is kept apart the same way: it borrows the file, and a\nsession hands the file out only after dropping its writer."
     },
     {
+      "id": "zu::write::Writer::commits",
+      "kind": "method",
+      "name": "commits",
+      "of": "zu::write::Writer",
+      "signature": "fn commits(&self) -> Arc<Commits>",
+      "doc": "What makes this writer's commits durable, held past the write\nside going back so the wait happens off the lock."
+    },
+    {
       "id": "zu::write::Writer::discard_above",
       "kind": "method",
       "name": "discard_above",
@@ -5340,6 +5380,14 @@
       "doc": "The log this writer commits to."
     },
     {
+      "id": "zu::write::Writer::settled",
+      "kind": "method",
+      "name": "settled",
+      "of": "zu::write::Writer",
+      "signature": "fn settled(&self) -> bool",
+      "doc": "Whether the log owes nothing. See [`Commits::settled`]."
+    },
+    {
       "id": "zu::write::Writer::write",
       "kind": "method",
       "name": "write",
@@ -5360,6 +5408,14 @@
       "of": "zu::write::Written",
       "signature": "zu_common::Epoch",
       "doc": "The epoch the change committed at. A transaction that staged\nnothing publishes nothing, so this is the epoch that was\nalready current when the closure did no work."
+    },
+    {
+      "id": "zu::write::Written::owed",
+      "kind": "field",
+      "name": "owed",
+      "of": "zu::write::Written",
+      "signature": "Option<u64>",
+      "doc": "How far the log has to be on the platter for this to have\ncommitted, or `None` when nothing is owed.\n\nNothing is owed by a transaction that staged nothing, and\nnothing is owed once a checkpoint has sealed the change into the\nbase file and cut the log, because then what would be waited for\nis not there any more and what it said is durable without it.\n\nThe caller waits for this after it has given the write side\nback, which is what lets the writer behind it stage into the\nsame sync. See [`Commits::sync_through`]."
     },
     {
       "id": "zu::write::Written::value",
@@ -9747,6 +9803,14 @@
       "doc": "Whether nothing has been staged."
     },
     {
+      "id": "zu::zu1::txn::WriteTxn::stage_commit",
+      "kind": "method",
+      "name": "stage_commit",
+      "of": "zu::zu1::txn::WriteTxn",
+      "signature": "fn stage_commit(self, wal: &mut Wal) -> Result<(Epoch, Option<u64>)>",
+      "doc": "[`Self::commit`] without the wait for the platter: the frames go\nto the log and what comes back is the epoch and the byte the log\nhas to be durable through for the transaction to have committed.\n\nThe overlays are applied here, before that wait, because they\nare what the writer itself reads and it has to see its own\nwrite. What must not happen before the wait is publishing them\nto the other connections, and that is the caller's to hold back.\n\nA transaction that staged nothing owes nothing and is already\ncommitted, trivially."
+    },
+    {
       "id": "zu::zu1::txn::WriteTxn::update",
       "kind": "method",
       "name": "update",
@@ -9895,6 +9959,14 @@
       "doc": "The syscall surface of one open file. `len` is fstat, hence the\n`Result`; emptiness is the caller's question to ask of the value."
     },
     {
+      "id": "zu::zu1::vfs::VfsFile::dup",
+      "kind": "method",
+      "name": "dup",
+      "of": "zu::zu1::vfs::VfsFile",
+      "signature": "fn dup(&self) -> Result<Box<dyn VfsFile>>",
+      "doc": "A second handle on the same file.\n\nGroup commit is what wants this: the sync that makes a batch of\ncommits durable runs while the writer that staged them has\nalready let go of the log, so it cannot be the same handle. A\nsync is a promise about the file rather than about the\ndescriptor, so syncing this one makes durable what was written\nthrough the other."
+    },
+    {
       "id": "zu::zu1::vfs::VfsFile::len",
       "kind": "method",
       "name": "len",
@@ -9943,10 +10015,31 @@
       "doc": "Redo-only write-ahead log, the sidecar file next to a zu1 database.\n\nThe record format is the engine-shared one from docs/08 section 3:\n`len: u32 LE | crc32c: u32 LE | body`, where the body is\n`epoch: u64 LE | kind: u8 | payload` and both length and crc cover\nthe body. The s3 engine batches the same records into objects when\nM5 lands; the sqlite engine delegates to SQLite's own WAL and never\ntouches this file.\n\nReplay stops at the first frame that does not verify: a short\nprefix, a length past the end of the file, or a crc mismatch all\nmean the same thing, a torn tail from a crash mid-append, and\neverything before the tear is intact because the single writer\nappends frames in order. A frame whose crc verifies but whose\npayload does not parse is different: that is corruption or version\nskew, not a tear, and it surfaces as an error instead of a silent\nstop. Delivery is transactional: records buffer per txn and reach\nthe sink only once their `TxnCommit` frame has been read, so a tear\nafter the last commit loses nothing that was promised durable."
     },
     {
+      "id": "zu::zu1::wal::Commits",
+      "kind": "struct",
+      "name": "Commits",
+      "doc": "The open sidecar log: an append position, a staging buffer and the\nframe codec around them. Commit durability is one `fdatasync` per\ncommit; the 1 ms group-commit window from docs/08 arrives with the\nwriter queue.\n\nA transaction's frames are built in memory and go to the file in one\nwrite at commit, because a small write is nearly all syscall: a one\ncell update is a begin frame, an update frame and a commit frame,\nthree pwrites of about thirty bytes each, and on this laptop those\nthree cost more processor time than everything the statement did\nbefore them. Nothing about durability changes, since the commit\nframe is still what reaches the disk last and the sync still follows\nit.\n\nThe room those frames go into is asked for ahead of them. A write\nthat makes a file longer is a write plus an allocation plus a size\nthe sync has to carry, and a commit that does that every time pays\nfor it every time: measured on this laptop, a hundred byte frame\nand its sync cost 34 us of processor time and 3.75 ms of wall\nappending, against 25 us and 3.17 ms into space the file already\nhad. So the log takes its space in chunks and writes zeros over it,\nand a commit writes inside what it already has.\n\nZeros are not padding, they are the end of the log. A frame is a\nlength and a crc, and a length of zero is shorter than the smallest\nrecord, so the scan that replay and open both use stops at the\nfirst byte of unused reservation. That is the same stop a torn tail\ngets and it is why nothing else is needed to say where the log\nends. It is also why every path that takes frames away, the cut\nafter a checkpoint and the rollback of a transaction the process\ndied inside, writes zeros over what it took rather than leaving\nbytes that once parsed.\nThe sync a commit waits on, shared by every writer on one log.\n\nA commit is durable once the log is on the platter through the byte\nits commit frame ends at. The log is append only, so that is a\nprefix property: one sync makes durable everything staged before it,\nwhoever staged it. Which is what lets commits share one.\n\nA writer that finds nobody syncing becomes the leader, and syncs the\nlog as far as it has been staged rather than only as far as its own\nframes go, so the writers that staged behind it while it waited for\nthe write side come along for free. A writer that finds a sync\nalready running waits for it, and either it covered them or they\nlead the next one. So a burst of n commits costs two syncs rather\nthan n: the one already in flight when the burst arrived, and the\none that covers the rest.\n\nThe sync runs on a second handle on the log, because by then the\nwriter that staged the frames has given the write side back and the\nlog belongs to somebody else."
+    },
+    {
+      "id": "zu::zu1::wal::Commits::settled",
+      "kind": "method",
+      "name": "settled",
+      "of": "zu::zu1::wal::Commits",
+      "signature": "fn settled(&self) -> bool",
+      "doc": "Whether the log owes nothing: every byte staged is on the\nplatter, so what the write side holds can be shown to a reader."
+    },
+    {
+      "id": "zu::zu1::wal::Commits::sync_through",
+      "kind": "method",
+      "name": "sync_through",
+      "of": "zu::zu1::wal::Commits",
+      "signature": "fn sync_through(&self, need: u64) -> Result<()>",
+      "doc": "Returns once the log is durable through `need` bytes, syncing it\nhere if nobody else is already doing it.\n\nThis is the commit point. It runs with the write side let go of,\nso the writers behind this one are staging their own frames\nwhile this sync is in the air, and the sync that covers them is\nthe next one rather than one each."
+    },
+    {
       "id": "zu::zu1::wal::Wal",
       "kind": "struct",
-      "name": "Wal",
-      "doc": "The open sidecar log: an append position, a staging buffer and the\nframe codec around them. Commit durability is one `fdatasync` per\ncommit; the 1 ms group-commit window from docs/08 arrives with the\nwriter queue.\n\nA transaction's frames are built in memory and go to the file in one\nwrite at commit, because a small write is nearly all syscall: a one\ncell update is a begin frame, an update frame and a commit frame,\nthree pwrites of about thirty bytes each, and on this laptop those\nthree cost more processor time than everything the statement did\nbefore them. Nothing about durability changes, since the commit\nframe is still what reaches the disk last and the sync still follows\nit.\n\nThe room those frames go into is asked for ahead of them. A write\nthat makes a file longer is a write plus an allocation plus a size\nthe sync has to carry, and a commit that does that every time pays\nfor it every time: measured on this laptop, a hundred byte frame\nand its sync cost 34 us of processor time and 3.75 ms of wall\nappending, against 25 us and 3.17 ms into space the file already\nhad. So the log takes its space in chunks and writes zeros over it,\nand a commit writes inside what it already has.\n\nZeros are not padding, they are the end of the log. A frame is a\nlength and a crc, and a length of zero is shorter than the smallest\nrecord, so the scan that replay and open both use stops at the\nfirst byte of unused reservation. That is the same stop a torn tail\ngets and it is why nothing else is needed to say where the log\nends. It is also why every path that takes frames away, the cut\nafter a checkpoint and the rollback of a transaction the process\ndied inside, writes zeros over what it took rather than leaving\nbytes that once parsed."
+      "name": "Wal"
     },
     {
       "id": "zu::zu1::wal::Wal::append",
@@ -9962,7 +10055,15 @@
       "name": "commit",
       "of": "zu::zu1::wal::Wal",
       "signature": "fn commit(&mut self, epoch: Epoch) -> Result<()>",
-      "doc": "Stages the txn's `TxnCommit` frame, writes everything the txn\nstaged in one go and syncs the file. The commit record hitting\ndisk is the commit point: replay delivers a txn exactly when\nthat frame verifies, and it is last in the buffer, so a write\nthe disk tears anywhere leaves a txn replay refuses."
+      "doc": "Stages the txn's `TxnCommit` frame, writes everything the txn\nstaged in one go and syncs the file. The commit record hitting\ndisk is the commit point: replay delivers a txn exactly when\nthat frame verifies, and it is last in the buffer, so a write\nthe disk tears anywhere leaves a txn replay refuses.\n\nThis is the whole commit, sync included, for the caller with\nnobody to share the sync with. A caller that wants to let the\nwrite side go before it waits for the platter wants\n[`Wal::stage_commit`] and then [`Commits::sync_through`], which\nis the same two steps with the lock let go of in between."
+    },
+    {
+      "id": "zu::zu1::wal::Wal::commits",
+      "kind": "method",
+      "name": "commits",
+      "of": "zu::zu1::wal::Wal",
+      "signature": "fn commits(&self) -> &Arc<Commits>",
+      "doc": "What makes this log's commits durable, to be held past the write\nside going back."
     },
     {
       "id": "zu::zu1::wal::Wal::is_empty",
@@ -10010,6 +10111,14 @@
       "of": "zu::zu1::wal::Wal",
       "signature": "fn rollback_above(&mut self, floor: Epoch) -> Result<()>",
       "doc": "Drops the frames of a transaction the process died inside, which\nare the ones committed after it began: the marker it left says\nwhere the log stood then, so everything above that floor is the\ntransaction's own and goes with it.\n\nEpochs only go up along the log, so this is a prefix cut rather\nthan a rewrite. Frames at or below the floor were committed\nbefore the transaction and stay, whether the base file has\nfolded them already or replay is about to bring them back."
+    },
+    {
+      "id": "zu::zu1::wal::Wal::stage_commit",
+      "kind": "method",
+      "name": "stage_commit",
+      "of": "zu::zu1::wal::Wal",
+      "signature": "fn stage_commit(&mut self, epoch: Epoch) -> Result<u64>",
+      "doc": "Writes the txn's frames and its `TxnCommit` out to the log\nwithout waiting for the platter, and returns the byte the log\nhas to be durable through for this txn to have committed.\n\nNothing is committed when this returns. What it buys is that the\nwrite side can go back to the next writer now, so their frames\nare staged while this one's sync is in the air and one sync\ncovers them both."
     },
     {
       "id": "zu::zu1::wal::Wal::truncate",

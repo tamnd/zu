@@ -317,6 +317,14 @@ const NOTES: &[&str] = &[
      of its own, so it reads the row around it through its expressions rather than through its \
      patterns, and a pattern in it writing a name the row already carries is refused by name \
      rather than quietly meaning a second element",
+    "the character string expressions of ISO 20.22 to 20.24: two strings are joined with the \
+     concatenation operator, which binds tighter than a comparison and looser than an addition, \
+     so a join written beside a sum joins the sum; a string is measured by its characters with \
+     CHAR_LENGTH, spelled out as CHARACTER_LENGTH for the same function, and by the bytes the \
+     store keeps with OCTET_LENGTH, and the two answer the same number only for ASCII; UPPER \
+     and LOWER fold it, and TRIM of one argument takes the spaces off both ends. A number is \
+     refused rather than measured or joined by its spelling, since a query that meant the \
+     digits says so with a CAST, and a null anywhere in one of these is a null out",
     "an INSERT runs once for every row the clauses before it answered, and the clauses after \
      it read the rows it wrote rather than the store, so a MATCH followed by an INSERT writes \
      one element per row the match answered",

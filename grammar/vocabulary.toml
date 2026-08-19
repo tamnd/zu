@@ -102,8 +102,8 @@ words = ["NULL", "TRUE", "FALSE"]
 
 [[group]]
 kind = "function"
-doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, PATH_LENGTH and ELEMENTS are the three that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls."
-words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS"]
+doc = "The built-ins the binder resolves by name. The first six are the set functions and the rest are scalar; ID, PATH_LENGTH and ELEMENTS are the three that read something only the graph knows, and ALL_DIFFERENT, SAME and PROPERTY_EXISTS are the three pattern predicates written as calls. The last six are the character string functions of ISO 20.22 and 20.24, CHAR_LENGTH and CHARACTER_LENGTH being two spellings the standard gives one function and OCTET_LENGTH being the other question, since the characters a reader counts and the bytes the store keeps are the same number only for ASCII."
+words = ["COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "ID", "SIZE", "CARDINALITY", "PATH_LENGTH", "ELEMENTS", "ALL_DIFFERENT", "SAME", "PROPERTY_EXISTS", "CHAR_LENGTH", "CHARACTER_LENGTH", "OCTET_LENGTH", "UPPER", "LOWER", "TRIM"]
 
 [[group]]
 kind = "algorithm"

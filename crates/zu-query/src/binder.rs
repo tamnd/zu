@@ -1543,6 +1543,24 @@ pub enum Func {
     /// G114. The other half of the same question: whether the elements
     /// named are all the same element.
     Same,
+    /// ISO 20.22. The character count of a string, which is what a
+    /// reader means by its length, so a character outside the basic
+    /// plane counts once rather than by the bytes it takes.
+    /// CHARACTER_LENGTH is the same word written out.
+    CharLength,
+    /// ISO 20.22. The byte count of the same string, which is the other
+    /// question and answers differently for anything but ASCII. It is
+    /// what a byte string is measured by, and the only length a byte
+    /// string has.
+    OctetLength,
+    /// ISO 20.24. The string with every character folded up.
+    Upper,
+    /// ISO 20.24. The string with every character folded down.
+    Lower,
+    /// ISO 20.24. The string with the spaces taken off both ends, which
+    /// is the one form of TRIM every implementation must have; naming
+    /// an end or a character to trim is GF06 and a separate spelling.
+    Trim,
 }
 
 impl Func {
@@ -1562,6 +1580,11 @@ impl Func {
             "elements" => Func::Elements,
             "all_different" => Func::AllDifferent,
             "same" => Func::Same,
+            "char_length" | "character_length" => Func::CharLength,
+            "octet_length" => Func::OctetLength,
+            "upper" => Func::Upper,
+            "lower" => Func::Lower,
+            "trim" => Func::Trim,
             _ => return None,
         })
     }
@@ -4665,6 +4688,25 @@ impl Binder<'_> {
                 }
                 Type::Bool
             }
+            // ISO 20.22 and 20.24. Five questions about a string, all
+            // taking one, and a number is refused rather than measured
+            // by its spelling, because GQL casts nothing to a string on
+            // its own and a query that meant the digits says so with a
+            // CAST. What the two lengths differ on is the unit: the
+            // characters a reader counts, and the bytes the store
+            // keeps, which are the same number only for ASCII.
+            Func::CharLength | Func::OctetLength | Func::Upper | Func::Lower | Func::Trim => {
+                if !arg_ty.is_str() {
+                    return Err(bad_type(format!(
+                        "{}() needs a string, got {arg_ty}",
+                        crate::plan::func_name(func)
+                    )));
+                }
+                match func {
+                    Func::CharLength | Func::OctetLength => Type::Int,
+                    _ => Type::Str,
+                }
+            }
         };
         Ok((
             BoundExpr::Call {
@@ -4725,6 +4767,18 @@ impl Binder<'_> {
                 }
                 Ok(Type::Bool)
             }
+            // ISO 20.23. Strings on both sides and a string out. It is
+            // written apart from the plus for the reason the standard
+            // writes it apart: a plus over two numbers adds them and a
+            // plus over two strings joins them, so a query whose
+            // operands the lattice does not know yet says which of the
+            // two it meant by which operator it wrote.
+            BinaryOp::Concat => {
+                if !lhs.is_str() || !rhs.is_str() {
+                    return Err(bad_type(format!("|| joins strings, got {lhs} and {rhs}")));
+                }
+                Ok(Type::Str)
+            }
         }
     }
 }
@@ -4778,6 +4832,7 @@ pub fn text(expr: &Expr) -> String {
                 BinaryOp::StartsWith => "STARTS WITH",
                 BinaryOp::EndsWith => "ENDS WITH",
                 BinaryOp::Contains => "CONTAINS",
+                BinaryOp::Concat => "||",
             };
             format!("{} {symbol} {}", text(lhs), text(rhs))
         }

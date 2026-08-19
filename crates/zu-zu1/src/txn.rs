@@ -160,6 +160,10 @@ pub enum Deferred {
     /// the row moves, here or in a fold, so what a reader is handed is
     /// the offset and what makes the row gone is the reader.
     Gone(u32, u64),
+    /// An edge taken away: the rel table and the pair it ran between.
+    /// A pair is the whole name of an edge, so this takes every copy of
+    /// it, which is what the fold does with the same pair.
+    DeadRel(u32, u64, u64),
     /// Rows added to a node table: the table, and the cell each new row
     /// holds in each column, by position in the props directory. They
     /// go on the end of the table in the order they are in here, which
@@ -866,15 +870,15 @@ impl Mvcc {
         self.deferred.clear();
         for op in ops {
             // What the op is about to put in the store, before the
-            // store has it. Five shapes can be handed to a reader as
+            // store has it. Six shapes can be handed to a reader as
             // they are, a value onto a row that is already there, the
             // same value onto an edge, an edge added to a rel table, a
-            // row taken away, and rows added to a node table;
-            // everything else needs a fold to become readable, and a
-            // store that holds one of those needs a fold whatever else
-            // arrives after it. A write of nothing at all is in the
-            // second group: what it changes is the validity mask, and
-            // no patch carries one.
+            // row taken away, an edge taken away, and rows added to a
+            // node table; everything else needs a fold to become
+            // readable, and a store that holds one of those needs a
+            // fold whatever else arrives after it. A write of nothing
+            // at all is in the second group: what it changes is the
+            // validity mask, and no patch carries one.
             match &op {
                 Op::Update {
                     table,
@@ -906,6 +910,9 @@ impl Mvcc {
                 }
                 Op::Delete { table, offset } if self.soft => {
                     self.deferred.push(Deferred::Gone(*table, *offset))
+                }
+                Op::DeleteRel { rel, src, dst } if self.soft => {
+                    self.deferred.push(Deferred::DeadRel(*rel, *src, *dst))
                 }
                 Op::InsertNodes { table, cols, rows } if self.soft => self
                     .deferred

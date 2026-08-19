@@ -358,6 +358,28 @@ pub enum Clause {
     Match {
         optional: bool,
         patterns: Vec<PathPattern>,
+        /// The alternatives written after the first one, ISO 16.7 and
+        /// features G030 and G032, each of them a whole pattern list of
+        /// its own. Empty for a match with no bar in it, which is every
+        /// match that describes one shape.
+        ///
+        /// A bar stands between two path patterns and a comma stands
+        /// between two pattern lists, so `A | B, C` describes two ways
+        /// of matching and each of them is a list: the parser writes
+        /// out the lists rather than keeping the bar, because what the
+        /// clause answers is the rows of one list or the rows of the
+        /// other and there is no operator between them for anything
+        /// downstream to read. `patterns` is the first of the lists and
+        /// this is the rest, so a reader that does not know about
+        /// alternation sees the shape that was written first.
+        alts: Vec<Vec<PathPattern>>,
+        /// Whether the alternatives are a set or a bag: `|` is the path
+        /// pattern union of feature G032, which answers each path once,
+        /// and `|+|` is the multiset alternation of feature G030, which
+        /// answers a path as many times as the alternatives matched it.
+        /// False for a match with no bar in it, where there is one
+        /// alternative and nothing to add up.
+        distinct: bool,
         filter: Option<Expr>,
     },
     /// `INSERT (x:Person {name: 'Zoe'}), (y:Person)`, the statement

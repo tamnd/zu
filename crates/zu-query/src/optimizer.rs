@@ -141,10 +141,13 @@ fn lift_close_filters(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         // A conjoin stands with the leaves here because the composite
         // is taken apart above these walks: each operand is optimized
-        // as a plan of its own, so none of them ever meets one.
-        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. }) => {
-            leaf
-        }
+        // as a plan of its own, so none of them ever meets one. A fork
+        // stands with them for the same reason, the session runs each
+        // way as a part and each part is optimized on its own.
+        leaf @ (LogicalPlan::Empty
+        | LogicalPlan::Rows { .. }
+        | LogicalPlan::Conjoin { .. }
+        | LogicalPlan::Fork { .. }) => leaf,
         LogicalPlan::ScanNodes {
             input,
             slot,
@@ -571,9 +574,11 @@ fn mark_asp_node(
         // A conjoin is here for the same reason a leaf is: the
         // composite is taken apart above this walk, so each operand
         // reaches it as a plan of its own and none of them holds one.
-        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. }) => {
-            (leaf, 1.0)
-        }
+        // A fork is taken apart the same way, into one part per way.
+        leaf @ (LogicalPlan::Empty
+        | LogicalPlan::Rows { .. }
+        | LogicalPlan::Conjoin { .. }
+        | LogicalPlan::Fork { .. }) => (leaf, 1.0),
         LogicalPlan::ScanNodes {
             input,
             slot,
@@ -895,9 +900,10 @@ fn rewrite(
         return reorder_run(plan, query, schema, notes);
     }
     match plan {
-        leaf @ (LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. }) => {
-            Ok(leaf)
-        }
+        leaf @ (LogicalPlan::Empty
+        | LogicalPlan::Rows { .. }
+        | LogicalPlan::Conjoin { .. }
+        | LogicalPlan::Fork { .. }) => Ok(leaf),
         LogicalPlan::Filter {
             input,
             expr,
@@ -1634,7 +1640,7 @@ fn place_filters(
 /// Aggregate replace visibility, so the walk stops at them.
 fn bound_slots(plan: &LogicalPlan, out: &mut HashSet<usize>) {
     match plan {
-        LogicalPlan::Empty | LogicalPlan::Conjoin { .. } => {}
+        LogicalPlan::Empty | LogicalPlan::Conjoin { .. } | LogicalPlan::Fork { .. } => {}
         LogicalPlan::Rows { slots, .. } => out.extend(slots.iter().copied()),
         LogicalPlan::ScanNodes { input, slot, .. } => {
             out.insert(*slot);
@@ -2535,7 +2541,10 @@ mod tests {
                 // A conjoin has two inputs and no one spine to walk, and
                 // no source this helper is asked about is written as a
                 // composite.
-                LogicalPlan::Empty | LogicalPlan::Rows { .. } | LogicalPlan::Conjoin { .. } => {
+                LogicalPlan::Empty
+                | LogicalPlan::Rows { .. }
+                | LogicalPlan::Conjoin { .. }
+                | LogicalPlan::Fork { .. } => {
                     break;
                 }
                 LogicalPlan::Expand {

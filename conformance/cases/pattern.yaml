@@ -1102,3 +1102,68 @@ cases:
       - values:
           - type: INT64
             value: "0"
+
+  - name: a-bar-between-two-paths-matches-either-of-them
+    doc: Path pattern union of ISO 16.7, feature G032. The two alternatives are separate walks and the clause after them reads the rows of both, so the count is the count each of them would have answered on its own added together. Here the first alternative finds the one edge out of ann and the second finds the one edge out of bo.
+    query: MATCH (a:person WHERE a.name = 'ann')-[:knows]->(b:person) | (a:person WHERE a.name = 'bo')-[:knows]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-bar-answers-a-path-both-alternatives-found-once
+    doc: The union is of paths and not of rows, so writing the same walk twice answers what the walk answers once. What tells two rows apart is the elements the walk went through, which is why this is a set: both alternatives here go through the same three edges.
+    query: MATCH (a:person)-[:knows]->(b:person) | (a:person)-[:knows]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-multiset-alternation-answers-it-twice
+    doc: Path multiset alternation of ISO 16.7, feature G030, which is the same shape with the counting left in. This is the one thing that separates the two spellings, so it is the same query as the case above with the bar changed.
+    query: MATCH (a:person)-[:knows]->(b:person) |+| (a:person)-[:knows]->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "6"
+
+  - name: a-bar-binds-inside-one-path-and-the-comma-outside
+    doc: The bar sits inside one path pattern and the comma sits between two of them, so this is two ways of matching and each of them is a pair. Reading it the other way round would answer a different number, which is why it is written down.
+    query: MATCH (a:person WHERE a.name = 'ann') | (a:person WHERE a.name = 'bo'), (c:person WHERE c.age = 40) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: an-alternative-reads-what-the-clause-in-front-of-it-bound
+    doc: The row the alternatives run over is the row the clauses before them answered, so a name bound earlier is the same element in every alternative. That is what makes the shape useful for anything but a standalone walk.
+    query: MATCH (n:person WHERE n.name = 'ann') MATCH (n)-[:knows]->(b:person) | (b:person)-[:knows]->(n) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "1"
+
+  - name: every-alternative-binds-the-same-names
+    doc: The clauses after the alternatives read one row whichever alternative answered it, so a name only one of them binds would be readable only some of the time. That is refused where it is written rather than answered as a null.
+    query: MATCH (a:person)-[:knows]->(b:person) | (a:person)-[r:knows]->(b:person) RETURN count(*) AS a
+    raises: "42001"
+
+  - name: an-optional-match-is-not-written-several-ways
+    doc: An OPTIONAL MATCH answers a row of nulls where it found nothing, and there is no one answer for how many such rows a match written several ways should have. The alternatives are written as statements joined with UNION instead.
+    query: OPTIONAL MATCH (a:person)-[:knows]->(b:person) | (a:person)-[:knows]->(b:person) RETURN count(*) AS a
+    raises: "42001"
+
+  - name: a-path-variable-is-not-written-several-ways
+    doc: A path variable is assembled out of the slots of the walk that bound it, and the alternatives walk differently, so there is no one shape to assemble. It is refused by name rather than answered from whichever alternative happened to run first.
+    query: MATCH p = (a:person)-[:knows]->(b:person) | (a:person)-[:knows]->(b:person) RETURN count(*) AS a
+    raises: "42001"

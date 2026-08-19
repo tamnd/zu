@@ -1057,7 +1057,10 @@ impl Compiler<'_> {
                 // the pair, and this engine compiles one pipeline. The
                 // statement goes back to the engine that runs the
                 // operands and meets them.
-                LogicalPlan::Conjoin { .. } => return Ok(None),
+                // A fork is one plan per way rather than a pipeline,
+                // and the session runs each way as a part, so this
+                // node never stands in front of a run.
+                LogicalPlan::Conjoin { .. } | LogicalPlan::Fork { .. } => return Ok(None),
                 LogicalPlan::ScanNodes { input, .. }
                 | LogicalPlan::Expand { input, .. }
                 | LogicalPlan::Filter { input, .. }

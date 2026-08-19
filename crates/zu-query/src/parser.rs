@@ -1437,16 +1437,20 @@ impl Parser<'_> {
                 // it either matches whole or every name it writes is
                 // null, which is why the whole block becomes one
                 // bracketed group rather than a group per statement.
-                let (patterns, filter) = if optional && self.at(&TokenKind::LBrace) {
-                    self.parse_match_block(&TokenKind::RBrace)?
+                let (patterns, alts, distinct, filter) = if optional && self.at(&TokenKind::LBrace)
+                {
+                    let (patterns, filter) = self.parse_match_block(&TokenKind::RBrace)?;
+                    (patterns, Vec::new(), false, filter)
                 } else {
                     self.expect_kw("MATCH")?;
-                    let patterns = self.parse_graph_pattern()?;
-                    (patterns, self.parse_where()?)
+                    let (patterns, alts, distinct) = self.parse_graph_pattern_alts()?;
+                    (patterns, alts, distinct, self.parse_where()?)
                 };
                 clauses.push(Clause::Match {
                     optional,
                     patterns,
+                    alts,
+                    distinct,
                     filter,
                 });
                 // GQ19. A yield belongs to the match it stands after,
@@ -1913,6 +1917,29 @@ impl Parser<'_> {
     // Patterns.
 
     fn parse_path(&mut self) -> Result<PathPattern> {
+        let mut bar = None;
+        let mut alts = self.parse_path_alts(&mut bar)?;
+        if alts.len() > 1 {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "a bar between two path patterns says either of them may be matched, \
+                 and this is a position that describes one shape rather than looking \
+                 for one",
+            ));
+        }
+        Ok(alts.remove(0))
+    }
+
+    /// One path pattern, as the terms the bars separated it into (ISO
+    /// 16.7).
+    ///
+    /// The path variable, the selector and the path mode are written
+    /// once in front of the whole alternation and belong to every term
+    /// of it, because they say what to do with the path that was
+    /// matched and not which shape matched it. `bar` carries which of
+    /// the two bars this list has seen so far, so that a list written
+    /// with both is caught wherever the second one is.
+    fn parse_path_alts(&mut self, bar: &mut Option<bool>) -> Result<Vec<PathPattern>> {
         // `p = (a)-...` binds the path; the lookahead keeps a bare
         // pattern unambiguous.
         let var = if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_)))
@@ -1927,6 +1954,43 @@ impl Parser<'_> {
             None
         };
         let (selector, mode) = self.parse_path_prefix()?;
+        let mut alts = vec![self.parse_term(var.clone(), selector, mode)?];
+        while self.at(&TokenKind::Pipe) {
+            let at = self.peek().expect("peeked").start;
+            self.expect(&TokenKind::Pipe)?;
+            // `|+|` is three tokens rather than one, because the lexer
+            // would have to know it was reading a pattern to make it
+            // one: the same three characters are a bar, a plus and a
+            // bar in an expression.
+            let multiset = self.eat(&TokenKind::Plus);
+            if multiset {
+                self.expect(&TokenKind::Pipe)?;
+            }
+            if bar.is_some_and(|seen| seen != multiset) {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    "one bar answers a path once however many alternatives matched it \
+                     and the other answers it once per alternative, so a pattern \
+                     written with both is asking for two answers at once; write the \
+                     alternatives with one of them",
+                ));
+            }
+            *bar = Some(multiset);
+            alts.push(self.parse_term(var.clone(), selector, mode)?);
+        }
+        Ok(alts)
+    }
+
+    /// One term of a path pattern: the walk itself, under the variable,
+    /// selector and mode the alternation around it was written with.
+    fn parse_term(
+        &mut self,
+        var: Option<String>,
+        selector: Option<Selector>,
+        mode: Option<PathMode>,
+    ) -> Result<PathPattern> {
         let mut path = Segment::default();
         self.parse_segment(&mut path)?;
         let subpaths = std::mem::take(&mut path.subpaths);
@@ -2186,16 +2250,52 @@ impl Parser<'_> {
     /// keeps the selector and takes the mode. Naming the same kind twice
     /// is refused rather than settled by a rule of precedence, because
     /// either way round would drop something the query asked for.
+    /// A graph pattern where nothing reads an alternation, which is
+    /// every pattern outside a match: an `INSERT` writes one shape and
+    /// a `MERGE` looks for one.
     fn parse_graph_pattern(&mut self) -> Result<Vec<PathPattern>> {
+        let (patterns, alts, _) = self.parse_graph_pattern_alts()?;
+        if !alts.is_empty() {
+            return Err(ZuError::gql(
+                codes::C42001,
+                "a bar between two path patterns says either of them may be matched, \
+                 and this is a position that describes one shape rather than looking \
+                 for one",
+            ));
+        }
+        Ok(patterns)
+    }
+
+    /// A graph pattern, as the ways of matching it was written as (ISO
+    /// 16.3 and 16.7, features G030 and G032).
+    ///
+    /// The bar binds tighter than the comma, because the standard puts
+    /// the alternation inside one path pattern and the comma between
+    /// two of them: `A | B, C` is a list of two patterns whose first
+    /// one is written two ways, so the ways of matching the list are
+    /// `A, C` and `B, C`. That is what this answers, one whole list per
+    /// way, since what the clause does with them is answer the rows of
+    /// each in turn and there is nothing left for an operator between
+    /// them to do.
+    ///
+    /// The two bars are not mixed in one list. `|` answers a path once
+    /// however many alternatives matched it and `|+|` answers it once
+    /// per alternative, so a list written with both is asking for two
+    /// different answers at once.
+    fn parse_graph_pattern_alts(
+        &mut self,
+    ) -> Result<(Vec<PathPattern>, Vec<Vec<PathPattern>>, bool)> {
         let list = PatternList {
             mode: self.parse_match_mode(),
             at: self.lists,
         };
         self.lists += 1;
-        let mut patterns = vec![self.parse_path()?];
+        let mut bar: Option<bool> = None;
+        let mut written = vec![self.parse_path_alts(&mut bar)?];
         while self.eat(&TokenKind::Comma) {
-            patterns.push(self.parse_path()?);
+            written.push(self.parse_path_alts(&mut bar)?);
         }
+        let mut ways = self.spread(written)?;
         if self.eat_kw("KEEP") {
             let at = self.pos;
             let (selector, mode) = self.parse_path_prefix()?;
@@ -2206,29 +2306,86 @@ impl Parser<'_> {
                      so it needs a path selector or a path mode after it",
                 ));
             }
-            for path in &mut patterns {
-                if selector.is_some() && path.selector.is_some() {
-                    return Err(ZuError::gql(
-                        codes::C42001,
-                        "a pattern carries a path selector and the KEEP names another, \
-                         so write one of the two",
-                    ));
-                }
-                if mode.is_some() && path.mode.is_some() {
-                    return Err(ZuError::gql(
-                        codes::C42001,
-                        "a pattern carries a path mode and the KEEP names another, \
-                         so write one of the two",
-                    ));
-                }
-                path.selector = path.selector.or(selector);
-                path.mode = path.mode.or(mode);
+            for patterns in &mut ways {
+                Self::keep(patterns, selector, mode)?;
             }
         }
-        for path in &mut patterns {
-            path.list = list;
+        for patterns in &mut ways {
+            for path in patterns.iter_mut() {
+                path.list = list;
+            }
         }
-        Ok(patterns)
+        let first = ways.remove(0);
+        // A bar that was never written leaves one way of matching and
+        // nothing to say about duplicates.
+        Ok((first, ways, bar == Some(false)))
+    }
+
+    /// The ways of matching a whole list, out of the ways each pattern
+    /// in it was written.
+    ///
+    /// A list is a join, so a list whose patterns were written two and
+    /// three ways is six ways of matching and every one of them is a
+    /// list of its own. That multiplies, which is why there is a
+    /// ceiling on it: each way is a walk the engine runs, and a
+    /// statement asking for more walks than this is describing
+    /// something a reader of it could not hold in their head either.
+    fn spread(&self, written: Vec<Vec<PathPattern>>) -> Result<Vec<Vec<PathPattern>>> {
+        const CEILING: usize = 64;
+        let ways = written.iter().map(Vec::len).product::<usize>();
+        if ways > CEILING {
+            return Err(ZuError::gql(
+                codes::C42001,
+                format!(
+                    "the patterns of this list are written {ways} ways between them, \
+                     and each way is a walk of its own; write the alternatives as \
+                     separate statements joined with UNION, which says the same thing \
+                     and says how many walks it is asking for"
+                ),
+            ));
+        }
+        let mut ways: Vec<Vec<PathPattern>> = vec![Vec::new()];
+        for alts in written {
+            ways = ways
+                .into_iter()
+                .flat_map(|so_far| {
+                    alts.iter().map(move |path| {
+                        let mut list = so_far.clone();
+                        list.push(path.clone());
+                        list
+                    })
+                })
+                .collect();
+        }
+        Ok(ways)
+    }
+
+    /// Fills in what the patterns of a list left out, which is what a
+    /// `KEEP` behind the list is for.
+    fn keep(
+        patterns: &mut [PathPattern],
+        selector: Option<Selector>,
+        mode: Option<PathMode>,
+    ) -> Result<()> {
+        for path in patterns {
+            if selector.is_some() && path.selector.is_some() {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "a pattern carries a path selector and the KEEP names another, \
+                     so write one of the two",
+                ));
+            }
+            if mode.is_some() && path.mode.is_some() {
+                return Err(ZuError::gql(
+                    codes::C42001,
+                    "a pattern carries a path mode and the KEEP names another, \
+                     so write one of the two",
+                ));
+            }
+            path.selector = path.selector.or(selector);
+            path.mode = path.mode.or(mode);
+        }
+        Ok(())
     }
 
     /// The match mode in front of a pattern list, `DIFFERENT EDGES`
@@ -4718,12 +4875,14 @@ mod tests {
         let Clause::Match {
             optional,
             patterns,
+            alts,
             filter,
+            ..
         } = &q.clauses()[0]
         else {
             panic!("first clause is MATCH");
         };
-        assert!(!optional && filter.is_none());
+        assert!(!optional && filter.is_none() && alts.is_empty());
         let node = &patterns[0].start;
         assert_eq!(node.var.as_deref(), Some("n"));
         assert_eq!(node.label, Some(LabelExpr::Label("Person".into())));
@@ -4731,6 +4890,68 @@ mod tests {
         assert_eq!(node.props[0].1, Expr::Param("personId".into()));
         let projection = q.result().expect("RETURN");
         assert_eq!(projection.items[0].alias.as_deref(), Some("firstName"));
+    }
+
+    /// The bar sits inside one path pattern and the comma between two
+    /// of them (ISO 16.7), so `A | B, C` is the two pattern lists
+    /// `A, C` and `B, C` and not the one list `A` beside the list
+    /// `B, C`. Reading it the other way round answers a different
+    /// number of rows, so the shape is asserted rather than the count
+    /// alone.
+    #[test]
+    fn a_bar_binds_tighter_than_a_comma() {
+        let q = parsed("MATCH (a)-[:K]->(b) | (a)-[:W]->(b), (c) RETURN *");
+        let Clause::Match {
+            patterns,
+            alts,
+            distinct,
+            ..
+        } = &q.clauses()[0]
+        else {
+            panic!("MATCH");
+        };
+        assert!(distinct, "a single bar is the union and not the multiset");
+        assert_eq!(alts.len(), 1, "two ways of matching");
+        for way in std::iter::once(patterns).chain(alts) {
+            assert_eq!(way.len(), 2, "each way is the alternative and the (c)");
+            assert_eq!(way[1].start.var.as_deref(), Some("c"));
+        }
+        assert_eq!(patterns[0].steps[0].0.types, vec!["K".to_string()]);
+        assert_eq!(alts[0][0].steps[0].0.types, vec!["W".to_string()]);
+    }
+
+    #[test]
+    fn a_multiset_alternation_is_not_a_union() {
+        let q = parsed("MATCH (a)-[:K]->(b) |+| (a)-[:W]->(b) RETURN *");
+        let Clause::Match {
+            alts, distinct, ..
+        } = &q.clauses()[0]
+        else {
+            panic!("MATCH");
+        };
+        assert!(!distinct, "|+| keeps a path each way found");
+        assert_eq!(alts.len(), 1);
+    }
+
+    /// The two bars mean different things about the same alternatives,
+    /// so a pattern that wrote both has not said which of them it
+    /// meant.
+    #[test]
+    fn the_two_bars_are_not_mixed_in_one_pattern() {
+        let err = parse_err("MATCH (a)-[:K]->(b) | (a)-[:W]->(b) |+| (a)-[:X]->(b) RETURN *");
+        assert!(err.contains("two answers at once"), "{err}");
+    }
+
+    /// Every comma multiplies the ways, so a long list of alternations
+    /// is a walk count nobody wrote down. It is refused with the
+    /// number and pointed at the composite query, which is the way to
+    /// write a union that stays one walk per operand.
+    #[test]
+    fn too_many_ways_of_matching_are_refused() {
+        let one = "(a)|(b)";
+        let list = std::iter::repeat_n(one, 7).collect::<Vec<_>>().join(", ");
+        let err = parse_err(&format!("MATCH {list} RETURN *"));
+        assert!(err.contains("UNION"), "{err}");
     }
 
     #[test]

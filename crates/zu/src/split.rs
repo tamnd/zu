@@ -17,18 +17,56 @@
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 use zu_query::binder::{
-    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundQuery, BoundSetItem,
-    MatchKind, Schema, Type,
+    BoundClause, BoundExpr, BoundInsertNode, BoundInsertRel, BoundItem, BoundPath, BoundQuery,
+    BoundSetItem, ForkBranch, MatchKind, Schema, Type,
 };
 use zu_query::plan::LogicalPlan;
 use zu_query::{optimizer, plan};
 
 /// One part of a split statement: the clauses that run together, and
-/// the write they end in, if they end in one.
+/// the seam they end in, if they end in one. The last part ends in
+/// none of them and answers the statement's rows.
 pub(crate) struct Part {
     pub(crate) query: BoundQuery,
     pub(crate) plan: LogicalPlan,
-    pub(crate) write: Option<Write>,
+    pub(crate) seam: Option<Seam>,
+}
+
+/// What one part ends in.
+///
+/// A write is one seam and a match written several ways is the other,
+/// and they are split at for the same reason: what the clauses after
+/// them read is not what one pipeline over the store would answer, so
+/// the rows are handed across rather than walked through.
+pub(crate) enum Seam {
+    Write(Write),
+    Fork(Fork),
+}
+
+/// A match written several ways, ISO 16.7 and features G030 and G032.
+///
+/// Each way is a plan of its own over the rows the part before it
+/// carried, and the rows they answer are put end to end. That is what
+/// the shape is for: the ways walk differently and bind slots of their
+/// own, and the row is where they meet.
+pub(crate) struct Fork {
+    pub(crate) branches: Vec<Branch>,
+    /// Whether a path two ways both found is answered once, which is
+    /// the path pattern union of G032, or twice, which is the multiset
+    /// alternation of G030.
+    pub(crate) distinct: bool,
+}
+
+/// One way of a [`Fork`], compiled.
+pub(crate) struct Branch {
+    pub(crate) query: BoundQuery,
+    pub(crate) plan: LogicalPlan,
+    /// How many of the columns of a row this way answers the next part
+    /// reads. Under `|` the elements the way walked follow them, so
+    /// that two ways that found the very same path answer one row and
+    /// two ways that found different paths through the same pair of
+    /// endpoints answer two; they are dropped once that is settled.
+    pub(crate) width: usize,
 }
 
 /// The write one part ends in.
@@ -188,10 +226,10 @@ pub(crate) struct Subquery {
 }
 
 /// Splits a bound statement into the parts the session runs, or
-/// answers `None` for a statement that writes nothing and runs as one
-/// plan the way every read does.
+/// answers `None` for a statement that runs as one plan the way every
+/// ordinary read does.
 pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Part>>> {
-    if !query.clauses.iter().any(is_write) {
+    if !query.clauses.iter().any(is_seam) {
         return Ok(None);
     }
     let mut parts: Vec<Part> = Vec::new();
@@ -200,24 +238,51 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
     // first one: it runs over the store the way a read does.
     let mut base: Option<Vec<usize>> = None;
     loop {
-        let Some(at) = rest.iter().position(is_write) else {
+        let Some(at) = rest.iter().position(is_seam) else {
             let part = compile(query, rest.to_vec(), query.columns.clone(), base, schema)?;
             parts.push(Part {
                 query: part.0,
                 plan: part.1,
-                write: None,
+                seam: None,
             });
             return Ok(Some(parts));
         };
-        let write = write_of(&rest[at], schema)?;
         let mut clauses = rest[..at].to_vec();
-        clauses.extend(write.before());
-        let exprs = write
-            .carry()
-            .iter()
-            .map(|slot| BoundExpr::Var(*slot))
-            .chain(write.values());
-        let items: Vec<BoundItem> = exprs.enumerate().map(|(i, expr)| item(expr, i)).collect();
+        let (seam, exprs, into) = match &rest[at] {
+            BoundClause::Fork {
+                branches,
+                distinct,
+                carry,
+                base,
+            } => {
+                let held: Vec<usize> = carry[..*base].to_vec();
+                let exprs: Vec<BoundExpr> = held.iter().map(|slot| BoundExpr::Var(*slot)).collect();
+                let fork = fork_of(query, branches, *distinct, held, schema)?;
+                (Seam::Fork(fork), exprs, carry.clone())
+            }
+            other => {
+                let write = write_of(other, schema)?;
+                clauses.extend(write.before());
+                let exprs: Vec<BoundExpr> = write
+                    .carry()
+                    .iter()
+                    .map(|slot| BoundExpr::Var(*slot))
+                    .chain(write.values())
+                    .collect();
+                let into: Vec<usize> = write
+                    .carry()
+                    .iter()
+                    .copied()
+                    .chain(write.created().iter().copied())
+                    .collect();
+                (Seam::Write(write), exprs, into)
+            }
+        };
+        let items: Vec<BoundItem> = exprs
+            .into_iter()
+            .enumerate()
+            .map(|(i, expr)| item(expr, i))
+            .collect();
         let columns = (0..items.len()).map(|i| format!("#{i}")).collect();
         clauses.push(BoundClause::Project {
             distinct: false,
@@ -228,24 +293,30 @@ pub(crate) fn split(query: &BoundQuery, schema: &Schema) -> Result<Option<Vec<Pa
             filter: None,
         });
         let part = compile(query, clauses, columns, base, schema)?;
-        base = Some(
-            write
-                .carry()
-                .iter()
-                .copied()
-                .chain(write.created().iter().copied())
-                .collect(),
-        );
+        base = Some(into);
         parts.push(Part {
             query: part.0,
             plan: part.1,
-            write: Some(write),
+            seam: Some(seam),
         });
         rest = &rest[at + 1..];
     }
 }
 
+/// Whether any part of a split statement changes the graph, which is
+/// what says whether the run needs a transaction around it.
+pub(crate) fn writes(parts: &[Part]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part.seam, Some(Seam::Write(_))))
+}
+
 /// Whether a clause is one the statement has to be split at.
+fn is_seam(clause: &BoundClause) -> bool {
+    is_write(clause) || matches!(clause, BoundClause::Fork { .. })
+}
+
+/// Whether a clause changes the graph.
 fn is_write(clause: &BoundClause) -> bool {
     matches!(
         clause,
@@ -254,6 +325,74 @@ fn is_write(clause: &BoundClause) -> bool {
             | BoundClause::Delete { .. }
             | BoundClause::Merge { .. }
     )
+}
+
+/// Compiles the ways of a match written several ways, each into a plan
+/// of its own over the rows the part in front of it carried.
+fn fork_of(
+    query: &BoundQuery,
+    branches: &[ForkBranch],
+    distinct: bool,
+    base: Vec<usize>,
+    schema: &Schema,
+) -> Result<Fork> {
+    let mut out = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let width = branch.slots.len();
+        let mut exprs: Vec<BoundExpr> = branch
+            .slots
+            .iter()
+            .map(|slot| BoundExpr::Var(*slot))
+            .collect();
+        if distinct {
+            exprs.extend(elements(&branch.patterns).into_iter().map(BoundExpr::Var));
+        }
+        let items: Vec<BoundItem> = exprs
+            .into_iter()
+            .enumerate()
+            .map(|(i, expr)| item(expr, i))
+            .collect();
+        let columns = (0..items.len()).map(|i| format!("#{i}")).collect();
+        let clauses = vec![
+            BoundClause::Match {
+                kind: MatchKind::Required,
+                patterns: branch.patterns.clone(),
+                filter: branch.filter.clone(),
+            },
+            BoundClause::Project {
+                distinct: false,
+                items,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+                filter: None,
+            },
+        ];
+        let (query, plan) = compile(query, clauses, columns, Some(base.clone()), schema)?;
+        out.push(Branch { query, plan, width });
+    }
+    Ok(Fork {
+        branches: out,
+        distinct,
+    })
+}
+
+/// Every element one way walked, in written order.
+///
+/// A path is what it went through and not only what it named, so this
+/// counts the anonymous elements too: `(a)-[:KNOWS]->(b)` and
+/// `(a)-[:WORKS_AT]->(b)` over the same pair are two paths, and under
+/// `|` the set is a set of paths.
+fn elements(patterns: &[BoundPath]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for path in patterns {
+        out.push(path.start.slot);
+        for (rel, node) in &path.steps {
+            out.push(rel.slot);
+            out.push(node.slot);
+        }
+    }
+    out
 }
 
 /// The write a clause [`is_write`] answered for describes.
@@ -356,6 +495,14 @@ fn nested_query(parsed: &zu_query::ast::Query, schema: &Schema) -> Result<Subque
         return Err(ZuError::gql(
             codes::C42001,
             "the query inside DELETE VALUE answers the element to delete, so it reads and does not write",
+        ));
+    }
+    // The nested query is run whole where the delete item is read, so
+    // there is nowhere to hand the rows of one way across to the next.
+    if query.clauses.iter().any(zu_query::binder::forks) {
+        return Err(ZuError::gql(
+            codes::C42001,
+            "the query inside DELETE VALUE answers one element, and a match written several ways is a walk per alternative; write the alternatives as operands of a composite query",
         ));
     }
     Ok(Subquery { query, plan })

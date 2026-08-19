@@ -13,7 +13,7 @@
 //! underlying handle seeks), so a session is Send but queries on it
 //! do not overlap; open one session per thread.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1137,6 +1137,12 @@ impl Session {
         // because the clauses after the write read what it made rather
         // than reading the store again.
         if let Some(parts) = &cached.parts {
+            // A statement split at a match written several ways and
+            // nothing else changes nothing, so it runs without the
+            // transaction a write is held in.
+            if !crate::split::writes(parts) {
+                return self.run_parts(&cached, parts, args, params);
+            }
             self.refuse_a_write()?;
             let held = self.hold()?;
             let out = self.run_parts(&cached, parts, args, params);
@@ -1189,20 +1195,41 @@ impl Session {
         // Asked before anything is worked out, so that a read-only
         // connection is told that it is read-only rather than told
         // something about the statement.
-        crate::write::writable(self.graph.file())?;
+        if crate::split::writes(parts) {
+            crate::write::writable(self.graph.file())?;
+        }
         let options = self.options.clone();
         let mut carried: Option<Value> = None;
         for part in parts {
-            let Some(write) = &part.write else {
-                // A write with nothing after it answers no rows, and a
-                // plan of no clauses would answer one row of no
-                // columns, which is a different answer.
-                if part.query.clauses.is_empty() {
-                    return Ok(QueryResult::new(Vec::new(), Vec::new()));
+            let write = match &part.seam {
+                Some(crate::split::Seam::Write(write)) => write,
+                Some(crate::split::Seam::Fork(fork)) => {
+                    let mut held = args.clone();
+                    held.extend(carried.take());
+                    let rows = self
+                        .read_part(&part.plan, &part.query, &cached.schema, &held, &options)?
+                        .rows;
+                    let seed = Value::List(rows.into_iter().map(Value::List).collect());
+                    carried = Some(self.run_fork(cached, fork, seed, &args, &options)?);
+                    continue;
                 }
-                let mut args = args.clone();
-                args.extend(carried);
-                return self.read_part(&part.plan, &part.query, &cached.schema, &args, &options);
+                None => {
+                    // A write with nothing after it answers no rows,
+                    // and a plan of no clauses would answer one row of
+                    // no columns, which is a different answer.
+                    if part.query.clauses.is_empty() {
+                        return Ok(QueryResult::new(Vec::new(), Vec::new()));
+                    }
+                    let mut args = args.clone();
+                    args.extend(carried);
+                    return self.read_part(
+                        &part.plan,
+                        &part.query,
+                        &cached.schema,
+                        &args,
+                        &options,
+                    );
+                }
             };
             let mut args = args.clone();
             args.extend(carried.take());
@@ -1407,6 +1434,45 @@ impl Session {
             carried = Some(Value::List(next));
         }
         unreachable!("the last part of a split statement writes nothing")
+    }
+
+    /// Runs a match written several ways: each way over the rows the
+    /// part in front of it answered, and the rows they answer put end
+    /// to end in written order.
+    ///
+    /// Under `|+|` that is the whole of it, because the alternation is
+    /// of multisets and a path found twice is answered twice. Under `|`
+    /// it is of sets, so a path two ways both found is answered once,
+    /// and what says whether two rows are the same path is the elements
+    /// the way walked, which each way projects behind its row for the
+    /// purpose. Two ways that reached the same pair of nodes over
+    /// different edges walked different paths and stay two rows.
+    fn run_fork(
+        &mut self,
+        cached: &CachedPlan,
+        fork: &crate::split::Fork,
+        seed: Value,
+        args: &[Value],
+        options: &exec::Options,
+    ) -> Result<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut seen: BTreeSet<Vec<exec::OrdValue>> = BTreeSet::new();
+        for branch in &fork.branches {
+            let mut args = args.to_vec();
+            args.push(seed.clone());
+            let rows = self
+                .read_part(&branch.plan, &branch.query, &cached.schema, &args, options)?
+                .rows;
+            for mut row in rows {
+                if fork.distinct && !seen.insert(row.iter().cloned().map(exec::OrdValue).collect())
+                {
+                    continue;
+                }
+                row.truncate(branch.width);
+                out.push(Value::List(row));
+            }
+        }
+        Ok(Value::List(out))
     }
 
     /// Runs the read half of one part of a write statement.

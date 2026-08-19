@@ -19,8 +19,9 @@
 //! else, so a change that is not folded is a change the next `MATCH`
 //! cannot see, and a write nobody can read is not a write. So a commit
 //! folds unless the read side can be handed what it wrote instead,
-//! which is one shape and only one: a word written onto a column of a
-//! row that is already there. Those go into a [`LanePatch`] per table,
+//! which is one shape: a word written onto a column of a row that is
+//! already there, whether the row is a node or an edge the graph runs
+//! through. Those go into a [`LanePatch`] per table,
 //! the readers put them over the words their columns hold, and a fold
 //! seals them later, at a checkpoint or when the run of them has gone
 //! on long enough. It is worth what it costs to keep narrow, because
@@ -285,7 +286,7 @@ impl Writer {
         let (epoch, mut owed) = txn.stage_commit(&mut self.wal)?;
         if staged {
             let changes = self.mvcc.take_deferred();
-            if self.defers(db, &changes)? {
+            if let Some(changes) = self.defers(db, changes)? {
                 self.stage_patch(changes);
             } else {
                 match db.unpublished_blocks() >= THRESHOLD_BLOCKS {
@@ -330,43 +331,104 @@ impl Writer {
         &self.patches
     }
 
-    /// Whether this commit can be left in the overlay for a later fold
-    /// to seal.
+    /// This commit as the patch would hold it, or `None` when it has to
+    /// be folded.
     ///
-    /// Two shapes can. A word written onto a row that is already there,
-    /// because the patch carries exactly that and a reader reads
-    /// through it. An edge added to a rel table, because the adjacency
-    /// reader merges it into the two lists it belongs in and its
-    /// property values sit under the ordinal it was given. Anything
-    /// else, a new node, a deleted row, a label, an edge taken away,
-    /// folds the way it always did. On top of the shape there are three
-    /// bounds: how many commits may go unfolded, how many cells they
-    /// may hold, and the block growth the checkpoint threshold already
-    /// bounds.
-    fn defers(&mut self, db: &mut Zu1File, changes: &[Deferred]) -> Result<bool> {
+    /// Three shapes need no fold. A word written onto a row that is
+    /// already there, because the patch carries exactly that and a
+    /// reader reads through it. The same word written onto an edge,
+    /// which is the one above once the pair has been turned into the
+    /// ordinal it holds, and turning it is why this answers with the
+    /// changes rather than about them. An edge added to a rel table,
+    /// because the adjacency reader merges it into the two lists it
+    /// belongs in and its property values sit under the ordinal it was
+    /// given. Anything else, a new node, a deleted row, a label, an edge
+    /// taken away, folds the way it always did. On top of the shape
+    /// there are three bounds: how many commits may go unfolded, how
+    /// many cells they may hold, and the block growth the checkpoint
+    /// threshold already bounds.
+    fn defers(
+        &mut self,
+        db: &mut Zu1File,
+        changes: Vec<Deferred>,
+    ) -> Result<Option<Vec<Deferred>>> {
         if changes.is_empty() || !self.mvcc.soft() {
-            return Ok(false);
+            return Ok(None);
         }
         if self.deferred >= DEFERRED_COMMITS
             || self.patches.cells() + changes.len() > DEFERRED_CELLS
             || db.unpublished_blocks() >= THRESHOLD_BLOCKS
         {
-            return Ok(false);
+            return Ok(None);
         }
+        let mut taken = Vec::with_capacity(changes.len());
         for change in changes {
-            let takes = match change {
+            match change {
                 Deferred::Lane((table, row, col, _)) => {
-                    self.patchable(db, *table, *row, *col as usize)?
+                    if !self.patchable(db, table, row, col as usize)? {
+                        return Ok(None);
+                    }
+                    taken.push(change);
                 }
-                Deferred::Edge(rel, src, dst, cols) => {
-                    self.edge_patchable(db, *rel, *src, *dst, cols)?
+                Deferred::RelLane((rel, src, dst, col, word)) => {
+                    let Some(run) = self.edge_lane(db, rel, src, dst, col as usize)? else {
+                        return Ok(None);
+                    };
+                    // Every copy of the pair, because the fold writes the
+                    // value onto every slot the pair holds and the two
+                    // paths have to leave the same column behind.
+                    taken.extend(run.map(|row| Deferred::Lane((rel, row, col, word))));
                 }
-            };
-            if !takes {
-                return Ok(false);
+                Deferred::Edge(rel, src, dst, ref cols) => {
+                    if !self.edge_patchable(db, rel, src, dst, cols)? {
+                        return Ok(None);
+                    }
+                    taken.push(change);
+                }
             }
         }
-        Ok(true)
+        Ok(Some(taken))
+    }
+
+    /// The rows of `rel`'s property columns that a word written onto the
+    /// edges of `src -> dst` lands on, and `None` when the write has to
+    /// be folded instead.
+    ///
+    /// A pair this run of deferred commits added is turned away. Its
+    /// values are in the rows the patch appended rather than in the
+    /// column underneath, so a word aimed at the column would be written
+    /// where nothing reads it, and folding is the cheap answer to a
+    /// write onto an edge that has not been sealed yet.
+    fn edge_lane(
+        &mut self,
+        db: &mut Zu1File,
+        rel: u32,
+        src: u64,
+        dst: u64,
+        col: usize,
+    ) -> Result<Option<std::ops::Range<u64>>> {
+        if self.fresh.get(&rel).is_some_and(|p| p.holds(src, dst)) {
+            return Ok(None);
+        }
+        self.load_reader(db, rel)?;
+        let Some(reader) = self.readers.get_mut(&rel) else {
+            return Ok(None);
+        };
+        let Some((base, count)) = reader.edge_run(db, src, dst)? else {
+            return Ok(None);
+        };
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(rel) {
+            slot.insert(load_rel_props(db, rel)?);
+        }
+        let patchable = self.dirs[&rel]
+            .as_ref()
+            .and_then(|directory| directory.columns.get(col))
+            .is_some_and(|column| {
+                column.is_lane()
+                    && column.validity.is_none()
+                    && base + count <= column.meta.value_count
+            });
+        Ok(patchable.then_some(base..base + count))
     }
 
     /// Whether a reader can be shown this edge without the CSR being
@@ -496,6 +558,9 @@ impl Writer {
                         rels.push(rel);
                     }
                 }
+                // [`Self::defers`] answers with the ordinals a pair
+                // holds, so what reaches here is already a lane write.
+                Deferred::RelLane(..) => unreachable!("resolved where the commit was taken"),
             }
         }
         let mut patches = Patches {
@@ -945,6 +1010,133 @@ mod tests {
         session.file_mut().expect("fold");
         assert_eq!(years(&mut session), deferred);
         assert!(session.epoch() > before, "a fold published no epoch");
+    }
+
+    /// A year written onto an edge that is already there is the write a
+    /// linkbench update of a link's payload is, and it is the one shape
+    /// the patch had to learn the ordinal for: a statement names the
+    /// edge by the pair it runs between, and the column it writes into
+    /// is in edge order.
+    #[test]
+    fn a_year_written_onto_an_edge_needs_no_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edge-set.zu1");
+        seeded_dated(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let before = session.epoch();
+        session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) WHERE a.name = 'ada' SET k.since = 1991",
+                &[],
+            )
+            .expect("write a year");
+        assert_eq!(session.epoch(), before, "an edge property set folded");
+
+        // Forward, where the ordinal is the slot the expand walked to,
+        // and backward, where it is the one the lookup worked out. The
+        // string beside it is untouched, which is what says the write
+        // landed on the column it named and not on the row.
+        let out = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) WHERE a.name = 'ada' \
+                 RETURN k.since AS since, k.note AS note",
+                &[],
+            )
+            .expect("read forward");
+        assert_eq!(out.rows[0][0], Value::Int(1991));
+        assert_eq!(string(&out.rows[0], 1), "school");
+
+        let back = session
+            .run(
+                "MATCH (a:person)<-[k:knows]-(b:person) WHERE b.name = 'ada' \
+                 RETURN k.since AS since",
+                &[],
+            )
+            .expect("read backward");
+        assert_eq!(back.rows[0][0], Value::Int(1991));
+
+        // And the other edges kept what they held, which is what says
+        // the ordinal was the pair's own and not the first of the table.
+        let all = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) \
+                 RETURN a.name AS from, k.since AS since ORDER BY from",
+                &[],
+            )
+            .expect("read every edge");
+        let years: Vec<(String, Value)> = all
+            .rows
+            .iter()
+            .map(|row| (string(row, 0), row[1].clone()))
+            .collect();
+        assert_eq!(
+            years,
+            [
+                ("ada".into(), Value::Int(1991)),
+                ("joe".into(), Value::Int(2010)),
+                ("kay".into(), Value::Int(2000)),
+            ]
+        );
+
+        // What the overlay answered, the file answers on its own.
+        session.file_mut().expect("fold");
+        let folded = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) \
+                 RETURN a.name AS from, k.since AS since ORDER BY from",
+                &[],
+            )
+            .expect("read every edge again");
+        assert_eq!(
+            folded
+                .rows
+                .iter()
+                .map(|row| (string(row, 0), row[1].clone()))
+                .collect::<Vec<_>>(),
+            years
+        );
+        assert!(session.epoch() > before, "a fold published no epoch");
+    }
+
+    /// A write onto an edge this same unfolded run added folds instead.
+    /// Its values are in the rows the patch appended and not in the
+    /// column underneath, so a word aimed at the column would land where
+    /// nothing reads it.
+    #[test]
+    fn a_year_written_onto_an_edge_just_added_folds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edge-set-fresh.zu1");
+        seeded_dated(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        let before = session.epoch();
+        session
+            .run(
+                "MATCH (a:person), (b:person) WHERE a.name = 'amy' AND b.name = 'ada' \
+                 INSERT (a)-[:knows {since: 2020, note: 'gym'}]->(b)",
+                &[],
+            )
+            .expect("write an edge");
+        assert_eq!(session.epoch(), before, "an edge insert folded");
+
+        session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) WHERE a.name = 'amy' SET k.since = 2021",
+                &[],
+            )
+            .expect("write a year onto it");
+        assert!(session.epoch() > before, "the write did not fold");
+
+        let out = session
+            .run(
+                "MATCH (a:person)-[k:knows]->(b:person) WHERE a.name = 'amy' \
+                 RETURN k.since AS since, k.note AS note",
+                &[],
+            )
+            .expect("read it back");
+        assert_eq!(out.rows[0][0], Value::Int(2021));
+        assert_eq!(string(&out.rows[0], 1), "gym");
     }
 
     /// A transaction whose staging raises leaves the database exactly

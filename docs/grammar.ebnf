@@ -326,20 +326,20 @@ quantifier      = "+" | "*" | "{" , [ integer ] , [ "," , [ integer ] ] , "}" ;
 property_map    = "{" , [ name , ":" , expression ,
                   { "," , name , ":" , expression } ] , "}" ;
 
-(* Expressions, loosest binding first. Nesting is capped at 128. *)
+(* Expressions, loosest binding first. Nesting is capped at 64. *)
 
 expression      = xor_expr , { "OR" , xor_expr } ;
 xor_expr        = and_expr , { "XOR" , and_expr } ;
 and_expr        = not_expr , { "AND" , not_expr } ;
 not_expr        = { "NOT" } , comparison ;
-comparison      = additive , { comparison_op , additive
+comparison      = concat , { comparison_op , concat
                              | "IS" , [ "NOT" ] , "NULL"
                              | "IS" , [ "NOT" ] , "TYPED" , value_type
                              | "IS" , [ "NOT" ] , "DIRECTED"
                              | "IS" , [ "NOT" ] , "LABELED" , label_expr
                              | "IS" , [ "NOT" ] ,
                                ( "SOURCE" | "DESTINATION" ) , "OF" ,
-                               additive } ;
+                               concat } ;
 (* ISO 19.8 to 19.10, features G110, G111 and G112. The three pattern
    predicates written after IS: whether an edge has a direction,
    whether an element carries a label, and whether a node is one end of
@@ -352,6 +352,15 @@ comparison      = additive , { comparison_op , additive
    predicate and a sort key never disagree about which value is first. *)
 comparison_op   = "=" | "<>" | "<" | "<=" | ">" | ">=" | "IN"
                 | "STARTS" , "WITH" | "ENDS" , "WITH" | "CONTAINS" ;
+(* ISO 20.23, mandatory. Concatenation binds tighter
+   than a comparison and looser than an addition, which is where the
+   standard puts it: 'a' || b = c asks about the joined string, and
+   'n=' || 1 + 2 joins the sum rather than joining the one and adding
+   the two. Both sides are strings and nothing else, since a plus over
+   two numbers adds them and a plus over two strings would have to
+   guess, and a query that meant the digits of a number says so with a
+   CAST. A null on either side gives null. *)
+concat          = additive , { "||" , additive } ;
 additive        = multiplicative , { ( "+" | "-" ) , multiplicative } ;
 multiplicative  = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary           = { "-" | "+" } , postfix ;
@@ -428,6 +437,13 @@ list_name       = [ "GROUP" ] , ( "LIST" | "ARRAY" ) ;
 record_fields   = "{" , [ name , "::" , value_type ,
                   { "," , name , "::" , value_type } ] , "}" ;
 
+(* ISO 20.22 and 20.24, mandatory. Five
+   questions about a string, all written as ordinary calls of one
+   argument. CHAR_LENGTH and CHARACTER_LENGTH are two spellings of the
+   same function and count characters, OCTET_LENGTH counts the bytes
+   the store keeps, and the two agree only for ASCII. UPPER and LOWER
+   fold, and the one argument TRIM takes the spaces off both ends. A
+   number here is refused rather than measured by its spelling. *)
 function_call   = name , "(" , [ "DISTINCT" ] ,
                   [ "*" | expression , { "," , expression } ] , ")" ;
 list            = "[" , [ expression , { "," , expression } ] , "]" ;

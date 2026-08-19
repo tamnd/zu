@@ -522,3 +522,33 @@ RETURN CASE WHEN n.age < 18 THEN 'child' ELSE 'adult' END AS band,
             (literal
               (integer)))
           (identifier))))))
+
+================================================================================
+Two strings joined, and the string functions
+================================================================================
+
+RETURN 'ab' || UPPER(x) AS v, CHAR_LENGTH(TRIM(y)) AS n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (binary_expression
+            (literal
+              (string))
+            (function_call
+              (identifier)
+              (variable
+                (identifier))))
+          (identifier))
+        (projection_item
+          (function_call
+            (identifier)
+            (function_call
+              (identifier)
+              (variable
+                (identifier))))
+          (identifier))))))

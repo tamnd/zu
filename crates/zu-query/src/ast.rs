@@ -1254,4 +1254,8 @@ pub enum BinaryOp {
     StartsWith,
     EndsWith,
     Contains,
+    /// ISO 20.23, `'ab' || 'cd'`. It binds tighter than a comparison
+    /// and looser than an addition, which is where the standard puts
+    /// it and what lets `a || b = c` ask about the joined string.
+    Concat,
 }

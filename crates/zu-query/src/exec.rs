@@ -6233,6 +6233,19 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     let r = settle(eval(ctx, rhs)?);
                     arith(*op, l, r)
                 }
+                // ISO 20.23. Strings and nothing else: a number here is
+                // refused rather than written out as its digits, since
+                // a query that meant the digits says so with a CAST and
+                // one that meant an addition wrote a plus.
+                Concat => {
+                    let l = settle(eval(ctx, lhs)?);
+                    let r = settle(eval(ctx, rhs)?);
+                    match (l, r) {
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
+                        (a, b) => Err(invalid(format!("|| joins strings, got {a:?} and {b:?}"))),
+                    }
+                }
                 In => {
                     let l = settle(eval(ctx, lhs)?);
                     match settle(eval(ctx, rhs)?) {
@@ -6389,6 +6402,48 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                 });
                 Ok(Value::Bool(held))
             }
+            // ISO 20.22 and 20.24. One string in, one answer out, and a
+            // null in answers null, which is the rule every one of
+            // these shares with the operators around them.
+            Func::CharLength | Func::OctetLength | Func::Upper | Func::Lower | Func::Trim => {
+                if *star || args.len() != 1 {
+                    return Err(invalid(format!(
+                        "{}() takes exactly one argument",
+                        crate::plan::func_name(*func)
+                    )));
+                }
+                let s = match settle(eval(ctx, &args[0])?) {
+                    Value::Str(s) => s,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(invalid(format!(
+                            "{}() expects a string, got {other:?}",
+                            crate::plan::func_name(*func)
+                        )));
+                    }
+                };
+                Ok(match func {
+                    // Characters, not bytes: what a reader counts is
+                    // the scalar values, and what the store keeps is
+                    // the UTF-8 they encode to. The two agree on ASCII
+                    // and nowhere else.
+                    Func::CharLength => Value::Int(s.chars().count() as i64),
+                    Func::OctetLength => Value::Int(s.len() as i64),
+                    // ASCII is the fold this does, which is the fold
+                    // the standard's default collation asks for and
+                    // the one that needs no table. A character outside
+                    // it is left as it stands rather than folded by a
+                    // rule this engine has not written down yet.
+                    Func::Upper => Value::Str(s.to_ascii_uppercase()),
+                    Func::Lower => Value::Str(s.to_ascii_lowercase()),
+                    // The one argument form trims spaces, which is what
+                    // ISO 20.24 says it trims: the trim character
+                    // defaults to a space and the trim specification to
+                    // BOTH. Naming either is GF06 and a spelling this
+                    // does not read.
+                    _ => Value::Str(s.trim_matches(' ').to_string()),
+                })
+            }
             _ => Err(invalid(
                 "aggregate call outside a projection, this is a bug".into(),
             )),
@@ -6542,7 +6597,12 @@ impl AggState {
             | Func::PathLength
             | Func::Elements
             | Func::AllDifferent
-            | Func::Same => {
+            | Func::Same
+            | Func::CharLength
+            | Func::OctetLength
+            | Func::Upper
+            | Func::Lower
+            | Func::Trim => {
                 unreachable!("scalar function as an aggregate")
             }
         };

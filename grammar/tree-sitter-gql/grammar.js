@@ -389,14 +389,17 @@ module.exports = grammar({
             $._expression,
           ),
         ),
-        prec.left(6, seq($._expression, choice("+", "-"), $._expression)),
-        prec.left(7, seq($._expression, choice("*", "/", "%"), $._expression)),
+        // ISO 20.23. Concatenation binds tighter than a comparison and
+        // looser than an addition, which is where the standard puts it.
+        prec.left(6, seq($._expression, "||", $._expression)),
+        prec.left(7, seq($._expression, choice("+", "-"), $._expression)),
+        prec.left(8, seq($._expression, choice("*", "/", "%"), $._expression)),
       ),
 
     unary_expression: ($) =>
       choice(
         prec.right(4, seq(kw("NOT"), $._expression)),
-        prec.right(8, seq(choice("-", "+"), $._expression)),
+        prec.right(9, seq(choice("-", "+"), $._expression)),
       ),
 
     is_expression: ($) =>

@@ -22,7 +22,7 @@ use crate::epoch::Slotted;
 use crate::error::Result;
 use crate::graph::Graph;
 use crate::index::{self, Bucket, EMPTY, Index, SLOTS};
-use crate::log::{Durability, Log};
+use crate::log::{self, Durability, Log};
 use crate::record::{self, RecordRef};
 use crate::{compact, file, recover};
 
@@ -57,6 +57,11 @@ pub struct Options {
     /// smaller than this is not worth a scan. The default is a hundred
     /// and twenty eight megabytes, which is thirty two pages.
     pub compact_below: u64,
+    /// How far past the write frontier the file's blocks are reserved,
+    /// so a durable write lands in space the file already owns. Zero
+    /// turns the reservation off, which is what a measurement of what
+    /// the reservation is worth wants.
+    pub provision_bytes: u64,
     /// How many bytes of log to keep per byte of live data, as a
     /// percentage.
     ///
@@ -80,6 +85,7 @@ impl Default for Options {
             sessions: 128,
             max_vertices: 1 << 26,
             compact_below: 128 << 20,
+            provision_bytes: log::PROVISION_CHUNK,
             space_target_percent: 200,
         }
     }
@@ -204,6 +210,7 @@ impl Db {
                 options.mutable_pages,
                 options.memory_pages,
                 options.sessions,
+                options.provision_bytes,
             ),
             index: Index::new(options.index_buckets),
             graph: Graph::new(options.max_vertices),

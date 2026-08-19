@@ -55,4 +55,4 @@ pub use compact::Compacted;
 pub use db::{Compaction, Db, Options, Session};
 pub use error::{Error, Result};
 pub use graph::{Direction, Graph};
-pub use log::Durability;
+pub use log::{Durability, PROVISION_CHUNK};

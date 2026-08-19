@@ -66,6 +66,30 @@ fn sync(f: &File) -> std::io::Result<()> {
     }
 }
 
+/// Asks the filesystem for the blocks without writing them, which is
+/// what `file::preallocate` does and what the log now does before it
+/// flushes. Separate from the allocated shape on purpose: `fallocate`
+/// hands out unwritten extents, and on a filesystem that has to convert
+/// one when the write lands the first write to a block is still a
+/// metadata change. Whether that conversion costs what an allocation
+/// costs is exactly what this shape measures.
+fn allocate(f: &File, len: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+        }
+        // SAFETY: the descriptor is open for writing and the range is
+        // in bounds.
+        unsafe { fallocate(f.as_raw_fd(), 0, 0, len as i64) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        f.set_len(len).is_ok()
+    }
+}
+
 fn run(name: &str, dir: &std::path::Path, prepare: impl Fn(&File)) {
     let path = dir.join(format!("appendcost-{name}"));
     let f = File::options()
@@ -102,6 +126,11 @@ fn main() {
     run("sparse", &dir, |f| {
         f.set_len(ROUNDS * BLOCK as u64).expect("truncate");
         f.sync_all().expect("sync");
+    });
+    run("fallocated", &dir, |f| {
+        if !allocate(f, ROUNDS * BLOCK as u64) {
+            println!("           (this filesystem has no allocation call)");
+        }
     });
     run("allocated", &dir, |f| {
         let mut w = f.try_clone().expect("clone");

@@ -75,7 +75,8 @@ fn page_layout() -> Layout {
     Layout::from_size_align(PAGE_SIZE, 64).expect("zu2 page layout")
 }
 
-/// How far past the write frontier the file is kept provisioned.
+/// How far past the write frontier the file is kept provisioned by
+/// default.
 ///
 /// The size is a trade between two syscalls. Provisioning covers a
 /// megabyte at a time, so a workload of small durable commits calls
@@ -84,7 +85,7 @@ fn page_layout() -> Layout {
 /// often and reserve more space that a database sitting idle has not
 /// used, and the reservation is given back at rest anyway, so a
 /// megabyte is the point where the syscall has stopped mattering.
-const PROVISION_CHUNK: u64 = 1 << 20;
+pub const PROVISION_CHUNK: u64 = 1 << 20;
 
 /// What the flusher and the sync committers share.
 struct Flushing {
@@ -147,6 +148,9 @@ pub struct Log {
     mutable_pages: usize,
     /// Pages kept in memory at all. `usize::MAX` means never evict.
     memory_pages: usize,
+    /// How far past the write frontier the blocks are reserved. Zero
+    /// never reserves.
+    provision_bytes: u64,
     pub(crate) epochs: Epochs,
 }
 
@@ -158,6 +162,7 @@ impl Log {
         mutable_pages: usize,
         memory_pages: usize,
         sessions: usize,
+        provision_bytes: u64,
     ) -> Self {
         Self {
             pages: (0..max_pages)
@@ -175,9 +180,10 @@ impl Log {
             flushing: Mutex::new(Flushing {
                 written: FIRST,
                 provisioned: 0,
-                provisions: true,
+                provisions: provision_bytes > 0,
                 stopping: false,
             }),
+            provision_bytes,
             dirty: Condvar::new(),
             dirty_lock: Mutex::new(false),
             mutable_pages: mutable_pages.max(1),
@@ -554,7 +560,7 @@ impl Log {
             return;
         }
         let from = state.provisioned;
-        let want = (upto + PROVISION_CHUNK).div_ceil(file::BLOCK) * file::BLOCK;
+        let want = (upto + self.provision_bytes).div_ceil(file::BLOCK) * file::BLOCK;
         if file::preallocate(&self.file, from, want - from) {
             state.provisioned = want;
         } else {
@@ -725,7 +731,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("z.log");
         let file = file::create_new(&path).expect("create");
-        let log = Log::new(file, &path, 4096, 2, memory_pages, 8);
+        let log = Log::new(file, &path, 4096, 2, memory_pages, 8, PROVISION_CHUNK);
         (dir, log)
     }
 

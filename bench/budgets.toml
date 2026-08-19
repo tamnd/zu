@@ -1835,3 +1835,34 @@ density_schemaless_prop_bits = 128.0
 # the reading so a slower box passes.
 paths_count_us = 2000.0
 paths_count_over_enumerate_x = 0.01
+
+# What a horizontal aggregate costs (ISO 20.9, feature GE09),
+# benches/fold.rs. A chain of fifty thousand nodes and a stretch
+# repeated eight times, so every row's group holds eight elements and
+# the statement folds about four hundred thousand of them, at one
+# worker.
+#
+# plan/04 asked for the fold to be a kernel over the group rather than a
+# loop over a list built to be walked, and the allocator is what settles
+# it: a fold that built the list would ask for it once a row. Measured
+# 5416.4 bytes a row for the match with nothing on it, 5416.5 for the
+# same match with the fold, and 6440.4 for the same group read as a
+# list, so the fold asks for nothing over the walk and the list asks for
+# exactly 1024 bytes a row. Those three numbers do not move with the
+# machine or the load, which is why the byte ceiling is the tight gate
+# and is set at one byte a row.
+#
+# The clock is the loose one. The walk is nine tenths of all three
+# shapes, so the aggregation is a difference of two large numbers: it
+# read 0.32 to 1.11 of the list build over ten runs on a laptop with a
+# load average of nineteen, taken as the median of the per round ratios.
+# A fold that built its list would pay for the list and then fold it,
+# which is near 1.7, so the ceiling is 1.4: it catches the shape of
+# regression this is about and is not asked to catch a tenth. The
+# microsecond ceiling is a backstop on the whole statement and is set to
+# catch an order of magnitude and nothing finer, since what it mostly
+# measures is the walk in front of the fold. Lower these ceilings, never
+# raise them.
+fold_alloc_bytes_row = 1.0
+fold_over_list_x = 1.4
+fold_group_us = 2000000.0

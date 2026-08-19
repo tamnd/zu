@@ -56,7 +56,7 @@ The Arrow table on both sides is the same shape and the same bytes. What differs
 
 DuckDB never has rows. A result is a sequence of data chunks and a chunk is a set of column vectors, so exporting to Arrow is a per-column handoff of a buffer and a validity bitmap, and for flat numerics it copies nothing at all.
 
-We have rows. `QueryResult` in `crates/zu-query/src/exec.rs` is `rows: Vec<Vec<Value>>`, and the sink in `crates/zu-exec/src/sink.rs` fills it a row at a time out of the vectors the executor was working in. Everything columnar then has to put that back the way it was.
+We had rows. `QueryResult` in `crates/zu-query/src/exec.rs` was `rows: Vec<Vec<Value>>`, and the sink in `crates/zu-exec/src/sink.rs` filled it a row at a time out of the vectors the executor was working in. Everything columnar then had to put that back the way it was. Section 4 is what that cost and what it now does instead, which is the other half of the fix below.
 
 The first version of this page measured that at twenty times DuckDB, and most of the twenty was the client rather than the engine: `zu-python`'s `columns.rs` walked the whole result once per column to settle a type, walked it again per column per batch to gather a `Vec<&Value>`, and built Arrow arrays by collecting iterators of `Option`s. Three passes over three million boxed values, strided every time, and a copy at the end of them.
 
@@ -69,7 +69,7 @@ That part is fixed. `zu::query::column` does the transpose once, in the engine, 
 
 The statement itself is 45 ms of each of those, so the export went from 103 ms to 26 ms. Of the 26 that are left, 22 are the transpose, which `cargo bench -p zu-query --bench columnar` times on its own. The Arrow half is about four milliseconds and there is not much left in it.
 
-So the remaining gap is no longer a client problem. It is the sink, and it is one number: 22 ms to read a result whose rows the executor built out of vectors it then threw away. `record_batches` is fixed alongside it, having been worse rather than better than its name promised: it built every batch into a `Vec<RecordBatch>` before handing back a reader, and a batch is a slice of a finished column now.
+So the remaining gap was no longer a client problem. It was the sink, and it was one number: 22 ms to read a result whose rows the executor built out of vectors it then threw away. Section 4 is where that number went. `record_batches` is fixed alongside it, having been worse rather than better than its name promised: it built every batch into a `Vec<RecordBatch>` before handing back a reader, and a batch is a slice of a finished column now.
 
 The same trade explains the row path going the other way. `fetchall` is faster than DuckDB's, and for exactly the reason Arrow is slower: our rows are already rows. The first pass of this page put that at three times, on a measurement that did not alternate the two sides; alternated, it is a tenth, and a tenth is what should be believed.
 
@@ -83,9 +83,22 @@ The thing that makes the fix tractable is that the hard half is built.
 
 The executor uses all of it. `run.rs`, `join.rs`, `group.rs` and `sip.rs` work in `ValueVector` and `DataChunk` at `VECTOR_SIZE` a time. The collapse happens at exactly one place, the sink, and `docs/10-api-and-tooling.md` section 4 already says so out loud about the C ABI's chunked reads: they are "a slice of what it already materialized", and will stop being "once a chunk is what the executor produced".
 
-That sentence is the work this page is asking for. A result that keeps the vectors it was built from makes Arrow export a handoff rather than a rebuild: for `Int64`, `Float64`, `Bool`, `Date`, `Timestamp` and strings, the buffer that goes into the Arrow array is the buffer the executor filled, released through Arrow's own release callback when the last reader is done with it. Zero copies, not fewer copies.
+That sentence was the work this page asked for, and it is done. `crates/zu-exec/src/columns.rs` is a sink that does not flatten: on a plan with nothing above the projection it appends each projected item into a buffer of its own, in the layout `zu::query::column` describes, and the answer comes back as those buffers. `columnar()` hands them over without walking anything. Nothing above the projection is the whole condition, and it is the right one, because a sort or a dedup or a group is a step over rows and the row is what it steps over, so those plans keep the row sink and the walk keeps answering for them.
 
-The row path keeps working because a row is a gather across vectors at a known offset, which is what `fetchall` would do instead of what it does now. Whether it stays as fast is the thing to measure rather than assume, and it is the reason this is staged behind a benchmark rather than declared.
+The types are known before the first row, which is what makes it simpler than the walk it replaces rather than harder. A projected item is a stored column with a declared type, a node, a row id or a constant, so there is no inference pass and no column that changes its mind halfway. One consequence is worth writing down: a result with no rows now reports the types the plan declared where the walk reported a column of nulls, which is what DuckDB does and is more use to a client building a schema.
+
+`cargo bench -p zu --bench columns` measures it end to end on the same million rows of `INT64`, `DOUBLE` and a short `VARCHAR`, at one worker, with `ZU_SINK=rows` pinning the row build so the two sinks are timed on the same engine on the same machine in one sitting:
+
+| path | rows, as was | columns |
+|---|---|---|
+| statement | 92 ms | 28 ms |
+| export, which is `columnar()` | 26 ms | 1.3 ms |
+| statement and export | 118 ms | 29 ms |
+| statement and read as rows | 94 ms | 115 ms |
+
+Four times on the export, and the 22 ms of transpose is 1.3 ms of handing buffers over. The last row is the honest cost: a caller who wanted rows after all pays about a fifth more, because the rows are built out of the buffers instead of straight into a row vector. That is the trade this makes on purpose, and it is not where it stops. `Row` already borrows the result rather than owning anything, so a row view that reads the buffers where they lie would give a string caller a borrowed `&str` instead of a fresh `String` and take the row path back past where it started. That is the next thing, not this thing.
+
+No client changed a line for any of it. `QueryResult::rows` is a `Rows` that derefs to the `Vec<Vec<Value>>` it always was and builds it on the first ask, so a caller reading rows reads rows, and `columnar()` answers a caller reading columns without either of them knowing which sink ran.
 
 ## 5. TypeScript was a milestone behind, and is most of the way back
 
@@ -138,11 +151,11 @@ The relational API is the one row worth arguing about, and the answer is no. It 
 
 In order, largest effect first.
 
-1. A columnar result, in two halves. The first is a result read down its columns at all, in the engine rather than in each client, which is `zu::query::column` and is done: one buffer per column in Arrow's own layout, filled in two passes over the rows instead of two per column, so the transpose happens once and correctly. The second is the executor keeping the vectors it already computes in, so that `Vec<Vec<Value>>` becomes something the row path gathers rather than something every other path unpicks and the transpose stops happening at all. The first half is what a client can use today; the second is the one that touches the engine, and it changes no client, because the type it fills is already the one they read.
-2. Arrow export as a handoff, which is done for Python. `to_arrow`, `__arrow_c_stream__` and `record_batches` are a description of the buffers `zu::query::column` filled and a release callback, with no copy for the physical types whose layout is already Arrow's, and a batch is a slice cut when the reader asks for it. The export alone went from 103 ms to 26 ms on a million rows, and 22 of the 26 are the transpose that item 1's second half removes. The same handoff is owed for Node, where it is item 3.
+1. A columnar result, in two halves, both done. The first is a result read down its columns at all, in the engine rather than in each client, which is `zu::query::column`: one buffer per column in Arrow's own layout, filled in two passes over the rows instead of two per column, so the transpose happens once and correctly. The second is the executor keeping the vectors it already computes in, which is `crates/zu-exec/src/columns.rs`, so on a plan with nothing above the projection there is no transpose left to do and the rows are built only if somebody asks for them. Neither half changed a client, because the type the sink fills is already the one they read.
+2. Arrow export as a handoff, which is done for Python. `to_arrow`, `__arrow_c_stream__` and `record_batches` are a description of the buffers `zu::query::column` filled and a release callback, with no copy for the physical types whose layout is already Arrow's, and a batch is a slice cut when the reader asks for it. The export alone went from 103 ms to 26 ms on a million rows, and the 22 of the 26 that were the transpose are gone with item 1's second half. The same handoff is owed for Node, where it is item 3.
 3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result. Done, all five. Arrow itself over the C Data Interface is what is left of it, and it is item 2's other half.
 4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on. Done in both.
 5. Real streaming, meaning a result read a chunk at a time as the executor produces it rather than a slice of a result that is already whole.
 6. The small ones: an in-memory connection that does not make a file, a second connection made from the first, and a progress callback, all done in both clients now. The first two are the engine's own answer rather than a special case in either one, and the third is a timer over a counter the engine was already keeping.
 
-Item 1's second half is the only thing left that the live measurement asks for, and it is 22 of the 26 milliseconds. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.
+Item 1's second half was the only thing left that the live measurement asked for, and it is done, so what the export costs now is the Arrow half and nothing else. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.

@@ -2281,7 +2281,8 @@ mod tests {
             rows: vec![
                 vec![Value::Int(3), Value::Str("Ada".into())],
                 vec![Value::Null, Value::Bool(true)],
-            ],
+            ]
+            .into(),
             notices: Vec::new(),
         };
         assert_eq!(
@@ -2296,7 +2297,7 @@ mod tests {
         // empty succeeded, it did not raise `02000 no data`.
         let empty = QueryResult {
             columns: vec!["d".into()],
-            rows: vec![],
+            rows: Vec::new().into(),
             notices: Vec::new(),
         };
         assert_eq!(
@@ -2352,7 +2353,8 @@ mod tests {
                 // one a reader cannot misparse.
                 vec![Value::Float(f64::NAN)],
                 vec![Value::Float(f64::INFINITY)],
-            ],
+            ]
+            .into(),
             notices: Vec::new(),
         };
         assert_eq!(
@@ -2376,7 +2378,8 @@ mod tests {
                 vec![Value::Float(-0.25)],
                 vec![Value::Float(0.0)],
                 vec![Value::Int(3)],
-            ],
+            ]
+            .into(),
             notices: Vec::new(),
         };
         assert_eq!(
@@ -2402,7 +2405,8 @@ mod tests {
                     ord: 0,
                 },
                 Value::List(vec![Value::Int(1), Value::List(vec![Value::Int(2)])]),
-            ]],
+            ]]
+            .into(),
             notices: Vec::new(),
         };
         assert_eq!(
@@ -2420,7 +2424,8 @@ mod tests {
             rows: vec![
                 vec![Value::Int(1), Value::Str("Ada".into())],
                 vec![Value::Int(1000), Value::Str("Grace".into())],
-            ],
+            ]
+            .into(),
             notices: Vec::new(),
         };
         assert_eq!(
@@ -2430,7 +2435,7 @@ mod tests {
 
         let one = QueryResult {
             columns: vec!["n".into()],
-            rows: vec![vec![Value::Int(5)]],
+            rows: vec![vec![Value::Int(5)]].into(),
             notices: Vec::new(),
         };
         assert_eq!(one.rows.len(), 1);

@@ -80,6 +80,7 @@ fn rows(db: &mut Zu1File, source: &str) -> Vec<Vec<Value>> {
     run(source, db, &[])
         .unwrap_or_else(|e| panic!("{source}: {e}"))
         .rows
+        .into_vec()
 }
 
 fn ints(db: &mut Zu1File, source: &str) -> Vec<i64> {

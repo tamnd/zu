@@ -21,6 +21,7 @@
 //! [`ChunkSet`]: zu_vector::ChunkSet
 //! [`Snapshot`]: zu_query::snapshot::Snapshot
 
+mod columns;
 mod compile;
 pub mod decide;
 mod group;

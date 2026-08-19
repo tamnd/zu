@@ -1395,6 +1395,13 @@ pub(crate) fn env_options() -> exec::Options {
         Ok("0") => exec::Sip::Off,
         _ => exec::Sip::On,
     };
+    // The sink of a plain projection keeps the vectors unless
+    // ZU_SINK=rows pins the row build, which is the baseline the
+    // columns are measured against and the answer they have to match.
+    options.sink = match std::env::var("ZU_SINK").as_deref() {
+        Ok("rows") => exec::Sink::Rows,
+        _ => exec::Sink::Columns,
+    };
     options
 }
 
@@ -2829,7 +2836,7 @@ mod tests {
             &[],
         )
         .expect("wcc");
-        let ints = |r: &QueryResult| -> Vec<Vec<Value>> { r.rows.clone() };
+        let ints = |r: &QueryResult| -> Vec<Vec<Value>> { r.rows.to_vec() };
         assert_eq!(
             ints(&r),
             [

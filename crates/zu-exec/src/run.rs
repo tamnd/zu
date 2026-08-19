@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zu_common::{GROUP_ROWS, IdMap, Interrupt, Result, ZuError};
-use zu_query::exec::{Options, QueryResult, Streaming, Value};
+use zu_query::column::ColumnType;
+use zu_query::exec::{Options, QueryResult, Sink, Streaming, Value};
 use zu_query::plan::BracketKind;
 use zu_query::snapshot::{ColId, CsrPin, Dir, FuncCol, RelId, SCAN_ROWS, Snapshot};
 use zu_vector::{
@@ -27,6 +28,7 @@ use zu_vector::{
     VecEncoding,
 };
 
+use crate::columns;
 use crate::compile::{
     AggSpec, Close, ColSpec, Dirs, ExecPlan, Op, PostSpec, ScalarRef, SinkSpec, Source,
 };
@@ -53,7 +55,7 @@ pub(crate) fn run(
         Source::Seeks(keys) => seeks_work(plan, snap, options, keys, true)?,
         Source::Scan(_) => scan_work(plan, snap, options)?,
     };
-    let (partials, mut decisions) = drive(plan, snap, &sched, &options.interrupt)?;
+    let (partials, mut decisions) = drive(plan, snap, &sched, options)?;
     // Workers drain at their next chunk boundary when the caller asks
     // them to stop, so what came back is a piece of an answer rather
     // than a short one. Asked here, before any of it is assembled.
@@ -152,7 +154,7 @@ pub(crate) fn run_streamed(
         sched.morsels.len(),
         options.interrupt.clone(),
     );
-    let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, &sched);
+    let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, &sched, Keep::Rows);
     for (idx, &range) in sched.morsels.iter().enumerate() {
         // Before the break below, because `stop.stopped()` is true for
         // a quota that is filled and for a caller who interrupted, and
@@ -843,7 +845,7 @@ fn drive(
     plan: &ExecPlan,
     snap: &mut dyn Snapshot,
     sched: &Schedule,
-    asked: &Interrupt,
+    opts: &Options,
 ) -> Result<(Vec<SinkState>, Decisions)> {
     let Schedule {
         morsels, threads, ..
@@ -853,13 +855,19 @@ fn drive(
         SinkSpec::Rows { post, .. } => quota_of(post),
         _ => None,
     };
-    let stop = StopState::new(quota, morsels.len(), asked.clone());
+    let stop = StopState::new(quota, morsels.len(), opts.interrupt.clone());
     let claim = AtomicUsize::new(0);
+    // `ZU_SINK=rows` pins the row sink, which is the baseline the
+    // columns are measured against and the answer they have to match.
+    let keep = match opts.sink {
+        Sink::Rows => Keep::Rows,
+        Sink::Columns => Keep::Whatever,
+    };
 
     // A single worker needs none of the handoff machinery, and a point
     // read is short enough that setting it up shows in the latency.
     if threads <= 1 || morsels.len() <= 1 {
-        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched);
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched, keep);
         w.work(morsels, &claim)?;
         let mut all = Decisions::with_sips(w.decisions.sip.len());
         all.merge(&w.decisions);
@@ -892,14 +900,14 @@ fn drive(
             .map(|(f, slot)| {
                 let (stop, claim) = (&stop, &claim);
                 Box::new(move || {
-                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop, sched);
+                    let mut w = Worker::new(plan, SnapHandle::Fork(f), stop, sched, keep);
                     let res = w.work(morsels, claim).map(|()| (w.sink, w.decisions));
                     *slot.lock().unwrap() = Some(res);
                 }) as Box<dyn FnOnce() + Send + '_>
             })
             .collect();
         let pending = pool::submit(jobs);
-        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched);
+        let mut w = Worker::new(plan, SnapHandle::Main(snap), &stop, sched, keep);
         let main = w.work(morsels, &claim).map(|()| (w.sink, w.decisions));
         pending.wait();
         main
@@ -986,6 +994,41 @@ fn split_morsels(rows: u64, want: u64) -> Vec<(u64, u64)> {
 /// whose ORDER BY sits under a small enough LIMIT. Every worker builds
 /// it off the same plan, so they all agree on whether the run is
 /// bounded before any of them emits a row.
+/// The columns a plain projection fills, `None` where the plan has a
+/// step above its projection or an item no column covers.
+///
+/// A step above the sink is a sort, a dedup or a window, and every one
+/// of those is written over rows, so a plan carrying one keeps the row
+/// sink. Everything else here is the projection's own item list, whose
+/// types are known before the first row runs: a stored column declares
+/// one, a node and a row id are what they are, and a constant is
+/// whatever the query wrote.
+fn column_sink(plan: &ExecPlan) -> Option<columns::ColumnSink> {
+    let SinkSpec::Rows { items, post } = &plan.sink else {
+        return None;
+    };
+    if !post.is_empty() || items.is_empty() {
+        return None;
+    }
+    let mut types = Vec::with_capacity(items.len());
+    for &r in items {
+        types.push(match r {
+            ScalarRef::Node { .. } => ColumnType::Node,
+            ScalarRef::RowId { .. } => ColumnType::Int,
+            ScalarRef::Col { ty, .. } => match ty {
+                zu_query::snapshot::ColType::Int => ColumnType::Int,
+                zu_query::snapshot::ColType::Float => ColumnType::Float,
+                zu_query::snapshot::ColType::Str => ColumnType::Str,
+            },
+            // A list the query wrote whose own items are types no list
+            // holds has no column, and it is the one thing here that
+            // can fail. The row sink takes it, as it always did.
+            ScalarRef::Const { at } => ColumnType::of(&plan.consts[at]).ok()?,
+        });
+    }
+    Some(columns::ColumnSink::new(types))
+}
+
 fn bounded_sink(plan: &ExecPlan) -> Option<sink::TopN> {
     let SinkSpec::Rows { post, .. } = &plan.sink else {
         return None;
@@ -1266,12 +1309,26 @@ fn parts(rows: &[u64], stop_early: bool) -> Parts<'_> {
     }
 }
 
+/// What a worker's sink keeps as the rows are found.
+///
+/// A buffered run keeps whatever the plan allows, which for a plain
+/// projection is columns. A streamed one keeps rows whatever the plan
+/// is, because what it hands the consumer between morsels is rows and
+/// building them out of columns to hand them straight on would be the
+/// transpose back again.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Keep {
+    Rows,
+    Whatever,
+}
+
 impl<'a> Worker<'a> {
     fn new(
         plan: &'a ExecPlan,
         snap: SnapHandle<'a>,
         stop: &'a StopState,
         sched: &'a Schedule,
+        keep: Keep,
     ) -> Self {
         Worker {
             plan,
@@ -1316,6 +1373,9 @@ impl<'a> Worker<'a> {
             args: Vec::new(),
             sink: SinkState {
                 top: bounded_sink(plan),
+                cols: (keep == Keep::Whatever)
+                    .then(|| column_sink(plan))
+                    .flatten(),
                 ..SinkState::default()
             },
             stop,
@@ -1377,7 +1437,9 @@ impl<'a> Worker<'a> {
                 }
             },
         }
-        if rows_sink {
+        if let Some(cols) = self.sink.cols.as_mut() {
+            cols.morsel_done(idx);
+        } else if rows_sink {
             let batch = std::mem::take(&mut self.sink.rows);
             self.sink.batches.push((idx, batch));
         }
@@ -3675,6 +3737,122 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
+    /// The rows of one chunk set, appended to the columns rather than
+    /// flattened into rows.
+    ///
+    /// Column by column and then row by row, which is the other way
+    /// round from the row sink and is the whole point: the ref is read
+    /// once per column instead of once per cell, the vector it names is
+    /// found once, and what is left inside the loop is a bounds check
+    /// and a push into a buffer that is already the right shape.
+    ///
+    /// A ref on a level below the newest one is pinned, so it answers
+    /// the same on every row of this set. It is still written a row at a
+    /// time, because a column that holds one value for a stretch and
+    /// another for the next is not a constant column, and a client
+    /// reading a buffer wants the buffer.
+    fn push_columns(&mut self, items: &[ScalarRef], set: &ChunkSet) -> Result<()> {
+        let plan = self.plan;
+        let last = set.chunks.len() - 1;
+        let count = active_count(&set.chunks[last]);
+        if count == 0 {
+            return Ok(());
+        }
+        self.local_rows += count as u64;
+        let cols = self.sink.cols.as_mut().expect("the caller looked");
+        for (ix, &r) in items.iter().enumerate() {
+            let fill = cols.at(ix);
+            let ScalarRef::Const { at } = r else {
+                let level = r.level();
+                let chunk = &set.chunks[level];
+                // Every level but the newest is pinned to one row, and
+                // that row is the same for every position here.
+                let pinned = (level != last).then(|| pinned_pos(chunk));
+                match r {
+                    ScalarRef::Node { .. } => {
+                        let table = plan.levels[level].table;
+                        for pos in active_positions(&set.chunks[last]) {
+                            let idx = pinned.unwrap_or(pos);
+                            if chunk.vecs[0].is_valid(idx) {
+                                fill.push_value(Value::Node {
+                                    table,
+                                    offset: row_at(chunk, idx),
+                                });
+                            } else {
+                                fill.push_null();
+                            }
+                        }
+                    }
+                    ScalarRef::RowId { .. } => {
+                        for pos in active_positions(&set.chunks[last]) {
+                            let idx = pinned.unwrap_or(pos);
+                            if chunk.vecs[0].is_valid(idx) {
+                                fill.push_int(row_at(chunk, idx) as i64);
+                            } else {
+                                fill.push_null();
+                            }
+                        }
+                    }
+                    ScalarRef::Col { vec, ty, .. } => {
+                        let held = &chunk.vecs[vec];
+                        match ty {
+                            zu_query::snapshot::ColType::Int => {
+                                let values = held.values::<i64>();
+                                for pos in active_positions(&set.chunks[last]) {
+                                    let idx = pinned.unwrap_or(pos);
+                                    if held.is_valid(idx) {
+                                        fill.push_int(values[idx]);
+                                    } else {
+                                        fill.push_null();
+                                    }
+                                }
+                            }
+                            zu_query::snapshot::ColType::Float => {
+                                let values = held.values::<f64>();
+                                for pos in active_positions(&set.chunks[last]) {
+                                    let idx = pinned.unwrap_or(pos);
+                                    if held.is_valid(idx) {
+                                        fill.push_float(values[idx]);
+                                    } else {
+                                        fill.push_null();
+                                    }
+                                }
+                            }
+                            // The bytes go from the vector they were
+                            // decoded in straight into the column, so a
+                            // string cell costs an append and never a
+                            // `String` of its own.
+                            zu_query::snapshot::ColType::Str => {
+                                for pos in active_positions(&set.chunks[last]) {
+                                    let idx = pinned.unwrap_or(pos);
+                                    if held.is_valid(idx) {
+                                        with_str_bytes(held, idx, |b| fill.push_bytes(b))?;
+                                    } else {
+                                        fill.push_null();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ScalarRef::Const { .. } => unreachable!("a constant answered above"),
+                }
+                continue;
+            };
+            let value = &plan.consts[at];
+            if matches!(value, Value::Null) {
+                for _ in 0..count {
+                    fill.push_null();
+                }
+            } else {
+                for _ in 0..count {
+                    fill.push_value(value.clone());
+                }
+            }
+        }
+        cols.rows(count);
+        Ok(())
+    }
+
     fn push_sink(&mut self, set: &mut ChunkSet) -> Result<()> {
         match &self.plan.sink {
             SinkSpec::Count => {
@@ -3685,6 +3863,9 @@ impl<'a> Worker<'a> {
             // accumulates against it, so the table is built for its
             // group count alone.
             SinkSpec::CountDistinct { keys } => self.group_vector(set, keys, &[]),
+            SinkSpec::Rows { items, .. } if self.sink.cols.is_some() => {
+                self.push_columns(items, set)
+            }
             SinkSpec::Rows { items, .. } => {
                 let plan = self.plan;
                 let last = set.chunks.len() - 1;
@@ -3888,6 +4069,14 @@ fn sides(dirs: Dirs) -> impl Iterator<Item = Dir> {
 }
 
 /// Physical positions of the active rows of an unpinned chunk.
+/// How many rows one chunk has active, without walking them.
+fn active_count(chunk: &DataChunk) -> usize {
+    match &chunk.sel {
+        Some(s) => s.as_slice().len(),
+        None => chunk.count as usize,
+    }
+}
+
 fn active_positions(chunk: &DataChunk) -> impl Iterator<Item = usize> + '_ {
     debug_assert!(chunk.cur.is_none(), "sink level is never pinned");
     match &chunk.sel {
@@ -5299,6 +5488,68 @@ mod tests {
         }
         let flat = run(&p, &mut snap.clone(), &seq()).unwrap().0;
         assert_eq!(flat.rows, r.rows, "sequential and parallel agree");
+    }
+
+    /// A projection with nothing above it never builds a row, and the
+    /// rows a caller reads off it are the ones the row sink would have
+    /// pushed.
+    #[test]
+    fn a_plain_projection_keeps_its_vectors() {
+        let snap = Mock::new(5000, |i| (i * 2) as i64, true);
+        let p = plan(
+            vec![age_level()],
+            Vec::new(),
+            SinkSpec::Rows {
+                items: vec![
+                    ScalarRef::RowId { level: 0 },
+                    ScalarRef::Col {
+                        level: 0,
+                        vec: 1,
+                        ty: zu_query::snapshot::ColType::Int,
+                    },
+                ],
+                post: Vec::new(),
+            },
+            &["n", "age"],
+        );
+        for threads in [1, 4] {
+            let opts = Options {
+                threads,
+                ..Options::default()
+            };
+            let r = run(&p, &mut snap.clone(), &opts).unwrap().0;
+            let held = r.rows.columns().expect("the sink kept its columns");
+            assert_eq!(held.rows, 5000, "{threads} threads");
+            assert_eq!(held.names(), vec!["n", "age"]);
+            let columns = r.columnar().expect("the columns are already there");
+            assert_eq!(columns.columns[0].ty, ColumnType::Int);
+            assert_eq!(columns.columns[1].ty, ColumnType::Int);
+            // The rows are built from the columns only because this
+            // asks for them, and they are the rows in scan order.
+            for (i, row) in r.rows.iter().enumerate() {
+                assert_eq!(row[0], Value::Int(i as i64), "{threads} threads");
+                assert_eq!(row[1], Value::Int(i as i64 * 2), "{threads} threads");
+            }
+        }
+    }
+
+    /// Anything above the projection is a step over rows, so the sink
+    /// hands rows on and there are no columns to read.
+    #[test]
+    fn a_post_step_gives_the_rows_back() {
+        let mut snap = Mock::new(64, |i| i as i64, false);
+        let p = plan(
+            vec![bare_level()],
+            Vec::new(),
+            SinkSpec::Rows {
+                items: vec![ScalarRef::RowId { level: 0 }],
+                post: vec![PostSpec::Limit(4)],
+            },
+            &["n"],
+        );
+        let r = run(&p, &mut snap, &seq()).unwrap().0;
+        assert!(r.rows.columns().is_none(), "a limit steps over rows");
+        assert_eq!(r.rows.len(), 4);
     }
 
     #[test]

@@ -925,7 +925,11 @@ impl Session {
     /// was read at rides along, because that is what makes a table
     /// holding element references answerable later.
     pub fn binding_table(&self, result: QueryResult) -> Value {
-        Value::BindingTable(BindingTable::new(result.columns, result.rows, self.epoch))
+        Value::BindingTable(BindingTable::new(
+            result.columns,
+            result.rows.into_vec(),
+            self.epoch,
+        ))
     }
 
     /// Checks the reference values among a statement's parameters

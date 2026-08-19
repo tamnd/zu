@@ -968,14 +968,14 @@ fn run_delete(dir: &Path, rows: u64) -> Cost {
 /// different from the `DELETE` run: the element has edges on it, and
 /// they go with it.
 ///
-/// This is the expensive shape of a write, and deliberately so. An edge
-/// has no offset a reader could filter it out by, so it cannot be
-/// tombstoned the way a row is: the fold drops it out of the CSR it
-/// rebuilds, and a CSR rebuild is the whole table's edges rather than
-/// the one that went. The number here is therefore the ceiling on what
-/// detaching costs today and the thing a group-local rebuild has to
-/// beat, and the bytes column says the same in what it pushes at the
-/// disk.
+/// This used to be the expensive shape of a write, because an edge has
+/// no offset a reader could filter it out by and so cannot be
+/// tombstoned the way a row is, which left the fold to drop it out of
+/// the CSR it rebuilds over the whole table's edges. What a reader is
+/// handed now is the pair the edge runs between, which is the whole
+/// name of it, and the adjacency reader takes it off the two lists it
+/// is in on the way past, so the statement costs what a DELETE does and
+/// the bytes column says the same at the disk.
 ///
 /// Both ends are checked afterwards: the rows are counted, and so are
 /// the edges, so a path that timed well by leaving an edge behind fails
@@ -1146,6 +1146,8 @@ fn main() {
         ("delete_stmt_cpu_us", delete.cpu),
         ("delete_stmt_growth_b", delete.growth),
         ("detach_stmt_us", detach.us),
+        ("detach_stmt_cpu_us", detach.cpu),
+        ("detach_stmt_growth_b", detach.growth),
         ("set_stmt_kb", set_small.written / 1024.0),
         ("delete_stmt_kb", delete.written / 1024.0),
         ("detach_stmt_kb", detach.written / 1024.0),

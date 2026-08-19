@@ -44,7 +44,7 @@
 //! (see [`GraphReader::edge_ordinal`]), and nothing in either direction
 //! costs a permutation on disk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
@@ -1480,6 +1480,14 @@ pub(crate) fn copy_blocks(db: &mut Zu1File, blocks: &[BlockPtr]) -> Result<Vec<B
 /// and the CSR is rebuilt once for the run of them rather than once
 /// each.
 ///
+/// An edge taken away is the same trade the other way round. It cannot
+/// be tombstoned the way a row is, because a row is named by an offset
+/// the reader already has in hand and an edge is named by the pair it
+/// runs between; so what is kept is the pair, and the merge drops it
+/// out of both lists on the way past. A `DETACH DELETE` is where they
+/// come from, and it is the reason the row it took away can go without
+/// the CSR being rebuilt around it.
+///
 /// An edge's ordinal is its row in the rel table's property columns.
 /// The base holds `base` of them, in the order the forward CSR lays
 /// them out, and an edge in here takes the next one after those, so
@@ -1500,6 +1508,15 @@ pub struct EdgePatch {
     /// How many edges are in here, which is what the next one's
     /// ordinal counts from.
     added: u64,
+    /// Pairs taken away, source first. A pair is the whole name of an
+    /// edge, so what goes in here takes every copy of it with it, which
+    /// is what the fold does with the same pair and what a
+    /// `DETACH DELETE` of either end wants anyway.
+    dead: BTreeSet<(u64, u64)>,
+    /// The same pairs destination first, because every read asks about
+    /// one node's list and a set keyed the way that list runs answers
+    /// it as a range.
+    dead_bwd: BTreeSet<(u64, u64)>,
 }
 
 impl EdgePatch {
@@ -1526,14 +1543,28 @@ impl EdgePatch {
         self.base
     }
 
+    /// Takes one edge away, by the pair it runs between, which is every
+    /// copy of it the file holds.
+    pub fn remove(&mut self, src: u64, dst: u64) {
+        self.dead.insert((src, dst));
+        self.dead_bwd.insert((dst, src));
+    }
+
     /// How many edges this holds, which is what a writer bounds when it
     /// decides whether to keep deferring the fold.
-    pub fn len(&self) -> u64 {
+    pub fn adds(&self) -> u64 {
         self.added
     }
 
+    /// How many pairs it has taken away, the other half of the same
+    /// bound.
+    pub fn removed(&self) -> u64 {
+        self.dead.len() as u64
+    }
+
+    /// Whether it has neither added nor taken anything away.
     pub fn is_empty(&self) -> bool {
-        self.added == 0
+        self.added == 0 && self.dead.is_empty()
     }
 
     /// Whether this holds an edge from `src` to `dst`, which is what a
@@ -1546,21 +1577,46 @@ impl EdgePatch {
         list.get(at).is_some_and(|&(n, _)| n == dst)
     }
 
-    /// Whether any node of `group` has an unfolded edge in `dir`, which
-    /// is what says a pinned group has to be built rather than handed
-    /// over as the file holds it.
-    fn touches(&self, group: usize, dir: Direction) -> bool {
-        let base = group as u64 * GROUP_ROWS as u64;
-        self.side(dir)
-            .range(base..base + GROUP_ROWS as u64)
+    /// Whether this has taken away the edges between `node` and `other`,
+    /// `node` being the end the list is keyed by.
+    pub fn drops(&self, node: u64, other: u64, dir: Direction) -> bool {
+        self.dead_side(dir).contains(&(node, other))
+    }
+
+    /// Whether it has taken anything off `node`'s list in `dir`, which
+    /// is what says the list has to be filtered rather than read.
+    fn drops_any(&self, node: u64, dir: Direction) -> bool {
+        self.dead_side(dir)
+            .range((node, 0)..=(node, u64::MAX))
             .next()
             .is_some()
+    }
+
+    /// Whether any node of `group` has an unfolded edge in `dir`, added
+    /// or taken away, which is what says a pinned group has to be built
+    /// rather than handed over as the file holds it.
+    fn touches(&self, group: usize, dir: Direction) -> bool {
+        let base = group as u64 * GROUP_ROWS as u64;
+        let end = base + GROUP_ROWS as u64;
+        self.side(dir).range(base..end).next().is_some()
+            || self
+                .dead_side(dir)
+                .range((base, 0)..(end, 0))
+                .next()
+                .is_some()
     }
 
     fn side(&self, dir: Direction) -> &BTreeMap<u64, Vec<(u64, u64)>> {
         match dir {
             Direction::Fwd => &self.fwd,
             Direction::Bwd => &self.bwd,
+        }
+    }
+
+    fn dead_side(&self, dir: Direction) -> &BTreeSet<(u64, u64)> {
+        match dir {
+            Direction::Fwd => &self.dead,
+            Direction::Bwd => &self.dead_bwd,
         }
     }
 
@@ -1577,6 +1633,21 @@ fn put(side: &mut BTreeMap<u64, Vec<(u64, u64)>>, node: u64, other: u64, ord: u6
     let list = side.entry(node).or_default();
     let at = list.partition_point(|&(n, o)| (n, o) < (other, ord));
     list.insert(at, (other, ord));
+}
+
+/// Copies a stretch of `node`'s list onto the end of a group being
+/// merged, less whatever the patch has taken off it. A node the patch
+/// has taken nothing from, which is nearly all of them, copies the
+/// stretch whole.
+fn live(out: &mut Vec<u64>, base: &[u64], patch: &EdgePatch, node: u64, dir: Direction) {
+    match patch.drops_any(node, dir) {
+        false => out.extend_from_slice(base),
+        true => out.extend(
+            base.iter()
+                .copied()
+                .filter(|&other| !patch.drops(node, other, dir)),
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -1744,6 +1815,39 @@ impl GraphReader {
             .map_or(0, |patch| patch.of(node, dir).len())
     }
 
+    /// Whether the patch has anything to say about `node`'s list in
+    /// `dir`, an edge on it or an edge off it. A node it says nothing
+    /// about is read straight out of the file, which on a patch of a
+    /// few hundred edges is very nearly every node.
+    fn touched(&self, node: u64, dir: Direction) -> bool {
+        self.edges
+            .as_ref()
+            .is_some_and(|patch| !patch.of(node, dir).is_empty() || patch.drops_any(node, dir))
+    }
+
+    /// How many of `node`'s edges in `dir` the patch has taken away,
+    /// which is what a degree read off the offset arrays alone is over
+    /// by. A dead pair is as many edges as the pair runs times, so this
+    /// counts the neighbor values rather than the pairs, and it is only
+    /// ever reached for a node something was deleted from.
+    fn dropped(&self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<u64> {
+        let Some(patch) = self.edges.as_ref().filter(|p| p.drops_any(node, dir)) else {
+            return Ok(0);
+        };
+        let Some((g, row)) = self.locate(node, dir)? else {
+            return Ok(0);
+        };
+        let meta = self.directory.groups[g].dir(dir);
+        let mut offs = Vec::with_capacity(2);
+        read_range(db, &meta.offsets, row as u64, row as u64 + 2, &mut offs)?;
+        let mut list = Vec::with_capacity((offs[1] - offs[0]) as usize);
+        read_range(db, &meta.neighbors, offs[0], offs[1], &mut list)?;
+        Ok(list
+            .iter()
+            .filter(|&&other| patch.drops(node, other, dir))
+            .count() as u64)
+    }
+
     /// Returns `node`'s sorted list in `dir`, decoding the node's group
     /// on a cache miss.
     ///
@@ -1753,7 +1857,7 @@ impl GraphReader {
     /// of a few hundred edges is very nearly all of them, takes the
     /// slice the group cache already has.
     pub fn neighbors_dir(&mut self, db: &mut Zu1File, node: u64, dir: Direction) -> Result<&[u64]> {
-        if self.added(node, dir) == 0 {
+        if !self.touched(node, dir) {
             return self.base_neighbors(db, node, dir);
         }
         let mut pairs = std::mem::take(&mut self.merged);
@@ -1839,6 +1943,12 @@ impl GraphReader {
             }
         }
         if let Some(patch) = self.edges.clone() {
+            // The pairs the patch took away go first, so that what is
+            // left is the list a fold would have rebuilt, and the added
+            // ones are placed into that.
+            if patch.drops_any(node, dir) {
+                out.retain(|&(other, _)| !patch.drops(node, other, dir));
+            }
             for &(other, ord) in patch.of(node, dir) {
                 let at = out.partition_point(|&(n, o)| (n, o) < (other, ord));
                 out.insert(at, (other, ord));
@@ -1933,25 +2043,20 @@ impl GraphReader {
         let rows = offsets.len() - 1;
         let base = group as u64 * GROUP_ROWS as u64;
         let mut merged_offsets = Vec::with_capacity(offsets.len());
-        let mut merged = Vec::with_capacity(neighbors.len() + patch.len() as usize);
+        let mut merged = Vec::with_capacity(neighbors.len() + patch.adds() as usize);
         merged_offsets.push(0);
         for row in 0..rows {
+            let node = base + row as u64;
             let lo = offsets[row] as usize;
             let hi = offsets[row + 1] as usize;
-            let added = patch.of(base + row as u64, dir);
-            match added.is_empty() {
-                true => merged.extend_from_slice(&neighbors[lo..hi]),
-                false => {
-                    let mut at = lo;
-                    for &(other, _) in added {
-                        let take = at + neighbors[at..hi].partition_point(|&n| n <= other);
-                        merged.extend_from_slice(&neighbors[at..take]);
-                        merged.push(other);
-                        at = take;
-                    }
-                    merged.extend_from_slice(&neighbors[at..hi]);
-                }
+            let mut at = lo;
+            for &(other, _) in patch.of(node, dir) {
+                let take = at + neighbors[at..hi].partition_point(|&n| n <= other);
+                live(&mut merged, &neighbors[at..take], patch, node, dir);
+                merged.push(other);
+                at = take;
             }
+            live(&mut merged, &neighbors[at..hi], patch, node, dir);
             merged_offsets.push(merged.len() as u64);
         }
         Ok((Arc::new(merged_offsets), Arc::new(merged)))
@@ -1988,7 +2093,8 @@ impl GraphReader {
         let meta = self.directory.groups[g].dir(dir);
         let pools = db.pools();
         let offs = read_segment_pooled(db, &pools.csr_offsets, &meta.offsets)?;
-        Ok(offs[row + 1] - offs[row] + self.added(node, dir) as u64)
+        let held = offs[row + 1] - offs[row];
+        Ok(held + self.added(node, dir) as u64 - self.dropped(db, node, dir)?)
     }
 
     /// The pooled offset array of `group` in `dir` through the
@@ -2079,7 +2185,9 @@ impl GraphReader {
                 let offs = Arc::clone(self.offsets(db, group, dir)?);
                 for (i, &node) in (at..end).zip(&nodes[at..end]) {
                     let (_, row) = self.locate(node, dir)?.expect("the run is one group");
-                    sink(i, offs[row + 1] - offs[row] + self.added(node, dir) as u64);
+                    let held = offs[row + 1] - offs[row];
+                    let gone = self.dropped(db, node, dir)?;
+                    sink(i, held + self.added(node, dir) as u64 - gone);
                 }
             } else {
                 let meta = &self.directory.groups[group].dir(dir).offsets;
@@ -2088,7 +2196,8 @@ impl GraphReader {
                     let (_, row) = self.locate(node, dir)?.expect("the run is one group");
                     pair.clear();
                     read_range(db, meta, row as u64, row as u64 + 2, &mut pair)?;
-                    sink(i, pair[1] - pair[0] + self.added(node, dir) as u64);
+                    let gone = self.dropped(db, node, dir)?;
+                    sink(i, pair[1] - pair[0] + self.added(node, dir) as u64 - gone);
                 }
             }
             at = end;
@@ -2119,8 +2228,19 @@ impl GraphReader {
         // The unfolded edges go into the list they belong in rather than
         // on the end of it, because the caller is owed a sorted list and
         // reads it as one. Each goes after the run of its own value, so
-        // this and the ordinals below agree slot for slot.
+        // this and the ordinals below agree slot for slot. What the
+        // patch took away comes out first, for the same reason the merge
+        // does it in that order.
         if let Some(patch) = &self.edges {
+            if patch.drops_any(node, dir) {
+                let mut kept = from;
+                for slot in from..out.len() {
+                    let other = out[slot];
+                    out[kept] = other;
+                    kept += usize::from(!patch.drops(node, other, dir));
+                }
+                out.truncate(kept);
+            }
             for &(other, _) in patch.of(node, dir) {
                 let at = from + out[from..].partition_point(|&n| n <= other);
                 out.insert(at, other);
@@ -2151,6 +2271,12 @@ impl GraphReader {
             let at = added.partition_point(|&(n, _)| n < other);
             if added.get(at).is_some_and(|&(n, _)| n == other) {
                 return Ok(true);
+            }
+            // A pair the patch took away is gone however many copies of
+            // it the file holds, because the pair is the whole name of
+            // the edge and the fold drops them all.
+            if patch.drops(node, other, dir) {
+                return Ok(false);
             }
         }
         let Some((g, row)) = self.locate(node, dir)? else {
@@ -2218,6 +2344,9 @@ impl GraphReader {
                 // graph does not hold, so the run it names is itself
                 // and there is nothing of the file's to count in.
                 return Ok(Some((ord, 1)));
+            }
+            if patch.drops(src, dst, Direction::Fwd) {
+                return Ok(None);
             }
         }
         self.base_edge_run(db, src, dst)
@@ -2291,7 +2420,7 @@ impl GraphReader {
         out: &mut Vec<u64>,
     ) -> Result<()> {
         out.clear();
-        if self.added(node, dir) > 0 {
+        if self.touched(node, dir) {
             let mut pairs = std::mem::take(&mut self.merged);
             let built = self.list_with_ordinals(db, node, dir, &mut pairs);
             out.extend(pairs.iter().map(|&(_, ord)| ord));

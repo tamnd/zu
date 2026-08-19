@@ -1554,16 +1554,28 @@ delete_stmt_kb = 96.0
 delete_stmt_cpu_us = 400.0
 delete_stmt_growth_b = 4096.0
 
-# A DETACH DELETE of an element that still has edges on it, measured 29
-# to 56 ms and 2324 kB at 10000 rows and 10000 edges. It costs about what a
-# DELETE does in time and about twice in bytes, and the difference is
-# the CSR: an edge has no offset a reader could filter it out by, so it
-# cannot be tombstoned the way a row is and the fold drops it out of the
-# CSR it rebuilds instead. That rebuild is the whole table's edges, so
-# this number grows with the edge count and not with the edges the
-# statement took away. Lower these ceilings, never raise them.
+# A DETACH DELETE of an element that still has edges on it, measured 3.6
+# ms, 84 us of processor time, 16.1 kB written and no growth at all at
+# 10000 rows and 10000 edges. It now costs what a DELETE does, because
+# it no longer folds: an edge has no offset a reader could filter it out
+# by, so what a reader is handed instead is the pair it runs between,
+# and the pair is the whole name of the edge, so the adjacency reader
+# drops it out of the two lists it is in as it reads them. The CSR is
+# not rebuilt and the columns underneath it do not move.
+#
+# Before the commit was deferred this was 6309 us with 1348 us of
+# processor time, 208.0 kB written and 13107 bytes of growth a
+# statement, and it is now 84 us, 16.1 kB and no growth, so about
+# sixteen times less processor time and thirteen times fewer bytes. The
+# bytes and the growth are the part that does not move between machines
+# and they are what the CSR rebuild cost. The kB ceiling is the DELETE's
+# because it is now the same one log frame, and the growth ceiling is a
+# page, loose enough for the log to extend the file and tight enough to
+# catch a fold coming back. Lower these ceilings, never raise them.
 detach_stmt_us = 250000.0
-detach_stmt_kb = 8192.0
+detach_stmt_kb = 96.0
+detach_stmt_cpu_us = 400.0
+detach_stmt_growth_b = 4096.0
 
 # A SET of one property of one edge, measured 3.6 ms, 398 us of
 # processor time and 15.7 kB at 10000 rows and 10000 edges. It is the

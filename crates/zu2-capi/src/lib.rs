@@ -12,7 +12,7 @@
 //!
 //! The traversals are the reason this crate exists in the shape it
 //! does. zu2's claim is that a hop is an indexed load, and a C API that
-//! made a host call back across the boundary once per vertex would
+//! made a host call back across the boundary once per node would
 //! spend more on the boundary than on the hop. So `zu2_khop`,
 //! `zu2_reach` and `zu2_triangles` run the whole walk inside one call,
 //! inside one announced epoch, and hand back only the answer.
@@ -74,7 +74,7 @@ pub struct Zu2Options {
     pub durability: u32,
     pub index_buckets: u64,
     pub max_pages: u64,
-    pub max_vertices: u64,
+    pub max_nodes: u64,
     pub space_target_percent: u32,
     pub compact_below: u64,
 }
@@ -140,9 +140,9 @@ struct State {
     /// expanded and `next` is the one being built.
     frontier: Vec<u32>,
     next: Vec<u32>,
-    /// One bit per vertex. Left clean by every call that uses it, by
+    /// One bit per node. Left clean by every call that uses it, by
     /// clearing the bits it set rather than the whole thing, so a probe
-    /// on a big graph costs its own frontier and not the vertex count.
+    /// on a big graph costs its own frontier and not the node count.
     seen: Vec<u64>,
 }
 
@@ -315,8 +315,8 @@ fn options_of(opt: *const Zu2Options) -> Option<Options> {
     if given.max_pages > 0 {
         options.max_pages = given.max_pages as usize;
     }
-    if given.max_vertices > 0 {
-        options.max_vertices = given.max_vertices as usize;
+    if given.max_nodes > 0 {
+        options.max_nodes = given.max_nodes as usize;
     }
     if given.space_target_percent > 0 {
         options.space_target_percent = given.space_target_percent;
@@ -705,19 +705,19 @@ pub unsafe extern "C" fn zu2_delete(
 
 // ---- graph ----
 
-/// Creates a vertex under an external key and returns its dense id.
+/// Creates a node under an external key and returns its dense id.
 ///
 /// # Safety
-/// `s` is live, `key` covers `key_len`, `vertex` is writable.
+/// `s` is live, `key` covers `key_len`, `node` is writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zu2_add_vertex(
+pub unsafe extern "C" fn zu2_add_node(
     s: *mut Zu2Session,
     key: *const u8,
     key_len: usize,
-    vertex: *mut u32,
+    node: *mut u32,
 ) -> Zu2Status {
-    if !vertex.is_null() {
-        unsafe { vertex.write(0) };
+    if !node.is_null() {
+        unsafe { node.write(0) };
     }
     let Some(s) = (unsafe { session(s) }) else {
         return Zu2Status::Misuse;
@@ -725,38 +725,38 @@ pub unsafe extern "C" fn zu2_add_vertex(
     let Some(key) = (unsafe { bytes(key, key_len) }) else {
         return Zu2Status::Misuse;
     };
-    if vertex.is_null() {
+    if node.is_null() {
         return Zu2Status::Misuse;
     }
     let Some(call) = s.enter() else {
         return Zu2Status::MisuseConcurrent;
     };
     let state = &mut *call.state;
-    let outcome = state.session.add_vertex(key);
+    let outcome = state.session.add_node(key);
     match note(&mut state.error, outcome) {
         Ok(id) => {
-            unsafe { vertex.write(id) };
+            unsafe { node.write(id) };
             Zu2Status::Ok
         }
         Err(status) => status,
     }
 }
 
-/// The dense id of the vertex with this key.
+/// The dense id of the node with this key.
 ///
 /// # Safety
-/// `s` is live, `key` covers `key_len`, `vertex` is writable, `found`
+/// `s` is live, `key` covers `key_len`, `node` is writable, `found`
 /// is writable or NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zu2_vertex_of(
+pub unsafe extern "C" fn zu2_node_of(
     s: *mut Zu2Session,
     key: *const u8,
     key_len: usize,
-    vertex: *mut u32,
+    node: *mut u32,
     found: *mut c_int,
 ) -> Zu2Status {
-    if !vertex.is_null() {
-        unsafe { vertex.write(0) };
+    if !node.is_null() {
+        unsafe { node.write(0) };
     }
     if !found.is_null() {
         unsafe { found.write(0) };
@@ -767,7 +767,7 @@ pub unsafe extern "C" fn zu2_vertex_of(
     let Some(key) = (unsafe { bytes(key, key_len) }) else {
         return Zu2Status::Misuse;
     };
-    if vertex.is_null() {
+    if node.is_null() {
         return Zu2Status::Misuse;
     }
     let Some(call) = s.enter() else {
@@ -775,11 +775,11 @@ pub unsafe extern "C" fn zu2_vertex_of(
     };
     let state = &mut *call.state;
     let mut buffer = std::mem::take(&mut state.value);
-    let outcome = state.session.vertex_of(key, &mut buffer);
+    let outcome = state.session.node_of(key, &mut buffer);
     state.value = buffer;
     match note(&mut state.error, outcome) {
         Ok(Some(id)) => {
-            unsafe { vertex.write(id) };
+            unsafe { node.write(id) };
             if !found.is_null() {
                 unsafe { found.write(1) };
             }
@@ -842,7 +842,7 @@ unsafe fn edge(s: *mut Zu2Session, src: u32, dst: u32, add: bool) -> Zu2Status {
 pub unsafe extern "C" fn zu2_degree(
     s: *mut Zu2Session,
     dir: c_int,
-    vertex: u32,
+    node: u32,
     degree: *mut u32,
 ) -> Zu2Status {
     if !degree.is_null() {
@@ -862,10 +862,10 @@ pub unsafe extern "C" fn zu2_degree(
     };
     let state = &mut *call.state;
     let answer = if let [one] = ways {
-        state.session.degree(*one, vertex)
+        state.session.degree(*one, node)
     } else {
         let mut buffer = std::mem::take(&mut state.answer);
-        gather(&mut state.session, ways, vertex, &mut buffer);
+        gather(&mut state.session, ways, node, &mut buffer);
         let count = buffer.len() as u32;
         state.answer = buffer;
         count
@@ -875,7 +875,7 @@ pub unsafe extern "C" fn zu2_degree(
     Zu2Status::Ok
 }
 
-/// A vertex's neighbours, copied into the session's buffer.
+/// A node's neighbours, copied into the session's buffer.
 ///
 /// # Safety
 /// `s` is live and both out-parameters are writable.
@@ -883,7 +883,7 @@ pub unsafe extern "C" fn zu2_degree(
 pub unsafe extern "C" fn zu2_neighbours(
     s: *mut Zu2Session,
     dir: c_int,
-    vertex: u32,
+    node: u32,
     out: *mut *const u32,
     len: *mut usize,
 ) -> Zu2Status {
@@ -907,7 +907,7 @@ pub unsafe extern "C" fn zu2_neighbours(
     };
     let state = &mut *call.state;
     let mut answer = std::mem::take(&mut state.answer);
-    gather(&mut state.session, ways, vertex, &mut answer);
+    gather(&mut state.session, ways, node, &mut answer);
     state.answer = answer;
     state.error.clear_message();
     unsafe { out.write(state.answer.as_ptr()) };
@@ -915,28 +915,28 @@ pub unsafe extern "C" fn zu2_neighbours(
     Zu2Status::Ok
 }
 
-/// One vertex's neighbours over every direction asked for, in `into`.
+/// One node's neighbours over every direction asked for, in `into`.
 ///
 /// A single direction is a copy of a list the engine already holds in
 /// order. Both directions is that twice and then a sort, because the two
-/// lists overlap wherever a pair of vertices point at each other and a
+/// lists overlap wherever a pair of nodes point at each other and a
 /// neighbour named twice would be counted twice. The same sort is what
 /// makes the two-list path safe against a load the engine retries, since
 /// a retry can run the closure again and the duplicate falls out.
-fn gather(session: &mut Session<'_>, ways: &[Direction], vertex: u32, into: &mut Vec<u32>) {
+fn gather(session: &mut Session<'_>, ways: &[Direction], node: u32, into: &mut Vec<u32>) {
     if let [one] = ways {
-        session.neighbours_into(*one, vertex, into);
+        session.neighbours_into(*one, node, into);
         return;
     }
     into.clear();
     for &direction in ways {
-        session.neighbours(direction, vertex, |slice| into.extend_from_slice(slice));
+        session.neighbours(direction, node, |slice| into.extend_from_slice(slice));
     }
     into.sort_unstable();
     into.dedup();
 }
 
-/// The distinct vertices exactly `k` hops from `seed`.
+/// The distinct nodes exactly `k` hops from `seed`.
 ///
 /// # Safety
 /// `s` is live and both out-parameters are writable.
@@ -987,15 +987,15 @@ fn khop(state: &mut State, ways: &[Direction], seed: u32, k: u32) {
     current.push(seed);
     for _ in 0..k {
         next.clear();
-        for &vertex in &current {
+        for &node in &current {
             for &direction in ways {
-                state.session.neighbours(direction, vertex, |slice| {
+                state.session.neighbours(direction, node, |slice| {
                     for &far in slice {
                         // The bitmap makes the level distinct, and it
                         // also makes the closure safe to run twice: a
                         // retry meets its own bits and adds nothing. It
                         // is also what keeps the undirected walk from
-                        // naming a vertex once per direction.
+                        // naming a node once per direction.
                         if mark(&mut seen, far) {
                             next.push(far);
                         }
@@ -1004,8 +1004,8 @@ fn khop(state: &mut State, ways: &[Direction], seed: u32, k: u32) {
             }
         }
         // Cleared per level rather than cumulatively, because distinct
-        // here means distinct within the level: a vertex the walk
-        // already passed is still a vertex k hops out.
+        // here means distinct within the level: a node the walk
+        // already passed is still a node k hops out.
         clear(&mut seen, &next);
         std::mem::swap(&mut current, &mut next);
         if current.is_empty() {
@@ -1019,7 +1019,7 @@ fn khop(state: &mut State, ways: &[Direction], seed: u32, k: u32) {
     state.seen = seen;
 }
 
-/// The distinct vertices reachable from `seed` in one hop or more, up to
+/// The distinct nodes reachable from `seed` in one hop or more, up to
 /// `max_depth` hops, breadth first.
 ///
 /// `max_depth` 0 is no bound and walks the whole reachable set, and
@@ -1092,9 +1092,9 @@ fn reach(state: &mut State, ways: &[Direction], seed: u32, max_depth: u32, max_v
     'walk: while !current.is_empty() && visited.len() < cap && depth < depth_cap {
         depth += 1;
         next.clear();
-        for &vertex in &current {
+        for &node in &current {
             for &direction in ways {
-                let full = state.session.neighbours(direction, vertex, |slice| {
+                let full = state.session.neighbours(direction, node, |slice| {
                     for &far in slice {
                         if mark(&mut seen, far) {
                             visited.push(far);
@@ -1201,12 +1201,12 @@ fn shortest(
     'walk: while !current.is_empty() && distance < depth_cap {
         distance += 1;
         next.clear();
-        for &vertex in &current {
+        for &node in &current {
             for &direction in ways {
-                let hit = state.session.neighbours(direction, vertex, |slice| {
+                let hit = state.session.neighbours(direction, node, |slice| {
                     for &far in slice {
                         if mark(&mut seen, far) {
-                            // Every marked vertex is remembered so the
+                            // Every marked node is remembered so the
                             // bitmap can be handed back clean at a cost
                             // of what was walked rather than what
                             // exists.
@@ -1294,9 +1294,9 @@ fn triangles(state: &mut State, seed: u32) -> u64 {
     total
 }
 
-/// Grows the bitmap to cover every vertex the graph has allocated.
+/// Grows the bitmap to cover every node the graph has allocated.
 fn resize_seen(seen: &mut Vec<u64>, session: &Session<'_>) {
-    let words = (session.core_ref().graph().vertices() as usize)
+    let words = (session.core_ref().graph().nodes() as usize)
         .div_ceil(64)
         .max(1);
     if seen.len() < words {
@@ -1304,13 +1304,13 @@ fn resize_seen(seen: &mut Vec<u64>, session: &Session<'_>) {
     }
 }
 
-/// Sets a vertex's bit and says whether it was this call that set it.
-/// A vertex past the bitmap is treated as already seen, which drops it:
-/// the alternative is growing the map inside the walk, and a vertex
+/// Sets a node's bit and says whether it was this call that set it.
+/// A node past the bitmap is treated as already seen, which drops it:
+/// the alternative is growing the map inside the walk, and a node
 /// allocated after the walk started is not part of the answer anyway.
-fn mark(seen: &mut [u64], vertex: u32) -> bool {
-    let word = vertex as usize / 64;
-    let bit = 1u64 << (vertex % 64);
+fn mark(seen: &mut [u64], node: u32) -> bool {
+    let word = node as usize / 64;
+    let bit = 1u64 << (node % 64);
     if word >= seen.len() || seen[word] & bit != 0 {
         return false;
     }
@@ -1318,30 +1318,30 @@ fn mark(seen: &mut [u64], vertex: u32) -> bool {
     true
 }
 
-fn is_marked(seen: &[u64], vertex: u32) -> bool {
-    let word = vertex as usize / 64;
-    word < seen.len() && seen[word] & (1u64 << (vertex % 64)) != 0
+fn is_marked(seen: &[u64], node: u32) -> bool {
+    let word = node as usize / 64;
+    word < seen.len() && seen[word] & (1u64 << (node % 64)) != 0
 }
 
 /// Clears exactly the bits a walk set, so the next probe costs its own
-/// frontier rather than the vertex count.
+/// frontier rather than the node count.
 fn clear(seen: &mut [u64], set: &[u32]) {
-    for &vertex in set {
-        let word = vertex as usize / 64;
+    for &node in set {
+        let word = node as usize / 64;
         if word < seen.len() {
-            seen[word] &= !(1u64 << (vertex % 64));
+            seen[word] &= !(1u64 << (node % 64));
         }
     }
 }
 
-/// How many vertices the graph holds.
+/// How many nodes the graph holds.
 ///
 /// # Safety
 /// `db` is live.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zu2_vertices(db: *const Zu2Db) -> u32 {
+pub unsafe extern "C" fn zu2_nodes(db: *const Zu2Db) -> u32 {
     match unsafe { handle(db) } {
-        Some(handle) => core_of(handle).graph().vertices(),
+        Some(handle) => core_of(handle).graph().nodes(),
         None => 0,
     }
 }

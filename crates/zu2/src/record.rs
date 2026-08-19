@@ -69,10 +69,10 @@ pub const KIND_VALUE: u32 = 0;
 /// the index never sees.
 pub const KIND_EDGE: u32 = 1;
 
-/// A keyed value that is also a vertex's external key, whose value is
+/// A keyed value that is also a node's external key, whose value is
 /// the four bytes of its dense id. The index treats it like any other
 /// value; the graph plane needs it so that recovery can restore the id
-/// counter without a second record per vertex.
+/// counter without a second record per node.
 pub const KIND_VERTEX: u32 = 2;
 
 /// Bytes a record with these lengths occupies, padded so the next

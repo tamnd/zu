@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
    * by name here and having the database come up is worth more than
    * comparing sizeof against a number. */
   options.durability = ZU2_ASYNC;
-  options.max_vertices = 1 << 16;
+  options.max_nodes = 1 << 16;
   options.compact_below = UINT64_MAX;
 
   zu2_db *db = NULL;
@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
   CHECK(found == 0);
   CHECK(value == NULL);
 
-  /* A ring of a thousand vertices with a chord across it, so a two hop
+  /* A ring of a thousand nodes with a chord across it, so a two hop
    * frontier has two members and a one hop has one, and neither is the
    * whole graph. */
   enum { N = 1000 };
@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < N; i++) {
     char key[32];
     int len = snprintf(key, sizeof key, "v%d", i);
-    CHECK(zu2_add_vertex(s, (const uint8_t *)key, (size_t)len, &ids[i]) ==
+    CHECK(zu2_add_node(s, (const uint8_t *)key, (size_t)len, &ids[i]) ==
           ZU2_OK);
   }
   for (int i = 0; i < N; i++) {
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
   CHECK(zu2_khop(s, ZU2_OUT, ids[0], 2, &out, &len) == ZU2_OK);
   CHECK(len == 2);
   /* Round the ring and back to the start, so the seed is in its own
-   * answer and the count is every vertex. */
+   * answer and the count is every node. */
   CHECK(zu2_reach(s, ZU2_OUT, ids[0], 0, 0, &out, &len) == ZU2_OK);
   CHECK(len == N);
   CHECK(zu2_reach(s, ZU2_OUT, ids[0], 1, 0, &out, &len) == ZU2_OK);
@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
   CHECK(zu2_shortest(s, ZU2_OUT, ids[1], ids[0], 3, &hops, &found) == ZU2_OK);
   CHECK(found == 0 && hops == 0);
 
-  /* Undirected degree is a merge and not a sum: vertex 500 is pointed
+  /* Undirected degree is a merge and not a sum: node 500 is pointed
    * at by 499 and by the chord and points at 501. */
   CHECK(zu2_degree(s, ZU2_BOTH, ids[500], &degree) == ZU2_OK);
   CHECK(degree == 3);
@@ -133,12 +133,12 @@ int main(int argc, char **argv) {
   uint64_t triangles = 0;
   CHECK(zu2_triangles(s, ids[0], &triangles) == ZU2_OK);
   CHECK(triangles == 0);
-  CHECK(zu2_vertices(db) == N);
+  CHECK(zu2_nodes(db) == N);
 
-  /* A vertex found by key is the id it was created with, which is what
+  /* A node found by key is the id it was created with, which is what
    * a loader's second pass over an edge list does. */
   uint32_t id = 0;
-  CHECK(zu2_vertex_of(s, (const uint8_t *)"v500", 4, &id, &found) == ZU2_OK);
+  CHECK(zu2_node_of(s, (const uint8_t *)"v500", 4, &id, &found) == ZU2_OK);
   CHECK(found == 1 && id == ids[500]);
 
   /* Misuse is caught rather than crashed on. */

@@ -45,10 +45,10 @@ pub struct Options {
     pub memory_pages: usize,
     /// Concurrent sessions the epoch table has room for.
     pub sessions: usize,
-    /// Vertices the graph plane is sized for. Only the array of chunk
-    /// pointers is allocated up front, one pointer per 16384 vertices
+    /// Nodes the graph plane is sized for. Only the array of chunk
+    /// pointers is allocated up front, one pointer per 16384 nodes
     /// per direction, so this is cheap to set high.
-    pub max_vertices: usize,
+    pub max_nodes: usize,
     /// The log span below which compaction does not bother. Zero turns
     /// compaction off, which is what a load that is going to be measured
     /// and thrown away wants.
@@ -83,7 +83,7 @@ impl Default for Options {
             mutable_pages: 4,
             memory_pages: usize::MAX,
             sessions: 128,
-            max_vertices: 1 << 26,
+            max_nodes: 1 << 26,
             compact_below: 128 << 20,
             provision_bytes: log::PROVISION_CHUNK,
             space_target_percent: 200,
@@ -213,7 +213,7 @@ impl Db {
                 options.provision_bytes,
             ),
             index: Index::new(options.index_buckets),
-            graph: Graph::new(options.max_vertices),
+            graph: Graph::new(options.max_nodes),
             version: AtomicU64::new(0),
             durability: options.durability,
             compact_at: AtomicU64::new(options.compact_below),

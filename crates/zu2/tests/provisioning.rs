@@ -23,7 +23,7 @@ fn options(durability: Durability) -> Options {
         durability,
         index_buckets: 1 << 10,
         max_pages: 64,
-        max_vertices: 1 << 16,
+        max_nodes: 1 << 16,
         // Compaction off, so the file's length is the write path's doing
         // and nothing else's.
         compact_below: 0,

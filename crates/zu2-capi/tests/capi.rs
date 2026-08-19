@@ -27,7 +27,7 @@ fn open(name: &str) -> (tempfile::TempDir, *mut Zu2Db) {
     // the device, and compaction off so nothing moves under them.
     options.durability = 0;
     options.compact_below = u64::MAX;
-    options.max_vertices = 1 << 16;
+    options.max_nodes = 1 << 16;
     let mut db: *mut Zu2Db = ptr::null_mut();
     let mut err: *const std::ffi::c_char = ptr::null();
     let mut err_len = 0usize;
@@ -85,9 +85,9 @@ fn read(s: *mut Zu2Session, key: &[u8]) -> Option<Vec<u8>> {
     Some(unsafe { std::slice::from_raw_parts(value, len) }.to_vec())
 }
 
-fn vertex(s: *mut Zu2Session, key: &[u8]) -> u32 {
+fn node(s: *mut Zu2Session, key: &[u8]) -> u32 {
     let mut id = u32::MAX;
-    let status = unsafe { zu2::zu2_add_vertex(s, key.as_ptr(), key.len(), &mut id) };
+    let status = unsafe { zu2::zu2_add_node(s, key.as_ptr(), key.len(), &mut id) };
     assert_eq!(status, Zu2Status::Ok);
     id
 }
@@ -262,7 +262,7 @@ fn the_graph_walks() {
     // and the two hop frontiers are not the same set and a walk that
     // confused levels with reachability would show it.
     let ids: Vec<u32> = (0..4)
-        .map(|i| vertex(s, format!("v{i}").as_bytes()))
+        .map(|i| node(s, format!("v{i}").as_bytes()))
         .collect();
     edge(s, ids[0], ids[1]);
     edge(s, ids[1], ids[2]);
@@ -309,7 +309,7 @@ fn the_graph_walks() {
     );
     assert_eq!(triangles, 1);
 
-    assert_eq!(unsafe { zu2::zu2_vertices(db) }, 4);
+    assert_eq!(unsafe { zu2::zu2_nodes(db) }, 4);
     close(db, &[s]);
 }
 
@@ -318,7 +318,7 @@ fn reach_walks_the_component_and_stops_where_it_is_told() {
     let (_dir, db) = open("reach.zu2");
     let s = session_on(db);
     let ids: Vec<u32> = (0..6)
-        .map(|i| vertex(s, format!("v{i}").as_bytes()))
+        .map(|i| node(s, format!("v{i}").as_bytes()))
         .collect();
     for pair in ids.windows(2) {
         edge(s, pair[0], pair[1]);
@@ -353,13 +353,13 @@ fn a_cycle_puts_the_seed_back_in_its_own_answer() {
     let (_dir, db) = open("cycle.zu2");
     let s = session_on(db);
     let ids: Vec<u32> = (0..3)
-        .map(|i| vertex(s, format!("v{i}").as_bytes()))
+        .map(|i| node(s, format!("v{i}").as_bytes()))
         .collect();
     edge(s, ids[0], ids[1]);
     edge(s, ids[1], ids[2]);
     edge(s, ids[2], ids[0]);
     // Three hops round a triangle arrive back where they started, and
-    // that is a vertex reachable in one to three hops.
+    // that is a node reachable in one to three hops.
     assert_eq!(reach(s, 0, ids[0], 3, 0).len(), 3);
     assert_eq!(reach(s, 0, ids[0], 2, 0).len(), 2);
     close(db, &[s]);
@@ -370,7 +370,7 @@ fn shortest_counts_hops_and_says_when_there_are_none() {
     let (_dir, db) = open("shortest.zu2");
     let s = session_on(db);
     let ids: Vec<u32> = (0..6)
-        .map(|i| vertex(s, format!("v{i}").as_bytes()))
+        .map(|i| node(s, format!("v{i}").as_bytes()))
         .collect();
     // A chain 0..4 with a shortcut 0 -> 3, and 5 off on its own.
     for pair in ids[..5].windows(2) {
@@ -401,9 +401,9 @@ fn shortest_counts_hops_and_says_when_there_are_none() {
 fn removing_an_edge_takes_it_out_of_the_walk() {
     let (_dir, db) = open("remove.zu2");
     let s = session_on(db);
-    let a = vertex(s, b"a");
-    let b = vertex(s, b"b");
-    let c = vertex(s, b"c");
+    let a = node(s, b"a");
+    let b = node(s, b"b");
+    let c = node(s, b"c");
     edge(s, a, b);
     edge(s, a, c);
     assert_eq!(khop(s, 0, a, 1), vec![b, c]);
@@ -415,24 +415,24 @@ fn removing_an_edge_takes_it_out_of_the_walk() {
     close(db, &[s]);
 }
 
-/// A vertex looked up by key comes back as the id it was created with,
+/// A node looked up by key comes back as the id it was created with,
 /// which is what a loader does on its second pass over an edge list.
 #[test]
-fn a_vertex_is_found_by_its_key() {
+fn a_node_is_found_by_its_key() {
     let (_dir, db) = open("keys.zu2");
     let s = session_on(db);
-    let a = vertex(s, b"alice");
+    let a = node(s, b"alice");
     let mut id = u32::MAX;
     let mut found: c_int = 0;
     assert_eq!(
-        unsafe { zu2::zu2_vertex_of(s, b"alice".as_ptr(), 5, &mut id, &mut found) },
+        unsafe { zu2::zu2_node_of(s, b"alice".as_ptr(), 5, &mut id, &mut found) },
         Zu2Status::Ok
     );
     assert_eq!((found, id), (1, a));
     let mut missing = 7u32;
     let mut found: c_int = 1;
     assert_eq!(
-        unsafe { zu2::zu2_vertex_of(s, b"bob".as_ptr(), 3, &mut missing, &mut found) },
+        unsafe { zu2::zu2_node_of(s, b"bob".as_ptr(), 3, &mut missing, &mut found) },
         Zu2Status::Ok
     );
     assert_eq!((found, missing), (0, 0));
@@ -449,8 +449,8 @@ fn sessions_share_the_database() {
     let two = session_on(db);
     upsert(one, b"k", b"v");
     assert_eq!(read(two, b"k").as_deref(), Some(&b"v"[..]));
-    let a = vertex(one, b"a");
-    let b = vertex(two, b"b");
+    let a = node(one, b"a");
+    let b = node(two, b"b");
     edge(one, a, b);
     assert_eq!(khop(two, 0, a, 1), vec![b]);
     close(db, &[one, two]);

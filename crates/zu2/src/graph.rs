@@ -9,30 +9,30 @@
 //!
 //! Three decisions get that.
 //!
-//! **Dense vertex ids.** A vertex has an external key, which lives in
+//! **Dense node ids.** A node has an external key, which lives in
 //! the record plane's hash index, and an internal `u32` assigned in
-//! creation order. Traversal uses the internal one, so the vertex table
-//! is an array and vertex to neighbourhood is an index rather than a
+//! creation order. Traversal uses the internal one, so the node table
+//! is an array and node to neighbourhood is an index rather than a
 //! lookup. The hash index is consulted exactly once, at the seed.
 //!
 //! **Two shapes of neighbourhood.** Up to [`INLINE_DEGREE`] neighbours
-//! live in the vertex entry itself, in the cacheline the degree and the
-//! version are already in, so the load that finds the vertex finds its
+//! live in the node entry itself, in the cacheline the degree and the
+//! version are already in, so the load that finds the node finds its
 //! neighbours too. Past that they live in a sorted block of `u32`. Both
 //! are read as a `&[u32]`, so a scan is sequential either way, which is
 //! the property LiveGraph (PVLDB 13(7), 2020) argues is the one worth
 //! protecting. Sorted, because neighbourhood intersection is what
 //! triangle counting and most pattern matching reduce to.
 //!
-//! **One version cell per vertex, not per neighbour.** Sortledton
+//! **One version cell per node, not per neighbour.** Sortledton
 //! (PVLDB 15(6), 2022) and Teseo (PVLDB 14(6), 2021) version each
 //! neighbour. The 2025 study of the design space (arXiv 2502.10959)
 //! measures what that costs: 4.1 to 8.9x the memory of a static CSR,
-//! with contention concentrated on the high degree vertices a traversal
+//! with contention concentrated on the high degree nodes a traversal
 //! visits most. Here the neighbourhood is a seqlock: a reader takes the
 //! version, walks the slice, and takes the version again. The tradeoff,
 //! stated rather than hidden, is that two writers on different edges of
-//! the same vertex serialise. In exchange a vertex costs 8 bytes of
+//! the same node serialise. In exchange a node costs 8 bytes of
 //! version rather than 8 bytes per edge, and a reader of a ten thousand
 //! neighbour list does two atomic loads rather than ten thousand.
 //!
@@ -54,16 +54,16 @@ use crate::epoch::Epochs;
 use crate::error::{Error, Result};
 use crate::record::{KIND_EDGE, KIND_VERTEX, LOCK};
 
-/// Neighbours that fit in the vertex entry itself.
+/// Neighbours that fit in the node entry itself.
 ///
-/// A vertex entry is one cacheline: 8 bytes of version, 4 of length, 4
+/// A node entry is one cacheline: 8 bytes of version, 4 of length, 4
 /// of capacity, 8 of block pointer, and the 40 that are left are ten
 /// neighbours. Degree distributions are power law, so this covers the
-/// large majority of vertices in every graph the benchmark loads.
+/// large majority of nodes in every graph the benchmark loads.
 pub const INLINE_DEGREE: usize = 10;
 
-/// Vertices per chunk of the vertex table. Chunks are allocated as the
-/// graph grows and never move, so a vertex lookup is two loads however
+/// Nodes per chunk of the node table. Chunks are allocated as the
+/// graph grows and never move, so a node lookup is two loads however
 /// large the graph gets and no reader ever sees a table being resized.
 const CHUNK: usize = 1 << 14;
 
@@ -94,7 +94,7 @@ impl Drop for Retired {
     }
 }
 
-/// One vertex's neighbours, one cacheline.
+/// One node's neighbours, one cacheline.
 #[repr(align(64))]
 struct Neighbourhood {
     /// Seqlock: bit 63 is the writer's lock, the rest counts edits.
@@ -209,9 +209,9 @@ struct Table {
 }
 
 impl Table {
-    fn new(max_vertices: usize) -> Self {
+    fn new(max_nodes: usize) -> Self {
         Self {
-            chunks: (0..max_vertices.div_ceil(CHUNK).max(1))
+            chunks: (0..max_nodes.div_ceil(CHUNK).max(1))
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
             growing: Mutex::new(()),
@@ -222,24 +222,24 @@ impl Table {
         self.chunks.len() * CHUNK
     }
 
-    fn get(&self, vertex: u32) -> Option<&Neighbourhood> {
-        let chunk = self.chunks.get(vertex as usize / CHUNK)?;
+    fn get(&self, node: u32) -> Option<&Neighbourhood> {
+        let chunk = self.chunks.get(node as usize / CHUNK)?;
         let base = chunk.load(Ordering::Acquire);
         if base.is_null() {
             return None;
         }
         // SAFETY: a non-null chunk holds CHUNK initialised entries and
         // is never freed while the graph lives.
-        Some(unsafe { &*base.add(vertex as usize % CHUNK) })
+        Some(unsafe { &*base.add(node as usize % CHUNK) })
     }
 
-    fn ensure(&self, vertex: u32) -> Option<&Neighbourhood> {
-        let index = vertex as usize / CHUNK;
+    fn ensure(&self, node: u32) -> Option<&Neighbourhood> {
+        let index = node as usize / CHUNK;
         if index >= self.chunks.len() {
             return None;
         }
         if self.chunks[index].load(Ordering::Acquire).is_null() {
-            let _guard = self.growing.lock().expect("zu2 vertex table");
+            let _guard = self.growing.lock().expect("zu2 node table");
             if self.chunks[index].load(Ordering::Acquire).is_null() {
                 let fresh: Box<[Neighbourhood]> =
                     (0..CHUNK).map(|_| Neighbourhood::default()).collect();
@@ -247,7 +247,7 @@ impl Table {
                 self.chunks[index].store(raw, Ordering::Release);
             }
         }
-        self.get(vertex)
+        self.get(node)
     }
 }
 
@@ -279,10 +279,10 @@ pub struct Graph {
 }
 
 impl Graph {
-    pub fn new(max_vertices: usize) -> Self {
+    pub fn new(max_nodes: usize) -> Self {
         Self {
-            out: Table::new(max_vertices),
-            inward: Table::new(max_vertices),
+            out: Table::new(max_nodes),
+            inward: Table::new(max_nodes),
             next: AtomicU32::new(0),
         }
     }
@@ -294,13 +294,13 @@ impl Graph {
         }
     }
 
-    /// Vertices created so far. Ids are dense, so this is also the
-    /// exclusive upper bound on a vertex id in use.
-    pub fn vertices(&self) -> u32 {
+    /// Nodes created so far. Ids are dense, so this is also the
+    /// exclusive upper bound on a node id in use.
+    pub fn nodes(&self) -> u32 {
         self.next.load(Ordering::Acquire)
     }
 
-    /// The largest vertex id plus one this graph was sized for.
+    /// The largest node id plus one this graph was sized for.
     pub fn capacity(&self) -> usize {
         self.out.capacity()
     }
@@ -309,8 +309,8 @@ impl Graph {
         self.next.fetch_add(1, Ordering::AcqRel)
     }
 
-    fn note_vertex(&self, vertex: u32) {
-        self.next.fetch_max(vertex + 1, Ordering::AcqRel);
+    fn note_node(&self, node: u32) {
+        self.next.fetch_max(node + 1, Ordering::AcqRel);
     }
 
     /// Applies an edge change to memory. The log record is written first
@@ -318,12 +318,12 @@ impl Graph {
     pub(crate) fn apply(&self, epochs: &Epochs, add: bool, src: u32, dst: u32) -> Result<()> {
         let highest = src.max(dst);
         if highest as usize >= self.capacity() {
-            return Err(Error::VertexOutOfRange {
-                vertex: highest,
+            return Err(Error::NodeOutOfRange {
+                node: highest,
                 max: self.capacity(),
             });
         }
-        self.note_vertex(highest);
+        self.note_node(highest);
         if add {
             self.link(epochs, Direction::Out, src, dst);
             self.link(epochs, Direction::In, dst, src);
@@ -392,15 +392,15 @@ impl Graph {
         entry.unlock(taken);
     }
 
-    /// The degree of a vertex, which is one load and no traversal.
-    pub fn degree(&self, direction: Direction, vertex: u32) -> u32 {
-        match self.table(direction).get(vertex) {
+    /// The degree of a node, which is one load and no traversal.
+    pub fn degree(&self, direction: Direction, node: u32) -> u32 {
+        match self.table(direction).get(node) {
             Some(entry) => entry.len.load(Ordering::Acquire),
             None => 0,
         }
     }
 
-    /// Runs `visit` on a vertex's neighbours.
+    /// Runs `visit` on a node's neighbours.
     ///
     /// # Safety
     ///
@@ -409,10 +409,10 @@ impl Graph {
     pub(crate) unsafe fn with_neighbours<R>(
         &self,
         direction: Direction,
-        vertex: u32,
+        node: u32,
         visit: &mut impl FnMut(&[u32]) -> R,
     ) -> R {
-        match self.table(direction).get(vertex) {
+        match self.table(direction).get(node) {
             // SAFETY: forwarded from this function's own contract.
             Some(entry) => unsafe { entry.read(visit) },
             None => visit(&[]),
@@ -477,24 +477,24 @@ impl Session<'_> {
         self.core_ref().graph()
     }
 
-    /// Creates a vertex under an external key and returns its dense id.
-    /// The key to id mapping is an ordinary record, so looking a vertex
+    /// Creates a node under an external key and returns its dense id.
+    /// The key to id mapping is an ordinary record, so looking a node
     /// up by key is a hash probe and nothing more, and it is paid once
     /// per traversal rather than once per hop.
-    pub fn add_vertex(&mut self, key: &[u8]) -> Result<u32> {
-        let vertex = self.graph().allocate();
-        if vertex as usize >= self.graph().capacity() {
-            return Err(Error::VertexOutOfRange {
-                vertex,
+    pub fn add_node(&mut self, key: &[u8]) -> Result<u32> {
+        let node = self.graph().allocate();
+        if node as usize >= self.graph().capacity() {
+            return Err(Error::NodeOutOfRange {
+                node,
                 max: self.graph().capacity(),
             });
         }
-        self.write(key, &vertex.to_le_bytes(), false, KIND_VERTEX)?;
-        Ok(vertex)
+        self.write(key, &node.to_le_bytes(), false, KIND_VERTEX)?;
+        Ok(node)
     }
 
-    /// The dense id of the vertex with this key.
-    pub fn vertex_of(&mut self, key: &[u8], scratch: &mut Vec<u8>) -> Result<Option<u32>> {
+    /// The dense id of the node with this key.
+    pub fn node_of(&mut self, key: &[u8], scratch: &mut Vec<u8>) -> Result<Option<u32>> {
         if !self.read(key, scratch)? || scratch.len() != 4 {
             return Ok(None);
         }
@@ -538,7 +538,7 @@ impl Session<'_> {
         self.make_durable(outcome?)
     }
 
-    /// Runs `visit` on a vertex's neighbours without copying them.
+    /// Runs `visit` on a node's neighbours without copying them.
     ///
     /// `visit` may run more than once when it races a writer, so it has
     /// to be pure. This is the form the traversal benchmark uses,
@@ -547,32 +547,32 @@ impl Session<'_> {
     pub fn neighbours<R>(
         &mut self,
         direction: Direction,
-        vertex: u32,
+        node: u32,
         mut visit: impl FnMut(&[u32]) -> R,
     ) -> R {
         self.slot.protect();
         // SAFETY: the epoch is announced for the whole call, so a block
         // a writer replaced is still mapped.
-        let answer = unsafe { self.graph().with_neighbours(direction, vertex, &mut visit) };
+        let answer = unsafe { self.graph().with_neighbours(direction, node, &mut visit) };
         self.slot.unprotect();
         answer
     }
 
-    /// Copies a vertex's neighbours out, for callers that cannot make
+    /// Copies a node's neighbours out, for callers that cannot make
     /// the purity promise [`Session::neighbours`] asks for.
-    pub fn neighbours_into(&mut self, direction: Direction, vertex: u32, out: &mut Vec<u32>) {
-        self.neighbours(direction, vertex, |slice| {
+    pub fn neighbours_into(&mut self, direction: Direction, node: u32, out: &mut Vec<u32>) {
+        self.neighbours(direction, node, |slice| {
             out.clear();
             out.extend_from_slice(slice);
         });
     }
 
     /// The out or in degree, one load.
-    pub fn degree(&mut self, direction: Direction, vertex: u32) -> u32 {
-        self.graph().degree(direction, vertex)
+    pub fn degree(&mut self, direction: Direction, node: u32) -> u32 {
+        self.graph().degree(direction, node)
     }
 
-    /// The distinct vertices two hops out, collected into `out`.
+    /// The distinct nodes two hops out, collected into `out`.
     ///
     /// `seen` and `first` are the caller's, so a benchmark can reuse one
     /// allocation across every probe and the number it prints is the
@@ -580,17 +580,17 @@ impl Session<'_> {
     pub fn two_hop(
         &mut self,
         direction: Direction,
-        vertex: u32,
+        node: u32,
         seen: &mut Vec<u64>,
         first: &mut Vec<u32>,
         out: &mut Vec<u32>,
     ) {
-        let words = (self.graph().vertices() as usize).div_ceil(64).max(1);
+        let words = (self.graph().nodes() as usize).div_ceil(64).max(1);
         if seen.len() < words {
             seen.resize(words, 0);
         }
         out.clear();
-        self.neighbours_into(direction, vertex, first);
+        self.neighbours_into(direction, node, first);
         self.slot.protect();
         let graph = self.core_ref().graph();
         for &near in first.iter() {
@@ -648,16 +648,16 @@ pub(crate) fn replay_edge(core: &Core, payload: &[u8]) -> Result<()> {
     core.graph().apply(core.epochs(), add, src, dst)
 }
 
-/// Restores the id counter from a vertex record during recovery, so that
-/// a vertex which never got an edge does not have its id handed out to
+/// Restores the id counter from a node record during recovery, so that
+/// a node which never got an edge does not have its id handed out to
 /// the next one.
-pub(crate) fn replay_vertex(core: &Core, value: &[u8]) {
+pub(crate) fn replay_node(core: &Core, value: &[u8]) {
     if value.len() != 4 {
         return;
     }
-    let vertex = u32::from_le_bytes(value.try_into().expect("four bytes"));
-    if (vertex as usize) < core.graph().capacity() {
-        core.graph().note_vertex(vertex);
+    let node = u32::from_le_bytes(value.try_into().expect("four bytes"));
+    if (node as usize) < core.graph().capacity() {
+        core.graph().note_node(node);
     }
 }
 
@@ -666,17 +666,12 @@ mod tests {
     use super::*;
     use crate::epoch::Slotted;
 
-    fn neighbours_of(
-        epochs: &Epochs,
-        graph: &Graph,
-        direction: Direction,
-        vertex: u32,
-    ) -> Vec<u32> {
+    fn neighbours_of(epochs: &Epochs, graph: &Graph, direction: Direction, node: u32) -> Vec<u32> {
         let session = Slotted::new(epochs);
         session.protect();
         let mut visit = |slice: &[u32]| slice.to_vec();
         // SAFETY: the epoch is announced and the closure only reads.
-        let out = unsafe { graph.with_neighbours(direction, vertex, &mut visit) };
+        let out = unsafe { graph.with_neighbours(direction, node, &mut visit) };
         session.unprotect();
         out
     }
@@ -694,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vertex_entry_is_one_cacheline() {
+    fn a_node_entry_is_one_cacheline() {
         assert_eq!(std::mem::size_of::<Neighbourhood>(), 64);
         assert_eq!(std::mem::align_of::<Neighbourhood>(), 64);
     }
@@ -739,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vertex_past_the_table_is_refused_rather_than_dropped() {
+    fn a_node_past_the_table_is_refused_rather_than_dropped() {
         let epochs = Epochs::new(4);
         let graph = Graph::new(16);
         let past = graph.capacity() as u32;

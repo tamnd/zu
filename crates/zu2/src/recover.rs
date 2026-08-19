@@ -74,10 +74,10 @@ pub fn replay(core: &Core) -> Result<()> {
                     graph::replay_edge(core, header.value_unchecked())?;
                 } else {
                     if header.kind() == record::KIND_VERTEX {
-                        // A vertex with no edges yet would otherwise
+                        // A node with no edges yet would otherwise
                         // leave no trace, and the next allocation would
                         // hand its id out again.
-                        graph::replay_vertex(core, header.value_unchecked());
+                        graph::replay_node(core, header.value_unchecked());
                     }
                     install(core, header, address);
                 }

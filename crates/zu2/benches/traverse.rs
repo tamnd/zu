@@ -12,7 +12,7 @@
 //! method. `expand`, `bfs` and `triangles` are written once, and zu2 and
 //! sqlite differ in nothing but what happens inside `neighbours`. A
 //! benchmark that let each engine use its own traversal would be
-//! comparing query planners, which is a different question.
+//! comparing optimizers, which is a different question.
 //!
 //! sqlite gets the adjacency shape it should have: a `WITHOUT ROWID`
 //! table keyed on `(src, dst)`, so the primary key is the table, a
@@ -46,10 +46,10 @@ use zu2::{Db, Direction, Durability, Options};
 /// costs more than a degree probe does, so the clock is read once a batch.
 const SAMPLE: u64 = 32;
 
-/// The most vertices a k hop or a BFS is allowed to touch before it stops.
+/// The most nodes a k hop or a BFS is allowed to touch before it stops.
 ///
-/// A BFS over a connected graph of a million vertices visits a million
-/// vertices, which measures memory bandwidth rather than the per hop cost,
+/// A BFS over a connected graph of a million nodes visits a million
+/// nodes, which measures memory bandwidth rather than the per hop cost,
 /// and a six hop from a hub reaches the whole graph. Both engines stop at
 /// the same number, so the comparison holds and a probe stays a probe.
 const VISIT_CAP: usize = 20_000;
@@ -89,17 +89,17 @@ fn key(v: u32) -> String {
 /// with degrees in the thousands and leaves everything else near the
 /// average. That shape is what makes the neighbourhood structure earn its
 /// two forms, and it is what a uniform random graph would hide.
-fn build_edges(vertices: u32, degree: u32) -> Vec<(u32, u32)> {
+fn build_edges(nodes: u32, degree: u32) -> Vec<(u32, u32)> {
     let mut rng = Rng(0x2545F4914F6CDD1D);
-    let hubs = (vertices / 1000).max(1);
-    let mut edges = Vec::with_capacity(vertices as usize * degree as usize);
-    for src in 0..vertices {
+    let hubs = (nodes / 1000).max(1);
+    let mut edges = Vec::with_capacity(nodes as usize * degree as usize);
+    for src in 0..nodes {
         for _ in 0..degree {
             let r = rng.next();
             let dst = if r.is_multiple_of(16) {
                 (r >> 8) as u32 % hubs
             } else {
-                (r >> 8) as u32 % vertices
+                (r >> 8) as u32 % nodes
             };
             edges.push((src, dst));
         }
@@ -111,11 +111,11 @@ fn build_edges(vertices: u32, degree: u32) -> Vec<(u32, u32)> {
 
 /// What a traversal needs from an engine, and nothing else.
 trait Adjacency {
-    /// Hands the out neighbours of `vertex` to `visit`, sorted.
-    fn neighbours(&mut self, vertex: u32, visit: &mut dyn FnMut(&[u32]));
+    /// Hands the out neighbours of `node` to `visit`, sorted.
+    fn neighbours(&mut self, node: u32, visit: &mut dyn FnMut(&[u32]));
     /// The out degree, which every engine can answer without materialising
     /// the neighbours.
-    fn degree(&mut self, vertex: u32) -> u64;
+    fn degree(&mut self, node: u32) -> u64;
 }
 
 /// The scratch a multi hop probe reuses, so the number printed is the
@@ -129,9 +129,9 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(vertices: u32) -> Self {
+    fn new(nodes: u32) -> Self {
         Self {
-            seen: vec![0; (vertices as usize).div_ceil(64).max(1)],
+            seen: vec![0; (nodes as usize).div_ceil(64).max(1)],
             frontier: Vec::new(),
             next: Vec::new(),
             left: Vec::new(),
@@ -140,9 +140,9 @@ impl Scratch {
     }
 
     #[inline]
-    fn mark(&mut self, vertex: u32) -> bool {
-        let word = vertex as usize / 64;
-        let bit = 1u64 << (vertex % 64);
+    fn mark(&mut self, node: u32) -> bool {
+        let word = node as usize / 64;
+        let bit = 1u64 << (node % 64);
         if self.seen[word] & bit != 0 {
             return false;
         }
@@ -159,7 +159,7 @@ impl Scratch {
     }
 }
 
-/// Expands `hops` levels from `seed`, counting distinct vertices reached.
+/// Expands `hops` levels from `seed`, counting distinct nodes reached.
 fn expand<A: Adjacency>(a: &mut A, seed: u32, hops: u32, s: &mut Scratch) -> u64 {
     let mut touched = Vec::new();
     s.frontier.clear();
@@ -275,23 +275,23 @@ struct Zu2Adj<'a> {
 }
 
 impl Adjacency for Zu2Adj<'_> {
-    fn neighbours(&mut self, vertex: u32, visit: &mut dyn FnMut(&[u32])) {
-        self.session.neighbours(Direction::Out, vertex, |slice| {
+    fn neighbours(&mut self, node: u32, visit: &mut dyn FnMut(&[u32])) {
+        self.session.neighbours(Direction::Out, node, |slice| {
             visit(slice);
         });
     }
 
-    fn degree(&mut self, vertex: u32) -> u64 {
-        u64::from(self.session.degree(Direction::Out, vertex))
+    fn degree(&mut self, node: u32) -> u64 {
+        u64::from(self.session.degree(Direction::Out, node))
     }
 }
 
-fn zu2_options(vertices: u32) -> Options {
+fn zu2_options(nodes: u32) -> Options {
     Options {
         durability: Durability::Async,
-        // One record per vertex and none per edge, so the index is sized
-        // for the vertex keys alone.
-        index_buckets: (vertices as usize / 4).next_power_of_two().max(1 << 12),
+        // One record per node and none per edge, so the index is sized
+        // for the node keys alone.
+        index_buckets: (nodes as usize / 4).next_power_of_two().max(1 << 12),
         max_pages: 1 << 17,
         // Log pages held in memory, four megabytes each. The default
         // never evicts, which is what a laptop with room wants and what
@@ -299,7 +299,7 @@ fn zu2_options(vertices: u32) -> Options {
         // way, so this only decides how much of the edge log stays with
         // it.
         memory_pages: env("ZU2_MEMORY_PAGES", usize::MAX),
-        max_vertices: vertices as usize + 1,
+        max_nodes: nodes as usize + 1,
         sessions: 256,
         // Every edge record the load writes is live, so there is nothing
         // for a compactor to take and leaving it on would only spend a
@@ -309,12 +309,12 @@ fn zu2_options(vertices: u32) -> Options {
     }
 }
 
-fn load_zu2(path: &Path, vertices: u32, edges: &[(u32, u32)]) -> Db {
-    let db = Db::create(path, zu2_options(vertices)).expect("create");
+fn load_zu2(path: &Path, nodes: u32, edges: &[(u32, u32)]) -> Db {
+    let db = Db::create(path, zu2_options(nodes)).expect("create");
     {
         let mut s = db.session();
-        for v in 0..vertices {
-            let id = s.add_vertex(key(v).as_bytes()).expect("vertex");
+        for v in 0..nodes {
+            let id = s.add_node(key(v).as_bytes()).expect("node");
             assert_eq!(id, v, "ids are handed out in creation order");
         }
         for &(src, dst) in edges {
@@ -372,7 +372,7 @@ impl SqlAdj {
 }
 
 impl Adjacency for SqlAdj {
-    fn neighbours(&mut self, vertex: u32, visit: &mut dyn FnMut(&[u32])) {
+    fn neighbours(&mut self, node: u32, visit: &mut dyn FnMut(&[u32])) {
         // Taken out and put back so the statement cache can borrow the
         // connection while the buffer is being filled.
         let mut buf = std::mem::take(&mut self.buf);
@@ -385,7 +385,7 @@ impl Adjacency for SqlAdj {
                 // only give sqlite a sorter to prove it does not need.
                 .prepare_cached("SELECT dst FROM edges WHERE src = ?1")
                 .expect("prepare neighbours");
-            let mut rows = stmt.query([vertex]).expect("query");
+            let mut rows = stmt.query([node]).expect("query");
             while let Some(row) = rows.next().expect("row") {
                 buf.push(row.get_unwrap::<_, i64>(0) as u32);
             }
@@ -394,12 +394,12 @@ impl Adjacency for SqlAdj {
         self.buf = buf;
     }
 
-    fn degree(&mut self, vertex: u32) -> u64 {
+    fn degree(&mut self, node: u32) -> u64 {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT count(*) FROM edges WHERE src = ?1")
             .expect("prepare degree");
-        stmt.query_row([vertex], |r| r.get::<_, i64>(0))
+        stmt.query_row([node], |r| r.get::<_, i64>(0))
             .expect("degree") as u64
     }
 }
@@ -587,19 +587,19 @@ fn measure<A: Adjacency>(
     probe: Probe,
     engine: &'static str,
     threads: usize,
-    vertices: u32,
+    nodes: u32,
     seconds: f64,
     make: impl Fn(usize) -> A + Sync,
 ) -> Row {
     let phase = phase(threads, |t| {
         let mut a = make(t);
-        let mut s = Scratch::new(vertices);
+        let mut s = Scratch::new(nodes);
         let mut rng = Rng(seed(t));
         let mut lat = Lat::new();
         let started = Instant::now();
         let (mut ops, mut visited) = (0u64, 0u64);
         loop {
-            let v = (rng.next() % u64::from(vertices)) as u32;
+            let v = (rng.next() % u64::from(nodes)) as u32;
             visited += probe.run(&mut a, v, &mut s);
             lat.tick();
             ops += 1;
@@ -675,7 +675,7 @@ fn device_floor(dir: &Path) -> f64 {
 }
 
 fn main() {
-    let vertices: u32 = env("ZU2_VERTICES", 200_000_u32);
+    let nodes: u32 = env("ZU2_VERTICES", 200_000_u32);
     let degree: u32 = env("ZU2_DEGREE", 16_u32);
     let seconds: f64 = env("ZU2_BUDGET", 2.0_f64);
     let threads: Vec<usize> = std::env::var("ZU2_THREADS")
@@ -684,10 +684,10 @@ fn main() {
         .filter_map(|t| t.trim().parse().ok())
         .collect();
 
-    let edges = build_edges(vertices, degree);
+    let edges = build_edges(nodes, degree);
     println!(
-        "traverse: {} vertices, {} edges before dedup, average out degree {}, {:.1}s a probe phase",
-        vertices,
+        "traverse: {} nodes, {} edges before dedup, average out degree {}, {:.1}s a probe phase",
+        nodes,
         edges.len(),
         degree,
         seconds
@@ -713,7 +713,7 @@ fn main() {
     let zu2_path = dir.path().join("graph.zu2");
     let sql_path = dir.path().join("graph.sqlite");
     let started = Instant::now();
-    let db = load_zu2(&zu2_path, vertices, &edges);
+    let db = load_zu2(&zu2_path, nodes, &edges);
     let zu2_load = started.elapsed().as_secs_f64();
     let started = Instant::now();
     load_sqlite(&sql_path, &edges);
@@ -736,12 +736,12 @@ fn main() {
         let mut rng = Rng(0x243F6A8885A308D3);
         let (mut mine, mut theirs) = (Vec::new(), Vec::new());
         for _ in 0..100 {
-            let v = (rng.next() % u64::from(vertices)) as u32;
+            let v = (rng.next() % u64::from(nodes)) as u32;
             mine.clear();
             theirs.clear();
             zu2.neighbours(v, &mut |s| mine.extend_from_slice(s));
             sql.neighbours(v, &mut |s| theirs.extend_from_slice(s));
-            assert_eq!(mine, theirs, "the two engines disagree about vertex {v}");
+            assert_eq!(mine, theirs, "the two engines disagree about node {v}");
             assert_eq!(
                 zu2.degree(v),
                 sql.degree(v),
@@ -765,10 +765,10 @@ fn main() {
             Probe::Bfs,
             Probe::Triangles,
         ] {
-            let mine = measure(probe, "zu2", t, vertices, seconds, |_| Zu2Adj {
+            let mine = measure(probe, "zu2", t, nodes, seconds, |_| Zu2Adj {
                 session: db.session(),
             });
-            let theirs = measure(probe, "sqlite", t, vertices, seconds, |_| {
+            let theirs = measure(probe, "sqlite", t, nodes, seconds, |_| {
                 SqlAdj::new(&sql_path)
             });
             line(&mine);
@@ -791,7 +791,7 @@ fn main() {
                 let started = Instant::now();
                 let (mut ops, mut visited) = (0u64, 0u64);
                 loop {
-                    let v = (rng.next() % u64::from(vertices)) as u32;
+                    let v = (rng.next() % u64::from(nodes)) as u32;
                     visited += recursive_hops(&conn, v, hops);
                     lat.tick();
                     ops += 1;
@@ -835,10 +835,10 @@ fn main() {
         // costs. The same note is in ycsb.rs.
         db.sync().expect("sync");
         let mine = phase(t, |worker| {
-            insert_zu2(&db, vertices, durability, worker, seconds)
+            insert_zu2(&db, nodes, durability, worker, seconds)
         });
         let theirs = phase(t, |worker| {
-            insert_sqlite(&sql_path, vertices, synchronous, worker, seconds)
+            insert_sqlite(&sql_path, nodes, synchronous, worker, seconds)
         });
         line(&Row {
             probe: "insert".into(),
@@ -855,12 +855,10 @@ fn main() {
 
     // Ninety percent traversal, ten percent write, concurrent, which is
     // the shape a graph application actually has and the one where an
-    // adjacency that locks per vertex has to prove it does not stall the
+    // adjacency that locks per node has to prove it does not stall the
     // readers.
-    let mine = phase(t, |worker| mixed_zu2(&db, vertices, worker, seconds));
-    let theirs = phase(t, |worker| {
-        mixed_sqlite(&sql_path, vertices, worker, seconds)
-    });
+    let mine = phase(t, |worker| mixed_zu2(&db, nodes, worker, seconds));
+    let theirs = phase(t, |worker| mixed_sqlite(&sql_path, nodes, worker, seconds));
     println!(
         "\nmixed, 90 percent one hop and 10 percent edge insert, {t} threads, commit does not wait"
     );
@@ -885,17 +883,17 @@ fn main() {
     }
 }
 
-/// A random edge between existing vertices. Both engines are handed the
+/// A random edge between existing nodes. Both engines are handed the
 /// same generator, seeded per worker, so neither is writing an easier
 /// edge than the other.
 #[inline]
-fn random_edge(rng: &mut Rng, vertices: u32) -> (u32, u32) {
-    let a = (rng.next() % u64::from(vertices)) as u32;
-    let b = (rng.next() % u64::from(vertices)) as u32;
+fn random_edge(rng: &mut Rng, nodes: u32) -> (u32, u32) {
+    let a = (rng.next() % u64::from(nodes)) as u32;
+    let b = (rng.next() % u64::from(nodes)) as u32;
     (a, b)
 }
 
-fn insert_zu2(db: &Db, vertices: u32, durability: Durability, worker: usize, seconds: f64) -> Work {
+fn insert_zu2(db: &Db, nodes: u32, durability: Durability, worker: usize, seconds: f64) -> Work {
     let mut s = db.session();
     s.set_durability(durability);
     let mut rng = Rng(seed(worker));
@@ -903,7 +901,7 @@ fn insert_zu2(db: &Db, vertices: u32, durability: Durability, worker: usize, sec
     let started = Instant::now();
     let mut ops = 0u64;
     loop {
-        let (src, dst) = random_edge(&mut rng, vertices);
+        let (src, dst) = random_edge(&mut rng, nodes);
         s.add_edge(src, dst).expect("add edge");
         lat.tick();
         ops += 1;
@@ -918,13 +916,7 @@ fn insert_zu2(db: &Db, vertices: u32, durability: Durability, worker: usize, sec
     }
 }
 
-fn insert_sqlite(
-    path: &Path,
-    vertices: u32,
-    synchronous: &str,
-    worker: usize,
-    seconds: f64,
-) -> Work {
+fn insert_sqlite(path: &Path, nodes: u32, synchronous: &str, worker: usize, seconds: f64) -> Work {
     let conn = connect(path, synchronous);
     let mut stmt = conn
         .prepare("INSERT OR IGNORE INTO edges (src, dst) VALUES (?1, ?2)")
@@ -934,7 +926,7 @@ fn insert_sqlite(
     let started = Instant::now();
     let mut ops = 0u64;
     loop {
-        let (src, dst) = random_edge(&mut rng, vertices);
+        let (src, dst) = random_edge(&mut rng, nodes);
         stmt.execute(rusqlite::params![src, dst]).expect("insert");
         lat.tick();
         ops += 1;
@@ -949,20 +941,20 @@ fn insert_sqlite(
     }
 }
 
-fn mixed_zu2(db: &Db, vertices: u32, worker: usize, seconds: f64) -> Work {
+fn mixed_zu2(db: &Db, nodes: u32, worker: usize, seconds: f64) -> Work {
     let mut a = Zu2Adj {
         session: db.session(),
     };
     a.session.set_durability(Durability::Async);
-    let mut s = Scratch::new(vertices);
+    let mut s = Scratch::new(nodes);
     let mut rng = Rng(seed(worker));
     let mut lat = Lat::new();
     let started = Instant::now();
     let (mut ops, mut visited) = (0u64, 0u64);
     loop {
-        let v = (rng.next() % u64::from(vertices)) as u32;
+        let v = (rng.next() % u64::from(nodes)) as u32;
         if rng.next().is_multiple_of(10) {
-            let (src, dst) = random_edge(&mut rng, vertices);
+            let (src, dst) = random_edge(&mut rng, nodes);
             a.session.add_edge(src, dst).expect("add edge");
         } else {
             visited += expand(&mut a, v, 1, &mut s);
@@ -980,17 +972,17 @@ fn mixed_zu2(db: &Db, vertices: u32, worker: usize, seconds: f64) -> Work {
     }
 }
 
-fn mixed_sqlite(path: &Path, vertices: u32, worker: usize, seconds: f64) -> Work {
+fn mixed_sqlite(path: &Path, nodes: u32, worker: usize, seconds: f64) -> Work {
     let mut a = SqlAdj::new(path);
-    let mut s = Scratch::new(vertices);
+    let mut s = Scratch::new(nodes);
     let mut rng = Rng(seed(worker));
     let mut lat = Lat::new();
     let started = Instant::now();
     let (mut ops, mut visited) = (0u64, 0u64);
     loop {
-        let v = (rng.next() % u64::from(vertices)) as u32;
+        let v = (rng.next() % u64::from(nodes)) as u32;
         if rng.next().is_multiple_of(10) {
-            let (src, dst) = random_edge(&mut rng, vertices);
+            let (src, dst) = random_edge(&mut rng, nodes);
             let mut stmt = a
                 .conn
                 .prepare_cached("INSERT OR IGNORE INTO edges (src, dst) VALUES (?1, ?2)")

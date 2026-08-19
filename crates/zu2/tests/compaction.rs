@@ -17,7 +17,7 @@ fn options() -> Options {
         durability: Durability::Async,
         index_buckets: 1 << 14,
         max_pages: 64,
-        max_vertices: 1 << 16,
+        max_nodes: 1 << 16,
         compact_below: 0,
         // One page of mutable window rather than the default four. The
         // window is the part of the log compaction is not allowed to
@@ -32,7 +32,7 @@ fn key(i: u32) -> Vec<u8> {
     format!("user{i:09}").into_bytes()
 }
 
-/// A key in its own namespace, for the graph test, where the vertex keys
+/// A key in its own namespace, for the graph test, where the node keys
 /// are the mapping from key to dense id and writing a property over one
 /// would replace the mapping rather than sit beside it.
 fn property(i: u32) -> Vec<u8> {
@@ -179,27 +179,27 @@ fn a_compacted_database_reopens_with_every_key() {
 fn a_compacted_graph_reopens_with_every_edge() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("g.zu2");
-    let vertices = 2000u32;
+    let nodes = 2000u32;
     let rounds = 10u32;
     {
         let db = Db::create(&path, options()).expect("create");
         let mut s = db.session();
-        for i in 0..vertices {
-            s.add_vertex(&key(i)).expect("vertex");
+        for i in 0..nodes {
+            s.add_node(&key(i)).expect("node");
         }
         // The properties are what makes the log long enough to have a
         // compactable region. The edges are what the test is about.
         for round in 0..rounds {
-            for i in 0..vertices {
+            for i in 0..nodes {
                 s.upsert(&property(i), &value(i, round)).expect("upsert");
             }
         }
-        for i in 0..vertices {
-            s.add_edge(i, (i + 1) % vertices).expect("ring");
-            s.add_edge(i, (i * 7 + 1) % vertices).expect("chord");
+        for i in 0..nodes {
+            s.add_edge(i, (i + 1) % nodes).expect("ring");
+            s.add_edge(i, (i * 7 + 1) % nodes).expect("chord");
         }
         // A hub, so at least one adjacency is out of line and large.
-        for i in 1..vertices {
+        for i in 1..nodes {
             s.add_edge(0, i).expect("hub");
         }
         s.remove_edge(0, 3).expect("remove");
@@ -211,34 +211,34 @@ fn a_compacted_graph_reopens_with_every_edge() {
     let mut s = db.session();
     let mut scratch = Vec::new();
     assert_eq!(
-        s.vertex_of(&key(11), &mut scratch).expect("vertex_of"),
+        s.node_of(&key(11), &mut scratch).expect("node_of"),
         Some(11),
         "the key to id mapping did not survive the compaction"
     );
     assert_eq!(
-        db.core().graph().vertices(),
-        vertices,
+        db.core().graph().nodes(),
+        nodes,
         "the id counter did not survive the compaction"
     );
     let hub = s.neighbours(Direction::Out, 0, |n| n.to_vec());
     assert_eq!(
         hub.len(),
-        (vertices - 2) as usize,
+        (nodes - 2) as usize,
         "the hub lost edges, or kept the removed one"
     );
     assert!(
         !hub.contains(&3),
         "the removed edge came back, so the remove record was compacted away"
     );
-    for i in 0..vertices {
+    for i in 0..nodes {
         let out = s.neighbours(Direction::Out, i, |n| n.to_vec());
         assert!(
-            out.contains(&((i + 1) % vertices)),
-            "vertex {i} lost its ring edge"
+            out.contains(&((i + 1) % nodes)),
+            "node {i} lost its ring edge"
         );
         assert!(
-            out.contains(&((i * 7 + 1) % vertices)),
-            "vertex {i} lost its chord"
+            out.contains(&((i * 7 + 1) % nodes)),
+            "node {i} lost its chord"
         );
     }
 }

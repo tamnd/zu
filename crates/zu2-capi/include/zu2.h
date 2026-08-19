@@ -1,7 +1,7 @@
 /* libzu2: the C surface over the zu2 storage engine.
  *
  * zu2 is a storage engine and not a database with a query language, so
- * this is a storage surface: keys and values, vertices and edges, and
+ * this is a storage surface: keys and values, nodes and edges, and
  * the traversals a host would otherwise write as a loop over hops. A
  * host that wants GQL wants libzu (crates/zu-capi), which is the other
  * engine and the other header.
@@ -44,7 +44,7 @@
  * pointer that outlived the call would be a pointer into a block a
  * writer is free to replace. This is the reason zu2_khop, zu2_reach and
  * zu2_triangles are here at all: a host that walks a graph one
- * zu2_neighbours call per vertex pays a copy per hop and measures the
+ * zu2_neighbours call per node pays a copy per hop and measures the
  * copy, and a host that asks for the k-hop frontier pays one copy for
  * the answer and walks the interior at Rust speed inside the epoch.
  *
@@ -72,7 +72,7 @@ extern "C" {
 typedef enum zu2_status {
   /* The call did what it was asked and wrote its out-parameter. */
   ZU2_OK = 0,
-  /* The engine refused the work: a full log, a vertex past the table,
+  /* The engine refused the work: a full log, a node past the table,
    * a malformed record, an io error. The handle says which. */
   ZU2_ERROR = 3,
   /* The caller broke the contract in this header: a NULL handle, a NULL
@@ -105,7 +105,7 @@ typedef enum zu2_durability {
  * ZU2_BOTH is the undirected reading, and it is two loads rather than
  * one: the engine keeps an out list and an in list and has no third
  * list for an edge with no arrow on it. Every call that takes a
- * direction takes this one, and every one of them counts a vertex
+ * direction takes this one, and every one of them counts a node
  * reachable both ways round once. */
 typedef enum zu2_direction {
   ZU2_OUT = 0,
@@ -117,7 +117,7 @@ typedef enum zu2_direction {
  *
  * Every field zero means the engine's own defaults, so a caller that
  * memsets the struct and sets nothing gets a working database.
- * index_buckets and max_vertices are sized once and not grown, so a
+ * index_buckets and max_nodes are sized once and not grown, so a
  * caller who knows the shape should say so: past the load factor the
  * index's collision chains lengthen, which is graceful and is not free.
  */
@@ -131,10 +131,10 @@ typedef struct zu2_options {
   /* Slots in the page table, which caps the log at max_pages * 4 MiB.
    * 0 takes the default. */
   uint64_t max_pages;
-  /* Vertices the graph plane is sized for. Only one pointer per 16384
-   * vertices per direction is allocated up front, so this is cheap to
+  /* Nodes the graph plane is sized for. Only one pointer per 16384
+   * nodes per direction is allocated up front, so this is cheap to
    * set high. 0 takes the default. */
-  uint64_t max_vertices;
+  uint64_t max_nodes;
   /* Bytes of log kept per byte of live data, as a percent. 200 settles
    * the file at about twice the live set. 0 takes the default. */
   uint32_t space_target_percent;
@@ -206,18 +206,18 @@ zu2_status zu2_delete(zu2_session *s, const uint8_t *key, size_t key_len,
 
 /* ---- graph ---- */
 
-/* Creates a vertex under an external key and returns its dense id.
+/* Creates a node under an external key and returns its dense id.
  *
- * The key to id mapping is an ordinary record, so looking a vertex up
+ * The key to id mapping is an ordinary record, so looking a node up
  * by key is a hash probe and nothing more, and a traversal pays it once
  * at the seed rather than once per hop, because a frontier is dense
  * ids. */
-zu2_status zu2_add_vertex(zu2_session *s, const uint8_t *key, size_t key_len,
-                          uint32_t *vertex);
+zu2_status zu2_add_node(zu2_session *s, const uint8_t *key, size_t key_len,
+                          uint32_t *node);
 
-/* The dense id of the vertex with this key. */
-zu2_status zu2_vertex_of(zu2_session *s, const uint8_t *key, size_t key_len,
-                         uint32_t *vertex, int *found);
+/* The dense id of the node with this key. */
+zu2_status zu2_node_of(zu2_session *s, const uint8_t *key, size_t key_len,
+                         uint32_t *node, int *found);
 
 /* Links src to dst. Repeating an edge is not an error and does not grow
  * the neighbourhood. */
@@ -230,27 +230,27 @@ zu2_status zu2_remove_edge(zu2_session *s, uint32_t src, uint32_t dst);
 /* The degree. One indexed load for ZU2_OUT and ZU2_IN, whatever the
  * degree is. ZU2_BOTH is the number of distinct neighbours either way
  * round, so it is two loads and a merge rather than a sum: a pair of
- * vertices that point at each other are one neighbour, not two. */
-zu2_status zu2_degree(zu2_session *s, zu2_direction dir, uint32_t vertex,
+ * nodes that point at each other are one neighbour, not two. */
+zu2_status zu2_degree(zu2_session *s, zu2_direction dir, uint32_t node,
                       uint32_t *degree);
 
-/* A vertex's neighbours, ascending, copied into the session's buffer
+/* A node's neighbours, ascending, copied into the session's buffer
  * and valid until the next call on it. */
-zu2_status zu2_neighbours(zu2_session *s, zu2_direction dir, uint32_t vertex,
+zu2_status zu2_neighbours(zu2_session *s, zu2_direction dir, uint32_t node,
                           const uint32_t **out, size_t *len);
 
-/* The distinct vertices exactly k hops from seed.
+/* The distinct nodes exactly k hops from seed.
  *
  * k == 0 is the seed itself. Distinct is per level rather than
  * cumulative, which is what
  * `MATCH (a)-[:E]->()-[:E]->(c) RETURN count(DISTINCT c)` asks for: a
- * vertex two paths of length k both reach is counted once, and a vertex
+ * node two paths of length k both reach is counted once, and a node
  * that is also reachable in fewer hops is still counted. The frontier
  * is the session's buffer and is valid until the next call on it. */
 zu2_status zu2_khop(zu2_session *s, zu2_direction dir, uint32_t seed,
                     uint32_t k, const uint32_t **out, size_t *len);
 
-/* The distinct vertices reachable from seed in one hop or more and at
+/* The distinct nodes reachable from seed in one hop or more and at
  * most max_depth hops, breadth first, in the order they were reached.
  *
  * max_depth 0 is no bound and walks the whole reachable set. max_visited
@@ -286,8 +286,8 @@ zu2_status zu2_shortest(zu2_session *s, zu2_direction dir, uint32_t src,
  * b->c and seed->c. */
 zu2_status zu2_triangles(zu2_session *s, uint32_t seed, uint64_t *count);
 
-/* How many vertices the graph holds. */
-uint32_t zu2_vertices(const zu2_db *db);
+/* How many nodes the graph holds. */
+uint32_t zu2_nodes(const zu2_db *db);
 
 /* ---- administration ---- */
 

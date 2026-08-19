@@ -30,12 +30,12 @@ pub enum Error {
     #[error("record at {address} is malformed: {why}")]
     Malformed { address: u64, why: &'static str },
 
-    /// A vertex id landed past the end of the vertex table. The table is
+    /// A node id landed past the end of the node table. The table is
     /// chunked and the chunks are allocated on demand, but the array of
-    /// chunk pointers is sized once so that a vertex lookup stays two
+    /// chunk pointers is sized once so that a node lookup stays two
     /// loads, so the ceiling is a configuration decision.
-    #[error("vertex {vertex} is past the {max} the graph was sized for")]
-    VertexOutOfRange { vertex: u32, max: usize },
+    #[error("node {node} is past the {max} the graph was sized for")]
+    NodeOutOfRange { node: u32, max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

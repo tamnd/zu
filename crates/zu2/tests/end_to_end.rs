@@ -16,7 +16,7 @@ fn options(durability: Durability) -> Options {
         // the read-only region rather than staying in the mutable window.
         index_buckets: 1 << 10,
         max_pages: 64,
-        max_vertices: 1 << 16,
+        max_nodes: 1 << 16,
         ..Options::default()
     }
 }
@@ -133,24 +133,24 @@ fn what_was_acknowledged_is_there_after_a_reopen() {
 fn a_graph_survives_a_reopen_with_its_edges() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("g.zu2");
-    let vertices = 400u32;
+    let nodes = 400u32;
     {
         let db = Db::create(&path, options(Durability::Durable)).expect("create");
         let mut s = db.session();
-        for i in 0..vertices {
-            let id = s.add_vertex(&key(i)).expect("vertex");
+        for i in 0..nodes {
+            let id = s.add_node(&key(i)).expect("node");
             assert_eq!(id, i, "ids are handed out in creation order");
         }
-        // A ring plus a chord, so every vertex has degree two out and a
+        // A ring plus a chord, so every node has degree two out and a
         // few have more, which puts some neighbourhoods out of line.
-        for i in 0..vertices {
-            s.add_edge(i, (i + 1) % vertices).expect("edge");
-            s.add_edge(i, (i * 7 + 1) % vertices).expect("edge");
+        for i in 0..nodes {
+            s.add_edge(i, (i + 1) % nodes).expect("edge");
+            s.add_edge(i, (i * 7 + 1) % nodes).expect("edge");
         }
         // A hub, to force a block that doubles several times. From one,
         // because a self edge is a different question than this test is
         // asking.
-        for i in 1..vertices {
+        for i in 1..nodes {
             s.add_edge(0, i).expect("hub edge");
         }
         s.remove_edge(0, 3).expect("remove");
@@ -160,20 +160,20 @@ fn a_graph_survives_a_reopen_with_its_edges() {
     let mut s = db.session();
     let mut scratch = Vec::new();
     assert_eq!(
-        s.vertex_of(&key(11), &mut scratch).expect("vertex_of"),
+        s.node_of(&key(11), &mut scratch).expect("node_of"),
         Some(11),
         "the key to id mapping did not survive"
     );
     assert_eq!(
-        db.core().graph().vertices(),
-        vertices,
+        db.core().graph().nodes(),
+        nodes,
         "the id counter did not survive"
     );
     let hub = s.neighbours(Direction::Out, 0, |n| n.to_vec());
     assert_eq!(
         hub.len(),
-        (vertices - 2) as usize,
-        "the hub lost edges: {} of {vertices}",
+        (nodes - 2) as usize,
+        "the hub lost edges: {} of {nodes}",
         hub.len()
     );
     assert!(!hub.contains(&3), "the removed edge came back");
@@ -182,9 +182,9 @@ fn a_graph_survives_a_reopen_with_its_edges() {
     assert_eq!(s.degree(Direction::Out, 0), hub.len() as u32);
     // Every ring edge has a reverse, which is what makes an in-hop cost
     // the same as an out-hop.
-    for i in 1..vertices {
-        let back = s.neighbours(Direction::In, (i + 1) % vertices, |n| n.to_vec());
-        assert!(back.contains(&i), "vertex {i} lost its reverse edge");
+    for i in 1..nodes {
+        let back = s.neighbours(Direction::In, (i + 1) % nodes, |n| n.to_vec());
+        assert!(back.contains(&i), "node {i} lost its reverse edge");
     }
 }
 
@@ -194,7 +194,7 @@ fn two_hops_are_the_distinct_neighbours_of_the_neighbours() {
     let db = Db::create(&dir.path().join("h.zu2"), options(Durability::Async)).expect("create");
     let mut s = db.session();
     for i in 0..64u32 {
-        s.add_vertex(&key(i)).expect("vertex");
+        s.add_node(&key(i)).expect("node");
     }
     // A grid of eight by eight, linked right and down, so the two hop
     // set from a corner is small enough to write out by hand.

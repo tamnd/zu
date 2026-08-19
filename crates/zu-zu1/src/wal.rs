@@ -18,14 +18,12 @@
 //! the sink only once their `TxnCommit` frame has been read, so a tear
 //! after the last commit loses nothing that was promised durable.
 
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 
 use zu_common::{Epoch, Result, ZuError};
 
-use crate::vfs::{RealFile, VfsFile};
+use crate::vfs::{RealVfs, Vfs, VfsFile};
 
 /// Frame prefix: `len: u32 | crc32c: u32`.
 const PREFIX: u64 = 8;
@@ -673,7 +671,6 @@ pub struct Wal {
     /// What makes a commit durable, shared with every other writer on
     /// this log so that their syncs are one sync.
     commits: Arc<Commits>,
-    path: PathBuf,
     len: u64,
     /// Bytes the file has been given and zeroed, which is where a
     /// commit may write without asking the filesystem for space.
@@ -708,12 +705,18 @@ impl Wal {
     /// frame. Crashing mid-append leaves a frame that fails its length
     /// or crc check; everything before it is kept.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_on(Box::new(RealFile::open_or_create(path)?), path)
+        Self::open_in(&RealVfs::shared(), path)
+    }
+
+    /// [`Self::open`] somewhere other than the filesystem, for a log
+    /// that belongs to a database that is not on disk either.
+    pub fn open_in(vfs: &Arc<dyn Vfs>, path: &Path) -> Result<Self> {
+        Self::open_on(vfs.open_or_create(path)?)
     }
 
     /// [`Self::open`] on an explicit file handle; the crash harness
     /// passes a recording one.
-    pub fn open_on(mut file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
+    pub fn open_on(mut file: Box<dyn VfsFile>) -> Result<Self> {
         let reserved = file.len()?;
         let mut bytes = vec![0u8; reserved as usize];
         file.read_exact_at(&mut bytes, 0)?;
@@ -726,7 +729,6 @@ impl Wal {
         let mut wal = Wal {
             file,
             commits,
-            path: path.to_path_buf(),
             len: end,
             reserved,
             buf: Vec::new(),
@@ -946,10 +948,13 @@ impl Wal {
         floor: Epoch,
         mut sink: impl FnMut(Epoch, &WalRecord) -> Result<()>,
     ) -> Result<()> {
-        let mut file = File::open(&self.path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        bytes.truncate(self.len as usize);
+        // A second handle on the log this one is holding, rather than a
+        // second open of the name it was opened under: the name is not
+        // always something to open, and reading a log through its own
+        // file is the thing that is true either way.
+        let mut file = self.file.dup()?;
+        let mut bytes = vec![0u8; self.len as usize];
+        file.read_exact_at(&mut bytes, 0)?;
         let mut floor = floor;
         let mut at = 0u64;
         while let Some((body, next)) = next_frame(&bytes, at) {
@@ -1099,7 +1104,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("group.wal");
         let (file, syncs) = CountingFile::open(&path);
-        let mut wal = Wal::open_on(file, &path).unwrap();
+        let mut wal = Wal::open_on(file).unwrap();
         let commits = Arc::clone(wal.commits());
 
         let first = staged(&mut wal, 1);
@@ -1134,7 +1139,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cut.wal");
         let (file, syncs) = CountingFile::open(&path);
-        let mut wal = Wal::open_on(file, &path).unwrap();
+        let mut wal = Wal::open_on(file).unwrap();
         let commits = Arc::clone(wal.commits());
 
         let need = staged(&mut wal, 1);

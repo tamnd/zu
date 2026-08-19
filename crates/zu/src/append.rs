@@ -526,7 +526,7 @@ impl<'c> Appender<'c> {
                 "no node table or rel table '{table}'"
             )));
         };
-        let wal = Wal::open(&sidecar(db.path()))?;
+        let wal = Wal::open_in(db.vfs(), &sidecar(db.path()))?;
         Ok(Appender {
             db,
             wal,

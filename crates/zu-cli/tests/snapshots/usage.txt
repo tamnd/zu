@@ -1,5 +1,5 @@
 $ zu shell --no-such-flag
-! usage: zu shell <file.zu1> [--format jsonl]
+! usage: zu shell [<file.zu1>] [--format jsonl]
 ! try `zu shell --help` for examples
 # exit 2
 

@@ -109,10 +109,17 @@ pub(crate) fn shell_command(args: &[String]) -> ExitCode {
             _ => return crate::usage_error("shell"),
         }
     }
-    let Some(path) = path else {
-        return crate::usage_error("shell");
+    // No file named, or `:memory:` named, is a database in memory:
+    // one nothing has to be cleaned up after, which is what somebody
+    // trying the language out wants and what a file in the working
+    // directory they did not ask for is the opposite of.
+    let memory = matches!(path, None | Some(":memory:"));
+    let path = path.unwrap_or(":memory:");
+    let opened = match memory {
+        true => Session::memory(),
+        false => Session::open(std::path::Path::new(path)),
     };
-    let mut session = match Session::open(std::path::Path::new(path)) {
+    let mut session = match opened {
         Ok(s) => s,
         Err(e) => return crate::command_error("shell", &e),
     };

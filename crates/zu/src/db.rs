@@ -28,6 +28,8 @@
 //! file, and a connection is genuinely cheap to take.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use zu_common::{Interrupt, Result, ZuError};
 use zu_query::exec::{self, Profile, Streamed};
@@ -39,6 +41,7 @@ use crate::append::Appender;
 use crate::query::{QueryResult, Value};
 use crate::session::Session;
 use crate::zu1::file::Zu1File;
+use crate::zu1::vfs::{MemVfs, RealVfs, Vfs};
 
 /// How a database is opened and what its statements are allowed to do.
 ///
@@ -124,6 +127,40 @@ impl Config {
 pub struct Database {
     path: PathBuf,
     config: Config,
+    /// Where this database's files come from. For one on disk it is the
+    /// filesystem and every clone shares the one instance; for one in
+    /// memory it is the bytes themselves, so the clone is what keeps
+    /// the database alive and what makes two connections to it two
+    /// connections to the same graph rather than to two empty ones.
+    vfs: Arc<dyn Vfs>,
+}
+
+/// A name for a database in memory, different from every other one
+/// this process has minted.
+///
+/// The registry in [`crate::shared`] keys the open files of a process
+/// by path, which is what stops two connections from opening two write
+/// sides of one file. A database in memory has no path the filesystem
+/// would recognise, but it still needs a name nothing else answers to,
+/// or two of them would be handed each other's write side. The counter
+/// is what gives it one; the `:memory:` spelling is the one every
+/// caller of an embedded database already reads as "not on disk", and
+/// canonicalizing it fails, so the registry keeps it as written.
+fn memory_path() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    PathBuf::from(format!(":memory:{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// A fresh database in memory, opened and ready to read.
+///
+/// Here rather than in [`crate::session`] because the name it is
+/// registered under is minted here, and two callers minting names
+/// from two counters could mint the same one.
+pub(crate) fn memory_file() -> Result<Zu1File> {
+    let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+    let path = memory_path();
+    drop(Zu1File::create_in(Arc::clone(&vfs), &path)?);
+    Zu1File::open_in(vfs, &path)
 }
 
 impl Database {
@@ -140,7 +177,11 @@ impl Database {
     /// [`Database::open`] with a configuration.
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Database> {
         let path = path.as_ref().to_path_buf();
-        let db = Database { path, config };
+        let db = Database {
+            path,
+            config,
+            vfs: RealVfs::shared(),
+        };
         // Proving the file opens is the whole point of doing it here,
         // and a handle that proved it has nothing else to offer: a
         // connection opens its own, with its own caches.
@@ -180,6 +221,52 @@ impl Database {
         Database::open_with(path, config)
     }
 
+    /// Creates a database that never touches the filesystem, with the
+    /// default configuration.
+    ///
+    /// The blocks a file would hold are held in memory instead, and the
+    /// log beside it too, so everything above this point runs unchanged:
+    /// the same headers, the same log, the same fold and the same
+    /// recovery, on bytes that go away when the last handle does. That
+    /// is what makes it worth having for a test or a scratch load and
+    /// what makes it useless for anything that has to survive the
+    /// process.
+    ///
+    /// Every call makes a database of its own. Two of them share
+    /// nothing, and cloning one, or connecting to it twice, is what
+    /// gets two views of the same graph.
+    pub fn memory() -> Result<Database> {
+        Database::memory_with(Config::default())
+    }
+
+    /// [`Database::memory`] with a configuration.
+    ///
+    /// `read_only` is refused for the same reason [`Database::create`]
+    /// refuses it: a fresh database nothing may write to is one that
+    /// stays empty forever, and here there is not even a file somebody
+    /// else could have filled.
+    pub fn memory_with(config: Config) -> Result<Database> {
+        if config.read_only {
+            return Err(ZuError::InvalidArgument(
+                "a database in memory opened read-only is one nothing could ever put a row in"
+                    .to_string(),
+            ));
+        }
+        let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
+        let path = memory_path();
+        drop(Zu1File::create_in(Arc::clone(&vfs), &path)?);
+        let db = Database { path, config, vfs };
+        drop(db.handle()?);
+        Ok(db)
+    }
+
+    /// Whether this database is the kind that goes away with the
+    /// process. A caller that offers to back one up, or warns before
+    /// closing one, needs to be able to ask.
+    pub fn is_memory(&self) -> bool {
+        !self.vfs.durable()
+    }
+
     /// Where this database lives.
     pub fn path(&self) -> &Path {
         &self.path
@@ -204,9 +291,9 @@ impl Database {
 
     fn handle(&self) -> Result<Zu1File> {
         let mut file = if self.config.read_only {
-            Zu1File::open_read_only(&self.path)?
+            Zu1File::open_read_only_in(Arc::clone(&self.vfs), &self.path)?
         } else {
-            Zu1File::open(&self.path)?
+            Zu1File::open_in(Arc::clone(&self.vfs), &self.path)?
         };
         file.set_memory_limit(self.config.memory_limit);
         Ok(file)
@@ -961,6 +1048,98 @@ mod tests {
         let mut conn = db.connect().expect("connect");
         let listing = conn.explain("MATCH (p:person) RETURN p").expect("explain");
         assert!(listing.contains("Scan"), "{listing}");
+    }
+
+    /// The point of the whole vfs layer: everything above the file runs
+    /// unchanged, so a statement that writes, the log it writes
+    /// through, the fold that reads it back and the statement that
+    /// reads the row all work with nothing on disk.
+    #[test]
+    fn a_database_in_memory_takes_rows_and_gives_them_back() {
+        let db = Database::memory().expect("memory");
+        assert!(db.is_memory());
+        let mut conn = db.connect().expect("connect");
+        conn.query("INSERT (p:person {uid: 1, name: 'ada'})")
+            .expect("ada");
+        conn.query_with(
+            "INSERT (p:person {uid: $uid, name: $name})",
+            &[("uid", Value::Int(2)), ("name", Value::from("grace"))],
+        )
+        .expect("grace");
+        let rows = conn
+            .query("MATCH (p:person) RETURN p.name ORDER BY p.uid")
+            .expect("read");
+        let names: Vec<_> = rows
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Str(name) => name.clone(),
+                other => panic!("a name is a string, not {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["ada", "grace"]);
+    }
+
+    /// Nothing on disk means nothing on disk: not the database, not the
+    /// log beside it, and not a directory either.
+    #[test]
+    fn a_database_in_memory_leaves_no_file_behind() {
+        let db = Database::memory().expect("memory");
+        let mut conn = db.connect().expect("connect");
+        conn.query("INSERT (p:person {uid: 1})").expect("insert");
+        assert!(!db.path().exists(), "{}", db.path().display());
+        let sidecar = crate::append::sidecar(db.path());
+        assert!(!sidecar.exists(), "{}", sidecar.display());
+    }
+
+    /// A clone is the same database, which is what makes it shareable
+    /// the way an opened one is: the connections a pool hands out all
+    /// read the rows the others wrote.
+    #[test]
+    fn connections_to_one_database_in_memory_read_each_other() {
+        let db = Database::memory().expect("memory");
+        let mut first = db.connect().expect("connect");
+        first
+            .query("INSERT (p:person {uid: 1, name: 'ada'})")
+            .expect("ada");
+        let mut second = db.clone().connect().expect("connect");
+        let rows = second
+            .query("MATCH (p:person) RETURN p.name")
+            .expect("read");
+        assert_eq!(rows.rows.len(), 1);
+    }
+
+    /// Two of them are two, not one under a name they both answer to.
+    /// The registry that keeps a process to one write side per database
+    /// keys by path, so this is the test that the names it keys on are
+    /// actually different.
+    #[test]
+    fn two_databases_in_memory_share_nothing() {
+        let one = Database::memory().expect("memory");
+        let other = Database::memory().expect("memory");
+        assert_ne!(one.path(), other.path());
+        let mut writing = one.connect().expect("connect");
+        writing
+            .query("INSERT (p:person {uid: 1, name: 'ada'})")
+            .expect("ada");
+        let mut reading = other.connect().expect("connect");
+        let rows = reading
+            .query("MATCH (p:person) RETURN p.name")
+            .expect("read");
+        assert!(rows.rows.is_empty(), "the other database is still empty");
+    }
+
+    #[test]
+    fn a_database_in_memory_cannot_be_opened_read_only() {
+        let refused = Database::memory_with(Config::new().read_only(true));
+        assert!(matches!(refused, Err(ZuError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn a_database_on_disk_is_not_a_database_in_memory() {
+        let (_dir, path) = scratch("durable.zu1");
+        let db = Database::open(&path).expect("open");
+        assert!(!db.is_memory());
     }
 
     #[test]

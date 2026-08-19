@@ -1136,6 +1136,68 @@ pub unsafe extern "C" fn zu_database_create_z(
     unsafe { zu_database_create(path, zlen(path), cfg, out, err) }
 }
 
+/// Creates a database that never touches the filesystem. `cfg` may be
+/// NULL for the defaults.
+///
+/// The blocks a file would hold are held in memory instead, and the log
+/// beside it too, so everything above this point runs unchanged and
+/// nothing survives the process. Every call makes a database of its
+/// own; two connections on one handle are two views of one graph.
+///
+/// [`zu_database_path`] still answers, with a name that is not a path:
+/// it is what this process calls the database, which is what an error
+/// message needs and not something to open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_database_memory(
+    cfg: *const ZuConfig,
+    out: *mut *mut ZuDatabase,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let db = Database::memory_with(unsafe { config_of(cfg) }?)?;
+        let stored = c_message(&db.path().to_string_lossy());
+        unsafe { *out = Box::into_raw(Box::new(ZuDatabase { db, path: stored })) };
+        Ok(ZuStatus::Ok)
+    })
+}
+
+/// Whether this database is the kind that goes away with the process.
+/// `ZU_OK` for one in memory, `ZU_DONE` for one on disk, so a host that
+/// offers to back a database up, or warns before closing one, can ask
+/// without parsing the path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_database_is_memory(db: *const ZuDatabase) -> ZuStatus {
+    if db.is_null() {
+        return ZuStatus::Misuse;
+    }
+    match unsafe { &*db }.db.is_memory() {
+        true => ZuStatus::Ok,
+        false => ZuStatus::Done,
+    }
+}
+
+/// [`zu_database_memory`] and one connection on it, for a host that
+/// wants a scratch graph and nothing else. The database is discarded
+/// here and the connection keeps it alive, the same way [`zu_open`]
+/// does, so the bytes go when the connection closes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_memory(out: *mut *mut ZuConn, err: *mut *mut ZuError) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let db = Database::memory()?;
+        let conn = db.connect()?;
+        unsafe { *out = ZuConn::new(conn).into_raw() };
+        Ok(ZuStatus::Ok)
+    })
+}
+
 /// The path this database was opened with, valid until it is closed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zu_database_path(

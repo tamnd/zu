@@ -1,9 +1,10 @@
 $ zu shell --help
-zu shell: open an interactive session on a file
+zu shell: open an interactive session on a file, or on nothing
 
-usage: zu shell <file.zu1> [--format jsonl]
+usage: zu shell [<file.zu1>] [--format jsonl]
 
 examples:
+  zu shell
   zu shell graph.zu1
   zu shell graph.zu1 --format jsonl < frames.jsonl
 

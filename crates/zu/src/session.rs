@@ -211,6 +211,15 @@ impl Session {
         Session::attached(FileHandle::attach(path, false, || Zu1File::open(path))?)
     }
 
+    /// A session on a database that never touches the filesystem: the
+    /// blocks a file would hold, and the log beside it, held in memory
+    /// and gone when this session is. It is what the shell opens when
+    /// nobody named a file, and what a caller wanting a graph rather
+    /// than a directory reaches for.
+    pub fn memory() -> Result<Session> {
+        Session::on(crate::db::memory_file()?)
+    }
+
     /// A session over a file handle the caller opened, which is how
     /// [`crate::db::Database`] applies a read-only or memory-limited
     /// open without this module growing a constructor per option.

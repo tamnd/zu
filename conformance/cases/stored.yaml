@@ -617,3 +617,22 @@ cases:
             value: "50"
           - type: INT64
             value: "1"
+
+  - name: a-property-no-column-holds-is-null
+    doc: ISO 20.11. A property reference to a property the element does not have is null and not an error, which is the same answer an element carrying the property and holding nothing in it gives, so a query cannot tell a property nobody wrote from a property nobody stored. A graph where half the people have a nickname is one column half the rows are null in, and a graph where none of them do is the same question asked of no column.
+    query: MATCH (n:person) RETURN n.nickname AS v ORDER BY n.age LIMIT 1
+    columns:
+      - v
+    rows:
+      - values:
+          - type: NULL
+
+  - name: a-property-no-column-holds-is-null-in-a-predicate
+    doc: The same null read where a predicate reads it. A comparison against a null is unknown rather than false, so a filter on a property nobody stored answers no rows and refuses nothing.
+    query: MATCH (n:person) WHERE n.nickname = 'ann' RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "0"

@@ -194,12 +194,12 @@ impl Graph for SqliteGraph<'_> {
             };
         }
         // Without a stored `id` column the id is the offset, the same
-        // dense contract the zu1 facade keeps.
+        // dense contract the zu1 facade keeps, and a property no column
+        // holds is the null of ISO 20.11 here for the same reason it is
+        // there: one engine, one answer, whichever store is under it.
         match key {
             "id" => Ok(Value::Int(offset as i64)),
-            other => Err(ZuError::InvalidArgument(format!(
-                "unknown property '{other}' on table {table}"
-            ))),
+            _ => Ok(Value::Null),
         }
     }
 }
@@ -334,8 +334,11 @@ mod tests {
         .unwrap();
         assert_eq!(r.rows, [[Value::Int(1)], [Value::Int(3)]]);
 
-        let err = run("MATCH (a:person) RETURN a.nope AS x", &store, &[]).unwrap_err();
-        assert!(err.to_string().contains("unknown property"), "got: {err}");
+        // The same null a property no column holds reads on zu1, since
+        // which store is under the engine is not something ISO 20.11
+        // knows about.
+        let r = run("MATCH (a:person) RETURN a.nope AS x LIMIT 1", &store, &[]).unwrap();
+        assert_eq!(r.rows, [[Value::Null]]);
     }
 
     #[test]

@@ -1,0 +1,40 @@
+[package]
+name = "zu-adbc"
+description = "ADBC driver for zu: a result as an Arrow stream, to anything that speaks ADBC"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "zu_adbc"
+# Both, and for two different callers. `lib` is what a Rust program
+# links to get the driver with no C in between, which is the fast way
+# and the one the tests here use. `cdylib` is the shared object a driver
+# manager opens by name, which is how Python, R, Java, Go and C++ get
+# to it.
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+zudb = { package = "zu", path = "../zu" }
+# No features: what ADBC wants back is a `RecordBatchReader`, and the
+# driver exporter is what turns one into a C stream. `zu-arrow`'s own
+# `ffi` would be a second way to do the same thing.
+zu-arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+adbc_core = "0.24"
+adbc_ffi = "0.24"
+
+[dev-dependencies]
+tempfile.workspace = true
+# The other side of the C ABI, so that the round trip a real caller
+# makes is the one the tests make: open the built `cdylib` by path, go
+# through the driver manager, and read the stream back.
+adbc_driver_manager = "0.24"
+
+[lints]
+workspace = true

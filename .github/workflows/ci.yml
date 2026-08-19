@@ -223,6 +223,15 @@ jobs:
       # first try and it did not hold, the job kept failing with /DEBUG
       # still on the link line, so the two now build in separate passes
       # and never reach that file at the same time.
+      # The ADBC driver's round trip opens its own shared object the way
+      # a driver manager does, and `cargo test` builds the library as an
+      # rlib to link the test against and stops there, since nothing it
+      # knows about consumes a cdylib. The suite builds the file itself
+      # when it is missing, which is what a developer gets on a clean
+      # tree; building it here with the same features the tests use means
+      # that nested build finds its work already done rather than
+      # compiling the dependency tree a second way.
+      - run: cargo build -p zu-adbc --all-features
       - if: matrix.os == 'windows-latest'
         run: |
           cargo test --workspace --exclude zu-capi --all-features

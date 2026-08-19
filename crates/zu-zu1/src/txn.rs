@@ -114,8 +114,8 @@ pub struct Mvcc {
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
     /// Whether everything published here is a shape a reader can be
-    /// handed without a fold sealing it first. Three are: an integer
-    /// write onto a column of a row the base file already holds, the
+    /// handed without a fold sealing it first. Three are: a value
+    /// written onto a column of a row the base file already holds, the
     /// same write onto an edge the graph already runs through, and an
     /// edge added to a rel table, which the adjacency reader merges
     /// into the lists it holds. It starts true on an empty store and
@@ -129,27 +129,27 @@ pub struct Mvcc {
     deferred: Vec<Deferred>,
 }
 
-/// One integer write onto an existing row: table, row offset, column
-/// position in the props directory, and the word.
-pub type LaneWrite = (u32, u64, u32, u64);
+/// One write onto an existing row: table, row offset, column position
+/// in the props directory, and the value.
+pub type CellWrite = (u32, u64, u32, Cell);
 
-/// One integer write onto an edge: rel table, the rows the edge runs
-/// between, column position in the props directory, and the word.
+/// One write onto an edge: rel table, the rows the edge runs between,
+/// column position in the props directory, and the value.
 ///
 /// The pair is the only name a statement has for an edge. Which row of
 /// the property columns it holds is the ordinal it was loaded at, and
 /// working that out takes the adjacency reader, which lives on the
 /// write side rather than in here.
-pub type RelLaneWrite = (u32, u64, u64, u32, u64);
+pub type RelCellWrite = (u32, u64, u64, u32, Cell);
 
 /// One change a reader can be shown before a fold has sealed it.
 #[derive(Debug, Clone)]
 pub enum Deferred {
-    /// A word written onto a column of a row that is already there.
-    Lane(LaneWrite),
-    /// A word written onto a column of an edge the graph already runs
+    /// A value written onto a column of a row that is already there.
+    Cell(CellWrite),
+    /// A value written onto a column of an edge the graph already runs
     /// through.
-    RelLane(RelLaneWrite),
+    RelCell(RelCellWrite),
     /// An edge added to a rel table: the table, the rows it runs
     /// between, and the cell it holds in each column the table stores,
     /// by position in the props directory.
@@ -830,29 +830,33 @@ impl Mvcc {
         for op in ops {
             // What the op is about to put in the store, before the
             // store has it. Three shapes can be handed to a reader as
-            // they are, a word onto a row that is already there, the
-            // same word onto an edge, and an edge added to a rel table;
-            // everything else needs a fold to become readable, and a
-            // store that holds one of those needs a fold whatever else
-            // arrives after it.
+            // they are, a value onto a row that is already there, the
+            // same value onto an edge, and an edge added to a rel
+            // table; everything else needs a fold to become readable,
+            // and a store that holds one of those needs a fold whatever
+            // else arrives after it. A write of nothing at all is in
+            // the second group: what it changes is the validity mask,
+            // and no patch carries one.
             match &op {
                 Op::Update {
                     table,
                     offset,
                     col,
-                    value: Cell::Int(word),
-                } if self.soft => self
-                    .deferred
-                    .push(Deferred::Lane((*table, *offset, *col, *word))),
+                    value: value @ (Cell::Int(_) | Cell::Str(_)),
+                } if self.soft => {
+                    self.deferred
+                        .push(Deferred::Cell((*table, *offset, *col, value.clone())))
+                }
                 Op::UpdateRel {
                     rel,
                     src,
                     dst,
                     col,
-                    value: Cell::Int(word),
-                } if self.soft => self
-                    .deferred
-                    .push(Deferred::RelLane((*rel, *src, *dst, *col, *word))),
+                    value: value @ (Cell::Int(_) | Cell::Str(_)),
+                } if self.soft => {
+                    self.deferred
+                        .push(Deferred::RelCell((*rel, *src, *dst, *col, value.clone())))
+                }
                 Op::InsertRel {
                     rel,
                     src,

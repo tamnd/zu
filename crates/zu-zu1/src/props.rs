@@ -1379,42 +1379,63 @@ struct StrChunk {
 }
 
 /// The cell writes a commit made that no fold has sealed into the
-/// columns yet, for the lane columns of one table.
+/// columns of one table yet.
 ///
 /// A commit used to fold because a reader read the sealed file and
 /// nothing else, so a change that was not folded was a change the next
 /// `MATCH` could not see. Rewriting a column to change one cell of it
 /// is most of what a point write cost. A reader holding one of these
-/// reads the column as it stands and puts the newer words over the
+/// reads the column as it stands and puts the newer values over the
 /// rows the patch names, which is what lets the fold wait for the
 /// checkpoint.
 ///
-/// Lane columns and no nulls, which is the write whose new value is a
-/// word that goes straight over the word the column holds. A commit
-/// that writes a string or takes a value away folds the way it always
-/// did, and that is what keeps the blob side, the validity masks and
-/// the label bitset out of here.
+/// A value goes over the value the row already holds, so what is
+/// refused is the write that has nowhere to go over: a value taken
+/// away, which lives in the validity mask, and a label, which lives in
+/// a bitset of its own. Both fold the way they always did.
 #[derive(Debug, Default, Clone)]
-pub struct LanePatch {
-    /// Row and new word, ascending by row, for each column the commit
-    /// wrote into. Ascending because a reader asks about a chunk at a
-    /// time and a run of rows sharing one is then a subslice.
+pub struct CellPatch {
+    /// Row and new word, ascending by row, for each lane column the
+    /// commit wrote into. Ascending because a reader asks about a chunk
+    /// at a time and a run of rows sharing one is then a subslice.
     cols: BTreeMap<usize, Vec<(u64, u64)>>,
+    /// Row and new bytes the same way, for the columns stored as
+    /// blobs. They are apart from the words because the two are read
+    /// through different paths all the way down, a lane gather against
+    /// a blob range, and nothing asks for both at once.
+    strs: BTreeMap<usize, Vec<(u64, Vec<u8>)>>,
 }
 
-impl LanePatch {
-    pub fn new(cols: BTreeMap<usize, Vec<(u64, u64)>>) -> Self {
-        Self { cols }
+impl CellPatch {
+    pub fn new(
+        cols: BTreeMap<usize, Vec<(u64, u64)>>,
+        strs: BTreeMap<usize, Vec<(u64, Vec<u8>)>>,
+    ) -> Self {
+        Self { cols, strs }
     }
 
     pub fn is_empty(&self) -> bool {
         self.cols.values().all(|rows| rows.is_empty())
+            && self.strs.values().all(|rows| rows.is_empty())
     }
 
     /// How many cells this holds, which is what a writer bounds when it
     /// decides whether to keep deferring the fold.
     pub fn cells(&self) -> usize {
-        self.cols.values().map(Vec::len).sum()
+        self.cols.values().map(Vec::len).sum::<usize>()
+            + self.strs.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// How many bytes the strings in it hold between them, the other
+    /// thing that writer bounds: a word is a word, but a string is
+    /// whatever the statement wrote, and a run of long ones would be
+    /// carried until the next fold.
+    pub fn bytes(&self) -> usize {
+        self.strs
+            .values()
+            .flat_map(|rows| rows.iter())
+            .map(|(_, bytes)| bytes.len())
+            .sum()
     }
 
     fn of(&self, col: usize) -> &[(u64, u64)] {
@@ -1436,6 +1457,24 @@ impl LanePatch {
         rows.get(at).filter(|&&(r, _)| r == row).map(|&(_, v)| v)
     }
 
+    /// The bytes written onto row `row` of blob column `col`.
+    fn bytes_of(&self, col: usize, row: u64) -> Option<&[u8]> {
+        let rows = self.strs.get(&col)?;
+        let at = rows.partition_point(|(r, _)| *r < row);
+        rows.get(at)
+            .filter(|(r, _)| *r == row)
+            .map(|(_, bytes)| &bytes[..])
+    }
+
+    /// The blob entries for rows `lo..hi`, a subslice for the same
+    /// reason [`Self::span`] is one.
+    fn str_span(&self, col: usize, lo: u64, hi: u64) -> &[(u64, Vec<u8>)] {
+        let rows = self.strs.get(&col).map_or(&[][..], Vec::as_slice);
+        let from = rows.partition_point(|(row, _)| *row < lo);
+        let to = rows.partition_point(|(row, _)| *row < hi);
+        &rows[from..to]
+    }
+
     /// `bounds` widened over whatever this holds for rows `lo..hi`.
     ///
     /// A zone is there to be skipped past, so it has to hold every
@@ -1455,7 +1494,7 @@ impl LanePatch {
 
 /// The rows a commit added that no fold has put in the columns yet.
 ///
-/// [`LanePatch`] carries a new word for a row the columns already hold,
+/// [`CellPatch`] carries a new value for a row the columns already hold,
 /// which is an update. This carries whole rows past the end of them,
 /// which is what an edge insert leaves behind once the adjacency reader
 /// stopped needing the CSR rebuilt to see it: the edge takes the next
@@ -1508,6 +1547,19 @@ impl RowPatch {
         self.rows.is_empty()
     }
 
+    /// How many bytes of string the rows hold between them, which a
+    /// writer bounds along with the count of them.
+    pub fn bytes(&self) -> usize {
+        self.rows
+            .iter()
+            .flatten()
+            .map(|cell| match cell {
+                Cell::Str(bytes) => bytes.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// The cell row `row` holds in `col`, or `None` when the row is one
     /// the columns already hold or the column was never given a value.
     fn get(&self, col: usize, row: u64) -> Option<&Cell> {
@@ -1528,7 +1580,7 @@ impl RowPatch {
     }
 
     /// The bytes row `row` holds in `col`, empty where it holds none.
-    fn bytes(&self, col: usize, row: u64) -> Option<&[u8]> {
+    fn bytes_of(&self, col: usize, row: u64) -> Option<&[u8]> {
         match self.get(col, row) {
             Some(Cell::Str(bytes)) => Some(bytes),
             Some(_) => Some(&[]),
@@ -1557,9 +1609,9 @@ pub struct PropsReader {
     label_state: Option<(Arc<ChunkDirectory>, ChunkCache)>,
     /// Row order scratch for the gathers, reused across calls.
     order_scratch: Vec<u32>,
-    /// Committed words the columns below do not hold yet. Shared,
+    /// Committed cells the columns below do not hold yet. Shared,
     /// because a query hands the same patch to every worker it forks.
-    patch: Option<Arc<LanePatch>>,
+    patch: Option<Arc<CellPatch>>,
     /// Committed rows they do not hold yet, the same way.
     added: Option<Arc<RowPatch>>,
 }
@@ -1578,9 +1630,9 @@ impl PropsReader {
         }
     }
 
-    /// Hands this reader the committed words its columns do not hold
+    /// Hands this reader the committed cells its columns do not hold
     /// yet, or takes them away when a fold has sealed them.
-    pub fn set_patch(&mut self, patch: Option<Arc<LanePatch>>) {
+    pub fn set_patch(&mut self, patch: Option<Arc<CellPatch>>) {
         self.patch = patch.filter(|p| !p.is_empty());
     }
 
@@ -1795,7 +1847,44 @@ impl PropsReader {
         }
         bytes.clear();
         ends.clear();
-        read_blob_range(db, &column.meta, start, end, bytes, ends)
+        read_blob_range(db, &column.meta, start, end, bytes, ends)?;
+        self.overwrite(col, start, bytes, ends);
+        Ok(())
+    }
+
+    /// Puts the unsealed strings of `col` over the range just read into
+    /// `bytes` and `ends`, which starts at row `start`.
+    ///
+    /// A blob range is one buffer with the values end to end, so a
+    /// value that changed length moves every value behind it and there
+    /// is nothing to write in place. The range is rebuilt instead, and
+    /// only when the patch has something inside it, which is what keeps
+    /// a scan of a column no commit has touched exactly as it was.
+    fn overwrite(&self, col: usize, start: u64, bytes: &mut Vec<u8>, ends: &mut Vec<u64>) {
+        let Some(patch) = &self.patch else {
+            return;
+        };
+        let written = patch.str_span(col, start, start + ends.len() as u64);
+        if written.is_empty() {
+            return;
+        }
+        let mut fresh = Vec::with_capacity(bytes.len());
+        let mut moved = Vec::with_capacity(ends.len());
+        let mut at = 0usize;
+        let mut lo = 0usize;
+        for (i, &hi) in ends.iter().enumerate() {
+            match written.get(at) {
+                Some((row, new)) if *row == start + i as u64 => {
+                    fresh.extend_from_slice(new);
+                    at += 1;
+                }
+                _ => fresh.extend_from_slice(&bytes[lo..hi as usize]),
+            }
+            moved.push(fresh.len() as u64);
+            lo = hi as usize;
+        }
+        *bytes = fresh;
+        *ends = moved;
     }
 
     pub fn read_int(&mut self, db: &mut Zu1File, col: usize, row: u64) -> Result<u64> {
@@ -1942,13 +2031,23 @@ impl PropsReader {
                 let bytes = self
                     .added
                     .as_ref()
-                    .and_then(|p| p.bytes(col, row))
+                    .and_then(|p| p.bytes_of(col, row))
                     .ok_or_else(|| {
                         ZuError::InvalidArgument(format!(
                             "row {row} out of 0..{}",
                             meta.value_count
                         ))
                     })?;
+                spans[ix as usize] = (staged.len(), staged.len() + bytes.len());
+                staged.extend_from_slice(bytes);
+                continue;
+            }
+            // A row the column holds but a commit has written over
+            // since, taken here rather than after the walk the way the
+            // words are: the walk stages the bytes it decodes, so
+            // going over them afterwards would mean moving the spans
+            // of every row behind this one.
+            if let Some(bytes) = self.patch.as_ref().and_then(|p| p.bytes_of(col, row)) {
                 spans[ix as usize] = (staged.len(), staged.len() + bytes.len());
                 staged.extend_from_slice(bytes);
                 continue;
@@ -1995,7 +2094,7 @@ impl PropsReader {
         row: u64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        if let Some(bytes) = self.added.as_ref().and_then(|p| p.bytes(col, row)) {
+        if let Some(bytes) = self.added.as_ref().and_then(|p| p.bytes_of(col, row)) {
             out.extend_from_slice(bytes);
             return Ok(());
         }
@@ -2005,6 +2104,10 @@ impl PropsReader {
                 "row {row} out of 0..{}",
                 meta.value_count
             )));
+        }
+        if let Some(bytes) = self.patch.as_ref().and_then(|p| p.bytes_of(col, row)) {
+            out.extend_from_slice(bytes);
+            return Ok(());
         }
         let chunk = row / CHUNK_ROWS as u64;
         if !self.str_state.get(&col).is_some_and(|c| c.chunk == chunk) {
@@ -2188,6 +2291,68 @@ mod tests {
 
         // A row past the patch is still out of range.
         assert!(reader.gather_int(&mut db, age, &[6], &mut out).is_err());
+    }
+
+    /// Strings written over rows the column already holds are read the
+    /// same way, by the same three paths, and the lengths change under
+    /// them: a blob range is one buffer of values end to end, so a
+    /// value that grew moves every value behind it.
+    #[test]
+    fn written_strings_are_read_by_every_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = setup(dir.path());
+        let names: Vec<&[u8]> = vec![b"ada", b"kay", b"joe", b"amy"];
+        store_props(&mut db, "person", &[("name", PropValues::Str(&names))]).unwrap();
+        let table = Catalog::load(&mut db)
+            .unwrap()
+            .node_by_name("person")
+            .unwrap()
+            .id;
+        let mut reader = PropsReader::new(load_props(&mut db, table).unwrap().unwrap());
+        let name = reader.col("name").unwrap();
+
+        // One longer than what it goes over and one shorter, so neither
+        // direction of the shift is the untested one.
+        let strs = BTreeMap::from([(
+            name,
+            vec![(1u64, b"katherine".to_vec()), (3, b"al".to_vec())],
+        )]);
+        reader.set_patch(Some(Arc::new(CellPatch::new(BTreeMap::new(), strs))));
+
+        let mut bytes = Vec::new();
+        reader.read_str(&mut db, name, 1, &mut bytes).unwrap();
+        assert_eq!(bytes, b"katherine");
+        bytes.clear();
+        reader.read_str(&mut db, name, 2, &mut bytes).unwrap();
+        assert_eq!(bytes, b"joe");
+
+        // A gather takes its rows in caller order, and a written row in
+        // the middle of one must not move the rows around it.
+        let mut ends = Vec::new();
+        bytes.clear();
+        reader
+            .gather_str(&mut db, name, &[3, 1, 0], &mut bytes, &mut ends)
+            .unwrap();
+        assert_eq!(ends, [2, 11, 14]);
+        assert_eq!(&bytes[..], b"alkatherineada");
+
+        // And the range a scan reads is rebuilt around what it holds.
+        bytes.clear();
+        ends.clear();
+        reader
+            .scan_str_range(&mut db, name, 0, 4, &mut bytes, &mut ends)
+            .unwrap();
+        assert_eq!(ends, [3, 12, 15, 17]);
+        assert_eq!(&bytes[..], b"adakatherinejoeal");
+
+        // A range that holds none of them is left exactly as it was.
+        bytes.clear();
+        ends.clear();
+        reader
+            .scan_str_range(&mut db, name, 2, 3, &mut bytes, &mut ends)
+            .unwrap();
+        assert_eq!(ends, [3]);
+        assert_eq!(&bytes[..], b"joe");
     }
 
     #[test]

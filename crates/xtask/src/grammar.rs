@@ -23,9 +23,16 @@
 //! not required, and deliberately: the vocabulary holds the words the
 //! parser refuses by name, `MERGE`, `FILTER`, `LET` and the rest, and
 //! those are coloured everywhere and parsed nowhere.
+//!
+//! Two of the three live here and the tree-sitter grammar does not: it
+//! is [`REPOSITORY`], and a checkout of it is something this may or may
+//! not find. So the shell half and the Shiki half always run, the
+//! tree-sitter half runs when there is a grammar to run it against, and
+//! the grammar's own CI is what makes sure that happens on every change
+//! to either side.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use zu_json::Json;
 
@@ -41,14 +48,62 @@ pub const PATH: &str = "grammar/vocabulary.toml";
 /// The shell's own table, checked against the list.
 pub const SHELL: &str = "crates/zu-cli/src/highlight.rs";
 
-/// The tree-sitter grammar, checked against the list.
-pub const GRAMMAR: &str = "grammar/tree-sitter-gql/grammar.js";
+/// The tree-sitter grammar, checked against the list. A path inside a
+/// checkout of the grammar's repository rather than of this one.
+pub const GRAMMAR: &str = "grammar.js";
 
-/// The tree-sitter highlight query, written from the list.
-pub const HIGHLIGHTS: &str = "grammar/tree-sitter-gql/queries/highlights.scm";
+/// The tree-sitter highlight query, written from the list. Also a path
+/// inside that checkout.
+pub const HIGHLIGHTS: &str = "queries/highlights.scm";
+
+/// Where the grammar lives now that it is not in this repository.
+pub const REPOSITORY: &str = "https://github.com/tamnd/tree-sitter-gql";
+
+/// The variable that says where a checkout of it is.
+pub const CHECKOUT: &str = "ZU_TREE_SITTER";
 
 /// The TextMate grammar Shiki reads, written from the list.
 pub const TEXTMATE: &str = "grammar/shiki/gql.tmLanguage.json";
+
+/// A checkout of the tree-sitter grammar, and its `grammar.js`.
+///
+/// The grammar is a repository of its own, because most of what it
+/// weighed was the generated parser and a clone of the engine paid for
+/// every rewrite of it. So the half of this audit that concerns the
+/// grammar runs where the grammar is: its CI checks this repository out
+/// and runs `cargo xtask grammar` against its own tree. Here, a
+/// checkout is a thing that may or may not be beside you, and the audit
+/// says which half it did.
+#[derive(Debug, Clone)]
+pub struct TreeSitter {
+    pub dir: PathBuf,
+    pub js: String,
+}
+
+impl TreeSitter {
+    /// The checkout to audit against: `$ZU_TREE_SITTER` when it is set,
+    /// and a sibling directory called `tree-sitter-gql` when it is not.
+    /// A variable that points at nothing is an error rather than a
+    /// skip, because a job that set it meant to check something.
+    pub fn find(root: &Path) -> Result<Option<TreeSitter>, String> {
+        let (dir, asked) = match std::env::var_os(CHECKOUT) {
+            Some(dir) if !dir.is_empty() => (PathBuf::from(dir), true),
+            _ => (root.join("..").join("tree-sitter-gql"), false),
+        };
+        let js = match std::fs::read_to_string(dir.join(GRAMMAR)) {
+            Ok(js) => js,
+            Err(_) if !asked => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "reading {}: {e}. {CHECKOUT} says the tree-sitter grammar is there, and \
+                     it is not; the grammar is {REPOSITORY}",
+                    dir.join(GRAMMAR).display()
+                ));
+            }
+        };
+        Ok(Some(TreeSitter { dir, js }))
+    }
+}
 
 /// What a word is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -127,10 +182,12 @@ pub struct Vocabulary {
     pub groups: Vec<Group>,
 }
 
-/// A file this module writes, and what should be in it.
+/// A file this module writes, and what should be in it. The path is
+/// where the file is, which for the highlight query is inside somebody
+/// else's checkout.
 #[derive(Debug, Clone)]
 pub struct Generated {
-    pub path: &'static str,
+    pub path: PathBuf,
     pub text: String,
 }
 
@@ -242,18 +299,22 @@ impl Vocabulary {
         words
     }
 
-    /// The files written from the list.
-    pub fn generated(&self, grammar_js: &str) -> Vec<Generated> {
-        vec![
-            Generated {
-                path: HIGHLIGHTS,
-                text: self.highlights(grammar_js),
-            },
-            Generated {
-                path: TEXTMATE,
-                text: self.textmate(),
-            },
-        ]
+    /// The files written from the list. The highlight query is one of
+    /// them only when the grammar it names the tokens of is here to be
+    /// read.
+    pub fn generated(&self, root: &Path, tree_sitter: Option<&TreeSitter>) -> Vec<Generated> {
+        let mut out = Vec::new();
+        if let Some(ts) = tree_sitter {
+            out.push(Generated {
+                path: ts.dir.join(HIGHLIGHTS),
+                text: self.highlights(&ts.js),
+            });
+        }
+        out.push(Generated {
+            path: root.join(TEXTMATE),
+            text: self.textmate(),
+        });
+        out
     }
 
     /// The tree-sitter highlight query.
@@ -546,7 +607,11 @@ impl Vocabulary {
     /// tree-sitter grammar spells. This runs whether the generated
     /// files are being written or checked, because writing them does
     /// not fix either one.
-    pub fn consistency(&self, root: &Path) -> Result<Vec<String>, String> {
+    pub fn consistency(
+        &self,
+        root: &Path,
+        tree_sitter: Option<&TreeSitter>,
+    ) -> Result<Vec<String>, String> {
         let mut notes = Vec::new();
         let shell_path = root.join(SHELL);
         let shell_text = std::fs::read_to_string(&shell_path)
@@ -575,16 +640,17 @@ impl Vocabulary {
             }
         }
 
-        let grammar_path = root.join(GRAMMAR);
-        let grammar_text = std::fs::read_to_string(&grammar_path)
-            .map_err(|e| format!("reading {}: {e}", grammar_path.display()))?;
-        let known: BTreeSet<&str> = self.all().into_iter().map(|(word, _)| word).collect();
-        for word in spelled(&grammar_text) {
-            if !known.contains(word.as_str()) {
-                notes.push(format!(
-                    "{GRAMMAR} parses {word:?} as a keyword and {PATH} has never heard of it, so \
-                     it is a word an editor colours and the shell does not"
-                ));
+        if let Some(ts) = tree_sitter {
+            let known: BTreeSet<&str> = self.all().into_iter().map(|(word, _)| word).collect();
+            let grammar = ts.dir.join(GRAMMAR);
+            for word in spelled(&ts.js) {
+                if !known.contains(word.as_str()) {
+                    notes.push(format!(
+                        "{} parses {word:?} as a keyword and {PATH} has never heard of it, so it \
+                         is a word an editor colours and the shell does not",
+                        grammar.display()
+                    ));
+                }
             }
         }
         Ok(notes)
@@ -592,18 +658,18 @@ impl Vocabulary {
 
     /// The above, and the generated files against what they would be
     /// written as now.
-    pub fn check(&self, root: &Path) -> Result<Vec<String>, String> {
-        let mut notes = self.consistency(root)?;
-        let grammar_path = root.join(GRAMMAR);
-        let grammar_text = std::fs::read_to_string(&grammar_path)
-            .map_err(|e| format!("reading {}: {e}", grammar_path.display()))?;
-        for file in self.generated(&grammar_text) {
-            let path = root.join(file.path);
-            let found = std::fs::read_to_string(&path).unwrap_or_default();
+    pub fn check(
+        &self,
+        root: &Path,
+        tree_sitter: Option<&TreeSitter>,
+    ) -> Result<Vec<String>, String> {
+        let mut notes = self.consistency(root, tree_sitter)?;
+        for file in self.generated(root, tree_sitter) {
+            let found = std::fs::read_to_string(&file.path).unwrap_or_default();
             if found != file.text {
                 notes.push(format!(
                     "{} is not what {PATH} writes; run `cargo xtask grammar`",
-                    file.path
+                    file.path.display()
                 ));
             }
         }
@@ -611,22 +677,22 @@ impl Vocabulary {
     }
 
     /// Writes the generated files, and says which ones changed.
-    pub fn write(&self, root: &Path) -> Result<Vec<&'static str>, String> {
-        let grammar_path = root.join(GRAMMAR);
-        let grammar_text = std::fs::read_to_string(&grammar_path)
-            .map_err(|e| format!("reading {}: {e}", grammar_path.display()))?;
+    pub fn write(
+        &self,
+        root: &Path,
+        tree_sitter: Option<&TreeSitter>,
+    ) -> Result<Vec<PathBuf>, String> {
         let mut written = Vec::new();
-        for file in self.generated(&grammar_text) {
-            let path = root.join(file.path);
-            if std::fs::read_to_string(&path).ok().as_deref() == Some(file.text.as_str()) {
+        for file in self.generated(root, tree_sitter) {
+            if std::fs::read_to_string(&file.path).ok().as_deref() == Some(file.text.as_str()) {
                 continue;
             }
-            if let Some(dir) = path.parent() {
+            if let Some(dir) = file.path.parent() {
                 std::fs::create_dir_all(dir)
                     .map_err(|e| format!("creating {}: {e}", dir.display()))?;
             }
-            std::fs::write(&path, &file.text)
-                .map_err(|e| format!("writing {}: {e}", path.display()))?;
+            std::fs::write(&file.path, &file.text)
+                .map_err(|e| format!("writing {}: {e}", file.path.display()))?;
             written.push(file.path);
         }
         Ok(written)

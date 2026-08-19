@@ -624,28 +624,32 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: grammar/package-lock.json
+      # The editor's grammar, which is tamnd/tree-sitter-gql and used to
+      # be a directory here. Checked out so the audit below covers all
+      # three highlighters rather than the two that live here.
+      - uses: actions/checkout@v7
+        with:
+          repository: tamnd/tree-sitter-gql
+          path: tree-sitter-gql
       # One word list, three highlighters. This is the check that the
       # shell's table, the editor grammar and the website's grammar
       # still hold the same words, and that the two generated files are
       # the ones the list writes.
       - run: cargo run -p xtask -- grammar --check
+        env:
+          ZU_TREE_SITTER: ${{ github.workspace }}/tree-sitter-gql
       # A hundred and fifty words is not the size this list ends at, so
       # the bench asserts the cost per word stays flat rather than
       # asserting a total.
       - run: cargo bench -p xtask --bench grammar
+        env:
+          ZU_TREE_SITTER: ${{ github.workspace }}/tree-sitter-gql
       - run: npm ci
         working-directory: grammar
-      # The parser is generated from grammar.js and committed, because
-      # an editor package builds from the C rather than from the CLI.
-      # Regenerating it here is what keeps the committed C derived: a
-      # grammar edited without regenerating fails on the diff.
-      - run: npm run generate
-        working-directory: grammar
-      - run: git diff --exit-code -- grammar
-      # The corpus is the gate. Every statement the engine answers has
-      # to parse with no error node, and every statement it answers with
-      # a syntax error has to fail to parse, which is the half a grammar
-      # that accepts everything would pass.
+      # The website's grammar against the corpus: no word in a thousand
+      # statements is painted as a kind of word it is not. The editor
+      # grammar gets the same corpus put to it by its own CI, which runs
+      # this repository's reader against its own tree.
       - run: npm test
         working-directory: grammar
 

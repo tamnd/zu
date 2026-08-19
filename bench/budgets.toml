@@ -1534,17 +1534,24 @@ delete_stmt_kb = 4096.0
 detach_stmt_us = 250000.0
 detach_stmt_kb = 8192.0
 
-# A SET of one property of one edge, measured 20 to 34 ms and 2580 kB at
-# 10000 rows and 10000 edges. It is the same statement as the node SET
-# against a column of a different shape: a node column is in row order,
-# so a change lands in one place in it, while an edge column is dense
-# over the edges in the order the table holds them and the change names
-# the pair of rows the edge runs between instead of an offset. The fold
-# therefore rewrites the column through the edge order it rebuilds,
-# which is why the bytes sit near the DETACH DELETE number rather than
-# the node SET one. Lower these ceilings, never raise them.
+# A SET of one property of one edge, measured 3.6 ms, 398 us of
+# processor time and 15.7 kB at 10000 rows and 10000 edges. It is the
+# same statement as the node SET against a column of a different shape:
+# a node column is in row order, so a change lands in one place in it,
+# while an edge column is dense over the edges in the order the table
+# holds them and the change names the pair of rows the edge runs between
+# instead of an offset. That used to mean a fold per statement, which
+# rewrote the column through the edge order it rebuilt and put the bytes
+# near the DETACH DELETE number, 2580 kB. The writer now works the pair
+# into the ordinal it holds and the word goes in the patch, so the bytes
+# are the log frame and nothing else and the store does not grow at all.
+# The processor ceiling is the one that says the ordinal lookup stayed a
+# lookup rather than becoming a scan. Lower these ceilings, never raise
+# them.
 set_edge_stmt_us = 250000.0
-set_edge_stmt_kb = 8192.0
+set_edge_stmt_kb = 64.0
+set_edge_stmt_cpu_us = 1200.0
+set_edge_stmt_growth_b = 2048.0
 
 # A SET of the whole record of one element, measured 34 to 46 ms and 1556
 # kB at 10000 rows, which is the same bytes as a SET of one property of

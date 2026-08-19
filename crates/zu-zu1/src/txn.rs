@@ -114,9 +114,10 @@ pub struct Mvcc {
     /// epochs; the fold frees these blocks once the data is sealed.
     ingests: Vec<(Epoch, BlockPtr)>,
     /// Whether everything published here is a shape a reader can be
-    /// handed without a fold sealing it first. Two are: an integer
-    /// write onto a column of a row the base file already holds, and
-    /// an edge added to a rel table, which the adjacency reader merges
+    /// handed without a fold sealing it first. Three are: an integer
+    /// write onto a column of a row the base file already holds, the
+    /// same write onto an edge the graph already runs through, and an
+    /// edge added to a rel table, which the adjacency reader merges
     /// into the lists it holds. It starts true on an empty store and
     /// one commit of any other shape turns it off until the next fold
     /// empties the store again.
@@ -132,11 +133,23 @@ pub struct Mvcc {
 /// position in the props directory, and the word.
 pub type LaneWrite = (u32, u64, u32, u64);
 
+/// One integer write onto an edge: rel table, the rows the edge runs
+/// between, column position in the props directory, and the word.
+///
+/// The pair is the only name a statement has for an edge. Which row of
+/// the property columns it holds is the ordinal it was loaded at, and
+/// working that out takes the adjacency reader, which lives on the
+/// write side rather than in here.
+pub type RelLaneWrite = (u32, u64, u64, u32, u64);
+
 /// One change a reader can be shown before a fold has sealed it.
 #[derive(Debug, Clone)]
 pub enum Deferred {
     /// A word written onto a column of a row that is already there.
     Lane(LaneWrite),
+    /// A word written onto a column of an edge the graph already runs
+    /// through.
+    RelLane(RelLaneWrite),
     /// An edge added to a rel table: the table, the rows it runs
     /// between, and the cell it holds in each column the table stores,
     /// by position in the props directory.
@@ -816,11 +829,12 @@ impl Mvcc {
         self.deferred.clear();
         for op in ops {
             // What the op is about to put in the store, before the
-            // store has it. Two shapes can be handed to a reader as
-            // they are, a word onto a row that is already there and an
-            // edge added to a rel table; everything else needs a fold
-            // to become readable, and a store that holds one of those
-            // needs a fold whatever else arrives after it.
+            // store has it. Three shapes can be handed to a reader as
+            // they are, a word onto a row that is already there, the
+            // same word onto an edge, and an edge added to a rel table;
+            // everything else needs a fold to become readable, and a
+            // store that holds one of those needs a fold whatever else
+            // arrives after it.
             match &op {
                 Op::Update {
                     table,
@@ -830,6 +844,15 @@ impl Mvcc {
                 } if self.soft => self
                     .deferred
                     .push(Deferred::Lane((*table, *offset, *col, *word))),
+                Op::UpdateRel {
+                    rel,
+                    src,
+                    dst,
+                    col,
+                    value: Cell::Int(word),
+                } if self.soft => self
+                    .deferred
+                    .push(Deferred::RelLane((*rel, *src, *dst, *col, *word))),
                 Op::InsertRel {
                     rel,
                     src,

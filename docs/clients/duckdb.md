@@ -100,7 +100,7 @@ What it had not, all of which `zu-python` had:
 - no `register`, so the zero-copy frame path, the fastest thing this engine does across a boundary, was not reachable from Node at all, which `register` now is
 - no bulk load, so a program could not build a database from Node, which `load` now does
 - no Arrow, no columnar read of any kind, of which `columnar` is the second half: the same buffers `zu::query::column` fills, handed over as typed arrays, with Arrow itself still owed
-- no `rowsRead` and no progress callback, which is the one row of the list still open
+- no `rowsRead` and no progress callback, which `rowsRead` and `progress()` now are
 
 The columnar read was the one to look at first alongside the numbers. `duck runAndReadAll getColumns` is 333 ms where the same rows as objects are 615 ms, and our own object path is 3198 ms. It was the single largest thing missing, and it was also the one that a columnar result made cheap to add.
 
@@ -121,7 +121,7 @@ DuckDB's Python connection has 71 public members and its module 181. Ours has 14
 | `register` / `unregister` | `register` / `unregister`, faster | `register` / `unregister` | done |
 | `append(table, df)` | `appender()` | `appender()`, and `load` for a whole database | done |
 | `begin` / `commit` / `rollback` | `transaction()` | `transaction()` | done |
-| `interrupt()`, `query_progress()` | `interrupt()`, `rows_read` | `AbortSignal` only | progress owed for Node |
+| `interrupt()`, `query_progress()` | `interrupt()`, `rows_read` | `AbortSignal`, `rowsRead`, `progress()` | done |
 | `cursor()` / `duplicate()` | `cursor()`, and `duplicate()` under the name that says what it does | `duplicate()`, since `cursor()` is a cursor over rows here | done |
 | prepared statements | `prepare()` | `prepare()` | done |
 | `explain`, profiling | `explain()`, `profile()` | `explain()`, `profile()` | done |
@@ -143,6 +143,6 @@ In order, largest effect first.
 3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result. Done, all five. Arrow itself over the C Data Interface is what is left of it, and it is item 2's other half.
 4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on. Done in both.
 5. Real streaming, meaning a result read a chunk at a time as the executor produces it rather than a slice of a result that is already whole.
-6. The small ones: an in-memory connection that does not make a file and a second connection made from the first are both done in both clients, and both are the engine's own answer rather than a special case in either one. What is left of this row is a progress callback in Node.
+6. The small ones: an in-memory connection that does not make a file, a second connection made from the first, and a progress callback, all done in both clients now. The first two are the engine's own answer rather than a special case in either one, and the third is a timer over a counter the engine was already keeping.
 
 Item 1's second half is the only thing left that the live measurement asks for, and it is 22 of the 26 milliseconds. Item 5 is what a user with more rows than memory needs, and today neither client has an answer for them.

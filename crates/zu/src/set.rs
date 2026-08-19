@@ -80,8 +80,13 @@ pub(crate) enum At {
 /// Nothing is written here: a statement that cannot be written has to
 /// raise before the transaction opens, so that the failing case costs
 /// no log write and no fold.
-/// The property columns of the tables writes have touched, held by the
-/// session rather than by the statement.
+/// The property columns of the tables writes have touched, and how many
+/// rows they hold, held by the session rather than by the statement.
+///
+/// A `SET` wants the columns, because a value has to meet the column it
+/// is going into. An `INSERT` wants the count as well, because the row
+/// it appends goes on the end of every column and the offset it lands
+/// at is that count plus whatever the patch has added since.
 ///
 /// Which tables those are is not known until the rows arrive, because a
 /// slot the write names is bound by a match and a match can leave
@@ -94,7 +99,7 @@ pub(crate) enum At {
 /// and that moves the header epoch, so the session drops this along
 /// with the plans and the readers an epoch move invalidates.
 #[derive(Default)]
-pub(crate) struct Dirs(BTreeMap<u32, Vec<PropColumn>>);
+pub(crate) struct Dirs(BTreeMap<u32, (Vec<PropColumn>, u64)>);
 
 impl Dirs {
     /// The columns of `table`, read from the file the first time and
@@ -105,14 +110,8 @@ impl Dirs {
     /// directory is what holds that order, so which of the two is read
     /// comes from what the element is.
     fn columns(&mut self, db: &mut Zu1File, table: u32, at: &At) -> Result<&[PropColumn]> {
-        if let Entry::Vacant(empty) = self.0.entry(table) {
-            let dir = match at {
-                At::Row(_) => load_props(db, table)?,
-                At::Edge(..) => load_rel_props(db, table)?,
-            };
-            empty.insert(dir.map_or_else(Vec::new, |dir| dir.columns));
-        }
-        let columns = &self.0[&table];
+        self.load(db, table, matches!(at, At::Edge(..)))?;
+        let columns = &self.0[&table].0;
         if columns.is_empty() {
             return Err(ZuError::Unsupported {
                 what: "setting a property on an element of a table that stores none",
@@ -120,6 +119,41 @@ impl Dirs {
             });
         }
         Ok(columns)
+    }
+
+    /// The columns of a node table and how many rows they hold, which
+    /// is what an `INSERT` needs: the row it appends goes on the end of
+    /// every column and the offset it lands at is the count.
+    pub(crate) fn node(&mut self, db: &mut Zu1File, table: u32) -> Result<(&[PropColumn], u64)> {
+        self.load(db, table, false)?;
+        let held = &self.0[&table];
+        Ok((&held.0, held.1))
+    }
+
+    /// The columns of a rel table, empty for a table that stores
+    /// nothing on its edges, which is most of them.
+    pub(crate) fn rel(&mut self, db: &mut Zu1File, rel: u32) -> Result<&[PropColumn]> {
+        self.load(db, rel, true)?;
+        Ok(&self.0[&rel].0)
+    }
+
+    /// The columns of a table already read, for a caller that read them
+    /// a moment ago and wants to hold on to them rather than to this.
+    /// A table nothing has read has none, which is the same answer a
+    /// table that stores nothing gives.
+    pub(crate) fn held(&self, table: u32) -> &[PropColumn] {
+        self.0.get(&table).map_or(&[][..], |held| &held.0)
+    }
+
+    fn load(&mut self, db: &mut Zu1File, table: u32, edge: bool) -> Result<()> {
+        if let Entry::Vacant(empty) = self.0.entry(table) {
+            let dir = match edge {
+                false => load_props(db, table)?,
+                true => load_rel_props(db, table)?,
+            };
+            empty.insert(dir.map_or_else(|| (Vec::new(), 0), |dir| (dir.columns, dir.node_count)));
+        }
+        Ok(())
     }
 }
 

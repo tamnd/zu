@@ -26,11 +26,12 @@ use zu_query::binder::{BoundExpr, BoundInsertNode, BoundInsertRel};
 
 use crate::deleted::Deleted;
 use crate::query::Value;
+use crate::set::Dirs;
 use crate::split::Insert;
 use crate::write::Patches;
 use crate::zu1::catalog::{Catalog, MAX_PROPERTIES};
 use crate::zu1::file::Zu1File;
-use crate::zu1::props::{PropColumn, load_props, load_rel_props};
+use crate::zu1::props::PropColumn;
 use crate::zu1::txn::{Cell, WriteTxn};
 
 /// One node about to be created: which table, what every column of it
@@ -108,13 +109,16 @@ pub(crate) struct Batch<'a> {
     /// it reads, and a delete that was not folded is in the patch this
     /// was merged with.
     gone: Deleted,
-    /// The property columns of each node table being written to, read
-    /// once.
-    columns: BTreeMap<u32, Vec<PropColumn>>,
-    /// The property columns of each rel table being written to, read
-    /// once. A rel table stores nothing on its edges until something is
-    /// stored there, and then this is empty for it.
-    rel_columns: BTreeMap<u32, Vec<PropColumn>>,
+    /// The property columns of each node table being written to,
+    /// borrowed from the session's directories rather than read here: a
+    /// directory is a block chain walk and a copy of every block in it,
+    /// and what it says only changes when the layout of the file does,
+    /// which moves the epoch and drops the lot.
+    columns: BTreeMap<u32, &'a [PropColumn]>,
+    /// The property columns of each rel table being written to, from
+    /// the same place. A rel table stores nothing on its edges until
+    /// something is stored there, and then this is empty for it.
+    rel_columns: BTreeMap<u32, &'a [PropColumn]>,
     /// Where the next row of each table lands, which is the count it
     /// holds plus the rows this statement has added to it so far.
     next: BTreeMap<u32, u64>,
@@ -128,27 +132,20 @@ impl<'a> Batch<'a> {
         write: &'a Insert,
         catalog: Catalog,
         patches: &Patches,
+        dirs: &'a mut Dirs,
     ) -> Result<Self> {
-        let mut columns = BTreeMap::new();
         let mut next = BTreeMap::new();
         for node in &write.nodes {
             room_for(&node.props, "element", codes::C22G0S)?;
-            if columns.contains_key(&node.table) {
+            if next.contains_key(&node.table) {
                 continue;
             }
-            columns.insert(node.table, columns_of(db, node.table)?);
-            next.insert(
-                node.table,
-                rows_in(db, node.table)? + patches.added_rows(node.table),
-            );
+            let (_, rows) = dirs.node(db, node.table)?;
+            next.insert(node.table, rows + patches.added_rows(node.table));
         }
-        let mut rel_columns = BTreeMap::new();
         for rel in &write.rels {
             room_for(&rel.props, "edge", codes::C22G0T)?;
-            if rel_columns.contains_key(&rel.table) {
-                continue;
-            }
-            rel_columns.insert(rel.table, rel_columns_of(db, rel.table)?);
+            dirs.rel(db, rel.table)?;
         }
         // Read once per statement rather than per row, and not at all
         // by a statement that writes no edges, which is where the
@@ -157,6 +154,17 @@ impl<'a> Batch<'a> {
             true => Deleted::default(),
             false => Deleted::load_with(db, &patches.gone)?,
         };
+        // The reading is done, so what is left is a look at what was
+        // read, one borrow per table for the rest of the statement.
+        let dirs = &*dirs;
+        let mut columns = BTreeMap::new();
+        for node in &write.nodes {
+            columns.insert(node.table, dirs.held(node.table));
+        }
+        let mut rel_columns = BTreeMap::new();
+        for rel in &write.rels {
+            rel_columns.insert(rel.table, dirs.held(rel.table));
+        }
         Ok(Self {
             write,
             catalog,
@@ -183,7 +191,7 @@ impl<'a> Batch<'a> {
         for node in &self.write.nodes {
             let values = &props[at..at + node.props.len()];
             at += node.props.len();
-            let cols = row(node, &self.columns[&node.table], values)?;
+            let cols = row(node, self.columns[&node.table], values)?;
             let offset = self.next.get_mut(&node.table).expect("read in open");
             let new = NewNode {
                 table: node.table,
@@ -197,7 +205,7 @@ impl<'a> Batch<'a> {
         for rel in &self.write.rels {
             let values = &props[at..at + rel.props.len()];
             at += rel.props.len();
-            let cols = edge_row(rel, &self.rel_columns[&rel.table], values)?;
+            let cols = edge_row(rel, self.rel_columns[&rel.table], values)?;
             let table = self.catalog.rel_by_id(rel.table).ok_or_else(|| {
                 ZuError::InvalidArgument(format!(
                     "the edge is going in unknown table {}",
@@ -490,28 +498,6 @@ fn room_for(props: &[(String, BoundExpr)], noun: &str, status: GqlStatus) -> Res
             props.len()
         ),
     ))
-}
-
-/// The property columns of a node table, empty for a table that stores
-/// none.
-fn columns_of(db: &mut Zu1File, table: u32) -> Result<Vec<PropColumn>> {
-    Ok(load_props(db, table)?.map_or_else(Vec::new, |dir| dir.columns))
-}
-
-/// The property columns of a rel table, empty for a table that stores
-/// nothing on its edges, which is most of them.
-fn rel_columns_of(db: &mut Zu1File, rel: u32) -> Result<Vec<PropColumn>> {
-    Ok(load_rel_props(db, rel)?.map_or_else(Vec::new, |dir| dir.columns))
-}
-
-/// How many rows the columns of the table hold, which the rows a
-/// commit added and nothing folded yet go on the end of.
-///
-/// The props directory is the count, because that is what the fold
-/// checks its own arithmetic against, and a table without one is a
-/// table [`row`] has already refused.
-fn rows_in(db: &mut Zu1File, table: u32) -> Result<u64> {
-    Ok(load_props(db, table)?.map_or(0, |dir| dir.node_count))
 }
 
 /// One row: every column of the table, in column order, filled from the

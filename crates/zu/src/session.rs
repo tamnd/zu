@@ -1166,6 +1166,7 @@ impl Session {
                         insert,
                         catalog,
                         &patches,
+                        &mut self.dirs,
                     )?;
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
@@ -1210,17 +1211,15 @@ impl Session {
                             )?);
                         }
                     }
-                    let catalog = self.graph.catalog().clone();
-                    let mut removals =
-                        crate::delete::Removals::open(delete, catalog, Arc::clone(&self.patches));
+                    let mut removals = crate::delete::Removals::open(delete);
                     let mut next = Vec::with_capacity(rows.len());
                     for row in &rows {
                         let (carried, _) = row.split_at(carry);
-                        removals.row(self.graph.file_mut(), carried)?;
+                        removals.row(&mut self.graph, carried)?;
                         next.push(Value::List(carried.to_vec()));
                     }
                     for value in &named {
-                        removals.element(self.graph.file_mut(), value)?;
+                        removals.element(&mut self.graph, value)?;
                     }
                     let (rows, edges) = removals.staged();
                     self.write(|txn| crate::delete::stage(txn, &rows, &edges))?;

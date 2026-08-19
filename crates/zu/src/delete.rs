@@ -18,19 +18,15 @@
 //! fold writes that offset into the table's tombstone chain, which is
 //! what [`crate::deleted`] reads back and every scan filters by.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::collections::BTreeSet;
 
 use zu_common::gqlstatus::codes;
 use zu_common::{Result, ZuError};
 
 use crate::insert::describe;
-use crate::query::Value;
+use crate::query::{Value, Zu1Graph};
 use crate::split::Delete;
-use crate::write::Patches;
-use crate::zu1::catalog::Catalog;
-use crate::zu1::file::Zu1File;
-use crate::zu1::graph::{Direction, GraphReader};
+use crate::zu1::graph::Direction;
 use crate::zu1::txn::WriteTxn;
 
 /// One element a delete takes away: the table it is in and its offset.
@@ -52,20 +48,6 @@ type Edge = (u32, u64, u64);
 /// edges costs no log write and no fold.
 pub(crate) struct Removals<'a> {
     write: &'a Delete,
-    /// The catalog as it stood when the write opened, which is what says
-    /// where an element's edges could be. Owned because the file it was
-    /// read out of is handed in a row at a time.
-    catalog: Catalog,
-    /// The rel tables whose adjacency has had to be read, loaded once
-    /// each. Which ones those are depends on the tables the elements
-    /// turn up in, and a slot the write names is bound by a match that
-    /// can leave several tables open.
-    readers: HashMap<u32, GraphReader>,
-    /// The edges the commits since the last fold added, which the
-    /// readers above read through. An edge that has not been folded is
-    /// an edge all the same, so the element it is on cannot go without
-    /// a `DETACH` any more than one the file holds can.
-    patches: Arc<Patches>,
     rows: BTreeSet<Row>,
     /// The edges a `DETACH` is taking away, as the rel table and the two
     /// rows each one runs between. A set for the same reason the rows
@@ -75,12 +57,9 @@ pub(crate) struct Removals<'a> {
 }
 
 impl<'a> Removals<'a> {
-    pub(crate) fn open(write: &'a Delete, catalog: Catalog, patches: Arc<Patches>) -> Self {
+    pub(crate) fn open(write: &'a Delete) -> Self {
         Self {
             write,
-            catalog,
-            readers: HashMap::new(),
-            patches,
             rows: BTreeSet::new(),
             edges: BTreeSet::new(),
         }
@@ -90,7 +69,7 @@ impl<'a> Removals<'a> {
     /// row the clauses before the write answered, holding the slots in
     /// [`Delete::carry`] in that order. A delete computes nothing, so
     /// there is nothing behind the row.
-    pub(crate) fn row(&mut self, db: &mut Zu1File, carried: &[Value]) -> Result<()> {
+    pub(crate) fn row(&mut self, graph: &mut Zu1Graph<'_>, carried: &[Value]) -> Result<()> {
         for &slot in &self.write.slots {
             let value = self
                 .write
@@ -104,7 +83,7 @@ impl<'a> Removals<'a> {
                     )
                 })?
                 .clone();
-            self.element(db, &value)?;
+            self.element(graph, &value)?;
         }
         Ok(())
     }
@@ -113,7 +92,7 @@ impl<'a> Removals<'a> {
     /// A variable reads it out of the row and a `VALUE { ... }` gets it
     /// from the query it ran, and from here on the two are the same
     /// thing.
-    pub(crate) fn element(&mut self, db: &mut Zu1File, value: &Value) -> Result<()> {
+    pub(crate) fn element(&mut self, graph: &mut Zu1Graph<'_>, value: &Value) -> Result<()> {
         let (table, offset) = match value {
             Value::Node { table, offset } => (*table, *offset),
             // An edge is named by the rows it runs between, and
@@ -139,7 +118,7 @@ impl<'a> Removals<'a> {
                 ));
             }
         };
-        self.detach(db, table, offset)?;
+        self.detach(graph, table, offset)?;
         self.rows.insert((table, offset));
         Ok(())
     }
@@ -153,29 +132,29 @@ impl<'a> Removals<'a> {
     /// stages what it finds; a plain `DELETE` is defined to refuse an
     /// element that still has an edge (G1001), and its message names a
     /// table the edges are in so the reader knows what to detach.
-    fn detach(&mut self, db: &mut Zu1File, table: u32, offset: u64) -> Result<()> {
-        let rels: Vec<(u32, bool, bool)> = self
-            .catalog
+    fn detach(&mut self, graph: &mut Zu1Graph<'_>, table: u32, offset: u64) -> Result<()> {
+        // Worked out before anything is read, because reading takes the
+        // graph and the catalog is the graph's.
+        let rels: Vec<(u32, bool, bool)> = graph
+            .catalog()
             .rel_tables()
             .iter()
             .filter(|rel| rel.from == table || rel.to == table)
             .map(|rel| (rel.id, rel.from == table, rel.to == table))
             .collect();
+        let mut ends = Vec::new();
         for (rel, out, back) in rels {
-            self.ensure_reader(db, rel)?;
-            let reader = self.readers.get(&rel).expect("just loaded");
             if self.write.detach {
                 // Read out rather than counted, because what the edges
                 // are is what has to be staged, and the count of them
                 // is only interesting to the statement that refuses.
-                let mut ends = Vec::new();
                 if out {
-                    reader.neighbors_dir_into(db, offset, Direction::Fwd, &mut ends)?;
+                    graph.ends_of(rel, offset, Direction::Fwd, &mut ends)?;
                     self.edges
                         .extend(ends.drain(..).map(|dst| (rel, offset, dst)));
                 }
                 if back {
-                    reader.neighbors_dir_into(db, offset, Direction::Bwd, &mut ends)?;
+                    graph.ends_of(rel, offset, Direction::Bwd, &mut ends)?;
                     self.edges
                         .extend(ends.drain(..).map(|src| (rel, src, offset)));
                 }
@@ -183,13 +162,17 @@ impl<'a> Removals<'a> {
             }
             let mut edges = 0;
             if out {
-                edges += reader.degree_of(db, offset, Direction::Fwd)?;
+                edges += graph.edges_on(rel, offset, Direction::Fwd)?;
             }
             if back {
-                edges += reader.degree_of(db, offset, Direction::Bwd)?;
+                edges += graph.edges_on(rel, offset, Direction::Bwd)?;
             }
             if edges > 0 {
-                let name = &self.catalog.rel_by_id(rel).expect("named the table").name;
+                let name = &graph
+                    .catalog()
+                    .rel_by_id(rel)
+                    .expect("named the table")
+                    .name;
                 return Err(ZuError::gql(
                     codes::CG1001,
                     format!(
@@ -198,22 +181,6 @@ impl<'a> Removals<'a> {
                 ));
             }
         }
-        Ok(())
-    }
-
-    fn ensure_reader(&mut self, db: &mut Zu1File, rel: u32) -> Result<()> {
-        if self.readers.contains_key(&rel) {
-            return Ok(());
-        }
-        let name = self
-            .catalog
-            .rel_by_id(rel)
-            .ok_or_else(|| ZuError::InvalidArgument(format!("unknown rel table {rel}")))?
-            .name
-            .clone();
-        let mut reader = GraphReader::load_table(db, &name)?;
-        reader.set_edges(self.patches.edges.get(&rel).cloned());
-        self.readers.insert(rel, reader);
         Ok(())
     }
 
@@ -249,6 +216,7 @@ mod tests {
     use std::path::Path;
 
     use crate::session::Session;
+    use crate::zu1::file::Zu1File;
     use crate::zu1::graph::bulk_load_as;
     use crate::zu1::props::{PropValues, store_props};
 
@@ -370,6 +338,50 @@ mod tests {
             Some("G1001"),
             "got: {err}"
         );
+    }
+
+    /// An edge a commit added and no fold has written into the CSR is
+    /// an edge all the same, so the element it is on cannot go without
+    /// a DETACH and a DETACH takes it with the element.
+    ///
+    /// This is what says the delete reads through the overlay. It reads
+    /// the session's adjacency readers rather than loading its own, and
+    /// those readers only see an unfolded edge because the writer hands
+    /// them the patch, so a delete that read past the patch would let
+    /// this statement through and leave the edge pointing at a row that
+    /// is gone.
+    #[test]
+    fn an_edge_no_fold_has_landed_still_holds_the_element() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = open(&dir, "delete-unfolded.zu1");
+
+        session
+            .run(
+                "MATCH (a:person {name: 'kay'}), (b:person {name: 'zoe'}) INSERT (a)-[:knows]->(b)",
+                &[],
+            )
+            .expect("insert an edge");
+
+        let err = session
+            .run("MATCH (p:person {name: 'zoe'}) DELETE p", &[])
+            .expect_err("kay knows zoe now");
+        assert_eq!(
+            err.gqlstatus().map(|s| s.code()),
+            Some("G1001"),
+            "got: {err}"
+        );
+
+        session
+            .run("MATCH (p:person {name: 'zoe'}) DETACH DELETE p", &[])
+            .expect("detach delete");
+        assert_eq!(names(&mut session), ["ada", "kay"]);
+        let left = session
+            .run(
+                "MATCH (:person)-[:knows]->(:person) RETURN count(*) AS n",
+                &[],
+            )
+            .expect("count");
+        assert_eq!(left.rows[0][0], Value::Int(1), "ada still knows kay");
     }
 
     /// Naming an element twice takes it away once, and the count the

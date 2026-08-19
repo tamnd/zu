@@ -1333,6 +1333,38 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             format!("PATH [{}]", rendered.join(", "))
         }
         BoundExpr::Cast { expr, ty } => format!("CAST({} AS {ty})", expr_text(expr, query)),
+        BoundExpr::Case {
+            subject,
+            branches,
+            otherwise,
+        } => {
+            let mut out = "CASE".to_string();
+            if let Some(subject) = subject {
+                out.push(' ');
+                out.push_str(&expr_text(subject, query));
+            }
+            for (when, then) in branches {
+                out.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    expr_text(when, query),
+                    expr_text(then, query)
+                ));
+            }
+            if let Some(otherwise) = otherwise {
+                out.push_str(&format!(" ELSE {}", expr_text(otherwise, query)));
+            }
+            out.push_str(" END");
+            out
+        }
+        BoundExpr::Coalesce(args) => {
+            let rendered: Vec<String> = args.iter().map(|a| expr_text(a, query)).collect();
+            format!("COALESCE({})", rendered.join(", "))
+        }
+        BoundExpr::NullIf { value, compared } => format!(
+            "NULLIF({}, {})",
+            expr_text(value, query),
+            expr_text(compared, query)
+        ),
     }
 }
 

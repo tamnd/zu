@@ -67,6 +67,11 @@ words = ["AND", "OR", "XOR", "NOT", "IS", "IN", "STARTS", "ENDS", "CONTAINS", "L
 
 [[group]]
 kind = "keyword"
+doc = "The case expression and the two abbreviations of it. COALESCE and NULLIF are written like calls and are not calls: the binder resolves no function by either name, because both pick which of their arguments to evaluate and a function has all of its arguments in hand before it is entered. END closes a CASE and closes nothing else, and ENDS is a different word, in the predicates group with the string tests."
+words = ["CASE", "WHEN", "THEN", "ELSE", "END", "COALESCE", "NULLIF"]
+
+[[group]]
+kind = "keyword"
 doc = "The catalog statements and what they name."
 words = ["CREATE", "DROP", "SCHEMA", "GRAPH", "PROPERTY", "TYPE", "IF", "REPLACE", "COPY", "OF", "NODE", "EDGE", "RELATIONSHIP", "PROPERTIES", "NO", "CURRENT_GRAPH", "CURRENT_PROPERTY_GRAPH", "HOME_GRAPH", "HOME_PROPERTY_GRAPH"]
 

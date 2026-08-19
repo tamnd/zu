@@ -27,6 +27,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -113,6 +121,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -176,6 +192,164 @@
     }
   },
   {
+    "type": "case_abbreviation",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
+          "type": "cast",
+          "named": true
+        },
+        {
+          "type": "exists_block",
+          "named": true
+        },
+        {
+          "type": "function_call",
+          "named": true
+        },
+        {
+          "type": "is_expression",
+          "named": true
+        },
+        {
+          "type": "list",
+          "named": true
+        },
+        {
+          "type": "literal",
+          "named": true
+        },
+        {
+          "type": "parameter",
+          "named": true
+        },
+        {
+          "type": "parenthesized_expression",
+          "named": true
+        },
+        {
+          "type": "path_constructor",
+          "named": true
+        },
+        {
+          "type": "property_access",
+          "named": true
+        },
+        {
+          "type": "record",
+          "named": true
+        },
+        {
+          "type": "temporal_literal",
+          "named": true
+        },
+        {
+          "type": "unary_expression",
+          "named": true
+        },
+        {
+          "type": "variable",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "case_expression",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
+          "type": "cast",
+          "named": true
+        },
+        {
+          "type": "exists_block",
+          "named": true
+        },
+        {
+          "type": "function_call",
+          "named": true
+        },
+        {
+          "type": "is_expression",
+          "named": true
+        },
+        {
+          "type": "list",
+          "named": true
+        },
+        {
+          "type": "literal",
+          "named": true
+        },
+        {
+          "type": "parameter",
+          "named": true
+        },
+        {
+          "type": "parenthesized_expression",
+          "named": true
+        },
+        {
+          "type": "path_constructor",
+          "named": true
+        },
+        {
+          "type": "property_access",
+          "named": true
+        },
+        {
+          "type": "record",
+          "named": true
+        },
+        {
+          "type": "temporal_literal",
+          "named": true
+        },
+        {
+          "type": "unary_expression",
+          "named": true
+        },
+        {
+          "type": "variable",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "cast",
     "named": true,
     "fields": {},
@@ -185,6 +359,14 @@
       "types": [
         {
           "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
           "named": true
         },
         {
@@ -517,6 +699,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -712,6 +902,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -856,6 +1054,14 @@
       "types": [
         {
           "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
           "named": true
         },
         {
@@ -1028,6 +1234,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -1139,6 +1353,14 @@
       "types": [
         {
           "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
           "named": true
         },
         {
@@ -1270,6 +1492,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -1380,6 +1610,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -1474,6 +1712,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -1560,6 +1806,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -1643,6 +1897,14 @@
       "types": [
         {
           "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
           "named": true
         },
         {
@@ -1893,6 +2155,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -2132,6 +2402,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -2208,6 +2486,14 @@
       "types": [
         {
           "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
           "named": true
         },
         {
@@ -2451,6 +2737,14 @@
           "named": true
         },
         {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
+          "named": true
+        },
+        {
           "type": "cast",
           "named": true
         },
@@ -2534,6 +2828,14 @@
       "types": [
         {
           "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
           "named": true
         },
         {
@@ -2696,6 +2998,14 @@
       "types": [
         {
           "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "case_abbreviation",
+          "named": true
+        },
+        {
+          "type": "case_expression",
           "named": true
         },
         {
@@ -2947,7 +3257,15 @@
     "named": false
   },
   {
+    "type": "CASE",
+    "named": false
+  },
+  {
     "type": "CAST",
+    "named": false
+  },
+  {
+    "type": "COALESCE",
     "named": false
   },
   {
@@ -3020,6 +3338,14 @@
   },
   {
     "type": "ELEMENTS",
+    "named": false
+  },
+  {
+    "type": "ELSE",
+    "named": false
+  },
+  {
+    "type": "END",
     "named": false
   },
   {
@@ -3115,6 +3441,10 @@
     "named": false
   },
   {
+    "type": "NULLIF",
+    "named": false
+  },
+  {
     "type": "NULLS",
     "named": false
   },
@@ -3203,6 +3533,10 @@
     "named": false
   },
   {
+    "type": "THEN",
+    "named": false
+  },
+  {
     "type": "TRAIL",
     "named": false
   },
@@ -3232,6 +3566,10 @@
   },
   {
     "type": "WALK",
+    "named": false
+  },
+  {
+    "type": "WHEN",
     "named": false
   },
   {

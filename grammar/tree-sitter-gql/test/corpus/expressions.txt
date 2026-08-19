@@ -353,3 +353,61 @@ MATCH (p)-[k]->(q) WHERE k IS DIRECTED AND p IS LABELED Person AND p IS SOURCE O
         (projection_item
           (variable
             (identifier)))))))
+
+================================================================================
+The case expression in both forms, and the two abbreviations
+================================================================================
+
+RETURN CASE WHEN n.age < 18 THEN 'child' ELSE 'adult' END AS band,
+       CASE n.kind WHEN 'a' THEN 1 END AS k,
+       COALESCE(n.a, 0) AS c, NULLIF(n.a, 0) AS d
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (return_clause
+      (projection
+        (projection_item
+          (case_expression
+            (binary_expression
+              (property_access
+                (variable
+                  (identifier))
+                (identifier))
+              (literal
+                (integer)))
+            (literal
+              (string))
+            (literal
+              (string)))
+          (identifier))
+        (projection_item
+          (case_expression
+            (property_access
+              (variable
+                (identifier))
+              (identifier))
+            (literal
+              (string))
+            (literal
+              (integer)))
+          (identifier))
+        (projection_item
+          (case_abbreviation
+            (property_access
+              (variable
+                (identifier))
+              (identifier))
+            (literal
+              (integer)))
+          (identifier))
+        (projection_item
+          (case_abbreviation
+            (property_access
+              (variable
+                (identifier))
+              (identifier))
+            (literal
+              (integer)))
+          (identifier))))))

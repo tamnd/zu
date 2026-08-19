@@ -1628,6 +1628,26 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         ty: LogicalType,
     },
+    /// GE01. `CASE` in both forms, the branches in the order they were
+    /// written, which is the order they are asked in: a branch is only
+    /// reached when every branch above it said no, and the value it
+    /// answers with is the only one evaluated.
+    Case {
+        /// The value the simple form compares each branch with, `None`
+        /// for the searched form, which asks each branch for a truth.
+        subject: Option<Box<BoundExpr>>,
+        branches: Vec<(BoundExpr, BoundExpr)>,
+        otherwise: Option<Box<BoundExpr>>,
+    },
+    /// GE01's case abbreviation: the first argument that is not null,
+    /// and null where every one of them is.
+    Coalesce(Vec<BoundExpr>),
+    /// GE01's other case abbreviation: null where the two are equal,
+    /// and the first of them otherwise.
+    NullIf {
+        value: Box<BoundExpr>,
+        compared: Box<BoundExpr>,
+    },
     /// Whether the node in `slot` satisfies a label expression, the
     /// runtime half of a label set. The binder only plants one where
     /// the candidate tables leave the answer open, so a pattern naming
@@ -1901,6 +1921,28 @@ pub(crate) fn expr_slots(expr: &BoundExpr, out: &mut impl Extend<usize>) {
             }
         }
         BoundExpr::Cast { expr, .. } => expr_slots(expr, out),
+        BoundExpr::Case {
+            subject,
+            branches,
+            otherwise,
+        } => {
+            for expr in subject.iter().chain(otherwise.iter()) {
+                expr_slots(expr, out);
+            }
+            for (when, then) in branches {
+                expr_slots(when, out);
+                expr_slots(then, out);
+            }
+        }
+        BoundExpr::Coalesce(args) => {
+            for arg in args {
+                expr_slots(arg, out);
+            }
+        }
+        BoundExpr::NullIf { value, compared } => {
+            expr_slots(value, out);
+            expr_slots(compared, out);
+        }
         BoundExpr::IsDirected { expr, .. }
         | BoundExpr::IsLabeled { expr, .. }
         | BoundExpr::PropertyExists { expr, .. } => expr_slots(expr, out),
@@ -4141,6 +4183,76 @@ impl Binder<'_> {
                 }
                 Ok((BoundExpr::Path(bound), Type::Path))
             }
+            // GE01. A searched branch has to be a truth and a simple
+            // branch has to be something the subject can be compared
+            // with, and the answer is one type for the whole
+            // expression, worked out from the branches and the ELSE
+            // together. A CASE with no ELSE can answer null, which is
+            // no more than every other expression here can do.
+            Expr::Case {
+                subject,
+                branches,
+                otherwise,
+            } => {
+                let subject = match subject {
+                    Some(expr) => Some(Box::new(self.bind_expr(expr, ctx)?.0)),
+                    None => None,
+                };
+                let mut bound = Vec::with_capacity(branches.len());
+                let mut answer = None;
+                for (when, then) in branches {
+                    let (when, when_ty) = self.bind_expr(when, ctx)?;
+                    // A simple branch holds a value to compare and is
+                    // checked the way `=` is, which is to say not at
+                    // all: whether two types can be equal is a question
+                    // the values answer.
+                    if subject.is_none() && !when_ty.is_bool() {
+                        return Err(bad_type(format!(
+                            "a WHEN of a CASE written without a value is a condition, and this one is {when_ty}"
+                        )));
+                    }
+                    let (then, then_ty) = self.bind_expr(then, ctx)?;
+                    answer = Some(merged(answer, then_ty));
+                    bound.push((when, then));
+                }
+                let otherwise = match otherwise {
+                    Some(expr) => {
+                        let (bound, ty) = self.bind_expr(expr, ctx)?;
+                        answer = Some(merged(answer, ty));
+                        Some(Box::new(bound))
+                    }
+                    None => None,
+                };
+                Ok((
+                    BoundExpr::Case {
+                        subject,
+                        branches: bound,
+                        otherwise,
+                    },
+                    answer.unwrap_or(Type::Any),
+                ))
+            }
+            Expr::Coalesce(args) => {
+                let mut bound = Vec::with_capacity(args.len());
+                let mut answer = None;
+                for arg in args {
+                    let (arg, ty) = self.bind_expr(arg, ctx)?;
+                    answer = Some(merged(answer, ty));
+                    bound.push(arg);
+                }
+                Ok((BoundExpr::Coalesce(bound), answer.unwrap_or(Type::Any)))
+            }
+            Expr::NullIf { value, compared } => {
+                let (value, value_ty) = self.bind_expr(value, ctx)?;
+                let (compared, _) = self.bind_expr(compared, ctx)?;
+                Ok((
+                    BoundExpr::NullIf {
+                        value: Box::new(value),
+                        compared: Box::new(compared),
+                    },
+                    value_ty,
+                ))
+            }
             Expr::Cast { expr, ty } => {
                 let (bound, _) = self.bind_expr(expr, ctx)?;
                 Ok((
@@ -4670,11 +4782,56 @@ pub fn text(expr: &Expr) -> String {
             format!("PATH [{}]", rendered.join(", "))
         }
         Expr::Cast { expr, ty } => format!("CAST({} AS {ty})", text(expr)),
+        Expr::Case {
+            subject,
+            branches,
+            otherwise,
+        } => {
+            let mut out = "CASE".to_string();
+            if let Some(subject) = subject {
+                out.push(' ');
+                out.push_str(&text(subject));
+            }
+            for (when, then) in branches {
+                out.push_str(&format!(" WHEN {} THEN {}", text(when), text(then)));
+            }
+            if let Some(otherwise) = otherwise {
+                out.push_str(&format!(" ELSE {}", text(otherwise)));
+            }
+            out.push_str(" END");
+            out
+        }
+        Expr::Coalesce(args) => {
+            let rendered: Vec<String> = args.iter().map(text).collect();
+            format!("COALESCE({})", rendered.join(", "))
+        }
+        Expr::NullIf { value, compared } => {
+            format!("NULLIF({}, {})", text(value), text(compared))
+        }
         // The patterns are not rendered: this text names a column and
         // titles an operator, and a whole match inside one of those
         // reads worse than the word does.
         Expr::Exists { .. } => "EXISTS { ... }".into(),
         Expr::ValueQuery(_) => "VALUE { ... }".into(),
+    }
+}
+
+/// The one type an expression with several answers is of, folded over
+/// the answers a branch at a time.
+///
+/// Two branches of the same type answer that type, an integer branch
+/// beside a float branch answers a float the way arithmetic over the
+/// two does, and anything else answers `ANY`, which is what the binder
+/// says where it knows a value arrives and not what kind. It is the
+/// rule a list literal uses, with the numbers added, because a CASE
+/// over a count and an average is a query somebody meant.
+fn merged(seen: Option<Type>, next: Type) -> Type {
+    match seen {
+        None => next,
+        Some(seen) if seen == next => seen,
+        Some(Type::Int) if next == Type::Float => Type::Float,
+        Some(Type::Float) if next == Type::Int => Type::Float,
+        _ => Type::Any,
     }
 }
 

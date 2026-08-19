@@ -6447,6 +6447,55 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Value::path(out)
         }
         BoundExpr::Cast { expr, ty } => crate::cast::cast(eval(ctx, expr)?, ty),
+        // GE01. The branches are asked in the order they were written
+        // and the walk stops at the first that says yes, so a branch
+        // below one that matched is never evaluated and neither is a
+        // THEN whose WHEN said no. That is what lets a CASE guard a
+        // division: the branch that would divide by zero is the branch
+        // the walk never reaches.
+        BoundExpr::Case {
+            subject,
+            branches,
+            otherwise,
+        } => {
+            let subject = match subject {
+                Some(expr) => Some(settle(eval(ctx, expr)?)),
+                None => None,
+            };
+            for (when, then) in branches {
+                let hit = match &subject {
+                    // The simple form compares, and a null on either
+                    // side is not a match, the way `=` answers null
+                    // rather than true.
+                    Some(value) => cmp_eq(value, &settle(eval(ctx, when)?))? == Some(true),
+                    None => truth(&eval(ctx, when)?)? == Some(true),
+                };
+                if hit {
+                    return eval(ctx, then);
+                }
+            }
+            match otherwise {
+                Some(expr) => eval(ctx, expr),
+                None => Ok(Value::Null),
+            }
+        }
+        BoundExpr::Coalesce(args) => {
+            for arg in args {
+                match settle(eval(ctx, arg)?) {
+                    Value::Null => {}
+                    value => return Ok(value),
+                }
+            }
+            Ok(Value::Null)
+        }
+        BoundExpr::NullIf { value, compared } => {
+            let value = settle(eval(ctx, value)?);
+            let compared = settle(eval(ctx, compared)?);
+            Ok(match cmp_eq(&value, &compared)? {
+                Some(true) => Value::Null,
+                _ => value,
+            })
+        }
     }
 }
 

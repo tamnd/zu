@@ -296,3 +296,60 @@ MATCH (match) RETURN match.value AS `order by`
               (identifier))
             (identifier))
           (quoted_identifier))))))
+
+================================================================================
+The pattern predicates
+================================================================================
+
+MATCH (p)-[k]->(q) WHERE k IS DIRECTED AND p IS LABELED Person AND p IS SOURCE OF k AND ALL_DIFFERENT(p, q) AND PROPERTY_EXISTS(p, name) RETURN p
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (query
+    (match_clause
+      (pattern
+        (path
+          (node
+            (identifier))
+          (relationship
+            (rel_detail
+              (identifier)))
+          (node
+            (identifier))))
+      (where_clause
+        (binary_expression
+          (binary_expression
+            (binary_expression
+              (binary_expression
+                (is_expression
+                  (variable
+                    (identifier)))
+                (is_expression
+                  (variable
+                    (identifier))
+                  (label_expr
+                    (label
+                      (identifier)))))
+              (is_expression
+                (variable
+                  (identifier))
+                (variable
+                  (identifier))))
+            (function_call
+              (identifier)
+              (variable
+                (identifier))
+              (variable
+                (identifier))))
+          (function_call
+            (identifier)
+            (variable
+              (identifier))
+            (variable
+              (identifier))))))
+    (return_clause
+      (projection
+        (projection_item
+          (variable
+            (identifier)))))))

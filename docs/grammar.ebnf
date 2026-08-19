@@ -324,7 +324,17 @@ and_expr        = not_expr , { "AND" , not_expr } ;
 not_expr        = { "NOT" } , comparison ;
 comparison      = additive , { comparison_op , additive
                              | "IS" , [ "NOT" ] , "NULL"
-                             | "IS" , [ "NOT" ] , "TYPED" , value_type } ;
+                             | "IS" , [ "NOT" ] , "TYPED" , value_type
+                             | "IS" , [ "NOT" ] , "DIRECTED"
+                             | "IS" , [ "NOT" ] , "LABELED" , label_expr
+                             | "IS" , [ "NOT" ] ,
+                               ( "SOURCE" | "DESTINATION" ) , "OF" ,
+                               additive } ;
+(* ISO 19.8 to 19.10, features G110, G111 and G112. The three pattern
+   predicates written after IS: whether an edge has a direction,
+   whether an element carries a label, and whether a node is one end of
+   an edge. The word behind IS is what tells all five readings apart,
+   NULL and TYPED included. *)
 (* ISO 12 and feature GA04. Two values of different types compare
    rather than answer unknown, and the order between the types is
    booleans, numbers, strings, temporals, nodes, edges, lists, records,
@@ -337,10 +347,17 @@ multiplicative  = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary           = { "-" | "+" } , postfix ;
 postfix         = primary , { "." , name } ;
 primary         = literal | temporal_literal | parameter | name
-                | function_call | cast | path_constructor | exists_block
+                | function_call | cast | property_exists
+                | path_constructor | exists_block
                 | value_query | "(" , expression , ")" | list | record ;
 
 cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
+(* ISO 19.13 and feature G115. Written like a call and not one: the
+   second argument is a property name rather than an expression, so
+   reading it as one would bind a variable the query never wrote.
+   ALL_DIFFERENT and SAME (G113, G114) are ordinary calls, since their
+   arguments are the elements themselves. *)
+property_exists = "PROPERTY_EXISTS" , "(" , expression , "," , name , ")" ;
 (* An existence block is a match written where a predicate goes, so it
    is grammar here and a clause everywhere else: it may be a whole
    conjunct of a WHERE, on its own or under one NOT, and nowhere a value

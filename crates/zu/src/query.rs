@@ -681,6 +681,38 @@ impl Graph for Zu1Graph<'_> {
         column_value(db, reader, col, ord, key)
     }
 
+    // G115. The columns are what the properties are, so both of these
+    // answer off the column list and never read a value: a property
+    // that is there and null is there.
+    fn has_property(&mut self, table: u32, offset: u64, key: &str) -> Result<bool> {
+        let _ = offset;
+        if let Some(frame) = self.frames.get(table) {
+            // A frame has no stored id and answers one from the row,
+            // which is the same answer a table without the column
+            // gives, so both carry the property.
+            return Ok(frame.column(key).is_some() || key == "id");
+        }
+        self.ensure_props(table)?;
+        let held = self
+            .props
+            .get_mut(&table)
+            .expect("just loaded")
+            .as_mut()
+            .is_some_and(|reader| reader.col(key).is_some());
+        Ok(held || key == "id")
+    }
+
+    fn has_rel_property(&mut self, rel: u32, ord: u64, key: &str) -> Result<bool> {
+        let _ = ord;
+        self.ensure_rel_props(rel)?;
+        Ok(self
+            .props
+            .get_mut(&rel)
+            .expect("just loaded")
+            .as_mut()
+            .is_some_and(|reader| reader.col(key).is_some()))
+    }
+
     fn edge_ordinal(&mut self, rel: u32, src: u64, dst: u64) -> Result<Option<u64>> {
         self.ensure_reader(rel)?;
         let Self { db, readers, .. } = self;

@@ -71,7 +71,8 @@ use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
 use zu_common::{DurationKind, Interrupt, Result, Temporal, ZuError, temporal};
 
 use crate::ast::{
-    BinaryOp, Conjunction, Literal, PathMode, RelDirection, Selector, SetOp, SortKey, UnaryOp,
+    BinaryOp, Conjunction, EdgeEnd, Literal, PathMode, RelDirection, Selector, SetOp, SortKey,
+    UnaryOp,
 };
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
 use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
@@ -530,6 +531,27 @@ pub trait Graph {
     fn rel_property(&mut self, rel: u32, ord: u64, key: &str) -> Result<Value> {
         let _ = (rel, ord, key);
         Ok(Value::Null)
+    }
+    /// G115. Whether the nodes of a table carry a property of this
+    /// name. It is a question about the table rather than about one
+    /// row, so a property that is there and null answers true, and the
+    /// row is passed in only because a store may keep its properties
+    /// per row rather than per table.
+    ///
+    /// The default asks for the value and reads a refused read as an
+    /// absent property, which is the answer for a store whose
+    /// properties are its columns. An engine whose reads fail for other
+    /// reasons answers the question directly instead.
+    fn has_property(&mut self, table: u32, offset: u64, key: &str) -> Result<bool> {
+        Ok(self.property(table, offset, key).is_ok())
+    }
+    /// The same question asked of an edge's table.
+    ///
+    /// The default reads the property and calls a null absent, which is
+    /// as close as a store that answers reads and nothing else can
+    /// come, and is exact for the engines whose edges hold nothing.
+    fn has_rel_property(&mut self, rel: u32, ord: u64, key: &str) -> Result<bool> {
+        Ok(!matches!(self.rel_property(rel, ord, key)?, Value::Null))
     }
     /// The rows a `DELETE` took away, read once per query. A delete
     /// does not compact, because every edge names its endpoints by row
@@ -6031,6 +6053,93 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
             Value::Null => Ok(Value::Null),
             other => Err(invalid(format!("label test on {other:?}, expected a node"))),
         },
+        // G110. Every edge of a table has a direction or none of them
+        // does, so the table is the whole of the answer.
+        BoundExpr::IsDirected {
+            expr,
+            undirected,
+            negated,
+        } => match eval(ctx, expr)? {
+            Value::Rel { table, .. } => Ok(Value::Bool(
+                undirected.binary_search(&table).is_err() != *negated,
+            )),
+            Value::Null => Ok(Value::Null),
+            other => Err(invalid(format!(
+                "IS DIRECTED asks about an edge, got {other:?}"
+            ))),
+        },
+        // G111. A node is asked with the bit test the pattern would
+        // have used, an edge by the table it is in.
+        BoundExpr::IsLabeled {
+            expr,
+            node,
+            rels,
+            negated,
+        } => match eval(ctx, expr)? {
+            Value::Node { table, offset } => {
+                let word = ctx.graph.labels(table, offset)?;
+                Ok(Value::Bool(node.matches(word) != *negated))
+            }
+            Value::Rel { table, .. } => {
+                Ok(Value::Bool(rels.binary_search(&table).is_ok() != *negated))
+            }
+            Value::Null => Ok(Value::Null),
+            other => Err(invalid(format!(
+                "IS LABELED asks about a node or an edge, got {other:?}"
+            ))),
+        },
+        // G112. The edge already holds both of its ends, so this is a
+        // comparison and never a lookup.
+        BoundExpr::IsEndpoint {
+            node,
+            rel,
+            end,
+            ends,
+            negated,
+        } => {
+            let (node, rel) = (eval(ctx, node)?, eval(ctx, rel)?);
+            match (node, rel) {
+                (
+                    Value::Node { table, offset },
+                    Value::Rel {
+                        table: rel_table,
+                        src,
+                        dst,
+                        ..
+                    },
+                ) => {
+                    let Ok(at) = ends.binary_search_by_key(&rel_table, |&(id, _, _)| id) else {
+                        return Err(invalid(format!("edge from unknown table {rel_table}")));
+                    };
+                    let (_, from, to) = ends[at];
+                    let (side, row) = match end {
+                        EdgeEnd::Source => (from, src),
+                        EdgeEnd::Destination => (to, dst),
+                    };
+                    Ok(Value::Bool((side == table && row == offset) != *negated))
+                }
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (node, rel) => Err(invalid(format!(
+                    "IS {} OF relates a node to an edge, got {node:?} and {rel:?}",
+                    end.text()
+                ))),
+            }
+        }
+        // G115. Whether the element's table carries the property, which
+        // is why a stored null answers true: the question is about the
+        // element and not about the value.
+        BoundExpr::PropertyExists { expr, key } => match eval(ctx, expr)? {
+            Value::Node { table, offset } => {
+                Ok(Value::Bool(ctx.graph.has_property(table, offset, key)?))
+            }
+            Value::Rel { table, ord, .. } => {
+                Ok(Value::Bool(ctx.graph.has_rel_property(table, ord, key)?))
+            }
+            Value::Null => Ok(Value::Null),
+            other => Err(invalid(format!(
+                "PROPERTY_EXISTS asks about a node or an edge, got {other:?}"
+            ))),
+        },
         BoundExpr::Property { base, key } => match eval(ctx, base)? {
             // A delete leaves the element bound, so a clause after one
             // can hold a reference to a row that is no longer there.
@@ -6247,6 +6356,39 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     other => Err(invalid(format!("elements() expects a path, got {other:?}"))),
                 }
             }
+            // G113, G114. Element identity, which is the table and the
+            // row for a node and the table, the ends and the ordinal
+            // for an edge, so comparing the values is comparing the
+            // elements. A null argument leaves the answer unknown, the
+            // way it does in the comparison this is a shorthand for,
+            // and a list this short is walked pairwise rather than
+            // sorted.
+            Func::AllDifferent | Func::Same => {
+                let mut elements = Vec::with_capacity(args.len());
+                for arg in args {
+                    match eval(ctx, arg)? {
+                        Value::Null => return Ok(Value::Null),
+                        value @ (Value::Node { .. } | Value::Rel { .. }) => elements.push(value),
+                        other => {
+                            return Err(invalid(format!(
+                                "{} compares nodes and edges, got {other:?}",
+                                if *func == Func::Same {
+                                    "same()"
+                                } else {
+                                    "all_different()"
+                                }
+                            )));
+                        }
+                    }
+                }
+                let same = *func == Func::Same;
+                let held = elements.iter().enumerate().all(|(at, left)| {
+                    elements[at + 1..]
+                        .iter()
+                        .all(|right| (left == right) == same)
+                });
+                Ok(Value::Bool(held))
+            }
             _ => Err(invalid(
                 "aggregate call outside a projection, this is a bug".into(),
             )),
@@ -6345,7 +6487,13 @@ impl AggState {
             Func::Min => Acc::Min(None),
             Func::Max => Acc::Max(None),
             Func::Collect => Acc::Collect(Vec::new()),
-            Func::Id | Func::Size | Func::Cardinality | Func::PathLength | Func::Elements => {
+            Func::Id
+            | Func::Size
+            | Func::Cardinality
+            | Func::PathLength
+            | Func::Elements
+            | Func::AllDifferent
+            | Func::Same => {
                 unreachable!("scalar function as an aggregate")
             }
         };

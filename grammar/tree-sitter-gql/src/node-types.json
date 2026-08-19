@@ -728,6 +728,10 @@
           "named": true
         },
         {
+          "type": "label_expr",
+          "named": true
+        },
+        {
           "type": "list",
           "named": true
         },
@@ -2859,11 +2863,19 @@
     "named": false
   },
   {
+    "type": "DESTINATION",
+    "named": false
+  },
+  {
     "type": "DETACH",
     "named": false
   },
   {
     "type": "DIFFERENT",
+    "named": false
+  },
+  {
+    "type": "DIRECTED",
     "named": false
   },
   {
@@ -2936,6 +2948,10 @@
   },
   {
     "type": "KEEP",
+    "named": false
+  },
+  {
+    "type": "LABELED",
     "named": false
   },
   {
@@ -3056,6 +3072,10 @@
   },
   {
     "type": "SKIP",
+    "named": false
+  },
+  {
+    "type": "SOURCE",
     "named": false
   },
   {

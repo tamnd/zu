@@ -759,3 +759,53 @@ cases:
       - values:
           - type: DATE
             value: "2024-01-01"
+
+  - name: sql-interval-year-to-month
+    doc: GL12. The SQL spelling of a duration, where the qualifier and not the string is what says which fields were written. A client that sends this to an engine reading only the ISO 8601 spelling gets a syntax error, and one that sends the ISO 8601 spelling to an engine reading only this one gets the same, so which of the two travels is worth knowing.
+    query: RETURN INTERVAL '1-2' YEAR TO MONTH AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1Y2M"
+
+  - name: sql-interval-day-to-second
+    doc: The day-time half of the same spelling, written as SQL writes it, with a space between the day and the clock and colons inside it.
+    query: RETURN INTERVAL '3 04:05:06' DAY TO SECOND AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P3DT4H5M6S"
+
+  - name: sql-interval-single-field
+    doc: One field rather than a run, which is the form most statements write. The same string under another qualifier is another duration, so an engine that ignores the qualifier answers this case and fails the next.
+    query: RETURN INTERVAL '1' DAY AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "P1D"
+
+  - name: sql-interval-leading-field-is-unbounded
+    doc: Twenty five hours is a duration and not a syntax error, because the field a qualifier starts with carries no calendar bound. The fields behind it do, which is why this is a case and not an accident.
+    query: RETURN INTERVAL '25' HOUR AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "PT25H"
+
+  - name: sql-interval-negated
+    doc: The sign may stand in front of the string as well as inside it, which is SQL's rule and is one an engine reading the string on its own will miss.
+    query: RETURN INTERVAL -'1' DAY AS n
+    columns:
+      - n
+    rows:
+      - values:
+          - type: DURATION
+            value: "-P1D"

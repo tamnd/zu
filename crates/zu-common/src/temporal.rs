@@ -167,6 +167,231 @@ impl Temporal {
         };
         Temporal::parse(&ty, text)
     }
+
+    /// The duration `text` spells when it is written the way SQL
+    /// writes one, `INTERVAL '3 04:05:06' DAY TO SECOND`, with the
+    /// qualifier already read.
+    ///
+    /// The qualifier is not decoration. It is the whole of what says
+    /// how to read the string, because `'1-2'` is a year and two
+    /// months under `YEAR TO MONTH` and is nothing at all under `DAY`,
+    /// and `'3'` is three of whichever single field was named. So this
+    /// reads the fields the qualifier lists, in order, and refuses
+    /// anything the qualifier did not ask for.
+    ///
+    /// The leading field is unbounded and the ones behind it are not:
+    /// `'25' HOUR` is twenty five hours, and `'1 25:00:00' DAY TO
+    /// SECOND` is not a day and an hour, because a written hour that
+    /// follows a written day has 24 of its own and the standard says
+    /// so. A number that runs over its field is refused rather than
+    /// carried, since carrying it would answer a question the
+    /// statement did not ask.
+    pub fn parse_sql_interval(text: &str, qualifier: &IntervalQualifier) -> Option<Temporal> {
+        if qualifier.start.kind() != qualifier.end.kind()
+            || qualifier.start.rank() > qualifier.end.rank()
+        {
+            return None;
+        }
+        let (negative, body) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text.strip_prefix('+').unwrap_or(text)),
+        };
+        let fields = &FIELD_ORDER[qualifier.start.rank()..=qualifier.end.rank()];
+        // The written value is one part a field, and which character
+        // stands between two of them depends on the pair: a year and a
+        // month are written with a minus sign, a day and the time
+        // behind it with a space, and the rest with a colon. That is
+        // `'1-2'`, `'3 04:05:06'` and `'04:05'`.
+        let mut parts = Vec::with_capacity(fields.len());
+        let mut rest = body;
+        for (ix, field) in fields.iter().enumerate() {
+            if ix + 1 == fields.len() {
+                parts.push(rest);
+                break;
+            }
+            let separator = match field {
+                IntervalField::Year => '-',
+                IntervalField::Day => ' ',
+                _ => ':',
+            };
+            let (head, tail) = rest.split_once(separator)?;
+            parts.push(head);
+            rest = tail;
+        }
+        // A written precision is a statement about the leading field
+        // alone, and it is the only meaning zu can give it, since the
+        // duration types carry one precision each and it is not this
+        // one.
+        let whole = parts[0].split('.').next()?;
+        if qualifier
+            .leading
+            .is_some_and(|limit| whole.len() > limit as usize)
+        {
+            return None;
+        }
+        let mut months = 0i64;
+        let mut nanos = 0i64;
+        for (ix, (field, text)) in fields.iter().zip(&parts).enumerate() {
+            let leading = ix == 0;
+            match field {
+                IntervalField::Year => {
+                    months = months.checked_add(uint(text)?.checked_mul(12)?)?;
+                }
+                IntervalField::Month => {
+                    months = months.checked_add(bounded(text, leading, 11)?)?;
+                }
+                IntervalField::Day => {
+                    nanos = nanos.checked_add(uint(text)?.checked_mul(NANOS_PER_DAY)?)?;
+                }
+                IntervalField::Hour => {
+                    nanos = nanos
+                        .checked_add(bounded(text, leading, 23)?.checked_mul(NANOS_PER_HOUR)?)?;
+                }
+                IntervalField::Minute => {
+                    nanos = nanos
+                        .checked_add(bounded(text, leading, 59)?.checked_mul(NANOS_PER_MINUTE)?)?;
+                }
+                IntervalField::Second => {
+                    nanos =
+                        nanos.checked_add(interval_seconds(text, leading, qualifier.fraction)?)?;
+                }
+            }
+        }
+        let sign = if negative { -1 } else { 1 };
+        Some(match qualifier.start.kind() {
+            DurationKind::YearMonth => Temporal::Duration(DurationKind::YearMonth, sign * months),
+            DurationKind::DayTime => Temporal::Duration(DurationKind::DayTime, sign * nanos),
+        })
+    }
+}
+
+/// The six primary datetime fields, smallest last, which is the order
+/// a qualifier names them in and the order they are written in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum IntervalField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+/// The fields in the order the standard writes them, so a qualifier is
+/// a slice of this and never a list built by hand.
+const FIELD_ORDER: [IntervalField; 6] = [
+    IntervalField::Year,
+    IntervalField::Month,
+    IntervalField::Day,
+    IntervalField::Hour,
+    IntervalField::Minute,
+    IntervalField::Second,
+];
+
+impl IntervalField {
+    /// The field this word names, or `None` when it names none.
+    pub fn spelled(word: &str) -> Option<IntervalField> {
+        FIELD_ORDER
+            .into_iter()
+            .find(|field| word.eq_ignore_ascii_case(field.word()))
+    }
+
+    /// The word the standard writes this field with.
+    pub fn word(self) -> &'static str {
+        match self {
+            IntervalField::Year => "YEAR",
+            IntervalField::Month => "MONTH",
+            IntervalField::Day => "DAY",
+            IntervalField::Hour => "HOUR",
+            IntervalField::Minute => "MINUTE",
+            IntervalField::Second => "SECOND",
+        }
+    }
+
+    /// Where this field stands among the six, which is what says
+    /// whether one field may follow another.
+    pub fn rank(self) -> usize {
+        FIELD_ORDER
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0)
+    }
+
+    /// Which of the two duration kinds this field counts in. The kinds
+    /// do not mix, so a qualifier naming one field from each is not a
+    /// qualifier at all.
+    pub fn kind(self) -> DurationKind {
+        match self {
+            IntervalField::Year | IntervalField::Month => DurationKind::YearMonth,
+            _ => DurationKind::DayTime,
+        }
+    }
+}
+
+/// The qualifier of a SQL interval literal: the run of fields the
+/// value is written in, and the precisions it was written with.
+///
+/// A single field is `start` and `end` the same, since one field is
+/// the run of length one and nothing about the reading changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IntervalQualifier {
+    pub start: IntervalField,
+    pub end: IntervalField,
+    /// Digits the leading field may have, when a precision was
+    /// written.
+    pub leading: Option<u32>,
+    /// Digits after the point in the seconds, when one was written.
+    pub fraction: Option<u32>,
+}
+
+impl fmt::Display for IntervalQualifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.start == self.end {
+            true => write!(f, "{}", self.start.word()),
+            false => write!(f, "{} TO {}", self.start.word(), self.end.word()),
+        }
+    }
+}
+
+/// A run of digits and nothing else, which is what every field of a
+/// SQL interval string is: the sign is written once, in front of them
+/// all, and a field carries no sign of its own.
+fn uint(text: &str) -> Option<i64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// The same, with the bound a field carries when something is written
+/// in front of it.
+fn bounded(text: &str, leading: bool, most: i64) -> Option<i64> {
+    let value = uint(text)?;
+    match leading || value <= most {
+        true => Some(value),
+        false => None,
+    }
+}
+
+/// The seconds of an interval string, which is the one field that may
+/// carry a fraction.
+fn interval_seconds(text: &str, leading: bool, digits: Option<u32>) -> Option<i64> {
+    let (whole, frac) = match text.split_once('.') {
+        Some((whole, frac)) => (whole, Some(frac)),
+        None => (text, None),
+    };
+    let mut nanos = bounded(whole, leading, 59)?.checked_mul(NANOS_PER_SEC)?;
+    if let Some(frac) = frac {
+        if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if digits.is_some_and(|limit| frac.len() > limit as usize) {
+            return None;
+        }
+        let scale = 10i64.pow(9 - frac.len() as u32);
+        nanos = nanos.checked_add(frac.parse::<i64>().ok()? * scale)?;
+    }
+    Some(nanos)
 }
 
 /// Whether a written time or datetime carries a zone.
@@ -661,5 +886,100 @@ mod tests {
             Some(Temporal::LocalTime(_))
         ));
         assert_eq!(Temporal::parse_any("nonsense"), None);
+    }
+
+    fn interval(text: &str, start: IntervalField, end: IntervalField) -> Option<Temporal> {
+        Temporal::parse_sql_interval(
+            text,
+            &IntervalQualifier {
+                start,
+                end,
+                leading: None,
+                fraction: None,
+            },
+        )
+    }
+
+    #[test]
+    fn a_sql_interval_is_read_by_the_fields_its_qualifier_names() {
+        use IntervalField::{Day, Hour, Minute, Month, Second, Year};
+        assert_eq!(
+            interval("1-2", Year, Month),
+            Some(Temporal::Duration(DurationKind::YearMonth, 14))
+        );
+        assert_eq!(
+            interval("2", Month, Month),
+            Some(Temporal::Duration(DurationKind::YearMonth, 2))
+        );
+        assert_eq!(
+            interval("3 04:05:06", Day, Second),
+            duration("P3DT4H5M6S").into()
+        );
+        assert_eq!(interval("10:30", Hour, Minute), duration("PT10H30M").into());
+        assert_eq!(interval("1.5", Second, Second), duration("PT1.5S").into());
+        // The same string under two qualifiers is two values, which is
+        // the whole reason the qualifier is not optional.
+        assert_eq!(interval("1", Day, Day), duration("P1D").into());
+        assert_eq!(interval("1", Hour, Hour), duration("PT1H").into());
+        // And a string the qualifier did not describe is nothing.
+        assert_eq!(interval("1-2", Day, Day), None);
+        assert_eq!(interval("3 04:05:06", Hour, Minute), None);
+        assert_eq!(interval("", Day, Day), None);
+        assert_eq!(interval("1x", Day, Day), None);
+    }
+
+    #[test]
+    fn only_the_leading_field_of_an_interval_runs_past_its_own_size() {
+        use IntervalField::{Day, Hour, Minute, Month, Second, Year};
+        assert_eq!(interval("25", Hour, Hour), duration("PT25H").into());
+        assert_eq!(interval("90", Minute, Minute), duration("PT1H30M").into());
+        assert_eq!(
+            interval("13", Month, Month),
+            Some(Temporal::Duration(DurationKind::YearMonth, 13))
+        );
+        // A field with something written in front of it has the size
+        // the calendar gives it, so these carry nothing and fail.
+        assert_eq!(interval("1 25:00:00", Day, Second), None);
+        assert_eq!(interval("1:60", Hour, Minute), None);
+        assert_eq!(interval("1:60", Minute, Second), None);
+        assert_eq!(interval("1-12", Year, Month), None);
+    }
+
+    #[test]
+    fn an_interval_precision_bounds_the_digits_that_were_written() {
+        use IntervalField::{Day, Second};
+        let bound = |text: &str, leading, fraction| {
+            Temporal::parse_sql_interval(
+                text,
+                &IntervalQualifier {
+                    start: Day,
+                    end: Day,
+                    leading,
+                    fraction,
+                },
+            )
+            .is_some()
+        };
+        assert!(bound("100", Some(3), None));
+        assert!(!bound("1000", Some(3), None));
+        assert!(bound("1000", None, None));
+        let seconds = |text: &str, fraction| {
+            Temporal::parse_sql_interval(
+                text,
+                &IntervalQualifier {
+                    start: Second,
+                    end: Second,
+                    leading: Some(2),
+                    fraction,
+                },
+            )
+            .is_some()
+        };
+        // The leading precision counts the digits in front of the
+        // point and the fraction counts the ones behind it, so a
+        // second written to three places fits `SECOND(2, 3)`.
+        assert!(seconds("1.123", Some(3)));
+        assert!(!seconds("1.1234", Some(3)));
+        assert!(!seconds("100.1", Some(3)));
     }
 }

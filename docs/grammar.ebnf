@@ -461,10 +461,21 @@ literal         = "NULL" | "TRUE" | "FALSE" | integer | float | string ;
 (* A temporal literal is a type name and the value written as a string,
    so DATE '2024-01-15' and DURATION 'P2D'. The name is read as a type
    only when a string follows it, which leaves DATE usable as a name. *)
-temporal_literal = temporal_name , string ;
+temporal_literal = temporal_name , string | interval_literal ;
 temporal_name   = "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "DURATION"
-                | "INTERVAL" | ( "LOCAL" | "ZONED" ) ,
+                | ( "LOCAL" | "ZONED" ) ,
                   ( "TIME" | "DATETIME" | "TIMESTAMP" ) ;
+(* The SQL spelling of a duration, where the qualifier is required
+   because it is what says how to read the string: '1-2' is a year and
+   two months under YEAR TO MONTH and is no duration at all under DAY.
+   The ISO 8601 spelling keeps its own word, DURATION, so there is one
+   spelling for each and INTERVAL 'P1D' is neither. A precision bounds
+   the digits that were written and nothing else. *)
+interval_literal = "INTERVAL" , [ "+" | "-" ] , string , interval_qualifier ;
+interval_qualifier = interval_field , [ precision ] ,
+                  [ "TO" , interval_field , [ precision ] ] ;
+interval_field  = "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" ;
+precision       = "(" , integer , [ "," , integer ] , ")" ;
 (* Every ISO spelling of a type: the integer tower and its word
    spellings, the decimals, the floats, BOOL, the string and byte string
    names, the temporal names above, PATH, BINDING TABLE, NULL and

@@ -1325,6 +1325,37 @@ pub unsafe extern "C" fn zu_create_z(
     unsafe { zu_create(path, zlen(path), out, err) }
 }
 
+/// Another connection to the database this one is on, made from the
+/// connection rather than from a path.
+///
+/// This is the call a pool makes when it has a connection and not the
+/// database handle it came from, which is every pool that hands the
+/// handle back after seeding itself, and the only way to get a second
+/// connection on a database in memory, which has no path to reopen.
+/// The new connection carries the switches and the read-only setting
+/// of the one it was made from, and has its own plan cache, its own
+/// caches, its own interrupt and its own transaction.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zu_conn_duplicate(
+    conn: *mut ZuConn,
+    out: *mut *mut ZuConn,
+    err: *mut *mut ZuError,
+) -> ZuStatus {
+    if out.is_null() {
+        return guard(err, || Err(misuse("out is NULL")));
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    guard(err, || {
+        let _claim = match unsafe { claim_conn(conn) } {
+            Ok(claim) => claim,
+            Err(status) => return Ok(status),
+        };
+        let made = unsafe { conn_of(conn) }.duplicate()?;
+        unsafe { *out = ZuConn::new(made).into_raw() };
+        Ok(ZuStatus::Ok)
+    })
+}
+
 /// Closes a connection. Statements prepared on it can still be closed
 /// afterwards, and anything else done with them answers
 /// [`ZuStatus::MisuseClosed`].

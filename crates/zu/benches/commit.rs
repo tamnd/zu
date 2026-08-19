@@ -39,7 +39,10 @@
 //! Latency is reported per statement rather than per level, because a
 //! writer that has to queue for the write side spends most of a burst
 //! waiting and the mean hides it. The p99 is the column that catches a
-//! writer starved behind the rest.
+//! writer starved behind the rest, and it is read against the one
+//! writer level's own p99 rather than its median: a machine somebody
+//! else is also using has a tail at every width, and only tail over
+//! tail cancels it.
 //!
 //! The one writer level is the denominator of all three ratios, and it
 //! is the level a busy machine moves most, since it is one thread
@@ -242,7 +245,11 @@ fn main() {
     let wide = levels.last().expect("a level ran");
     let commit_x = wide.stmts / one.stmts.max(0.001);
     let p50_x = wide.p50 / one.p50.max(0.001);
-    let p99_x = wide.p99 / one.p50.max(0.001);
+    // Tail against tail, not tail against median. A machine somebody
+    // else is also using spikes at both levels, and dividing the two
+    // tails is what cancels it; dividing the wide tail by the narrow
+    // median leaves the spike in the number and gates on the load.
+    let p99_x = wide.p99 / one.p99.max(0.001);
     println!(
         "commit_x: {commit_x:.2}x the statements a second of one writer, at {} writers",
         wide.writers

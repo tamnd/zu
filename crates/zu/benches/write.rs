@@ -736,6 +736,66 @@ fn run_set_edge(dir: &Path, rows: u64) -> Cost {
     }
 }
 
+/// A `MERGE` over two rows, one the walk finds and one it does not,
+/// `WRITES` times over.
+///
+/// This is the only statement shape that writes twice: the row the walk
+/// missed is an insert and the row it found is a `SET`, and until they
+/// shared a transaction the statement paid a commit frame, an epoch and
+/// a fold for each of them. They are different rows by definition, so
+/// neither half reads what the other wrote, which is what lets them go
+/// in together. The number to watch is the bytes: a second commit for
+/// the same work is a second frame, and the row count at the end is
+/// what says both halves still happened.
+///
+/// The walk itself is a scan of the table, the same as the `SET` run
+/// above, so most of the clock here is the read and the bytes are the
+/// part of the number that is about the write.
+fn run_merge(dir: &Path, rows: u64) -> Cost {
+    let path = build(dir, rows);
+    let db = Database::open_with(&path, Config::new().threads(1)).expect("open");
+    let mut conn = db.connect().expect("connect");
+    let merge = |found: u64, made: u64| {
+        format!(
+            "UNWIND [{found}, {made}] AS a MERGE (p:person {{age: a}}) \
+             ON CREATE SET p.name = 'made' ON MATCH SET p.name = 'found'"
+        )
+    };
+    conn.query(&merge(0, rows)).expect("warmup");
+
+    let before = usage();
+    let disk_before = disk(dir);
+    let start = Instant::now();
+    for i in 0..WRITES {
+        conn.query(&merge(i % rows, rows + 1 + i)).expect("merge");
+    }
+    let elapsed = start.elapsed();
+    let after = usage();
+    let growth = disk(dir).saturating_sub(disk_before);
+
+    assert_eq!(
+        one(&mut conn, "MATCH (p:person) RETURN count(p) AS n"),
+        (rows + WRITES + 1) as i64,
+        "the half that writes wrote a row a statement and no more"
+    );
+    assert_eq!(
+        one(
+            &mut conn,
+            "MATCH (p:person) WHERE p.name = 'found' RETURN count(p) AS n"
+        ),
+        WRITES.min(rows) as i64,
+        "and the half that matched changed the rows it matched"
+    );
+    Cost {
+        us: elapsed.as_nanos() as f64 / 1e3 / WRITES as f64,
+        cpu: after.cpu.saturating_sub(before.cpu) as f64 / WRITES as f64,
+        written: after.written.saturating_sub(before.written) as f64 / WRITES as f64,
+        growth: growth as f64 / WRITES as f64,
+        rss: after.rss,
+        peak: after.peak_rss.saturating_sub(before.peak_rss),
+    }
+}
+
 /// An `INSERT` of one element, `WRITES` times over, for the same reason
 /// and at the same shape: a statement, a commit and a fold each.
 ///
@@ -1061,6 +1121,9 @@ fn main() {
     let insert = run_insert(&root.path().join("insert"), SMALL);
     insert.report(&format!("INSERT, {SMALL} rows"), sync);
 
+    let merge = run_merge(&root.path().join("merge"), SMALL);
+    merge.report(&format!("MERGE, one found one made, {SMALL} rows"), sync);
+
     let edge_small = run_insert_edge(&root.path().join("insert-edge-small"), SMALL, false);
     edge_small.report(&format!("INSERT an edge, {SMALL} edges"), sync);
 
@@ -1156,6 +1219,10 @@ fn main() {
         ("detach_stmt_us", detach.us),
         ("detach_stmt_cpu_us", detach.cpu),
         ("detach_stmt_growth_b", detach.growth),
+        ("merge_stmt_us", merge.us),
+        ("merge_stmt_kb", merge.written / 1024.0),
+        ("merge_stmt_cpu_us", merge.cpu),
+        ("merge_stmt_growth_b", merge.growth),
         ("set_stmt_kb", set_small.written / 1024.0),
         ("delete_stmt_kb", delete.written / 1024.0),
         ("detach_stmt_kb", detach.written / 1024.0),

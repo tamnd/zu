@@ -401,7 +401,56 @@ impl QueryResult {
 /// The rows each table has lost to `DELETE`, ascending, keyed by
 /// table id. The sets are shared rather than copied because a reader
 /// hands the same one to every worker of a query.
-pub type DeletedRows = BTreeMap<u32, Arc<[u64]>>;
+///
+/// It comes in two halves because that is how the storage layer holds
+/// it, and putting them together would cost the length of the whole
+/// set on every statement. `sealed` is what the tombstone chains in
+/// the file say, and it only changes when a fold rewrites them;
+/// `fresh` is what the commits since then took away. A row is gone
+/// when either half names it, so a lookup is two binary searches on a
+/// table that has deleted something and two map misses on one that
+/// has not.
+#[derive(Clone, Debug, Default)]
+pub struct DeletedRows {
+    sealed: BTreeMap<u32, Arc<[u64]>>,
+    fresh: BTreeMap<u32, Arc<[u64]>>,
+}
+
+impl DeletedRows {
+    /// Nothing deleted, which is what an engine that cannot delete
+    /// answers and what a file that has only been written to holds.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The two halves as the storage layer has them.
+    pub fn of(sealed: BTreeMap<u32, Arc<[u64]>>, fresh: BTreeMap<u32, Arc<[u64]>>) -> Self {
+        Self { sealed, fresh }
+    }
+
+    /// Whether any table has lost a row.
+    pub fn is_empty(&self) -> bool {
+        self.sealed.is_empty() && self.fresh.is_empty()
+    }
+
+    /// Whether one row of one table is a row a `DELETE` took away.
+    pub fn holds(&self, table: u32, offset: u64) -> bool {
+        let names = |half: &BTreeMap<u32, Arc<[u64]>>| {
+            half.get(&table)
+                .is_some_and(|rows| rows.binary_search(&offset).is_ok())
+        };
+        names(&self.sealed) || names(&self.fresh)
+    }
+}
+
+impl FromIterator<(u32, Arc<[u64]>)> for DeletedRows {
+    fn from_iter<I: IntoIterator<Item = (u32, Arc<[u64]>)>>(rows: I) -> Self {
+        Self {
+            sealed: rows.into_iter().collect(),
+            fresh: BTreeMap::new(),
+        }
+    }
+}
 
 /// What the executor needs from a storage engine. Methods take
 /// `&mut self` because readers cache decoded state.
@@ -3757,13 +3806,8 @@ fn hop_levels(
 }
 
 /// Whether one row of one table is a row a `DELETE` took away.
-///
-/// The sets are per table and ascending, so this is a binary search
-/// over a handful of words on a file that has deleted something and a
-/// map lookup that misses on every other one.
 fn deleted(gone: &DeletedRows, table: u32, offset: u64) -> bool {
-    gone.get(&table)
-        .is_some_and(|rows| rows.binary_search(&offset).is_ok())
+    gone.holds(table, offset)
 }
 
 /// The nodes a key expression names, one per candidate table it exists

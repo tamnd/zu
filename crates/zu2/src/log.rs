@@ -567,6 +567,15 @@ impl Log {
         if !state.provisions || state.provisioned >= upto {
             return;
         }
+        // A flush with a chunk's worth of records behind it is a bulk
+        // load, not a commit. Growing the file costs it one inode update
+        // for a megabyte of data it was going to write anyway, and
+        // writing zeros first would double what it puts on the device.
+        // The reservation is for the small durable commit, which is the
+        // case where the metadata is most of the cost.
+        if upto - state.written >= self.provision_bytes {
+            return;
+        }
         let from = upto.div_ceil(file::BLOCK) * file::BLOCK;
         let want = (upto + self.provision_bytes).div_ceil(file::BLOCK) * file::BLOCK;
         if self.initialise(from, want).is_ok() {

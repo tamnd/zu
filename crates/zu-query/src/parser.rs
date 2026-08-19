@@ -56,6 +56,22 @@ struct Segment {
     filter: Option<Expr>,
 }
 
+/// One step of what a simplified path pattern describes (ISO 16.12),
+/// before the arrow around it has said which way the steps that wrote
+/// no direction of their own go.
+#[derive(Clone)]
+struct Simplified {
+    /// The types the step may walk, which is what the labels the
+    /// expression wrote for this step come to.
+    types: Vec<String>,
+    /// The direction this step overrode the pattern's with, if it wrote
+    /// one (features G081 and G082).
+    direction: Option<RelDirection>,
+    /// The hops the step walks, when a quantifier was written on it and
+    /// there was one step for it to be about.
+    range: Option<(Option<u64>, Option<u64>)>,
+}
+
 impl Segment {
     /// The node position the next factor written with no edge in front
     /// of it starts at, which is the one this segment ends at.
@@ -305,6 +321,27 @@ fn one_shape(bar: bool) -> &'static str {
         "a stretch repeated a variable number of times matches paths of several \
          lengths, which is several shapes, and this is a position that describes \
          one shape rather than looking for one; write a fixed count"
+    }
+}
+
+/// Which edges an arrow walks, read off the three marks it may carry:
+/// the `<` in front of it, the tilde that stands where a dash would,
+/// and the `>` behind it. `None` is the one combination that says two
+/// things at once, an edge with no direction that points both ways.
+///
+/// The seven that are left are the seven edge patterns of ISO 18.9,
+/// and they are also the seven ways a simplified path pattern spells
+/// which way its edges go, so both are read here.
+fn a_direction(inbound: bool, tilde: bool, outbound: bool) -> Option<RelDirection> {
+    match (inbound, tilde, outbound) {
+        (true, true, true) => None,
+        (true, false, false) => Some(RelDirection::In),
+        (false, false, true) => Some(RelDirection::Out),
+        (true, false, true) => Some(RelDirection::AnyDirected),
+        (false, true, false) => Some(RelDirection::Undirected),
+        (true, true, false) => Some(RelDirection::InOrUndirected),
+        (false, true, true) => Some(RelDirection::OutOrUndirected),
+        (false, false, false) => Some(RelDirection::Any),
     }
 }
 
@@ -2151,6 +2188,28 @@ impl Parser<'_> {
     fn parse_segment(&mut self, into: &mut Segment) -> Result<()> {
         self.parse_factor(into)?;
         loop {
+            // A simplified path pattern is as many steps as its labels
+            // spell, so the nodes between them are written here: they
+            // are nodes the query did not write and says nothing about,
+            // and the last step reaches the factor that follows.
+            if self.at_simplified() {
+                let rels = self.parse_simplified()?;
+                let Some((last, rest)) = rels.split_last() else {
+                    let mut right = Segment::default();
+                    self.parse_factor(&mut right)?;
+                    into.juxtapose(right);
+                    continue;
+                };
+                for rel in rest {
+                    let mut between = Segment::default();
+                    between.join(NodePattern::default());
+                    into.step(rel.clone(), between);
+                }
+                let mut right = Segment::default();
+                self.parse_factor(&mut right)?;
+                into.step(last.clone(), right);
+                continue;
+            }
             if self.at(&TokenKind::Minus) || self.at(&TokenKind::Lt) || self.at(&TokenKind::Tilde) {
                 let rel = self.parse_rel()?;
                 let mut right = Segment::default();
@@ -2332,7 +2391,11 @@ impl Parser<'_> {
     /// lengths as the engine felt like walking.
     fn repetitions(&mut self, times: (Option<u64>, Option<u64>), at: usize) -> Result<usize> {
         let (lo, hi) = match times {
-            (Some(min), Some(max)) if min <= max => (min as usize, max as usize),
+            // A range with no floor written starts at nought, which is
+            // the stretch not walked at all.
+            (min, Some(max)) if min.unwrap_or(0) <= max => {
+                (min.unwrap_or(0) as usize, max as usize)
+            }
             (Some(min), Some(max)) => {
                 return Err(ZuError::gql_in(
                     codes::C42001,
@@ -2835,22 +2898,13 @@ impl Parser<'_> {
             (Some(hops), None) => Some(hops),
             (None, quantified) => quantified,
         };
-        let direction = match (inbound, left_tilde, outbound) {
-            (true, true, true) => {
-                return Err(ZuError::gql_in(
-                    codes::C42001,
-                    self.source,
-                    self.tokens[self.pos - 1].start,
-                    "an undirected relationship cannot point both ways",
-                ));
-            }
-            (true, false, false) => RelDirection::In,
-            (false, false, true) => RelDirection::Out,
-            (true, false, true) => RelDirection::AnyDirected,
-            (false, true, false) => RelDirection::Undirected,
-            (true, true, false) => RelDirection::InOrUndirected,
-            (false, true, true) => RelDirection::OutOrUndirected,
-            (false, false, false) => RelDirection::Any,
+        let Some(direction) = a_direction(inbound, left_tilde, outbound) else {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                self.tokens[self.pos - 1].start,
+                "an undirected relationship cannot point both ways",
+            ));
         };
         Ok(RelPattern {
             var,
@@ -2870,6 +2924,264 @@ impl Parser<'_> {
         }
         self.expect(&TokenKind::Minus)?;
         Ok(false)
+    }
+
+    /// Whether an arrow opens a simplified path pattern (ISO 16.12),
+    /// which is told from an ordinary one by the slash: the label
+    /// expression goes inside the arrow rather than in brackets behind
+    /// it, so `-/ LINK /->` is where `-[:LINK]->` would have stood.
+    fn at_simplified(&self) -> bool {
+        let mut at = self.pos;
+        if matches!(self.tokens.get(at).map(|t| &t.kind), Some(TokenKind::Lt)) {
+            at += 1;
+        }
+        if !matches!(
+            self.tokens.get(at).map(|t| &t.kind),
+            Some(TokenKind::Minus | TokenKind::Tilde)
+        ) {
+            return false;
+        }
+        matches!(
+            self.tokens.get(at + 1).map(|t| &t.kind),
+            Some(TokenKind::Slash)
+        )
+    }
+
+    /// A simplified path pattern (ISO 16.12, features G039 and G080 to
+    /// G082): the steps it describes, in written order.
+    ///
+    /// What the slashes hold is an expression over edge labels rather
+    /// than one label: labels written one after another are steps one
+    /// after another, a bar between them is either label on the one
+    /// step, brackets group, and a quantifier behind any of it repeats
+    /// it. The arrow around the slashes says which way the steps go,
+    /// and a step may write a direction of its own in front of or
+    /// behind its label, which is what the override features are.
+    ///
+    /// It reads as the pattern it abbreviates and nothing below the
+    /// parser learns about it: `-/ A B /->` is `-[:A]->()-[:B]->`, and
+    /// the anonymous node between the steps is written by the caller,
+    /// which is the one that knows what the pattern ends at.
+    fn parse_simplified(&mut self) -> Result<Vec<RelPattern>> {
+        let inbound = self.eat(&TokenKind::Lt);
+        let left_tilde = self.parse_rel_bar()?;
+        self.expect(&TokenKind::Slash)?;
+        let steps = self.parse_simple_contents()?;
+        let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
+        self.expect(&TokenKind::Slash)?;
+        let right_tilde = self.parse_rel_bar()?;
+        if left_tilde != right_tilde {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "a simplified path pattern is undirected at both ends or at neither",
+            ));
+        }
+        let outbound = self.eat(&TokenKind::Gt);
+        let Some(default) = a_direction(inbound, left_tilde, outbound) else {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "an undirected relationship cannot point both ways",
+            ));
+        };
+        Ok(steps
+            .into_iter()
+            .map(|step| RelPattern {
+                var: None,
+                types: step.types,
+                direction: step.direction.unwrap_or(default),
+                range: step.range,
+                props: Vec::new(),
+                filter: None,
+            })
+            .collect())
+    }
+
+    /// What the slashes hold: the terms and the bars between them.
+    fn parse_simple_contents(&mut self) -> Result<Vec<Simplified>> {
+        let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
+        let mut ways = vec![self.parse_simple_term()?];
+        let mut multiset = false;
+        while self.eat(&TokenKind::Pipe) {
+            if self.eat(&TokenKind::Plus) {
+                multiset = true;
+                self.expect(&TokenKind::Pipe)?;
+            }
+            ways.push(self.parse_simple_term()?);
+        }
+        if ways.len() == 1 {
+            return Ok(ways.pop().expect("a term was read"));
+        }
+        if multiset {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "a multiset alternation answers a path once per way that found it, and \
+                 the ways inside a simplified path pattern are labels on one step \
+                 rather than walks of their own; write the alternatives as path \
+                 patterns with a bar between them",
+            ));
+        }
+        // Two ways of one step each are the one step with either label
+        // on it, which is what a step written `[:A|B]` is. Ways of more
+        // than one step are walks of different shapes, and a walk is
+        // not something a label expression can hold.
+        let mut types = Vec::new();
+        for way in &ways {
+            match way.as_slice() {
+                [one] if one.range.is_none() && one.direction == ways[0][0].direction => {
+                    // A label written on two of the ways is the one
+                    // label: what the bar answers is a set of paths,
+                    // and a step that walked the same edge under the
+                    // same type walked the same path.
+                    for name in &one.types {
+                        if !types.contains(name) {
+                            types.push(name.clone());
+                        }
+                    }
+                }
+                _ => {
+                    return Err(ZuError::gql_in(
+                        codes::C42001,
+                        self.source,
+                        at,
+                        "a bar inside a simplified path pattern says either label on the \
+                         one step, so the ways it separates are single steps that go the \
+                         same way; write the alternatives as path patterns with a bar \
+                         between them",
+                    ));
+                }
+            }
+        }
+        Ok(vec![Simplified {
+            types,
+            direction: ways[0][0].direction,
+            range: None,
+        }])
+    }
+
+    /// One term: the factors written one after another, which are the
+    /// steps of the walk in the order it takes them.
+    fn parse_simple_term(&mut self) -> Result<Vec<Simplified>> {
+        let mut out = self.parse_simple_factor()?;
+        while self.at_simple_factor() {
+            out.extend(self.parse_simple_factor()?);
+        }
+        Ok(out)
+    }
+
+    /// Whether another factor is written here, which is what ends a
+    /// term: a bar, a closing bracket and the closing slash do not.
+    fn at_simple_factor(&self) -> bool {
+        matches!(
+            self.peek().map(|t| &t.kind),
+            Some(
+                TokenKind::Ident(_)
+                    | TokenKind::QuotedIdent(_)
+                    | TokenKind::LParen
+                    | TokenKind::Lt
+                    | TokenKind::Tilde
+                    | TokenKind::Bang
+                    | TokenKind::Percent
+            )
+        )
+    }
+
+    /// One factor: a direction of its own, then the label or the
+    /// bracketed group it applies to, then a quantifier.
+    fn parse_simple_factor(&mut self) -> Result<Vec<Simplified>> {
+        let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
+        let inbound = self.eat(&TokenKind::Lt);
+        let tilde = self.eat(&TokenKind::Tilde);
+        let mut steps = self.parse_simple_primary()?;
+        let outbound = self.eat(&TokenKind::Gt);
+        if inbound || tilde || outbound {
+            let Some(over) = a_direction(inbound, tilde, outbound) else {
+                return Err(ZuError::gql_in(
+                    codes::C42001,
+                    self.source,
+                    at,
+                    "an undirected relationship cannot point both ways",
+                ));
+            };
+            // A group takes the direction written on it wherever it did
+            // not write one of its own, which is what makes the
+            // override a default of its own rather than a rewrite.
+            for step in &mut steps {
+                step.direction.get_or_insert(over);
+            }
+        }
+        let times = if self.eat(&TokenKind::Question) {
+            Some((Some(0), Some(1)))
+        } else {
+            self.parse_edge_quantifier()?
+        };
+        let Some(times) = times else {
+            return Ok(steps);
+        };
+        // A quantifier on one step that walks at least one hop is the
+        // hops that step walks, which is the shape a variable-length
+        // step already has, so a count with no ceiling on it costs
+        // nothing here. Everything else is a stretch repeated: more
+        // than one step, or a count that may be nought, which is a
+        // stretch that may not be walked at all. Those are lengths, and
+        // the lengths are patterns of their own.
+        if let [one] = steps.as_slice()
+            && one.range.is_none()
+            && times.0.unwrap_or(0) >= 1
+        {
+            return Ok(vec![Simplified {
+                types: one.types.clone(),
+                direction: one.direction,
+                range: Some(times),
+            }]);
+        }
+        let count = self.repetitions(times, at)?;
+        let mut out = Vec::with_capacity(steps.len() * count);
+        for _ in 0..count {
+            out.extend(steps.iter().cloned());
+        }
+        Ok(out)
+    }
+
+    /// One label, or a bracketed expression over labels.
+    fn parse_simple_primary(&mut self) -> Result<Vec<Simplified>> {
+        let at = self.peek().map(|t| t.start).unwrap_or(self.source.len());
+        if self.at(&TokenKind::Bang) || self.at(&TokenKind::Percent) {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "an edge is stored under one type in this engine, so a label expression \
+                 on a step is the types it may have and nothing else; write the types \
+                 the step walks with bars between them",
+            ));
+        }
+        if self.eat(&TokenKind::LParen) {
+            let inner = self.parse_simple_contents()?;
+            self.expect(&TokenKind::RParen)?;
+            return Ok(inner);
+        }
+        let name = self.expect_name("an edge type")?;
+        if self.at(&TokenKind::Amp) {
+            return Err(ZuError::gql_in(
+                codes::C42001,
+                self.source,
+                at,
+                "an edge is stored under one type in this engine, so no edge has two of \
+                 them at once and a conjunction of labels on a step matches nothing; \
+                 write the one type the step walks",
+            ));
+        }
+        Ok(vec![Simplified {
+            types: vec![name],
+            direction: None,
+            range: None,
+        }])
     }
 
     /// The hop range after `*`: nothing, `2`, `1..3`, `..3`, or `2..`.

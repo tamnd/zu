@@ -260,6 +260,23 @@ const NOTES: &[&str] = &[
      lengths is out of reach behind it, the lengths holding the elements in different places \
      and the row between the parts holding one column per name, and it is the reading of the \
      name that is refused rather than the walk",
+    "a simplified path pattern writes a stretch of edges between one pair of slashes, so \
+     `-/ knows knows /->` is the two steps that pattern spells out and every node between them \
+     is a node nobody named. The arrow around the slashes says which way the steps go and there \
+     are seven of them, the same seven an ordinary arrow writes, so a stretch written between \
+     `-/` and `/-` walks either way and one written between `~/` and `/~>` walks an undirected \
+     edge or an outgoing one. That direction is the one every step of the stretch takes unless \
+     the step overrides it, which a step does by writing `<` in front of the type or `>` behind \
+     it. Inside the slashes a type is one step, two types written against each other are two \
+     steps with a node between them, a bar between two types is the one step either type \
+     answers, brackets group, and a quantifier repeats what stands in front of it: a count with \
+     a floor of one or more over a single step is the hop range the arrow already writes, and \
+     every other count is written out the way a quantifier behind brackets is. What the standard \
+     writes for label expressions this engine has no store for is refused by name: an edge is \
+     kept under one type here, so a negated type, a wildcard and a conjunction have no answer, \
+     and a bar separating stretches of more than one step is refused as well, that being an \
+     alternation of paths rather than of labels and something the bar between whole patterns \
+     already says",
     "a condition may be written inside an element pattern, and it is asked of the one element \
      that pattern stands on where the pattern reaches it rather than of the row a whole pattern \
      built: a node writes it after its labels and its property map and an edge writes it inside \

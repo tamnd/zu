@@ -1215,3 +1215,58 @@ cases:
     doc: An INSERT describes one shape to make, and a stretch of several lengths describes several, so there is no answer to how many elements it asked for. It is refused where it is written.
     query: INSERT (a:person) ((x:person)-[:knows]->(y:person))? (b:person)
     raises: "42001"
+
+  - name: a-simplified-stretch-is-the-pattern-it-abbreviates
+    doc: A simplified path pattern of ISO 16.12, feature G039, writes a stretch of edges between one pair of slashes and leaves the nodes between them unwritten. One label is one step, so this asks what the arrow written the long way asks and answers the three edges of the fixture.
+    query: MATCH (a:person)-/ knows /->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: two-labels-in-a-simplified-stretch-are-two-steps
+    doc: Labels written one after another are steps one after another, with a node nobody named between them, so this walks two edges. Ann knows bo and bo knows cy is one such walk and the edge that runs from di to di, walked twice, is the other, which is the same pair of walks the two steps written the long way answer.
+    query: MATCH (a:person)-/ knows knows /->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "2"
+
+  - name: a-bar-in-a-simplified-stretch-is-either-label-on-one-step
+    doc: The bar inside the slashes separates labels rather than walks, so a label written on both sides of it is the one label and the step is walked once. Anything else would count the same edge twice.
+    query: MATCH (a:person)-/ knows|knows /->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-quantifier-in-a-simplified-stretch-repeats-what-it-follows
+    doc: A count behind a label repeats that step, so a range of one to two hops answers the three walks of one edge and the one walk of two.
+    query: MATCH (a:person)-/ knows{1,2} /->(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-step-may-override-the-direction-the-arrow-set
+    doc: The arrow around the slashes says which way every step goes, and a step overrides it by writing an arrowhead of its own, which is ISO 16.12, features G081 and G082. The arrow here walks an edge either way round and the override narrows it to the way the edges run.
+    query: MATCH (a:person)-/ knows> /-(b:person) RETURN count(*) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "3"
+
+  - name: a-label-expression-a-single-typed-edge-cannot-answer-is-refused
+    doc: An edge is stored under exactly one type in this engine, so a negated label on a step describes something no edge of it can be asked about. It is refused by name where it is written rather than answered as though the negation had been dropped.
+    query: MATCH (a:person)-/ !knows /->(b:person) RETURN count(*) AS a
+    raises: "42001"

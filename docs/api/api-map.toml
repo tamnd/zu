@@ -307,6 +307,11 @@ tier = 1
 reason = "open, prepare, execute, explain, profile: the surface a binding is"
 
 [[group]]
+prefix = "zu::shared"
+tier = 3
+reason = "the one write side a process keeps per file, which sessions borrow to write and fork to read. A binding opens a connection and the sharing happens under it."
+
+[[group]]
 prefix = "zu::snapshot"
 tier = 3
 reason = "the vectorized read path, zone maps and CSR pins, which sits under the executor"

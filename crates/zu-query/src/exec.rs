@@ -6627,6 +6627,31 @@ fn eval(ctx: &mut StageCtx, expr: &BoundExpr) -> Result<Value> {
                     other => Err(invalid(format!("id() expects a node, got {other:?}"))),
                 }
             }
+            // G100. A string, and one that says which kind of element
+            // it names, so a node and an edge that happen to sit at the
+            // same number are two identifiers and not one. A node is
+            // its table and its offset; an edge is its table, the pair
+            // it runs between and which copy of that pair it is, which
+            // is what tells parallel edges apart. Null in is null out,
+            // as it is for every scalar here.
+            Func::ElementId => {
+                if *star || args.len() != 1 {
+                    return Err(invalid("element_id() takes exactly one argument".into()));
+                }
+                match eval(ctx, &args[0])? {
+                    Value::Node { table, offset } => Ok(Value::Str(format!("n:{table}:{offset}"))),
+                    Value::Rel {
+                        table,
+                        src,
+                        dst,
+                        ord,
+                    } => Ok(Value::Str(format!("e:{table}:{src}:{dst}:{ord}"))),
+                    Value::Null => Ok(Value::Null),
+                    other => Err(invalid(format!(
+                        "element_id() expects a node or an edge, got {other:?}"
+                    ))),
+                }
+            }
             Func::Size => {
                 if *star || args.len() != 1 {
                     return Err(invalid("size() takes exactly one argument".into()));
@@ -6927,6 +6952,7 @@ impl AggState {
             Func::Max => Acc::Max(None),
             Func::Collect => Acc::Collect(Vec::new()),
             Func::Id
+            | Func::ElementId
             | Func::Size
             | Func::Cardinality
             | Func::PathLength

@@ -1223,6 +1223,7 @@ pub(crate) fn func_name(func: Func) -> &'static str {
         Func::Max => "max",
         Func::Collect => "collect",
         Func::Id => "id",
+        Func::ElementId => "element_id",
         Func::Size => "size",
         Func::Cardinality => "cardinality",
         Func::PathLength => "path_length",

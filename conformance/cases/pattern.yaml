@@ -1062,3 +1062,43 @@ cases:
       - values:
           - type: INT64
             value: "4"
+
+  - name: element-id-names-a-node
+    doc: ELEMENT_ID of ISO 20.10 answers an identifier for an element, and what the identifier is the standard leaves to the engine. zu answers a string that says which kind of element it names, then which table, then where in it, so the spelling is here rather than only in the declaration; a client that stores one of these is relying on it.
+    query: MATCH (n:person) WHERE n.name = 'ann' RETURN element_id(n) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: "n:0:0"
+
+  - name: element-id-names-an-edge-as-well-as-a-node
+    doc: The argument is an element and not a node, so an edge has one too, and an edge's is its table, the pair it runs between and which copy of that pair it is. Nothing an edge answers can collide with what a node answers, because the two spellings start differently.
+    query: MATCH (a:person)-[r:knows]->(b:person) WHERE a.name = 'ann' RETURN element_id(r) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: "e:1:0:1:0"
+
+  - name: element-id-tells-two-elements-apart
+    doc: The one thing an identifier owes is to name one element, so two elements answer two identifiers. This is the property a client relies on and the reason the answer is a string rather than the offset ID gives, which a node and an edge would share.
+    query: MATCH (a:person), (b:person) WHERE a.name = 'ann' AND b.name = 'bo' RETURN element_id(a) <> element_id(b) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: BOOL
+            value: true
+
+  - name: element-id-of-nothing-is-nothing
+    doc: A null element has no identifier rather than an identifier for null, which is how every other scalar here reads a null.
+    query: MATCH (n:person) OPTIONAL MATCH (n)-[:knows]->(m:person WHERE m.age > 90) RETURN count(element_id(m)) AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: INT64
+            value: "0"

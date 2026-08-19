@@ -48,6 +48,16 @@ pub trait VfsFile: Debug + Send {
     fn sync_all(&mut self) -> Result<()>;
     fn sync_data(&mut self) -> Result<()>;
     fn len(&self) -> Result<u64>;
+
+    /// A second handle on the same file.
+    ///
+    /// Group commit is what wants this: the sync that makes a batch of
+    /// commits durable runs while the writer that staged them has
+    /// already let go of the log, so it cannot be the same handle. A
+    /// sync is a promise about the file rather than about the
+    /// descriptor, so syncing this one makes durable what was written
+    /// through the other.
+    fn dup(&self) -> Result<Box<dyn VfsFile>>;
 }
 
 /// The production implementation: every call is the syscall it names.
@@ -167,6 +177,10 @@ impl VfsFile for RealFile {
     fn len(&self) -> Result<u64> {
         Ok(self.0.metadata()?.len())
     }
+
+    fn dup(&self) -> Result<Box<dyn VfsFile>> {
+        Ok(Box::new(RealFile(self.0.try_clone()?)))
+    }
 }
 
 /// Which file an [`IoEvent`] belongs to. Sync barriers are per file:
@@ -251,5 +265,16 @@ impl VfsFile for RecordingFile {
 
     fn len(&self) -> Result<u64> {
         self.inner.len()
+    }
+
+    /// The copy records onto the same log, so a sync issued through it
+    /// lands in the event stream where it happened and the crash
+    /// harness sees a group commit exactly as it sees any other.
+    fn dup(&self) -> Result<Box<dyn VfsFile>> {
+        Ok(Box::new(RecordingFile {
+            inner: RealFile(self.inner.0.try_clone()?),
+            id: self.id,
+            log: Arc::clone(&self.log),
+        }))
     }
 }

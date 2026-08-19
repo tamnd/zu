@@ -56,7 +56,7 @@ use crate::zu1::fold::{checkpoint_fold, recover, staged_fold};
 use crate::zu1::graph::{EdgePatch, GraphReader};
 use crate::zu1::props::{LanePatch, PropsDirectory, RowPatch, load_props, load_rel_props};
 use crate::zu1::txn::{Cell, Deferred, Mvcc, WriteTxn};
-use crate::zu1::wal::Wal;
+use crate::zu1::wal::{Commits, Wal};
 
 /// How much a run of folds may take before one of them checkpoints.
 ///
@@ -135,6 +135,19 @@ pub struct Written<T> {
     /// nothing publishes nothing, so this is the epoch that was
     /// already current when the closure did no work.
     pub epoch: Epoch,
+
+    /// How far the log has to be on the platter for this to have
+    /// committed, or `None` when nothing is owed.
+    ///
+    /// Nothing is owed by a transaction that staged nothing, and
+    /// nothing is owed once a checkpoint has sealed the change into the
+    /// base file and cut the log, because then what would be waited for
+    /// is not there any more and what it said is durable without it.
+    ///
+    /// The caller waits for this after it has given the write side
+    /// back, which is what lets the writer behind it stage into the
+    /// same sync. See [`Commits::sync_through`].
+    pub owed: Option<u64>,
 }
 
 /// The write side of one open database.
@@ -266,7 +279,10 @@ impl Writer {
         if staged {
             db.keep_savepoint()?;
         }
-        let epoch = txn.commit(&mut self.wal)?;
+        // The frames go to the log, and the wait for the platter does
+        // not happen here: the caller does it once it has let go of the
+        // write side, so the next writer stages into the same sync.
+        let (epoch, mut owed) = txn.stage_commit(&mut self.wal)?;
         if staged {
             let changes = self.mvcc.take_deferred();
             if self.defers(db, &changes)? {
@@ -281,7 +297,25 @@ impl Writer {
                 }
             }
         }
-        Ok(Written { value, epoch })
+        // A fold that checkpointed put this epoch in the base file,
+        // synced it there and cut the log. So the offset above names a
+        // byte the log no longer has, and what it was going to make
+        // durable is durable already.
+        if owed.is_some_and(|need| self.wal.len() < need) {
+            owed = None;
+        }
+        Ok(Written { value, epoch, owed })
+    }
+
+    /// What makes this writer's commits durable, held past the write
+    /// side going back so the wait happens off the lock.
+    pub fn commits(&self) -> Arc<Commits> {
+        Arc::clone(self.wal.commits())
+    }
+
+    /// Whether the log owes nothing. See [`Commits::settled`].
+    pub fn settled(&self) -> bool {
+        self.wal.commits().settled()
     }
 
     /// The cells the commits since the last fold wrote, which a reader
@@ -678,6 +712,67 @@ mod tests {
             .expect("write");
         assert_eq!(rows, 1);
         assert_eq!(names(&mut session), ["ada", "amy", "eva", "joe", "kay"]);
+    }
+
+    /// Eight connections writing the same file at once end with every
+    /// row they inserted there, once each.
+    ///
+    /// This is the shape group commit changed. A writer stages its
+    /// frames, gives the write side back, and only then waits for the
+    /// platter, so the next writer is staging while the sync of the
+    /// last one is in the air and one sync commits them both. What that
+    /// must not cost is any of this: every commit still lands, and the
+    /// state a reader picks up is one a crash could not take back.
+    #[test]
+    fn eight_connections_writing_one_file_all_land() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("burst.zu1");
+        seeded(&path);
+
+        const WRITERS: u64 = 8;
+        const EACH: u64 = 10;
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let path = path.as_path();
+                scope.spawn(move || {
+                    let mut session = Session::open(path).expect("open");
+                    let (person, _) = person_and_knows(&session);
+                    for i in 0..EACH {
+                        let age = 1000 + writer * EACH + i;
+                        session
+                            .write(|txn| {
+                                txn.insert_nodes(
+                                    person,
+                                    vec![
+                                        (0, vec![Cell::Int(age)]),
+                                        (1, vec![Cell::Str(b"new".to_vec())]),
+                                    ],
+                                )
+                            })
+                            .expect("write");
+                    }
+                });
+            }
+        });
+
+        let mut session = Session::open(&path).expect("open");
+        let rows = session
+            .run(
+                "MATCH (p:person) WHERE p.age >= 1000 RETURN p.age AS age",
+                &[],
+            )
+            .expect("read")
+            .rows;
+        let mut ages: Vec<u64> = rows
+            .iter()
+            .map(|row| match row[0] {
+                Value::Int(age) => age as u64,
+                ref other => panic!("expected an age, got {other:?}"),
+            })
+            .collect();
+        ages.sort_unstable();
+        let want: Vec<u64> = (1000..1000 + WRITERS * EACH).collect();
+        assert_eq!(ages, want, "every commit landed exactly once");
     }
 
     /// An edge committed the same way is an edge a hop walks.

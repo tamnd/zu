@@ -18,6 +18,7 @@
 //! state and nothing else.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use zu_common::{Epoch, GROUP_ROWS, Result, ZuError};
 
@@ -1036,17 +1037,37 @@ impl WriteTxn<'_> {
     /// [`Wal::commit`] is the commit point; failure before it leaves
     /// the store untouched and the tail torn, which replay drops.
     pub fn commit(self, wal: &mut Wal) -> Result<Epoch> {
+        let commits = Arc::clone(wal.commits());
+        let (epoch, owed) = self.stage_commit(wal)?;
+        if let Some(need) = owed {
+            commits.sync_through(need)?;
+        }
+        Ok(epoch)
+    }
+
+    /// [`Self::commit`] without the wait for the platter: the frames go
+    /// to the log and what comes back is the epoch and the byte the log
+    /// has to be durable through for the transaction to have committed.
+    ///
+    /// The overlays are applied here, before that wait, because they
+    /// are what the writer itself reads and it has to see its own
+    /// write. What must not happen before the wait is publishing them
+    /// to the other connections, and that is the caller's to hold back.
+    ///
+    /// A transaction that staged nothing owes nothing and is already
+    /// committed, trivially.
+    pub fn stage_commit(self, wal: &mut Wal) -> Result<(Epoch, Option<u64>)> {
         if self.ops.is_empty() {
-            return Ok(self.mvcc.epoch);
+            return Ok((self.mvcc.epoch, None));
         }
         let epoch = self.mvcc.epoch + 1;
         wal.append(epoch, &WalRecord::TxnBegin)?;
         for rec in build_records(&self.ops) {
             wal.append(epoch, &rec)?;
         }
-        wal.commit(epoch)?;
+        let need = wal.stage_commit(epoch)?;
         self.mvcc.apply(epoch, self.ops);
-        Ok(epoch)
+        Ok((epoch, Some(need)))
     }
 }
 

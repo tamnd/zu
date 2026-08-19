@@ -302,6 +302,11 @@ tier = 1
 reason = "one runtime value, in and out, which is the type every binding spends its conversion code on"
 
 [[group]]
+prefix = "zu::query::column"
+tier = 1
+reason = "the same rows read down their columns, which is the shape every binding hands to Arrow, pandas or polars; a binding that writes the transpose itself is the one docs/clients/duckdb.md measured at twenty times DuckDB"
+
+[[group]]
 prefix = "zu::session"
 tier = 1
 reason = "open, prepare, execute, explain, profile: the surface a binding is"

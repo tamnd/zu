@@ -362,6 +362,12 @@ A scorecard says whether a client has the apparatus. It does not say whether the
 
 Its finding is one sentence long. We are twenty times faster on a point read and eleven times faster registering somebody else's columns, three times faster reading a result as rows, and twenty times slower turning one into Arrow, and all four of those numbers have the same cause: `QueryResult` is `Vec<Vec<Value>>`, so the row path starts where it wants to be and every columnar path has to transpose back out of it. `crates/zu-vector` is already a vector layer of the right shape, down to a `StrView` that is Arrow's `Utf8View` byte for byte, and the executor already works in it. What is missing is a result that keeps the vectors rather than a sink that flattens them, which is the same thing §4 says about the C ABI's chunked reads being a slice of what was already materialized.
 
+The answer to it starts at `zu::query::column`, which is a result read down its columns rather than across its rows: one contiguous buffer per column in the layout Arrow already uses, a validity bitmap that is absent when nothing is null, and strings as bytes and offsets. `QueryResult::columnar` fills it in two passes over the rows in row order, one to settle each column's type and one to fill each column's buffer, which is where the twenty went: a client used to walk the whole result once per column to infer and again per column per batch to gather, so a three column result was six strided passes and this is two sequential ones. A column of nodes, rels, paths, lists or records still arrives as values, borrowed rather than copied, because no buffer describes them and nobody exports a million of them.
+
+It lives in the engine and not in a binding for one reason. The transpose is a transpose only until the sink stops flattening: `crates/zu-vector` is what the executor already computes in, [`SinkState`] is the one place the vectors die, and when that changes `columnar` hands back the buffers the executor filled and no client changes a line. A binding that had written the transpose for itself would have to be rewritten instead.
+
+[`SinkState`]: https://github.com/tamnd/zu/blob/main/crates/zu-exec/src/sink.rs
+
 ## 17. Documentation deliverables (v1.0 gate)
 
 Format spec (`docs/format-zu1.md`, byte-accurate, enough to write an independent reader), grammar EBNF, GQL conformance declaration, ops guide for s3 engine (cost tuning worked examples), migration guides (Neo4j/Kùzu → zu: data model mapping + Cypher dialect diffs).

@@ -3905,6 +3905,14 @@
       "doc": "Where a column is, by name, or `None` when the result has no\nsuch column. This is the cheap question a caller asks once\nbefore a loop, so that the loop reads by index and never\ncompares a string per row."
     },
     {
+      "id": "zu::query::QueryResult::columnar",
+      "kind": "method",
+      "name": "columnar",
+      "of": "zu::query::QueryResult",
+      "signature": "fn columnar(&self) -> Result<Columns, MixedColumn>",
+      "doc": "This result read down its columns.\n\nTwo passes over the rows in row order, both of them sequential:\nthe first settles each column's type, the second fills each\ncolumn's buffer. Not two passes per column. A client that wanted\nArrow used to walk the result once per column to infer and once\nper column per batch to gather, which on a wide result is a\nmultiple of this and on any result is strided.\n\nFails only where a column's rows are types no single column\nholds, and says which column, which row, and what the two types\nwere. Every other refusal belongs to the client, because the\nformat decides it: a time with an offset has no Arrow type and\nthat is Arrow's fact rather than the engine's.\n\nThe buffers are owned and the complex columns borrow, so the\nresult stays readable afterwards and a client may ask twice."
+    },
+    {
       "id": "zu::query::QueryResult::columns",
       "kind": "field",
       "name": "columns",
@@ -4282,6 +4290,506 @@
       "name": "bind",
       "signature": "fn bind(source: &str, catalog: &zu::zu1::catalog::Catalog) -> zu_common::Result<zu_query::binder::BoundQuery>",
       "doc": "Parses and binds one query against a zu1 catalog."
+    },
+    {
+      "id": "zu::query::column",
+      "kind": "module",
+      "name": "column",
+      "source": "zu_query::column",
+      "doc": "A result read down its columns instead of across its rows.\n\nEvery client that hands a result to something else hands it over as\ncolumns. Arrow is columns, pandas is columns, polars is columns, and\nthe C ABI's chunked read is columns. A result is [`Vec<Vec<Value>>`],\nso each of those clients has been writing the same transpose, and\nwriting it badly: `zu-python` walked the whole result once per column\nto decide the column's type and again per batch to gather the values,\nwhich on a million rows of three columns is six strided passes over\nthirty two byte cells and a `Vec` of pointers per batch per column.\n`docs/clients/duckdb.md` measured what that costs. Twenty times\nDuckDB, for the same bytes in the same layout at the other end.\n\nThis is the transpose written once, in the engine, where the next\nchange makes it free. Two passes over the rows in row order: one to\nsettle each column's type, one to fill each column's buffer. Not two\nper column, two in total, and both of them sequential over memory the\nresult already had hot. The buffers that come out are Arrow's own\nlayouts, so a client's remaining job is to name them rather than to\ncopy them: a `Vec<i64>` becomes an `Int64Array` by moving, offsets\nand bytes become a `StringArray` by moving, and a validity bitmap is\nArrow's null buffer with the same bit order and the same meaning of\nset.\n\nIt is a transpose because the sink still flattens. `crates/zu-vector`\nis the vector layer the executor already computes in, and the one\nplace the vectors die is [`SinkState`], which fills a row at a time\nout of them. When that changes, [`QueryResult::columnar`] stops\nwalking anything and starts handing back the buffers the executor\nfilled, and no client changes a line. That is the whole reason the\nanswer is shaped like this and lives here rather than in a binding.\n\n[`SinkState`]: ../../zu_exec/sink/struct.SinkState.html"
+    },
+    {
+      "id": "zu::query::column::Column",
+      "kind": "struct",
+      "name": "Column",
+      "doc": "One column of a result: its name, the type its rows turned out to\nbe, its buffer, and which of its rows have a value."
+    },
+    {
+      "id": "zu::query::column::Column::data",
+      "kind": "field",
+      "name": "data",
+      "of": "zu::query::column::Column",
+      "signature": "ColumnData"
+    },
+    {
+      "id": "zu::query::column::Column::len",
+      "kind": "field",
+      "name": "len",
+      "of": "zu::query::column::Column",
+      "signature": "usize"
+    },
+    {
+      "id": "zu::query::column::Column::name",
+      "kind": "field",
+      "name": "name",
+      "of": "zu::query::column::Column",
+      "signature": "&str"
+    },
+    {
+      "id": "zu::query::column::Column::ty",
+      "kind": "field",
+      "name": "ty",
+      "of": "zu::query::column::Column",
+      "signature": "ColumnType"
+    },
+    {
+      "id": "zu::query::column::Column::validity",
+      "kind": "field",
+      "name": "validity",
+      "of": "zu::query::column::Column",
+      "signature": "Option<Validity>",
+      "doc": "Absent when every row has a value."
+    },
+    {
+      "id": "zu::query::column::ColumnData",
+      "kind": "enum",
+      "name": "ColumnData",
+      "doc": "The buffer holding one column's values.\n\nEvery arm but [`ColumnData::Complex`] is a contiguous buffer of one\nphysical type, in the layout a columnar reader wants, and a client\nturns it into an array by taking ownership rather than by walking\nit. `Complex` is the fallback for what no primitive covers: nodes,\nrels, paths, lists, records and the two handles. Those still arrive\nas values, borrowed from the result rather than cloned out of it,\nand a client builds them the way it always did. They are also the\ncolumns nobody exports a million of.\n\nA null row still occupies its cell in a flat buffer, holding\nwhatever the type's zero is. That is what the validity bitmap is\nfor, and it is why the buffers are strided and can be moved rather\nthan rebuilt."
+    },
+    {
+      "id": "zu::query::column::ColumnData::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Bool { bits: Vec<u8> }",
+      "doc": "One bit per row, least significant bit first, the same packing\nas [`Validity`]."
+    },
+    {
+      "id": "zu::query::column::ColumnData::Complex",
+      "kind": "variant",
+      "name": "Complex",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Complex(Vec<&zu_query::exec::Value>)",
+      "doc": "The values themselves, for the types no buffer covers."
+    },
+    {
+      "id": "zu::query::column::ColumnData::Days",
+      "kind": "variant",
+      "name": "Days",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Days(Vec<i32>)",
+      "doc": "Days, for [`ColumnType::Date`]."
+    },
+    {
+      "id": "zu::query::column::ColumnData::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Float(Vec<f64>)"
+    },
+    {
+      "id": "zu::query::column::ColumnData::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Int(Vec<i64>)"
+    },
+    {
+      "id": "zu::query::column::ColumnData::Months",
+      "kind": "variant",
+      "name": "Months",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Months(Vec<i64>)",
+      "doc": "Months, for [`ColumnType::YearMonth`]."
+    },
+    {
+      "id": "zu::query::column::ColumnData::Nanos",
+      "kind": "variant",
+      "name": "Nanos",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Nanos(Vec<i64>)",
+      "doc": "Nanoseconds, for every time, datetime and day-time duration."
+    },
+    {
+      "id": "zu::query::column::ColumnData::Null",
+      "kind": "variant",
+      "name": "Null",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Null",
+      "doc": "A column of nothing but nulls. It has a length and no buffer,\nbecause there is nothing to put in one."
+    },
+    {
+      "id": "zu::query::column::ColumnData::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::query::column::ColumnData",
+      "signature": "Str(StrColumn)"
+    },
+    {
+      "id": "zu::query::column::ColumnType",
+      "kind": "enum",
+      "name": "ColumnType",
+      "doc": "The type a whole column turned out to be.\n\nA column has one type and the values decide it: the first one that\nis not null settles it, and every value after has to fit. There is\nexactly one widening, integer to float, because a projection that\nreturns `count(x)` on one row and `avg(x)` on another means a number\nand every reader of the column reads it as one. Everything else that\ndoes not fit is refused and named, because a column that quietly\nbecame strings is worse than one that would not build.\n\nThis is not [`LogicalType`]. A logical type is what the language\ndeclared, with its nullability and its width and its precision. This\nis what a finished column holds, which is a smaller question with a\nsmaller answer: nullability is the validity bitmap and never the\ntype, and a width is a check that already happened.\n\n[`LogicalType`]: zu_common::LogicalType"
+    },
+    {
+      "id": "zu::query::column::ColumnType::BindingTable",
+      "kind": "variant",
+      "name": "BindingTable",
+      "of": "zu::query::column::ColumnType",
+      "signature": "BindingTable",
+      "doc": "GV61, a reference to a binding table."
+    },
+    {
+      "id": "zu::query::column::ColumnType::Bool",
+      "kind": "variant",
+      "name": "Bool",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Bool"
+    },
+    {
+      "id": "zu::query::column::ColumnType::Date",
+      "kind": "variant",
+      "name": "Date",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Date",
+      "doc": "Days since 1970-01-01."
+    },
+    {
+      "id": "zu::query::column::ColumnType::DayTime",
+      "kind": "variant",
+      "name": "DayTime",
+      "of": "zu::query::column::ColumnType",
+      "signature": "DayTime",
+      "doc": "Nanoseconds."
+    },
+    {
+      "id": "zu::query::column::ColumnType::Float",
+      "kind": "variant",
+      "name": "Float",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Float"
+    },
+    {
+      "id": "zu::query::column::ColumnType::Graph",
+      "kind": "variant",
+      "name": "Graph",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Graph",
+      "doc": "GV60, a reference to a graph."
+    },
+    {
+      "id": "zu::query::column::ColumnType::Int",
+      "kind": "variant",
+      "name": "Int",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Int"
+    },
+    {
+      "id": "zu::query::column::ColumnType::List",
+      "kind": "variant",
+      "name": "List",
+      "of": "zu::query::column::ColumnType",
+      "signature": "List(Box<ColumnType>)"
+    },
+    {
+      "id": "zu::query::column::ColumnType::LocalDatetime",
+      "kind": "variant",
+      "name": "LocalDatetime",
+      "of": "zu::query::column::ColumnType",
+      "signature": "LocalDatetime",
+      "doc": "Nanoseconds since 1970-01-01T00:00:00."
+    },
+    {
+      "id": "zu::query::column::ColumnType::LocalTime",
+      "kind": "variant",
+      "name": "LocalTime",
+      "of": "zu::query::column::ColumnType",
+      "signature": "LocalTime",
+      "doc": "Nanoseconds since midnight."
+    },
+    {
+      "id": "zu::query::column::ColumnType::Node",
+      "kind": "variant",
+      "name": "Node",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Node"
+    },
+    {
+      "id": "zu::query::column::ColumnType::Null",
+      "kind": "variant",
+      "name": "Null",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Null",
+      "doc": "Nothing but nulls. Every columnar format has a type for it, and\na column of nulls with no type would be the one case a reader\ncould not name."
+    },
+    {
+      "id": "zu::query::column::ColumnType::Path",
+      "kind": "variant",
+      "name": "Path",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Path"
+    },
+    {
+      "id": "zu::query::column::ColumnType::Record",
+      "kind": "variant",
+      "name": "Record",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Record(Vec<(String, ColumnType)>)"
+    },
+    {
+      "id": "zu::query::column::ColumnType::Rel",
+      "kind": "variant",
+      "name": "Rel",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Rel"
+    },
+    {
+      "id": "zu::query::column::ColumnType::Str",
+      "kind": "variant",
+      "name": "Str",
+      "of": "zu::query::column::ColumnType",
+      "signature": "Str"
+    },
+    {
+      "id": "zu::query::column::ColumnType::YearMonth",
+      "kind": "variant",
+      "name": "YearMonth",
+      "of": "zu::query::column::ColumnType",
+      "signature": "YearMonth",
+      "doc": "Months."
+    },
+    {
+      "id": "zu::query::column::ColumnType::ZonedDatetime",
+      "kind": "variant",
+      "name": "ZonedDatetime",
+      "of": "zu::query::column::ColumnType",
+      "signature": "ZonedDatetime { offset: i16 }",
+      "doc": "Nanoseconds since the epoch in UTC, and the offset in minutes\nthe value was written with. Later rows may have been written\nsomewhere else and are the same instant either way, so the\noffset decides how the column prints and never what it holds."
+    },
+    {
+      "id": "zu::query::column::ColumnType::ZonedTime",
+      "kind": "variant",
+      "name": "ZonedTime",
+      "of": "zu::query::column::ColumnType",
+      "signature": "ZonedTime { offset: i16 }",
+      "doc": "Nanoseconds since midnight in the offset's own day, and the\noffset in minutes. The first such value in the column names the\noffset, the way the first zoned datetime does."
+    },
+    {
+      "id": "zu::query::column::ColumnType::is_flat",
+      "kind": "method",
+      "name": "is_flat",
+      "of": "zu::query::column::ColumnType",
+      "signature": "fn is_flat(&self) -> bool",
+      "doc": "Whether a column of this type is held as one buffer of fixed\nwidth cells, which is the case a client turns into an array by\nmoving a `Vec` rather than by walking values."
+    },
+    {
+      "id": "zu::query::column::ColumnType::name",
+      "kind": "method",
+      "name": "name",
+      "of": "zu::query::column::ColumnType",
+      "signature": "fn name(&self) -> String",
+      "doc": "What to call this in a message a person reads."
+    },
+    {
+      "id": "zu::query::column::ColumnType::of",
+      "kind": "method",
+      "name": "of",
+      "of": "zu::query::column::ColumnType",
+      "signature": "fn of(value: &Value) -> Result<ColumnType, Mixture>",
+      "doc": "The type of one value on its own, which is where inference\nstarts.\n\nFails on the one disagreement that hides below a row: a list, or\na record holding one, whose own items are types no single list\nholds. The row loop cannot see inside a value, so the mixture is\nfound here and named where the row number is known."
+    },
+    {
+      "id": "zu::query::column::ColumnType::unify",
+      "kind": "method",
+      "name": "unify",
+      "of": "zu::query::column::ColumnType",
+      "signature": "fn unify(left: ColumnType, right: ColumnType) -> Option<ColumnType>",
+      "doc": "The one type two types are both, or nothing when they are not."
+    },
+    {
+      "id": "zu::query::column::Columns",
+      "kind": "struct",
+      "name": "Columns",
+      "doc": "A whole result read down its columns."
+    },
+    {
+      "id": "zu::query::column::Columns::columns",
+      "kind": "field",
+      "name": "columns",
+      "of": "zu::query::column::Columns",
+      "signature": "Vec<Column>"
+    },
+    {
+      "id": "zu::query::column::Columns::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::query::column::Columns",
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether the result had no columns, which is what a statement\nwith no projection gives back."
+    },
+    {
+      "id": "zu::query::column::Columns::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::query::column::Columns",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many columns."
+    },
+    {
+      "id": "zu::query::column::Columns::rows",
+      "kind": "field",
+      "name": "rows",
+      "of": "zu::query::column::Columns",
+      "signature": "usize",
+      "doc": "Rows in the result, which is every column's length and is also\nthe answer for a result with no columns at all."
+    },
+    {
+      "id": "zu::query::column::MixedColumn",
+      "kind": "struct",
+      "name": "MixedColumn",
+      "doc": "Two rows of one column that no single column holds.\n\nThe row is in it because that is the only part a caller can act on:\nthe column name says where to look and the row number says where to\nlook in it, and a message with neither is a message that sends\nsomebody to read a million rows by hand."
+    },
+    {
+      "id": "zu::query::column::MixedColumn::arrived",
+      "kind": "field",
+      "name": "arrived",
+      "of": "zu::query::column::MixedColumn",
+      "signature": "String",
+      "doc": "What this row brought."
+    },
+    {
+      "id": "zu::query::column::MixedColumn::column",
+      "kind": "field",
+      "name": "column",
+      "of": "zu::query::column::MixedColumn",
+      "signature": "String"
+    },
+    {
+      "id": "zu::query::column::MixedColumn::held",
+      "kind": "field",
+      "name": "held",
+      "of": "zu::query::column::MixedColumn",
+      "signature": "String",
+      "doc": "What the column held before this row."
+    },
+    {
+      "id": "zu::query::column::MixedColumn::in_list",
+      "kind": "field",
+      "name": "in_list",
+      "of": "zu::query::column::MixedColumn",
+      "signature": "bool",
+      "doc": "Set when the disagreement is between the items of one list\nrather than between rows of the column."
+    },
+    {
+      "id": "zu::query::column::MixedColumn::row",
+      "kind": "field",
+      "name": "row",
+      "of": "zu::query::column::MixedColumn",
+      "signature": "usize"
+    },
+    {
+      "id": "zu::query::column::Mixture",
+      "kind": "struct",
+      "name": "Mixture",
+      "doc": "Two types found inside one value, which is a disagreement with no\nrow number on it yet. [`QueryResult::columnar`] adds the row and the\ncolumn and turns it into a [`MixedColumn`]."
+    },
+    {
+      "id": "zu::query::column::Mixture::arrived",
+      "kind": "field",
+      "name": "arrived",
+      "of": "zu::query::column::Mixture",
+      "signature": "String"
+    },
+    {
+      "id": "zu::query::column::Mixture::held",
+      "kind": "field",
+      "name": "held",
+      "of": "zu::query::column::Mixture",
+      "signature": "String"
+    },
+    {
+      "id": "zu::query::column::Offsets",
+      "kind": "enum",
+      "name": "Offsets",
+      "doc": "String offsets, narrow until they cannot be."
+    },
+    {
+      "id": "zu::query::column::Offsets::I32",
+      "kind": "variant",
+      "name": "I32",
+      "of": "zu::query::column::Offsets",
+      "signature": "I32(Vec<i32>)"
+    },
+    {
+      "id": "zu::query::column::Offsets::I64",
+      "kind": "variant",
+      "name": "I64",
+      "of": "zu::query::column::Offsets",
+      "signature": "I64(Vec<i64>)"
+    },
+    {
+      "id": "zu::query::column::Offsets::is_empty",
+      "kind": "method",
+      "name": "is_empty",
+      "of": "zu::query::column::Offsets",
+      "signature": "fn is_empty(&self) -> bool",
+      "doc": "Whether the column has no rows."
+    },
+    {
+      "id": "zu::query::column::Offsets::len",
+      "kind": "method",
+      "name": "len",
+      "of": "zu::query::column::Offsets",
+      "signature": "fn len(&self) -> usize",
+      "doc": "How many strings these offsets describe."
+    },
+    {
+      "id": "zu::query::column::StrColumn",
+      "kind": "struct",
+      "name": "StrColumn",
+      "doc": "A string column in the layout Arrow calls Utf8 and LargeUtf8: the\nbytes of every string end to end, and `len + 1` offsets into them,\nwhere row `i` spans `offsets[i]..offsets[i + 1]`.\n\nThe offsets start narrow and widen once, when the bytes pass what a\n32 bit offset addresses. Widening is a walk of the offsets and never\nof the bytes, so the column that needed it pays a pass over four\nbytes a row and the columns that did not pay nothing."
+    },
+    {
+      "id": "zu::query::column::StrColumn::bytes",
+      "kind": "field",
+      "name": "bytes",
+      "of": "zu::query::column::StrColumn",
+      "signature": "Vec<u8>"
+    },
+    {
+      "id": "zu::query::column::StrColumn::offsets",
+      "kind": "field",
+      "name": "offsets",
+      "of": "zu::query::column::StrColumn",
+      "signature": "Offsets"
+    },
+    {
+      "id": "zu::query::column::Validity",
+      "kind": "struct",
+      "name": "Validity",
+      "doc": "Validity, in the layout every columnar format keeps it in: one bit\nper row, least significant bit first, set meaning the row has a\nvalue.\n\nAbsent from a [`Column`] when nothing in it is null, which is the\ncommon case and the one where a reader gets to skip the AND\nentirely. Present means at least one null, so a client never has to\ncount to find out whether the buffer is worth attaching."
+    },
+    {
+      "id": "zu::query::column::Validity::bits",
+      "kind": "field",
+      "name": "bits",
+      "of": "zu::query::column::Validity",
+      "signature": "Vec<u8>",
+      "doc": "Packed bits, `len.div_ceil(8)` bytes of them."
+    },
+    {
+      "id": "zu::query::column::Validity::is_valid",
+      "kind": "method",
+      "name": "is_valid",
+      "of": "zu::query::column::Validity",
+      "signature": "fn is_valid(&self, at: usize) -> bool",
+      "doc": "Whether row `at` has a value."
+    },
+    {
+      "id": "zu::query::column::Validity::len",
+      "kind": "field",
+      "name": "len",
+      "of": "zu::query::column::Validity",
+      "signature": "usize",
+      "doc": "How many rows the bits cover."
+    },
+    {
+      "id": "zu::query::column::Validity::nulls",
+      "kind": "field",
+      "name": "nulls",
+      "of": "zu::query::column::Validity",
+      "signature": "usize",
+      "doc": "How many of them are null, which is the count a format's null\nbuffer carries beside the bits."
     },
     {
       "id": "zu::query::explain",

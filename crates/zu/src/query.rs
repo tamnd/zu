@@ -22,6 +22,14 @@ use crate::zu1::graph::{Direction, GraphReader};
 use crate::zu1::props::{ListElement, PropsReader, list_elements, load_props, load_props_at};
 use zu_common::{FloatBits, LogicalType, Temporal};
 
+/// The same rows read down their columns, which is the shape every
+/// client that hands a result to Arrow, pandas or polars needs.
+///
+/// The module rather than its names, because [`crate::Column`] is
+/// already a column of a frame going the other way, and two things
+/// called `Column` in one namespace is a question a reader should not
+/// have to ask.
+pub use zu_query::column;
 /// The types [`run`] speaks, re-exported here so a caller that depends
 /// on `zu` alone can bind a parameter and read a row back without also
 /// depending on `zu-query`.

@@ -120,7 +120,7 @@ The relational API is the one row worth arguing about, and the answer is no. It 
 
 In order, largest effect first.
 
-1. A columnar result. The executor keeps the vectors, the result owns them, and `Vec<Vec<Value>>` becomes something the row path gathers rather than something every other path unpicks. This is the 20x and it is the only item here that touches the engine.
+1. A columnar result, in two halves. The first is a result read down its columns at all, in the engine rather than in each client, which is `zu::query::column` and is done: one buffer per column in Arrow's own layout, filled in two passes over the rows instead of two per column, so the transpose happens once and correctly. The second is the executor keeping the vectors it already computes in, so that `Vec<Vec<Value>>` becomes something the row path gathers rather than something every other path unpicks and the transpose stops happening at all. The first half is what a client can use today; the second is the one that touches the engine, and it changes no client, because the type it fills is already the one they read.
 2. Arrow export as a handoff. Once the vectors survive, `to_arrow`, `__arrow_c_stream__` and `record_batches` become a description of buffers and a release callback, with no copy for the six physical types whose layout is already Arrow's.
 3. The TypeScript client reaching the Python one: transactions, appender, register, bulk load, and a columnar read of a result.
 4. Prepared statements, `explain` and `profile` in both, which is what the `api-map` scorecard item is blocked on.

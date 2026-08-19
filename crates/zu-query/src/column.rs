@@ -22,15 +22,19 @@
 //! Arrow's null buffer with the same bit order and the same meaning of
 //! set.
 //!
-//! It is a transpose because the sink still flattens. `crates/zu-vector`
-//! is the vector layer the executor already computes in, and the one
-//! place the vectors die is [`SinkState`], which fills a row at a time
-//! out of them. When that changes, [`QueryResult::columnar`] stops
-//! walking anything and starts handing back the buffers the executor
-//! filled, and no client changes a line. That is the whole reason the
-//! answer is shaped like this and lives here rather than in a binding.
+//! That was a transpose because the sink used to flatten.
+//! `crates/zu-vector` is the vector layer the executor computes in, and
+//! the place the vectors died was the sink, which filled a row at a time
+//! out of them. It does not any more: on a plan with nothing above the
+//! projection the sink fills [`Held`] columns straight out of the
+//! vectors, [`QueryResult::columnar`] hands those buffers back without
+//! walking anything, and the rows are built only if somebody asks for
+//! them. No client changed a line. That is the whole reason the answer
+//! is shaped like this and lives here rather than in a binding.
 //!
-//! [`SinkState`]: ../../zu_exec/sink/struct.SinkState.html
+//! The walk below is still what answers for every other plan, because a
+//! sort or a dedup or a group is a step over rows and the sink hands
+//! those on as rows.
 
 use std::fmt;
 
@@ -333,6 +337,16 @@ pub struct StrColumn {
     pub offsets: Offsets,
 }
 
+impl StrColumn {
+    /// Where row `at` starts and ends in the bytes.
+    pub fn span(&self, at: usize) -> (usize, usize) {
+        match &self.offsets {
+            Offsets::I32(o) => (o[at] as usize, o[at + 1] as usize),
+            Offsets::I64(o) => (o[at] as usize, o[at + 1] as usize),
+        }
+    }
+}
+
 /// String offsets, narrow until they cannot be.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Offsets {
@@ -424,6 +438,144 @@ impl<'a> Columns<'a> {
     /// with no projection gives back.
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
+    }
+}
+
+/// A whole result the executor filled down its columns, owning every
+/// buffer in it.
+///
+/// [`Columns`] is the same answer borrowed: its complex arm points at
+/// values that live in a [`QueryResult`], which is what lets the walk
+/// below hand back node and list columns without cloning them. A sink
+/// that filled the buffers itself has nothing to point at, so this is
+/// the shape it keeps them in, and [`Held::borrow`] is the view a client
+/// reads.
+///
+/// The arms are the ones a projection produces: a stored column is an
+/// integer, a real or a string, a row id is an integer, and everything
+/// else a RETURN item can name is one value at a time. Dates and
+/// durations have buffers in [`ColumnData`] and no arm here on purpose,
+/// because the only way one reaches a projection in this executor is as
+/// a constant, and a constant column that went through a buffer and
+/// back would have to be told which of its rows carried which offset.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Held {
+    pub columns: Vec<HeldColumn>,
+    /// Rows in the result, which is every column's length.
+    pub rows: usize,
+}
+
+/// One column of a [`Held`] result.
+#[derive(Clone, PartialEq, Debug)]
+pub struct HeldColumn {
+    pub name: String,
+    pub ty: ColumnType,
+    pub data: HeldData,
+    /// Absent when every row has a value.
+    pub validity: Option<Validity>,
+}
+
+/// The buffer one [`HeldColumn`] holds, in the layouts [`ColumnData`]
+/// describes.
+#[derive(Clone, PartialEq, Debug)]
+pub enum HeldData {
+    Null,
+    Bool {
+        bits: Vec<u8>,
+    },
+    Int(Vec<i64>),
+    Float(Vec<f64>),
+    Str(StrColumn),
+    /// The values themselves, for nodes and for anything else no buffer
+    /// covers.
+    Complex(Vec<Value>),
+}
+
+impl Held {
+    /// This answer as the borrowed view a client reads.
+    ///
+    /// The flat buffers are copied and the complex ones are borrowed,
+    /// which is the one copy left on the export path: a memcpy of the
+    /// bytes that are already contiguous and already the right shape,
+    /// against the two strided walks of a row vector this replaced. It
+    /// goes when a client takes the result by value instead of by
+    /// reference, and not before, because a caller is allowed to ask
+    /// twice.
+    pub fn borrow(&self) -> Columns<'_> {
+        let columns = self
+            .columns
+            .iter()
+            .map(|held| Column {
+                name: held.name.as_str(),
+                ty: held.ty.clone(),
+                data: match &held.data {
+                    HeldData::Null => ColumnData::Null,
+                    HeldData::Bool { bits } => ColumnData::Bool { bits: bits.clone() },
+                    HeldData::Int(values) => ColumnData::Int(values.clone()),
+                    HeldData::Float(values) => ColumnData::Float(values.clone()),
+                    HeldData::Str(strings) => ColumnData::Str(strings.clone()),
+                    HeldData::Complex(values) => ColumnData::Complex(values.iter().collect()),
+                },
+                validity: held.validity.clone(),
+                len: self.rows,
+            })
+            .collect();
+        Columns {
+            columns,
+            rows: self.rows,
+        }
+    }
+
+    /// The column names, which are the result's own.
+    pub fn names(&self) -> Vec<String> {
+        self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// This answer read back across its rows, for the callers that want
+    /// rows after all.
+    ///
+    /// One row per row and one allocation per row, which is what a row
+    /// costs whoever builds it. Reading down the columns to write across
+    /// the rows would touch every buffer once per row and miss the cache
+    /// doing it, so this fills the rows a column at a time instead: the
+    /// row vectors are all there before any value goes in, and each
+    /// column is then read start to end.
+    pub fn rows(&self) -> Vec<Vec<Value>> {
+        let width = self.columns.len();
+        let mut rows: Vec<Vec<Value>> = (0..self.rows)
+            .map(|_| {
+                let mut row = Vec::with_capacity(width);
+                row.resize_with(width, || Value::Null);
+                row
+            })
+            .collect();
+        for (ix, held) in self.columns.iter().enumerate() {
+            for (at, row) in rows.iter_mut().enumerate() {
+                if held.validity.as_ref().is_some_and(|v| !v.is_valid(at)) {
+                    continue;
+                }
+                row[ix] = held.value(at);
+            }
+        }
+        rows
+    }
+}
+
+impl HeldColumn {
+    /// The value at row `at`, which the caller has already found to be
+    /// there.
+    fn value(&self, at: usize) -> Value {
+        match &self.data {
+            HeldData::Null => Value::Null,
+            HeldData::Bool { bits } => Value::Bool(bits[at / 8] & (1u8 << (at % 8)) != 0),
+            HeldData::Int(values) => Value::Int(values[at]),
+            HeldData::Float(values) => Value::Float(values[at]),
+            HeldData::Str(strings) => {
+                let (from, to) = strings.span(at);
+                Value::Str(String::from_utf8_lossy(&strings.bytes[from..to]).into_owned())
+            }
+            HeldData::Complex(values) => values[at].clone(),
+        }
     }
 }
 
@@ -612,7 +764,15 @@ impl QueryResult {
     ///
     /// The buffers are owned and the complex columns borrow, so the
     /// result stays readable afterwards and a client may ask twice.
+    ///
+    /// A sink that filled the columns itself is answered from those and
+    /// nothing here runs, which is the case that matters: it is the
+    /// plain projection, it is what an export asks for, and it is the
+    /// one where the rows are never built at all.
     pub fn columnar(&self) -> Result<Columns<'_>, MixedColumn> {
+        if let Some(held) = self.rows.columns() {
+            return Ok(held.borrow());
+        }
         let rows = self.rows.len();
         let width = self.columns.len();
 

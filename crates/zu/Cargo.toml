@@ -147,6 +147,10 @@ name = "convert"
 harness = false
 
 [[bench]]
+name = "columns"
+harness = false
+
+[[bench]]
 name = "density"
 harness = false
 

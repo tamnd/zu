@@ -64,7 +64,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use zu_common::gqlstatus::{DiagnosticRecord, GqlStatus, codes};
@@ -75,6 +75,7 @@ use crate::ast::{
     UnaryOp,
 };
 use crate::binder::{BoundExpr, BoundItem, BoundQuery, Func, PathPart, Schema, TableFunc};
+use crate::column::Held;
 use crate::plan::{Bracket, BracketKind, LogicalPlan, Side, expr_text};
 use crate::refs::{BindingTable, GraphHandle};
 use crate::row::{Batch, Flow};
@@ -346,8 +347,179 @@ fn chain_start(link: &PathLink) -> (u32, u64) {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryResult {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
+    pub rows: Rows,
     pub notices: Vec<DiagnosticRecord>,
+}
+
+/// The answer's rows, which the executor may not have built.
+///
+/// A sink that filled columns has the whole answer already, in a shape
+/// a third of the size and one a columnar client takes as it stands.
+/// Building the rows out of them costs an allocation each, and most of
+/// the callers that would pay it never look, so the rows are built the
+/// first time somebody reads them and not before.
+///
+/// It derefs to the `Vec<Vec<Value>>` it always was, so a caller writes
+/// what a caller always wrote. `len` and `is_empty` are answered off
+/// the columns without building anything, because "how many rows" is
+/// the question a caller who wants no rows asks.
+///
+/// A caller who reads both keeps both, since the columns are what a
+/// second reader is answered from and a result may be read twice. The
+/// one who wants only rows says so with [`Rows::into_vec`], which takes
+/// them and drops everything else.
+#[derive(Debug, Default)]
+pub struct Rows {
+    /// What the sink filled, when it filled columns.
+    held: Option<Held>,
+    /// The rows, once somebody has asked for them.
+    rows: OnceLock<Vec<Vec<Value>>>,
+}
+
+impl Rows {
+    /// The rows a caller handed over, which are already built.
+    pub fn of(rows: Vec<Vec<Value>>) -> Rows {
+        Rows {
+            held: None,
+            rows: OnceLock::from(rows),
+        }
+    }
+
+    /// The columns a sink filled, whose rows nobody has asked for.
+    pub fn held(held: Held) -> Rows {
+        Rows {
+            held: Some(held),
+            rows: OnceLock::new(),
+        }
+    }
+
+    /// How many rows, without building one.
+    pub fn len(&self) -> usize {
+        match (&self.held, self.rows.get()) {
+            (_, Some(rows)) => rows.len(),
+            (Some(held), None) => held.rows,
+            (None, None) => 0,
+        }
+    }
+
+    /// Whether the answer has no rows, without building one.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The columns the sink filled, when it filled any.
+    pub fn columns(&self) -> Option<&Held> {
+        self.held.as_ref()
+    }
+
+    /// The rows, taken by a caller who wants them and nothing else.
+    pub fn into_vec(mut self) -> Vec<Vec<Value>> {
+        std::mem::take(&mut *self)
+    }
+
+    /// The rows, built out of the columns the first time this is asked.
+    fn built(&self) -> &Vec<Vec<Value>> {
+        self.rows
+            .get_or_init(|| self.held.as_ref().map(Held::rows).unwrap_or_default())
+    }
+}
+
+impl std::ops::Deref for Rows {
+    type Target = Vec<Vec<Value>>;
+
+    fn deref(&self) -> &Vec<Vec<Value>> {
+        self.built()
+    }
+}
+
+impl std::ops::DerefMut for Rows {
+    /// The rows, built and then owned by the caller.
+    ///
+    /// The columns go here, because a caller holding the rows mutably is
+    /// a caller who may be about to change them, and a copy of the same
+    /// answer that does not change with them is a copy that lies.
+    fn deref_mut(&mut self) -> &mut Vec<Vec<Value>> {
+        self.built();
+        self.held = None;
+        self.rows.get_mut().expect("built above")
+    }
+}
+
+impl From<Vec<Vec<Value>>> for Rows {
+    fn from(rows: Vec<Vec<Value>>) -> Rows {
+        Rows::of(rows)
+    }
+}
+
+impl IntoIterator for Rows {
+    type Item = Vec<Value>;
+    type IntoIter = std::vec::IntoIter<Vec<Value>>;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        std::mem::take(&mut *self).into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Rows {
+    type Item = &'a Vec<Value>;
+    type IntoIter = std::slice::Iter<'a, Vec<Value>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.built().iter()
+    }
+}
+
+impl Clone for Rows {
+    fn clone(&self) -> Rows {
+        Rows {
+            held: self.held.clone(),
+            rows: self.rows.clone(),
+        }
+    }
+}
+
+impl PartialEq for Rows {
+    /// Two answers are equal when their rows are, whichever of them the
+    /// executor happened to build columns for.
+    fn eq(&self, other: &Rows) -> bool {
+        self.len() == other.len() && **self == **other
+    }
+}
+
+/// Equal to the rows themselves, in the three spellings a caller
+/// writes them in, so a test that knows what it expects writes the
+/// rows it expects and nothing about how they were built.
+impl<T> PartialEq<Vec<T>> for Rows
+where
+    Vec<Value>: PartialEq<T>,
+{
+    fn eq(&self, other: &Vec<T>) -> bool {
+        **self == *other
+    }
+}
+
+impl<T> PartialEq<[T]> for Rows
+where
+    Vec<Value>: PartialEq<T>,
+{
+    fn eq(&self, other: &[T]) -> bool {
+        **self == *other
+    }
+}
+
+impl<T, const N: usize> PartialEq<[T; N]> for Rows
+where
+    Vec<Value>: PartialEq<T>,
+{
+    fn eq(&self, other: &[T; N]) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<Rows> for Vec<Vec<Value>> {
+    fn eq(&self, other: &Rows) -> bool {
+        *self == **other
+    }
 }
 
 impl QueryResult {
@@ -355,7 +527,16 @@ impl QueryResult {
     pub fn new(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
         QueryResult {
             columns,
-            rows,
+            rows: Rows::of(rows),
+            notices: Vec::new(),
+        }
+    }
+
+    /// The result of a statement whose sink filled columns.
+    pub fn held(columns: Vec<String>, held: Held) -> Self {
+        QueryResult {
+            columns,
+            rows: Rows::held(held),
             notices: Vec::new(),
         }
     }
@@ -665,6 +846,8 @@ pub struct Options {
     /// operators producing its probe side, the sideways pass of
     /// perf/13 §1.
     pub sip: Sip,
+    /// What the sink of a plain projection keeps.
+    pub sink: Sink,
     /// The handle whoever asked for the statement can stop it through,
     /// and the count of rows it has read so far. Here rather than as a
     /// parameter of its own because every execution path already
@@ -698,6 +881,19 @@ pub enum Sip {
     #[default]
     On,
     Off,
+}
+
+/// What the sink of a projection with nothing above it keeps.
+/// `Columns` fills the buffers the executor computed in, which is the
+/// default and is what a columnar client reads without a transpose.
+/// `Rows` flattens each row as it is found, the way every other sink
+/// does, and is the baseline the columns are measured against and the
+/// answer they have to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sink {
+    #[default]
+    Columns,
+    Rows,
 }
 
 // ---------------------------------------------------------------------------
@@ -8152,7 +8348,13 @@ fn run_conjoin(
         notices.extend(other.notices);
         notices
     };
-    let rows = conjoin_rows(result.rows, other.rows, op, all, *build);
+    let rows = conjoin_rows(
+        result.rows.into_vec(),
+        other.rows.into_vec(),
+        op,
+        all,
+        *build,
+    );
     result = QueryResult::new(query.columns.clone(), rows);
     for record in notices {
         result.notice(record);
@@ -10585,7 +10787,11 @@ mod tests {
         for q in queries {
             let fac = run_with(q, &[], false);
             let flat = run_with(q, &[], true);
-            assert_eq!(sorted(fac.rows), sorted(flat.rows), "query: {q}");
+            assert_eq!(
+                sorted(fac.rows.into_vec()),
+                sorted(flat.rows.into_vec()),
+                "query: {q}"
+            );
         }
     }
 
@@ -11007,8 +11213,8 @@ mod tests {
             let fac = run_with(source, params, false);
             let flat = run_with(source, params, true);
             assert_eq!(
-                sorted(fac.rows.clone()),
-                sorted(flat.rows.clone()),
+                sorted(fac.rows.to_vec()),
+                sorted(flat.rows.to_vec()),
                 "flat and factorized disagree on: {source}"
             );
         }

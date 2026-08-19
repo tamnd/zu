@@ -54,7 +54,7 @@ impl Fixture {
     }
 
     fn run(&mut self, text: &str) -> Vec<Vec<Value>> {
-        self.conn.query(text).expect(text).rows
+        self.conn.query(text).expect(text).rows.into_vec()
     }
 
     /// How many rows the person table holds, which is what says whether

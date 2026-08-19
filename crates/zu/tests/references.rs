@@ -200,7 +200,7 @@ fn the_epoch_check_reaches_a_nested_element() {
     let Value::List(_) = &result.rows[0][0] else {
         panic!("a list, got {:?}", result.rows[0][0]);
     };
-    let nested = BindingTable::new(result.columns, result.rows, 0);
+    let nested = BindingTable::new(result.columns, result.rows.into_vec(), 0);
 
     assert!(!numbers.holds_elements());
     assert!(nested.holds_elements());

@@ -163,7 +163,7 @@ fn text_fan() -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
 fn measure(db: &mut Zu1File, qs: &[(&str, &[Vec<Value>])], runs: usize) -> Vec<f64> {
     for (source, want) in qs {
         let warm = query::run(source, db, &[]).expect("warmup");
-        assert_eq!(warm.rows, *want, "warmup answer for {source}");
+        assert_eq!(warm.rows, **want, "warmup answer for {source}");
     }
     let mut times = vec![Vec::with_capacity(runs); qs.len()];
     for _ in 0..runs {
@@ -171,7 +171,7 @@ fn measure(db: &mut Zu1File, qs: &[(&str, &[Vec<Value>])], runs: usize) -> Vec<f
             let t = Instant::now();
             let r = query::run(source, db, &[]).expect("timed run");
             times[at].push(t.elapsed().as_secs_f64() * 1e3);
-            assert_eq!(r.rows, *want, "answer changed for {source}");
+            assert_eq!(r.rows, **want, "answer changed for {source}");
         }
     }
     times

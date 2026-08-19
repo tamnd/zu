@@ -14,6 +14,7 @@ use zu_common::{Result, ZuError};
 use zu_query::ast::{BinaryOp, SortKey};
 use zu_query::exec::{OrdValue, QueryResult, Value};
 
+use crate::columns::ColumnSink;
 use crate::compile::{AggSpec, PostAgg, PostPred, PostSpec};
 use crate::group::{GroupTable, KeyBatch, PartKind};
 
@@ -161,6 +162,11 @@ pub(crate) struct SinkState {
     /// The bounded buffer, on the plans whose ORDER BY sits under a
     /// LIMIT. A worker running with one never fills `rows`.
     pub top: Option<TopN>,
+    /// The columns, on the plans with nothing above the projection. A
+    /// worker running with these never fills `rows` either, and the
+    /// answer they make is the one a columnar client reads without a
+    /// transpose and a row reader builds its rows out of.
+    pub cols: Option<ColumnSink>,
 }
 
 /// Post steps over materialized rows, exactly the old apply_post.
@@ -1005,6 +1011,15 @@ pub(crate) fn finish_rows(
     post: &[PostSpec],
     mut partials: Vec<SinkState>,
 ) -> QueryResult {
+    // A plan with nothing above the projection filled columns instead
+    // of rows, and those columns are the answer. Same reasoning as the
+    // bounded case below: every worker read the same plan, so either
+    // all of them kept columns or none did.
+    if !partials.is_empty() && partials.iter().all(|p| p.cols.is_some()) {
+        let sinks = partials.iter_mut().filter_map(|p| p.cols.take()).collect();
+        let held = crate::columns::merge(&columns, sinks);
+        return QueryResult::held(columns, held);
+    }
     // The workers all read the same post chain, so either every one of
     // them ran bounded or none did, and the sort is already served.
     if let Some((keys, need)) = topn_of(post)

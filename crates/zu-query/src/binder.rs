@@ -1236,6 +1236,11 @@ pub struct BoundNode {
     /// candidate tables have answered what they can, `None` when the
     /// narrowing answered the whole of it.
     pub label: Option<LabelTest>,
+    /// The element pattern predicate written inside the parentheses
+    /// (G041), asked of this node where the pattern reaches it. It is
+    /// bound with everything to its left already in scope, so it may
+    /// read the nodes and edges the pattern bound before it.
+    pub filter: Option<BoundExpr>,
 }
 
 /// A compiled label expression: bit tests over the one word a row
@@ -3379,6 +3384,13 @@ impl Binder<'_> {
     /// `(x)` and `(x:person|company)` do not say, and a table nobody
     /// named is not one this can pick.
     fn bind_insert_node(&mut self, pat: &NodePattern) -> Result<BoundInsertNode> {
+        if pat.filter.is_some() {
+            return Err(invalid(
+                "a condition inside an element pattern picks which elements match it, and \
+                 an INSERT describes an element to make rather than one to find"
+                    .into(),
+            ));
+        }
         let Some(label) = &pat.label else {
             return Err(invalid(format!(
                 "INSERT needs a label saying which table the element goes in, and '({})' names none",
@@ -3503,10 +3515,22 @@ impl Binder<'_> {
             }
         }
         let props = self.bind_props(&pat.props)?;
+        // The predicate is bound after the node's own name is in scope,
+        // since it is mostly about this node, and everything the
+        // pattern bound to its left is in scope already, which is what
+        // lets it compare this node with one the walk came from.
+        let filter = match &pat.filter {
+            Some(expr) => {
+                let mut ctx = ExprCtx::new(false);
+                Some(self.bind_expr(expr, &mut ctx)?.0)
+            }
+            None => None,
+        };
         Ok(BoundNode {
             slot,
             props,
             label: residue,
+            filter,
         })
     }
 

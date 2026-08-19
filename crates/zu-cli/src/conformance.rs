@@ -253,6 +253,17 @@ const NOTES: &[&str] = &[
      list of them in the order the walk took them, reading a property of it answers the list of \
      the properties, and an aggregate written around it folds that row's bindings rather than \
      the rows, which is one row in and one row out and no grouping under it",
+    "a condition may be written inside an element pattern, and it is asked of the one element \
+     that pattern stands on where the pattern reaches it rather than of the row a whole pattern \
+     built: a node writes it after its labels and its property map and an edge writes it inside \
+     the brackets, and both may read the names the pattern bound to their left, which is what \
+     makes them non local. Being part of the pattern is what tells the condition apart from the \
+     same text written behind it: under an OPTIONAL MATCH a node the condition refuses is a \
+     match that did not happen rather than a row to drop, so the left side keeps its row. Two \
+     conditions where two stretches meet are both asked of the node they meet at; one inside a \
+     repeated stretch is refused, since the name inside the brackets stands for the group and \
+     not for the repetition's element; and one inside an inserted pattern is refused, an INSERT \
+     describing an element to make rather than one to find",
     "six predicates ask about an element the statement already bound rather than about the rows \
      a pattern is walking: IS DIRECTED holds of an edge whose table stores a direction and is \
      refused of a node, which has none to answer with; IS LABELED asks the label expression a \

@@ -190,6 +190,16 @@ fn merge_ends(end: &mut NodePattern, node: NodePattern) {
         (Some(seen), Some(next)) => Some(LabelExpr::And(Box::new(seen), Box::new(next))),
     };
     end.props.extend(node.props);
+    // Two predicates on the one node are both asked of it, in the order
+    // the pattern wrote them.
+    end.filter = match (end.filter.take(), node.filter) {
+        (None, other) | (other, None) => other,
+        (Some(seen), Some(next)) => Some(Box::new(Expr::Binary {
+            op: BinaryOp::And,
+            lhs: seen,
+            rhs: next,
+        })),
+    };
 }
 
 /// The names a repeated stretch binds, and where each repetition binds
@@ -1887,7 +1897,9 @@ impl Parser<'_> {
                  for one, and a list of paths is not a value this engine has",
             ));
         }
-        if filter.is_some() || inner.filter.is_some() {
+        let inline = inner.nodes.iter().any(|node| node.filter.is_some())
+            || inner.rels.iter().any(|rel| rel.filter.is_some());
+        if filter.is_some() || inner.filter.is_some() || inline {
             return Err(ZuError::gql_in(
                 codes::C42001,
                 self.source,
@@ -2223,12 +2235,23 @@ impl Parser<'_> {
         } else {
             Vec::new()
         };
+        // G041. A WHERE inside the parentheses is asked of this node,
+        // and it may read what the pattern bound to its left, which is
+        // what makes it the non local predicate: the node is filtered
+        // where it is reached rather than after the whole pattern has
+        // been walked.
+        let filter = if self.eat_kw("WHERE") {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
         self.expect(&TokenKind::RParen)?;
         Ok(NodePattern {
             var,
             aliases: Vec::new(),
             label,
             props,
+            filter,
         })
     }
 
@@ -4264,6 +4287,74 @@ mod tests {
             panic!("MATCH");
         };
         assert!(patterns[0].steps[0].0.filter.is_none());
+    }
+
+    /// The same predicate on a node, which is where G041 writes it, and
+    /// it reads after the labels and the property map the way the edge
+    /// one reads after the type and the range.
+    #[test]
+    fn a_where_inside_the_parentheses_belongs_to_the_node() {
+        for text in [
+            "b WHERE b.step > 1",
+            "b:Step WHERE b.step > 1",
+            "b:Step {kind: 'link'} WHERE b.step > 1",
+        ] {
+            let q = parsed(&format!("MATCH (a)-[:LINK]->({text}) RETURN a"));
+            let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+                panic!("MATCH");
+            };
+            let (_, node) = &patterns[0].steps[0];
+            let Some(filter) = &node.filter else {
+                panic!("no predicate on {text}");
+            };
+            assert!(
+                matches!(
+                    **filter,
+                    Expr::Binary {
+                        op: BinaryOp::Gt,
+                        ..
+                    }
+                ),
+                "predicate of {text} parsed as {filter:?}"
+            );
+        }
+
+        // The one written on the node the pattern starts at is the same
+        // predicate in the same place, and a node without one carries
+        // none.
+        let q = parsed("MATCH (a:Step WHERE a.step = 0)-[:LINK]->(b) RETURN b");
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        assert!(patterns[0].start.filter.is_some());
+        assert!(patterns[0].steps[0].1.filter.is_none());
+
+        // Two stretches meeting at a node describe one node, so both
+        // conditions written there are asked of it.
+        let q =
+            parsed("MATCH (a:Step WHERE a.step = 0)((a WHERE a.kind = 'x')-[:LINK]->(c)) RETURN c");
+        let Clause::Match { patterns, .. } = &q.clauses()[0] else {
+            panic!("MATCH");
+        };
+        let Some(filter) = &patterns[0].start.filter else {
+            panic!("the two conditions met");
+        };
+        assert!(matches!(
+            **filter,
+            Expr::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+
+        // Inside a repeated stretch it would be asked once per
+        // repetition of an element the name no longer stands for, which
+        // is refused by name rather than answered about the group.
+        assert!(
+            parse_err("MATCH ((x:Step WHERE x.step > 0)-[:LINK]->(y)){2} RETURN x")
+                .contains("once per repetition"),
+            "a predicate inside a repeated stretch"
+        );
     }
 
     #[test]

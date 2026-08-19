@@ -278,7 +278,12 @@ path_mode       = "WALK" | "TRAIL" | "SIMPLE" | "ACYCLIC" ;
    one another, because a cycle is a simple path and not an acyclic
    one. *)
 node            = "(" , [ name ] , { ":" , label_expr } ,
-                  [ property_map ] , ")" ;
+                  [ property_map ] , [ "WHERE" , expression ] , ")" ;
+(* The condition inside the parentheses is the element pattern
+   predicate of ISO 16.6, feature G041. It is asked of the one element
+   the pattern is standing on, where the pattern reaches it, and it may
+   read what the pattern bound to its left, which is what "non local"
+   names. *)
 label_expr      = label_term , { "|" , label_term } ;
 label_term      = label_factor , { "&" , label_factor } ;
 label_factor    = { "!" } , label_atom ;
@@ -301,7 +306,11 @@ bar             = "-" | "~" ;
    the edge type rather than of the pattern. `-[]-` walks either kind
    either way round. *)
 rel_detail      = "[" , [ name ] , [ ":" , name , { "|" , name } ] ,
-                  [ "*" , [ hop_range ] ] , [ property_map ] , "]" ;
+                  [ "*" , [ hop_range ] ] , [ property_map ] ,
+                  [ "WHERE" , expression ] , "]" ;
+(* The same predicate on an edge, asked of every edge the step walks
+   before the step walks it, so an edge that fails it is never followed
+   and no longer path is built through it. *)
 hop_range       = integer , [ ".." , [ integer ] ]
                 | ".." , integer ;
 (* `*n` alone means exactly n hops; a bare `*` is unbounded. *)

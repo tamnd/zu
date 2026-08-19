@@ -5200,9 +5200,20 @@ fn step(descs: &[OpDesc], ctx: &mut StageCtx, i: usize) -> Result<bool> {
             }
             let items = match settle(eval(ctx, expr)?) {
                 Value::List(items) => items,
+                // GQ23. A binding table is the other thing a FOR may
+                // run over, and a row of one is a record: the columns
+                // are the field names, which is what the table already
+                // says a row is. Nothing else changes, so the counter
+                // of WITH ORDINALITY numbers the rows the same way it
+                // numbers a list's elements.
+                Value::BindingTable(table) => (0..table.rows().len())
+                    .map(|row| table.record(row).unwrap_or(Value::Null))
+                    .collect(),
                 Value::Null => continue,
                 other => {
-                    return Err(invalid(format!("UNWIND expects a list, got {other:?}")));
+                    return Err(invalid(format!(
+                        "UNWIND expects a list or a binding table, got {other:?}"
+                    )));
                 }
             };
             if items.is_empty() {

@@ -7,12 +7,19 @@
 //! on. Everything in this crate that hands out a raw pointer into a log
 //! page relies on it.
 //!
-//! Two things use it here. Page eviction defers the free of a page's
-//! memory, so a reader holding a pointer into that page finishes before
-//! the bytes go away. The flusher uses the same counter for a different
-//! purpose: to learn when every thread that allocated below a given
-//! address has finished writing its record, which is what makes a
-//! partial flush of the tail page safe without a per-page byte counter.
+//! Page eviction is what uses it: the free of a page's memory is
+//! deferred, so a reader holding a pointer into that page finishes
+//! before the bytes go away.
+//!
+//! The flusher needs a different answer, and it used to take it from the
+//! same counter. It has to know that every record below the address it
+//! is about to write is complete, and waiting for the epoch to turn over
+//! answers that by waiting for every session to leave whatever it was
+//! doing, readers included. That is far more than the question asked, and
+//! on a busy database it made a commit cost what the other threads were
+//! doing rather than what the device charges. Each session now publishes
+//! the lowest address it may be writing, so the flusher can ask its own
+//! question directly and a reader never appears in the answer.
 //!
 //! A slot is claimed by a [`Session`] rather than by a thread local, so
 //! that a thread's participation is explicit and its cost is paid once
@@ -28,10 +35,19 @@ const FREE: u64 = 0;
 /// A slot claimed by a session that is not inside an operation.
 const IDLE: u64 = u64::MAX;
 
-/// One session's announced epoch, on its own cacheline so that two
-/// sessions announcing do not fight over one line.
+/// The frontier of a session that is not writing anything. Above every
+/// real address, so a session at rest never holds the floor down.
+pub const NOWHERE: u64 = u64::MAX;
+
+/// One session's announced epoch and write frontier, on their own
+/// cacheline so that two sessions announcing do not fight over one line.
+/// The two live together because a write announces both and pays for one
+/// line rather than two.
 #[repr(align(64))]
-struct Slot(AtomicU64);
+struct Slot {
+    epoch: AtomicU64,
+    writing: AtomicU64,
+}
 
 type Action = Box<dyn FnOnce() + Send>;
 
@@ -61,7 +77,12 @@ impl Epochs {
             // Epoch 0 is never announced, so a reclaim safe point of 0
             // means nothing has been queued yet.
             current: AtomicU64::new(1),
-            slots: (0..sessions).map(|_| Slot(AtomicU64::new(FREE))).collect(),
+            slots: (0..sessions)
+                .map(|_| Slot {
+                    epoch: AtomicU64::new(FREE),
+                    writing: AtomicU64::new(NOWHERE),
+                })
+                .collect(),
             claimed: AtomicUsize::new(0),
             deferred: Mutex::new(Vec::new()),
         }
@@ -86,12 +107,38 @@ impl Epochs {
         let mut safe = self.current();
         let claimed = self.claimed.load(Ordering::Acquire);
         for slot in &self.slots[..claimed] {
-            let announced = slot.0.load(Ordering::Acquire);
+            let announced = slot.epoch.load(Ordering::Acquire);
             if announced != FREE && announced != IDLE && announced < safe {
                 safe = announced;
             }
         }
         safe
+    }
+
+    /// The lowest address any session may still be writing, or `ceiling`
+    /// when none of them is writing below it.
+    ///
+    /// Everything below the answer is a complete record, which is what
+    /// the flusher needs to know before it hands bytes to the device.
+    ///
+    /// Two orderings carry this. The caller reads the tail before it
+    /// calls, and an appending session publishes its frontier before it
+    /// claims tail space, so a caller whose tail read saw the claim also
+    /// sees the frontier that went with it. A session updating a record
+    /// in place has no tail claim to carry it, so that one is a sequenced
+    /// store followed by a sequenced load of the flush target on its
+    /// side and the mirror image on the flusher's, which leaves no
+    /// interleaving where both of them think they have the bytes.
+    pub fn write_floor(&self, ceiling: u64) -> u64 {
+        let mut floor = ceiling;
+        let claimed = self.claimed.load(Ordering::Acquire);
+        for slot in &self.slots[..claimed] {
+            let at = slot.writing.load(Ordering::SeqCst);
+            if at < floor {
+                floor = at;
+            }
+        }
+        floor
     }
 
     /// Runs `action` once no session can still be looking at whatever
@@ -151,7 +198,7 @@ impl Epochs {
     fn claim(&self) -> usize {
         for (i, slot) in self.slots.iter().enumerate() {
             if slot
-                .0
+                .epoch
                 .compare_exchange(FREE, IDLE, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
@@ -187,7 +234,7 @@ impl<'a> Slotted<'a> {
     #[inline]
     pub fn protect(&self) {
         self.epochs.slots[self.slot]
-            .0
+            .epoch
             .store(self.epochs.current(), Ordering::Release);
     }
 
@@ -195,15 +242,54 @@ impl<'a> Slotted<'a> {
     #[inline]
     pub fn unprotect(&self) {
         self.epochs.slots[self.slot]
-            .0
+            .epoch
             .store(IDLE, Ordering::Release);
+    }
+
+    /// Announces that this session is about to claim tail space at or
+    /// above `address` and write a record there.
+    ///
+    /// A release store is enough because the claim itself follows, and a
+    /// flusher that saw the claim in the tail therefore sees this. A
+    /// flusher that did not see the claim has a tail below the record
+    /// and is bounded by that instead.
+    #[inline]
+    pub fn appending_at(&self, address: u64) {
+        self.epochs.slots[self.slot]
+            .writing
+            .store(address, Ordering::Release);
+    }
+
+    /// Announces that this session is about to rewrite the record at
+    /// `address` where it lies.
+    ///
+    /// Nothing follows this to carry it, so it is sequenced, and the
+    /// caller reads the flush target sequenced straight after. See
+    /// [`Epochs::write_floor`].
+    #[inline]
+    pub fn updating_at(&self, address: u64) {
+        self.epochs.slots[self.slot]
+            .writing
+            .store(address, Ordering::SeqCst);
+    }
+
+    /// Announces that the record is complete, so the flusher may take
+    /// it. Release, so the bytes are visible to whoever sees this.
+    #[inline]
+    pub fn wrote(&self) {
+        self.epochs.slots[self.slot]
+            .writing
+            .store(NOWHERE, Ordering::Release);
     }
 }
 
 impl Drop for Slotted<'_> {
     fn drop(&mut self) {
         self.epochs.slots[self.slot]
-            .0
+            .writing
+            .store(NOWHERE, Ordering::Release);
+        self.epochs.slots[self.slot]
+            .epoch
             .store(FREE, Ordering::Release);
     }
 }
@@ -257,6 +343,33 @@ mod tests {
         let s = Slotted::new(&epochs);
         s.protect();
         s.unprotect();
+    }
+
+    #[test]
+    fn a_writing_session_holds_the_write_floor_and_a_reader_does_not() {
+        let epochs = Epochs::new(4);
+        let reader = Slotted::new(&epochs);
+        reader.protect();
+        assert_eq!(epochs.write_floor(100), 100, "a reader held the floor");
+        let writer = Slotted::new(&epochs);
+        writer.appending_at(40);
+        assert_eq!(epochs.write_floor(100), 40, "the writer did not hold it");
+        writer.wrote();
+        assert_eq!(epochs.write_floor(100), 100, "the floor did not come back");
+        writer.updating_at(60);
+        assert_eq!(epochs.write_floor(100), 60, "an in-place write is a write");
+        writer.wrote();
+        assert_eq!(epochs.write_floor(100), 100);
+    }
+
+    #[test]
+    fn a_dropped_session_does_not_hold_the_write_floor() {
+        let epochs = Epochs::new(2);
+        {
+            let writer = Slotted::new(&epochs);
+            writer.appending_at(40);
+        }
+        assert_eq!(epochs.write_floor(100), 100, "a gone session pinned it");
     }
 
     #[test]

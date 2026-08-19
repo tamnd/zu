@@ -435,7 +435,7 @@ impl Session<'_> {
         let address = self
             .core
             .log
-            .append(NULL, version, &[], payload, false, kind)?;
+            .append(&self.slot, NULL, version, &[], payload, false, kind)?;
         Ok(address + record::size_of(0, payload.len()) as u64)
     }
 
@@ -680,6 +680,7 @@ impl Session<'_> {
                 // getting it right is that the chain keeps the stale
                 // version too, which compaction is what removes.
                 let fresh = self.core.log.append(
+                    &self.slot,
                     index::address_of(entry),
                     version,
                     key,
@@ -725,7 +726,7 @@ impl Session<'_> {
                 let fresh = self
                     .core
                     .log
-                    .append(NULL, version, key, value, tombstone, kind)?;
+                    .append(&self.slot, NULL, version, key, value, tombstone, kind)?;
                 bucket.slots[i].store(index::entry(tag, fresh, false), Ordering::Release);
                 return Ok(Some(fresh + size));
             }
@@ -740,6 +741,7 @@ impl Session<'_> {
             }
             let version = self.core.next_version();
             let fresh = self.core.log.append(
+                &self.slot,
                 index::address_of(entry),
                 version,
                 key,
@@ -810,6 +812,7 @@ impl Session<'_> {
                 }
                 let version = self.core.next_version();
                 let fresh = self.core.log.append(
+                    &self.slot,
                     index::address_of(entry),
                     version,
                     key,
@@ -859,9 +862,19 @@ impl Session<'_> {
         }
         // SAFETY: the record is resident, the epoch is held, and the
         // length is checked before anything is written.
-        unsafe {
+        let end = unsafe {
             let r = RecordRef::new(base);
             if r.tombstone() || r.value_len() != value.len() {
+                return None;
+            }
+            // Claim the bytes, then read the floor a second time. A
+            // flush that starts from here on will see the claim and
+            // wait; a flush that started before it will already have
+            // raised the target, and this reads it and stands down.
+            // Ordering is in Epochs::write_floor.
+            self.slot.updating_at(address);
+            if address < self.core.log.in_place_floor() {
+                self.slot.wrote();
                 return None;
             }
             let version = self.core.next_version();
@@ -869,10 +882,13 @@ impl Session<'_> {
                 // The bytes are inside a record the flusher has not
                 // claimed, so the end of that record is what has to
                 // become durable, not a fresh append.
-                return Some(address + r.size() as u64);
+                Some(address + r.size() as u64)
+            } else {
+                None
             }
-        }
-        None
+        };
+        self.slot.wrote();
+        end
     }
 }
 

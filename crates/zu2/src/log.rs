@@ -25,10 +25,11 @@
 //! per 4 MiB page.
 //!
 //! Flushing a partial page is safe without any per-page byte counter,
-//! because the flusher waits on the epoch: it snapshots the tail, bumps
-//! the epoch, and waits for every session that was inside an operation
-//! to leave. Any allocation below the snapshot happened inside one of
-//! those sessions, so once they are gone the bytes are all there.
+//! because every session publishes the lowest address it may be writing
+//! and the flusher writes below the lowest of those. A session that is
+//! only reading publishes nothing and holds nothing up, which is the
+//! difference between a commit that costs what the device charges and
+//! one that costs whatever the other threads happen to be doing.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::fs::File;
@@ -37,7 +38,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::addr::{Address, FIRST, PAGE_SIZE, page_of, page_start};
-use crate::epoch::Epochs;
+use crate::epoch::{Epochs, Slotted};
 use crate::error::{Error, Result};
 use crate::{file, record};
 
@@ -119,13 +120,14 @@ pub struct Log {
     /// The address a flush in progress is going to write up to.
     ///
     /// This is what makes an in-place update safe against the flusher.
-    /// The flusher publishes its target before it waits for
-    /// quiescence, so a session that was already running finishes
-    /// before any byte is written, and a session that starts later sees
-    /// the target and refuses to rewrite anything below it. Without it
-    /// a writer could be editing a record while the flusher was reading
-    /// the same bytes, and the file would take a record whose checksum
-    /// belongs to neither version.
+    /// The flusher publishes its target before it reads the session
+    /// write frontiers, and a session about to rewrite a record
+    /// publishes its frontier before it reads the target, so at least
+    /// one of the two sees the other: either the flusher waits for the
+    /// rewrite or the rewrite stands down and appends instead. Without
+    /// it a writer could be editing a record while the flusher was
+    /// reading the same bytes, and the file would take a record whose
+    /// checksum belongs to neither version.
     flush_target: AtomicU64,
     /// The lowest address any record still lives at.
     ///
@@ -332,11 +334,49 @@ impl Log {
     /// The lowest address an update may still rewrite in place: young
     /// enough that no reader treats it as immutable, and not inside a
     /// flush that is already under way.
+    ///
+    /// The flush target is read sequenced because a caller that has
+    /// already published its frontier is relying on one of the two
+    /// sides seeing the other. See [`Epochs::write_floor`].
+    ///
+    /// [`Epochs::write_floor`]: crate::epoch::Epochs::write_floor
     #[inline]
     pub fn in_place_floor(&self) -> Address {
-        self.read_only
-            .load(Ordering::Acquire)
-            .max(self.flush_target.load(Ordering::Acquire))
+        self.flush_target
+            .load(Ordering::SeqCst)
+            .max(self.read_only.load(Ordering::Acquire))
+    }
+
+    /// The address below which every record is complete.
+    ///
+    /// The tail is read first and the frontiers after, because a
+    /// session publishes its frontier before it claims tail space: read
+    /// the other way round, a claim could land between the two reads
+    /// and be missed by both.
+    #[inline]
+    fn write_floor(&self) -> Address {
+        let tail = self.tail();
+        self.epochs.write_floor(tail)
+    }
+
+    /// Waits until every record below `upto` is complete.
+    ///
+    /// This is what a flush waits for, and it used to wait for global
+    /// epoch quiescence instead, which is a much larger thing: every
+    /// session had to leave whatever it was doing, so a commit cost
+    /// what the other threads happened to be doing rather than what the
+    /// device charges. A reader does not appear here at all, and
+    /// neither does a writer working above `upto`.
+    fn wait_for_writers(&self, upto: Address) {
+        let mut spins = 0u32;
+        while self.write_floor() < upto {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
     }
 
     fn page_ptr(&self, page: usize) -> *mut u8 {
@@ -374,7 +414,15 @@ impl Log {
     }
 
     /// Reserves `size` bytes at the tail and returns where they start.
-    fn allocate(&self, size: usize) -> Result<Address> {
+    ///
+    /// The session's frontier goes out before the claim and names the
+    /// tail as it stood, which is at or below where the claim lands, so
+    /// a flusher that sees the claim also sees a frontier it can trust.
+    /// Naming it early is what makes the frontier safe rather than
+    /// merely early: too low only holds a flush back for as long as this
+    /// takes, and too high would let one through over a half written
+    /// record.
+    fn allocate(&self, slot: &Slotted, size: usize) -> Result<Address> {
         if size > PAGE_SIZE {
             return Err(Error::RecordTooLarge {
                 size,
@@ -383,6 +431,7 @@ impl Log {
         }
         loop {
             let observed = self.tail.load(Ordering::Acquire);
+            slot.appending_at(observed);
             let page = page_of(observed);
             let offset = (observed - page_start(page)) as usize;
             let start = if offset + size > PAGE_SIZE {
@@ -449,9 +498,15 @@ impl Log {
     /// Appends a record and returns its address. The bytes are complete
     /// before this returns, so publishing the address publishes the
     /// record.
+    ///
+    /// The session's write frontier is cleared on every path out,
+    /// including the failing ones. A frontier left behind names an
+    /// address no record will ever finish at, and the flusher would
+    /// wait at it for the life of the process.
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &self,
+        slot: &Slotted,
         previous: Address,
         version: u64,
         key: &[u8],
@@ -460,16 +515,20 @@ impl Log {
         kind: u32,
     ) -> Result<Address> {
         let size = record::size_of(key.len(), value.len());
-        let address = self.allocate(size)?;
-        let page = self.ensure_page(page_of(address))?;
-        // SAFETY: the range came back from the tail allocator, so no
-        // other thread owns it, and it lies inside the page because the
-        // allocator never splits a record.
-        unsafe {
-            let dst = page.add((address - page_start(page_of(address))) as usize);
-            record::write_at(dst, previous, version, key, value, tombstone, kind);
-        }
-        Ok(address)
+        let outcome = (|| -> Result<Address> {
+            let address = self.allocate(slot, size)?;
+            let page = self.ensure_page(page_of(address))?;
+            // SAFETY: the range came back from the tail allocator, so no
+            // other thread owns it, and it lies inside the page because
+            // the allocator never splits a record.
+            unsafe {
+                let dst = page.add((address - page_start(page_of(address))) as usize);
+                record::write_at(dst, previous, version, key, value, tombstone, kind);
+            }
+            Ok(address)
+        })();
+        slot.wrote();
+        outcome
     }
 
     /// A pointer to a resident record, or null when the page has been
@@ -661,8 +720,9 @@ impl Log {
                     why: "page left memory before it was flushed",
                 });
             }
-            // SAFETY: the range is inside a resident page, and the
-            // quiescence wait means every record in it is complete.
+            // SAFETY: the range is inside a resident page, and the wait
+            // for the write frontier means every record in it is
+            // complete.
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     base.add((from - page_start(page)) as usize),
@@ -684,8 +744,8 @@ impl Log {
         if upto <= self.flushed() {
             return Ok(());
         }
-        self.flush_target.fetch_max(upto, Ordering::AcqRel);
-        self.epochs.wait_for_quiescence();
+        self.flush_target.fetch_max(upto, Ordering::SeqCst);
+        self.wait_for_writers(upto);
         let mut state = self.flushing.lock().expect("zu2 flush state");
         if upto <= self.flushed() {
             return Ok(());
@@ -740,8 +800,8 @@ impl Log {
         // writer could edit bytes this thread is about to read, and
         // without the wait an earlier one could still be mid-record.
         let target = self.tail().max(upto);
-        self.flush_target.fetch_max(target, Ordering::AcqRel);
-        self.epochs.wait_for_quiescence();
+        self.flush_target.fetch_max(target, Ordering::SeqCst);
+        self.wait_for_writers(target);
         self.write_and_sync(&mut state, target, true)
     }
 
@@ -782,6 +842,7 @@ mod tests {
     use crate::addr::PAGE_SIZE;
     use crate::epoch::Slotted;
     use crate::record::RecordRef;
+    use std::sync::atomic::AtomicBool;
 
     fn log(memory_pages: usize) -> (tempfile::TempDir, Log) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -794,6 +855,7 @@ mod tests {
     #[test]
     fn a_record_never_straddles_a_page() {
         let (_dir, log) = log(usize::MAX);
+        let session = Slotted::new(&log.epochs);
         let value = vec![0u8; 4000];
         let mut last = 0;
         // 4032 bytes a record over 4 MiB pages, so this crosses four
@@ -801,6 +863,7 @@ mod tests {
         for i in 0..5000u32 {
             let a = log
                 .append(
+                    &session,
                     last,
                     u64::from(i) + 1,
                     &i.to_be_bytes(),
@@ -823,9 +886,11 @@ mod tests {
     #[test]
     fn the_read_only_boundary_trails_the_tail_by_the_mutable_window() {
         let (_dir, log) = log(usize::MAX);
+        let session = Slotted::new(&log.epochs);
         let value = vec![7u8; 8192];
         for i in 0..2000u32 {
             log.append(
+                &session,
                 0,
                 u64::from(i) + 1,
                 &i.to_be_bytes(),
@@ -856,6 +921,7 @@ mod tests {
         for i in 0..3000u32 {
             let a = log
                 .append(
+                    &session,
                     0,
                     u64::from(i) + 1,
                     &i.to_be_bytes(),
@@ -885,12 +951,47 @@ mod tests {
         assert!(r.intact(), "the record did not survive the round trip");
     }
 
+    /// The point of the write frontier, stated as a test that hangs
+    /// rather than fails if it regresses: the reader here does not stand
+    /// down until the commit has already returned, so a commit that
+    /// waited for the epoch to turn over would never return at all.
+    #[test]
+    fn a_durable_commit_does_not_wait_for_a_reader() {
+        let (_dir, log) = log(usize::MAX);
+        let holding = AtomicBool::new(false);
+        let release = AtomicBool::new(false);
+        let mut end = 0;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let reader = Slotted::new(&log.epochs);
+                reader.protect();
+                holding.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                reader.unprotect();
+            });
+            while !holding.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            let session = Slotted::new(&log.epochs);
+            let a = log
+                .append(&session, 0, 1, b"k", b"v", false, record::KIND_VALUE)
+                .expect("append");
+            end = a + record::size_of(1, 1) as u64;
+            log.make_durable(end, Durability::Durable).expect("durable");
+            release.store(true, Ordering::Release);
+        });
+        assert!(log.flushed() >= end, "the commit did not reach the device");
+    }
+
     #[test]
     fn a_record_larger_than_a_page_is_refused_rather_than_split() {
         let (_dir, log) = log(usize::MAX);
+        let session = Slotted::new(&log.epochs);
         let value = vec![0u8; PAGE_SIZE];
         let error = log
-            .append(0, 1, b"k", &value, false, record::KIND_VALUE)
+            .append(&session, 0, 1, b"k", &value, false, record::KIND_VALUE)
             .expect_err("too big");
         assert!(matches!(error, Error::RecordTooLarge { .. }), "{error}");
     }

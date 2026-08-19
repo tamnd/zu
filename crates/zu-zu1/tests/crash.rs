@@ -255,14 +255,11 @@ fn every_cut_recovers_to_a_committed_prefix() {
             &db_path,
         )
         .unwrap();
-        let mut wal = Wal::open_on(
-            Box::new(RecordingFile::new(
-                RealFile::open_or_create(&wal_path).unwrap(),
-                IoFile::Wal,
-                log.clone(),
-            )),
-            &wal_path,
-        )
+        let mut wal = Wal::open_on(Box::new(RecordingFile::new(
+            RealFile::open_or_create(&wal_path).unwrap(),
+            IoFile::Wal,
+            log.clone(),
+        )))
         .unwrap();
         let catalog = Catalog::load(&mut db).unwrap();
         let tables = Tables {

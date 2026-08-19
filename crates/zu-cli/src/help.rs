@@ -45,9 +45,10 @@ pub(crate) struct Command {
 pub(crate) const COMMANDS: &[Command] = &[
     Command {
         name: "shell",
-        summary: "open an interactive session on a file",
-        synopsis: &["zu shell <file.zu1> [--format jsonl]"],
+        summary: "open an interactive session on a file, or on nothing",
+        synopsis: &["zu shell [<file.zu1>] [--format jsonl]"],
         examples: &[
+            "zu shell",
             "zu shell graph.zu1",
             "zu shell graph.zu1 --format jsonl < frames.jsonl",
         ],

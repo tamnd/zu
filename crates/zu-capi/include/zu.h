@@ -292,6 +292,21 @@ zu_status zu_database_create(const char *path, size_t path_len, const zu_config 
                              zu_database **out, zu_error **err);
 zu_status zu_database_create_z(const char *path, const zu_config *cfg, zu_database **out,
                                zu_error **err);
+/* Creates a database that never touches the filesystem. The blocks a
+ * file would hold are held in memory instead, and the log beside it
+ * too, so everything above this point runs unchanged and nothing
+ * survives the process.
+ *
+ * Every call makes a database of its own. Two connections on one handle
+ * are two views of one graph; two handles share nothing.
+ *
+ * zu_database_path still answers, with a name that is not a path: it is
+ * what this process calls the database, which is what an error message
+ * needs and not something to open. zu_database_is_memory is the way to
+ * ask rather than to parse that name, and returns ZU_OK for a database
+ * in memory and ZU_DONE for one on disk. */
+zu_status zu_database_memory(const zu_config *cfg, zu_database **out, zu_error **err);
+zu_status zu_database_is_memory(const zu_database *db);
 zu_status zu_database_path(const zu_database *db, const char **out, size_t *len);
 void zu_database_close(zu_database *db);
 
@@ -315,6 +330,9 @@ zu_status zu_open_z(const char *path, zu_conn **out, zu_error **err);
  * zu_database_create and one connection on it. */
 zu_status zu_create(const char *path, size_t path_len, zu_conn **out, zu_error **err);
 zu_status zu_create_z(const char *path, zu_conn **out, zu_error **err);
+/* And the same over a database that is nowhere: one scratch graph and
+ * one connection on it, which go together when the connection closes. */
+zu_status zu_memory(zu_conn **out, zu_error **err);
 void zu_conn_close(zu_conn *conn);
 void zu_close(zu_conn *conn); /* the old name; goes at the freeze */
 

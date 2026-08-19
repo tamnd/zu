@@ -153,21 +153,81 @@ fn one_process_serves_statements_frames_and_errors() {
     assert!(status.success());
 }
 
+/// The verb with no file is a session on a database in memory, which
+/// is what somebody trying the language out wants: nothing to make
+/// first and nothing left in the working directory after.
 #[test]
-fn bare_shell_prints_usage_not_unknown_command() {
+fn bare_shell_opens_a_database_in_memory() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let out = Command::new(env!("CARGO_BIN_EXE_zu"))
         .arg("shell")
+        .arg("--format")
+        .arg("jsonl")
+        .current_dir(dir.path())
         .output()
         .expect("run");
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // A mode probe runs the bare verb and takes "unknown command" to
-    // mean the verb does not exist; a usage line must not read as that.
-    assert!(stderr.contains("usage:"), "got {stderr}");
-    assert!(!stderr.contains("unknown command"), "got {stderr}");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\":memory:\""), "got {stdout}");
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read the directory")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "nothing is left behind, found {left:?}");
+
     let help = Command::new(env!("CARGO_BIN_EXE_zu"))
         .arg("--help")
         .output()
         .expect("help");
     assert!(String::from_utf8_lossy(&help.stdout).contains("shell"));
+}
+
+/// A flag nobody has is still a usage line rather than a session. A
+/// mode probe runs the bare verb and takes "unknown command" to mean
+/// the verb does not exist, so a usage line must not read as that.
+#[test]
+fn a_flag_nobody_has_prints_usage_not_unknown_command() {
+    let out = Command::new(env!("CARGO_BIN_EXE_zu"))
+        .arg("shell")
+        .arg("--nope")
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "got {stderr}");
+    assert!(!stderr.contains("unknown command"), "got {stderr}");
+}
+
+/// And the name every embedded database spells it with means the same
+/// thing as leaving it out.
+#[test]
+fn the_memory_name_is_the_same_as_no_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zu"))
+        .arg("shell")
+        .arg(":memory:")
+        .arg("--format")
+        .arg("jsonl")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting").expect("greeting");
+    writeln!(stdin, "INSERT (p:person {{uid: 1, name: 'ada'}})").expect("write");
+    lines.next().expect("insert").expect("insert");
+    writeln!(stdin, "MATCH (p:person) RETURN p.name AS name").expect("write");
+    let read = lines.next().expect("read").expect("read");
+    assert!(read.contains("ada"), "got {read}");
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("read the directory")
+            .next()
+            .is_none(),
+        "no file called :memory: is left behind"
+    );
 }

@@ -36,6 +36,7 @@ use zu_common::Result;
 use crate::write::{Patches, Writer, Written};
 use crate::zu1::file::{DatabaseHeader, Shared, Zu1File};
 use crate::zu1::txn::WriteTxn;
+use crate::zu1::vfs::Vfs;
 use crate::zu1::wal::Commits;
 
 /// Replays a sidecar WAL that a previous writer left behind.
@@ -58,10 +59,10 @@ fn replay_sidecar(db: &mut Zu1File) -> Result<()> {
         return Ok(());
     }
     let path = crate::append::sidecar(db.path());
-    if !path.try_exists().unwrap_or(false) {
+    if !db.vfs().exists(&path) {
         return Ok(());
     }
-    let mut wal = crate::zu1::wal::Wal::open(&path)?;
+    let mut wal = crate::zu1::wal::Wal::open_in(db.vfs(), &path)?;
     if wal.is_empty() {
         return Ok(());
     }
@@ -294,6 +295,11 @@ pub struct FileHandle {
     /// so a reader that has to open its own descriptor takes them up
     /// rather than starting a second cache nothing invalidates.
     shared: Shared,
+    /// Where the file came from, kept for the same reason the key is:
+    /// a reader that arrives while somebody is writing opens its own
+    /// descriptor, and the path alone does not say what to open it
+    /// through when the database is not on disk.
+    vfs: Arc<dyn Vfs>,
     /// Hands out the order writers staged their published states in,
     /// so a state that lands after a newer one can be recognized as
     /// stale and dropped. See [`FileHandle::stage`].
@@ -384,9 +390,11 @@ impl FileHandle {
             staged: 0,
         };
         let shared = file.shared();
+        let vfs = Arc::clone(file.vfs());
         let handle = Arc::new(FileHandle {
             key: key.clone(),
             shared,
+            vfs,
             gate: Mutex::new(Gate {
                 side: Some(WriteSide { file, writer: None }),
                 next: 0,
@@ -441,8 +449,8 @@ impl FileHandle {
                 drop(gate);
                 let published = self.published();
                 let mut file = match self.key.1 {
-                    true => Zu1File::open(&self.key.0)?,
-                    false => Zu1File::open_read_only(&self.key.0)?,
+                    true => Zu1File::open_in(Arc::clone(&self.vfs), &self.key.0)?,
+                    false => Zu1File::open_read_only_in(Arc::clone(&self.vfs), &self.key.0)?,
                 };
                 file.adopt(&self.shared);
                 file.follow(published.header(), published.slot());

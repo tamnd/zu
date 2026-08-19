@@ -24,21 +24,21 @@ use zu::{
     zu_conn_in_transaction, zu_conn_interrupt, zu_conn_register, zu_conn_registered_count,
     zu_conn_registered_name, zu_conn_rows_read, zu_conn_set_progress, zu_conn_unregister_z,
     zu_connect, zu_create, zu_create_z, zu_database_close, zu_database_create_z,
-    zu_database_open_z, zu_database_path, zu_error_code, zu_error_doc_url, zu_error_excerpt,
-    zu_error_free, zu_error_message, zu_error_offset, zu_error_position, zu_error_retryable,
-    zu_error_severity, zu_error_standard_text, zu_error_status, zu_execute, zu_frame_col_bool,
-    zu_frame_col_float, zu_frame_col_int, zu_frame_col_str, zu_frame_col_view, zu_frame_free,
-    zu_frame_new, zu_frame_new_z, zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64,
-    zu_loader_col_str, zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish,
-    zu_loader_free, zu_loader_table, zu_loader_table_z, zu_open, zu_open_z, zu_prepare,
-    zu_prepare_z, zu_query, zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type,
-    zu_result_chunk, zu_result_chunk_col_f64, zu_result_chunk_col_i64,
-    zu_result_chunk_col_node_offset, zu_result_chunk_col_valid, zu_result_chunk_count,
-    zu_result_col_f64, zu_result_col_i64, zu_result_col_name, zu_result_col_node_offset,
-    zu_result_col_valid, zu_result_cols, zu_result_free, zu_result_gqlstatus, zu_result_notice,
-    zu_result_notices, zu_result_rows, zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool,
-    zu_value_f64, zu_value_i64, zu_value_len, zu_value_node, zu_value_str, zu_value_temporal,
-    zu_value_type, zu_version,
+    zu_database_is_memory, zu_database_memory, zu_database_open_z, zu_database_path, zu_error_code,
+    zu_error_doc_url, zu_error_excerpt, zu_error_free, zu_error_message, zu_error_offset,
+    zu_error_position, zu_error_retryable, zu_error_severity, zu_error_standard_text,
+    zu_error_status, zu_execute, zu_frame_col_bool, zu_frame_col_float, zu_frame_col_int,
+    zu_frame_col_str, zu_frame_col_view, zu_frame_free, zu_frame_new, zu_frame_new_z,
+    zu_loader_col_bool, zu_loader_col_f64, zu_loader_col_i64, zu_loader_col_str,
+    zu_loader_col_temporal, zu_loader_create, zu_loader_edges, zu_loader_finish, zu_loader_free,
+    zu_loader_table, zu_loader_table_z, zu_memory, zu_open, zu_open_z, zu_prepare, zu_prepare_z,
+    zu_query, zu_query_z, zu_result_cell, zu_result_cell_str, zu_result_cell_type, zu_result_chunk,
+    zu_result_chunk_col_f64, zu_result_chunk_col_i64, zu_result_chunk_col_node_offset,
+    zu_result_chunk_col_valid, zu_result_chunk_count, zu_result_col_f64, zu_result_col_i64,
+    zu_result_col_name, zu_result_col_node_offset, zu_result_col_valid, zu_result_cols,
+    zu_result_free, zu_result_gqlstatus, zu_result_notice, zu_result_notices, zu_result_rows,
+    zu_rollback, zu_stmt_close, zu_value_at, zu_value_bool, zu_value_f64, zu_value_i64,
+    zu_value_len, zu_value_node, zu_value_str, zu_value_temporal, zu_value_type, zu_version,
 };
 
 fn seeded(path: &std::path::Path) {
@@ -2223,6 +2223,96 @@ fn a_database_is_created_where_there_was_none() {
         );
         assert!(conn.is_null() && !err.is_null());
         zu_error_free(err);
+    }
+}
+
+/// The database a C host starts from when it does not want a file at
+/// all: a scratch graph for a test, a fixture, or a load it is about to
+/// throw away. Nothing on disk means the host does not have to find
+/// somewhere writable first, and does not have to clean up after.
+#[test]
+fn a_database_is_made_in_memory_and_leaves_nothing_behind() {
+    unsafe {
+        let mut db: *mut ZuDatabase = ptr::null_mut();
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(
+            zu_database_memory(ptr::null(), &mut db, &mut err),
+            ZuStatus::Ok
+        );
+        assert!(!db.is_null() && err.is_null());
+        assert_eq!(zu_database_is_memory(db), ZuStatus::Ok);
+
+        // It answers with a name rather than a path, and the name is
+        // not something the filesystem knows.
+        let mut text: *const c_char = ptr::null();
+        let mut len = 0usize;
+        assert_eq!(zu_database_path(db, &mut text, &mut len), ZuStatus::Ok);
+        let name = std::str::from_utf8(std::slice::from_raw_parts(text.cast::<u8>(), len))
+            .expect("utf-8 name");
+        assert!(name.starts_with(":memory:"), "{name}");
+        assert!(!std::path::Path::new(name).exists(), "{name}");
+
+        // Two connections on the one handle are two views of one graph,
+        // which is the whole difference between a database and a
+        // connection and holds here exactly as it holds on disk.
+        let mut writing: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_connect(db, &mut writing, &mut err), ZuStatus::Ok);
+        let result = query(writing, "INSERT (p:person {uid: 1, name: 'ada'})", &mut err);
+        zu_result_free(result);
+        let mut reading: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_connect(db, &mut reading, &mut err), ZuStatus::Ok);
+        let result = query(reading, "MATCH (p:person) RETURN p.uid AS uid", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [1]);
+        zu_result_free(result);
+        zu_conn_close(reading);
+        zu_conn_close(writing);
+        zu_database_close(db);
+
+        // Two handles share nothing, which is what makes one per test
+        // the right thing to reach for.
+        let mut other: *mut ZuDatabase = ptr::null_mut();
+        assert_eq!(
+            zu_database_memory(ptr::null(), &mut other, &mut err),
+            ZuStatus::Ok
+        );
+        let mut conn: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_connect(other, &mut conn, &mut err), ZuStatus::Ok);
+        let result = query(conn, "MATCH (p:person) RETURN p.uid AS uid", &mut err);
+        assert_eq!(zu_result_rows(result), 0);
+        zu_result_free(result);
+        zu_conn_close(conn);
+        zu_database_close(other);
+
+        // And the convenience beside it, which is zu_create's other
+        // half: one scratch graph and one connection on it.
+        let mut only: *mut ZuConn = ptr::null_mut();
+        assert_eq!(zu_memory(&mut only, &mut err), ZuStatus::Ok);
+        assert!(!only.is_null() && err.is_null());
+        let result = query(only, "RETURN 1 AS n", &mut err);
+        assert_eq!(col_i64(result, 0, 1), [1]);
+        zu_result_free(result);
+        zu_conn_close(only);
+    }
+}
+
+/// A database on disk is not one in memory, which is the question a
+/// host asks before it offers to back one up.
+#[test]
+fn a_database_on_disk_says_it_is_not_in_memory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("durable.zu1");
+    seeded(&path);
+    unsafe {
+        let cpath = c(path.to_str().expect("utf-8 path"));
+        let mut db: *mut ZuDatabase = ptr::null_mut();
+        let mut err: *mut ZuError = ptr::null_mut();
+        assert_eq!(
+            zu_database_open_z(cpath.as_ptr(), ptr::null(), &mut db, &mut err),
+            ZuStatus::Ok
+        );
+        assert_eq!(zu_database_is_memory(db), ZuStatus::Done);
+        zu_database_close(db);
+        assert_eq!(zu_database_is_memory(ptr::null()), ZuStatus::Misuse);
     }
 }
 

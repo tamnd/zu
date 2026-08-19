@@ -14,7 +14,7 @@ use zu_common::{Epoch, IdSet, Result, ZuError};
 
 use crate::cache::{BlockCache, CacheStats, DecodedPool, PinnedBlock};
 use crate::segment::ChunkDirectory;
-use crate::vfs::{RealFile, VfsFile};
+use crate::vfs::{RealVfs, Vfs, VfsFile};
 use crate::{BLOCK_SIZE, FORMAT_VERSION, MAGIC, MIN_READER_VERSION};
 
 /// Memory limit the caches size themselves from when the caller sets
@@ -339,6 +339,12 @@ pub struct Zu1File {
     /// a second read handle to a query worker. Block reads seek, so
     /// workers cannot share one file descriptor.
     path: std::path::PathBuf,
+    /// Where the file came from, kept for the same reason the path is:
+    /// a reopen has to go back to the same place, and so does the
+    /// sidecar log, which is opened by name off this path later. For a
+    /// database on disk this is the filesystem and carrying it costs a
+    /// pointer; for one that is not, it is the only way back.
+    vfs: Arc<dyn Vfs>,
     file_header: FileHeader,
     db: DatabaseHeader,
     /// Slot the current header was read from; the flip writes the other one.
@@ -428,12 +434,24 @@ impl Zu1File {
     /// Creates a new database file. Fails if `path` already exists, so an
     /// existing database is never silently clobbered.
     pub fn create(path: &Path) -> Result<Self> {
-        Self::create_on(Box::new(RealFile::create_new(path)?), path)
+        Self::create_in(RealVfs::shared(), path)
+    }
+
+    /// [`Self::create`] somewhere other than the filesystem. The vfs is
+    /// kept, so the sidecar log and every reopened handle land in the
+    /// same place this one did.
+    pub fn create_in(vfs: Arc<dyn Vfs>, path: &Path) -> Result<Self> {
+        let file = vfs.create_new(path)?;
+        Self::create_within(vfs, file, path)
     }
 
     /// [`Self::create`] on an explicit file handle; the crash harness
     /// passes a recording one.
-    pub fn create_on(mut file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
+    pub fn create_on(file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
+        Self::create_within(RealVfs::shared(), file, path)
+    }
+
+    fn create_within(vfs: Arc<dyn Vfs>, mut file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
         let file_header = FileHeader::fresh();
         let db = DatabaseHeader {
             epoch: 1,
@@ -447,6 +465,7 @@ impl Zu1File {
         Ok(Self {
             file,
             path: path.to_path_buf(),
+            vfs,
             file_header,
             db,
             active_slot: 0,
@@ -470,7 +489,13 @@ impl Zu1File {
     /// Opens an existing database: read 12 KiB, validate the file header,
     /// and adopt the valid database header with the highest epoch.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_on(Box::new(RealFile::open_rw(path)?), path)
+        Self::open_in(RealVfs::shared(), path)
+    }
+
+    /// [`Self::open`] somewhere other than the filesystem.
+    pub fn open_in(vfs: Arc<dyn Vfs>, path: &Path) -> Result<Self> {
+        let file = vfs.open_rw(path)?;
+        Self::open_kind(vfs, file, path, true)
     }
 
     /// Opens an existing database on a descriptor the operating system
@@ -480,16 +505,27 @@ impl Zu1File {
     /// wrote learns which promise it broke rather than which syscall
     /// failed.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        Self::open_kind(Box::new(RealFile::open_r(path)?), path, false)
+        Self::open_read_only_in(RealVfs::shared(), path)
+    }
+
+    /// [`Self::open_read_only`] somewhere other than the filesystem.
+    pub fn open_read_only_in(vfs: Arc<dyn Vfs>, path: &Path) -> Result<Self> {
+        let file = vfs.open_r(path)?;
+        Self::open_kind(vfs, file, path, false)
     }
 
     /// [`Self::open`] on an explicit file handle; the crash harness
     /// passes a recording one.
     pub fn open_on(file: Box<dyn VfsFile>, path: &Path) -> Result<Self> {
-        Self::open_kind(file, path, true)
+        Self::open_kind(RealVfs::shared(), file, path, true)
     }
 
-    fn open_kind(mut file: Box<dyn VfsFile>, path: &Path, writable: bool) -> Result<Self> {
+    fn open_kind(
+        vfs: Arc<dyn Vfs>,
+        mut file: Box<dyn VfsFile>,
+        path: &Path,
+        writable: bool,
+    ) -> Result<Self> {
         let mut head = [0u8; FILE_HEADER_SIZE + 2 * DB_HEADER_SIZE];
         // Read what the file has rather than what a database would
         // have. A file too small for the header is usually not a
@@ -572,6 +608,7 @@ impl Zu1File {
         let mut this = Self {
             file,
             path: path.to_path_buf(),
+            vfs,
             file_header,
             db,
             active_slot,
@@ -625,11 +662,12 @@ impl Zu1File {
         }
         Ok(Self {
             file: if self.writable {
-                Box::new(RealFile::open_rw(&self.path)?)
+                self.vfs.open_rw(&self.path)?
             } else {
-                Box::new(RealFile::open_r(&self.path)?)
+                self.vfs.open_r(&self.path)?
             },
             path: self.path.clone(),
+            vfs: Arc::clone(&self.vfs),
             file_header: self.file_header.clone(),
             db: self.db.clone(),
             active_slot: self.active_slot,
@@ -1128,6 +1166,13 @@ impl Zu1File {
     /// carry the path alongside it and hope the two agree.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Where this handle's files come from, which is the other half of
+    /// what naming the sidecar takes: the name says where beside the
+    /// database it goes, and this says which world that name is in.
+    pub fn vfs(&self) -> &Arc<dyn Vfs> {
+        &self.vfs
     }
 
     /// Refuses the call when this handle is read-only. Every durable

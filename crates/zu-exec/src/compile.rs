@@ -16,8 +16,8 @@
 
 use std::sync::Arc;
 
-use zu_common::{IdMap, Result};
 use zu_common::types::LogicalType;
+use zu_common::{IdMap, Result};
 use zu_query::ast::{BinaryOp, Literal, RelDirection, SortKey};
 use zu_query::binder::{BoundClause, BoundExpr, BoundItem, BoundQuery, Func, Schema, TableFunc};
 use zu_query::exec::{Options, Sip, Value, Wcoj};

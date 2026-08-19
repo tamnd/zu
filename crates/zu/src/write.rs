@@ -296,7 +296,7 @@ impl Writer {
     pub fn open(db: &mut Zu1File) -> Result<Writer> {
         writable(db)?;
         let path = sidecar(db.path());
-        let mut wal = Wal::open(&path)?;
+        let mut wal = Wal::open_in(db.vfs(), &path)?;
         let mvcc = recover(db, &mut wal)?;
         let mut writer = Writer {
             wal,

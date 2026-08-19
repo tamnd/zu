@@ -787,6 +787,18 @@ impl Session<'_> {
     /// also what makes the region safe to drop afterwards: the copy is
     /// above the region and everything the entry could reach through it
     /// is still reachable through the copy.
+    ///
+    /// `version` is the version of the record being copied and not a new
+    /// one, and that is the whole of what makes a lost race safe. The
+    /// copy is appended before the compare and swap that would make it
+    /// the index entry, so a copy that loses stays on the log with
+    /// nobody pointing at it, at an address above the newer record that
+    /// beat it. A replay in address order would install that copy last
+    /// and hand back the value the loser held, which is what #436 was:
+    /// every key correct in memory and thousands of them a round or two
+    /// behind after a reopen. Carrying the original version means the
+    /// replay can tell which of the two records is the newer one without
+    /// knowing anything about compaction.
     pub(crate) fn copy_forward(
         &mut self,
         key: &[u8],
@@ -794,6 +806,7 @@ impl Session<'_> {
         tombstone: bool,
         kind: u32,
         from: Address,
+        version: u64,
     ) -> Result<bool> {
         let hash = index::hash(key);
         let bucket = self.core.index.bucket(hash);
@@ -823,7 +836,6 @@ impl Session<'_> {
                     // is a version and not the record.
                     return Ok(false);
                 }
-                let version = self.core.next_version();
                 let fresh = self.core.log.append(
                     &self.slot,
                     index::address_of(entry),

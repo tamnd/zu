@@ -39,13 +39,32 @@ fn property(i: u32) -> Vec<u8> {
     format!("prop{i:09}").into_bytes()
 }
 
-/// A thousand bytes, the YCSB record size, so the page arithmetic in
-/// these tests matches what the benchmark sees.
+/// About a thousand bytes, the YCSB record size, so the page arithmetic
+/// in these tests matches what the benchmark sees.
+///
+/// The length alternates by round, and that is load bearing rather than
+/// decoration. An update whose value is the same length as the one it
+/// replaces, on a record that is still above the read-only boundary, is
+/// an in-place rewrite that appends nothing. With a constant length the
+/// amount of log these tests produce therefore depends on where the
+/// boundary happens to have got to, which depends on how much has been
+/// appended, which is a feedback loop and moves with how busy the
+/// machine is: the same sixteen rounds gave anywhere from 6 to 19 MiB
+/// under parallel load, and at the bottom of that range there was
+/// nothing below the boundary to compact and the test failed saying
+/// compaction had not worked. Alternating the length means consecutive
+/// rounds can never be in place, so the log is what the record count
+/// says it is on any machine (#435).
 fn value(i: u32, round: u32) -> Vec<u8> {
     let mut v = format!("{i:09}-{round:09}").into_bytes();
-    v.resize(1000, b'x');
+    v.resize(1000 + (round as usize % 2) * 8, b'x');
     v
 }
+
+/// The most a record of ours can take on the log, value plus key plus
+/// header, rounded up. The live set bounds in these tests are written
+/// against it.
+const RECORD: u64 = 1064;
 
 /// Pushes everything appended so far to the device, so the next pass has
 /// a flushed region to work on rather than racing the background thread.
@@ -78,9 +97,20 @@ fn a_rewritten_log_gives_its_blocks_back() {
         "the file should be about as big as the log before compaction: {before} against {written}"
     );
 
+    // The setup, checked rather than assumed. Compaction can only take
+    // pages that are below the read-only boundary, so a log that has not
+    // cleared the mutable window by several pages leaves it nothing to
+    // do and the assertions below would blame the engine for a rewrite
+    // that never happened (#435).
+    let mutable = options().mutable_pages as u64 * (4 << 20);
+    assert!(
+        written > mutable * 4,
+        "the rounds did not produce enough log to compact: {written} against a {mutable} byte window"
+    );
+
     db.compact().expect("compact");
     let after = db.disk_bytes().expect("disk bytes");
-    let live = u64::from(records) * 1040;
+    let live = u64::from(records) * RECORD;
     // What compaction cannot take: the mutable window, which is above the
     // read-only boundary and so out of reach by construction, plus the
     // page the copies landed in. That is the floor, and the live set is
@@ -292,14 +322,14 @@ fn the_background_compactor_runs_under_writers_and_keeps_everything() {
                 .passes
                 .load(std::sync::atomic::Ordering::Relaxed)
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while passes() == 0 && std::time::Instant::now() < deadline {
+        // No deadline. A wall clock bound here is not a test of the
+        // compactor, it is a test of how busy the machine is, and it
+        // failed a third of the time under a parallel hammer for that
+        // reason alone (#435). A thread that never runs hangs the suite,
+        // which says what went wrong far more clearly than a flake does.
+        while passes() == 0 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(
-            passes() > 0,
-            "the background compactor never ran, so this test proved nothing"
-        );
 
         let mut s = db.session();
         let mut out = Vec::new();
@@ -315,6 +345,95 @@ fn the_background_compactor_runs_under_writers_and_keeps_everything() {
     }
 
     let db = Db::open(&path, eager).expect("reopen");
+    let mut s = db.session();
+    let mut out = Vec::new();
+    for i in 0..threads * per_thread {
+        assert!(
+            s.read(&key(i), &mut out).expect("read"),
+            "lost {i} on reopen"
+        );
+        assert_eq!(
+            out,
+            value(i % per_thread, rounds - 1),
+            "wrong value for {i} on reopen"
+        );
+    }
+}
+
+#[test]
+fn a_foreground_pass_beside_writers_survives_a_reopen() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Passes from another thread while sessions write, which is the one
+    // shape the other reopen tests here do not have: they compact after
+    // the writers are done, so no copy of theirs can lose a race. A copy
+    // that does lose one is appended before the compare and swap that
+    // would publish it, so it stays on the log above the record that
+    // beat it with nobody pointing at it, and a replay that ordered the
+    // log by address handed the key back a round behind (#436). The
+    // narrow test for that is in `recover.rs`; this is the workload it
+    // came out of.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("r.zu2");
+    let threads = 4u32;
+    let per_thread = 800u32;
+    let rounds = 6u32;
+    {
+        let db = Arc::new(Db::create(&path, options()).expect("create"));
+        let writing = Arc::new(AtomicBool::new(true));
+        let passes = {
+            let db = Arc::clone(&db);
+            let writing = Arc::clone(&writing);
+            std::thread::spawn(move || {
+                while writing.load(Ordering::Acquire) {
+                    // A pass can only read what is on the device and
+                    // below the read-only boundary, and on a machine
+                    // busy enough that the flusher does not get a turn
+                    // there is nothing there at all. Pushing first is
+                    // what makes the pass have work rather than hoping
+                    // it does (#435).
+                    db.sync().expect("sync");
+                    db.compact().expect("compact");
+                }
+            })
+        };
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                let mut s = db.session();
+                for round in 0..rounds {
+                    for i in 0..per_thread {
+                        let k = key(t * per_thread + i);
+                        s.upsert(&k, &value(i, round)).expect("upsert");
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer");
+        }
+        // The precondition, waited for rather than asserted after the
+        // fact: a run where no pass ever read a byte proves nothing, and
+        // on a loaded machine that is decided by who got the cpu.
+        let scanned = || db.compaction().scanned.load(Ordering::Relaxed);
+        while scanned() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        writing.store(false, Ordering::Release);
+        passes.join().expect("compactor");
+
+        let mut s = db.session();
+        let mut out = Vec::new();
+        for i in 0..threads * per_thread {
+            assert!(s.read(&key(i), &mut out).expect("read"), "lost {i}");
+            assert_eq!(out, value(i % per_thread, rounds - 1), "wrong value for {i}");
+        }
+        flush(&mut s, 5, rounds - 1);
+    }
+
+    let db = Db::open(&path, options()).expect("reopen");
     let mut s = db.session();
     let mut out = Vec::new();
     for i in 0..threads * per_thread {

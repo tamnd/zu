@@ -28,6 +28,15 @@
 //! its entry swings, and every key that was reachable through that entry
 //! stays reachable through the copy.
 //!
+//! A copy carries the version of the record it copies. The alternative,
+//! a fresh version, is what made the log disagree with memory: the copy
+//! is written before the compare and swap that would publish it, so a
+//! copy that loses the race to a concurrent update is left on the log
+//! above the update with nobody pointing at it, and a replay that took
+//! the highest address as the newest version installed the loser. With
+//! the original version on it the replay can order the two records the
+//! way the workload did (#436).
+//!
 //! The region is scanned in address order, so a record that is only
 //! reachable through another record in the same region has already been
 //! copied by the time its chain link is dropped.
@@ -38,6 +47,14 @@
 //! whose add lies above the region is what stops a replay from bringing
 //! a deleted edge back, and it is why removes are the one thing here
 //! that is kept conservatively rather than exactly.
+//!
+//! That question can go stale, and #437 is the open half of #436: an
+//! edge writer puts its record on the log before it touches the
+//! adjacency, so a pass can be told an edge is present, append an add
+//! copy above a remove record that is already down, and leave a replay
+//! that brings the edge back. The version that fixes it for keyed
+//! records does not reach here, because a replay has no per edge
+//! version to compare against.
 
 use crate::addr::{Address, PAGE_SIZE, page_of, page_start};
 use crate::db::Session;
@@ -125,7 +142,7 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
             // offset is 8 byte aligned, so the header words are there.
             // Nothing past the header is touched until the lengths have
             // been checked against what is left of the page.
-            let (size, kind, tombstone) = unsafe {
+            let (size, kind, tombstone, version) = unsafe {
                 let r = RecordRef::new(page.as_ptr().cast::<u8>().add(offset));
                 let key_len = r.key_len();
                 let value_len = r.value_len();
@@ -141,13 +158,13 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
                 key.extend_from_slice(r.key());
                 value.clear();
                 value.extend_from_slice(r.value_unchecked());
-                (size, r.kind(), r.tombstone())
+                (size, r.kind(), r.tombstone(), r.version())
             };
             done.records += 1;
             done.scanned += size as u64;
             let kept = match kind {
                 record::KIND_EDGE => keep_edge(session, &value),
-                _ => session.copy_forward(&key, &value, tombstone, kind, address),
+                _ => session.copy_forward(&key, &value, tombstone, kind, address, version),
             };
             match kept {
                 Ok(true) => {

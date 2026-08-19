@@ -6,6 +6,16 @@
 //! naming the newest record for every key, which is the same state the
 //! writes left it in.
 //!
+//! Address order is not quite commit order, and the difference is
+//! compaction. A copy is appended before the compare and swap that would
+//! publish it, so a copy that loses that race sits on the log above the
+//! record that beat it and belongs to nobody. Installing by address
+//! alone hands such a key back at the value the loser held (#436), so
+//! the scan installs a record only when its version is at least the
+//! version of the record the index already reaches for that key.
+//! Versions are what compaction copies carry from the records they
+//! copy, so the two rules are the same rule.
+//!
 //! The scan stops at the first record whose checksum does not hold, and
 //! that address is the durable prefix. Padding at the end of a page is
 //! zeros, so a scan that finds a zero header there moves to the next
@@ -126,11 +136,17 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address) {
         if index::tag_of(entry) != tag && !index::is_foreign(entry) {
             continue;
         }
-        if chain_holds(core, index::address_of(entry), key) {
-            bucket.slots[i].store(
-                index::entry(tag, address, index::is_foreign(entry)),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        if let Some(installed) = chain_version(core, index::address_of(entry), key) {
+            // Not greater than: a pass that copies a copy leaves two
+            // records carrying the same version, and the higher address
+            // is the one that is still there after the region below it
+            // goes.
+            if header.version() >= installed {
+                bucket.slots[i].store(
+                    index::entry(tag, address, index::is_foreign(entry)),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             return;
         }
     }
@@ -150,26 +166,76 @@ fn install(core: &Core, header: RecordRef<'_>, address: Address) {
     );
 }
 
-/// Whether a chain contains `key`, following the pointers the records
-/// themselves carry. Stops at the log's begin for the same reason the
-/// live path does: below it there is nothing left to find.
-fn chain_holds(core: &Core, mut address: Address, key: &[u8]) -> bool {
+/// The version of the record this chain holds for `key`, or `None` when
+/// it holds none. Follows the pointers the records themselves carry and
+/// stops at the log's begin for the same reason the live path does:
+/// below it there is nothing left to find.
+///
+/// The first match is the answer, because a chain runs newest first.
+fn chain_version(core: &Core, mut address: Address, key: &[u8]) -> Option<u64> {
     let floor = core.log.begin();
     while address >= floor && address != crate::addr::NULL {
         let base = core.log.resident(address);
         if base.is_null() {
-            return false;
+            return None;
         }
         // SAFETY: the whole file was restored into pages before the
         // scan, so any address a record points at is resident.
         let previous = unsafe {
             let r = RecordRef::new(base);
             if r.key() == key {
-                return true;
+                return Some(r.version());
             }
             r.previous()
         };
         address = previous;
     }
-    false
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::addr::NULL;
+    use crate::db::{Db, Options};
+    use crate::record::KIND_VALUE;
+
+    /// The shape a compaction pass leaves on the log when one of its
+    /// copies loses its race: an older version of a key sitting above
+    /// the record that beat it, named by nothing. Memory is right either
+    /// way because the compare and swap failed, so the only way to see
+    /// it is to close and open again, and a replay that went by address
+    /// handed back the value the loser held (#436).
+    ///
+    /// Written by hand rather than raced for, because a race that shows
+    /// up in one run out of three is a test that passes for the wrong
+    /// reason the other two.
+    #[test]
+    fn a_replay_takes_the_newest_version_and_not_the_highest_address() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.zu2");
+        {
+            let db = Db::create(&path, Options::default()).expect("create");
+            let mut s = db.session();
+            s.upsert(b"k", b"old").expect("first");
+            s.upsert(b"k", b"new").expect("second");
+            s.slot.protect();
+            let orphan = s
+                .core
+                .log
+                .append(&s.slot, NULL, 1, b"k", b"old", false, KIND_VALUE);
+            s.slot.unprotect();
+            orphan.expect("orphan");
+            db.sync().expect("sync");
+        }
+
+        let db = Db::open(&path, Options::default()).expect("reopen");
+        let mut s = db.session();
+        let mut out = Vec::new();
+        assert!(s.read(b"k", &mut out).expect("read"), "the key is gone");
+        assert_eq!(
+            out,
+            b"new".to_vec(),
+            "the replay took the copy that lost its race"
+        );
+    }
 }

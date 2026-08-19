@@ -166,6 +166,7 @@ impl SnapshotCache {
             if let Some(reader) = reader {
                 reader.set_patch(patches.cells.get(table).cloned());
                 reader.set_added(patches.rows.get(table).cloned());
+                reader.set_marks(patches.marks.get(table).cloned());
             }
         }
         for (rel, reader) in &mut self.readers {
@@ -248,10 +249,12 @@ impl<'a> Zu1Snapshot<'a> {
         }
         let patch = self.patches.cells.get(&table).cloned();
         let added = self.patches.rows.get(&table).cloned();
+        let marks = self.patches.marks.get(&table).cloned();
         let reader = load_props(&mut self.db, table)?.map(|directory| {
             let mut reader = PropsReader::new(directory);
             reader.set_patch(patch);
             reader.set_added(added);
+            reader.set_marks(marks);
             reader
         });
         self.props.insert(table, reader);

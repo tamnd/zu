@@ -345,6 +345,7 @@ impl<'a> Zu1Graph<'a> {
             if let Some(reader) = reader {
                 reader.set_patch(patches.cells.get(table).cloned());
                 reader.set_added(patches.rows.get(table).cloned());
+                reader.set_marks(patches.marks.get(table).cloned());
             }
         }
         for (rel, reader) in &mut self.readers {
@@ -366,6 +367,7 @@ impl<'a> Zu1Graph<'a> {
             let mut reader = PropsReader::new(directory);
             reader.set_patch(self.patches.cells.get(&table).cloned());
             reader.set_added(self.patches.rows.get(&table).cloned());
+            reader.set_marks(self.patches.marks.get(&table).cloned());
             reader
         });
         self.props.insert(table, reader);

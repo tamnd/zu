@@ -52,12 +52,13 @@ use zu_common::{Epoch, Result, ZuError};
 
 use crate::append::sidecar;
 use crate::deleted::Tombstones;
-use crate::zu1::catalog::Catalog;
+use crate::zu1::catalog::{Catalog, ElementKind};
 use crate::zu1::file::Zu1File;
 use crate::zu1::fold::{checkpoint_fold, recover, staged_fold};
 use crate::zu1::graph::{Direction, EdgePatch, GraphReader};
 use crate::zu1::props::{
-    CellPatch, PropColumn, PropsDirectory, RowPatch, load_props, load_rel_props,
+    CellPatch, LabelPatch, PropColumn, PropsDirectory, RowPatch, load_props, load_rel_props,
+    stored_label_word,
 };
 use crate::zu1::txn::{Cell, Deferred, Mvcc, WriteTxn};
 use crate::zu1::wal::{Commits, Wal};
@@ -103,13 +104,14 @@ const DEFERRED_BYTES: usize = 256 * 1024;
 /// Everything the commits since the last fold left for the readers to
 /// read through, which is what makes a deferred commit visible.
 ///
-/// Four shapes, because there are four ways a change can sit above a
+/// Five shapes, because there are five ways a change can sit above a
 /// column nobody has rewritten: a new value for a row the column
 /// already holds, a whole new row past the end of it, an edge added or
 /// taken away, which is a pair the adjacency reader merges into or out
 /// of two lists and, where it was added, a row of the rel table's
-/// property columns, and a row taken away, which is an offset every
-/// read of the table filters by.
+/// property columns, a row taken away, which is an offset every read of
+/// the table filters by, and a label change, which is a word the reader
+/// answers with in place of the bitset's.
 #[derive(Debug, Default)]
 pub struct Patches {
     /// New values, by table.
@@ -127,6 +129,10 @@ pub struct Patches {
     /// the table's tombstone chain, so what the patch carries is what
     /// the chain would have held.
     pub gone: Tombstones,
+    /// The labels rows are left carrying, by table. A label is not a
+    /// column, so there is no cell to lay a value over: what is kept is
+    /// the whole word, composed where the commit was taken.
+    pub marks: HashMap<u32, Arc<LabelPatch>>,
 }
 
 impl Patches {
@@ -139,6 +145,7 @@ impl Patches {
             && self.rows.is_empty()
             && self.edges.is_empty()
             && self.gone.is_empty()
+            && self.marks.is_empty()
     }
 
     /// How many cells everything in here holds between them, which is
@@ -152,6 +159,7 @@ impl Patches {
                 .map(|p| (p.adds() + p.removed()) as usize)
                 .sum::<usize>()
             + self.gone.values().map(|rows| rows.len()).sum::<usize>()
+            + self.marks.values().map(|p| p.len()).sum::<usize>()
     }
 
     /// How many rows a commit has added to `table` and not folded,
@@ -236,6 +244,10 @@ pub struct Writer {
     added: HashMap<u32, RowPatch>,
     /// The edges they added, by rel table, the same way.
     fresh: HashMap<u32, EdgePatch>,
+    /// The labels they left on rows, by table, again the same way. A
+    /// row named twice is in here once, carrying what the later of the
+    /// two commits left it with.
+    marks: HashMap<u32, LabelPatch>,
     /// The rows they took away, by table. A set, because a row can be
     /// deleted twice and the second one takes nothing away, and sorted
     /// because that is the order the readers merge it in.
@@ -296,6 +308,7 @@ impl Writer {
             deferred: 0,
             added: HashMap::new(),
             fresh: HashMap::new(),
+            marks: HashMap::new(),
             graves: HashMap::new(),
             readers: HashMap::new(),
             catalog: None,
@@ -446,6 +459,9 @@ impl Writer {
                 _ => None,
             })
             .collect();
+        // The words this commit has left on rows so far, by table and
+        // offset, for the same reason.
+        let mut staged: HashMap<(u32, u64), u64> = HashMap::new();
         let mut taken = Vec::with_capacity(changes.len());
         for change in changes {
             match change {
@@ -488,6 +504,18 @@ impl Writer {
                     }
                     taken.push(change);
                 }
+                Deferred::Labels(table, row, add, remove) => {
+                    let Some(word) = self.marked(db, table, row, add, remove, &staged)? else {
+                        return Ok(None);
+                    };
+                    // Two changes of one commit can name one row, and
+                    // the second of them goes over what the first left
+                    // rather than over what the file holds.
+                    staged.insert((table, row), word);
+                    taken.push(Deferred::Marks(table, row, word));
+                }
+                // The composing is here, so nothing else makes one.
+                Deferred::Marks(..) => unreachable!("composed where the commit was taken"),
             }
         }
         Ok(Some(taken))
@@ -803,8 +831,85 @@ impl Writer {
             Direction::Fwd => (node, other),
             Direction::Bwd => (other, node),
         };
-        self.fresh.get(&rel).is_some_and(|patch| patch.drops(node, other, dir))
+        self.fresh
+            .get(&rel)
+            .is_some_and(|patch| patch.drops(node, other, dir))
             || dying.contains(&(rel, src, dst))
+    }
+
+    /// The labels row `offset` of `table` is left carrying, and `None`
+    /// when the change has to be folded instead.
+    ///
+    /// A change is a pair of masks and what a reader wants is a word,
+    /// so the word the row had is read and the masks go over it: out of
+    /// this run's patch when a commit has already left one there, off
+    /// the bitset when the file has one, and out of the catalog when
+    /// neither does, a row nobody has renamed carrying the name of its
+    /// own table and nothing else. That is the word a fold would have
+    /// started from as well.
+    ///
+    /// The rules a change has to keep are the fold's, and they are
+    /// asked here in the same order, because what this does with a
+    /// change that breaks one is refuse to defer it. The fold then
+    /// raises where it always raised, and there is one place saying
+    /// what a label change may do rather than two.
+    ///
+    /// A table that stores nothing has no props directory to hang a
+    /// bitset off, and the fold makes one for the first change that
+    /// lands on it, so that one folds.
+    fn marked(
+        &mut self,
+        db: &mut Zu1File,
+        table: u32,
+        offset: u64,
+        add: u64,
+        remove: u64,
+        staged: &HashMap<(u32, u64), u64>,
+    ) -> Result<Option<u64>> {
+        if self.catalog.is_none() {
+            self.catalog = Some(Catalog::load(db)?);
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.dirs.entry(table) {
+            slot.insert(load_props(db, table)?);
+        }
+        let catalog = self.catalog.as_ref().expect("just loaded");
+        let Some(node) = catalog.node_by_id(table) else {
+            return Ok(None);
+        };
+        let primary = 1u64 << node.primary_label();
+        // What the table has declared its rows may be called, which is
+        // what bounds a change, and its own name, which is the one
+        // label a row of it cannot be rid of.
+        if add & !node.label_mask() != 0 || remove & primary != 0 {
+            return Ok(None);
+        }
+        let graph = node.graph;
+        let Some(directory) = self.dirs[&table].as_ref() else {
+            return Ok(None);
+        };
+        let rows = directory.node_count + self.added.get(&table).map_or(0, |p| p.len() as u64);
+        if offset >= rows {
+            return Ok(None);
+        }
+        let held = match staged
+            .get(&(table, offset))
+            .copied()
+            .or_else(|| self.marks.get(&table).and_then(|marks| marks.get(offset)))
+        {
+            Some(word) => word,
+            None => stored_label_word(db, directory, offset)?.unwrap_or(primary),
+        };
+        let after = (held | add) & !remove;
+        // A closed graph type is a promise about every element the
+        // graph holds, so it is asked about the word the row ends with,
+        // which is this one. An element that would fall out of every
+        // element type of it is the fold's refusal to raise.
+        if let Some(ty) = catalog.closed_type_of(graph)
+            && ty.holder(ElementKind::Node, after).is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(after))
     }
 
     /// Adds a deferred commit's cells to the patch and republishes it.
@@ -817,6 +922,7 @@ impl Writer {
         let mut rels: Vec<u32> = Vec::new();
         let mut graves: Vec<u32> = Vec::new();
         let mut grown: Vec<u32> = Vec::new();
+        let mut marked: Vec<u32> = Vec::new();
         for change in changes {
             match change {
                 Deferred::Cell((table, row, col, value)) => {
@@ -874,6 +980,15 @@ impl Writer {
                         grown.push(table);
                     }
                 }
+                Deferred::Marks(table, row, word) => {
+                    self.marks.entry(table).or_default().set(row, word);
+                    if !marked.contains(&table) {
+                        marked.push(table);
+                    }
+                }
+                // [`Self::defers`] reads the word the row had and puts
+                // the masks over it, so what reaches here is the answer.
+                Deferred::Labels(..) => unreachable!("composed where the commit was taken"),
                 // [`Self::defers`] answers with the ordinals a pair
                 // holds, so what reaches here names a row of its own.
                 Deferred::RelCell(..) => unreachable!("resolved where the commit was taken"),
@@ -884,6 +999,7 @@ impl Writer {
             rows: self.patches.rows.clone(),
             edges: self.patches.edges.clone(),
             gone: self.patches.gone.clone(),
+            marks: self.patches.marks.clone(),
         };
         for table in cells {
             let words = self.pending.get(&table).map_or_else(BTreeMap::new, |cols| {
@@ -917,6 +1033,11 @@ impl Writer {
             patches
                 .rows
                 .insert(table, Arc::new(self.added[&table].clone()));
+        }
+        for table in marked {
+            patches
+                .marks
+                .insert(table, Arc::new(self.marks[&table].clone()));
         }
         self.patches = Arc::new(patches);
         self.deferred += 1;
@@ -992,6 +1113,7 @@ impl Writer {
             self.strings.clear();
             self.added.clear();
             self.fresh.clear();
+            self.marks.clear();
             self.graves.clear();
             self.patches = Arc::new(Patches::new());
         }
@@ -2710,5 +2832,145 @@ mod tests {
         session.run("ROLLBACK", &[]).expect("roll back");
         assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay"]);
         assert_eq!(hops(&mut session), 3);
+    }
+
+    /// The rows a pattern finds by a label it was given without a fold,
+    /// which is the label change read out of the patch.
+    fn bots(session: &mut Session) -> Vec<String> {
+        let out = session
+            .run("MATCH (p:Bot) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read the bots");
+        out.rows.iter().map(|row| string(row, 0)).collect()
+    }
+
+    /// A label put on a row is read out of the patch: the pattern that
+    /// names it finds the row, the rows it did not name are not found,
+    /// and the properties of all of them are where they were.
+    ///
+    /// The first change is not the one this is about. A table that has
+    /// never been named a label has no bitset and has declared no bit,
+    /// so the first one widens the catalog and makes the bitset, and
+    /// both of those are folds. What is measured here is the second.
+    #[test]
+    fn a_label_put_on_a_row_needs_no_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("label-set.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Bot", &[])
+            .expect("declare the label and make the bitset");
+        let before = session.epoch();
+
+        session
+            .run("MATCH (p:person) WHERE p.name = 'joe' SET p:Bot", &[])
+            .expect("put it on a second row");
+        assert_eq!(session.epoch(), before, "a label set folded");
+        assert_eq!(bots(&mut session), ["ada", "joe"]);
+
+        // A label is a bit beside the row rather than anything in a
+        // column, so nothing a column holds moved.
+        assert_eq!(ages(&mut session), [10, 20, 30, 40]);
+        assert_eq!(names(&mut session), ["ada", "amy", "joe", "kay"]);
+
+        // And off again, over the word the patch is already carrying,
+        // which is the half of it a second read of the file would get
+        // wrong.
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' REMOVE p:Bot", &[])
+            .expect("take it off again");
+        assert_eq!(session.epoch(), before, "a label remove folded");
+        assert_eq!(bots(&mut session), ["joe"]);
+
+        // What the patch answered, the bitset answers on its own.
+        session.file_mut().expect("fold");
+        assert_eq!(bots(&mut session), ["joe"]);
+        assert!(session.epoch() > before, "a fold published no epoch");
+    }
+
+    /// Two labels of one row, put on by two statements, both land: the
+    /// second composes over the word the first left rather than over
+    /// the word the bitset holds.
+    #[test]
+    fn a_second_label_on_one_row_goes_over_the_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("label-two.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Bot", &[])
+            .expect("the first label of the table");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Admin", &[])
+            .expect("the second, which the catalog widens for");
+        let before = session.epoch();
+
+        session
+            .run("MATCH (p:person) WHERE p.name = 'kay' SET p:Bot", &[])
+            .expect("one label on another row");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'kay' SET p:Admin", &[])
+            .expect("and the other on the same row");
+        assert_eq!(session.epoch(), before, "a label set folded");
+
+        assert_eq!(bots(&mut session), ["ada", "kay"]);
+        let admins = session
+            .run("MATCH (p:Admin) RETURN p.name AS name ORDER BY name", &[])
+            .expect("read the admins");
+        assert_eq!(
+            admins
+                .rows
+                .iter()
+                .map(|row| string(row, 0))
+                .collect::<Vec<_>>(),
+            ["ada", "kay"],
+            "the second label did not take the first off"
+        );
+    }
+
+    /// A label change is in the log before it is in the patch, so a
+    /// crash before the fold brings it back with everything else.
+    #[test]
+    fn a_label_change_survives_a_crash_before_the_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crash-label.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Bot", &[])
+            .expect("declare the label");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'joe' SET p:Bot", &[])
+            .expect("the one that is only in the patch");
+        std::mem::forget(session);
+        crate::shared::forget(&path);
+
+        let mut session = Session::open(&path).expect("reopen");
+        assert_eq!(bots(&mut session), ["ada", "joe"]);
+    }
+
+    /// And one inside a transaction that rolls back goes away, which is
+    /// the word the patch was carrying being dropped with the epoch.
+    #[test]
+    fn a_rolled_back_label_change_goes_away() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rollback-label.zu1");
+        seeded(&path);
+
+        let mut session = Session::open(&path).expect("open");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'ada' SET p:Bot", &[])
+            .expect("declare the label");
+
+        session.run("START TRANSACTION", &[]).expect("start");
+        session
+            .run("MATCH (p:person) WHERE p.name = 'kay' SET p:Bot", &[])
+            .expect("a second bot");
+        assert_eq!(bots(&mut session), ["ada", "kay"]);
+        session.run("ROLLBACK", &[]).expect("roll back");
+        assert_eq!(bots(&mut session), ["ada"]);
     }
 }

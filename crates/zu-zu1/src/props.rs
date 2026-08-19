@@ -41,7 +41,7 @@ use crate::fullzip::{read_blob_range, write_blob_segment};
 use crate::meta;
 use crate::segment::{
     CHUNK_ROWS, ChunkCache, ChunkDirectory, SegmentMeta, cached_chunk, chunk_zone, decode_chunk,
-    load_chunk_directory_pooled, read_one_cached, write_segment,
+    load_chunk_directory_pooled, read_one_cached, read_range, write_segment,
 };
 use crate::stats;
 use crate::txn::Cell;
@@ -1368,6 +1368,30 @@ pub fn load_props(db: &mut Zu1File, table_id: u32) -> Result<Option<PropsDirecto
     Ok(Some(PropsDirectory::decode(&meta::read_chain(db, root)?)?))
 }
 
+/// The label word row `row` carries in a stored bitset, `None` when the
+/// table stores none or the row is past the end of it, which is a row
+/// carrying its table's own label and nothing else.
+///
+/// This is [`PropsReader::label_word`] for a caller holding a directory
+/// rather than a reader, which is the write side: it asks once per
+/// statement, to put a change's masks over the word the row had, so
+/// there is nothing for a cache to save.
+pub fn stored_label_word(
+    db: &mut Zu1File,
+    directory: &PropsDirectory,
+    row: u64,
+) -> Result<Option<u64>> {
+    let Some(meta) = &directory.labels else {
+        return Ok(None);
+    };
+    if row >= directory.node_count {
+        return Ok(None);
+    }
+    let mut word = Vec::with_capacity(1);
+    read_range(db, meta, row, row + 1, &mut word)?;
+    Ok(word.first().copied())
+}
+
 /// One decoded FullZip chunk of a string column: the values of rows
 /// `chunk * CHUNK_ROWS` onward concatenated in `bytes`, row `i` of the
 /// chunk ending at `ends[i]`.
@@ -1391,8 +1415,8 @@ struct StrChunk {
 ///
 /// A value goes over the value the row already holds, so what is
 /// refused is the write that has nowhere to go over: a value taken
-/// away, which lives in the validity mask, and a label, which lives in
-/// a bitset of its own. Both fold the way they always did.
+/// away, which lives in the validity mask. It folds the way it always
+/// did. A label has a bitset of its own and [`LabelPatch`] carries it.
 #[derive(Debug, Default, Clone)]
 pub struct CellPatch {
     /// Row and new word, ascending by row, for each lane column the
@@ -1489,6 +1513,46 @@ impl CellPatch {
             max = max.max(value);
         }
         (min, max)
+    }
+}
+
+/// The labels a commit put on rows that no fold has written into the
+/// bitset yet.
+///
+/// A label change is written as a pair of masks, the bits to put on a
+/// row and the bits to take off it, because two statements can name two
+/// labels of one row and both have to land. What a reader wants is the
+/// word, so the composing is done once, on the way in: the writer reads
+/// the word the row carried, puts the masks over it, and what is kept
+/// here is the answer. That also puts the rules a change has to keep,
+/// which is the fold's business, where the row it lands on is known.
+#[derive(Debug, Default, Clone)]
+pub struct LabelPatch {
+    /// Row and the word it is left carrying, ascending by row.
+    words: BTreeMap<u64, u64>,
+}
+
+impl LabelPatch {
+    /// The word `row` carries, `None` when no commit has named it and
+    /// the bitset underneath is the whole answer.
+    pub fn get(&self, row: u64) -> Option<u64> {
+        self.words.get(&row).copied()
+    }
+
+    /// Puts `word` on `row`, which is what the row carries from here
+    /// until a fold seals it.
+    pub fn set(&mut self, row: u64, word: u64) {
+        self.words.insert(row, word);
+    }
+
+    /// How many rows this names, which is what a writer bounds when it
+    /// decides whether to keep deferring the fold.
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
     }
 }
 
@@ -1656,6 +1720,9 @@ pub struct PropsReader {
     patch: Option<Arc<CellPatch>>,
     /// Committed rows they do not hold yet, the same way.
     added: Option<Arc<RowPatch>>,
+    /// Committed label words the bitset does not hold yet, again the
+    /// same way.
+    marks: Option<Arc<LabelPatch>>,
 }
 
 impl PropsReader {
@@ -1669,6 +1736,7 @@ impl PropsReader {
             order_scratch: Vec::new(),
             patch: None,
             added: None,
+            marks: None,
         }
     }
 
@@ -1681,6 +1749,11 @@ impl PropsReader {
     /// The same for the committed rows past the end of them.
     pub fn set_added(&mut self, added: Option<Arc<RowPatch>>) {
         self.added = added.filter(|p| !p.is_empty());
+    }
+
+    /// And for the labels the bitset does not carry yet.
+    pub fn set_marks(&mut self, marks: Option<Arc<LabelPatch>>) {
+        self.marks = marks.filter(|p| !p.is_empty());
     }
 
     /// Whether row `row` of `col` holds a value.
@@ -1710,13 +1783,18 @@ impl PropsReader {
     /// else. The bits are dictionary positions, so a caller tests a
     /// pattern's mask against the word with one AND.
     pub fn label_word(&mut self, db: &mut Zu1File, row: u64) -> Result<Option<u64>> {
+        // The patch is asked first and answers whole: what a commit
+        // left on a row is the labels it carries, bitset or no bitset,
+        // because the writer composed it against what the row had.
+        if let Some(word) = self.marks.as_ref().and_then(|marks| marks.get(row)) {
+            return Ok(Some(word));
+        }
         let Some(meta) = self.directory.labels.clone() else {
             return Ok(None);
         };
         // A row the bitset does not reach carries its table's own label
         // and nothing else, which is what the caller answers when there
-        // is no word here. A statement that puts another label on a row
-        // writes one the patch does not carry, and folds.
+        // is no word here.
         if row >= self.stored() {
             return Ok(None);
         }
@@ -1729,10 +1807,13 @@ impl PropsReader {
         Ok(Some(read_one_cached(db, &meta, dir, cache, row)?))
     }
 
-    /// Whether the table stores a label bitset at all, which is what
-    /// says whether a scan has a word to read per row.
+    /// Whether the table has a label bitset at all, which is what says
+    /// whether a scan has a word to read per row. A commit that has not
+    /// folded counts: its words are labels the rows carry, and the
+    /// first of them on a table that stored none is the reason the
+    /// bitset is about to exist.
     pub fn has_labels(&self) -> bool {
-        self.directory.labels.is_some()
+        self.directory.labels.is_some() || self.marks.is_some()
     }
 
     /// Whether `col` has a null in it anywhere, which is what says

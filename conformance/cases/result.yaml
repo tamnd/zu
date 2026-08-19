@@ -550,6 +550,48 @@ cases:
           - type: STRING
             value: cy
 
+  - name: a-page-is-a-statement-of-its-own
+    doc: ISO 14.9 makes the order by and page a statement that stands where a statement stands, so the words in front of a RETURN page the rows the match found rather than the columns the projection made.
+    query: MATCH (n:person) ORDER BY n.name LIMIT 2 RETURN n.name AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: a-page-of-its-own-sorts-by-what-is-bound
+    doc: The statement runs before the projection, so its keys are whatever the clauses in front of it bound and not only what the answer carries.
+    query: MATCH (n:person) ORDER BY n.age DESC, n.name LIMIT 1 RETURN n.name AS a
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: cy
+
+  - name: a-limit-alone-is-a-statement
+    doc: Each of the three parts stands alone in the standard's grammar, so a LIMIT with no ORDER BY in front of it is a whole statement.
+    query: MATCH (n:person) ORDER BY n.name RETURN n.name AS a LIMIT 2
+    columns:
+      - a
+    rows:
+      - values:
+          - type: STRING
+            value: ann
+      - values:
+          - type: STRING
+            value: bo
+
+  - name: finish-answers-no-columns
+    doc: FINISH is the other way a query ends (ISO 14.10). It says the query has no result, which is not the same as a result with no rows in it, so the answer carries no columns at all.
+    query: MATCH (n:person) FINISH
+    columns:
+    rows:
+
   - name: paging-an-aggregate
     doc: A limit over grouped rows counts groups and not the rows they came from, which is the number a client showing a summary page needs.
     query: MATCH (n:person) RETURN n.age AS a, count(*) AS b ORDER BY a LIMIT 2

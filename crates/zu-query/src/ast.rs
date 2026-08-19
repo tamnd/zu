@@ -447,6 +447,34 @@ pub enum Clause {
         projection: Projection,
         filter: Option<Expr>,
     },
+    /// `ORDER BY p.age SKIP 1 LIMIT 3` standing where a statement
+    /// stands, the order by and page statement of ISO 14.9.
+    ///
+    /// It is the tail of a projection with no projection in front of
+    /// it, and it says what a reader means: sort what is in hand, then
+    /// take a page of it, and leave the columns alone. The same words
+    /// written after a `RETURN` belong to that projection and are on
+    /// [`Projection`], because there they say what the answer looks
+    /// like; here they say what the rows going into the next statement
+    /// are.
+    ///
+    /// All three parts are optional and at least one of them was
+    /// written, since `ORDER BY` alone, `SKIP` alone and `LIMIT` alone
+    /// are each a whole statement in the standard's grammar.
+    Order {
+        keys: Vec<SortKey<Expr>>,
+        skip: Option<Expr>,
+        limit: Option<Expr>,
+    },
+    /// `FINISH`, the primitive result statement of ISO 14.10 that
+    /// says the query has no result.
+    ///
+    /// It is the last clause of the last statement, which the parser
+    /// makes sure of: nothing may follow it and nothing may read from
+    /// it. It is a clause here rather than another kind of result
+    /// because what it does is end the statement, and the result it
+    /// leaves is a table with no columns and no rows.
+    Finish,
 }
 
 /// One item of a `DELETE`, which ISO writes as a value expression and

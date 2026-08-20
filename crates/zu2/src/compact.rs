@@ -16,7 +16,7 @@
 //! replaced, and it goes. No mark phase, no reference counts, no second
 //! index: the index that answers reads answers this too.
 //!
-//! Three things make it safe to then declare the whole region gone.
+//! Four things make it safe to then declare the whole region gone.
 //!
 //! A chain only ever points backwards, so the path from an index entry
 //! to a live record above the region never dips below it. That is what
@@ -48,13 +48,19 @@
 //! a deleted edge back, and it is why removes are the one thing here
 //! that is kept conservatively rather than exactly.
 //!
-//! That question can go stale, and #437 is the open half of #436: an
-//! edge writer puts its record on the log before it touches the
-//! adjacency, so a pass can be told an edge is present, append an add
-//! copy above a remove record that is already down, and leave a replay
-//! that brings the edge back. The version that fixes it for keyed
-//! records does not reach here, because a replay has no per edge
-//! version to compare against.
+//! That question can go stale, which was #437. An edge writer puts its
+//! record on the log before it touches the adjacency, because an edge in
+//! memory that is not on the log would be a lost write, so a pass
+//! reading between the two halves is told an edge is present, appends an
+//! add copy above a remove record that is already down, and leaves a
+//! replay that brings the edge back. The version rule that fixes it for
+//! keyed records does not reach here, because a replay has no per edge
+//! version to compare against and building one would need a map the size
+//! of the edge set on a path whose point is that it carries no state.
+//! What fixes it instead is closing the window: the writer holds
+//! [`crate::graph::Graph::order_edges`] across its append and its apply,
+//! the pass holds the same one across its question and its copy, and
+//! neither can see the other half done.
 
 use crate::addr::{Address, PAGE_SIZE, page_of, page_start};
 use crate::db::Session;
@@ -201,10 +207,16 @@ pub fn compact(session: &mut Session<'_>, upto: Address) -> Result<Compacted> {
 /// does not, because the add it cancels may sit above this region and a
 /// replay without the remove would bring the edge back. That keeps a few
 /// removes longer than strictly needed, which is the safe direction.
+///
+/// The question and the copy are one step, under the same order an edge
+/// writer takes, because an answer read between a writer's append and
+/// its apply is an answer that is already wrong. #437 has what that
+/// costs when the two are apart.
 fn keep_edge(session: &mut Session<'_>, payload: &[u8]) -> Result<bool> {
     let Some((add, src, dst)) = graph::decode_edge(payload) else {
         return Ok(false);
     };
+    let _order = session.core.graph().order_edges(src);
     let present = session.neighbours(Direction::Out, src, |n| n.binary_search(&dst).is_ok());
     if present != add {
         return Ok(false);
@@ -224,4 +236,103 @@ pub fn slice(session: &Session<'_>) -> Address {
     let ceiling = ceiling(session);
     let quarter = begin + ceiling.saturating_sub(begin) / 4;
     page_start(page_of(quarter)).max(page_start(page_of(begin) + 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::addr::PAGE_SIZE;
+    use crate::db::{Db, Options};
+    use crate::graph::{Direction, encode_edge};
+    use crate::log::Durability;
+    use crate::record::KIND_EDGE;
+
+    /// A pass cannot be told an edge is present by an adjacency that a
+    /// writer has already superseded on the log (#437).
+    ///
+    /// The window this is about is one instruction wide in a real run,
+    /// so the test builds it rather than racing for it. It puts a remove
+    /// record on the log by hand, leaves the adjacency alone, and only
+    /// then lets a pass look, which is exactly the state an edge writer
+    /// is in between its append and its apply. Without the order the two
+    /// of them share, the pass reads the adjacency, is told the edge is
+    /// there, copies the add above the remove, and the reopened graph
+    /// has an edge the writers deleted.
+    ///
+    /// The sleep is not what makes it correct, only what makes it
+    /// discriminating: with the order in place the answer is right
+    /// whether the pass arrives during the window or after it, and
+    /// without it the pass has to arrive during the window to be wrong.
+    #[test]
+    fn a_pass_cannot_copy_an_edge_a_writer_has_already_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("e.zu2");
+        let options = Options {
+            durability: Durability::Async,
+            index_buckets: 1 << 14,
+            max_pages: 64,
+            max_nodes: 1 << 10,
+            compact_below: 0,
+            // One page rather than four, so the edge record below is out
+            // of the mutable window and a pass is allowed to reach it.
+            mutable_pages: 1,
+            ..Options::default()
+        };
+        {
+            let db = Db::create(&path, options).expect("create");
+            let mut s = db.session();
+            for i in 0..4u32 {
+                s.add_node(format!("n{i}").as_bytes()).expect("node");
+            }
+            // The record the pass will have to make its mind up about,
+            // in the first page and nowhere near the tail by the end.
+            s.add_edge(0, 1).expect("edge");
+            // Five pages of ordinary records above it, so the first page
+            // is both flushed and below the read-only boundary.
+            for i in 0..20_000u32 {
+                s.upsert(format!("k{i:09}").as_bytes(), &vec![b'x'; 1000])
+                    .expect("fill");
+            }
+            s.set_durability(Durability::Durable);
+            s.upsert(b"flush", b"x").expect("flush");
+            s.set_durability(Durability::Async);
+
+            let core = db.core().clone();
+            let mut writer = db.session();
+            // Half an edge writer: the remove is on the log and the
+            // adjacency has not heard about it yet.
+            let order = core.graph().order_edges(0);
+            writer.slot.protect();
+            writer
+                .append_untracked(KIND_EDGE, &encode_edge(false, 0, 1))
+                .expect("remove record");
+            writer.slot.unprotect();
+
+            std::thread::scope(|scope| {
+                let pass = scope.spawn(|| db.compact().expect("compact"));
+                std::thread::sleep(Duration::from_millis(200));
+                // The other half of the writer, and then the pass is
+                // free to look.
+                core.graph()
+                    .apply(core.epochs(), false, 0, 1)
+                    .expect("apply");
+                drop(order);
+                pass.join().expect("pass");
+            });
+            assert!(
+                db.core().log.begin() >= PAGE_SIZE as u64,
+                "the pass never reached the page the edge record is in"
+            );
+            db.sync().expect("sync");
+        }
+
+        let db = Db::open(&path, options).expect("reopen");
+        let mut s = db.session();
+        let out = s.neighbours(Direction::Out, 0, |n| n.to_vec());
+        assert!(
+            !out.contains(&1),
+            "the removed edge came back, so the pass copied an add above the remove"
+        );
+    }
 }

@@ -428,7 +428,11 @@ fn a_foreground_pass_beside_writers_survives_a_reopen() {
         let mut out = Vec::new();
         for i in 0..threads * per_thread {
             assert!(s.read(&key(i), &mut out).expect("read"), "lost {i}");
-            assert_eq!(out, value(i % per_thread, rounds - 1), "wrong value for {i}");
+            assert_eq!(
+                out,
+                value(i % per_thread, rounds - 1),
+                "wrong value for {i}"
+            );
         }
         flush(&mut s, 5, rounds - 1);
     }

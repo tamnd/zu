@@ -67,6 +67,14 @@ pub const INLINE_DEGREE: usize = 10;
 /// large the graph gets and no reader ever sees a table being resized.
 const CHUNK: usize = 1 << 14;
 
+/// How many locks order the edge records of a node.
+///
+/// One per node would be a lock per node in a table meant to be one
+/// cacheline an entry, and one for the whole graph would put every edge
+/// writer in the same queue. A thousand of them makes a collision
+/// between two writers on unrelated nodes rare and costs 32 KiB once.
+const EDGE_STRIPES: usize = 1024;
+
 /// The payload of an edge record: one operation byte and two ids.
 const EDGE_PAYLOAD: usize = 9;
 
@@ -276,6 +284,7 @@ pub struct Graph {
     out: Table,
     inward: Table,
     next: AtomicU32,
+    stripes: Box<[Mutex<()>]>,
 }
 
 impl Graph {
@@ -284,7 +293,33 @@ impl Graph {
             out: Table::new(max_nodes),
             inward: Table::new(max_nodes),
             next: AtomicU32::new(0),
+            stripes: (0..EDGE_STRIPES).map(|_| Mutex::new(())).collect(),
         }
+    }
+
+    /// Orders the log records of the edges out of `src` against the
+    /// adjacency they are applied to.
+    ///
+    /// An edge writer holds this across appending its record and
+    /// applying it, and a compaction pass holds it across asking the
+    /// adjacency about an edge and appending its copy. Neither can do
+    /// its half atomically without it. A pass reading between a
+    /// writer's append and its apply is told the old answer and puts a
+    /// copy of it on the log above the record that supersedes it, and a
+    /// replay then hands back the state the pass saw rather than the one
+    /// the writers agreed on. That was #437. Two writers on the same
+    /// edge have the same problem in a smaller way: without an order
+    /// they can append in one order and apply in the other, and memory
+    /// and the log disagree from then on.
+    ///
+    /// It is deliberately not the entry lock from [`Neighbourhood`].
+    /// That one is a spinlock every reader of the node takes, and
+    /// holding it across a log append would stall readers of a hub for
+    /// as long as an append takes. Readers never come here.
+    pub(crate) fn order_edges(&self, src: u32) -> std::sync::MutexGuard<'_, ()> {
+        // Dense ids, so the low bits are already spread.
+        let stripe = src as usize & (EDGE_STRIPES - 1);
+        self.stripes[stripe].lock().expect("zu2 edge order")
     }
 
     fn table(&self, direction: Direction) -> &Table {
@@ -514,6 +549,11 @@ impl Session<'_> {
     }
 
     fn edge(&mut self, add: bool, src: u32, dst: u32) -> Result<()> {
+        let core = self.core;
+        // Before the epoch is announced, so a thread waiting here is not
+        // a thread a flush is waiting for, and dropped before the commit
+        // so that the device is never waited on under it.
+        let order = core.graph().order_edges(src);
         // Inside the epoch, and this is not optional. The flusher decides
         // that a page is complete by publishing its target and waiting
         // for every announced session to leave, so an append that
@@ -535,6 +575,7 @@ impl Session<'_> {
             Ok(end)
         })();
         self.slot.unprotect();
+        drop(order);
         self.make_durable(outcome?)
     }
 
@@ -619,7 +660,7 @@ impl Session<'_> {
 }
 
 /// The bytes an edge change is logged as.
-fn encode_edge(add: bool, src: u32, dst: u32) -> [u8; EDGE_PAYLOAD] {
+pub(crate) fn encode_edge(add: bool, src: u32, dst: u32) -> [u8; EDGE_PAYLOAD] {
     let mut payload = [0u8; EDGE_PAYLOAD];
     payload[0] = u8::from(add);
     payload[1..5].copy_from_slice(&src.to_le_bytes());

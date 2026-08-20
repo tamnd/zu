@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use zu_common::unicode::NormalForm;
 use zu_common::{Result, ZuError};
 
 use crate::arena::MorselArena;
@@ -15,7 +16,7 @@ use crate::bitmap::Bitmap;
 use crate::chunk::DataChunk;
 use crate::kernels::{
     BinOp, CmpOp, MathOp, MathPair, StrFold, StrLen, StrTrim, TrimSet, binary, compare, fold,
-    length, pair, trim, unary,
+    length, normalize, normalized, pair, trim, unary,
 };
 use crate::str::StrView;
 use crate::vector::{Aux, PhysType, ValueVector};
@@ -93,6 +94,25 @@ pub enum ExprOp {
     StrTrim {
         ends: StrTrim,
         set: Arc<TrimSet>,
+        src: Reg,
+        dst: Reg,
+    },
+    /// A string put into one of the four normal forms. The form is
+    /// whatever the statement wrote, or NFC where it wrote none, and it
+    /// is the same form for every chunk the program runs over.
+    StrNorm {
+        form: NormalForm,
+        src: Reg,
+        dst: Reg,
+    },
+    /// Whether a string is in a normal form already. This is the one
+    /// string op whose answer is a predicate rather than a value, so it
+    /// writes a bitmap the way a comparison does. `negated` carries the
+    /// NOT, which belongs in the kernel: a null row is off in either
+    /// answer, and a complement of the bitmap would have turned it on.
+    StrNormalized {
+        form: NormalForm,
+        negated: bool,
         src: Reg,
         dst: Reg,
     },
@@ -217,6 +237,28 @@ impl Program {
                         trim(arena, *ends, set, v)?
                     };
                     regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrNorm { form, src, dst } => {
+                    let out = {
+                        let v = resolve(&regs, *src, chunk)?;
+                        normalize(arena, *form, v)?
+                    };
+                    regs[*dst as usize] = Slot::Vec(out);
+                    last = *dst;
+                }
+                ExprOp::StrNormalized {
+                    form,
+                    negated,
+                    src,
+                    dst,
+                } => {
+                    let mut bits = Bitmap::new_in(arena, count, false);
+                    {
+                        let v = resolve(&regs, *src, chunk)?;
+                        normalized(*form, *negated, v, &mut bits)?;
+                    }
+                    regs[*dst as usize] = Slot::Bits(bits);
                     last = *dst;
                 }
                 ExprOp::Compare { op, l, r, dst } => {

@@ -2028,3 +2028,19 @@ vec_str_fold_grows_s = 0.03
 # the observed run, which was 0.09 at load 10.8 on ten cores, with the
 # same margin the fold beside it has. Raise floors, never lower them.
 vec_str_trim_grows_s = 0.03
+
+# A decomposition of a 2048-row flat string vector, the string kernel
+# that has to write its answers out: a normal form can make a string
+# longer or shorter, so neither the trim's trick of pointing back into
+# the argument nor the fold's exact sizing is available to it. What is
+# available is the question this measures. The column is plain ASCII,
+# which is what nearly every stored column is, and no character below
+# 128 decomposes or combines, so every row is in all four forms already
+# and the work is a scan that finds that out plus a copy of the views.
+# The bench prints the same kernel over an accented column beside this
+# one, where every row is decoded, looked up, sorted and written out,
+# and that line runs at about a hundredth of this one. Floor sits under
+# the worst observed run, which was 0.17 at load 11.5 on ten cores, an
+# earlier run at load 5.8 measuring 0.49. Raise floors, never lower
+# them.
+vec_str_normalize_grows_s = 0.08

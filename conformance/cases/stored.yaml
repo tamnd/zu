@@ -1196,3 +1196,95 @@ cases:
     doc: TRIM takes one character whatever it is trimming, so a column argument does not make a longer trim string acceptable. The condition belongs to what was written rather than to any row, so it is raised whether a row is read or not.
     query: MATCH (n:person) RETURN TRIM('ab' FROM n.name) AS t
     raises: "22027"
+
+  - name: the-two-canonical-forms-over-a-stored-string
+    doc: GF08 over a column. The stored tag holds an accented letter written as one character, so NFC answers it unchanged and NFD answers the plain letter followed by a combining accent. A client whose normalization is a no-op passes the first of these and fails the second.
+    query: MATCH (n:person) WHERE n.name = 'bo' RETURN NORMALIZE(n.tag, NFC) AS c, NORMALIZE(n.tag, NFD) AS d
+    columns:
+      - c
+      - d
+    rows:
+      - values:
+          - type: STRING
+            value: "héllo"
+          - type: STRING
+            value: "héllo"
+
+  - name: a-normal-form-answers-a-plain-string-unchanged
+    doc: Every character below 128 is in all four normal forms already, so a normalization of a stored name is the name. This is the case a client is most likely to get right by accident and the one an engine can answer without reading a table, so it says nothing about the tables and everything about the column not being touched.
+    query: MATCH (n:person) WHERE NORMALIZE(n.name, NFD) = n.name RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-normalization-can-make-a-string-longer
+    doc: A count of characters before and after a decomposition of the same stored value. The accented letter becomes two characters, so the two counts differ, which is what separates this function from every other string function in the suite: the answer is not a part of the argument and is not the length of it either.
+    query: MATCH (n:person) WHERE n.name = 'bo' RETURN char_length(n.tag) AS w, char_length(NORMALIZE(n.tag, NFD)) AS d
+    columns:
+      - w
+      - d
+    rows:
+      - values:
+          - type: INT64
+            value: "5"
+          - type: INT64
+            value: "6"
+
+  - name: the-compatibility-forms-agree-here
+    doc: None of the four stored tags has a compatibility decomposition that differs from its canonical one, an emoji and a tab included, so NFKC answers what NFC answers for every row. A client that treated the K forms as a licence to fold anything it liked would fail this.
+    query: MATCH (n:person) WHERE NORMALIZE(n.tag, NFKC) = NORMALIZE(n.tag, NFC) RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-stored-string-is-asked-which-form-it-is-in
+    doc: The predicate of ISO 19.7 over a column. Three of the four tags hold nothing that composes, so they are in the decomposed form as they stand; the fourth holds the composed accent and is not. The rows are named rather than counted so a client that answers the predicate backwards cannot pass on the count.
+    query: MATCH (n:person) WHERE n.tag IS NORMALIZED NFD RETURN n.name AS m ORDER BY m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: STRING
+            value: "ann"
+      - values:
+          - type: STRING
+            value: "cy"
+      - values:
+          - type: STRING
+            value: "di"
+
+  - name: the-negated-predicate-names-the-other-row
+    doc: The same question spelled with NOT in it, which has to answer the row the plain spelling left out and no other. A null would be in neither answer, there being no third bit in a predicate, and there is no null here so the two answers cover the table between them.
+    query: MATCH (n:person) WHERE n.tag IS NOT NORMALIZED NFD RETURN n.name AS m
+    columns:
+      - m
+    rows:
+      - values:
+          - type: STRING
+            value: "bo"
+
+  - name: the-predicate-defaults-to-the-composed-form
+    doc: The form is optional in the predicate the way it is optional in the function, and ISO 19.7 defaults it to NFC. All four stored tags are in that form, so a client that defaults to no form at all and answers true passes this by luck, and one that defaults to NFD answers three.
+    query: MATCH (n:person) WHERE n.tag IS NORMALIZED RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "4"
+
+  - name: a-normalization-in-a-filter
+    doc: A normalization on one side of a comparison and the column it read on the other, which counts the rows that were in the form already. It is the same three rows the predicate names, so an engine whose function and whose predicate disagree fails one of the two.
+    query: MATCH (n:person) WHERE NORMALIZE(n.tag, NFD) = n.tag RETURN count(*) AS c
+    columns:
+      - c
+    rows:
+      - values:
+          - type: INT64
+            value: "3"

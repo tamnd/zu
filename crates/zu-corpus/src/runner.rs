@@ -18,7 +18,7 @@
 //! defect in the case.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use zu::query::Value;
 use zu::session::Session;
@@ -92,15 +92,50 @@ impl Report {
 ///
 /// `dir` is a directory the runner may make databases under. Each case
 /// gets its own file in it, named after the case, so that a failure
-/// leaves something to open.
+/// leaves something to open. A case that did not fail has its file
+/// taken away again as soon as it is done, so what is left in `dir` at
+/// the end is the failures and nothing else.
+///
+/// The sweeping is not tidiness. A case's graph is a handful of nodes
+/// and its file is 3.75 MiB, the corpus is a thousand cases, and the
+/// two tests over it run at once, so keeping them all is 4.4 GiB of
+/// disk held for the length of the run. That was enough to run a
+/// laptop out of space and take every other test in the workspace down
+/// with it, reported as sixteen broken cases and really one full
+/// filesystem (#482).
 pub fn run(suites: &[Suite], dir: &Path) -> Report {
     let mut report = Report::default();
     for suite in suites {
         for case in &suite.cases {
-            report.ran.push(one(suite, case, dir));
+            let ran = one(suite, case, dir);
+            if ran.outcome != Outcome::Failed {
+                sweep(&database(suite, case, dir));
+            }
+            report.ran.push(ran);
         }
     }
     report
+}
+
+/// Where a case's database goes. One place, because the runner writes
+/// it and the sweep takes it away and a second spelling of the name is
+/// a way for those two to stop meaning the same file.
+fn database(suite: &Suite, case: &Case, dir: &Path) -> PathBuf {
+    dir.join(format!("{}-{}.zu", suite.name, case.name))
+}
+
+/// Takes away a database and the log beside it.
+///
+/// Errors are dropped on purpose. This is a temporary directory that
+/// is about to be removed wholesale, so a file that will not go is a
+/// file the directory takes with it, and a runner that failed a case
+/// over a failed unlink would be reporting on the filesystem instead
+/// of on the engine.
+fn sweep(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let mut log = path.as_os_str().to_owned();
+    log.push(".wal");
+    let _ = std::fs::remove_file(PathBuf::from(log));
 }
 
 fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
@@ -111,7 +146,7 @@ fn one(suite: &Suite, case: &Case, dir: &Path) -> Ran {
         outcome,
         detail,
     };
-    let path = dir.join(format!("{}-{}.zu", suite.name, case.name));
+    let path = database(suite, case, dir);
     let mut file = match zu::zu1::file::Zu1File::create(&path) {
         Ok(file) => file,
         Err(e) => return ran(Outcome::Failed, format!("creating {}: {e}", path.display())),
@@ -398,5 +433,36 @@ mod tests {
             report.summary(),
             "2 cases, 1 passed, 1 failed, 0 unsupported"
         );
+    }
+
+    /// The database a case ran on is there to be opened when the case
+    /// failed, so a failure keeps it and everything else gives it back.
+    /// This is what stops the corpus holding a thousand files at once,
+    /// which is 4.4 GiB of disk and was enough to fail the workspace
+    /// on a full filesystem (#482).
+    #[test]
+    fn only_a_case_that_failed_leaves_its_database_behind() {
+        let suite = Suite::parse(&format!(
+            "{HEAD}  - name: passes\n    doc: one that answers what it says it will\n    query: RETURN 1 AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT8\n            value: 1\n  - name: fails\n    doc: one that does not, so its database is worth keeping\n    query: RETURN 1 AS n\n    columns:\n      - n\n    rows:\n      - values:\n          - type: INT8\n            value: 2\n  - name: ahead\n    doc: one written ahead of the engine, whose database says nothing\n    query: CREATE (n:person)\n    columns:\n      - n\n    rows:\n"
+        ))
+        .expect("the fixture parses");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let report = run(&[suite], dir.path());
+        assert_eq!(
+            report.summary(),
+            "3 cases, 1 passed, 1 failed, 1 unsupported"
+        );
+
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read the dir")
+            .map(|e| {
+                e.expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".zu"))
+            .collect();
+        assert_eq!(left, vec!["t-fails.zu"], "what the run left behind");
     }
 }

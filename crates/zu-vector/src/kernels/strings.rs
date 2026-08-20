@@ -21,6 +21,16 @@
 //! rather than two thousand counts. The narrower the table the wider
 //! the gap, and a column of a few dozen distinct values is where the
 //! saving is worth having.
+//!
+//! The functions that answer a string sort themselves by how many
+//! bytes they have to put somewhere. A trim puts none anywhere, since
+//! what it answers is a part of what it was handed and those bytes are
+//! already in a buffer somebody is holding, so its answers point back
+//! into the argument. A fold writes as much as it was handed, an ASCII
+//! fold never changing a byte's width. Anything that can change a
+//! length, which is what a normal form does, has to write out an
+//! amount it cannot know in advance, and that is the case the builder
+//! exists for.
 
 use std::sync::Arc;
 
@@ -300,6 +310,247 @@ pub fn fold(arena: &mut MorselArena, op: StrFold, v: &ValueVector) -> Result<Val
     Ok(out)
 }
 
+/// Which ends a trim takes characters off.
+///
+/// ISO 20.24 spells six functions here and the kernel knows three,
+/// because the whole of what the six disagree about is settled before a
+/// plan is built. `TRIM` takes one character and raises `22027` when it
+/// is handed more, and `BTRIM`, `LTRIM` and `RTRIM` take a set; that is
+/// a question about what was written, not about what the loop does, so
+/// the compiler asks it against the written set and this is left with
+/// the only thing that varies a row at a time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrTrim {
+    /// TRIM and BTRIM: both ends.
+    Both,
+    /// TRIM LEADING and LTRIM: the front.
+    Leading,
+    /// TRIM TRAILING and RTRIM: the back.
+    Trailing,
+}
+
+impl StrTrim {
+    fn name(self) -> &'static str {
+        match self {
+            StrTrim::Both => "trim",
+            StrTrim::Leading => "ltrim",
+            StrTrim::Trailing => "rtrim",
+        }
+    }
+
+    fn front(self) -> bool {
+        matches!(self, StrTrim::Both | StrTrim::Leading)
+    }
+
+    fn back(self) -> bool {
+        matches!(self, StrTrim::Both | StrTrim::Trailing)
+    }
+
+    /// The type the answers land in. A trimmed string is a string.
+    pub fn answer_type(self, arg: PhysType) -> Option<PhysType> {
+        match arg {
+            PhysType::Str => Some(PhysType::Str),
+            _ => None,
+        }
+    }
+
+    /// Whether a row could have no answer. The one condition in the
+    /// trim family is about the trim set rather than about a row, and
+    /// it is settled at compile time, so nothing here can raise.
+    pub fn may_raise(self) -> bool {
+        false
+    }
+}
+
+/// The characters a trim takes off, in the form the loop wants them.
+///
+/// The set is written once in a statement and asked about once a
+/// character, so it is worth preparing. The plain characters become a
+/// bitmask, one bit each, which is the whole test for the sets almost
+/// every statement writes: a space, or a handful of punctuation. Any
+/// character past ASCII is kept as the bytes it is written as, and
+/// matching is then a comparison of bytes rather than a decode.
+///
+/// Bytes are enough because of what UTF-8 is. A byte below 128 is
+/// always a whole character and never part of a longer one, and the
+/// encoding of a character is never the front or the back of another
+/// character's encoding, so a match on bytes is a match on characters
+/// and no member of the set can be found halfway through something
+/// else.
+#[derive(Debug, Default)]
+pub struct TrimSet {
+    /// One bit a character for the members below 128.
+    ascii: u128,
+    /// The encodings of the members above it, which is usually none.
+    wide: Vec<Box<[u8]>>,
+}
+
+impl TrimSet {
+    /// The set a statement wrote, prepared.
+    pub fn new(chars: &str) -> Self {
+        let mut set = Self::default();
+        for c in chars.chars() {
+            if c.is_ascii() {
+                set.ascii |= 1u128 << (c as u8);
+            } else {
+                let mut buf = [0u8; 4];
+                let bytes = c.encode_utf8(&mut buf).as_bytes();
+                if !set.wide.iter().any(|w| &**w == bytes) {
+                    set.wide.push(bytes.into());
+                }
+            }
+        }
+        set
+    }
+
+    /// Whether the set has anything in it. An empty one trims nothing,
+    /// which is the answer the row engine gives too.
+    pub fn is_empty(&self) -> bool {
+        self.ascii == 0 && self.wide.is_empty()
+    }
+
+    /// How many bytes the character at the front of `bytes` takes, when
+    /// that character is a member. `bytes` is not empty.
+    #[inline(always)]
+    fn width_at(&self, bytes: &[u8]) -> Option<usize> {
+        let head = bytes[0];
+        if head < 0x80 {
+            return ((self.ascii >> head) & 1 == 1).then_some(1);
+        }
+        self.wide
+            .iter()
+            .find(|w| bytes.starts_with(w))
+            .map(|w| w.len())
+    }
+
+    /// The same for the character at the back of `bytes`.
+    #[inline(always)]
+    fn width_before(&self, bytes: &[u8]) -> Option<usize> {
+        let last = bytes[bytes.len() - 1];
+        if last < 0x80 {
+            return ((self.ascii >> last) & 1 == 1).then_some(1);
+        }
+        self.wide
+            .iter()
+            .find(|w| bytes.ends_with(w))
+            .map(|w| w.len())
+    }
+}
+
+/// The part of `bytes` a trim leaves: where it starts and how long it
+/// is.
+///
+/// Nothing is written here, which is the point. A trim of a string that
+/// has nothing to take off walks one character at each end it trims and
+/// answers the string it was given, and a trim that takes plenty off
+/// still only walks what it takes.
+#[inline(always)]
+fn kept(ends: StrTrim, set: &TrimSet, bytes: &[u8]) -> (usize, usize) {
+    let mut start = 0;
+    let mut end = bytes.len();
+    if ends.front() {
+        while start < end {
+            match set.width_at(&bytes[start..end]) {
+                Some(n) => start += n,
+                None => break,
+            }
+        }
+    }
+    if ends.back() {
+        while start < end {
+            match set.width_before(&bytes[start..end]) {
+                Some(n) => end -= n,
+                None => break,
+            }
+        }
+    }
+    (start, end - start)
+}
+
+/// Evaluate `ends(v, set)` into a new flat string vector.
+///
+/// This is the string kernel that fills no buffer. What a trim answers
+/// is a part of what it was handed, and a part of a string is bytes
+/// that are already somewhere, so a flat argument's answers are views
+/// back into the argument's own buffers and the answer vector holds the
+/// same buffers rather than a copy of them. A chunk of two thousand
+/// trimmed strings costs two thousand views and not one byte more.
+///
+/// That is a saving in memory rather than in time. The walk still
+/// tests the set once for every character it takes off, which on the
+/// bench's fifteen byte strings costs about what the fold's copy of
+/// the same string costs, so the two run level there.
+///
+/// A dictionary is the one shape that cannot do that, since the entries
+/// of a table are not bytes a view can name, so the table's answers are
+/// written out once an entry and the rows gather over them. That is
+/// still a table's worth of copying rather than a chunk's.
+pub fn trim(
+    arena: &mut MorselArena,
+    ends: StrTrim,
+    set: &TrimSet,
+    v: &ValueVector,
+) -> Result<ValueVector> {
+    if ends.answer_type(v.phys).is_none() {
+        return Err(ZuError::InvalidArgument(format!(
+            "no {}() kernel for {:?}",
+            ends.name(),
+            v.phys
+        )));
+    }
+    let len = v.len as usize;
+    let bufs = v.str_buffers().unwrap_or(&NO_BUFFERS);
+    let mut out = ValueVector::flat_uninit(arena, PhysType::Str, len);
+    // Set only where the answers' bytes had to be written somewhere,
+    // which is the dictionary and nothing else.
+    let mut made = None;
+    match v.encoding {
+        VecEncoding::Constant => {
+            let view = v.constant_value::<StrView>();
+            let bytes = view.bytes(bufs);
+            let (at, n) = kept(ends, set, bytes);
+            out.values_mut::<StrView>()[..len].fill(view.sub(bytes, at, n));
+        }
+        VecEncoding::Dict { .. } => {
+            let dict = v.dictionary();
+            let mut build = StrBuilder::with_capacity(long_bytes(v));
+            let table: Vec<StrView> = (0..dict.len())
+                .map(|i| {
+                    let entry = dict.get(i as u32);
+                    let (at, n) = kept(ends, set, entry);
+                    build.push(&entry[at..at + n])
+                })
+                .collect();
+            let codes = v.codes_u16();
+            let dst = out.values_mut::<StrView>();
+            for (slot, code) in dst[..len].iter_mut().zip(codes) {
+                *slot = table[*code as usize];
+            }
+            made = Some(build.finish());
+        }
+        VecEncoding::Flat => {
+            let views = v.values::<StrView>();
+            let dst = out.values_mut::<StrView>();
+            for (slot, view) in dst[..len].iter_mut().zip(views) {
+                let bytes = view.bytes(bufs);
+                let (at, n) = kept(ends, set, bytes);
+                *slot = view.sub(bytes, at, n);
+            }
+        }
+    }
+    out.aux = match made {
+        Some(bufs) => Aux::Str(Arc::new(bufs)),
+        // The argument's buffers, held rather than copied, because the
+        // answers are pointing into them.
+        None => match &v.aux {
+            Aux::Str(bufs) => Aux::Str(Arc::clone(bufs)),
+            _ => Aux::None,
+        },
+    };
+    out.validity = carried(arena, v, len);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +755,154 @@ mod tests {
         assert_eq!(StrFold::Upper.answer_type(PhysType::Float64), None);
     }
 
+    /// The three ends, over a set of one character, which is the shape
+    /// TRIM itself is limited to.
+    #[test]
+    fn each_end_trims_the_end_it_names() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["  ann  ", "bo", "   ", ""]);
+        let set = TrimSet::new(" ");
+        let both = trim(&mut arena, StrTrim::Both, &set, &v).unwrap();
+        assert_eq!(both.phys, PhysType::Str);
+        assert_eq!(read(&both), ["ann", "bo", "", ""]);
+        let front = trim(&mut arena, StrTrim::Leading, &set, &v).unwrap();
+        assert_eq!(read(&front), ["ann  ", "bo", "", ""]);
+        let back = trim(&mut arena, StrTrim::Trailing, &set, &v).unwrap();
+        assert_eq!(read(&back), ["  ann", "bo", "", ""]);
+    }
+
+    /// A set of several characters, which is what btrim and its two
+    /// neighbours exist for: any member comes off, in any order, until
+    /// something that is not a member is reached.
+    #[test]
+    fn a_set_takes_any_of_its_members_off() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["xyxaxbyx", "xxx", "axb"]);
+        let set = TrimSet::new("xy");
+        let out = trim(&mut arena, StrTrim::Both, &set, &v).unwrap();
+        assert_eq!(read(&out), ["axb", "", "axb"]);
+    }
+
+    /// A member past ASCII is matched as the bytes it is written as,
+    /// and matching bytes has to still be matching characters: a trim
+    /// of the accented letter must not eat half of it or half of
+    /// anything else.
+    #[test]
+    fn a_wide_member_comes_off_whole() {
+        let mut arena = MorselArena::new();
+        let v = str_vector(&mut arena, &["ééhélloé", "🙂a🙂", "é🙂é"]);
+        let set = TrimSet::new("é🙂");
+        let out = trim(&mut arena, StrTrim::Both, &set, &v).unwrap();
+        assert_eq!(read(&out), ["héllo", "a", ""]);
+        // The accented letter's second byte is a continuation byte and
+        // shares it with plenty of others, so a trim that matched bytes
+        // one at a time would cut this string apart.
+        let v = str_vector(&mut arena, &["ñ"]);
+        let out = trim(&mut arena, StrTrim::Both, &TrimSet::new("é"), &v).unwrap();
+        assert_eq!(read(&out), ["ñ"]);
+    }
+
+    /// An empty set trims nothing, which is what the row engine
+    /// answers: nothing is a member, so the first character at either
+    /// end stops the walk.
+    #[test]
+    fn an_empty_set_answers_the_string_it_was_given() {
+        let mut arena = MorselArena::new();
+        let set = TrimSet::new("");
+        assert!(set.is_empty());
+        let v = str_vector(&mut arena, &["  ann  ", ""]);
+        let out = trim(&mut arena, StrTrim::Both, &set, &v).unwrap();
+        assert_eq!(read(&out), ["  ann  ", ""]);
+    }
+
+    /// The whole reason a trim costs no memory: a flat argument's
+    /// answers point back into the argument's own bytes, so the answer
+    /// vector holds the buffers it was handed and fills none of its
+    /// own.
+    #[test]
+    fn a_trimmed_string_points_back_at_what_it_was_trimmed_from() {
+        let mut arena = MorselArena::new();
+        let long = "  a string well past the twelve bytes a view holds  ";
+        let v = str_vector(&mut arena, &[long, "  short  "]);
+        let out = trim(&mut arena, StrTrim::Both, &TrimSet::new(" "), &v).unwrap();
+        assert_eq!(read(&out), [long.trim(), "short"]);
+        let views = out.values::<StrView>();
+        assert!(!views[0].is_inline(), "a long answer stays in the buffer");
+        assert!(views[1].is_inline(), "a short one fits in its view");
+        // Handed over, not copied: the answers are reading the
+        // argument's bytes where they already lie.
+        let (Aux::Str(theirs), Aux::Str(ours)) = (&v.aux, &out.aux) else {
+            panic!("a chunk with a long string in it carries buffers");
+        };
+        assert!(Arc::ptr_eq(theirs, ours));
+    }
+
+    /// One string standing for the chunk is trimmed once, and every row
+    /// reads the one answer back.
+    #[test]
+    fn a_constant_is_trimmed_once() {
+        let mut arena = MorselArena::new();
+        let mut v = ValueVector::constant(
+            &mut arena,
+            PhysType::Str,
+            StrView::inline("  ann  ".as_bytes()),
+            3,
+        );
+        v.aux = Aux::None;
+        let out = trim(&mut arena, StrTrim::Both, &TrimSet::new(" "), &v).unwrap();
+        assert_eq!(read(&out), ["ann", "ann", "ann"]);
+    }
+
+    /// Codes over a table trim the table rather than the rows, and the
+    /// answer still has to be what the same strings flat would have
+    /// given.
+    #[test]
+    fn a_dictionary_is_trimmed_a_table_at_a_time() {
+        let mut arena = MorselArena::new();
+        let entries = ["  a longer entry than a view holds  ", " ann ", "bo  "];
+        let dict = Arc::new(Dictionary::from_sorted(entries.iter()));
+        let codes = [2u16, 0, 1, 0];
+        let v = ValueVector::dict_str(&mut arena, &codes, dict);
+        let set = TrimSet::new(" ");
+        let out = trim(&mut arena, StrTrim::Both, &set, &v).unwrap();
+        let flat = str_vector(&mut arena, &codes.map(|c| entries[c as usize]));
+        assert_eq!(
+            read(&out),
+            read(&trim(&mut arena, StrTrim::Both, &set, &flat).unwrap())
+        );
+        assert_eq!(read(&out)[0], "bo");
+        assert_eq!(read(&out)[1], entries[0].trim());
+    }
+
+    /// A null argument answers null, and the rows around it answer what
+    /// they would have answered on their own.
+    #[test]
+    fn a_trim_of_a_null_is_null() {
+        let mut arena = MorselArena::new();
+        let mut v = str_vector(&mut arena, &[" ann ", " bo ", " cy "]);
+        let mut valid = Bitmap::new_in(&mut arena, 3, true);
+        valid.clear(1);
+        v.validity = Some(valid);
+        let out = trim(&mut arena, StrTrim::Both, &TrimSet::new(" "), &v).unwrap();
+        assert!(!out.is_valid(1), "null in, null out");
+        assert!(out.is_valid(0) && out.is_valid(2));
+        assert_eq!(read(&out)[0], "ann");
+        assert_eq!(read(&out)[2], "cy");
+    }
+
+    /// No trim has a row it cannot answer, the one condition in the
+    /// family being about the set rather than about a row, and a
+    /// trimmed string is a string.
+    #[test]
+    fn a_trim_cannot_raise_and_answers_a_string() {
+        assert!(!StrTrim::Both.may_raise());
+        assert_eq!(
+            StrTrim::Leading.answer_type(PhysType::Str),
+            Some(PhysType::Str)
+        );
+        assert_eq!(StrTrim::Trailing.answer_type(PhysType::Int64), None);
+    }
+
     /// A number is not a string, and a kernel handed one says so
     /// rather than reading sixteen bytes of it as a view.
     #[test]
@@ -518,5 +917,9 @@ mod tests {
             panic!("a number was folded as a string");
         };
         assert!(err.to_string().contains("upper"));
+        let Err(err) = trim(&mut arena, StrTrim::Both, &TrimSet::new(" "), &v) else {
+            panic!("a number was trimmed as a string");
+        };
+        assert!(err.to_string().contains("trim"));
     }
 }

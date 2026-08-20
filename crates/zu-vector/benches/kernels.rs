@@ -476,6 +476,59 @@ fn main() {
         per_sec_fold_dict / per_sec_fold
     );
 
+    // The trim, which is the string kernel that fills no buffer: the
+    // set is the digits, so every entry here loses its number and what
+    // is left is a part of the entry that the answer points back at.
+    // The ratio against the fold is printed because the two walk the
+    // same column, and it is worth reading for what it does not say.
+    // The trim comes out about level with the fold rather than well
+    // ahead of it, because taking six characters off a string is six
+    // tests of the set, which costs about what copying fifteen bytes
+    // costs. What the trim saves is the buffer, not the walk.
+    let digits = kernels::TrimSet::new("0123456789");
+    let per_sec_trim = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::trim(
+                &mut arith_scratch,
+                kernels::StrTrim::Both,
+                black_box(&digits),
+                black_box(&flat),
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    let trim_grows = per_sec_trim * VECTOR as f64 / 1e9;
+    println!(
+        "str_trim: {trim_grows:.2} G rows/s over fifteen byte strings ({:.1}x the fold of the same column, no spec target)",
+        per_sec_trim / per_sec_fold
+    );
+    if let Some(floor) = budgets.get("vec_str_trim_grows_s")
+        && trim_grows < floor
+    {
+        println!("GATE FAIL vec_str_trim_grows_s: {trim_grows:.2} < floor {floor}");
+        failed = true;
+    }
+    let per_sec_trim_dict = measure(|| {
+        arith_scratch.reset();
+        black_box(
+            kernels::trim(
+                &mut arith_scratch,
+                kernels::StrTrim::Both,
+                black_box(&digits),
+                black_box(&dv),
+            )
+            .unwrap()
+            .len,
+        );
+    });
+    println!(
+        "str_trim_dict: {:.2} G rows/s ({:.1}x the flat column, no target)",
+        per_sec_trim_dict * VECTOR as f64 / 1e9,
+        per_sec_trim_dict / per_sec_trim
+    );
+
     // Sorted intersection, balanced inputs: the multiway join inner
     // loop. Throughput counts every element the merge consumes.
     let a: Vec<u64> = (0..4096u64).map(|i| i * 3).collect();

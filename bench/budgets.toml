@@ -2018,3 +2018,13 @@ vec_str_length_grows_s = 0.05
 # under the worst observed run, which was 0.05 at load 17.6 on ten
 # cores. Raise floors, never lower them.
 vec_str_fold_grows_s = 0.03
+
+# A trim of the digits off both ends of a 2048-row flat string vector,
+# the string kernel that fills no buffer at all: an answer is a part of
+# its argument, so it points back into the argument's own bytes. That
+# saves the memory rather than the walk, and the bench prints it beside
+# the fold to say so: the two come out about level, a trim paying a
+# test of the set for every character it takes off. Floor sits under
+# the observed run, which was 0.09 at load 10.8 on ten cores, with the
+# same margin the fold beside it has. Raise floors, never lower them.
+vec_str_trim_grows_s = 0.03

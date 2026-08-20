@@ -104,6 +104,30 @@ impl StrView {
         }
     }
 
+    /// A view over `len` bytes of this string starting at `start`,
+    /// where `bytes` is what [`Self::bytes`] answered for it.
+    ///
+    /// A part of a string is bytes that are already somewhere, so this
+    /// makes no bytes and copies none: a part short enough goes inline
+    /// and a longer one names the buffer and offset this view names,
+    /// moved along by where the part begins. That is what a trim wants,
+    /// since what a trim answers is always a part of what it was
+    /// handed, and it is why a chunk of trimmed strings can cost no
+    /// bytes at all beyond the views themselves.
+    ///
+    /// A part longer than the inline limit can only have come from a
+    /// view that was already long, so the buffer it names is there to
+    /// name.
+    pub fn sub(&self, bytes: &[u8], start: usize, len: usize) -> Self {
+        debug_assert!(start + len <= self.len());
+        let part = &bytes[start..start + len];
+        if len <= INLINE_LEN {
+            Self::inline(part)
+        } else {
+            Self::long(part, self.buffer_id(), self.offset() + start as u32)
+        }
+    }
+
     /// Equality without materializing either side. The length and prefix
     /// word reject most non-equal pairs before any buffer is touched.
     pub fn eq_with(&self, a_bufs: &StrBuffers, other: &StrView, b_bufs: &StrBuffers) -> bool {
@@ -403,6 +427,24 @@ mod tests {
         assert!(a.eq_with(&bufs, &b, &bufs));
         let short = StrView::inline(b"hello");
         assert!(!a.eq_with(&bufs, &short, &bufs));
+    }
+
+    /// A part of a long string keeps pointing at the bytes it was
+    /// always pointing at, and a part short enough to sit in a view
+    /// stops needing the buffer at all.
+    #[test]
+    fn a_part_of_a_string_points_back_at_it() {
+        let mut bufs = StrBuffers::new();
+        let payload: Arc<[u8]> = Arc::from(&b"  a string long enough to need a buffer  "[..]);
+        let id = bufs.push(Arc::clone(&payload));
+        let whole = StrView::long(&payload, id, 0);
+        let bytes = whole.bytes(&bufs);
+        let inner = whole.sub(bytes, 2, payload.len() - 4);
+        assert!(!inner.is_inline());
+        assert_eq!(inner.bytes(&bufs), b"a string long enough to need a buffer");
+        let head = whole.sub(bytes, 2, 8);
+        assert!(head.is_inline(), "a short part carries its own bytes");
+        assert_eq!(head.bytes(&StrBuffers::new()), b"a string");
     }
 
     #[test]

@@ -271,15 +271,21 @@ static int engine_value(run *r, const zu_value *v, const char *where, cv *out, c
 /* The names the case wrote, and the names the result carries, in the
  * one shape the comparison and the report both want. */
 static const zy_str *wanted_names(run *r, const zy_node *columns, size_t *count) {
+    const zy_node *items = NULL;
     zy_str *out;
     size_t i;
-    *count = columns->count;
-    out = (zy_str *)slots(r, columns->count, sizeof(zy_str));
-    for (i = 0; out != NULL && i < columns->count; i++) {
-        if (columns->items[i].kind != ZY_SCALAR) {
+    /* A `columns:` with nothing under it is a result with no columns,
+     * which is what FINISH answers, so it goes through the same
+     * accessor `rows:` does rather than reading the fields directly. */
+    if (zy_seq_or_empty(columns, &items, count) != 0) {
+        return NULL;
+    }
+    out = (zy_str *)slots(r, *count, sizeof(zy_str));
+    for (i = 0; out != NULL && i < *count; i++) {
+        if (items[i].kind != ZY_SCALAR) {
             return NULL;
         }
-        out[i] = columns->items[i].text;
+        out[i] = items[i].text;
     }
     return out;
 }
@@ -837,7 +843,8 @@ static outcome answer(run *r, zu_conn *conn, const zy_node *node, char *detail, 
         return out;
     }
 
-    if (columns == NULL || columns->kind != ZY_SEQ || rows == NULL) {
+    if (columns == NULL || (columns->kind != ZY_SEQ && columns->kind != ZY_EMPTY)
+        || rows == NULL) {
         zu_result_free(result);
         zu_error_free(e);
         say(detail, len, "a case says what it produces, with `columns:` and `rows:` or `raises:`");

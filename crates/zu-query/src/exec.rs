@@ -419,6 +419,20 @@ impl Rows {
         std::mem::take(&mut *self)
     }
 
+    /// The columns themselves, out of a result nobody will read again.
+    ///
+    /// [`Rows::columns`] lends them, which is what lets a result be read
+    /// twice and is also what makes an export copy: a buffer that leaves
+    /// through a borrow has to be copied, because the one behind it stays
+    /// where it is. This is the other half of that bargain, and it is
+    /// crate-private on purpose. Taking the columns leaves a `Rows` that
+    /// says it has none, so the only safe place to call it from is
+    /// [`QueryResult::into_columns`], which owns the whole result and
+    /// gives nobody the chance to look at what is left.
+    pub(crate) fn take_columns(&mut self) -> Option<Held> {
+        self.held.take()
+    }
+
     /// The rows, built out of the columns the first time this is asked.
     fn built(&self) -> &Vec<Vec<Value>> {
         self.rows

@@ -414,7 +414,7 @@ primary         = literal | temporal_literal | parameter | name
                 | value_query | "(" , expression , ")" | list | record ;
 
 cast            = "CAST" , "(" , expression , "AS" , value_type , ")" ;
-(* ISO 19.4 and mandatory feature GE01. Two forms: the searched one
+(* ISO 20.7 and mandatory feature GE01. Two forms: the searched one
    asks a condition per branch, and the simple one names a value and
    compares each branch with it. Whether a value stands before the
    first WHEN is what tells them apart. The branches are asked in the

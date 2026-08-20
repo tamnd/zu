@@ -55,7 +55,7 @@ pub const MAX_DAY: i32 = 2_932_896;
 /// instant it is running at and the displacement its session keeps.
 ///
 /// It is one reading and not a call to the operating system per row,
-/// because ISO 20.6 asks that every datetime value function in one
+/// because ISO 20.27 asks that every datetime value function in one
 /// statement answer the same instant. A statement that read the clock
 /// twice could have `CURRENT_DATE` and `CURRENT_TIMESTAMP` land on two
 /// days, and a scan of ten million rows would spend ten million system

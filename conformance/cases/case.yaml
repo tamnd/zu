@@ -1,6 +1,6 @@
 schema: 3
 suite: case
-doc: The case expression and its two abbreviations, ISO 19.4 and mandatory feature GE01. Two things are being asked here and only one of them is arithmetic. The first is which branch answers, which a client gets wrong by testing a null branch as false rather than as a branch that did not hold, and by comparing rather than testing in the simple form. The second is which branches are evaluated at all, which a client gets wrong by evaluating every branch and picking one afterwards, since the branch nobody reached is exactly where a query puts the expression the other rows cannot answer.
+doc: The case expression and its two abbreviations, ISO 20.7 and mandatory feature GE01. Two things are being asked here and only one of them is arithmetic. The first is which branch answers, which a client gets wrong by testing a null branch as false rather than as a branch that did not hold, and by comparing rather than testing in the simple form. The second is which branches are evaluated at all, which a client gets wrong by evaluating every branch and picking one afterwards, since the branch nobody reached is exactly where a query puts the expression the other rows cannot answer.
 
 cases:
   - name: searched-form

@@ -1733,7 +1733,7 @@ pub enum Func {
     /// is one no string has. Which end the characters are counted from
     /// is what [`Cut`] says.
     Cut(Cut),
-    /// ISO 20.6, the datetime value functions. Five cuts of the one
+    /// ISO 20.27, the datetime value functions. Five cuts of the one
     /// instant the statement is running at, which is the argument the
     /// call carries, so the clock is read once per statement however
     /// many of these it holds and however many rows they answer over.
@@ -1755,7 +1755,7 @@ pub enum Func {
     Math(Math),
 }
 
-/// ISO 20.19 to 20.21, the functions over one or two numbers: the
+/// ISO 20.22, the functions over one or two numbers: the
 /// arithmetic set, the trigonometric set and the logarithms.
 ///
 /// They are together because they are one family to everything outside
@@ -1913,7 +1913,7 @@ pub enum BoundExpr {
     },
     /// The instant the statement is running at, the hidden argument
     /// every datetime value function is handed. No query writes it: the
-    /// binder plants it under the five words of ISO 20.6.
+    /// binder plants it under the five words of ISO 20.27.
     ///
     /// It is a leaf and not a literal on purpose. A literal is folded
     /// where the arguments are all literals, and folding a clock would
@@ -5616,7 +5616,7 @@ impl Binder<'_> {
         self.bind_row(at, "trim", false, false, &args, ctx)
     }
 
-    /// `CURRENT_DATE` and the four words beside it, ISO 20.6. Each is
+    /// `CURRENT_DATE` and the four words beside it, ISO 20.27. Each is
     /// a cut of one instant, so the call the binder writes takes that
     /// instant as its argument and the row says which cut it is. The
     /// clock is read where the statement runs rather than here, which

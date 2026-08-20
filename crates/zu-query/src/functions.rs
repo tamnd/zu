@@ -582,7 +582,7 @@ pub static REGISTRY: &[Signature] = &[
         by_name: true,
         kernel: Some(cut_kernel),
     },
-    // ISO 20.6, the datetime value functions. None of them is reachable
+    // ISO 20.27, the datetime value functions. None of them is reachable
     // by name: the grammar writes them as bare words with no
     // parentheses, so a query saying CURRENT_DATE() is asking for a
     // function nobody defined and gets told so. The argument is the
@@ -1364,7 +1364,7 @@ fn cut_kernel(func: Func, args: &[Value]) -> Result<Value> {
     Ok(Value::Str(taken))
 }
 
-/// ISO 20.6, the datetime value functions: one instant cut five ways.
+/// ISO 20.27, the datetime value functions: one instant cut five ways.
 ///
 /// The instant arrives as the argument, so this kernel reads no clock
 /// and is as pure as every other one here. What makes the five differ
@@ -1596,7 +1596,7 @@ fn real_kernel(func: Func, args: &[Value]) -> Result<Value> {
     }
     let x = real(func, &value)?;
     let answer = match math {
-        // ISO 20.20 defines the square root as the power of one half,
+        // ISO 20.22 defines the square root as the power of one half,
         // so a negative argument is the power function's condition
         // rather than a condition of its own.
         Math::Sqrt => {
@@ -1726,7 +1726,7 @@ fn pair_kernel(func: Func, args: &[Value]) -> Result<Value> {
             x.powf(y)
         }
         // LOG takes the base first and the number second, which is the
-        // order ISO 20.21 writes it in.
+        // order ISO 20.22 writes it in.
         Math::Log => {
             if x <= 0.0 || x == 1.0 {
                 return Err(gql(

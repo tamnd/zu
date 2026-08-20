@@ -1423,7 +1423,7 @@ pub fn expr_text(expr: &BoundExpr, query: &BoundQuery) -> String {
             args,
             ..
         } => {
-            // ISO 20.6 writes these five as bare words, so a plan
+            // ISO 20.27 writes these five as bare words, so a plan
             // that printed the instant they were handed would print a
             // thing no query can write and no reader asked for.
             if let Func::Datetime(which) = func {

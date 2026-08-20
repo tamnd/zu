@@ -529,7 +529,7 @@ pub enum DeleteTarget {
     /// `DELETE n`: a variable an earlier clause bound.
     Variable(String),
     /// `DELETE VALUE { MATCH (p:Person) WHERE p.name = 'Ada' RETURN p }`,
-    /// the value query expression of ISO 20.9. The query inside runs on
+    /// the value query expression of ISO 20.6. The query inside runs on
     /// its own and has to answer one row of one column, because the
     /// item is one element and a query answering two of them has not
     /// said which.
@@ -1142,7 +1142,7 @@ pub enum TrimSide {
     Both,
 }
 
-/// The datetime value functions of ISO 20.6: the five words a statement
+/// The datetime value functions of ISO 20.27: the five words a statement
 /// asks the time with.
 ///
 /// The three CURRENT words answer in the session's displacement and the
@@ -1234,7 +1234,7 @@ pub enum Expr {
         chars: Option<Box<Expr>>,
         source: Box<Expr>,
     },
-    /// `CURRENT_DATE` and the four words beside it, ISO 20.6. They are
+    /// `CURRENT_DATE` and the four words beside it, ISO 20.27. They are
     /// written as bare words rather than as calls, which is why they are
     /// here and not resolved by name: the grammar gives them no
     /// parentheses, so nothing follows the word to say it was one.
@@ -1311,7 +1311,7 @@ pub enum Expr {
     /// worth the same wherever they are written. What it answers is a
     /// reference and not the graph, which is what GV60 is.
     GraphRef(GraphRef),
-    /// `LET n = a + b IN n * n END`, ISO 20.7 and GE03: a name that
+    /// `LET n = a + b IN n * n END`, ISO 20.5 and GE03: a name that
     /// stands for a value for the length of one expression.
     ///
     /// The same [`LetItem`] the clause is made of, because it is the
@@ -1327,7 +1327,7 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: LogicalType,
     },
-    /// `CASE`, ISO 19.4 and mandatory feature GE01, in both of the forms
+    /// `CASE`, ISO 20.7 and mandatory feature GE01, in both of the forms
     /// the standard writes it in.
     ///
     /// The searched form asks a condition per branch,

@@ -198,7 +198,7 @@ cases:
     rows:
 
   - name: a-record-named-by-its-type
-    doc: The record constructor of ISO 20.19 may name what it is building the way the list constructor does, and the name changes nothing about the record. The field is read back here rather than the record itself, because the wire encoding of this corpus has no record value and a client is not asked to invent one.
+    doc: The record constructor of ISO 20.18 may name what it is building the way the list constructor does, and the name changes nothing about the record. The field is read back here rather than the record itself, because the wire encoding of this corpus has no record value and a client is not asked to invent one.
     query: RETURN (RECORD {a: 1, b: 2}).b AS n
     columns:
       - n
@@ -268,7 +268,7 @@ cases:
             value: kept
 
   - name: a-name-that-lives-for-one-expression
-    doc: ISO 20.7 lets an expression name a value for its own length, which is the LET clause said in a smaller place. The name is worked out once however often the body reads it, and the answer says nothing about that, so what is asked here is the plain reading.
+    doc: ISO 20.5 lets an expression name a value for its own length, which is the LET clause said in a smaller place. The name is worked out once however often the body reads it, and the answer says nothing about that, so what is asked here is the plain reading.
     query: RETURN LET n = 2 + 3 IN n * n END AS n
     columns:
       - n

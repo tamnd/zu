@@ -1,0 +1,101 @@
+{
+  "name": "zu",
+  "displayName": "zu",
+  "description": "zuQL for VS Code: diagnostics, completion, hover, formatting and colour, from the zu binary",
+  "version": "0.0.1",
+  "publisher": "tamnd",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tamnd/zu.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "keywords": [
+    "gql",
+    "zuql",
+    "graph",
+    "database",
+    "zu"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/*.zu1"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "gql",
+        "aliases": [
+          "zuQL",
+          "GQL"
+        ],
+        "extensions": [
+          ".gql",
+          ".zuql"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "gql",
+        "scopeName": "source.gql",
+        "path": "./syntaxes/gql.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "zu",
+      "properties": {
+        "zu.server.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The `zu` binary to run the language server from. Empty means the one bundled with this extension, and then the one on `PATH`."
+        },
+        "zu.database": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The `.zu1` file to answer about. A relative path is from the workspace folder. Empty means no database, and then the server checks syntax and offers keywords but knows no table names."
+        },
+        "zu.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log the traffic between this editor and the server, in the zu output channel."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "zu.selectDatabase",
+        "title": "zu: Select Database",
+        "category": "zu"
+      },
+      {
+        "command": "zu.restartServer",
+        "title": "zu: Restart Language Server",
+        "category": "zu"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "1.85.0"
+  }
+}

@@ -1,0 +1,153 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "gql",
+  "displayName": "zuQL",
+  "scopeName": "source.gql",
+  "fileTypes": [
+    "gql",
+    "zuql"
+  ],
+  "patterns": [
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#string"
+    },
+    {
+      "include": "#identifier"
+    },
+    {
+      "include": "#parameter"
+    },
+    {
+      "include": "#number"
+    },
+    {
+      "include": "#literal"
+    },
+    {
+      "include": "#temporal"
+    },
+    {
+      "include": "#type"
+    },
+    {
+      "include": "#function"
+    },
+    {
+      "include": "#algorithm"
+    },
+    {
+      "include": "#keyword"
+    },
+    {
+      "include": "#operator"
+    }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.gql",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.gql",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.raw.gql",
+          "begin": "@'",
+          "end": "'(?!')"
+        },
+        {
+          "name": "string.quoted.double.raw.gql",
+          "begin": "@\"",
+          "end": "\"(?!\")"
+        },
+        {
+          "name": "string.quoted.single.gql",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.gql",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.gql",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.gql",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "identifier": {
+      "name": "variable.other.quoted.gql",
+      "match": "`[^`]*`"
+    },
+    "parameter": {
+      "name": "variable.parameter.gql",
+      "match": "\\$[A-Za-z0-9_]+"
+    },
+    "number": {
+      "name": "constant.numeric.gql",
+      "match": "(?i)\\b(0x[0-9a-f]+|0o[0-7]+|0b[01]+|[0-9]+(\\.[0-9]+)?(e[+-]?[0-9]+)?[mfd]?)\\b"
+    },
+    "literal": {
+      "name": "constant.language.gql",
+      "match": "(?i)\\b(NULL|TRUE|FALSE)\\b"
+    },
+    "function": {
+      "name": "support.function.gql",
+      "match": "(?i)\\b(COUNT|SUM|AVG|MIN|MAX|COLLECT_LIST|COLLECT|STDDEV_SAMP|STDDEV_POP|PERCENTILE_CONT|PERCENTILE_DISC|ID|ELEMENT_ID|SIZE|CARDINALITY|PATH_LENGTH|ELEMENTS|ALL_DIFFERENT|SAME|PROPERTY_EXISTS|CHAR_LENGTH|CHARACTER_LENGTH|OCTET_LENGTH|UPPER|LOWER|TRIM|NORMALIZE|ABS|CEIL|CEILING|FLOOR|ROUND|SIGN|MOD|POWER|SQRT|EXP|LN|LOG|LOG10|SIN|COS|TAN|COT|ASIN|ACOS|ATAN|DEGREES|RADIANS|BTRIM|LTRIM|RTRIM|LEFT|RIGHT|ZONED_TIME|ZONED_DATETIME|LOCAL_DATETIME|DURATION_BETWEEN)\\b(?=\\s*\\()"
+    },
+    "algorithm": {
+      "name": "support.function.graph.gql",
+      "match": "(?i)\\b(pagerank|wcc|bfs|sssp|sssp_weighted|cdlp|lcc|triangle_count|betweenness|louvain)\\b(?=\\s*\\()"
+    },
+    "keyword": {
+      "name": "keyword.control.gql",
+      "match": "(?i)\\b(USE|OPTIONAL|MATCH|FOR|ORDINALITY|OFFSET|UNWIND|FILTER|LET|WITH|WHERE|RETURN|FINISH|YIELD|NEXT|UNION|EXCEPT|INTERSECT|OTHERWISE|DISTINCT|AS|GROUP|ORDER|BY|ASC|ASCENDING|DESC|DESCENDING|NULLS|FIRST|LAST|SKIP|LIMIT|ALL|ANY|SHORTEST|PATHS|GROUPS|KEEP|WALK|TRAIL|ACYCLIC|SIMPLE|REPEATABLE|ELEMENT|DIFFERENT|EDGES|BINDINGS|AND|OR|XOR|NOT|IS|IN|STARTS|ENDS|CONTAINS|LIKE|EXISTS|TYPED|CAST|DIRECTED|LABELED|SOURCE|DESTINATION|CASE|WHEN|THEN|ELSE|END|COALESCE|NULLIF|CREATE|DROP|SCHEMA|GRAPH|PROPERTY|TYPE|IF|REPLACE|COPY|OF|NODE|EDGE|RELATIONSHIP|PROPERTIES|NO|CURRENT_GRAPH|CURRENT_PROPERTY_GRAPH|HOME_GRAPH|HOME_PROPERTY_GRAPH|LIST|ARRAY|RECORD|VALUE|INSERT|SET|REMOVE|DELETE|DETACH|NODETACH|CALL|START|COMMIT|ROLLBACK|MERGE|SESSION|YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|TO|CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP|LOCAL_TIME|LOCAL_TIMESTAMP|LEADING|TRAILING|BOTH|FROM|NORMALIZED|NFC|NFD|NFKC|NFKD)\\b"
+    },
+    "type": {
+      "match": "(?i)(\\bAS\\b|\\bTYPED\\b|::)\\s*(INT8|INT16|INT32|INT64|INT128|INT256|UINT8|UINT16|UINT32|UINT64|UINT128|UINT256|SMALLINT|USMALLINT|INT|INTEGER|UINT|BIGINT|UBIGINT|DECIMAL|DEC|NUMERIC|FLOAT16|FLOAT32|FLOAT64|FLOAT128|FLOAT256|REAL|DOUBLE|PRECISION|FLOAT|BOOL|BOOLEAN|STRING|VARCHAR|CHAR|BYTES|VARBINARY|BINARY|DATE|TIME|DATETIME|TIMESTAMP|LOCAL|ZONED|DURATION|INTERVAL|PATH|BINDING|TABLE|NOTHING)\\b",
+      "captures": {
+        "1": {
+          "name": "keyword.control.gql"
+        },
+        "2": {
+          "name": "support.type.gql"
+        }
+      }
+    },
+    "temporal": {
+      "match": "(?i)\\b((?:INT8|INT16|INT32|INT64|INT128|INT256|UINT8|UINT16|UINT32|UINT64|UINT128|UINT256|SMALLINT|USMALLINT|INT|INTEGER|UINT|BIGINT|UBIGINT|DECIMAL|DEC|NUMERIC|FLOAT16|FLOAT32|FLOAT64|FLOAT128|FLOAT256|REAL|DOUBLE|PRECISION|FLOAT|BOOL|BOOLEAN|STRING|VARCHAR|CHAR|BYTES|VARBINARY|BINARY|DATE|TIME|DATETIME|TIMESTAMP|LOCAL|ZONED|DURATION|INTERVAL|PATH|BINDING|TABLE|NOTHING)\\s+)?(INT8|INT16|INT32|INT64|INT128|INT256|UINT8|UINT16|UINT32|UINT64|UINT128|UINT256|SMALLINT|USMALLINT|INT|INTEGER|UINT|BIGINT|UBIGINT|DECIMAL|DEC|NUMERIC|FLOAT16|FLOAT32|FLOAT64|FLOAT128|FLOAT256|REAL|DOUBLE|PRECISION|FLOAT|BOOL|BOOLEAN|STRING|VARCHAR|CHAR|BYTES|VARBINARY|BINARY|DATE|TIME|DATETIME|TIMESTAMP|LOCAL|ZONED|DURATION|INTERVAL|PATH|BINDING|TABLE|NOTHING)\\s*(?=@?['\"])",
+      "captures": {
+        "1": {
+          "name": "support.type.gql"
+        },
+        "2": {
+          "name": "support.type.gql"
+        }
+      }
+    },
+    "operator": {
+      "name": "keyword.operator.gql",
+      "match": "<-|->|<=|>=|<>|::|=>|\\.\\.|[-+*/%<>=&|!~]"
+    }
+  }
+}
